@@ -818,3 +818,61 @@ async fn search_due_bounds_use_household_timezone() {
     assert!(found.contains(ids[1].as_str()));
     assert!(found.contains(ids[2].as_str()));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_truncates_calendar_instead_of_failing() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let token =
+        support::issue_token(&db.pool, household.household_id, &["ha:read", "ha:write"]).await;
+    let app = support::app(&db.pool);
+
+    // Четыре ежедневные задачи на горизонте 300 дней дают ~1200 вхождений —
+    // больше лимита снапшота.
+    let end = (Utc::now() + Duration::days(300)).date_naive().to_string();
+    for index in 0..4 {
+        let (status, _) = support::request(
+            &app,
+            Method::POST,
+            &format!("/api/v1/lists/{}/items", household.tasks_list_id),
+            Some(&token),
+            Some(json!({
+                "title": format!("Ежедневная {index}"),
+                "recurrence": {"freq": "daily"}
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let (status, snapshot) = support::request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/snapshot?calendar_end={end}"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "календарный лимит не должен ронять весь снапшот"
+    );
+    let events = snapshot["calendar_events"].as_array().expect("events");
+    assert_eq!(events.len(), 1000);
+    assert_eq!(snapshot["calendar_truncated"], json!(true));
+
+    // Без calendar_end ответ не содержит календаря, но todo-данные на месте.
+    let (status, snapshot) =
+        support::request(&app, Method::GET, "/api/v1/snapshot", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        snapshot["calendar_events"]
+            .as_array()
+            .expect("events")
+            .len(),
+        0
+    );
+    assert_eq!(snapshot["calendar_truncated"], json!(false));
+    assert_eq!(snapshot["items"].as_array().expect("items").len(), 4);
+}

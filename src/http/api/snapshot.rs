@@ -41,6 +41,7 @@ pub async fn snapshot(
     let (items, deleted_item_ids) = items::snapshot(&mut conn, auth.household_id, since).await?;
 
     let mut calendar_events = Vec::new();
+    let mut calendar_truncated = false;
     if let Some(value) = query.calendar_end.as_deref() {
         let end = NaiveDate::parse_from_str(value, "%Y-%m-%d")
             .map_err(|_| ApiError::validation("calendar_end must be YYYY-MM-DD"))?;
@@ -51,12 +52,14 @@ pub async fn snapshot(
             for item in items::calendar_items(&mut conn, auth.household_id).await? {
                 calendar_events.extend(calendar::expand_item(&item, start, end, timezone)?);
             }
-            if calendar_events.len() > MAX_CALENDAR_OCCURRENCES {
-                return Err(ApiError::validation(format!(
-                    "calendar interval produces more than {MAX_CALENDAR_OCCURRENCES} occurrences"
-                )));
-            }
             calendar_events.sort_by_key(CalendarEvent::sort_key);
+            // Календарь в снапшоте вспомогательный: усекаем до лимита, а не
+            // роняем весь ответ, иначе HA теряет и todo-синхронизацию. Полный
+            // горизонт HA берёт через GET /calendar с его лимитом.
+            if calendar_events.len() > MAX_CALENDAR_OCCURRENCES {
+                calendar_events.truncate(MAX_CALENDAR_OCCURRENCES);
+                calendar_truncated = true;
+            }
         }
     }
 
@@ -67,6 +70,7 @@ pub async fn snapshot(
         items: items.into_iter().map(ItemResponse::from).collect(),
         deleted_item_ids,
         calendar_events,
+        calendar_truncated,
     }))
 }
 

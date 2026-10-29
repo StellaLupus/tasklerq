@@ -167,4 +167,7 @@ pub struct SnapshotResponse {
     pub deleted_item_ids: Vec<Uuid>,
     /// Календарные события.
     pub calendar_events: Vec<CalendarEvent>,
+    /// Календарь усечён до лимита вхождений (полный горизонт отдаёт
+    /// `GET /calendar`).
+    pub calendar_truncated: bool,
 }
