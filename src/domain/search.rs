@@ -2,7 +2,7 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -33,7 +33,7 @@ pub struct SearchFilters {
     pub tag: Option<String>,
     /// Начало диапазона сроков.
     pub due_from: Option<DateTime<Utc>>,
-    /// Конец диапазона сроков.
+    /// Конец диапазона сроков (исключающий).
     pub due_to: Option<DateTime<Utc>>,
     /// Размер страницы.
     pub limit: i64,
@@ -75,17 +75,11 @@ impl SearchFilters {
 pub struct SearchCursor {
     /// Релевантность.
     pub rank: f64,
-    /// Срок; для элементов без срока — [`null_due_sentinel`].
+    /// Срок сортировки; для элементов без срока — `9999-12-31` (как в SQL
+    /// запроса поиска).
     pub due: DateTime<Utc>,
     /// Идентификатор.
     pub id: Uuid,
-}
-
-/// Значение сортировки для элементов без срока.
-pub fn null_due_sentinel() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(9999, 12, 31, 0, 0, 0)
-        .single()
-        .expect("valid sentinel")
 }
 
 /// Закодировать курсор в base64url.
@@ -146,6 +140,7 @@ pub fn parse_due_bound(
 
 #[cfg(test)]
 mod tests {
+    use chrono::TimeZone;
     use chrono_tz::Europe::Moscow;
 
     use super::*;

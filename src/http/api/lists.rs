@@ -6,7 +6,6 @@ use axum::http::StatusCode;
 use uuid::Uuid;
 
 use crate::auth::tokens::AuthContext;
-use crate::domain::error::DomainError;
 use crate::domain::models::{List, ListKind};
 use crate::storage::repositories::lists;
 
@@ -97,19 +96,4 @@ pub async fn delete(
     commit(tx).await?;
 
     Ok(StatusCode::NO_CONTENT)
-}
-
-/// Проверить, что список принадлежит household (для вложенных маршрутов).
-pub async fn ensure_list(
-    state: &AppState,
-    household_id: Uuid,
-    list_id: Uuid,
-) -> Result<List, ApiError> {
-    let mut conn = connection(state).await?;
-    lists::get_visible(&mut conn, household_id, list_id)
-        .await
-        .map_err(|error| match error {
-            DomainError::NotFound => ApiError::not_found("List not found"),
-            other => other.into(),
-        })
 }

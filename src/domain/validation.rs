@@ -7,7 +7,7 @@ use super::models::{
     ItemPriority, ItemSource, ListKind, MonthRule, NewItem, Recurrence, RecurrenceFreq,
     RecurrenceInput, SubtaskInput,
 };
-use super::recurrence::{Due, last_day_of_month, parse_timezone, resolve_local, weekday_iso};
+use super::recurrence::{Due, last_day_of_month, parse_timezone, resolve_local};
 
 /// Максимальная длина названия.
 pub const MAX_TITLE: usize = 200;
@@ -289,14 +289,4 @@ fn sanitize(value: &str) -> String {
         .chars()
         .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
         .collect()
-}
-
-/// Проверить, что день недели входит в ISO-диапазон.
-pub fn valid_weekdays(byweekday: &[i16]) -> bool {
-    byweekday.iter().all(|day| (1..=7).contains(day))
-}
-
-/// ISO-номер дня недели.
-pub fn iso_weekday(date: NaiveDate) -> i16 {
-    weekday_iso(date.weekday())
 }

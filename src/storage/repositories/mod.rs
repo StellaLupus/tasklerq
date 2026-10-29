@@ -11,7 +11,6 @@ pub mod subtasks;
 pub mod tags;
 pub mod tokens;
 
-use chrono::{DateTime, Utc};
 use sqlx::PgConnection;
 
 /// Проверить, что пользователь — активный участник household.
@@ -32,9 +31,4 @@ pub async fn active_member(
     .await?;
 
     Ok(exists)
-}
-
-/// Привести `now` к UTC-моменту для записи в timestamptz.
-pub fn timestamp(now: DateTime<Utc>) -> DateTime<Utc> {
-    now
 }

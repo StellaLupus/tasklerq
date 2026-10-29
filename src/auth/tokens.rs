@@ -44,11 +44,6 @@ impl AuthContext {
             Err(AuthError::Forbidden(scope.to_owned()))
         }
     }
-
-    /// Есть ли scope.
-    pub fn has_scope(&self, scope: &str) -> bool {
-        self.scopes.iter().any(|value| value == scope)
-    }
 }
 
 /// SHA-256 токена в нижнем hexadecimal-представлении.
