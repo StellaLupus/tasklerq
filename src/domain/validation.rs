@@ -284,7 +284,7 @@ pub fn normalize_text_allow_empty(
 }
 
 /// Удалить управляющие символы, кроме перевода строки и табуляции.
-fn sanitize(value: &str) -> String {
+pub(crate) fn sanitize(value: &str) -> String {
     value
         .chars()
         .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))

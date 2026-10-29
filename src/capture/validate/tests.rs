@@ -1,0 +1,826 @@
+use chrono::TimeZone;
+
+use super::*;
+use crate::capture::test_support::{context, list, member};
+
+fn raw(kind: ListKind, title: &str) -> RawItem {
+    RawItem {
+        target_kind: kind,
+        target_list: None,
+        title: title.to_owned(),
+        notes: None,
+        due_date: None,
+        due_time: None,
+        all_day: None,
+        priority: None,
+        assignee: None,
+        tags: Vec::new(),
+        quantity: None,
+        unit: None,
+        subtasks: Vec::new(),
+        recurrence: None,
+    }
+}
+
+fn task() -> RawItem {
+    raw(ListKind::Tasks, "Позвонить маме")
+}
+
+fn check(raw: RawItem) -> DraftItem {
+    validate_item(&context(), ItemSource::HaVoice, raw)
+}
+
+fn codes(item: &DraftItem) -> Vec<&'static str> {
+    item.errors.iter().map(|error| error.code).collect()
+}
+
+fn weekly(days: &[i64]) -> RawRecurrence {
+    RawRecurrence {
+        freq: Some("weekly".to_owned()),
+        weekdays: days.to_vec(),
+        ..RawRecurrence::default()
+    }
+}
+
+#[test]
+fn valid_task_becomes_new_item_with_source() {
+    let mut raw = task();
+    raw.notes = Some("  про рецепт ".to_owned());
+    raw.priority = Some("High".to_owned());
+    raw.tags = vec!["#Семья".to_owned(), "семья".to_owned()];
+    raw.subtasks = vec!["Набрать".to_owned()];
+
+    let draft = check(raw);
+
+    assert!(draft.is_valid(), "{:?}", draft.errors);
+    let item = draft.item.unwrap();
+    assert_eq!(item.title, "Позвонить маме");
+    assert_eq!(item.notes.as_deref(), Some("про рецепт"));
+    assert_eq!(item.priority, ItemPriority::High);
+    assert_eq!(item.tags, ["семья"]);
+    assert_eq!(item.subtasks.len(), 1);
+    assert_eq!(item.source, ItemSource::HaVoice);
+    assert_eq!(Some(item.list_id), draft.list_id);
+}
+
+#[test]
+fn title_length_is_one_to_two_hundred() {
+    assert_eq!(codes(&check(raw(ListKind::Tasks, "   "))), ["title_length"]);
+    assert_eq!(
+        codes(&check(raw(ListKind::Tasks, &"я".repeat(201)))),
+        ["title_length"]
+    );
+    assert!(check(raw(ListKind::Tasks, &"я".repeat(200))).is_valid());
+}
+
+#[test]
+fn control_characters_are_removed_from_title() {
+    let draft = check(raw(ListKind::Tasks, "куп\u{0}ить\u{7} хлеб"));
+
+    assert_eq!(draft.title, "купить хлеб");
+}
+
+#[test]
+fn html_in_title_is_kept_as_data() {
+    let draft = check(raw(ListKind::Shopping, "<b>купить</b> хлеб"));
+
+    assert!(draft.is_valid());
+    assert_eq!(draft.item.unwrap().title, "<b>купить</b> хлеб");
+}
+
+#[test]
+fn notes_longer_than_two_thousand_are_rejected() {
+    let mut raw = task();
+    raw.notes = Some("я".repeat(2_001));
+    assert_eq!(codes(&check(raw)), ["notes_length"]);
+
+    let mut raw = task();
+    raw.notes = Some("я".repeat(2_000));
+    assert!(check(raw).is_valid());
+}
+
+#[test]
+fn past_date_is_an_item_error_and_today_is_allowed() {
+    let mut yesterday = task();
+    yesterday.due_date = Some("2026-10-29".to_owned());
+    let draft = check(yesterday);
+    assert_eq!(codes(&draft), ["date_past"]);
+    assert_eq!(draft.errors[0].message, "Дата уже прошла");
+    assert!(draft.item.is_none());
+
+    let mut today = task();
+    today.due_date = Some("2026-10-30".to_owned());
+    assert!(check(today).is_valid());
+}
+
+#[test]
+fn date_horizon_is_five_years() {
+    let mut edge = task();
+    edge.due_date = Some("2031-10-30".to_owned());
+    assert!(check(edge).is_valid());
+
+    let mut far = task();
+    far.due_date = Some("2031-10-31".to_owned());
+    let draft = check(far);
+    assert_eq!(codes(&draft), ["date_far"]);
+    assert_eq!(draft.errors[0].message, "Слишком далёкая дата");
+}
+
+#[test]
+fn malformed_date_and_time_are_rejected() {
+    for value in ["завтра", "2026-13-01", "30.10.2026", "2026-02-30"] {
+        let mut raw = task();
+        raw.due_date = Some(value.to_owned());
+        assert_eq!(codes(&check(raw)), ["date_invalid"], "{value}");
+    }
+    for value in ["25:00", "18:60", "вечером", "6pm"] {
+        let mut raw = task();
+        raw.due_date = Some("2026-10-31".to_owned());
+        raw.due_time = Some(value.to_owned());
+        assert_eq!(codes(&check(raw)), ["time_invalid"], "{value}");
+    }
+}
+
+#[test]
+fn time_without_date_is_rejected_instead_of_guessed() {
+    let mut raw = task();
+    raw.due_time = Some("18:00".to_owned());
+
+    let draft = check(raw);
+
+    assert_eq!(codes(&draft), ["time_without_date"]);
+}
+
+#[test]
+fn date_and_time_become_utc_moment_in_household_timezone() {
+    let mut raw = task();
+    raw.due_date = Some("2026-10-30".to_owned());
+    raw.due_time = Some("18:00".to_owned());
+    raw.all_day = Some(true);
+
+    let item = check(raw).item.unwrap();
+
+    assert_eq!(item.due_date, None);
+    assert_eq!(
+        item.due_at,
+        Some(Utc.with_ymd_and_hms(2026, 10, 30, 15, 0, 0).unwrap())
+    );
+}
+
+#[test]
+fn date_without_time_is_all_day_even_if_flag_says_otherwise() {
+    let mut raw = task();
+    raw.due_date = Some("2026-10-31".to_owned());
+    raw.all_day = Some(false);
+
+    let item = check(raw).item.unwrap();
+
+    assert_eq!(item.due_at, None);
+    assert_eq!(item.due_date, NaiveDate::from_ymd_opt(2026, 10, 31));
+}
+
+#[test]
+fn priority_must_be_known() {
+    let mut raw = task();
+    raw.priority = Some("критично".to_owned());
+
+    let draft = check(raw);
+
+    assert_eq!(codes(&draft), ["priority_unknown"]);
+    assert_eq!(draft.errors[0].message, "Неизвестный приоритет");
+}
+
+#[test]
+fn assignee_must_be_a_household_member() {
+    let context = context();
+    let mut raw = task();
+    raw.assignee = Some("Мария".to_owned());
+    let draft = validate_item(&context, ItemSource::Api, raw);
+    assert_eq!(codes(&draft), ["assignee_unknown"]);
+    assert_eq!(draft.errors[0].message, "Такого участника нет");
+    assert!(draft.item.is_none());
+
+    for name in ["анна", " Анна ", "@anna", "ANNA"] {
+        let mut raw = task();
+        raw.assignee = Some(name.to_owned());
+        let item = validate_item(&context, ItemSource::Api, raw).item.unwrap();
+        assert_eq!(item.assignee_user_id, Some(context.members[0].id), "{name}");
+    }
+}
+
+#[test]
+fn yo_and_ye_are_the_same_letter_for_names() {
+    let context = context();
+    let mut raw = task();
+    raw.assignee = Some("Петр".to_owned());
+
+    let item = validate_item(&context, ItemSource::Api, raw).item.unwrap();
+
+    assert_eq!(item.assignee_user_id, Some(context.members[1].id));
+}
+
+#[test]
+fn ambiguous_assignee_is_not_guessed() {
+    let mut context = context();
+    context.members = vec![
+        member("Алексей", Some("alex_a")),
+        member("Алексей", Some("alex_b")),
+    ];
+    let expected: Vec<_> = context.members.iter().map(|member| member.id).collect();
+    let mut raw = task();
+    raw.assignee = Some("Алексей".to_owned());
+
+    let draft = validate_item(&context, ItemSource::Api, raw);
+
+    assert_eq!(codes(&draft), [ASSIGNEE_AMBIGUOUS]);
+    assert_eq!(draft.assignee_candidates, expected);
+    assert!(draft.item.is_none());
+}
+
+#[test]
+fn username_and_display_name_of_one_member_are_not_ambiguous() {
+    let mut context = context();
+    context.members = vec![member("Anna", Some("anna")), member("Борис", Some("boris"))];
+    let mut raw = task();
+    raw.assignee = Some("anna".to_owned());
+
+    assert!(validate_item(&context, ItemSource::Api, raw).is_valid());
+}
+
+#[test]
+fn tags_are_limited_in_count_and_length() {
+    let mut raw = task();
+    raw.tags = (0..11).map(|n| format!("тег{n}")).collect();
+    assert_eq!(codes(&check(raw)), ["tags_count"]);
+
+    let mut raw = task();
+    raw.tags = (0..10).map(|n| format!("тег{n}")).collect();
+    assert!(check(raw).is_valid());
+
+    let mut raw = task();
+    raw.tags = vec!["я".repeat(33)];
+    assert_eq!(codes(&check(raw)), ["tag_length"]);
+
+    let mut raw = task();
+    raw.tags = vec!["я".repeat(32)];
+    assert!(check(raw).is_valid());
+}
+
+#[test]
+fn quantity_must_be_positive_and_at_most_9999() {
+    for quantity in [0.0, -1.0, 10_000.0, 9_999.5, 0.0001, 1.2345] {
+        let mut raw = raw(ListKind::Shopping, "Молоко");
+        raw.quantity = Some(quantity);
+        let draft = check(raw);
+        assert_eq!(codes(&draft), ["quantity_range"], "{quantity}");
+        assert_eq!(draft.errors[0].message, "Количество вне диапазона");
+    }
+    for quantity in [0.001, 2.0, 2.5, 9_999.0] {
+        let mut raw = raw(ListKind::Shopping, "Молоко");
+        raw.quantity = Some(quantity);
+        assert!(check(raw).is_valid(), "{quantity}");
+    }
+}
+
+#[test]
+fn shopping_item_keeps_quantity_and_unit() {
+    let mut raw = raw(ListKind::Shopping, "Молоко");
+    raw.quantity = Some(2.0);
+    raw.unit = Some(" л ".to_owned());
+
+    let item = check(raw).item.unwrap();
+
+    assert_eq!(item.quantity, Some(2.0));
+    assert_eq!(item.unit.as_deref(), Some("л"));
+}
+
+#[test]
+fn subtasks_are_limited() {
+    let mut raw = task();
+    raw.subtasks = (0..51).map(|n| format!("шаг {n}")).collect();
+    assert_eq!(codes(&check(raw)), ["subtasks_count"]);
+
+    let mut raw = task();
+    raw.subtasks = (0..50).map(|n| format!("шаг {n}")).collect();
+    assert!(check(raw).is_valid());
+
+    let mut raw = task();
+    raw.subtasks = vec!["я".repeat(201)];
+    assert_eq!(codes(&check(raw)), ["subtask_length"]);
+}
+
+#[test]
+fn recurrence_interval_zero_is_rejected() {
+    let mut raw = task();
+    raw.recurrence = Some(RawRecurrence {
+        freq: Some("daily".to_owned()),
+        interval: Some(0),
+        ..RawRecurrence::default()
+    });
+
+    let draft = check(raw);
+
+    assert_eq!(codes(&draft), ["recurrence_interval"]);
+    assert_eq!(draft.errors[0].message, "Интервал — от 1 до 365");
+    assert!(draft.item.is_none());
+}
+
+#[test]
+fn recurrence_interval_upper_bound() {
+    for (interval, valid) in [(365, true), (366, false)] {
+        let mut raw = task();
+        raw.recurrence = Some(RawRecurrence {
+            freq: Some("daily".to_owned()),
+            interval: Some(interval),
+            ..RawRecurrence::default()
+        });
+        assert_eq!(check(raw).is_valid(), valid, "{interval}");
+    }
+}
+
+#[test]
+fn weekly_recurrence_needs_valid_weekdays() {
+    let mut raw = task();
+    raw.recurrence = Some(weekly(&[]));
+    let draft = check(raw);
+    assert_eq!(codes(&draft), ["recurrence_weekdays"]);
+    assert_eq!(draft.errors[0].message, "Укажите дни недели");
+
+    let mut raw = task();
+    raw.recurrence = Some(weekly(&[2, 8]));
+    assert_eq!(codes(&check(raw)), ["recurrence_weekdays"]);
+
+    let mut raw = task();
+    raw.due_date = Some("2026-11-03".to_owned());
+    raw.recurrence = Some(weekly(&[2]));
+    let item = check(raw).item.unwrap();
+    let recurrence = item.recurrence.unwrap();
+    assert_eq!(recurrence.freq, RecurrenceFreq::Weekly);
+    assert_eq!(recurrence.byweekday, [2]);
+    assert_eq!(recurrence.interval, Some(1));
+}
+
+#[test]
+fn missing_or_unknown_frequency_is_rejected() {
+    let mut raw = task();
+    raw.recurrence = Some(RawRecurrence {
+        interval: Some(2),
+        ..RawRecurrence::default()
+    });
+    assert_eq!(codes(&check(raw)), ["recurrence_freq"]);
+
+    let mut raw = task();
+    raw.recurrence = Some(RawRecurrence {
+        freq: Some("hourly".to_owned()),
+        ..RawRecurrence::default()
+    });
+    assert_eq!(codes(&check(raw)), ["recurrence_freq"]);
+}
+
+#[test]
+fn irrelevant_weekdays_and_month_rule_are_dropped() {
+    let mut raw = task();
+    raw.recurrence = Some(RawRecurrence {
+        freq: Some("daily".to_owned()),
+        weekdays: vec![1, 2],
+        month_rule: Some("last_day".to_owned()),
+        ..RawRecurrence::default()
+    });
+
+    let recurrence = check(raw).item.unwrap().recurrence.unwrap();
+
+    assert!(recurrence.byweekday.is_empty());
+    assert_eq!(recurrence.month_rule, None);
+}
+
+#[test]
+fn monthly_month_rule_is_validated() {
+    let mut raw = task();
+    raw.recurrence = Some(RawRecurrence {
+        freq: Some("monthly".to_owned()),
+        month_rule: Some("last_day".to_owned()),
+        ..RawRecurrence::default()
+    });
+    let recurrence = check(raw).item.unwrap().recurrence.unwrap();
+    assert_eq!(recurrence.month_rule, Some(MonthRule::LastDay));
+
+    let mut raw = task();
+    raw.recurrence = Some(RawRecurrence {
+        freq: Some("monthly".to_owned()),
+        month_rule: Some("sometimes".to_owned()),
+        ..RawRecurrence::default()
+    });
+    assert_eq!(codes(&check(raw)), ["recurrence_month_rule"]);
+}
+
+#[test]
+fn recurrence_until_is_within_start_and_five_years() {
+    let cases = [
+        ("2026-11-03", true),
+        ("2026-11-02", false),
+        ("2031-11-03", true),
+        ("2031-11-04", false),
+        ("когда-нибудь", false),
+    ];
+    for (until, valid) in cases {
+        let mut raw = task();
+        raw.due_date = Some("2026-11-03".to_owned());
+        raw.recurrence = Some(RawRecurrence {
+            until: Some(until.to_owned()),
+            ..weekly(&[2])
+        });
+        let draft = check(raw);
+        assert_eq!(draft.is_valid(), valid, "{until}: {:?}", draft.errors);
+        if !valid {
+            assert_eq!(draft.errors[0].message, "Неверная дата окончания");
+        }
+    }
+}
+
+#[test]
+fn recurrence_is_only_for_task_lists() {
+    let mut raw = raw(ListKind::Shopping, "Молоко");
+    raw.recurrence = Some(RawRecurrence {
+        freq: Some("daily".to_owned()),
+        ..RawRecurrence::default()
+    });
+
+    assert_eq!(codes(&check(raw)), ["recurrence_kind"]);
+}
+
+#[test]
+fn named_list_of_matching_kind_is_used() {
+    let context = context();
+    let mut raw = task();
+    raw.target_list = Some(" дача ".to_owned());
+
+    let draft = validate_item(&context, ItemSource::Api, raw);
+
+    assert_eq!(draft.list_id, Some(context.lists[2].id));
+    assert!(!draft.list_auto_selected);
+}
+
+#[test]
+fn unknown_list_falls_back_to_default_and_is_flagged() {
+    let context = context();
+    let mut raw = task();
+    raw.target_list = Some("Гараж".to_owned());
+
+    let draft = validate_item(&context, ItemSource::Api, raw);
+
+    assert!(draft.is_valid());
+    assert_eq!(draft.list_id, Some(context.lists[0].id));
+    assert!(draft.list_auto_selected);
+}
+
+#[test]
+fn list_of_another_kind_is_not_used_by_name() {
+    let context = context();
+    let mut raw = raw(ListKind::Shopping, "Молоко");
+    raw.target_list = Some("Задачи".to_owned());
+
+    let draft = validate_item(&context, ItemSource::Api, raw);
+
+    assert_eq!(draft.list_id, Some(context.lists[1].id));
+    assert!(draft.list_auto_selected);
+}
+
+#[test]
+fn unnamed_list_uses_default_without_flag() {
+    let context = context();
+
+    let draft = validate_item(&context, ItemSource::Api, raw(ListKind::Shopping, "Хлеб"));
+
+    assert_eq!(draft.list_id, Some(context.lists[1].id));
+    assert!(!draft.list_auto_selected);
+}
+
+#[test]
+fn household_without_list_of_kind_rejects_item() {
+    let mut context = context();
+    context
+        .lists
+        .retain(|list| list.kind != ListKind::Checklist);
+
+    let draft = validate_item(
+        &context,
+        ItemSource::Api,
+        raw(ListKind::Checklist, "Собрать сумку"),
+    );
+
+    assert_eq!(codes(&draft), ["list_missing"]);
+    assert!(draft.item.is_none());
+}
+
+#[test]
+fn default_list_prefers_flagged_list() {
+    let mut context = context();
+    context.lists = vec![
+        list("Старый", ListKind::Tasks, false),
+        list("Основной", ListKind::Tasks, true),
+    ];
+
+    assert_eq!(
+        context
+            .default_list(ListKind::Tasks)
+            .map(|l| l.name.as_str()),
+        Some("Основной")
+    );
+
+    context.lists[1].is_default = false;
+    assert_eq!(
+        context
+            .default_list(ListKind::Tasks)
+            .map(|l| l.name.as_str()),
+        Some("Старый")
+    );
+}
+
+#[test]
+fn all_errors_of_an_item_are_collected() {
+    let mut raw = task();
+    raw.due_date = Some("2026-10-01".to_owned());
+    raw.assignee = Some("Мария".to_owned());
+    raw.priority = Some("???".to_owned());
+
+    let draft = check(raw);
+
+    assert_eq!(
+        codes(&draft),
+        ["priority_unknown", "assignee_unknown", "date_past"]
+    );
+    assert!(draft.item.is_none());
+}
+
+#[test]
+fn one_invalid_item_blocks_the_whole_draft_but_keeps_the_rest_visible() {
+    let mut bad = task();
+    bad.due_date = Some("2026-10-29".to_owned());
+    let parsed = ParsedResponse {
+        items: vec![raw(ListKind::Shopping, "Молоко"), bad],
+        clarifications: vec!["Когда?".to_owned()],
+    };
+
+    let draft = validate_items(&context(), ItemSource::HaVoice, parsed);
+
+    assert!(!draft.is_valid());
+    assert!(draft.items[0].is_valid());
+    assert!(!draft.items[1].is_valid());
+    assert_eq!(draft.clarifications, ["Когда?"]);
+}
+
+#[test]
+fn empty_draft_is_not_valid() {
+    let draft = validate_items(&context(), ItemSource::Api, ParsedResponse::default());
+
+    assert!(!draft.is_valid());
+}
+
+#[test]
+fn mixed_valid_draft_passes() {
+    let mut call = task();
+    call.due_date = Some("2026-10-30".to_owned());
+    call.due_time = Some("18:00".to_owned());
+    let mut milk = raw(ListKind::Shopping, "Молоко");
+    milk.quantity = Some(2.0);
+    milk.unit = Some("л".to_owned());
+    let parsed = ParsedResponse {
+        items: vec![milk, raw(ListKind::Shopping, "Хлеб"), call],
+        clarifications: Vec::new(),
+    };
+
+    let draft = validate_items(&context(), ItemSource::Telegram, parsed);
+
+    assert!(draft.is_valid());
+    assert!(draft.items.iter().all(|item| item.item.is_some()));
+}
+
+#[test]
+fn long_unit_is_truncated_like_the_domain_does() {
+    let mut raw = raw(ListKind::Shopping, "Молоко");
+    raw.quantity = Some(1.0);
+    raw.unit = Some("я".repeat(40));
+
+    let draft = check(raw);
+
+    assert!(draft.is_valid(), "{:?}", draft.errors);
+    assert_eq!(draft.item.unwrap().unit, Some("я".repeat(MAX_UNIT)));
+}
+
+#[test]
+fn all_day_flag_is_ignored() {
+    for all_day in [None, Some(true), Some(false)] {
+        let mut dated = task();
+        dated.due_date = Some("2026-10-31".to_owned());
+        dated.all_day = all_day;
+        let item = check(dated).item.unwrap();
+        assert_eq!(item.due_date, NaiveDate::from_ymd_opt(2026, 10, 31));
+        assert_eq!(item.due_at, None);
+
+        let mut timed = task();
+        timed.due_date = Some("2026-10-31".to_owned());
+        timed.due_time = Some("09:30".to_owned());
+        timed.all_day = all_day;
+        let item = check(timed).item.unwrap();
+        assert_eq!(item.due_date, None);
+        assert!(item.due_at.is_some());
+    }
+}
+
+#[test]
+fn leading_at_sign_is_not_stripped_from_list_names() {
+    let mut context = context();
+    context.lists.push(list("@дом", ListKind::Tasks, false));
+    let at_home = context.lists.last().unwrap().id;
+
+    let mut exact = task();
+    exact.target_list = Some("@дом".to_owned());
+    let draft = validate_item(&context, ItemSource::Api, exact);
+    assert_eq!(draft.list_id, Some(at_home));
+    assert!(!draft.list_auto_selected);
+
+    let mut bare = task();
+    bare.target_list = Some("дом".to_owned());
+    let draft = validate_item(&context, ItemSource::Api, bare);
+    assert_ne!(draft.list_id, Some(at_home));
+    assert!(draft.list_auto_selected);
+}
+
+#[test]
+fn domain_disagreement_becomes_an_item_error() {
+    let context = context();
+    let mut item = check(task()).item.unwrap();
+    item.title = String::new();
+    let mut errors = Vec::new();
+
+    let confirmed = confirm_domain(
+        &context,
+        ListKind::Tasks,
+        item,
+        context.today(),
+        &mut errors,
+    );
+
+    assert!(confirmed.is_none());
+    assert_eq!(
+        errors,
+        [ItemError {
+            field: "item",
+            code: "domain_rejected",
+            message: "Элемент не прошёл проверку",
+        }]
+    );
+}
+
+/// Дублирование правил домена закреплено тестом: всё, что принимает слой
+/// capture, принимает и домен, то есть `domain_rejected` недостижим.
+#[test]
+fn domain_never_rejects_what_validation_accepts() {
+    let long = |n: usize| "я".repeat(n);
+    let mut cases: Vec<RawItem> = vec![
+        task(),
+        raw(ListKind::Tasks, &long(MAX_TITLE)),
+        raw(ListKind::Checklist, " Собрать сумку "),
+        raw(ListKind::Shopping, "<b>хлеб</b>"),
+        raw(ListKind::Tasks, "куп\u{0}ить\u{7}"),
+    ];
+
+    let mut notes = task();
+    notes.notes = Some(long(MAX_NOTES));
+    cases.push(notes);
+
+    for priority in ["low", "Normal", " HIGH ", "urgent"] {
+        let mut raw = task();
+        raw.priority = Some(priority.to_owned());
+        cases.push(raw);
+    }
+
+    for (date, time) in [
+        ("2026-10-30", None),
+        ("2026-10-30", Some("00:00")),
+        ("2026-10-30", Some("23:59:59")),
+        ("2026-11-01", Some("18:00")),
+        ("2031-10-30", None),
+        ("2031-10-30", Some("12:00")),
+    ] {
+        let mut raw = task();
+        raw.due_date = Some(date.to_owned());
+        raw.due_time = time.map(str::to_owned);
+        cases.push(raw);
+    }
+
+    let mut tags = task();
+    tags.tags = (0..MAX_TAGS).map(|n| format!("#Тег{n}")).collect();
+    cases.push(tags);
+    let mut tag = task();
+    tag.tags = vec![long(MAX_TAG), "Дубль".to_owned(), "дубль".to_owned()];
+    cases.push(tag);
+
+    let mut subtasks = task();
+    subtasks.subtasks = (0..MAX_SUBTASKS).map(|n| format!("шаг {n}")).collect();
+    cases.push(subtasks);
+    let mut subtask = task();
+    subtask.subtasks = vec![long(MAX_TITLE)];
+    cases.push(subtask);
+
+    for quantity in [0.001, 1.0, 2.5, 9_999.0] {
+        for unit in [
+            None,
+            Some("л"),
+            Some("  кг "),
+            Some("очень-длинная-единица-измерения"),
+        ] {
+            let mut raw = raw(ListKind::Shopping, "Молоко");
+            raw.quantity = Some(quantity);
+            raw.unit = unit.map(str::to_owned);
+            cases.push(raw);
+        }
+    }
+
+    for (freq, interval) in [
+        ("daily", None),
+        ("daily", Some(365)),
+        ("monthly", Some(1)),
+        ("yearly", Some(2)),
+    ] {
+        for month_rule in [None, Some("anchor_day"), Some("last_day")] {
+            let mut raw = task();
+            raw.due_date = Some("2026-11-03".to_owned());
+            raw.recurrence = Some(RawRecurrence {
+                freq: Some(freq.to_owned()),
+                interval,
+                month_rule: month_rule.map(str::to_owned),
+                // У «чужих» частот модель заполняет их по привычке.
+                weekdays: vec![1, 2],
+                until: Some("2031-11-03".to_owned()),
+            });
+            cases.push(raw);
+        }
+    }
+    for days in [&[1][..], &[1, 3, 5], &[1, 2, 3, 4, 5, 6, 7]] {
+        let mut raw = task();
+        raw.due_date = Some("2026-11-03".to_owned());
+        raw.recurrence = Some(RawRecurrence {
+            until: Some("2027-01-01".to_owned()),
+            interval: Some(2),
+            ..weekly(days)
+        });
+        cases.push(raw);
+    }
+
+    let mut named = task();
+    named.target_list = Some("Дача".to_owned());
+    named.assignee = Some("@Anna".to_owned());
+    cases.push(named);
+
+    let mut context = context();
+    context
+        .lists
+        .push(list("Чек-лист", ListKind::Checklist, true));
+    for (index, raw) in cases.into_iter().enumerate() {
+        let draft = validate_item(&context, ItemSource::HaVoice, raw.clone());
+        assert!(
+            draft.is_valid(),
+            "случай {index} должен быть валиден: {:?}\n{raw:?}",
+            draft.errors
+        );
+        assert!(draft.item.is_some(), "случай {index}");
+    }
+}
+
+#[test]
+fn dst_gap_and_overlap_resolve_in_household_timezone() {
+    let mut context = context();
+    context.timezone = chrono_tz::Europe::Berlin;
+    context.now = Utc.with_ymd_and_hms(2026, 10, 20, 10, 0, 0).unwrap();
+    // Неоднозначное время (25.10.2026 часы идут 03:00 → 02:00) — первое
+    // вхождение, летнее; несуществующее (28.03.2027 02:00 → 03:00) сдвигается
+    // вперёд до первого существующего момента.
+    let cases = [
+        (
+            "2026-10-25",
+            "02:30",
+            Utc.with_ymd_and_hms(2026, 10, 25, 0, 30, 0),
+        ),
+        (
+            "2027-03-28",
+            "02:30",
+            Utc.with_ymd_and_hms(2027, 3, 28, 1, 0, 0),
+        ),
+    ];
+
+    for (date, time, expected) in cases {
+        let mut raw = task();
+        raw.due_date = Some(date.to_owned());
+        raw.due_time = Some(time.to_owned());
+
+        let draft = validate_item(&context, ItemSource::Api, raw);
+
+        assert!(draft.is_valid(), "{date} {time}: {:?}", draft.errors);
+        assert_eq!(
+            draft.item.unwrap().due_at,
+            expected.single(),
+            "{date} {time}"
+        );
+    }
+}
