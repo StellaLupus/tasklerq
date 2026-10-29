@@ -120,7 +120,10 @@ async fn search_filters_status_list_assignee_and_due_range() {
 
     let mut assigned = support::new_item(household.shopping_list_id, "Купить сыр");
     assigned.assignee_user_id = Some(household.member_id);
-    assigned.due_date = Some(Utc::now().date_naive());
+    // Дата в часовом поясе household: иначе с 00:00 до 03:00 MSK UTC-дата
+    // отстаёт на день, и срок выпадает из диапазона `due_from`.
+    let moscow = tasklerq::domain::recurrence::parse_timezone("Europe/Moscow").expect("timezone");
+    assigned.due_date = Some(Utc::now().with_timezone(&moscow).date_naive());
     let assigned = support::create_item(
         &db.pool,
         &household,
