@@ -1,0 +1,12 @@
+[package]
+name = "mnemosyne-guard"
+version = "0.1.0"
+edition = "2024"
+description = "stdio proxy that pins a Mnemosyne MCP server to a single memory bank"
+
+[dependencies]
+serde_json = "1"
+
+# Standalone tool: keep it out of any Cargo workspace the application may add
+# in the parent directories.
+[workspace]

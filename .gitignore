@@ -1,0 +1,17 @@
+# Contains the ha-mcp bearer token — never commit
+opencode.json
+
+# Rust
+/target
+**/*.rs.bk
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Runtime data
+/data
+*.log

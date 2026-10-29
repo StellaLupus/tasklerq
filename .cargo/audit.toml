@@ -1,0 +1,5 @@
+[advisories]
+# RUSTSEC-2023-0071 (rsa, Marvin attack) присутствует только в Cargo.lock как
+# опциональная зависимость sqlx-mysql. MySQL не включён в features и не
+# компилируется; Postgres-драйвер rsa не использует.
+ignore = ["RUSTSEC-2023-0071"]
