@@ -6,7 +6,7 @@ use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::Deserialize;
 
 use crate::auth::tokens::AuthContext;
-use crate::domain::calendar::{self, CalendarEvent};
+use crate::domain::calendar;
 use crate::domain::recurrence::{MAX_CALENDAR_OCCURRENCES, parse_timezone};
 use crate::storage::repositories::{households, items, lists};
 
@@ -52,7 +52,7 @@ pub async fn snapshot(
             for item in items::calendar_items(&mut conn, auth.household_id).await? {
                 calendar_events.extend(calendar::expand_item(&item, start, end, timezone)?);
             }
-            calendar_events.sort_by_key(CalendarEvent::sort_key);
+            calendar_events.sort_by_key(|event| event.sort_key(timezone));
             // Календарь в снапшоте вспомогательный: усекаем до лимита, а не
             // роняем весь ответ, иначе HA теряет и todo-синхронизацию. Полный
             // горизонт HA берёт через GET /calendar с его лимитом.

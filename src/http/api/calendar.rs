@@ -6,7 +6,7 @@ use chrono::NaiveDate;
 use serde::Deserialize;
 
 use crate::auth::tokens::AuthContext;
-use crate::domain::calendar::{self, CalendarEvent};
+use crate::domain::calendar;
 use crate::domain::recurrence::{MAX_CALENDAR_OCCURRENCES, parse_timezone};
 use crate::storage::repositories::{households, items};
 
@@ -51,7 +51,7 @@ pub async fn calendar(
         )));
     }
 
-    events.sort_by_key(CalendarEvent::sort_key);
+    events.sort_by_key(|event| event.sort_key(timezone));
     Ok(Json(CalendarResponse { events }))
 }
 

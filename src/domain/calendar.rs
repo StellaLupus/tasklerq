@@ -41,13 +41,15 @@ pub struct CalendarEvent {
 }
 
 impl CalendarEvent {
-    /// Ключ сортировки: дата начала (вседневные раньше временных в тот же
-    /// день), затем время, затем детерминированный ключ вхождения.
-    pub fn sort_key(&self) -> (NaiveDate, bool, Option<DateTime<Utc>>, String) {
+    /// Ключ сортировки: локальная дата начала (вседневные раньше временных в
+    /// тот же день), затем момент времени, затем детерминированный ключ
+    /// вхождения. День всегда считается в часовом поясе `timezone`, иначе
+    /// ночное событие попадало бы в предыдущий день по UTC.
+    pub fn sort_key(&self, timezone: Tz) -> (NaiveDate, bool, Option<DateTime<Utc>>, String) {
         match &self.start {
             CalendarTime::Date(date) => (*date, false, None, self.occurrence_key.clone()),
             CalendarTime::DateTime(at) => (
-                at.date_naive(),
+                at.with_timezone(&timezone).date_naive(),
                 true,
                 Some(*at),
                 self.occurrence_key.clone(),
@@ -169,4 +171,53 @@ fn single_event(
     }
 
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::TimeZone;
+    use chrono_tz::Europe::Moscow;
+
+    use super::*;
+
+    fn event(title: &str, start: CalendarTime) -> CalendarEvent {
+        let all_day = matches!(start, CalendarTime::Date(_));
+        CalendarEvent {
+            item_id: Uuid::nil(),
+            list_id: Uuid::nil(),
+            occurrence_key: title.to_owned(),
+            end: start.clone(),
+            start,
+            all_day,
+            title: title.to_owned(),
+            status: ItemStatus::Open,
+        }
+    }
+
+    #[test]
+    fn events_are_ordered_by_household_local_date() {
+        let day = |d| NaiveDate::from_ymd_opt(2026, 10, d).unwrap();
+        // 01:00 MSK 29 октября — это 22:00Z 28 октября, но для household день 29-е.
+        let night = Utc.with_ymd_and_hms(2026, 10, 28, 22, 0, 0).unwrap();
+        let morning = Utc.with_ymd_and_hms(2026, 10, 29, 8, 0, 0).unwrap();
+
+        let mut events = [
+            event("timed-morning-29", CalendarTime::DateTime(morning)),
+            event("timed-night-29", CalendarTime::DateTime(night)),
+            event("all-day-29", CalendarTime::Date(day(29))),
+            event("all-day-28", CalendarTime::Date(day(28))),
+        ];
+        events.sort_by_key(|event| event.sort_key(Moscow));
+
+        let titles: Vec<_> = events.iter().map(|e| e.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            [
+                "all-day-28",
+                "all-day-29",
+                "timed-night-29",
+                "timed-morning-29"
+            ]
+        );
+    }
 }
