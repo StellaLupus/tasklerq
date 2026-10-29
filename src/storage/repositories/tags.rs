@@ -108,3 +108,16 @@ pub async fn for_items(
     }
     Ok(grouped)
 }
+
+/// Все теги household по имени.
+pub async fn list(conn: &mut PgConnection, household_id: Uuid) -> Result<Vec<Tag>, DomainError> {
+    let tags = sqlx::query_as::<_, Tag>(
+        "SELECT id, household_id, name, created_at FROM tags
+         WHERE household_id = $1 ORDER BY name",
+    )
+    .bind(household_id)
+    .fetch_all(conn)
+    .await?;
+
+    Ok(tags)
+}

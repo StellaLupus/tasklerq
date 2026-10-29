@@ -255,6 +255,7 @@ curl -sS -X POST \
 | `TELEGRAM_BOT_TOKEN` | при `webhook`/`polling` | `123:AA...` | Токен бота; не нужен при `disabled`. |
 | `TELEGRAM_WEBHOOK_SECRET` | при `webhook` | `hex` | Секрет webhook. |
 | `TELEGRAM_WEBHOOK_URL` | при `webhook` | `https://tasklerq.stellalupus.ru/webhooks/telegram` | Регистрация webhook. |
+| `TELEGRAM_BOT_USERNAME` | нет | `tasklerqbot` | Имя бота без `@` для ссылок-приглашений. |
 | `TELEGRAM_MODE` | нет | `webhook` | `webhook`/`polling` (dev)/`disabled` (headless). |
 | `CAPTURE_API_ENABLED` | нет | `true` | Включить `POST /api/v1/capture`. |
 | `CAPTURE_VOICE_TIMEOUT_MS` | нет | `8000` | Таймаут LLM для `source=ha_voice`. |
@@ -267,13 +268,13 @@ curl -sS -X POST \
 | `LLM_CAPTURE_ENABLED` | нет | `true` | Включить разбор. |
 | `LLM_DAILY_QUOTA` | нет | `200` | Разборов в сутки на household. |
 | `QUEUE_MAX_ATTEMPTS` | нет | `10` | Попытки обработки update. |
-| `QUEUE_READY_LAG_SECONDS` | нет | `300` | Порог readiness. |
+| `QUEUE_READY_LAG_SECONDS` | нет | `300` | Порог readiness: `/health/ready` отвечает 503, если обновление Telegram ждёт обработки дольше. Проверка нужна для healthcheck контейнера и мониторинга; не используйте её, чтобы убирать инстанс из маршрутизации webhook: при лаге это остановит приём обновлений и усугубит задержку. |
 | `RETENTION_UPDATES_DAYS` | нет | `7` | Хранение входящих обновлений. |
 | `RETENTION_DRAFTS_DAYS` | нет | `30` | Хранение черновиков и `raw_text`. |
 | `RETENTION_LLM_RUNS_DAYS` | нет | `90` | Метаданные LLM. |
 | `RETENTION_EVENTS_DAYS` | нет | `365` | События задач. |
 | `RETENTION_DELETED_DAYS` | нет | `30` | Мягко удалённые данные. |
-| `RETENTION_OUTBOX_DAYS` | нет | `30` | Отправленный outbox. |
+| `RETENTION_OUTBOX_DAYS` | нет | `30` | Завершённый outbox: sent, skipped, dead. |
 | `RETENTION_AUDIT_DAYS` | нет | `365` | События членства и безопасности, а также использованные, отозванные и истёкшие приглашения. Не меньше 90: столько дней показывает «Журнал». |
 | `RUST_LOG` | нет | `info,tasklerq=debug` | Логи. |
 | `TZ` | нет | `UTC` | Часовой пояс логов. |
@@ -576,13 +577,18 @@ curl -fsS http://127.0.0.1:18080/health/ready
 
 | Данные | Срок | Настройка |
 | --- | --- | --- |
-| `telegram_updates` | 7 дней | `RETENTION_UPDATES_DAYS` |
+| `telegram_updates` (обработанные и `dead`; текст обновления затирается сразу после обработки) | 7 дней | `RETENTION_UPDATES_DAYS` |
 | `capture_drafts` | 30 дней | `RETENTION_DRAFTS_DAYS` |
 | `llm_runs` | 90 дней | `RETENTION_LLM_RUNS_DAYS` |
 | `item_events` | 365 дней | `RETENTION_EVENTS_DAYS` |
 | soft-deleted items | 30 дней | `RETENTION_DELETED_DAYS` |
-| sent outbox | 30 дней | `RETENTION_OUTBOX_DAYS` |
+| outbox: отправленные, пропущенные и `dead` (текст затирается при отправке, пропуске и переводе в `dead`) | 30 дней | `RETENTION_OUTBOX_DAYS` |
 | `audit_events`, использованные и истёкшие `invites` | 365 дней (не меньше 90) | `RETENTION_AUDIT_DAYS` |
+
+Текст обновлений и сообщений затирается (`payload = {"redacted": true}`)
+при обработке, отправке, пропуске и переводе в `dead`, поэтому `dead`-запись
+нельзя перепроиграть вручную: для разбора остаются `update_id`, `last_error`
+и число попыток. Пользователь повторяет действие в боте сам.
 
 Исходный текст LLM-черновика (`raw_text`) хранится **30 дней** (подтверждено).
 Фоновое задание запускается ежедневно. Перед изменением сроков проверьте

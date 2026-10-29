@@ -234,7 +234,7 @@ CHECK ((recurrence_freq = 'monthly') = (recurrence_month_rule IS NOT NULL))
 | `chat_id` | `bigint` | Чат. |
 | `user_id` | `bigint` | Пользователь. |
 | `payload` | `jsonb` | Полный Update. |
-| `status` | `update_status` | `pending`/`processing`/`processed`/`failed`/`dead`. |
+| `status` | `update_status` | `pending`/`processed`/`dead`. Обработка идёт под `FOR UPDATE SKIP LOCKED`, поэтому отдельных `processing` и `failed` нет. После обработки `payload` затирается. |
 | `attempts` | `integer` | По умолчанию 0. |
 | `available_at` | `timestamptz` | Время следующей попытки. |
 | `last_error` | `text` | Код/краткое описание. |
@@ -314,12 +314,12 @@ household, созданные через `tasklerq admin`, попадают в �
 | `month_rule` | `anchor_day`, `last_day` |
 | `actor_type` | `user`, `system`, `home_assistant`, `voice` |
 | `event_type` | `created`, `updated`, `completed`, `reopened`, `deleted`, `restored`, `assigned`, `unassigned`, `recurrence_changed`, `subtask_completed`, `subtask_reopened` |
-| `update_status` | `pending`, `processing`, `processed`, `failed`, `dead` |
+| `update_status` | `pending`, `processed`, `dead` |
 | `draft_status` | `pending`, `applied`, `cancelled`, `expired`, `rejected` |
 | `capture_source` | `telegram`, `ha_voice`, `ha_automation`, `api`, `shortcut` |
 | `capture_mode` | `auto`, `draft` |
 | `item_source` | `telegram`, `ha_todo`, `ha_voice`, `ha_automation`, `api`, `import` |
-| `outbox_status` | `pending`, `sending`, `sent`, `failed`, `dead` |
+| `outbox_status` | `pending`, `sent`, `dead`, `skipped` |
 | `notification_kind` | `reminder`, `digest`, `assignment`, `snooze` |
 
 ## 5. Инварианты
@@ -505,11 +505,11 @@ anchor:    date — исходная дата серии
 | `items.deleted_at` | 30 дней | purge job. |
 | `lists.deleted_at` | 30 дней | purge job + каскад. |
 | `households.deleted_at` | 30 дней | purge job. |
-| `telegram_updates` | 7 дней | retention job. |
+| `telegram_updates` (processed, dead) | 7 дней | retention job. |
 | `capture_drafts` | 30 дней | retention job. |
 | `llm_runs` | 90 дней | retention job. |
 | `item_events` | 365 дней | retention job. |
-| `outbox` sent | 30 дней | retention job. |
+| `outbox` sent, skipped, dead | 30 дней | retention job. |
 | `audit_events` | 365 дней | retention job. |
 
 Purge удаляет связанные подзадачи, теги, события и черновики. Восстановление

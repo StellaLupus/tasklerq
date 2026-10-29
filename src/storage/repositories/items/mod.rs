@@ -4,11 +4,13 @@ mod find;
 mod lifecycle;
 mod read;
 mod row;
+mod stats;
 mod write;
 
 pub use find::{SearchHit, search};
 pub use lifecycle::{complete, reopen, restore, soft_delete, undo_last};
 pub use read::{calendar_items, get, list_by_list, snapshot};
+pub use stats::{MenuCounts, menu_counts, open_counts_by_list};
 pub use write::{create, update};
 
 use chrono::{DateTime, NaiveDate, Utc};

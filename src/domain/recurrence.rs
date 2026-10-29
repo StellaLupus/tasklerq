@@ -437,7 +437,7 @@ fn add_months(year: i32, month: u32, delta: i32) -> (i32, u32) {
 ///
 /// Несуществующее время (весенний DST) сдвигается вперёд до первого
 /// существующего; неоднозначное (осенний DST) трактуется как первое вхождение.
-pub(super) fn resolve_local(
+pub(crate) fn resolve_local(
     timezone: Tz,
     date: NaiveDate,
     time: NaiveTime,
