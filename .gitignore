@@ -1,6 +1,9 @@
 # Contains the ha-mcp bearer token — never commit
 opencode.json
 
+# Claude Code hooks with machine-specific absolute paths
+.claude/settings.json
+
 # Rust
 /target
 **/*.rs.bk
@@ -15,3 +18,6 @@ opencode.json
 # Runtime data
 /data
 *.log
+
+# Кэш индекса Token Savior
+.token-savior-cache.json
