@@ -16,3 +16,18 @@ This repository has its own isolated Mnemosyne bank: `tasklerq`.
   `ds`, or any other bank for this repository.
 - Do not store ephemeral task state, secrets, tokens, or raw logs.
 - Update or invalidate outdated memories instead of creating duplicates.
+
+# Code navigation — Token Savior
+
+Prefer the `token-savior` MCP tools over reading whole files and grepping:
+
+- `find_symbol` / `get_function_source` — locate and read one function or type
+  instead of the entire file.
+- `get_full_context` / `get_call_chain` — a symbol with its dependencies and
+  callers.
+- `search_codebase` — search across the indexed project.
+- `replace_symbol_source` — edit a single symbol in place.
+- `get_git_status` — compact git status.
+
+Use plain `Read` / `Grep` for non-code files (Markdown, TOML, YAML, SQL
+migrations).
