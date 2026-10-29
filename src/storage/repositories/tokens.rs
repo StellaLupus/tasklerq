@@ -102,3 +102,95 @@ pub async fn touch(
 
     Ok(())
 }
+
+const COLUMNS: &str = "id, household_id, name, prefix, scopes, expires_at, revoked_at, \
+    last_used_at, created_at";
+
+/// Токен по идентификатору.
+pub async fn find_by_id(
+    conn: &mut PgConnection,
+    token_id: Uuid,
+) -> Result<Option<ApiToken>, DomainError> {
+    let token =
+        sqlx::query_as::<_, ApiToken>(&format!("SELECT {COLUMNS} FROM api_tokens WHERE id = $1"))
+            .bind(token_id)
+            .fetch_optional(conn)
+            .await?;
+
+    Ok(token)
+}
+
+/// Токены household, новые первыми. Хеши не возвращаются.
+pub async fn list(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+) -> Result<Vec<ApiToken>, DomainError> {
+    let tokens = sqlx::query_as::<_, ApiToken>(&format!(
+        "SELECT {COLUMNS} FROM api_tokens
+         WHERE household_id = $1
+         ORDER BY created_at DESC, id DESC"
+    ))
+    .bind(household_id)
+    .fetch_all(conn)
+    .await?;
+
+    Ok(tokens)
+}
+
+/// Отозвать токен. Возвращает запись, если токен был отозван сейчас, и `None`,
+/// если он уже отозван или не существует.
+pub async fn revoke(
+    conn: &mut PgConnection,
+    token_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<Option<ApiToken>, DomainError> {
+    let token = sqlx::query_as::<_, ApiToken>(&format!(
+        "UPDATE api_tokens SET revoked_at = $2
+         WHERE id = $1 AND revoked_at IS NULL
+         RETURNING {COLUMNS}"
+    ))
+    .bind(token_id)
+    .bind(now)
+    .fetch_optional(conn)
+    .await?;
+
+    Ok(token)
+}
+
+/// Отозвать все токены household.
+pub(crate) async fn revoke_all(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<u64, DomainError> {
+    let result = sqlx::query(
+        "UPDATE api_tokens SET revoked_at = $2
+         WHERE household_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(household_id)
+    .bind(now)
+    .execute(conn)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+/// Отозвать токены, выпущенные пользователем.
+pub(crate) async fn revoke_created_by(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    user_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<u64, DomainError> {
+    let result = sqlx::query(
+        "UPDATE api_tokens SET revoked_at = $3
+         WHERE household_id = $1 AND created_by_user_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(household_id)
+    .bind(user_id)
+    .bind(now)
+    .execute(conn)
+    .await?;
+
+    Ok(result.rows_affected())
+}

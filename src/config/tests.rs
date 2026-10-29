@@ -126,6 +126,7 @@ fn defaults_match_documented_values() {
     assert_eq!(config.retention.deleted_days, 30);
     assert_eq!(config.retention.outbox_days, 30);
     assert_eq!(config.retention.audit_days, 365);
+    assert!(i64::from(MIN_AUDIT_DAYS) >= crate::storage::repositories::audit::JOURNAL_DAYS);
     assert_eq!(config.log_filter, DEFAULT_LOG_FILTER);
 }
 
@@ -566,6 +567,7 @@ fn numeric_limits_are_enforced() {
         ("QUEUE_MAX_ATTEMPTS", "0", "101"),
         ("QUEUE_READY_LAG_SECONDS", "0", "86401"),
         ("RETENTION_EVENTS_DAYS", "0", "3651"),
+        ("RETENTION_AUDIT_DAYS", "89", "3651"),
     ] {
         for value in [too_small, too_large] {
             let mut vars = base_env();

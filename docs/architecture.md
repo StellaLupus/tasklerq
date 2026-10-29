@@ -244,8 +244,9 @@ src/
 │   ├── middleware.rs    # request_id, auth, rate limit, body limit
 │   └── error.rs         # единый формат ошибок
 ├── auth/
-│   ├── tokens.rs        # API-токены, scopes, хеширование
-│   └── access.rs        # household, роли, проверки
+│   ├── tokens.rs        # API-токены: выпуск, отзыв, scopes, хеширование
+│   ├── secrets.rs       # случайные секреты (токены, коды приглашений)
+│   └── access.rs        # роли owner/member, системные акторы
 ├── telegram/
 │   ├── api.rs           # trait TelegramApi + HTTP-клиент
 │   ├── rich.rs          # RichMessage DTO и рендерер

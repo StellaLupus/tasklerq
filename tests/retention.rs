@@ -229,3 +229,99 @@ async fn retention_expires_drafts_and_purges_old_data() {
     assert_eq!(repeated.purged_events, 0);
     assert_eq!(repeated.purged_drafts, 0);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_purges_old_audit_events_only() {
+    use tasklerq::domain::identity::AuditEventType;
+    use tasklerq::domain::models::{Actor, ActorType};
+    use tasklerq::storage::repositories::audit;
+
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let actor = Actor::system(ActorType::System);
+
+    for (age_days, label) in [(200, "old"), (10, "recent")] {
+        audit::record(
+            &mut conn,
+            Some(household.household_id),
+            &actor,
+            AuditEventType::MemberLeft,
+            serde_json::json!({"label": label}),
+            now - Duration::days(age_days),
+        )
+        .await
+        .expect("event");
+    }
+
+    let stats = retention::run(&db.pool, &config(), now)
+        .await
+        .expect("retention");
+    assert!(stats.purged_audit_events >= 1);
+
+    let labels: Vec<String> = sqlx::query_scalar(
+        "SELECT payload->>'label' FROM audit_events
+         WHERE household_id = $1 AND payload ? 'label'",
+    )
+    .bind(household.household_id)
+    .fetch_all(&db.pool)
+    .await
+    .expect("labels");
+    assert_eq!(labels, vec!["recent".to_owned()]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_purges_finished_invites_only() {
+    use tasklerq::storage::repositories::invites;
+
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let long_ago = now - Duration::days(400);
+
+    // Истёкшее давно, использованное давно, отозванное давно и свежее активное.
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let mut created = Vec::new();
+    for (age, name) in [
+        (long_ago, "expired"),
+        (long_ago, "used"),
+        (long_ago, "revoked"),
+    ] {
+        let invite = invites::create(&mut conn, household.household_id, &household.owner(), age)
+            .await
+            .expect(name);
+        created.push(invite.invite.id);
+    }
+    sqlx::query("UPDATE invites SET used_by_user_id = $2, used_at = $3 WHERE id = $1")
+        .bind(created[1])
+        .bind(household.member_id)
+        .bind(long_ago)
+        .execute(&mut *conn)
+        .await
+        .expect("mark used");
+    sqlx::query("UPDATE invites SET revoked_at = $2 WHERE id = $1")
+        .bind(created[2])
+        .bind(long_ago)
+        .execute(&mut *conn)
+        .await
+        .expect("mark revoked");
+    let fresh = invites::create(&mut conn, household.household_id, &household.owner(), now)
+        .await
+        .expect("fresh");
+    drop(conn);
+
+    // Тесты файла идут параллельно на одной базе, и чужой запуск retention мог
+    // удалить строки раньше, поэтому счётчик не проверяется, только состояние.
+    retention::run(&db.pool, &config(), now)
+        .await
+        .expect("retention");
+
+    let left: Vec<uuid::Uuid> =
+        sqlx::query_scalar("SELECT id FROM invites WHERE household_id = $1")
+            .bind(household.household_id)
+            .fetch_all(&db.pool)
+            .await
+            .expect("invites");
+    assert_eq!(left, vec![fresh.invite.id]);
+}

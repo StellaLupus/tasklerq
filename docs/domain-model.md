@@ -60,12 +60,14 @@ erDiagram
 | `username` | `text` | NULL, до 64. |
 | `role` | `user_role` | `owner`/`member`. |
 | `timezone` | `text` | NULL → используется timezone household. |
-| `settings` | `jsonb` | Уведомления, quiet hours, digest. |
+| `settings` | `jsonb` | `{"notifications": {...}}`: напоминания, сводка, назначения, lead time (5..1440 мин), время сводки и напоминания о задачах на весь день, тихие часы. Отсутствующие поля принимают значения по умолчанию. |
 | `created_at`, `updated_at` | `timestamptz` | NOT NULL. |
 | `deleted_at` | `timestamptz` | NULL. |
 
 Один пользователь — один household. При удалении участника строка остаётся с
-`deleted_at`, чтобы сохранить авторство задач.
+`deleted_at`, чтобы сохранить авторство задач. В household не более одного
+активного `owner` (частичный UNIQUE по `household_id` для `role = 'owner'`);
+владение передаётся в одной транзакции. `telegram_user_id` не редактируется.
 
 ### 3.3 `lists`
 
@@ -285,11 +287,20 @@ CHECK ((recurrence_freq = 'monthly') = (recurrence_month_rule IS NOT NULL))
 
 ### 3.13 `audit_events`
 
-`id`, `household_id` (NULL для системных), `actor_user_id`, `type`, `payload
+`id`, `household_id` (NULL для системных), `actor_user_id`, `actor_type`
+(источник: `user`/`system`/`home_assistant`/`voice`), `event_type`, `payload
 jsonb`, `created_at`. Типы: `household_created`, `member_joined`,
-`member_removed`, `role_changed`, `invite_created`, `invite_used`,
-`invite_revoked`, `token_created`, `token_revoked`, `auth_failed`,
-`rate_limited`, `household_deleted`.
+`member_left`, `member_removed`, `role_changed`, `invite_created`,
+`invite_used`, `invite_revoked`, `token_created`, `token_revoked`,
+`auth_failed`, `rate_limited`, `household_deleted`.
+
+Раздел «Журнал» владельца показывает события членства
+(`household_created`, `member_*`, `role_changed`, `invite_*`,
+`household_deleted`) за 90 дней; события токенов и безопасности остаются в
+аудите. Payload собирается из явных полей и не содержит кодов приглашений,
+токенов и хешей; имена хранятся снимком на момент события. Участники и
+household, созданные через `tasklerq admin`, попадают в журнал от имени
+системного актора (`actor_type = system`).
 
 ## 4. Перечисления
 

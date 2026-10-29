@@ -4,8 +4,10 @@ mod support;
 
 use chrono::Utc;
 use tasklerq::domain::error::DomainError;
+use tasklerq::domain::identity::NewMember;
 use tasklerq::domain::models::{ItemPriority, ItemStatus, ListKind, SubtaskInput};
-use tasklerq::storage::repositories::{households, items, lists, tags};
+use tasklerq::storage::repositories::households::{self, NewOwner};
+use tasklerq::storage::repositories::{items, lists, tags, users};
 use uuid::Uuid;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -29,7 +31,7 @@ async fn household_creation_creates_owner_and_default_lists() {
             .any(|list| list.kind == ListKind::Shopping && list.is_default)
     );
 
-    let members = households::members(&mut conn, household.household_id)
+    let members = users::list_active(&mut conn, household.household_id)
         .await
         .expect("members");
     assert_eq!(members.len(), 2);
@@ -41,21 +43,24 @@ async fn transaction_rollback_leaves_no_household() {
     let name = format!("Rollback {}", Uuid::now_v7());
     let mut tx = db.pool.begin().await.expect("transaction");
 
-    let (household, _) = households::create_with_owner(
+    let onboarded = households::onboard(
         &mut tx,
         &name,
         "Europe/Moscow",
-        tasklerq::storage::repositories::households::NewOwner {
-            telegram_user_id: 7_000_000_001,
-            telegram_chat_id: 7_000_000_001,
-            display_name: "Rollback Owner".into(),
-            username: None,
+        NewOwner {
+            member: NewMember {
+                telegram_user_id: 7_000_000_001,
+                telegram_chat_id: 7_000_000_001,
+                display_name: "Rollback Owner".into(),
+                username: None,
+            },
             timezone: None,
         },
         Utc::now(),
     )
     .await
     .expect("household in transaction");
+    let household = onboarded.household;
     tx.rollback().await.expect("rollback");
 
     let mut conn = db.pool.acquire().await.expect("connection");

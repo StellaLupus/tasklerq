@@ -3,13 +3,17 @@
 //! Функции принимают `&mut PgConnection`, чтобы вызывающая сторона могла
 //! объединять несколько операций в одну транзакцию.
 
+pub mod audit;
 pub mod events;
 pub mod households;
+pub mod invites;
 pub mod items;
 pub mod lists;
+pub mod members;
 pub mod subtasks;
 pub mod tags;
 pub mod tokens;
+pub mod users;
 
 use sqlx::PgConnection;
 

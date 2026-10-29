@@ -274,7 +274,7 @@ curl -sS -X POST \
 | `RETENTION_EVENTS_DAYS` | нет | `365` | События задач. |
 | `RETENTION_DELETED_DAYS` | нет | `30` | Мягко удалённые данные. |
 | `RETENTION_OUTBOX_DAYS` | нет | `30` | Отправленный outbox. |
-| `RETENTION_AUDIT_DAYS` | нет | `365` | События членства и безопасности. |
+| `RETENTION_AUDIT_DAYS` | нет | `365` | События членства и безопасности, а также использованные, отозванные и истёкшие приглашения. Не меньше 90: столько дней показывает «Журнал». |
 | `RUST_LOG` | нет | `info,tasklerq=debug` | Логи. |
 | `TZ` | нет | `UTC` | Часовой пояс логов. |
 
@@ -582,7 +582,7 @@ curl -fsS http://127.0.0.1:18080/health/ready
 | `item_events` | 365 дней | `RETENTION_EVENTS_DAYS` |
 | soft-deleted items | 30 дней | `RETENTION_DELETED_DAYS` |
 | sent outbox | 30 дней | `RETENTION_OUTBOX_DAYS` |
-| `audit_events` | 365 дней | `RETENTION_AUDIT_DAYS` |
+| `audit_events`, использованные и истёкшие `invites` | 365 дней (не меньше 90) | `RETENTION_AUDIT_DAYS` |
 
 Исходный текст LLM-черновика (`raw_text`) хранится **30 дней** (подтверждено).
 Фоновое задание запускается ежедневно. Перед изменением сроков проверьте

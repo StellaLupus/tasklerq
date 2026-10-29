@@ -15,6 +15,9 @@ use thiserror::Error;
 use url::Url;
 
 use crate::VERSION;
+
+/// Минимум `RETENTION_AUDIT_DAYS`: журнал владельца обещает 90 дней.
+const MIN_AUDIT_DAYS: u32 = 90;
 use env_source::EnvSource;
 
 /// Фильтр журналирования по умолчанию.
@@ -359,7 +362,8 @@ impl Config {
             events_days: source.u32("RETENTION_EVENTS_DAYS", 365, 1, 3_650)?,
             deleted_days: source.u32("RETENTION_DELETED_DAYS", 30, 1, 3_650)?,
             outbox_days: source.u32("RETENTION_OUTBOX_DAYS", 30, 1, 3_650)?,
-            audit_days: source.u32("RETENTION_AUDIT_DAYS", 365, 1, 3_650)?,
+            // Не меньше глубины журнала владельца (`audit::JOURNAL_DAYS`).
+            audit_days: source.u32("RETENTION_AUDIT_DAYS", 365, MIN_AUDIT_DAYS, 3_650)?,
         };
 
         let log_filter = source.log_filter();

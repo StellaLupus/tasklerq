@@ -4,7 +4,7 @@ use axum::Json;
 use axum::extract::State;
 
 use crate::auth::tokens::AuthContext;
-use crate::storage::repositories::households;
+use crate::storage::repositories::{households, users};
 
 use super::super::error::ApiError;
 use super::super::router::AppState;
@@ -20,7 +20,7 @@ pub async fn get(
     let mut conn = connection(&state).await?;
 
     let household = households::get(&mut conn, auth.household_id).await?;
-    let members = households::members(&mut conn, auth.household_id).await?;
+    let members = users::list_active(&mut conn, auth.household_id).await?;
 
     Ok(Json(HouseholdResponse { household, members }))
 }

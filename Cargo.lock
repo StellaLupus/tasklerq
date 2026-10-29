@@ -2876,6 +2876,7 @@ dependencies = [
  "chrono-tz",
  "clap",
  "dotenvy",
+ "getrandom 0.4.3",
  "http-body-util",
  "libc",
  "reqwest",

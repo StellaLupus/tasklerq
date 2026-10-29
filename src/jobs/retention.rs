@@ -20,6 +20,10 @@ pub struct RetentionStats {
     pub purged_events: u64,
     /// Удалённые черновики.
     pub purged_drafts: u64,
+    /// Удалённые события аудита.
+    pub purged_audit_events: u64,
+    /// Удалённые приглашения: использованные, отозванные и истёкшие.
+    pub purged_invites: u64,
 }
 
 /// Выполнить retention на момент `now`.
@@ -31,6 +35,7 @@ pub async fn run(
     let deleted_cutoff = now - Duration::days(i64::from(config.deleted_days));
     let events_cutoff = now - Duration::days(i64::from(config.events_days));
     let drafts_cutoff = now - Duration::days(i64::from(config.drafts_days));
+    let audit_cutoff = now - Duration::days(i64::from(config.audit_days));
 
     let mut tx = pool.begin().await?;
 
@@ -77,6 +82,22 @@ pub async fn run(
         .await?
         .rows_affected();
 
+    let purged_audit_events = sqlx::query("DELETE FROM audit_events WHERE created_at < $1")
+        .bind(audit_cutoff)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+    // Приглашения хранятся столько же, сколько события аудита об их выдаче.
+    let purged_invites = sqlx::query(
+        "DELETE FROM invites
+         WHERE COALESCE(used_at, revoked_at, expires_at) < $1",
+    )
+    .bind(audit_cutoff)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+
     tx.commit().await?;
     Ok(RetentionStats {
         expired_drafts,
@@ -85,5 +106,7 @@ pub async fn run(
         purged_households,
         purged_events,
         purged_drafts,
+        purged_audit_events,
+        purged_invites,
     })
 }

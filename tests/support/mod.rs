@@ -15,6 +15,7 @@ use serde_json::Value;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tasklerq::auth::tokens::hash_token;
+use tasklerq::domain::identity::NewMember;
 use tasklerq::domain::models::{
     Actor, ItemPriority, ItemSource, NewItem, RecurrenceInput, SubtaskInput, UserRole,
 };
@@ -33,6 +34,7 @@ use uuid::Uuid;
 
 static DATABASE: OnceCell<SharedDatabase> = OnceCell::const_new();
 static NEXT_HOUSEHOLD: AtomicI64 = AtomicI64::new(1);
+static NEXT_TELEGRAM: AtomicI64 = AtomicI64::new(1);
 static CONTAINER_ID: OnceLock<String> = OnceLock::new();
 
 /// Удалить контейнер при выходе процесса. Статик не получает `Drop`, поэтому
@@ -67,6 +69,27 @@ pub async fn db() -> TestDb {
         .await
         .expect("database should accept connections");
     TestDb { pool }
+}
+
+/// URL общей тестовой базы (для запуска бинарника `tasklerq`).
+pub async fn database_url() -> String {
+    DATABASE.get_or_init(start_db).await.url.clone()
+}
+
+/// Уникальный Telegram ID, не пересекающийся с household из `create_household`.
+pub fn next_telegram_id() -> i64 {
+    7_000_000_000 + NEXT_TELEGRAM.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Новый участник Telegram с уникальным ID.
+pub fn new_member(name: &str) -> tasklerq::domain::identity::NewMember {
+    let id = next_telegram_id();
+    tasklerq::domain::identity::NewMember {
+        telegram_user_id: id,
+        telegram_chat_id: id,
+        display_name: name.to_owned(),
+        username: None,
+    }
 }
 
 async fn start_db() -> SharedDatabase {
@@ -136,21 +159,24 @@ pub async fn create_household(pool: &PgPool) -> TestHousehold {
     let now = Utc::now();
     let mut conn = pool.acquire().await.expect("connection");
 
-    let (household, owner) = households::create_with_owner(
+    let onboarded = households::onboard(
         &mut conn,
         &format!("Test household {sequence}"),
         "Europe/Moscow",
         NewOwner {
-            telegram_user_id: 8_000_000_000 + sequence,
-            telegram_chat_id: 8_000_000_000 + sequence,
-            display_name: format!("Owner {sequence}"),
-            username: None,
+            member: NewMember {
+                telegram_user_id: 8_000_000_000 + sequence,
+                telegram_chat_id: 8_000_000_000 + sequence,
+                display_name: format!("Owner {sequence}"),
+                username: None,
+            },
             timezone: Some("Europe/Moscow".into()),
         },
         now,
     )
     .await
     .expect("household should be created");
+    let (household, owner) = (onboarded.household, onboarded.user);
 
     let member_id = Uuid::now_v7();
     sqlx::query(
