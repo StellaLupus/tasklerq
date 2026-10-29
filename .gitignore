@@ -1,8 +1,9 @@
 # Contains the ha-mcp bearer token — never commit
 opencode.json
 
-# Claude Code hooks with machine-specific absolute paths
-.claude/settings.json
+# Локальные настройки и сгенерированные файлы AI-инструментов
+.claude/
+.opencode/
 
 # Rust
 /target
