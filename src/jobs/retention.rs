@@ -24,6 +24,14 @@ pub struct RetentionStats {
     pub purged_audit_events: u64,
     /// Удалённые приглашения: использованные, отозванные и истёкшие.
     pub purged_invites: u64,
+    /// Удалённые входящие обновления Telegram.
+    pub purged_updates: u64,
+    /// Удалённые просроченные callback-токены.
+    pub purged_callback_tokens: u64,
+    /// Удалённые завершённые сообщения outbox: отправленные, пропущенные, мёртвые.
+    pub purged_outbox: u64,
+    /// Удалённые просроченные формы.
+    pub purged_conversations: u64,
 }
 
 /// Выполнить retention на момент `now`.
@@ -98,6 +106,23 @@ pub async fn run(
     .await?
     .rows_affected();
 
+    // Необработанные (`pending`) остаются: их ещё должен разобрать воркер.
+    let purged_updates = sqlx::query(
+        "DELETE FROM telegram_updates WHERE status IN ('processed', 'dead') AND received_at < $1",
+    )
+    .bind(now - Duration::days(i64::from(config.updates_days)))
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+
+    let purged_callback_tokens = crate::telegram::callbacks::purge_expired(&mut tx, now).await?;
+    let purged_outbox = crate::telegram::outbox::purge(
+        &mut tx,
+        now - Duration::days(i64::from(config.outbox_days)),
+    )
+    .await?;
+    let purged_conversations = crate::telegram::views::purge_conversations(&mut tx, now).await?;
+
     tx.commit().await?;
     Ok(RetentionStats {
         expired_drafts,
@@ -108,5 +133,9 @@ pub async fn run(
         purged_drafts,
         purged_audit_events,
         purged_invites,
+        purged_updates,
+        purged_callback_tokens,
+        purged_outbox,
+        purged_conversations,
     })
 }

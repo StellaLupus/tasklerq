@@ -2,6 +2,8 @@
 
 #![allow(dead_code)]
 
+pub mod telegram;
+
 use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, Ordering};

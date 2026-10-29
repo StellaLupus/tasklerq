@@ -325,3 +325,88 @@ async fn retention_purges_finished_invites_only() {
             .expect("invites");
     assert_eq!(left, vec![fresh.invite.id]);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_purges_finished_telegram_data_but_keeps_pending() {
+    let db = support::db().await;
+    let now = Utc::now();
+    let old = now - Duration::days(40);
+    let tag = Uuid::now_v7().to_string();
+
+    // Обновления: старые обработанные и мёртвые удаляются, ожидающие остаются.
+    for (id, status, received) in [
+        (7_100_001_i64, "processed", old),
+        (7_100_002, "dead", old),
+        (7_100_003, "pending", old),
+        (7_100_004, "processed", now),
+    ] {
+        sqlx::query(
+            "INSERT INTO telegram_updates (update_id, payload, status, received_at)
+             VALUES ($1, '{}'::jsonb, $2::update_status, $3)",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(received)
+        .execute(&db.pool)
+        .await
+        .expect("update");
+    }
+    // Outbox: старые отправленные, пропущенные и мёртвые удаляются, ожидающие остаются.
+    for (status, created) in [
+        ("sent", old),
+        ("skipped", old),
+        ("dead", old),
+        ("pending", old),
+        ("sent", now),
+    ] {
+        sqlx::query(
+            "INSERT INTO outbox (chat_id, kind, payload, status, created_at, dedupe_key)
+             VALUES (1, 'message', '{}'::jsonb, $1::outbox_status, $2, $3)",
+        )
+        .bind(status)
+        .bind(created)
+        .bind(format!("{tag}:{status}:{}", created.timestamp()))
+        .execute(&db.pool)
+        .await
+        .expect("outbox");
+    }
+    sqlx::query(
+        "INSERT INTO conversation_states (chat_id, telegram_user_id, kind, expires_at)
+         VALUES (7100001, 1, 'search', $1), (7100002, 1, 'search', $2)",
+    )
+    .bind(now - Duration::minutes(1))
+    .bind(now + Duration::minutes(10))
+    .execute(&db.pool)
+    .await
+    .expect("forms");
+
+    let stats = retention::run(&db.pool, &config(), now)
+        .await
+        .expect("retention");
+
+    assert!(stats.purged_updates >= 1);
+    assert!(stats.purged_outbox >= 1);
+    assert!(stats.purged_conversations >= 1);
+    let remaining: Vec<(i64,)> = sqlx::query_as(
+        "SELECT update_id FROM telegram_updates WHERE update_id BETWEEN 7100001 AND 7100004 ORDER BY 1",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("remaining");
+    assert_eq!(remaining, [(7_100_003,), (7_100_004,)]);
+    let outbox: Vec<(String,)> = sqlx::query_as(
+        "SELECT status::text FROM outbox WHERE dedupe_key LIKE $1 ORDER BY status::text",
+    )
+    .bind(format!("{tag}%"))
+    .fetch_all(&db.pool)
+    .await
+    .expect("outbox");
+    assert_eq!(outbox, [("pending".to_owned(),), ("sent".to_owned(),)]);
+    let forms: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM conversation_states WHERE chat_id IN (7100001, 7100002)",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("forms");
+    assert_eq!(forms, 1);
+}

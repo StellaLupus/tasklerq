@@ -217,6 +217,8 @@ pub struct TelegramConfig {
     pub webhook_secret: Option<SecretString>,
     /// Публичный URL webhook; обязателен в режиме `webhook`.
     pub webhook_url: Option<Url>,
+    /// Имя бота без `@` для ссылок-приглашений.
+    pub bot_username: String,
 }
 
 /// Параметры внешнего capture.
@@ -427,11 +429,28 @@ impl Config {
             }
         }
 
+        let bot_username = source
+            .get("TELEGRAM_BOT_USERNAME")
+            .unwrap_or("tasklerqbot")
+            .trim_start_matches('@')
+            .to_owned();
+        if bot_username.is_empty()
+            || !bot_username
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            return Err(ConfigError::invalid(
+                "TELEGRAM_BOT_USERNAME",
+                "expected a Telegram username like tasklerqbot",
+            ));
+        }
+
         Ok(TelegramConfig {
             mode,
             bot_token,
             webhook_secret,
             webhook_url,
+            bot_username,
         })
     }
 
