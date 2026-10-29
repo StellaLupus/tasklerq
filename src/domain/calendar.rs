@@ -41,10 +41,18 @@ pub struct CalendarEvent {
 }
 
 impl CalendarEvent {
-    /// Ключ сортировки: начало события, затем детерминированный ключ.
-    pub fn sort_key(&self) -> String {
-        let start = serde_json::to_string(&self.start).unwrap_or_default();
-        format!("{start}:{}", self.occurrence_key)
+    /// Ключ сортировки: дата начала (вседневные раньше временных в тот же
+    /// день), затем время, затем детерминированный ключ вхождения.
+    pub fn sort_key(&self) -> (NaiveDate, bool, Option<DateTime<Utc>>, String) {
+        match &self.start {
+            CalendarTime::Date(date) => (*date, false, None, self.occurrence_key.clone()),
+            CalendarTime::DateTime(at) => (
+                at.date_naive(),
+                true,
+                Some(*at),
+                self.occurrence_key.clone(),
+            ),
+        }
     }
 }
 

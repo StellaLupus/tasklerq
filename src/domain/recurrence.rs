@@ -215,7 +215,9 @@ impl Recurrence {
     /// Следующая дата по правилу без учёта завершения.
     fn next_date(&self, date: NaiveDate) -> Option<NaiveDate> {
         match self.freq {
-            RecurrenceFreq::Daily => date.checked_add_days(chrono::Days::new(self.interval as u64)),
+            RecurrenceFreq::Daily => {
+                date.checked_add_days(chrono::Days::new(u64::try_from(self.interval).unwrap_or(0)))
+            }
             RecurrenceFreq::Weekly => self.next_weekly_date(date),
             RecurrenceFreq::Monthly => self.next_monthly_date(date),
             RecurrenceFreq::Yearly => self.next_yearly_date(date),
@@ -314,11 +316,11 @@ impl RecurrenceInput {
             .as_deref()
             .unwrap_or(household_timezone)
             .to_owned();
-        parse_timezone(&timezone)?;
+        let tz = parse_timezone(&timezone)?;
 
         let anchor_date = self
             .anchor_date
-            .or_else(|| due.map(|due| due.local_date(parse_timezone(&timezone).unwrap())))
+            .or_else(|| due.map(|due| due.local_date(tz)))
             .unwrap_or(today);
 
         let byweekday = if self.freq == RecurrenceFreq::Weekly {
@@ -414,7 +416,7 @@ fn monday_of(date: NaiveDate) -> NaiveDate {
 }
 
 /// Последний день месяца.
-fn last_day_of_month(year: i32, month: u32) -> NaiveDate {
+pub(super) fn last_day_of_month(year: i32, month: u32) -> NaiveDate {
     let (next_year, next_month) = if month == 12 {
         (year + 1, 1)
     } else {
@@ -435,7 +437,7 @@ fn add_months(year: i32, month: u32, delta: i32) -> (i32, u32) {
 ///
 /// Несуществующее время (весенний DST) сдвигается вперёд до первого
 /// существующего; неоднозначное (осенний DST) трактуется как первое вхождение.
-fn resolve_local(
+pub(super) fn resolve_local(
     timezone: Tz,
     date: NaiveDate,
     time: NaiveTime,

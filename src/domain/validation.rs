@@ -1,14 +1,13 @@
 //! Валидация доменных полей.
 
-use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
-use chrono_tz::Tz;
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 
 use super::error::DomainError;
 use super::models::{
     ItemPriority, ItemSource, ListKind, MonthRule, NewItem, Recurrence, RecurrenceFreq,
     RecurrenceInput, SubtaskInput,
 };
-use super::recurrence::{Due, parse_timezone, weekday_iso};
+use super::recurrence::{Due, last_day_of_month, parse_timezone, resolve_local, weekday_iso};
 
 /// Максимальная длина названия.
 pub const MAX_TITLE: usize = 200;
@@ -137,12 +136,6 @@ pub fn normalize_recurrence(
     };
 
     let recurrence = input.normalize(household_timezone, due, today)?;
-
-    if recurrence.freq == RecurrenceFreq::Weekly && recurrence.byweekday.is_empty() {
-        return Err(DomainError::Validation(
-            "weekly recurrence requires at least one weekday".into(),
-        ));
-    }
 
     Ok(recurrence)
 }
@@ -306,38 +299,4 @@ pub fn valid_weekdays(byweekday: &[i16]) -> bool {
 /// ISO-номер дня недели.
 pub fn iso_weekday(date: NaiveDate) -> i16 {
     weekday_iso(date.weekday())
-}
-
-fn last_day_of_month(year: i32, month: u32) -> NaiveDate {
-    let (next_year, next_month) = if month == 12 {
-        (year + 1, 1)
-    } else {
-        (year, month + 1)
-    };
-    NaiveDate::from_ymd_opt(next_year, next_month, 1)
-        .and_then(|date| date.checked_sub_days(chrono::Days::new(1)))
-        .expect("valid calendar month")
-}
-
-fn resolve_local(
-    timezone: Tz,
-    date: NaiveDate,
-    time: chrono::NaiveTime,
-) -> Result<DateTime<Utc>, DomainError> {
-    let naive = chrono::NaiveDateTime::new(date, time);
-    match timezone.from_local_datetime(&naive) {
-        chrono::LocalResult::Single(at) => Ok(at.with_timezone(&Utc)),
-        chrono::LocalResult::Ambiguous(first, _) => Ok(first.with_timezone(&Utc)),
-        chrono::LocalResult::None => {
-            for minutes in 1..=180 {
-                let shifted = naive + chrono::Duration::minutes(minutes);
-                if let chrono::LocalResult::Single(at) = timezone.from_local_datetime(&shifted) {
-                    return Ok(at.with_timezone(&Utc));
-                }
-            }
-            Err(DomainError::Validation(
-                "local time does not exist in the recurrence timezone".into(),
-            ))
-        }
-    }
 }
