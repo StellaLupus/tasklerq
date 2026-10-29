@@ -70,6 +70,10 @@ async fn get_with_deleted(
 }
 
 /// Создать дополнительный список.
+///
+/// Проверка лимита сериализуется блокировкой строки household: вызывающая
+/// сторона обязана работать в транзакции (HTTP-слой всегда её открывает),
+/// иначе параллельные create увидят одинаковый счётчик и обойдут лимит.
 pub async fn create(
     conn: &mut PgConnection,
     household_id: Uuid,
@@ -78,6 +82,12 @@ pub async fn create(
     now: DateTime<Utc>,
 ) -> Result<List, DomainError> {
     let name = normalize_text(name, 64, "list name")?;
+
+    sqlx::query("SELECT id FROM households WHERE id = $1 FOR UPDATE")
+        .bind(household_id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or(DomainError::NotFound)?;
 
     let count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM lists WHERE household_id = $1 AND deleted_at IS NULL",

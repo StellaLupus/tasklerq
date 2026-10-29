@@ -251,3 +251,73 @@ async fn subtask_progress_and_full_replacement() {
     let tags = tags::item_tags(&mut conn, item.id).await.expect("tags");
     assert!(tags.is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_list_creates_respect_the_limit() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+
+    // 2 списка по умолчанию + 17 дополнительных = 19: до лимита один слот.
+    for index in 0..17 {
+        let mut conn = db.pool.acquire().await.expect("connection");
+        lists::create(
+            &mut conn,
+            household.household_id,
+            ListKind::Checklist,
+            &format!("Список {index}"),
+            Utc::now(),
+        )
+        .await
+        .expect("fill lists");
+    }
+
+    // Восемь параллельных create в отдельных транзакциях: ровно один должен
+    // пройти, остальные — упереться в лимит 20.
+    let household_id = household.household_id;
+    let mut handles = Vec::new();
+    for index in 0..8 {
+        let pool = db.pool.clone();
+        handles.push(tokio::spawn(async move {
+            let mut tx = pool.begin().await.expect("transaction");
+            let result = lists::create(
+                &mut tx,
+                household_id,
+                ListKind::Checklist,
+                &format!("Гонка {index}"),
+                Utc::now(),
+            )
+            .await;
+            match result {
+                Ok(list) => {
+                    tx.commit().await.expect("commit");
+                    Ok(list)
+                }
+                Err(error) => {
+                    tx.rollback().await.expect("rollback");
+                    Err(error)
+                }
+            }
+        }));
+    }
+
+    let mut created = 0;
+    let mut conflicts = 0;
+    for handle in handles {
+        match handle.await.expect("join") {
+            Ok(_) => created += 1,
+            Err(DomainError::Conflict { .. }) => conflicts += 1,
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+    assert_eq!(created, 1, "only one create must fit the last slot");
+    assert_eq!(conflicts, 7);
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let all = lists::list(&mut conn, household.household_id)
+        .await
+        .expect("lists");
+    assert_eq!(
+        all.len(),
+        usize::try_from(lists::MAX_LISTS).expect("limit as usize")
+    );
+}
