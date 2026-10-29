@@ -205,12 +205,43 @@ async fn serve() -> Result<()> {
         .local_addr()
         .context("failed to read the bound address")?;
 
-    let app = build_router(AppState::new(pool));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let telegram = tasklerq::telegram::runtime::start(&config, &pool, shutdown_rx)
+        .await
+        .context("telegram startup failed")?;
+    let mut state = AppState::new(pool);
+    let mut workers = Vec::new();
+    if let Some(runtime) = telegram {
+        if let Some(ingress) = runtime.ingress {
+            state = state.with_telegram(ingress);
+        }
+        state = state.with_queue_lag_limit(config.queue.ready_lag_seconds);
+        workers = runtime.tasks;
+    }
+    tracing::info!(
+        mode = config.telegram.mode.as_str(),
+        workers = workers.len(),
+        "telegram configured"
+    );
+
+    let app = build_router(state);
     tracing::info!(%address, "http server listening");
 
-    server::serve(listener, app, shutdown_signal())
-        .await
-        .context("http server failed")?;
+    server::serve(listener, app, async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    })
+    .await
+    .context("http server failed")?;
+
+    for worker in workers {
+        if tokio::time::timeout(Duration::from_secs(10), worker)
+            .await
+            .is_err()
+        {
+            tracing::warn!("a background worker did not stop in time");
+        }
+    }
 
     tracing::info!("stopped");
     Ok(())

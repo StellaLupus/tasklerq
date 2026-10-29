@@ -30,7 +30,8 @@ pub async fn live() -> Json<HealthResponse> {
     })
 }
 
-/// `GET /health/ready`: база доступна и принимает запросы.
+/// `GET /health/ready`: база доступна и принимает запросы, а очередь обновлений
+/// Telegram не застряла (если воркер запущен).
 pub async fn ready(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
     sqlx::query("SELECT 1")
         .execute(&state.pool)
@@ -40,9 +41,32 @@ pub async fn ready(State(state): State<AppState>) -> Result<Json<HealthResponse>
             ApiError::service_unavailable("Database is unavailable")
         })?;
 
+    let now = Utc::now();
+    if let Some(limit) = state.queue_lag_limit {
+        // Упавший или остановленный воркер заметен по самому старому обновлению,
+        // которое давно могло быть обработано.
+        let oldest: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT min(available_at) FROM telegram_updates
+             WHERE status = 'pending' AND available_at <= $1",
+        )
+        .bind(now)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "readiness check failed");
+            ApiError::service_unavailable("Database is unavailable")
+        })?;
+        if oldest.is_some_and(|oldest| now - oldest > limit) {
+            tracing::warn!("telegram update queue is lagging");
+            return Err(ApiError::service_unavailable(
+                "Telegram update queue is lagging",
+            ));
+        }
+    }
+
     Ok(Json(HealthResponse {
         status: "ok",
         version: VERSION,
-        time: Utc::now(),
+        time: now,
     }))
 }
