@@ -291,7 +291,10 @@ async fn search_cursor_is_stable_and_skips_archived_lists() {
     };
     let mut seen = Vec::new();
     let mut extra_id = None;
-    loop {
+    // Предохранитель: сломанный курсор не должен зацикливать тест.
+    let max_pages = created.len() + 3;
+    for page in 0.. {
+        assert!(page < max_pages, "pagination did not terminate");
         let (hits, next) =
             items::search(&mut conn, household.household_id, "Europe/Moscow", &filters)
                 .await
@@ -388,4 +391,63 @@ async fn search_cursor_is_stable_and_skips_archived_lists() {
         .await
         .expect("deleted item excluded");
     assert!(hits.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn due_upper_bound_is_exclusive_at_local_midnight() {
+    use chrono::TimeZone;
+    use tasklerq::domain::recurrence::parse_timezone;
+    use tasklerq::domain::search::{DueBound, parse_due_bound};
+
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let timezone = parse_timezone("Europe/Moscow").expect("timezone");
+
+    // Вседневная задача 3 ноября хранится как 3 ноября 00:00 по локальному
+    // времени, то есть ровно на исключающей границе диапазона «2 ноября».
+    let mut all_day = support::new_item(household.tasks_list_id, "Вседневная 3 ноября");
+    all_day.due_date = chrono::NaiveDate::from_ymd_opt(2026, 11, 3);
+    // 2026-11-02T21:00Z — тоже 3 ноября 00:00 MSK.
+    let mut timed = support::new_item(household.tasks_list_id, "Ровно полночь 3 ноября");
+    timed.due_at = Some(chrono::Utc.with_ymd_and_hms(2026, 11, 2, 21, 0, 0).unwrap());
+    // Последняя секунда 2 ноября остаётся внутри диапазона.
+    let mut last_second = support::new_item(household.tasks_list_id, "Последняя секунда 2 ноября");
+    last_second.due_at = Some(
+        chrono::Utc
+            .with_ymd_and_hms(2026, 11, 2, 20, 59, 59)
+            .unwrap(),
+    );
+    for item in [all_day, timed, last_second] {
+        support::create_item(
+            &db.pool,
+            &household,
+            household.tasks_list_id,
+            &household.owner(),
+            item,
+        )
+        .await;
+    }
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let search = |from: &'static str, to: &'static str| {
+        let filters = SearchFilters {
+            due_from: parse_due_bound(Some(from), DueBound::From, timezone).expect("from"),
+            due_to: parse_due_bound(Some(to), DueBound::To, timezone).expect("to"),
+            ..SearchFilters::default()
+        };
+        (filters, household.household_id)
+    };
+
+    let (filters, household_id) = search("2026-11-02", "2026-11-02");
+    let (hits, _) = items::search(&mut conn, household_id, "Europe/Moscow", &filters)
+        .await
+        .expect("search");
+    let titles: Vec<_> = hits.iter().map(|hit| hit.item.title.as_str()).collect();
+    assert_eq!(titles, ["Последняя секунда 2 ноября"]);
+
+    let (filters, household_id) = search("2026-11-03", "2026-11-03");
+    let (hits, _) = items::search(&mut conn, household_id, "Europe/Moscow", &filters)
+        .await
+        .expect("search");
+    assert_eq!(hits.len(), 2, "both items due on 3 November are found");
 }

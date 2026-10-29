@@ -33,7 +33,7 @@ pub struct SearchQuery {
     pub tag: Option<String>,
     /// Начало диапазона сроков.
     pub due_from: Option<String>,
-    /// Конец диапазона сроков.
+    /// Конец диапазона сроков (исключающий).
     pub due_to: Option<String>,
     /// Размер страницы.
     pub limit: Option<String>,

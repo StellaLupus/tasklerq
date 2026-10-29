@@ -1,6 +1,8 @@
 //! Репозиторий тегов.
 
-use sqlx::PgConnection;
+use std::collections::HashMap;
+
+use sqlx::{FromRow, PgConnection};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -75,4 +77,34 @@ pub async fn item_tags(conn: &mut PgConnection, item_id: Uuid) -> Result<Vec<Tag
     .await?;
 
     Ok(tags)
+}
+
+#[derive(FromRow)]
+struct ItemTagRow {
+    item_id: Uuid,
+    #[sqlx(flatten)]
+    tag: Tag,
+}
+
+/// Теги нескольких элементов одним запросом, по имени внутри элемента.
+pub async fn for_items(
+    conn: &mut PgConnection,
+    item_ids: &[Uuid],
+) -> Result<HashMap<Uuid, Vec<Tag>>, DomainError> {
+    let rows = sqlx::query_as::<_, ItemTagRow>(
+        "SELECT it.item_id, t.id, t.household_id, t.name, t.created_at
+         FROM item_tags it
+         JOIN tags t ON t.id = it.tag_id
+         WHERE it.item_id = ANY($1)
+         ORDER BY t.name",
+    )
+    .bind(item_ids)
+    .fetch_all(conn)
+    .await?;
+
+    let mut grouped: HashMap<Uuid, Vec<Tag>> = HashMap::new();
+    for row in rows {
+        grouped.entry(row.item_id).or_default().push(row.tag);
+    }
+    Ok(grouped)
 }

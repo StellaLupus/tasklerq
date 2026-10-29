@@ -71,7 +71,9 @@ async fn get_with_deleted(
 
 /// Создать дополнительный список.
 ///
-/// Проверка лимита сериализуется блокировкой строки household: вызывающая
+/// Проверка лимита сериализуется блокировкой строки household (`FOR NO KEY
+/// UPDATE`: создатели списков ждут друг друга, а проверки внешних ключей при
+/// вставке элементов не блокируются): вызывающая
 /// сторона обязана работать в транзакции (HTTP-слой всегда её открывает),
 /// иначе параллельные create увидят одинаковый счётчик и обойдут лимит.
 pub async fn create(
@@ -83,7 +85,7 @@ pub async fn create(
 ) -> Result<List, DomainError> {
     let name = normalize_text(name, 64, "list name")?;
 
-    sqlx::query("SELECT id FROM households WHERE id = $1 FOR UPDATE")
+    sqlx::query("SELECT id FROM households WHERE id = $1 FOR NO KEY UPDATE")
         .bind(household_id)
         .fetch_optional(&mut *conn)
         .await?

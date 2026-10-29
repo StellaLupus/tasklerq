@@ -321,3 +321,154 @@ async fn parallel_list_creates_respect_the_limit() {
         usize::try_from(lists::MAX_LISTS).expect("limit as usize")
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_list_creation_respects_the_limit() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    // Два списка по умолчанию + 17 = 19: остаётся ровно одно место.
+    for index in 0..17 {
+        lists::create(
+            &mut conn,
+            household.household_id,
+            ListKind::Shopping,
+            &format!("Список {index}"),
+            Utc::now(),
+        )
+        .await
+        .expect("list within limit");
+    }
+    drop(conn);
+
+    // Транзакция A занимает последнее место и пока не коммитится.
+    let mut first = db.pool.begin().await.expect("transaction");
+    lists::create(
+        &mut first,
+        household.household_id,
+        ListKind::Shopping,
+        "Гонка A",
+        Utc::now(),
+    )
+    .await
+    .expect("first create takes the last slot");
+
+    // Транзакция B стартует параллельно и не видит незакоммиченный список A.
+    let pool = db.pool.clone();
+    let household_id = household.household_id;
+    let second = tokio::spawn(async move {
+        let mut tx = pool.begin().await.expect("transaction");
+        let result = lists::create(
+            &mut tx,
+            household_id,
+            ListKind::Shopping,
+            "Гонка B",
+            Utc::now(),
+        )
+        .await;
+        if result.is_ok() {
+            tx.commit().await.expect("commit");
+        }
+        result
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    first.commit().await.expect("commit");
+
+    let second = second.await.expect("task");
+    assert!(
+        matches!(second, Err(DomainError::Conflict { .. })),
+        "second concurrent create must be rejected, got {second:?}"
+    );
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let total = lists::list(&mut conn, household.household_id)
+        .await
+        .expect("lists")
+        .len();
+    assert_eq!(total, 20);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_hydration_keeps_tags_and_subtasks_per_item() {
+    use tasklerq::domain::search::SearchFilters;
+
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+
+    let fixtures: [(&str, &[&str], &[&str]); 3] = [
+        ("Первая", &["b-тег", "a-тег"], &["шаг 1", "шаг 2"]),
+        ("Вторая", &[], &[]),
+        ("Третья", &["c-тег"], &["единственный шаг"]),
+    ];
+    for (title, tags, steps) in fixtures {
+        let mut item = support::new_item(household.tasks_list_id, title);
+        item.tags = tags.iter().map(|tag| (*tag).to_owned()).collect();
+        item.subtasks = steps.iter().map(|step| support::subtask(step)).collect();
+        support::create_item(
+            &db.pool,
+            &household,
+            household.tasks_list_id,
+            &household.owner(),
+            item,
+        )
+        .await;
+    }
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let summarize = |items: &[tasklerq::domain::models::Item]| {
+        let mut summary: Vec<(String, Vec<String>, Vec<String>)> = items
+            .iter()
+            .map(|item| {
+                (
+                    item.title.clone(),
+                    item.tags.iter().map(|tag| tag.name.clone()).collect(),
+                    item.subtasks
+                        .iter()
+                        .map(|subtask| subtask.title.clone())
+                        .collect(),
+                )
+            })
+            .collect();
+        summary.sort();
+        summary
+    };
+    let expected = vec![
+        (
+            "Вторая".to_owned(),
+            Vec::<String>::new(),
+            Vec::<String>::new(),
+        ),
+        (
+            "Первая".to_owned(),
+            vec!["a-тег".to_owned(), "b-тег".to_owned()],
+            vec!["шаг 1".to_owned(), "шаг 2".to_owned()],
+        ),
+        (
+            "Третья".to_owned(),
+            vec!["c-тег".to_owned()],
+            vec!["единственный шаг".to_owned()],
+        ),
+    ];
+
+    let listed = items::list_by_list(&mut conn, household.household_id, household.tasks_list_id)
+        .await
+        .expect("list");
+    assert_eq!(summarize(&listed), expected);
+
+    let (snapshot, _) = items::snapshot(&mut conn, household.household_id, None)
+        .await
+        .expect("snapshot");
+    assert_eq!(summarize(&snapshot), expected);
+
+    let (hits, _) = items::search(
+        &mut conn,
+        household.household_id,
+        "Europe/Moscow",
+        &SearchFilters::default(),
+    )
+    .await
+    .expect("search");
+    let found: Vec<_> = hits.into_iter().map(|hit| hit.item).collect();
+    assert_eq!(summarize(&found), expected);
+}

@@ -583,3 +583,147 @@ async fn undo_rejects_stale_event_after_list_deletion() {
         Err(DomainError::NotFound)
     ));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undo_is_limited_to_the_actor_or_the_owner() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let by_owner = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        support::new_item(household.tasks_list_id, "Создал владелец"),
+    )
+    .await;
+    let by_member = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.member(),
+        support::new_item(household.tasks_list_id, "Создал участник"),
+    )
+    .await;
+
+    // Участник не может отменить чужое действие, и элемент остаётся на месте.
+    assert!(matches!(
+        items::undo_last(
+            &mut conn,
+            household.household_id,
+            &household.member(),
+            by_owner.id,
+            Utc::now(),
+        )
+        .await,
+        Err(DomainError::Forbidden(_))
+    ));
+    assert!(
+        items::get(&mut conn, household.household_id, by_owner.id)
+            .await
+            .is_ok()
+    );
+
+    // Автор отменяет собственное действие.
+    let undone = items::undo_last(
+        &mut conn,
+        household.household_id,
+        &household.member(),
+        by_member.id,
+        Utc::now(),
+    )
+    .await
+    .expect("actor can undo own action");
+    assert!(undone.deleted_at.is_some());
+
+    // Владелец может отменить действие участника.
+    let by_member_again = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.member(),
+        support::new_item(household.tasks_list_id, "Ещё от участника"),
+    )
+    .await;
+    let undone = items::undo_last(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        by_member_again.id,
+        Utc::now(),
+    )
+    .await
+    .expect("owner can undo any action");
+    assert!(undone.deleted_at.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn assignee_must_belong_to_the_household() {
+    use axum::http::{Method, StatusCode};
+    use serde_json::json;
+
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let foreign = support::create_household(&db.pool).await;
+    let item = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        support::new_item(household.tasks_list_id, "Назначение"),
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    for stranger in [foreign.owner_id, foreign.member_id, uuid::Uuid::now_v7()] {
+        let result = items::update(
+            &mut conn,
+            household.household_id,
+            &household.owner(),
+            item.id,
+            item.version,
+            ItemPatch {
+                assignee_user_id: tasklerq::domain::models::Field::Value(stranger),
+                ..ItemPatch::default()
+            },
+            "Europe/Moscow",
+            Utc::now(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(DomainError::Validation(_))),
+            "update must reject assignee {stranger}, got {result:?}"
+        );
+    }
+
+    let token = support::issue_token(&db.pool, household.household_id, &["ha:write"]).await;
+    let app = support::app(&db.pool);
+    let (status, _) = support::request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/lists/{}/items", household.tasks_list_id),
+        Some(&token),
+        Some(json!({"title": "Чужому", "assignee_user_id": foreign.owner_id})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Свой участник по-прежнему назначается.
+    let assigned = items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        item.id,
+        item.version,
+        ItemPatch {
+            assignee_user_id: tasklerq::domain::models::Field::Value(household.member_id),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("own member can be assigned");
+    assert_eq!(assigned.assignee_user_id, Some(household.member_id));
+}

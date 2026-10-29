@@ -1,5 +1,7 @@
 //! Репозиторий подзадач.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use sqlx::PgConnection;
 use uuid::Uuid;
@@ -83,4 +85,26 @@ pub async fn list(conn: &mut PgConnection, item_id: Uuid) -> Result<Vec<Subtask>
     .await?;
 
     Ok(subtasks)
+}
+
+/// Подзадачи нескольких элементов одним запросом, по порядку внутри элемента.
+pub async fn for_items(
+    conn: &mut PgConnection,
+    item_ids: &[Uuid],
+) -> Result<HashMap<Uuid, Vec<Subtask>>, DomainError> {
+    let subtasks = sqlx::query_as::<_, Subtask>(
+        "SELECT id, item_id, title, status, position, created_at, completed_at
+         FROM subtasks
+         WHERE item_id = ANY($1)
+         ORDER BY position, created_at, id",
+    )
+    .bind(item_ids)
+    .fetch_all(conn)
+    .await?;
+
+    let mut grouped: HashMap<Uuid, Vec<Subtask>> = HashMap::new();
+    for subtask in subtasks {
+        grouped.entry(subtask.item_id).or_default().push(subtask);
+    }
+    Ok(grouped)
 }
