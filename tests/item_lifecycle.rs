@@ -4,8 +4,8 @@ mod support;
 
 use chrono::{Datelike, Duration, Utc};
 use tasklerq::domain::error::DomainError;
-use tasklerq::domain::models::{ItemPatch, ItemStatus};
-use tasklerq::storage::repositories::items;
+use tasklerq::domain::models::{ItemPatch, ItemStatus, ListKind};
+use tasklerq::storage::repositories::{items, lists};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn version_conflict_returns_current_version() {
@@ -516,4 +516,70 @@ async fn restore_rejects_items_deleted_beyond_retention() {
     .await
     .expect_err("retention must block restore");
     assert!(matches!(error, DomainError::Conflict { .. }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undo_rejects_stale_event_after_list_deletion() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    // Дополнительный список, который можно удалить целиком.
+    let list = lists::create(
+        &mut conn,
+        household.household_id,
+        ListKind::Checklist,
+        "Временный",
+        Utc::now(),
+    )
+    .await
+    .expect("list");
+
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        list.id,
+        &household.owner(),
+        support::new_item(list.id, "Пропадёт со списком"),
+    )
+    .await;
+    let edited = items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        created.version,
+        ItemPatch {
+            title: Some("Изменённая".into()),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("edit");
+    assert_eq!(edited.version, 2);
+
+    // Удаление списка мягко удаляет элементы и поднимает version, не записывая
+    // событий: последнее событие элемента устаревает.
+    lists::delete(&mut conn, household.household_id, list.id, true, Utc::now())
+        .await
+        .expect("delete list");
+
+    let error = items::undo_last(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Utc::now(),
+    )
+    .await
+    .expect_err("undo must not resurrect an item in a deleted list");
+    assert!(matches!(error, DomainError::Conflict { .. }));
+
+    // Элемент остаётся удалённым вместе со списком.
+    assert!(matches!(
+        items::get(&mut conn, household.household_id, created.id).await,
+        Err(DomainError::NotFound)
+    ));
 }

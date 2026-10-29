@@ -794,8 +794,10 @@ pub async fn undo_last(
     let row = row_by_id(conn, household_id, item_id, true, true).await?;
     let current = hydrate_one(conn, row).await?;
 
-    let events = events::for_item(conn, household_id, item_id).await?;
-    if events.first().is_some_and(|event| event.undo_of.is_some()) {
+    if events::latest(conn, household_id, item_id)
+        .await?
+        .is_some_and(|event| event.undo_of.is_some())
+    {
         // Компенсирующее событие уже применено: повторная отмена не должна
         // откатывать более раннее действие.
         return Err(DomainError::conflict("there is no action to undo"));
@@ -812,6 +814,20 @@ pub async fn undo_last(
         ));
     }
     ensure_can_undo(actor, &event)?;
+
+    // Откатывать можно только актуальное событие. Если элемент менялся после
+    // него — в том числе удалением списка, которое поднимает version, не
+    // пишя событий, — отмена воскресила бы устаревшее состояние.
+    let event_version = event
+        .payload
+        .get("after")
+        .and_then(|after| after.get("version"))
+        .and_then(Value::as_i64);
+    if event_version != Some(i64::from(current.version)) {
+        return Err(DomainError::conflict(
+            "the item was modified after the action; there is nothing to undo",
+        ));
+    }
 
     let before = event.payload.get("before").cloned();
     if !matches!(&before, Some(Value::Object(_))) {

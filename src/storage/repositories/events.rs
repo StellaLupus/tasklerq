@@ -71,6 +71,31 @@ pub async fn latest_undoable(
     Ok(event)
 }
 
+/// Последнее событие элемента любого типа.
+///
+/// Используется для проверки «последнее действие уже отменено» без загрузки
+/// всего журнала вместе со снимками.
+pub async fn latest(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    item_id: Uuid,
+) -> Result<Option<ItemEvent>, DomainError> {
+    let event = sqlx::query_as::<_, ItemEvent>(
+        "SELECT id, household_id, item_id, actor_user_id, actor_type, event_type,
+                payload, undo_of, created_at
+         FROM item_events
+         WHERE household_id = $1 AND item_id = $2
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1",
+    )
+    .bind(household_id)
+    .bind(item_id)
+    .fetch_optional(conn)
+    .await?;
+
+    Ok(event)
+}
+
 /// События элемента по убыванию времени (для аудита и тестов).
 pub async fn for_item(
     conn: &mut PgConnection,
