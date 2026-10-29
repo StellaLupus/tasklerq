@@ -3,11 +3,13 @@
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::error::DomainError;
 use super::models::ItemStatus;
+use super::recurrence::resolve_local;
 
 /// Размер страницы по умолчанию.
 pub const DEFAULT_LIMIT: i64 = 20;
@@ -102,10 +104,25 @@ pub fn decode_cursor(value: &str) -> Result<SearchCursor, DomainError> {
         .map_err(|_| DomainError::Validation("invalid search cursor".into()))
 }
 
-/// Разобрать диапазон дат для фильтра сроков.
+/// Граница диапазона сроков.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DueBound {
+    /// Включающее начало.
+    From,
+    /// Исключающий конец.
+    To,
+}
+
+/// Разобрать границу диапазона сроков.
+///
+/// Дата `YYYY-MM-DD` трактуется в часовом поясе household: `From` — локальная
+/// полночь дня, `To` — локальная полночь следующего дня. Диапазон
+/// полуоткрытый, поэтому последняя секунда дня не теряется. Значение RFC 3339 —
+/// точный момент: `From` включается, `To` исключается.
 pub fn parse_due_bound(
     value: Option<&str>,
-    end_of_day: bool,
+    bound: DueBound,
+    timezone: Tz,
 ) -> Result<Option<DateTime<Utc>>, DomainError> {
     let Some(value) = value else {
         return Ok(None);
@@ -117,10 +134,52 @@ pub fn parse_due_bound(
 
     let date = NaiveDate::parse_from_str(value, "%Y-%m-%d")
         .map_err(|_| DomainError::Validation("due bound must be RFC 3339 or YYYY-MM-DD".into()))?;
-    let time = if end_of_day {
-        chrono::NaiveTime::from_hms_opt(23, 59, 59).expect("valid time")
-    } else {
-        chrono::NaiveTime::from_hms_opt(0, 0, 0).expect("valid time")
+    let day = match bound {
+        DueBound::From => date,
+        DueBound::To => date.succ_opt().ok_or_else(|| {
+            DomainError::Validation("due bound is out of the supported date range".into())
+        })?,
     };
-    Ok(Some(Utc.from_utc_datetime(&date.and_time(time))))
+    let midnight = chrono::NaiveTime::from_hms_opt(0, 0, 0).expect("valid time");
+    Ok(Some(resolve_local(timezone, day, midnight)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono_tz::Europe::Moscow;
+
+    use super::*;
+
+    #[test]
+    fn date_bounds_use_household_timezone_half_open() {
+        let from = parse_due_bound(Some("2026-11-02"), DueBound::From, Moscow)
+            .expect("from bound")
+            .expect("some");
+        let to = parse_due_bound(Some("2026-11-02"), DueBound::To, Moscow)
+            .expect("to bound")
+            .expect("some");
+
+        // 00:00 и 01:00 MSK 2/3 ноября в UTC.
+        assert_eq!(from, Utc.with_ymd_and_hms(2026, 11, 1, 21, 0, 0).unwrap());
+        assert_eq!(to, Utc.with_ymd_and_hms(2026, 11, 2, 21, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn rfc3339_bound_is_exact_instant() {
+        let from = parse_due_bound(Some("2026-11-02T00:30:00+03:00"), DueBound::From, Moscow)
+            .expect("from bound")
+            .expect("some");
+        assert_eq!(from, Utc.with_ymd_and_hms(2026, 11, 1, 21, 30, 0).unwrap());
+    }
+
+    #[test]
+    fn missing_and_invalid_bounds() {
+        assert!(
+            parse_due_bound(None, DueBound::From, Moscow)
+                .expect("none bound")
+                .is_none()
+        );
+        assert!(parse_due_bound(Some("2026-13-01"), DueBound::From, Moscow).is_err());
+        assert!(parse_due_bound(Some("nope"), DueBound::To, Moscow).is_err());
+    }
 }

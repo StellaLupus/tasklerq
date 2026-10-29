@@ -7,7 +7,10 @@ use uuid::Uuid;
 
 use crate::auth::tokens::AuthContext;
 use crate::domain::models::ItemStatus;
-use crate::domain::search::{DEFAULT_LIMIT, SearchFilters, decode_cursor, parse_due_bound};
+use crate::domain::recurrence::parse_timezone;
+use crate::domain::search::{
+    DEFAULT_LIMIT, DueBound, SearchFilters, decode_cursor, parse_due_bound,
+};
 use crate::storage::repositories::{households, items};
 
 use super::super::error::ApiError;
@@ -64,6 +67,10 @@ pub async fn search(
         None => DEFAULT_LIMIT,
     };
 
+    let mut conn = connection(&state).await?;
+    let household = households::get(&mut conn, auth.household_id).await?;
+    let timezone = parse_timezone(&household.timezone)?;
+
     let filters = SearchFilters {
         q: query.q,
         status,
@@ -71,15 +78,14 @@ pub async fn search(
         list_id: parse_uuid(query.list_id.as_deref(), "list_id")?,
         assignee_user_id: parse_uuid(query.assignee_user_id.as_deref(), "assignee_user_id")?,
         tag: query.tag,
-        due_from: parse_due_bound(query.due_from.as_deref(), false)?,
-        due_to: parse_due_bound(query.due_to.as_deref(), true)?,
+        // Даты разбираются в часовом поясе household, интервал полуоткрытый.
+        due_from: parse_due_bound(query.due_from.as_deref(), DueBound::From, timezone)?,
+        due_to: parse_due_bound(query.due_to.as_deref(), DueBound::To, timezone)?,
         limit,
         cursor: query.cursor.as_deref().map(decode_cursor).transpose()?,
     };
     filters.validate()?;
 
-    let mut conn = connection(&state).await?;
-    let household = households::get(&mut conn, auth.household_id).await?;
     let (hits, next_cursor) =
         items::search(&mut conn, auth.household_id, &household.timezone, &filters).await?;
 

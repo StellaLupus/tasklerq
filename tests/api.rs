@@ -2,6 +2,8 @@
 
 mod support;
 
+use std::collections::HashSet;
+
 use axum::http::{Method, StatusCode};
 use chrono::{Duration, Utc};
 use serde_json::json;
@@ -726,4 +728,93 @@ async fn unknown_resources_and_households_are_not_leaked() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["error"]["code"], "not_found");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_due_bounds_use_household_timezone() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let token =
+        support::issue_token(&db.pool, household.household_id, &["ha:read", "ha:write"]).await;
+    let app = support::app(&db.pool);
+
+    // Household — Europe/Moscow (UTC+3). 2 ноября 01:00 MSK — это
+    // 2026-11-01T22:00Z, а 3 ноября 02:30 MSK — 2026-11-02T23:30Z.
+    let cases = [
+        (
+            json!({"title": "Рано 2 ноября", "due_at": "2026-11-01T22:00:00Z"}),
+            true,
+        ),
+        (
+            json!({"title": "Поздно 3 ноября", "due_at": "2026-11-02T23:30:00Z"}),
+            false,
+        ),
+        (
+            json!({"title": "Вседневная 2 ноября", "due_date": "2026-11-02"}),
+            true,
+        ),
+        (
+            json!({"title": "Вечер 1 ноября", "due_at": "2026-11-01T20:59:00Z"}),
+            false,
+        ),
+    ];
+    let mut ids = Vec::new();
+    for (body, _) in &cases {
+        let (status, item) = support::request(
+            &app,
+            Method::POST,
+            &format!("/api/v1/lists/{}/items", household.tasks_list_id),
+            Some(&token),
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        ids.push(item["id"].as_str().expect("item id").to_owned());
+    }
+
+    // Полуоткрытый интервал [2 ноября 00:00, 3 ноября 00:00) локального
+    // времени: задача 3 ноября 02:30 MSK не должна попадать в выдачу.
+    let (status, search) = support::request(
+        &app,
+        Method::GET,
+        "/api/v1/search?due_from=2026-11-02&due_to=2026-11-02",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let found: HashSet<&str> = search["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|item| item["id"].as_str().expect("item id"))
+        .collect();
+    for (id, (_, expected)) in ids.iter().zip(&cases) {
+        assert_eq!(
+            found.contains(id.as_str()),
+            *expected,
+            "unexpected membership for {id}"
+        );
+    }
+
+    // Расширение до 3 ноября включает и задачу 02:30 MSK.
+    let (status, search) = support::request(
+        &app,
+        Method::GET,
+        "/api/v1/search?due_from=2026-11-02&due_to=2026-11-03",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let found: HashSet<&str> = search["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|item| item["id"].as_str().expect("item id"))
+        .collect();
+    assert_eq!(found.len(), 3);
+    assert!(found.contains(ids[0].as_str()));
+    assert!(found.contains(ids[1].as_str()));
+    assert!(found.contains(ids[2].as_str()));
 }
