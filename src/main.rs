@@ -128,6 +128,9 @@ async fn seed() -> Result<()> {
     let pool = storage::db::connect(&database)
         .await
         .context("database connection failed")?;
+    storage::migrations::run(&pool)
+        .await
+        .context("database migration failed")?;
     storage::seed::run(&pool).await.context("seed failed")?;
 
     tracing::info!("seed complete");

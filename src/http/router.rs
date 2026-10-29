@@ -4,6 +4,7 @@ use axum::Router;
 use axum::routing::get;
 use sqlx::PgPool;
 
+use super::api;
 use super::error::ApiError;
 use super::health;
 use super::middleware::request_id;
@@ -27,6 +28,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health/live", get(health::live))
         .route("/health/ready", get(health::ready))
+        .nest("/api/v1", api::router())
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(axum::middleware::from_fn(request_id))

@@ -8,6 +8,8 @@ use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
+use crate::domain::error::DomainError;
+
 use super::middleware::{REQUEST_ID_HEADER, current_request_id};
 
 /// Машиночитаемый код ошибки.
@@ -161,6 +163,23 @@ impl ApiError {
     /// Машиночитаемый код.
     pub fn code(&self) -> ErrorCode {
         self.code
+    }
+}
+
+impl From<DomainError> for ApiError {
+    fn from(error: DomainError) -> Self {
+        match error {
+            DomainError::Validation(message) => Self::validation(message),
+            DomainError::NotFound => Self::not_found("Resource not found"),
+            DomainError::Forbidden(message) => Self::forbidden(message),
+            DomainError::Conflict { message, details } => {
+                Self::conflict(message).with_details(details)
+            }
+            DomainError::Database(error) => {
+                tracing::error!(error = %error, "database operation failed");
+                Self::internal("Database error")
+            }
+        }
     }
 }
 
