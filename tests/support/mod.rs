@@ -2,6 +2,8 @@
 
 #![allow(dead_code)]
 
+use std::process::Command;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use axum::Router;
@@ -31,6 +33,16 @@ use uuid::Uuid;
 
 static DATABASE: OnceCell<SharedDatabase> = OnceCell::const_new();
 static NEXT_HOUSEHOLD: AtomicI64 = AtomicI64::new(1);
+static CONTAINER_ID: OnceLock<String> = OnceLock::new();
+
+/// Удалить контейнер при выходе процесса. Статик не получает `Drop`, поэтому
+/// testcontainers сам контейнер не остановит, а Ryuk в Rust-крейте нет:
+/// без этого каждый тестовый бинарник оставляет контейнер postgres работать.
+extern "C" fn remove_container() {
+    if let Some(id) = CONTAINER_ID.get() {
+        let _ = Command::new("docker").args(["rm", "-f", "-v", id]).output();
+    }
+}
 
 /// Общий контейнер и URL базы. Контейнер живёт до конца процесса, а пул
 /// создаётся отдельно для каждого теста: соединения sqlx привязаны к runtime,
@@ -69,6 +81,11 @@ async fn start_db() -> SharedDatabase {
         .start()
         .await
         .expect("postgres container should start");
+
+    if CONTAINER_ID.set(container.id().to_owned()).is_ok() {
+        // SAFETY: обработчик не паникует и только запускает `docker rm`.
+        unsafe { libc::atexit(remove_container) };
+    }
 
     let port = container
         .get_host_port_ipv4(5432)
