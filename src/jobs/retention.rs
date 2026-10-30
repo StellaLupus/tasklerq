@@ -28,6 +28,8 @@ pub struct RetentionStats {
     pub purged_updates: u64,
     /// Удалено завершённых заданий разбора.
     pub purged_capture_jobs: u64,
+    /// Удалённые метаданные разборов LLM.
+    pub purged_llm_runs: u64,
     /// Удалённые просроченные callback-токены.
     pub purged_callback_tokens: u64,
     /// Удалённые завершённые сообщения outbox: отправленные, пропущенные, мёртвые.
@@ -123,6 +125,12 @@ pub async fn run(
     )
     .await?;
 
+    let purged_llm_runs = crate::storage::repositories::llm_runs::purge(
+        &mut tx,
+        now - Duration::days(i64::from(config.llm_runs_days)),
+    )
+    .await?;
+
     let purged_callback_tokens = crate::telegram::callbacks::purge_expired(&mut tx, now).await?;
     let purged_outbox = crate::telegram::outbox::purge(
         &mut tx,
@@ -143,6 +151,7 @@ pub async fn run(
         purged_invites,
         purged_updates,
         purged_capture_jobs,
+        purged_llm_runs,
         purged_callback_tokens,
         purged_outbox,
         purged_conversations,

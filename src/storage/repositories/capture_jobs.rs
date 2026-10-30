@@ -141,6 +141,24 @@ pub async fn enqueue(
     Ok(id)
 }
 
+/// Сколько заданий участника поставлено после `since`.
+pub async fn count_recent_for_user(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    user_id: Uuid,
+    since: DateTime<Utc>,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM capture_jobs
+         WHERE household_id = $1 AND user_id = $2 AND created_at >= $3",
+    )
+    .bind(household_id)
+    .bind(user_id)
+    .bind(since)
+    .fetch_one(conn)
+    .await
+}
+
 /// Захватить следующее готовое задание на время [`LEASE`].
 ///
 /// Готово то, что ждёт и чьё время подошло, а также то, чья аренда истекла

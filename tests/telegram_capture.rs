@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use tasklerq::home_assistant::{AiTask, GenerateData, HaError};
 use tasklerq::telegram::bot::Bot;
-use tasklerq::telegram::capture_worker::{CaptureWorker, MAX_ATTEMPTS, Pass};
+use tasklerq::telegram::capture_worker::{CaptureWorker, DEFAULT_DAILY_QUOTA, MAX_ATTEMPTS, Pass};
 use tokio::sync::Notify;
 
 use support::telegram::{FakeTelegram, Harness};
@@ -80,15 +80,35 @@ fn two_items() -> Value {
     ]})
 }
 
+/// Ответ LLM: больше 20 элементов, пользователя просят разделить текст.
+fn too_many_items() -> Value {
+    let items: Vec<Value> = (0..21)
+        .map(|n| json!({"target_kind": "tasks", "title": format!("Дело {n}")}))
+        .collect();
+    json!({"items": items})
+}
+
 struct Stand {
     bot: Harness,
     worker: CaptureWorker,
     ai: Arc<StubAi>,
 }
 
+/// Сколько разборов в минуту допускает бот.
+const PARSES_PER_MINUTE: i64 = 10;
+
 async fn stand(pool: &PgPool, answers: Vec<Result<Value, HaError>>) -> Stand {
+    stand_with(pool, answers, DEFAULT_DAILY_QUOTA, true).await
+}
+
+async fn stand_with(
+    pool: &PgPool,
+    answers: Vec<Result<Value, HaError>>,
+    quota: u32,
+    llm_capture: bool,
+) -> Stand {
     let id = next_telegram_id();
-    let handler = Bot::new("tasklerqbot").with_llm_capture(true);
+    let handler = Bot::new("tasklerqbot").with_llm_capture(llm_capture);
     let ai = StubAi::new(answers);
     let mut bot = Harness::with_handler(pool, id, Arc::new(handler.clone()), FakeTelegram::new());
     bot.text("/start").await;
@@ -97,8 +117,17 @@ async fn stand(pool: &PgPool, answers: Vec<Result<Value, HaError>>) -> Stand {
     bot.press("меню").await;
 
     let worker = CaptureWorker::new(pool.clone(), ai.clone(), handler, Arc::new(Notify::new()))
-        .only_chat(id);
+        .only_chat(id)
+        .with_quota(quota);
     Stand { bot, worker, ai }
+}
+
+async fn stand_with_quota(
+    pool: &PgPool,
+    answers: Vec<Result<Value, HaError>>,
+    quota: u32,
+) -> Stand {
+    stand_with(pool, answers, quota, true).await
 }
 
 impl Stand {
@@ -440,16 +469,36 @@ async fn persistent_server_errors_exhaust_attempts() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn too_many_items_asks_to_split_the_text() {
     let db = db().await;
-    let items: Vec<Value> = (0..21)
-        .map(|n| json!({"target_kind": "tasks", "title": format!("Дело {n}")}))
-        .collect();
-    let mut stand = stand(&db.pool, vec![Ok(json!({"items": items}))]).await;
+    let mut stand = stand(&db.pool, vec![Ok(too_many_items())]).await;
 
     stand.bot.text("очень длинный список дел").await;
     assert_eq!(stand.work().await, Pass::Dead);
 
     stand.bot.assert_screen_contains("Разделите его на части");
     assert_eq!(stand.household_items().await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn too_many_items_do_not_open_the_circuit_breaker() {
+    let db = db().await;
+    let mut answers: Vec<Result<Value, HaError>> = (0..5).map(|_| Ok(too_many_items())).collect();
+    answers.push(Ok(two_items()));
+    let mut stand = stand(&db.pool, answers).await;
+
+    for number in 1..=5 {
+        stand
+            .bot
+            .text(&format!("очень длинный список {number}"))
+            .await;
+        assert_eq!(stand.work().await, Pass::Dead);
+        stand.bot.assert_screen_contains("Разделите его на части");
+        stand.bot.press("Отмена").await;
+    }
+
+    // Пользовательская ошибка не расходует порог предохранителя: шестое
+    // сообщение всё ещё уходит в LLM.
+    stand.capture("шестое дело").await;
+    assert_eq!(stand.ai.calls(), 6);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -668,6 +717,152 @@ async fn after_three_clarifications_the_bot_offers_manual_editing() {
         stand.bot.screen()
     );
     assert_eq!(stand.ai.calls(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_parse_opens_the_manual_form_with_the_source_text() {
+    let db = db().await;
+    let mut stand = stand(&db.pool, vec![Err(HaError::Rejected(400))]).await;
+
+    stand.bot.text("купить молоко").await;
+    assert_eq!(stand.work().await, Pass::Dead);
+
+    stand.bot.assert_screen_contains("Проверьте и сохраните");
+    stand.bot.assert_screen_contains("купить молоко");
+    stand.bot.assert_has_button("Сохранить");
+    assert_eq!(stand.ai.calls(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn circuit_breaker_skips_the_llm_after_five_failures_and_recovers() {
+    let db = db().await;
+    let mut answers: Vec<Result<Value, HaError>> =
+        (0..5).map(|_| Err(HaError::Rejected(400))).collect();
+    answers.push(Ok(two_items()));
+    let mut stand = stand(&db.pool, answers).await;
+
+    for number in 1..=5 {
+        stand.bot.text(&format!("дело {number}")).await;
+        assert_eq!(stand.work().await, Pass::Dead);
+        stand.bot.assert_screen_contains("Проверьте и сохраните");
+        stand.bot.press("Отмена").await;
+    }
+    assert_eq!(stand.ai.calls(), 5);
+
+    // Предохранитель разомкнут: шестое сообщение не уходит в LLM, а сразу
+    // открывает ручную форму с исходным текстом.
+    stand.bot.text("дело 6").await;
+    assert_eq!(stand.work().await, Pass::Dead);
+    assert_eq!(stand.ai.calls(), 5, "the LLM must not be called while open");
+    stand.bot.assert_screen_contains("временно недоступен");
+    stand.bot.assert_screen_contains("дело 6");
+    stand.bot.press("Отмена").await;
+
+    // Через две минуты разбор снова разрешён.
+    stand.bot.advance(Duration::minutes(2));
+    stand.bot.text("дело 7").await;
+    assert_eq!(stand.work().await, Pass::Drafted);
+    assert_eq!(stand.ai.calls(), 6);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_successful_parse_resets_the_breaker_failure_count() {
+    let db = db().await;
+    let answers = vec![
+        Err(HaError::Rejected(400)),
+        Err(HaError::Rejected(400)),
+        Err(HaError::Rejected(400)),
+        Err(HaError::Rejected(400)),
+        Ok(two_items()),
+        Err(HaError::Rejected(400)),
+        Ok(two_items()),
+    ];
+    let mut stand = stand(&db.pool, answers).await;
+
+    for number in 1..=4 {
+        stand.bot.text(&format!("дело {number}")).await;
+        assert_eq!(stand.work().await, Pass::Dead);
+        stand.bot.press("Отмена").await;
+    }
+
+    // Успешный разбор обнуляет счётчик ошибок.
+    stand.capture("дело 5").await;
+    stand.bot.press("Отмена").await;
+
+    stand.bot.text("дело 6").await;
+    assert_eq!(stand.work().await, Pass::Dead);
+    stand.bot.press("Отмена").await;
+
+    // Без сброса счётчика пятая ошибка разомкнула бы предохранитель.
+    stand.capture("дело 7").await;
+    assert_eq!(stand.ai.calls(), 7);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn more_than_ten_parses_per_minute_are_rejected_without_llm() {
+    let db = db().await;
+    let mut stand = stand(&db.pool, vec![]).await;
+
+    for number in 1..=PARSES_PER_MINUTE {
+        stand.bot.text(&format!("дело {number}")).await;
+    }
+    assert_eq!(stand.jobs().await, PARSES_PER_MINUTE);
+
+    stand.bot.text("дело 11").await;
+    stand.bot.assert_latest_contains("Слишком много сообщений");
+    assert_eq!(stand.jobs().await, PARSES_PER_MINUTE);
+    assert_eq!(stand.ai.calls(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daily_quota_stops_parsing_and_opens_the_manual_form() {
+    let db = db().await;
+    let mut stand = stand_with_quota(&db.pool, vec![Ok(two_items()), Ok(two_items())], 2).await;
+
+    stand.bot.text("первое дело").await;
+    assert_eq!(stand.work().await, Pass::Drafted);
+    stand.bot.text("второе дело").await;
+    assert_eq!(stand.work().await, Pass::Drafted);
+
+    stand.bot.text("третье дело").await;
+    assert_eq!(stand.work().await, Pass::Dead);
+    assert_eq!(stand.ai.calls(), 2, "the quota must block the LLM call");
+    stand
+        .bot
+        .assert_screen_contains("автоматический разбор закончился");
+    stand.bot.assert_screen_contains("третье дело");
+    stand.bot.assert_has_button("Сохранить");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quota_ignores_runs_older_than_a_day() {
+    let db = db().await;
+    let mut stand = stand_with_quota(&db.pool, vec![Ok(two_items()), Ok(two_items())], 1).await;
+
+    stand.capture("первое дело").await;
+    let household = household_id(&db.pool, stand.bot.chat).await;
+    sqlx::query("UPDATE llm_runs SET created_at = $2 WHERE household_id = $1")
+        .bind(household)
+        .bind(stand.bot.now - Duration::hours(25))
+        .execute(&db.pool)
+        .await
+        .expect("age the run");
+
+    stand.capture("второе дело").await;
+    assert_eq!(stand.ai.calls(), 2, "the quota is a rolling day");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabled_llm_opens_the_manual_form_without_queueing() {
+    let db = db().await;
+    let mut stand = stand_with(&db.pool, vec![], DEFAULT_DAILY_QUOTA, false).await;
+
+    stand.bot.text("купить хлеб").await;
+
+    stand.bot.assert_screen_contains("Проверьте и сохраните");
+    stand.bot.assert_screen_contains("купить хлеб");
+    assert_eq!(stand.jobs().await, 0);
+    assert_eq!(stand.ai.calls(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

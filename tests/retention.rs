@@ -331,6 +331,46 @@ async fn retention_purges_finished_invites_only() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_purges_llm_runs_older_than_the_retention_window() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let old = Uuid::now_v7();
+    let recent = Uuid::now_v7();
+
+    for (id, created) in [
+        (old, now - Duration::days(31)),
+        (recent, now - Duration::days(5)),
+    ] {
+        sqlx::query(
+            "INSERT INTO llm_runs (
+                 id, household_id, source, mode, prompt_version, status,
+                 latency_ms, created_at
+             )
+             VALUES ($1, $2, 'telegram', 'draft', 'capture-v2', 'success', 1200, $3)",
+        )
+        .bind(id)
+        .bind(household.household_id)
+        .bind(created)
+        .execute(&db.pool)
+        .await
+        .expect("llm run");
+    }
+
+    let stats = retention::run(&db.pool, &config(), now)
+        .await
+        .expect("retention");
+    assert!(stats.purged_llm_runs >= 1);
+
+    let left: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM llm_runs WHERE id = ANY($1)")
+        .bind(vec![old, recent])
+        .fetch_all(&db.pool)
+        .await
+        .expect("runs");
+    assert_eq!(left, vec![recent]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retention_purges_finished_telegram_data_but_keeps_pending() {
     let db = support::isolated_db().await;
     let now = Utc::now();

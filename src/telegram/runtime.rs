@@ -78,7 +78,8 @@ pub async fn start(
     let ai = build_ai(&config.llm);
     let bot = Bot::new(telegram.bot_username.clone()).with_llm_capture(ai.is_some());
     if let Some(ai) = ai {
-        let capture = CaptureWorker::new(pool.clone(), ai, bot.clone(), wake_outbox.clone());
+        let capture = CaptureWorker::new(pool.clone(), ai, bot.clone(), wake_outbox.clone())
+            .with_quota(config.llm.daily_quota);
         tasks.push(tokio::spawn(capture.run(shutdown.clone())));
     }
     let updates = UpdateWorker::new(
@@ -116,5 +117,23 @@ fn build_ai(llm: &LlmConfig) -> Option<Arc<dyn AiTask>> {
             );
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SecretString;
+
+    #[test]
+    fn disabled_llm_capture_builds_no_client() {
+        let llm = LlmConfig {
+            enabled: false,
+            base_url: Some("http://127.0.0.1:8123".parse().expect("url")),
+            token: Some(SecretString::new("token")),
+            ai_task_entity_id: Some("ai_task.google_ai_task_2".into()),
+            daily_quota: 200,
+        };
+        assert!(build_ai(&llm).is_none());
     }
 }

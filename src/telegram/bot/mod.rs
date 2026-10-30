@@ -356,12 +356,52 @@ impl Bot {
         screen: Screen,
         banner: Option<String>,
     ) -> Result<(), sqlx::Error> {
+        let mut ctx = self.context(conn, now, to, banner);
+        match ctx.present(screen).await {
+            Ok(()) => Ok(()),
+            Err(Fail::Infra(error)) => Err(error),
+            Err(Fail::User(_)) => {
+                tracing::debug!("screen could not be presented to the user");
+                Ok(())
+            }
+        }
+    }
+
+    /// Открыть ручную форму с исходным текстом: так заканчивается разбор,
+    /// который не удался или недоступен. Форма ставится в `outbox` в
+    /// транзакции вызывающего.
+    pub async fn present_quick_add(
+        &self,
+        conn: &mut PgConnection,
+        now: DateTime<Utc>,
+        to: Recipient<'_>,
+        text: &str,
+        banner: Option<String>,
+    ) -> Result<(), sqlx::Error> {
+        let mut ctx = self.context(conn, now, to, banner);
+        match forms::quick_add(&mut ctx, text).await {
+            Ok(()) => Ok(()),
+            Err(Fail::Infra(error)) => Err(error),
+            Err(Fail::User(_)) => {
+                tracing::debug!("quick add form could not be presented to the user");
+                Ok(())
+            }
+        }
+    }
+
+    fn context<'a>(
+        &'a self,
+        conn: &'a mut PgConnection,
+        now: DateTime<Utc>,
+        to: Recipient<'_>,
+        banner: Option<String>,
+    ) -> Ctx<'a> {
         let Recipient {
             user,
             household,
             chat_id,
         } = to;
-        let mut ctx = Ctx {
+        Ctx {
             conn,
             now,
             bot_username: &self.username,
@@ -377,14 +417,6 @@ impl Bot {
             toast: None,
             banner,
             llm_capture: self.llm_capture,
-        };
-        match ctx.present(screen).await {
-            Ok(()) => Ok(()),
-            Err(Fail::Infra(error)) => Err(error),
-            Err(Fail::User(_)) => {
-                tracing::debug!("screen could not be presented to the user");
-                Ok(())
-            }
         }
     }
 

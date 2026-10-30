@@ -1,5 +1,6 @@
 //! LLM-capture: оркестрация разбора, черновики, валидация и подтверждение.
 
+pub mod breaker;
 pub mod context;
 pub mod draft;
 pub mod prompt;

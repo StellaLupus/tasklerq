@@ -33,6 +33,9 @@ mod clarify;
 /// Максимальная длина текста на разбор.
 pub const MAX_TEXT: usize = 2_000;
 
+/// Сколько разборов пользователь может запустить за минуту.
+pub const PARSES_PER_MINUTE: i64 = 10;
+
 /// Принять свободный текст на разбор.
 pub async fn intake(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
     let user_id = ctx.user()?.id;
@@ -42,6 +45,22 @@ pub async fn intake(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
             .say(&format!(
                 "Сообщение слишком длинное: не больше {MAX_TEXT} символов. \
                  Сократите его или разделите на части."
+            ))
+            .await;
+    }
+
+    let recent = capture_jobs::count_recent_for_user(
+        &mut *ctx.conn,
+        household_id,
+        user_id,
+        ctx.now - chrono::Duration::minutes(1),
+    )
+    .await?;
+    if recent >= PARSES_PER_MINUTE {
+        return ctx
+            .say(&format!(
+                "Слишком много сообщений на разбор: не больше {PARSES_PER_MINUTE} в минуту. \
+                 Подождите немного и отправьте снова."
             ))
             .await;
     }

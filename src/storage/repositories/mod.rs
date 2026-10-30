@@ -11,6 +11,7 @@ pub mod households;
 pub mod invites;
 pub mod items;
 pub mod lists;
+pub mod llm_runs;
 pub mod members;
 pub mod subtasks;
 pub mod tags;
