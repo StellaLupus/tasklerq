@@ -69,6 +69,25 @@ async fn get_with_deleted(
     .ok_or(DomainError::NotFound)
 }
 
+/// Вид списка, включая мягко удалённый.
+///
+/// Нужен повторному подтверждению capture: его элементы переживают удаление
+/// списка, и ответ обязан сохранить их исходный вид.
+pub async fn kind(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    list_id: Uuid,
+) -> Result<Option<ListKind>, DomainError> {
+    let kind = sqlx::query_scalar::<_, ListKind>(
+        "SELECT kind FROM lists WHERE id = $1 AND household_id = $2",
+    )
+    .bind(list_id)
+    .bind(household_id)
+    .fetch_optional(conn)
+    .await?;
+    Ok(kind)
+}
+
 /// Создать дополнительный список.
 ///
 /// Проверка лимита сериализуется блокировкой строки household (`FOR NO KEY

@@ -165,7 +165,7 @@ Content-Type: application/json
 | `200` | Capture обработан: `applied`, `draft` или `rejected`. |
 | `401` | Нет Bearer-токена или токен недействителен. LLM не вызывается. |
 | `403` | У токена нет scope `capture:write` (например, только `ha:read`/`ha:write`). |
-| `404` | `CAPTURE_API_ENABLED=false`: маршрут выглядит отсутствующим. Для `/captures/{id}/confirm`, `/cancel` и `/undo` — ещё и несуществующий, чужой capture или Telegram-черновик. |
+| `404` | `CAPTURE_API_ENABLED=false`: маршрут выглядит отсутствующим (включая `/captures/undo-last`). Для `/captures/{id}/confirm`, `/cancel` и `/undo` — ещё и несуществующий, чужой capture или Telegram-черновик. |
 | `413` | Тело больше 16 КБ; текст не разбирается. |
 | `415` | Нет заголовка `Content-Type: application/json` или он неверен. LLM не вызывается. |
 | `409` | Запрос с этим `Idempotency-Key` ещё обрабатывается; в ответе есть `Retry-After`. Второй разбор не запускается. Для действий над capture — отменённый или уже применённый черновик, изменённые элементы, закрытое окно undo или неприменённый capture. |
@@ -214,9 +214,10 @@ Content-Type: application/json
 с `Retry-After`, остальные сбои — `503`, элементы и черновик не создаются.
 
 **Подтверждение, отмена и undo.** Эндпоинты
-`POST /api/v1/captures/{id}/confirm`, `/cancel` и `/undo` не требуют тела и
-работают с тем же Bearer-токеном и scope `capture:write`, что и `POST /capture`.
-Они видят только capture своего household и только внешних источников
+`POST /api/v1/captures/{id}/confirm`, `/cancel` и `/undo`, а также
+`POST /api/v1/captures/undo-last` не требуют тела и работают с тем же
+Bearer-токеном и scope `capture:write`, что и `POST /capture`. Эндпоинты с
+`{id}` видят только capture своего household и только внешних источников
 (`ha_voice`, `ha_automation`, `api`, `shortcut`); чужой, несуществующий capture
 и Telegram-черновик дают `404`.
 
@@ -245,6 +246,23 @@ Content-Type: application/json
   другие элементы не трогаются. Если элемент изменён или завершён — `409`, и
   не удаляется ни один элемент; закрытое окно 10 минут — `409`; неприменённый
   capture — `409`.
+- `undo-last` — отменяет последний применённый capture household с
+  `source=ha_voice` за последние 10 минут. Учитываются `auto` (включая
+  fallback) и подтверждённый `draft`; ожидающие черновики и другие источники
+  (включая Telegram) не считаются. Выбор идёт по `applied_at`; отмена — та же,
+  что у `/captures/{id}/undo`:
+
+  ```json
+  {"capture_id": "019...", "status": "undone", "removed": 2,
+   "speech": "Отменил добавление: 2 элемента."}
+  ```
+
+  Если за 10 минут голосового capture не было, ответ — `200` с
+  `capture_id=null`, `removed=0` и фразой «Нечего отменять». Если последний
+  capture уже отменён, повторная команда возвращает `200` с его `capture_id` и
+  `removed=0` и **не** отменяет более ранние добавления: повтор идемпотентен.
+  Изменённый или завершённый элемент последнего capture — `409`, ничего не
+  удаляется.
 
 **Идемпотентность.** Ключ можно передать заголовком `Idempotency-Key` или полем
 `idempotency_key`; если переданы оба и различаются — `422`. Допустимы 1..128
@@ -269,7 +287,9 @@ HA-компонент генерирует UUID на каждый вызов с�
 
 **Отмена.** `POST /api/v1/captures/{id}/undo` отменяет весь capture в течение
 10 минут, если элементы не изменены после создания. HA-сервис
-`tasklerq.undo_last_capture` отменяет последний голосовой capture household.
+`tasklerq.undo_last_capture` вызывает `POST /api/v1/captures/undo-last` и тем
+самым отменяет последний голосовой capture household; повтор команды не
+съедает предыдущие добавления.
 
 **Без бота.** Внешний capture не пишет в `outbox` и не требует работающего
 Telegram. При `TELEGRAM_MODE=disabled` сервис запускается без бота и без

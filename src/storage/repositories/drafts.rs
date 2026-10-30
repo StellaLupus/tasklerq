@@ -269,6 +269,30 @@ pub async fn link_items(
     Ok(())
 }
 
+/// Последний применённый голосовой capture household не старше `since`.
+///
+/// Запрос опирается на `capture_source_applied_idx (household_id, source,
+/// applied_at DESC)`. Уже отменённый capture остаётся `applied`, поэтому
+/// повторный `undo-last` найдёт его же, а не более ранний.
+pub async fn last_voice_applied(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    since: DateTime<Utc>,
+) -> Result<Option<Draft>, DomainError> {
+    let row = sqlx::query_as::<_, Draft>(&format!(
+        "SELECT {COLUMNS} FROM capture_drafts
+         WHERE household_id = $1 AND source = 'ha_voice' AND status = 'applied'
+           AND applied_at >= $2
+         ORDER BY applied_at DESC, id DESC
+         LIMIT 1"
+    ))
+    .bind(household_id)
+    .bind(since)
+    .fetch_optional(conn)
+    .await?;
+    Ok(row)
+}
+
 /// Идентификаторы элементов capture в порядке создания, включая удалённые.
 pub async fn linked_item_ids(
     conn: &mut PgConnection,

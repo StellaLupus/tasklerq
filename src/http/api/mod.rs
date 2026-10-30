@@ -52,6 +52,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
             post(capture::capture).layer(DefaultBodyLimit::max(capture::BODY_LIMIT_BYTES)),
         );
         router = router
+            .route("/captures/undo-last", post(captures::undo_last))
             .route("/captures/{id}/confirm", post(captures::confirm))
             .route("/captures/{id}/cancel", post(captures::cancel))
             .route("/captures/{id}/undo", post(captures::undo));

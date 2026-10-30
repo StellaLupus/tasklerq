@@ -15,8 +15,9 @@ use uuid::Uuid;
 
 use crate::capture::draft::{self, DraftError};
 use crate::domain::error::DomainError;
-use crate::domain::models::{CaptureSource, ListKind};
+use crate::domain::models::{CaptureSource, Item, ListKind};
 use crate::storage::repositories::drafts::{self, Draft};
+use crate::storage::repositories::items;
 use crate::storage::repositories::lists;
 
 use super::super::error::ApiError;
@@ -60,6 +61,22 @@ pub struct UndoResponse {
     pub speech: String,
 }
 
+/// Ответ `POST /api/v1/captures/undo-last`.
+///
+/// `capture_id` пуст, если за окно не нашлось подходящего голосового capture:
+/// это не ошибка, отменять просто нечего.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UndoLastResponse {
+    /// Идентификатор отменённого capture; `None`, если отменять нечего.
+    pub capture_id: Option<Uuid>,
+    /// Итог.
+    pub status: ActionStatus,
+    /// Сколько элементов мягко удалено этим запросом.
+    pub removed: usize,
+    /// Короткая фраза для озвучивания.
+    pub speech: String,
+}
+
 /// Подтвердить внешний черновик.
 pub async fn confirm(
     State(state): State<AppState>,
@@ -75,7 +92,13 @@ pub async fn confirm(
         .await
         .map_err(action_error)?;
 
-    let kinds = list_kinds(&mut conn, auth.household_id).await?;
+    // Применённый capture без живых элементов уже отменён: повторный confirm
+    // не должен отвечать «Добавил 0 элементов».
+    if confirmed.replayed && confirmed.items.is_empty() {
+        return Err(ApiError::conflict("Capture was undone"));
+    }
+
+    let kinds = list_kinds(&mut conn, auth.household_id, &confirmed.items).await?;
     let mut items = Vec::with_capacity(confirmed.items.len());
     for item in &confirmed.items {
         let kind = kinds.get(&item.list_id).copied().ok_or_else(|| {
@@ -88,7 +111,7 @@ pub async fn confirm(
     Ok(Json(CaptureResponse {
         capture_id,
         status: Status::Applied,
-        fallback: false,
+        fallback: draft.fallback,
         speech: fit_speech(applied_speech(&items)),
         items,
         draft_id: None,
@@ -147,6 +170,49 @@ pub async fn undo(
     }))
 }
 
+/// Отменить последний голосовой capture household за окно undo.
+///
+/// Учитываются только `ha_voice` в статусе `applied`: `auto` (включая
+/// fallback) и подтверждённый `draft`. Применённый capture остаётся
+/// `applied` после отмены, поэтому повторная команда находит его же и
+/// возвращает `removed=0`, не отменяя более ранние добавления.
+pub async fn undo_last(
+    State(state): State<AppState>,
+    auth: CaptureAuth,
+) -> Result<Json<UndoLastResponse>, ApiError> {
+    let auth = auth.0;
+    let mut conn = connection(&state).await?;
+    let now = Utc::now();
+    let since = now - chrono::Duration::minutes(items::UNDO_WINDOW_MINUTES);
+    let Some(draft) = drafts::last_voice_applied(&mut conn, auth.household_id, since).await? else {
+        return Ok(Json(UndoLastResponse {
+            capture_id: None,
+            status: ActionStatus::Undone,
+            removed: 0,
+            speech: fit_speech(
+                "Нечего отменять: за последние 10 минут голосовых добавлений не было.".to_owned(),
+            ),
+        }));
+    };
+    let actor = integration_actor(draft::item_source(draft.source));
+    let removed = draft::undo(&mut conn, auth.household_id, &actor, draft.id, now)
+        .await
+        .map_err(action_error)?;
+
+    let speech = if removed.is_empty() {
+        "Отменять нечего: элементы уже удалены.".to_owned()
+    } else {
+        fit_speech(format!("Отменил добавление: {}.", elements(removed.len())))
+    };
+
+    Ok(Json(UndoLastResponse {
+        capture_id: Some(draft.id),
+        status: ActionStatus::Undone,
+        removed: removed.len(),
+        speech,
+    }))
+}
+
 /// Capture своего household и внешнего источника; иначе — `404`.
 async fn external_capture(
     conn: &mut PgConnection,
@@ -178,15 +244,29 @@ fn capture_not_found() -> ApiError {
     ApiError::not_found("Capture not found")
 }
 
+/// Вид каждого списка, который нужен для ответа.
+///
+/// Список ищется по `item.list_id`, включая мягко удалённые: элемент capture
+/// переживает удаление своего списка, и повторный `confirm` должен вернуть его
+/// исходный вид, а не `500`.
 async fn list_kinds(
     conn: &mut PgConnection,
     household_id: Uuid,
+    items: &[Item],
 ) -> Result<HashMap<Uuid, ListKind>, ApiError> {
-    let kinds = lists::list(conn, household_id)
-        .await?
-        .into_iter()
-        .map(|list| (list.id, list.kind))
-        .collect();
+    let mut kinds = HashMap::new();
+    for item in items {
+        if kinds.contains_key(&item.list_id) {
+            continue;
+        }
+        let kind = lists::kind(conn, household_id, item.list_id)
+            .await?
+            .ok_or_else(|| {
+                tracing::error!(item_id = %item.id, "capture item has no list");
+                ApiError::internal("Database error")
+            })?;
+        kinds.insert(item.list_id, kind);
+    }
     Ok(kinds)
 }
 
