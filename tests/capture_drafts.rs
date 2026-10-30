@@ -36,6 +36,7 @@ fn raw(title: &str, kind: ListKind) -> RawItem {
 
 fn capture(household: &TestHousehold, items: Vec<RawItem>) -> NewCapture {
     NewCapture {
+        id: None,
         household_id: household.household_id,
         user_id: Some(household.owner_id),
         chat_id: Some(1),

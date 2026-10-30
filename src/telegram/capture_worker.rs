@@ -382,6 +382,7 @@ impl CaptureWorker {
         let created = draft::create(
             &mut tx,
             NewCapture {
+                id: None,
                 household_id: job.household_id,
                 user_id: Some(prepared.user.id),
                 chat_id: Some(job.chat_id),

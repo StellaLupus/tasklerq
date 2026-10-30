@@ -20,6 +20,8 @@ pub struct RetentionStats {
     pub purged_events: u64,
     /// Удалённые черновики.
     pub purged_drafts: u64,
+    /// Удалённые резервы ключей идемпотентности capture.
+    pub purged_capture_requests: u64,
     /// Удалённые события аудита.
     pub purged_audit_events: u64,
     /// Удалённые приглашения: использованные, отозванные и истёкшие.
@@ -94,6 +96,12 @@ pub async fn run(
         .await?
         .rows_affected();
 
+    let purged_capture_requests = sqlx::query("DELETE FROM capture_requests WHERE created_at < $1")
+        .bind(drafts_cutoff)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
     let purged_audit_events = sqlx::query("DELETE FROM audit_events WHERE created_at < $1")
         .bind(audit_cutoff)
         .execute(&mut *tx)
@@ -147,6 +155,7 @@ pub async fn run(
         purged_households,
         purged_events,
         purged_drafts,
+        purged_capture_requests,
         purged_audit_events,
         purged_invites,
         purged_updates,

@@ -13,6 +13,7 @@
 
 use chrono::{DateTime, Days, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sqlx::{Connection, PgConnection};
 use thiserror::Error;
 use uuid::Uuid;
@@ -26,7 +27,7 @@ use crate::domain::models::{
 };
 use crate::domain::validation::{sanitize, validate_new_item};
 use crate::storage::repositories::drafts::{self, Draft, NewDraft};
-use crate::storage::repositories::{households, items, lists, users};
+use crate::storage::repositories::{capture_requests, households, items, lists, users};
 
 /// Источник элементов, созданных из capture с данным источником.
 pub fn item_source(source: CaptureSource) -> ItemSource {
@@ -128,9 +129,16 @@ impl Stored {
     }
 }
 
+/// Построитель сериализованного ответа, который сохраняется в резерве ключа
+/// идемпотентности в той же транзакции, что и строки capture.
+pub type Responder<'a, T> = Box<dyn FnOnce(&T) -> Value + Send + 'a>;
+
 /// Данные нового черновика.
 #[derive(Debug, Clone)]
 pub struct NewCapture {
+    /// Идентификатор, зарезервированный вызывающей стороной (ключ
+    /// идемпотентности); иначе генерируется новый.
+    pub id: Option<Uuid>,
     /// Household.
     pub household_id: Uuid,
     /// Автор; у голосового capture его нет.
@@ -256,15 +264,32 @@ pub async fn create(
     capture: NewCapture,
     now: DateTime<Utc>,
 ) -> Result<Draft, DomainError> {
+    create_with_responder(conn, capture, now, None).await
+}
+
+/// Сохранить черновик и ответ для ключа идемпотентности одной транзакцией.
+///
+/// `responder` вызывается после вставки черновика, но до коммита, поэтому ответ
+/// и `capture_drafts` коммитятся вместе. Вызывающая сторона должна передать
+/// соединение внутри транзакции, чтобы обе записи были атомарны.
+pub async fn create_with_responder(
+    conn: &mut PgConnection,
+    capture: NewCapture,
+    now: DateTime<Utc>,
+    responder: Option<Responder<'_, Draft>>,
+) -> Result<Draft, DomainError> {
     let stored = Stored::from_parsed(capture.parsed);
-    drafts::insert(
+    let household_id = capture.household_id;
+    let source = capture.source;
+    let idempotency_key = capture.idempotency_key.clone();
+    let draft = drafts::insert(
         conn,
         NewDraft {
-            id: Uuid::now_v7(),
-            household_id: capture.household_id,
+            id: capture.id.unwrap_or_else(Uuid::now_v7),
+            household_id,
             user_id: capture.user_id,
             chat_id: capture.chat_id,
-            source: capture.source,
+            source,
             mode: capture.mode,
             idempotency_key: capture.idempotency_key,
             request_hash: capture.request_hash,
@@ -275,7 +300,12 @@ pub async fn create(
         },
         now,
     )
-    .await
+    .await?;
+    if let (Some(key), Some(responder)) = (idempotency_key.as_deref(), responder) {
+        let response = responder(&draft);
+        capture_requests::complete(conn, household_id, source, key, &response, now).await?;
+    }
+    Ok(draft)
 }
 
 /// Черновик с проверенными элементами; чужой черновик — `NotFound`.
@@ -584,7 +614,8 @@ pub async fn confirm(
 /// Строка `capture_drafts` сразу пишется в статусе `applied`, затем в той же
 /// транзакции создаются элементы (вместе с их событиями) и привязываются к
 /// capture. Любая ошибка откатывает всё: не остаётся ни элементов, ни событий,
-/// ни строки capture.
+/// ни строки capture. Ответ для ключа идемпотентности пишется в той же
+/// транзакции через `responder`.
 pub async fn apply_auto(
     conn: &mut PgConnection,
     capture: NewCapture,
@@ -592,19 +623,22 @@ pub async fn apply_auto(
     context: &CaptureContext,
     items: Vec<DraftItem>,
     now: DateTime<Utc>,
+    responder: Option<Responder<'_, Applied>>,
 ) -> Result<Applied, DraftError> {
     let household_id = capture.household_id;
+    let source = capture.source;
+    let idempotency_key = capture.idempotency_key.clone();
     let stored = Stored::from_parsed(capture.parsed);
 
     let mut tx = conn.begin().await?;
     let draft = drafts::insert_applied(
         &mut tx,
         NewDraft {
-            id: Uuid::now_v7(),
+            id: capture.id.unwrap_or_else(Uuid::now_v7),
             household_id,
             user_id: capture.user_id,
             chat_id: capture.chat_id,
-            source: capture.source,
+            source,
             mode: capture.mode,
             idempotency_key: capture.idempotency_key,
             request_hash: capture.request_hash,
@@ -617,18 +651,25 @@ pub async fn apply_auto(
     )
     .await?;
 
-    let mut created = create_items(&mut tx, household_id, context, items, actor, now).await?;
+    let created = create_items(&mut tx, household_id, context, items, actor, now).await?;
     let ids: Vec<Uuid> = created.iter().map(|item| item.id).collect();
     drafts::link_items(&mut tx, household_id, draft.id, &ids).await?;
-    tx.commit().await?;
 
-    for item in &mut created {
-        item.capture_id = Some(draft.id);
-    }
-    Ok(Applied {
+    let mut applied = Applied {
         capture_id: draft.id,
         items: created,
-    })
+    };
+    if let (Some(key), Some(responder)) = (idempotency_key.as_deref(), responder) {
+        let response = responder(&applied);
+        capture_requests::complete(&mut tx, household_id, source, key, &response, now).await?;
+    }
+
+    tx.commit().await?;
+
+    for item in &mut applied.items {
+        item.capture_id = Some(draft.id);
+    }
+    Ok(applied)
 }
 
 /// Создать элементы проверенного черновика в уже открытой транзакции.

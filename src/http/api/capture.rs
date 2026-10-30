@@ -10,16 +10,18 @@ use std::sync::{Arc, Mutex};
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRequest, FromRequestParts, Request, State};
-use axum::http::StatusCode;
 use axum::http::request::Parts;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sqlx::Connection;
 use uuid::Uuid;
 
 use crate::auth::tokens::AuthContext;
 use crate::capture::breaker::CircuitBreaker;
-use crate::capture::draft::{self, NewCapture};
+use crate::capture::draft::{self, Applied, NewCapture, Responder};
 use crate::capture::llm::{self, Failure};
 use crate::capture::prompt::PROMPT_VERSION;
 use crate::capture::schema::{ParseError, ParsedResponse};
@@ -28,6 +30,9 @@ use crate::config::CaptureConfig;
 use crate::domain::error::DomainError;
 use crate::domain::models::{CaptureMode, CaptureSource, Item, List, ListKind};
 use crate::home_assistant::AiTask;
+use crate::storage::repositories::capture_requests;
+use crate::storage::repositories::capture_requests::Reserved;
+use crate::storage::repositories::drafts::Draft;
 use crate::storage::repositories::lists;
 use crate::storage::repositories::llm_runs::{self, FAILURE, NewRun, SUCCESS};
 
@@ -264,7 +269,7 @@ pub struct CaptureRequest {
 }
 
 /// Статус capture в ответе.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
     /// Элементы созданы.
@@ -276,7 +281,7 @@ pub enum Status {
 }
 
 /// Элемент в ответе.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaptureItem {
     /// Идентификатор созданного элемента; у черновика — `null`.
     pub id: Option<Uuid>,
@@ -293,7 +298,7 @@ pub struct CaptureItem {
 }
 
 /// Ответ `POST /api/v1/capture`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaptureResponse {
     /// Идентификатор capture; для черновика совпадает с `draft_id`.
     pub capture_id: Uuid,
@@ -313,10 +318,18 @@ pub struct CaptureResponse {
     pub clarifications: Vec<String>,
 }
 
+/// Заголовок с ключом повтора.
+const IDEMPOTENCY_HEADER: &str = "idempotency-key";
+/// Предельная длина ключа повтора.
+const IDEMPOTENCY_KEY_MAX: usize = 128;
+/// Через сколько секунд повторять запрос, пока первый обрабатывается.
+const IN_PROGRESS_RETRY_AFTER: u64 = 2;
+
 /// Обработать внешний capture.
 pub async fn capture(
     State(state): State<AppState>,
     auth: CaptureAuth,
+    headers: HeaderMap,
     ApiJson(request): ApiJson<CaptureRequest>,
 ) -> Result<Json<CaptureResponse>, ApiError> {
     let auth = auth.0;
@@ -337,8 +350,17 @@ pub async fn capture(
     let now = Utc::now();
     let source: CaptureSource = request.source.into();
     // Идентификатор попытки для журнала и ответа `rejected`; у применённого
-    // capture в ответе и журнале будет идентификатор черновика.
+    // capture в ответе и журнале будет идентификатор черновика. При повторе
+    // этот же идентификатор закрепляется за резервом ключа.
     let capture_id = Uuid::now_v7();
+
+    let idempotency_key = resolve_idempotency_key(
+        headers.get(IDEMPOTENCY_HEADER),
+        request.idempotency_key.as_deref(),
+    )?;
+    let request_hash = idempotency_key
+        .as_ref()
+        .map(|_| request_hash(&text, source, request.mode, request.hint, request.list_id));
 
     let decision = capture.rate.check(auth.token_id, now);
     if !decision.allowed {
@@ -373,10 +395,73 @@ pub async fn capture(
             None => None,
         };
 
-        let used = llm_runs::count_since(&mut conn, auth.household_id, now - Duration::hours(24))
+        // Ключ резервируется отдельной короткой транзакцией до вызова LLM:
+        // параллельный повтор должен увидеть резерв, а не запустить второй
+        // разбор. Коммит делает `reserve` перед возвратом. Проверки квоты и
+        // предохранителя идут после резерва, чтобы завершённый повтор получал
+        // сохранённый ответ, даже если квота уже исчерпана.
+        if let Some(key) = &idempotency_key {
+            let hash = request_hash.as_deref().unwrap_or_default();
+            match capture_requests::reserve(
+                &mut conn,
+                auth.household_id,
+                source,
+                key,
+                hash,
+                capture_id,
+                now,
+            )
             .await
-            .map_err(database_error)?;
+            .map_err(database_error)?
+            {
+                Reserved::Acquired => {}
+                Reserved::Completed(response) => {
+                    let response: CaptureResponse =
+                        serde_json::from_value(response).map_err(|error| {
+                            tracing::error!(%error, "stored idempotency response is corrupted");
+                            ApiError::internal("Database error")
+                        })?;
+                    log_capture(source, "replayed", response.capture_id);
+                    return Ok(Json(response));
+                }
+                Reserved::InProgress => {
+                    return Err(ApiError::conflict(
+                        "Capture with this Idempotency-Key is still in progress",
+                    )
+                    .with_retry_after(IN_PROGRESS_RETRY_AFTER));
+                }
+                Reserved::Mismatch => {
+                    return Err(ApiError::validation(
+                        "Idempotency-Key was already used with a different request",
+                    ));
+                }
+            }
+        }
+
+        let used =
+            match llm_runs::count_since(&mut conn, auth.household_id, now - Duration::hours(24))
+                .await
+            {
+                Ok(used) => used,
+                Err(error) => {
+                    release_key(
+                        &mut conn,
+                        auth.household_id,
+                        source,
+                        idempotency_key.as_deref(),
+                    )
+                    .await;
+                    return Err(database_error(error));
+                }
+            };
         if used >= i64::from(capture.quota) {
+            release_key(
+                &mut conn,
+                auth.household_id,
+                source,
+                idempotency_key.as_deref(),
+            )
+            .await;
             tracing::warn!(
                 metric = "capture_quota_exhausted",
                 "llm capture quota is exhausted"
@@ -387,6 +472,13 @@ pub async fn capture(
             ));
         }
         if !capture.breaker.allow(now) {
+            release_key(
+                &mut conn,
+                auth.household_id,
+                source,
+                idempotency_key.as_deref(),
+            )
+            .await;
             tracing::warn!(
                 metric = "capture_circuit_open",
                 "llm circuit breaker is open"
@@ -397,7 +489,20 @@ pub async fn capture(
             ));
         }
 
-        let context = draft::load_context_for(&mut conn, auth.household_id, None, now).await?;
+        let context = match draft::load_context_for(&mut conn, auth.household_id, None, now).await {
+            Ok(context) => context,
+            Err(error) => {
+                release_key(
+                    &mut conn,
+                    auth.household_id,
+                    source,
+                    idempotency_key.as_deref(),
+                )
+                .await;
+                return Err(error.into());
+            }
+        };
+
         (target_list, context)
     };
 
@@ -437,14 +542,28 @@ pub async fn capture(
                 failed.failure,
                 Failure::Parse(ParseError::TooManyItems { .. })
             ) {
+                let response =
+                    rejected_response(capture_id, TOO_MANY_ITEMS_SPEECH.to_owned(), Vec::new());
+                store_response(
+                    &mut conn,
+                    auth.household_id,
+                    source,
+                    idempotency_key.as_deref(),
+                    &response,
+                    failed.finished_at,
+                )
+                .await?;
                 log_capture(source, "rejected", capture_id);
-                return Ok(rejected_response(
-                    capture_id,
-                    TOO_MANY_ITEMS_SPEECH.to_owned(),
-                    Vec::new(),
-                ));
+                return Ok(Json(response));
             }
 
+            release_key(
+                &mut conn,
+                auth.household_id,
+                source,
+                idempotency_key.as_deref(),
+            )
+            .await;
             log_capture(source, "unavailable", capture_id);
             return Err(ApiError::service_unavailable(
                 "Automatic capture is temporarily unavailable",
@@ -473,42 +592,80 @@ pub async fn capture(
         input_tokens: None,
         output_tokens: None,
     };
-    llm_runs::record(&mut conn, run, finished_at)
-        .await
-        .map_err(database_error)?;
+    if let Err(error) = llm_runs::record(&mut conn, run, finished_at).await {
+        release_key(
+            &mut conn,
+            auth.household_id,
+            source,
+            idempotency_key.as_deref(),
+        )
+        .await;
+        return Err(database_error(error));
+    }
 
     if validated.items.is_empty() {
-        log_capture(source, "rejected", capture_id);
-        return Ok(rejected_response(
+        let response = rejected_response(
             capture_id,
             rejected_speech(&validated.items),
-            validated.clarifications,
-        ));
+            validated.clarifications.clone(),
+        );
+        store_response(
+            &mut conn,
+            auth.household_id,
+            source,
+            idempotency_key.as_deref(),
+            &response,
+            finished_at,
+        )
+        .await?;
+        log_capture(source, "rejected", capture_id);
+        return Ok(Json(response));
     }
 
     match request.mode {
         CaptureMode::Auto => {
             if !validated.is_valid() {
-                log_capture(source, "rejected", capture_id);
-                return Ok(rejected_response(
+                let response = rejected_response(
                     capture_id,
                     rejected_speech(&validated.items),
-                    validated.clarifications,
-                ));
+                    validated.clarifications.clone(),
+                );
+                store_response(
+                    &mut conn,
+                    auth.household_id,
+                    source,
+                    idempotency_key.as_deref(),
+                    &response,
+                    finished_at,
+                )
+                .await?;
+                log_capture(source, "rejected", capture_id);
+                return Ok(Json(response));
             }
             let item_kinds: Vec<ListKind> = validated.items.iter().map(|item| item.kind).collect();
             let expected_items = item_kinds.len();
             let actor = integration_actor(item_source);
-            let applied = draft::apply_auto(
+            let kinds_for_response = item_kinds.clone();
+            let clarifications = validated.clarifications.clone();
+            let responder: Responder<'_, Applied> = Box::new(move |applied| {
+                serde_json::to_value(applied_response(
+                    applied,
+                    &kinds_for_response,
+                    clarifications,
+                ))
+                .unwrap_or(Value::Null)
+            });
+            let applied = match draft::apply_auto(
                 &mut conn,
                 NewCapture {
+                    id: idempotency_key.as_ref().map(|_| capture_id),
                     household_id: auth.household_id,
                     user_id: None,
                     chat_id: None,
                     source,
                     mode: CaptureMode::Auto,
-                    idempotency_key: None,
-                    request_hash: None,
+                    idempotency_key: idempotency_key.clone(),
+                    request_hash: request_hash.clone(),
                     raw_text: text.clone(),
                     parsed: parsed.clone(),
                     fallback: false,
@@ -518,63 +675,269 @@ pub async fn capture(
                 &context,
                 validated.items,
                 finished_at,
+                Some(responder),
             )
             .await
-            .map_err(draft_error)?;
+            {
+                Ok(applied) => applied,
+                Err(error) => {
+                    release_key(
+                        &mut conn,
+                        auth.household_id,
+                        source,
+                        idempotency_key.as_deref(),
+                    )
+                    .await;
+                    return Err(draft_error(error));
+                }
+            };
             if applied.items.len() != expected_items {
                 tracing::error!("applied capture item count does not match the parse");
+                release_key(
+                    &mut conn,
+                    auth.household_id,
+                    source,
+                    idempotency_key.as_deref(),
+                )
+                .await;
                 return Err(ApiError::internal("Database error"));
             }
-            let items: Vec<CaptureItem> = applied
-                .items
-                .iter()
-                .zip(&item_kinds)
-                .map(|(item, kind)| item_response(item, *kind))
-                .collect();
             log_capture(source, "applied", applied.capture_id);
-            Ok(Json(CaptureResponse {
-                capture_id: applied.capture_id,
-                status: Status::Applied,
-                fallback: false,
-                speech: fit_speech(applied_speech(&items)),
-                items,
-                draft_id: None,
-                expires_at: None,
-                clarifications: validated.clarifications,
-            }))
+            Ok(Json(applied_response(
+                &applied,
+                &item_kinds,
+                validated.clarifications,
+            )))
         }
         CaptureMode::Draft => {
-            let draft = draft::create(
-                &mut conn,
+            let items: Vec<CaptureItem> = validated.items.iter().map(draft_item_response).collect();
+            let draft_items = items.clone();
+            let clarifications = validated.clarifications.clone();
+            let responder: Responder<'_, Draft> = Box::new(move |draft| {
+                serde_json::to_value(draft_response(draft, draft_items, clarifications))
+                    .unwrap_or(Value::Null)
+            });
+            // Ответ и черновик пишутся одной транзакцией: падение между ними не
+            // должно оставить ключ в состоянии «обрабатывается» после коммита.
+            let mut tx = conn.begin().await.map_err(database_error)?;
+            let created = draft::create_with_responder(
+                &mut tx,
                 NewCapture {
+                    id: idempotency_key.as_ref().map(|_| capture_id),
                     household_id: auth.household_id,
                     user_id: None,
                     chat_id: None,
                     source,
                     mode: CaptureMode::Draft,
-                    idempotency_key: None,
-                    request_hash: None,
+                    idempotency_key: idempotency_key.clone(),
+                    request_hash: request_hash.clone(),
                     raw_text: text,
                     parsed,
                     fallback: false,
                     prompt_version: Some(PROMPT_VERSION.to_owned()),
                 },
                 finished_at,
+                Some(responder),
             )
-            .await?;
-            let items: Vec<CaptureItem> = validated.items.iter().map(draft_item_response).collect();
+            .await;
+            let draft = match created {
+                Ok(draft) => {
+                    if let Err(error) = tx.commit().await {
+                        let mut fresh = connection(&state).await?;
+                        release_key(
+                            &mut fresh,
+                            auth.household_id,
+                            source,
+                            idempotency_key.as_deref(),
+                        )
+                        .await;
+                        return Err(database_error(error));
+                    }
+                    draft
+                }
+                Err(error) => {
+                    let _ = tx.rollback().await;
+                    release_key(
+                        &mut conn,
+                        auth.household_id,
+                        source,
+                        idempotency_key.as_deref(),
+                    )
+                    .await;
+                    return Err(error.into());
+                }
+            };
             log_capture(source, "draft", draft.id);
-            Ok(Json(CaptureResponse {
-                capture_id: draft.id,
-                status: Status::Draft,
-                fallback: false,
-                speech: fit_speech(draft_speech(&items)),
+            Ok(Json(draft_response(
+                &draft,
                 items,
-                draft_id: Some(draft.id),
-                expires_at: Some(draft.expires_at),
-                clarifications: validated.clarifications,
-            }))
+                validated.clarifications,
+            )))
         }
+    }
+}
+
+/// Ключ повтора: заголовок сильнее поля, но различающиеся значения — ошибка.
+fn resolve_idempotency_key(
+    header: Option<&HeaderValue>,
+    field: Option<&str>,
+) -> Result<Option<String>, ApiError> {
+    let header = match header {
+        Some(value) => match value.to_str() {
+            Ok(value) => validate_idempotency_key(value)?,
+            Err(_) => return Err(invalid_idempotency_key()),
+        },
+        None => None,
+    };
+    let field = field.map(validate_idempotency_key).transpose()?.flatten();
+    match (header, field) {
+        (Some(header), Some(field)) if header != field => Err(ApiError::validation(
+            "Idempotency-Key header and idempotency_key field must match",
+        )),
+        (Some(key), _) | (None, Some(key)) => Ok(Some(key)),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Пустой ключ означает «без ключа»; иначе допустимы 1..128 видимых ASCII.
+fn validate_idempotency_key(raw: &str) -> Result<Option<String>, ApiError> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if raw.len() > IDEMPOTENCY_KEY_MAX || !raw.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(invalid_idempotency_key());
+    }
+    Ok(Some(raw.to_owned()))
+}
+
+fn invalid_idempotency_key() -> ApiError {
+    ApiError::validation("Idempotency-Key must be 1..128 visible ASCII characters without spaces")
+}
+
+/// sha256 канонического представления значимых полей. Ключ сюда не входит.
+fn request_hash(
+    text: &str,
+    source: CaptureSource,
+    mode: CaptureMode,
+    hint: Option<RequestHint>,
+    list_id: Option<Uuid>,
+) -> String {
+    let canonical = json!({
+        "text": text,
+        "source": source_name(source),
+        "mode": mode_name(mode),
+        "hint": hint.map(hint_name),
+        "list_id": list_id,
+    });
+    sha256_hex(canonical.to_string().as_bytes())
+}
+
+fn sha256_hex(value: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(value);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+fn mode_name(mode: CaptureMode) -> &'static str {
+    match mode {
+        CaptureMode::Auto => "auto",
+        CaptureMode::Draft => "draft",
+    }
+}
+
+fn hint_name(hint: RequestHint) -> &'static str {
+    match hint {
+        RequestHint::Tasks => "tasks",
+        RequestHint::Shopping => "shopping",
+        RequestHint::Checklist => "checklist",
+    }
+}
+
+fn applied_response(
+    applied: &Applied,
+    kinds: &[ListKind],
+    clarifications: Vec<String>,
+) -> CaptureResponse {
+    let items: Vec<CaptureItem> = applied
+        .items
+        .iter()
+        .zip(kinds)
+        .map(|(item, kind)| item_response(item, *kind))
+        .collect();
+    CaptureResponse {
+        capture_id: applied.capture_id,
+        status: Status::Applied,
+        fallback: false,
+        speech: fit_speech(applied_speech(&items)),
+        items,
+        draft_id: None,
+        expires_at: None,
+        clarifications,
+    }
+}
+
+fn draft_response(
+    draft: &Draft,
+    items: Vec<CaptureItem>,
+    clarifications: Vec<String>,
+) -> CaptureResponse {
+    CaptureResponse {
+        capture_id: draft.id,
+        status: Status::Draft,
+        fallback: false,
+        speech: fit_speech(draft_speech(&items)),
+        items,
+        draft_id: Some(draft.id),
+        expires_at: Some(draft.expires_at),
+        clarifications,
+    }
+}
+
+/// Сохранить ответ в резерве ключа. После ошибки записи резерв освобождается,
+/// чтобы повтор не ждал истечения.
+async fn store_response(
+    conn: &mut sqlx::PgConnection,
+    household_id: Uuid,
+    source: CaptureSource,
+    key: Option<&str>,
+    response: &CaptureResponse,
+    now: DateTime<Utc>,
+) -> Result<(), ApiError> {
+    let Some(key) = key else {
+        return Ok(());
+    };
+    let value = serde_json::to_value(response).map_err(|error| {
+        tracing::error!(%error, "capture response could not be serialized");
+        ApiError::internal("Database error")
+    })?;
+    if let Err(error) =
+        capture_requests::complete(conn, household_id, source, key, &value, now).await
+    {
+        tracing::error!(%error, "could not store the idempotency response");
+        release_key(conn, household_id, source, Some(key)).await;
+        return Err(database_error(error));
+    }
+    Ok(())
+}
+
+/// Освободить ключ после ошибки, чтобы повтор обработался заново.
+async fn release_key(
+    conn: &mut sqlx::PgConnection,
+    household_id: Uuid,
+    source: CaptureSource,
+    key: Option<&str>,
+) {
+    let Some(key) = key else {
+        return;
+    };
+    if let Err(error) = capture_requests::release(conn, household_id, source, key).await {
+        tracing::error!(%error, "could not release the idempotency key");
     }
 }
 
@@ -677,8 +1040,8 @@ fn rejected_response(
     capture_id: Uuid,
     speech: String,
     clarifications: Vec<String>,
-) -> Json<CaptureResponse> {
-    Json(CaptureResponse {
+) -> CaptureResponse {
+    CaptureResponse {
         capture_id,
         status: Status::Rejected,
         fallback: false,
@@ -687,7 +1050,7 @@ fn rejected_response(
         draft_id: None,
         expires_at: None,
         clarifications,
-    })
+    }
 }
 
 fn rejected_speech(items: &[DraftItem]) -> String {
