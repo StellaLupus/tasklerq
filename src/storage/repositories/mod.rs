@@ -4,11 +4,14 @@
 //! объединять несколько операций в одну транзакцию.
 
 pub mod audit;
+pub mod capture_jobs;
+pub mod drafts;
 pub mod events;
 pub mod households;
 pub mod invites;
 pub mod items;
 pub mod lists;
+pub mod llm_runs;
 pub mod members;
 pub mod subtasks;
 pub mod tags;

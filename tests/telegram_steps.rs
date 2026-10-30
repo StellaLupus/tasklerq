@@ -28,6 +28,7 @@ fn ctx(conn: &mut PgConnection, chat: i64) -> Ctx<'_> {
         tz: chrono_tz::UTC,
         toast: None,
         banner: None,
+        llm_capture: false,
     }
 }
 

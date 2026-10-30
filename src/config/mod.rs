@@ -251,6 +251,16 @@ pub struct LlmConfig {
     pub daily_quota: u32,
 }
 
+impl LlmConfig {
+    /// Загрузить только параметры LLM-capture из окружения.
+    ///
+    /// Нужно подкоманде `capture-eval`: остальная конфигурация сервиса ей не
+    /// требуется.
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Config::llm_config(&EnvSource::from_process())
+    }
+}
+
 /// Параметры очередей.
 #[derive(Clone, Copy, Debug)]
 pub struct QueueConfig {

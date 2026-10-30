@@ -1,0 +1,515 @@
+{
+  "version": 1,
+  "context": {
+    "now": "2026-10-30T11:05:00Z",
+    "timezone": "Europe/Moscow",
+    "author": "Анна",
+    "lists": [
+      { "name": "Задачи", "kind": "tasks", "default": true },
+      { "name": "Покупки", "kind": "shopping", "default": true },
+      { "name": "Дача", "kind": "tasks", "default": false }
+    ],
+    "members": [
+      { "name": "Анна", "username": "anna" },
+      { "name": "Пётр" }
+    ]
+  },
+  "phrases": [
+    {
+      "id": "simple-call-mom",
+      "category": "simple",
+      "text": "позвонить маме",
+      "expect": {
+        "items": [
+          { "title": "Позвонить маме", "kind": "tasks", "list": "Задачи" }
+        ]
+      }
+    },
+    {
+      "id": "simple-water-flowers",
+      "category": "simple",
+      "text": "полить цветы",
+      "expect": {
+        "items": [
+          { "title": "Полить цветы", "kind": "tasks", "list": "Задачи" }
+        ]
+      }
+    },
+    {
+      "id": "simple-take-out-trash",
+      "category": "simple",
+      "text": "вынести мусор",
+      "expect": {
+        "items": [
+          { "title": "Вынести мусор", "kind": "tasks", "list": "Задачи" }
+        ]
+      }
+    },
+    {
+      "id": "simple-paint-fence-dacha",
+      "category": "simple",
+      "text": "на даче покрасить забор",
+      "expect": {
+        "items": [
+          { "title": "Покрасить забор", "kind": "tasks", "list": "Дача" }
+        ]
+      }
+    },
+    {
+      "id": "shopping-milk-bread",
+      "category": "shopping",
+      "text": "купить молоко и хлеб",
+      "expect": {
+        "items": [
+          { "title": "Молоко", "kind": "shopping", "list": "Покупки" },
+          { "title": "Хлеб", "kind": "shopping", "list": "Покупки" }
+        ]
+      }
+    },
+    {
+      "id": "shopping-three-positions",
+      "category": "shopping",
+      "text": "купить молоко 2 л, хлеб и яйца",
+      "expect": {
+        "items": [
+          { "title": "Молоко", "kind": "shopping", "list": "Покупки" },
+          { "title": "Хлеб", "kind": "shopping", "list": "Покупки" },
+          { "title": "Яйца", "kind": "shopping", "list": "Покупки" }
+        ]
+      }
+    },
+    {
+      "id": "shopping-named-list",
+      "category": "shopping",
+      "text": "в Покупки: сыр, колбаса и сметана",
+      "expect": {
+        "items": [
+          { "title": "Сыр", "kind": "shopping", "list": "Покупки" },
+          { "title": "Колбаса", "kind": "shopping", "list": "Покупки" },
+          { "title": "Сметана", "kind": "shopping", "list": "Покупки" }
+        ]
+      }
+    },
+    {
+      "id": "shopping-cat-supplies",
+      "category": "shopping",
+      "text": "купить корм для кота и наполнитель",
+      "expect": {
+        "items": [
+          { "title": "Корм для кота", "kind": "shopping", "list": "Покупки" },
+          { "title": "Наполнитель", "kind": "shopping", "list": "Покупки" }
+        ]
+      }
+    },
+    {
+      "id": "relative-tomorrow-bread",
+      "category": "dates_relative",
+      "text": "завтра купить хлеб",
+      "expect": {
+        "items": [
+          {
+            "title": "Хлеб",
+            "kind": "shopping",
+            "list": "Покупки",
+            "due_date": "2026-10-31"
+          }
+        ]
+      }
+    },
+    {
+      "id": "relative-day-after-tomorrow",
+      "category": "dates_relative",
+      "text": "послезавтра позвонить в поликлинику",
+      "expect": {
+        "items": [
+          {
+            "title": "Позвонить в поликлинику",
+            "kind": "tasks",
+            "list": "Задачи",
+            "due_date": "2026-11-01"
+          }
+        ]
+      }
+    },
+    {
+      "id": "relative-next-monday",
+      "category": "dates_relative",
+      "text": "в понедельник сдать отчёт",
+      "expect": {
+        "items": [
+          {
+            "title": "Сдать отчёт",
+            "kind": "tasks",
+            "list": "Задачи",
+            "due_date": "2026-11-02"
+          }
+        ]
+      }
+    },
+    {
+      "id": "relative-in-a-week",
+      "category": "dates_relative",
+      "text": "через неделю оплатить интернет",
+      "expect": {
+        "items": [
+          {
+            "title": "Оплатить интернет",
+            "kind": "tasks",
+            "list": "Задачи",
+            "due_date": "2026-11-06"
+          }
+        ]
+      }
+    },
+    {
+      "id": "absolute-november-5",
+      "category": "dates_absolute",
+      "text": "5 ноября сходить к стоматологу",
+      "expect": {
+        "items": [
+          {
+            "title": "Сходить к стоматологу",
+            "kind": "tasks",
+            "list": "Задачи",
+            "due_date": "2026-11-05"
+          }
+        ]
+      }
+    },
+    {
+      "id": "absolute-december-15",
+      "category": "dates_absolute",
+      "text": "15 декабря продлить страховку",
+      "expect": {
+        "items": [
+          {
+            "title": "Продлить страховку",
+            "kind": "tasks",
+            "list": "Задачи",
+            "due_date": "2026-12-15"
+          }
+        ]
+      }
+    },
+    {
+      "id": "absolute-december-31",
+      "category": "dates_absolute",
+      "text": "31 декабря купить подарки",
+      "expect": {
+        "items": [
+          {
+            "title": "Купить подарки",
+            "kind": "tasks",
+            "list": "Задачи",
+            "due_date": "2026-12-31"
+          }
+        ]
+      }
+    },
+    {
+      "id": "absolute-january-2027",
+      "category": "dates_absolute",
+      "text": "1 января 2027 поздравить бабушку",
+      "expect": {
+        "items": [
+          {
+            "title": "Поздравить бабушку",
+            "kind": "tasks",
+            "list": "Задачи",
+            "due_date": "2027-01-01"
+          }
+        ]
+      }
+    },
+    {
+      "id": "time-today-evening",
+      "category": "time_of_day",
+      "text": "позвонить маме в 18:00",
+      "expect": {
+        "items": [
+          {
+            "title": "Позвонить маме",
+            "kind": "tasks",
+            "list": "Задачи",
+            "due_date": "2026-10-30",
+            "due_time": "18:00"
+          }
+        ]
+      }
+    },
+    {
+      "id": "time-tomorrow-morning",
+      "category": "time_of_day",
+      "text": "завтра в 9 утра сделать зарядку",
+      "expect": {
+        "items": [
+          {
+            "title": "Сделать зарядку",
+            "kind": "tasks",
+            "list": "Задачи",
+            "due_date": "2026-10-31",
+            "due_time": "09:00"
+          }
+        ]
+      }
+    },
+    {
+      "id": "time-today-late",
+      "category": "time_of_day",
+      "text": "сегодня в 20:30 посмотреть фильм",
+      "expect": {
+        "items": [
+          {
+            "title": "Посмотреть фильм",
+            "kind": "tasks",
+            "list": "Задачи",
+            "due_date": "2026-10-30",
+            "due_time": "20:30"
+          }
+        ]
+      }
+    },
+    {
+      "id": "time-wednesday-afternoon",
+      "category": "time_of_day",
+      "text": "в среду в 15:00 встреча с врачом",
+      "expect": {
+        "items": [
+          {
+            "title": "Встреча с врачом",
+            "kind": "tasks",
+            "list": "Задачи",
+            "due_date": "2026-11-04",
+            "due_time": "15:00"
+          }
+        ]
+      }
+    },
+    {
+      "id": "recurrence-daily-vitamins",
+      "category": "recurrence",
+      "text": "каждый день принимать витамины",
+      "expect": {
+        "items": [
+          {
+            "title": "Принимать витамины",
+            "kind": "tasks",
+            "list": "Задачи",
+            "due_date": "2026-10-30",
+            "recurrence": { "freq": "daily" }
+          }
+        ]
+      }
+    },
+    {
+      "id": "recurrence-friday-flowers",
+      "category": "recurrence",
+      "text": "каждую пятницу поливать цветы",
+      "expect": {
+        "items": [
+          {
+            "title": "Поливать цветы",
+            "kind": "tasks",
+            "list": "Задачи",
+            "due_date": "2026-10-30",
+            "recurrence": { "freq": "weekly", "weekdays": [5] }
+          }
+        ]
+      }
+    },
+    {
+      "id": "recurrence-tuesday-thursday-gym",
+      "category": "recurrence",
+      "text": "по вторникам и четвергам ходить в спортзал",
+      "expect": {
+        "items": [
+          {
+            "title": "Ходить в спортзал",
+            "kind": "tasks",
+            "list": "Задачи",
+            "due_date": "2026-11-03",
+            "recurrence": { "freq": "weekly", "weekdays": [2, 4] }
+          }
+        ]
+      }
+    },
+    {
+      "id": "recurrence-monthly-rent",
+      "category": "recurrence",
+      "text": "каждый месяц оплачивать квартиру",
+      "expect": {
+        "items": [
+          {
+            "title": "Оплачивать квартиру",
+            "kind": "tasks",
+            "list": "Задачи",
+            "due_date": "2026-10-30",
+            "recurrence": { "freq": "monthly" }
+          }
+        ]
+      }
+    },
+    {
+      "id": "assignee-pyotr-dishes",
+      "category": "assignees",
+      "text": "поручить Петру помыть посуду",
+      "expect": {
+        "items": [
+          {
+            "title": "Помыть посуду",
+            "kind": "tasks",
+            "list": "Задачи",
+            "assignee": "Пётр"
+          }
+        ]
+      }
+    },
+    {
+      "id": "assignee-anna-flowers-tomorrow",
+      "category": "assignees",
+      "text": "полить цветы завтра — Анна",
+      "expect": {
+        "items": [
+          {
+            "title": "Полить цветы",
+            "kind": "tasks",
+            "list": "Задачи",
+            "assignee": "Анна",
+            "due_date": "2026-10-31"
+          }
+        ]
+      }
+    },
+    {
+      "id": "assignee-pyotr-trash",
+      "category": "assignees",
+      "text": "вынести мусор — Пётр",
+      "expect": {
+        "items": [
+          {
+            "title": "Вынести мусор",
+            "kind": "tasks",
+            "list": "Задачи",
+            "assignee": "Пётр"
+          }
+        ]
+      }
+    },
+    {
+      "id": "assignee-author-me",
+      "category": "assignees",
+      "text": "напомни мне позвонить в банк",
+      "expect": {
+        "items": [
+          {
+            "title": "Позвонить в банк",
+            "kind": "tasks",
+            "list": "Задачи",
+            "assignee": "Анна"
+          }
+        ]
+      }
+    },
+    {
+      "id": "ambiguity-alexey-dishes",
+      "category": "ambiguity",
+      "text": "поручить Алексею помыть посуду",
+      "context": {
+        "now": "2026-10-30T11:05:00Z",
+        "timezone": "Europe/Moscow",
+        "author": "Алексей",
+        "lists": [
+          { "name": "Задачи", "kind": "tasks", "default": true },
+          { "name": "Покупки", "kind": "shopping", "default": true },
+          { "name": "Дача", "kind": "tasks", "default": false }
+        ],
+        "members": [
+          { "name": "Алексей", "username": "alexey" },
+          { "name": "Алексей", "username": "alexey_2" }
+        ]
+      },
+      "expect": {
+        "items": [
+          { "title": "Помыть посуду", "kind": "tasks", "list": "Задачи" }
+        ],
+        "clarifications": ["assignee"]
+      }
+    },
+    {
+      "id": "ambiguity-alexey-documents",
+      "category": "ambiguity",
+      "text": "отнести документы Алексею",
+      "context": {
+        "now": "2026-10-30T11:05:00Z",
+        "timezone": "Europe/Moscow",
+        "author": "Алексей",
+        "lists": [
+          { "name": "Задачи", "kind": "tasks", "default": true },
+          { "name": "Покупки", "kind": "shopping", "default": true },
+          { "name": "Дача", "kind": "tasks", "default": false }
+        ],
+        "members": [
+          { "name": "Алексей", "username": "alexey" },
+          { "name": "Алексей", "username": "alexey_2" }
+        ]
+      },
+      "expect": {
+        "items": [
+          { "title": "Отнести документы", "kind": "tasks", "list": "Задачи" }
+        ],
+        "clarifications": ["assignee"]
+      }
+    },
+    {
+      "id": "ambiguity-doctor-tomorrow",
+      "category": "ambiguity",
+      "text": "встретиться с врачом завтра",
+      "expect": {
+        "items": [
+          {
+            "title": "Встретиться с врачом",
+            "kind": "tasks",
+            "list": "Задачи",
+            "due_date": "2026-10-31"
+          }
+        ],
+        "clarifications": ["due_date"]
+      }
+    },
+    {
+      "id": "ambiguity-meeting-no-date",
+      "category": "ambiguity",
+      "text": "встреча с врачом",
+      "expect": {
+        "items": [
+          { "title": "Встреча с врачом", "kind": "tasks", "list": "Задачи" }
+        ],
+        "clarifications": ["due_date"]
+      }
+    },
+    {
+      "id": "garbage-greeting",
+      "category": "garbage",
+      "text": "привет",
+      "expect": { "items": [] }
+    },
+    {
+      "id": "garbage-thanks",
+      "category": "garbage",
+      "text": "спасибо!",
+      "expect": { "items": [] }
+    },
+    {
+      "id": "garbage-small-talk",
+      "category": "garbage",
+      "text": "как дела?",
+      "expect": { "items": [] }
+    },
+    {
+      "id": "garbage-weather",
+      "category": "garbage",
+      "text": "сегодня хорошая погода",
+      "expect": { "items": [] }
+    }
+  ]
+}

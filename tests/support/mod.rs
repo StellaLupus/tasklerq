@@ -73,6 +73,36 @@ pub async fn db() -> TestDb {
     TestDb { pool }
 }
 
+/// Отдельная база с применёнными миграциями на том же сервере.
+///
+/// Нужна тестам, которые меняют схему (триггеры, DDL): такие операции берут
+/// блокировки на таблицы и подвешивают параллельные тесты общей базы.
+pub async fn isolated_db() -> TestDb {
+    let shared = DATABASE.get_or_init(start_db).await;
+    let name = format!("isolated_{}", Uuid::now_v7().simple());
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&shared.url)
+        .await
+        .expect("database should accept connections");
+    sqlx::query(&format!("CREATE DATABASE {name}"))
+        .execute(&admin)
+        .await
+        .expect("isolated database should be created");
+    admin.close().await;
+
+    let url = shared.url.replace("/tasklerq?", &format!("/{name}?"));
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&url)
+        .await
+        .expect("isolated database should accept connections");
+    storage::migrations::run(&pool)
+        .await
+        .expect("migrations should apply");
+    TestDb { pool }
+}
+
 /// URL общей тестовой базы (для запуска бинарника `tasklerq`).
 pub async fn database_url() -> String {
     DATABASE.get_or_init(start_db).await.url.clone()

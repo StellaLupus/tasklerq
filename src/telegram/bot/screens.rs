@@ -19,6 +19,8 @@ use super::{Ctx, Fail, card, forms, settings};
 pub async fn build(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
     match screen {
         Screen::Form => forms::view(ctx).await,
+        Screen::Processing => Ok(super::capture::processing()),
+        Screen::Draft { draft_id } => super::capture::view(ctx, *draft_id).await,
         Screen::Menu => menu(ctx).await,
         Screen::Welcome => Ok(welcome()),
         Screen::Add => Ok(add_choice()),

@@ -260,6 +260,9 @@ async fn create_action(ctx: &mut Ctx<'_>, mut form: ItemForm, act: FormAct) -> R
     let today = today(ctx);
     match act {
         FormAct::Cancel => {
+            if let Some(target) = form.target {
+                return crate::telegram::bot::capture::leave_form(ctx, target).await;
+            }
             clear(ctx).await?;
             ctx.toast("Отменено");
             ctx.present(Screen::Menu).await
@@ -293,6 +296,9 @@ async fn create_action(ctx: &mut Ctx<'_>, mut form: ItemForm, act: FormAct) -> R
             let step = form.step;
             advance(&mut form, step);
             open(ctx, Form::Create(form)).await
+        }
+        FormAct::Save | FormAct::SaveAnyway if form.target.is_some() => {
+            crate::telegram::bot::capture::save_form(ctx, form).await
         }
         FormAct::Save => save_create(ctx, form, false).await,
         FormAct::SaveAnyway => save_create(ctx, form, true).await,

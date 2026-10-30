@@ -9,6 +9,7 @@ use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::capture::draft::DueChoice;
 use crate::domain::error::DomainError;
 use crate::domain::models::{
     Field, Item, ItemPatch, ItemPriority, ItemStatus, ListKind, MonthRule, NewItem, Recurrence,
@@ -142,6 +143,13 @@ pub enum Screen {
     },
     /// Текущий шаг формы из `conversation_states`.
     Form,
+    /// Текст принят и ждёт разбора в фоне.
+    Processing,
+    /// Черновик capture: карточка, результат или причина, по которой он закрыт.
+    Draft {
+        /// Черновик.
+        draft_id: Uuid,
+    },
 }
 
 impl Screen {
@@ -448,6 +456,60 @@ pub enum Action {
     },
     /// Обновить текущий экран.
     Refresh,
+    /// Исправить элемент черновика в форме.
+    DraftEdit {
+        /// Черновик.
+        draft_id: Uuid,
+        /// Номер элемента с нуля.
+        index: usize,
+    },
+    /// Убрать элемент из черновика.
+    DraftRemove {
+        /// Черновик.
+        draft_id: Uuid,
+        /// Номер элемента с нуля.
+        index: usize,
+    },
+    /// Выбрать исполнителя в ответ на уточняющий вопрос.
+    DraftAssign {
+        /// Черновик.
+        draft_id: Uuid,
+        /// Номер элемента с нуля.
+        index: usize,
+        /// Выбранный участник.
+        user_id: Uuid,
+    },
+    /// Выбрать «сегодня» или «завтра» в ответ на вопрос о дате.
+    DraftDue {
+        /// Черновик.
+        draft_id: Uuid,
+        /// Номер элемента с нуля.
+        index: usize,
+        /// Какой день выбрать.
+        choice: DueChoice,
+    },
+    /// Открыть форму правки сразу на шаге срока.
+    DraftEditDue {
+        /// Черновик.
+        draft_id: Uuid,
+        /// Номер элемента с нуля.
+        index: usize,
+    },
+    /// Сохранить все элементы черновика.
+    DraftSave {
+        /// Черновик.
+        draft_id: Uuid,
+    },
+    /// Отказаться от черновика.
+    DraftCancel {
+        /// Черновик.
+        draft_id: Uuid,
+    },
+    /// Отменить сохранённый capture целиком.
+    DraftUndo {
+        /// Черновик.
+        draft_id: Uuid,
+    },
 }
 
 /// Настройка, которую можно переключить.
@@ -747,6 +809,18 @@ pub struct ItemForm {
     /// Найденная такая же позиция списка покупок.
     #[serde(default)]
     pub duplicate: Option<Duplicate>,
+    /// Форма правит элемент черновика capture, а не создаёт новый.
+    #[serde(default)]
+    pub target: Option<DraftTarget>,
+}
+
+/// Элемент черновика capture, который правит форма.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftTarget {
+    /// Черновик.
+    pub draft_id: Uuid,
+    /// Номер элемента с нуля.
+    pub index: usize,
 }
 
 /// Позиция, которая уже есть в списке.

@@ -2,6 +2,10 @@
 
 mod support;
 
+// Каждый тест работает в своей базе: `retention::run` чистит всю базу целиком,
+// и в общей базе параллельный тест успевал удалить строки соседа раньше, чем
+// тот читал статистику.
+
 use chrono::{Duration, Utc};
 use tasklerq::config::RetentionConfig;
 use tasklerq::domain::models::ListKind;
@@ -23,7 +27,7 @@ fn config() -> RetentionConfig {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retention_expires_drafts_and_purges_old_data() {
-    let db = support::db().await;
+    let db = support::isolated_db().await;
     let household = support::create_household(&db.pool).await;
     let doomed = support::create_household(&db.pool).await;
     let now = Utc::now();
@@ -236,7 +240,7 @@ async fn retention_purges_old_audit_events_only() {
     use tasklerq::domain::models::{Actor, ActorType};
     use tasklerq::storage::repositories::audit;
 
-    let db = support::db().await;
+    let db = support::isolated_db().await;
     let household = support::create_household(&db.pool).await;
     let now = Utc::now();
     let mut conn = db.pool.acquire().await.expect("connection");
@@ -275,7 +279,7 @@ async fn retention_purges_old_audit_events_only() {
 async fn retention_purges_finished_invites_only() {
     use tasklerq::storage::repositories::invites;
 
-    let db = support::db().await;
+    let db = support::isolated_db().await;
     let household = support::create_household(&db.pool).await;
     let now = Utc::now();
     let long_ago = now - Duration::days(400);
@@ -327,8 +331,48 @@ async fn retention_purges_finished_invites_only() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_purges_llm_runs_older_than_the_retention_window() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let old = Uuid::now_v7();
+    let recent = Uuid::now_v7();
+
+    for (id, created) in [
+        (old, now - Duration::days(31)),
+        (recent, now - Duration::days(5)),
+    ] {
+        sqlx::query(
+            "INSERT INTO llm_runs (
+                 id, household_id, source, mode, prompt_version, status,
+                 latency_ms, created_at
+             )
+             VALUES ($1, $2, 'telegram', 'draft', 'capture-v2', 'success', 1200, $3)",
+        )
+        .bind(id)
+        .bind(household.household_id)
+        .bind(created)
+        .execute(&db.pool)
+        .await
+        .expect("llm run");
+    }
+
+    let stats = retention::run(&db.pool, &config(), now)
+        .await
+        .expect("retention");
+    assert!(stats.purged_llm_runs >= 1);
+
+    let left: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM llm_runs WHERE id = ANY($1)")
+        .bind(vec![old, recent])
+        .fetch_all(&db.pool)
+        .await
+        .expect("runs");
+    assert_eq!(left, vec![recent]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retention_purges_finished_telegram_data_but_keeps_pending() {
-    let db = support::db().await;
+    let db = support::isolated_db().await;
     let now = Utc::now();
     let old = now - Duration::days(40);
     let tag = Uuid::now_v7().to_string();
