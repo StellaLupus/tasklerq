@@ -4,8 +4,6 @@
 //! источниками: Telegram-черновик живёт в боте и через API не виден. Чужой,
 //! несуществующий и не внешний capture не отличаются в ответе — все дают `404`.
 
-use std::collections::HashMap;
-
 use axum::Json;
 use axum::extract::{Path, State};
 use chrono::Utc;
@@ -99,14 +97,12 @@ pub async fn confirm(
     }
 
     let kinds = list_kinds(&mut conn, auth.household_id, &confirmed.items).await?;
-    let mut items = Vec::with_capacity(confirmed.items.len());
-    for item in &confirmed.items {
-        let kind = kinds.get(&item.list_id).copied().ok_or_else(|| {
-            tracing::error!(item_id = %item.id, "capture item has no list");
-            ApiError::internal("Database error")
-        })?;
-        items.push(item_response(item, kind));
-    }
+    let items: Vec<_> = confirmed
+        .items
+        .iter()
+        .zip(kinds)
+        .map(|(item, kind)| item_response(item, kind))
+        .collect();
 
     Ok(Json(CaptureResponse {
         capture_id,
@@ -156,17 +152,11 @@ pub async fn undo(
         .await
         .map_err(action_error)?;
 
-    let speech = if removed.is_empty() {
-        "Отменять нечего: элементы уже удалены.".to_owned()
-    } else {
-        fit_speech(format!("Отменил добавление: {}.", elements(removed.len())))
-    };
-
     Ok(Json(UndoResponse {
         capture_id,
         status: ActionStatus::Undone,
         removed: removed.len(),
-        speech,
+        speech: undo_speech(&removed),
     }))
 }
 
@@ -189,8 +179,9 @@ pub async fn undo_last(
             capture_id: None,
             status: ActionStatus::Undone,
             removed: 0,
-            speech: fit_speech(
-                "Нечего отменять: за последние 10 минут голосовых добавлений не было.".to_owned(),
+            speech: format!(
+                "Нечего отменять: за последние {} минут голосовых добавлений не было.",
+                items::UNDO_WINDOW_MINUTES
             ),
         }));
     };
@@ -199,17 +190,11 @@ pub async fn undo_last(
         .await
         .map_err(action_error)?;
 
-    let speech = if removed.is_empty() {
-        "Отменять нечего: элементы уже удалены.".to_owned()
-    } else {
-        fit_speech(format!("Отменил добавление: {}.", elements(removed.len())))
-    };
-
     Ok(Json(UndoLastResponse {
         capture_id: Some(draft.id),
         status: ActionStatus::Undone,
         removed: removed.len(),
-        speech,
+        speech: undo_speech(&removed),
     }))
 }
 
@@ -244,7 +229,7 @@ fn capture_not_found() -> ApiError {
     ApiError::not_found("Capture not found")
 }
 
-/// Вид каждого списка, который нужен для ответа.
+/// Вид списка для каждого элемента, в том же порядке.
 ///
 /// Список ищется по `item.list_id`, включая мягко удалённые: элемент capture
 /// переживает удаление своего списка, и повторный `confirm` должен вернуть его
@@ -253,21 +238,27 @@ async fn list_kinds(
     conn: &mut PgConnection,
     household_id: Uuid,
     items: &[Item],
-) -> Result<HashMap<Uuid, ListKind>, ApiError> {
-    let mut kinds = HashMap::new();
+) -> Result<Vec<ListKind>, ApiError> {
+    let mut kinds = Vec::with_capacity(items.len());
     for item in items {
-        if kinds.contains_key(&item.list_id) {
-            continue;
-        }
         let kind = lists::kind(conn, household_id, item.list_id)
             .await?
             .ok_or_else(|| {
                 tracing::error!(item_id = %item.id, "capture item has no list");
                 ApiError::internal("Database error")
             })?;
-        kinds.insert(item.list_id, kind);
+        kinds.push(kind);
     }
     Ok(kinds)
+}
+
+/// Фраза ответа об отмене capture.
+fn undo_speech(removed: &[Item]) -> String {
+    if removed.is_empty() {
+        "Отменять нечего: элементы уже удалены.".to_owned()
+    } else {
+        fit_speech(format!("Отменил добавление: {}.", elements(removed.len())))
+    }
 }
 
 fn action_error(error: DraftError) -> ApiError {

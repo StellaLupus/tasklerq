@@ -2430,3 +2430,60 @@ async fn capture_actions_require_the_scope_and_an_enabled_route() {
 
     assert_eq!(item_count(&db.pool, household.household_id).await, 0);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undo_last_uses_the_confirmation_time_not_the_draft_creation_time() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(two_purchases())]);
+    let app = app(&db.pool, ai.clone(), config());
+    let capture_id = voice_draft_capture(&app, &token).await;
+    sqlx::query(
+        "UPDATE capture_drafts SET created_at = now() - interval '11 minutes' WHERE id = $1",
+    )
+    .bind(capture_id)
+    .execute(&db.pool)
+    .await
+    .expect("age draft creation");
+
+    let (status, _, confirmed) = call(
+        &app,
+        Method::POST,
+        &action_uri(capture_id, "confirm"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{confirmed}");
+
+    let (status, json) = undo_last(&app, &token).await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["capture_id"], capture_id.to_string());
+    assert_eq!(json["removed"], 2);
+    assert_eq!(live_items_in_capture(&db.pool, capture_id).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undo_last_reports_nothing_removed_when_the_items_are_already_deleted() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(two_purchases())]);
+    let app = app(&db.pool, ai.clone(), config());
+    let capture_id = voice_auto_capture(&app, &token, "купить молоко и хлеб").await;
+    sqlx::query("UPDATE items SET deleted_at = now() WHERE capture_id = $1")
+        .bind(capture_id)
+        .execute(&db.pool)
+        .await
+        .expect("delete items manually");
+
+    let (status, json) = undo_last(&app, &token).await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["capture_id"], capture_id.to_string());
+    assert_eq!(json["removed"], 0);
+    let speech = json["speech"].as_str().expect("speech");
+    assert!(speech.contains("Отменять нечего"), "{speech}");
+}

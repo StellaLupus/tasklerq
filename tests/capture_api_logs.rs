@@ -134,3 +134,66 @@ fn capture_logs_have_metadata_but_not_the_text() {
         "the text, speech and item titles must not reach the logs:\n{captured}"
     );
 }
+
+#[test]
+fn a_disabled_llm_logs_the_fallback_reason_without_the_text() {
+    let logs = LogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(logs.clone())
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let db = db().await;
+            let household = support::create_household(&db.pool).await;
+            let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+            let state = AppState::new(db.pool.clone()).with_capture(CaptureState::new(
+                CaptureConfig {
+                    enabled: true,
+                    voice_timeout_ms: 8_000,
+                    voice_fallback_raw: true,
+                    rate_limit_per_min: 10,
+                    max_text_chars: 2_000,
+                },
+                None,
+                Arc::new(CircuitBreaker::default()),
+                200,
+            ));
+            let app = build_router(state);
+            let body = serde_json::to_vec(&json!({
+                "text": "секретная заметка про подарок",
+                "source": "ha_voice",
+                "mode": "auto"
+            }))
+            .expect("json");
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/capture")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .expect("request");
+            let response = app.oneshot(request).await.expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = response.into_body().collect().await.expect("body");
+        });
+    });
+
+    let captured = logs.0.lock().expect("lock").clone();
+    let captured = String::from_utf8(captured).expect("utf8");
+    assert!(
+        captured.contains("\"metric\":\"capture_fallback_total\"")
+            && captured.contains("\"reason\":\"llm_disabled\""),
+        "the fallback metrics must name the disabled llm:\n{captured}"
+    );
+    assert!(
+        !captured.contains("секретная") && !captured.contains("подарок"),
+        "the text must not reach the logs:\n{captured}"
+    );
+}

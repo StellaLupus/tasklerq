@@ -174,7 +174,7 @@ pub async fn complete(
 }
 
 /// Освободить ключ после ошибки: повтор обработается заново. Чужой резерв
-/// (перехваченный после 60 секунд) остаётся нетронутым.
+/// (перехваченный после 60 секунд) и уже записанный ответ остаются нетронутыми.
 pub async fn release(
     conn: &mut PgConnection,
     household_id: Uuid,
@@ -185,7 +185,7 @@ pub async fn release(
     sqlx::query(
         "DELETE FROM capture_requests
          WHERE household_id = $1 AND source = $2 AND idempotency_key = $3
-           AND capture_id = $4",
+           AND capture_id = $4 AND response IS NULL",
     )
     .bind(household_id)
     .bind(source)
@@ -251,6 +251,11 @@ impl Reservation {
     /// Ответ и строки capture закоммичены: освобождать нечего.
     pub fn settle(&mut self) {
         self.settled = true;
+    }
+
+    /// Резерв уже завершён или освобождён.
+    pub fn is_settled(&self) -> bool {
+        self.settled
     }
 
     /// Освободить ключ после ошибки. Если ответ уже записан, ничего не делает.

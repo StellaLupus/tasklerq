@@ -108,6 +108,45 @@ impl AiTask for HangingAi {
     }
 }
 
+/// Заглушка, которая отвечает мусором после задержки: нужна для проверки
+/// повтора при почти исчерпанном бюджете.
+struct SlowAi {
+    delay: StdDuration,
+    answer: Value,
+    calls: AtomicUsize,
+}
+
+impl SlowAi {
+    fn new(delay: StdDuration, answer: Value) -> Arc<Self> {
+        Arc::new(Self {
+            delay,
+            answer,
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl AiTask for SlowAi {
+    async fn check_entity(&self) -> Result<(), HaError> {
+        Ok(())
+    }
+
+    async fn generate_data(
+        &self,
+        _request: &GenerateData<'_>,
+        _timeout: StdDuration,
+    ) -> Result<Value, HaError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(self.delay).await;
+        Ok(self.answer.clone())
+    }
+}
+
 fn config() -> CaptureConfig {
     CaptureConfig {
         enabled: true,
@@ -768,4 +807,266 @@ async fn complete_and_release_ignore_a_taken_over_reservation() {
     .await
     .expect("row");
     assert_eq!(response, Some(json!({"fresh": true})));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disabled_llm_falls_back_in_auto_when_raw_fallback_is_enabled() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let app = app_with(
+        &db.pool,
+        None,
+        config(),
+        Arc::new(CircuitBreaker::default()),
+        200,
+    );
+    let text = "купить молоко";
+
+    let (status, _, json) = call(&app, &token, body(text, "ha_voice", "auto")).await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["status"], "applied");
+    assert_eq!(json["fallback"], true);
+    assert_eq!(json["items"].as_array().expect("items").len(), 1);
+    assert_eq!(json["items"][0]["title"], text);
+    let speech = json["speech"].as_str().expect("speech");
+    assert!(speech.starts_with("Записал как есть:"), "{speech}");
+
+    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM llm_runs WHERE household_id = $1")
+        .bind(household.household_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("count llm runs");
+    assert_eq!(runs, 0, "a disabled LLM must not create an llm run");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disabled_llm_without_raw_fallback_returns_503_in_auto() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let mut config = config();
+    config.voice_fallback_raw = false;
+    let app = app_with(
+        &db.pool,
+        None,
+        config,
+        Arc::new(CircuitBreaker::default()),
+        200,
+    );
+
+    let (status, _, json) = call(&app, &token, body("купить молоко", "ha_voice", "auto")).await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+    assert_error_envelope(&json, "service_unavailable");
+    assert_eq!(item_count(&db.pool, household.household_id).await, 0);
+    assert_eq!(
+        draft_count(&db.pool, household.household_id, "auto").await,
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disabled_llm_in_draft_returns_503_and_creates_nothing() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let app = app_with(
+        &db.pool,
+        None,
+        config(),
+        Arc::new(CircuitBreaker::default()),
+        200,
+    );
+
+    let (status, _, json) = call(&app, &token, body("купить молоко", "api", "draft")).await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+    assert_error_envelope(&json, "service_unavailable");
+    assert_eq!(
+        draft_count(&db.pool, household.household_id, "draft").await,
+        0
+    );
+    assert_eq!(item_count(&db.pool, household.household_id).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repeat_after_a_disabled_llm_fallback_returns_the_stored_response() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let app = app_with(
+        &db.pool,
+        None,
+        config(),
+        Arc::new(CircuitBreaker::default()),
+        200,
+    );
+    let key = Uuid::now_v7().to_string();
+    let payload = body("купить молоко", "ha_voice", "auto");
+
+    let (status, _, first) = call_with_key(&app, &token, Some(&key), payload.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["fallback"], true);
+
+    let (status, _, repeat) = call_with_key(&app, &token, Some(&key), payload).await;
+    assert_eq!(status, StatusCode::OK, "{repeat}");
+    assert_eq!(repeat, first, "the saved fallback must be replayed");
+
+    let requests: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM capture_requests WHERE household_id = $1")
+            .bind(household.household_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("count requests");
+    assert_eq!(requests, 1);
+    assert_eq!(item_count(&db.pool, household.household_id).await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parse_retry_is_skipped_when_less_than_a_second_is_left() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let mut config = config();
+    config.voice_timeout_ms = 1_000;
+    let ai = SlowAi::new(StdDuration::from_millis(900), json!({"unexpected": true}));
+    let app = app(&db.pool, ai.clone(), config);
+
+    let (status, _, json) = call(&app, &token, body("купить молоко", "ha_voice", "auto")).await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["fallback"], true);
+    assert_eq!(
+        ai.calls(),
+        1,
+        "a retry with almost no budget must not start"
+    );
+    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM llm_runs WHERE household_id = $1")
+        .bind(household.household_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("count llm runs");
+    assert_eq!(runs, 1, "only the first call must be logged");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn too_many_items_in_the_retry_is_rejected_not_fallen_back() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let items: Vec<Value> = (0..21)
+        .map(|n| json!({"target_kind": "tasks", "title": format!("задача {n}")}))
+        .collect();
+    let ai = StubAi::new(vec![
+        Ok(json!({"unexpected": true})),
+        Ok(json!({"items": items})),
+    ]);
+    let app = app(&db.pool, ai.clone(), config());
+
+    let (status, _, json) = call(
+        &app,
+        &token,
+        body("двадцать одна задача", "ha_voice", "auto"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["status"], "rejected");
+    assert_eq!(json["fallback"], false);
+    assert_eq!(json["items"], json!([]));
+    assert_eq!(ai.calls(), 2);
+    assert_eq!(item_count(&db.pool, household.household_id).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_characters_only_cannot_be_stored_and_release_the_key() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Err(HaError::Unreachable), Err(HaError::Unreachable)]);
+    let app = app(&db.pool, ai.clone(), config());
+    let key = Uuid::now_v7().to_string();
+    let payload = body("\u{1}\u{2}", "ha_voice", "auto");
+
+    let (status, _, json) = call_with_key(&app, &token, Some(&key), payload.clone()).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{json}");
+    assert_error_envelope(&json, "validation_error");
+
+    let requests: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM capture_requests WHERE household_id = $1")
+            .bind(household.household_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("count requests");
+    assert_eq!(requests, 0, "the reservation must be released");
+
+    let (status, _, json) = call_with_key(&app, &token, Some(&key), payload).await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "the repeat must be processed again, not rejected as 409: {json}"
+    );
+    assert_eq!(ai.calls(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_draft_llm_failure_returns_503_without_a_draft() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Err(HaError::Unreachable)]);
+    let app = app(&db.pool, ai.clone(), config());
+
+    let (status, _, json) = call(&app, &token, body("купить молоко", "api", "draft")).await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+    assert_error_envelope(&json, "service_unavailable");
+    assert_eq!(
+        draft_count(&db.pool, household.household_id, "draft").await,
+        0
+    );
+    assert_eq!(item_count(&db.pool, household.household_id).await, 0);
+    assert_eq!(ai.calls(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hanging_llm_is_recorded_as_a_breaker_failure() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let mut config = config();
+    config.voice_timeout_ms = 300;
+    let breaker = Arc::new(CircuitBreaker::new(
+        1,
+        chrono::Duration::seconds(300),
+        chrono::Duration::seconds(60),
+    ));
+    let ai = HangingAi::new();
+    let app = app_with(&db.pool, Some(ai.clone()), config, breaker.clone(), 200);
+
+    let started = Instant::now();
+    let (status, _, json) = call(&app, &token, body("купить молоко", "ha_voice", "auto")).await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["fallback"], true);
+    assert!(
+        elapsed >= StdDuration::from_millis(300),
+        "the request must wait for the timeout, not return earlier: {elapsed:?}"
+    );
+    assert!(
+        breaker.retry_after(Utc::now()).is_some(),
+        "the timeout must be recorded as a breaker failure"
+    );
+
+    let (run_status, error_code): (String, Option<String>) =
+        sqlx::query_as("SELECT status, error_code FROM llm_runs WHERE household_id = $1")
+            .bind(household.household_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("llm run");
+    assert_eq!(run_status, "failure");
+    assert_eq!(error_code.as_deref(), Some("timeout"));
 }

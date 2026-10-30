@@ -17,7 +17,7 @@ use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::Connection;
+use sqlx::{Connection, PgPool};
 use uuid::Uuid;
 
 use crate::auth::tokens::AuthContext;
@@ -330,6 +330,64 @@ const IN_PROGRESS_RETRY_AFTER: u64 = 2;
 /// Точный момент смены суток зависит от часового пояса household, поэтому
 /// используется консервативный час: раньше квота не восстановится.
 const QUOTA_RETRY_AFTER: u64 = 3_600;
+/// Минимальный остаток бюджета, при котором повтор разбора имеет смысл:
+/// второй вызов с меньшим бюджетом почти наверняка упадёт таймаутом.
+const MIN_RETRY_BUDGET: StdDuration = StdDuration::from_secs(1);
+
+/// Освобождает незавершённый резерв, если future запроса отброшена.
+///
+/// Обычная ветка ошибки освобождает ключ синхронно; `Drop` нужен только для
+/// отмены запроса (например, клиент разорвал соединение), когда `capture_inner`
+/// не успевает вернуть результат.
+struct ReservationGuard {
+    pool: PgPool,
+    reservation: Option<capture_requests::Reservation>,
+}
+
+impl ReservationGuard {
+    fn new(pool: PgPool) -> Self {
+        Self {
+            pool,
+            reservation: None,
+        }
+    }
+
+    fn slot(&mut self) -> &mut Option<capture_requests::Reservation> {
+        &mut self.reservation
+    }
+
+    async fn release(&mut self) {
+        let Some(reservation) = self.reservation.as_mut() else {
+            return;
+        };
+        match self.pool.acquire().await {
+            Ok(mut conn) => reservation.release(&mut conn).await,
+            Err(error) => {
+                tracing::error!(?error, "could not acquire a connection to release the key");
+            }
+        }
+    }
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        let Some(mut reservation) = self.reservation.take() else {
+            return;
+        };
+        if reservation.is_settled() {
+            return;
+        }
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            match pool.acquire().await {
+                Ok(mut conn) => reservation.release(&mut conn).await,
+                Err(error) => {
+                    tracing::error!(?error, "could not acquire a connection to release the key");
+                }
+            }
+        });
+    }
+}
 
 /// Обработать внешний capture.
 pub async fn capture(
@@ -338,21 +396,15 @@ pub async fn capture(
     headers: HeaderMap,
     ApiJson(request): ApiJson<CaptureRequest>,
 ) -> Result<Json<CaptureResponse>, ApiError> {
-    let mut reservation: Option<capture_requests::Reservation> = None;
-    let result = capture_inner(&state, auth.0, &headers, request, &mut reservation).await;
+    let mut guard = ReservationGuard::new(state.pool.clone());
+    let result = capture_inner(&state, auth.0, &headers, request, guard.slot()).await;
 
-    // Единственное место освобождения резерва: любая ветка ошибки после
-    // `reserve`, не записавшая ответ, возвращает ключ. `Reservation::release`
-    // не трогает уже завершённый или перехваченный резерв.
-    if result.is_err()
-        && let Some(reservation) = reservation.as_mut()
-    {
-        match connection(&state).await {
-            Ok(mut conn) => reservation.release(&mut conn).await,
-            Err(error) => {
-                tracing::error!(?error, "could not release the idempotency key");
-            }
-        }
+    // Единственное синхронное место освобождения резерва: любая ветка ошибки
+    // после `reserve`, не записавшая ответ, возвращает ключ. `Drop` выше
+    // освобождает его, если запрос был отменён. `Reservation::release` не
+    // трогает уже завершённый или перехваченный резерв.
+    if result.is_err() {
+        guard.release().await;
     }
     result
 }
@@ -385,171 +437,172 @@ async fn capture_inner(
     // этот же идентификатор закрепляется за резервом ключа.
     let capture_id = Uuid::now_v7();
 
-    let idempotency_key = resolve_idempotency_key(
-        headers.get(IDEMPOTENCY_HEADER),
-        request.idempotency_key.as_deref(),
-    )?;
-    let request_hash = idempotency_key
-        .as_ref()
-        .map(|_| request_hash(&text, source, request.mode, request.hint, request.list_id));
-
+    // Лимит частоты проверяется до разбора ключа: запрос с невалидным ключом —
+    // такой же запрос и тоже расходует лимит.
     let decision = capture.rate.check(auth.token_id, now);
     if !decision.allowed {
         return Err(ApiError::rate_limited("Too many capture requests")
             .with_retry_after(decision.retry_after.unwrap_or(60)));
     }
 
-    let Some(ai) = capture.ai.as_deref() else {
-        log_capture(source, "unavailable", capture_id);
-        return Err(ApiError::service_unavailable(
-            "Automatic capture is not configured",
-        ));
+    let header_key = {
+        let mut values = headers.get_all(IDEMPOTENCY_HEADER).iter();
+        let first = values.next();
+        if values.next().is_some() {
+            return Err(ApiError::validation(
+                "Idempotency-Key must be provided only once",
+            ));
+        }
+        first
     };
+    let idempotency_key = resolve_idempotency_key(header_key, request.idempotency_key.as_deref())?;
+    let request_hash = idempotency_key
+        .as_ref()
+        .map(|_| request_hash(&text, source, request.mode, request.hint, request.list_id));
 
     // Соединение нужно только для коротких чтений до вызова LLM: сам вызов
     // занимает до 20 секунд и не должен держать соединение пула.
-    let (target_list, context) = {
-        let mut conn = connection(state).await?;
-        // Конкретный список проверяется до LLM: чужой, отсутствующий и
-        // архивный список дают один и тот же 422, чтобы не раскрывать чужие
-        // данные.
-        let target_list = match request.list_id {
-            Some(list_id) => {
-                match lists::get_visible(&mut conn, auth.household_id, list_id).await {
-                    Ok(list) => Some(list),
-                    Err(DomainError::NotFound) => {
-                        return Err(ApiError::validation("Unknown list"));
-                    }
-                    Err(error) => return Err(error.into()),
-                }
+    let mut conn = connection(state).await?;
+
+    // Ключ резервируется отдельной короткой транзакцией до вызова LLM:
+    // параллельный повтор должен увидеть резерв, а не запустить второй разбор.
+    // Коммит делает `reserve` перед возвратом. Проверки списка, квоты,
+    // предохранителя и доступности LLM идут после резерва, чтобы завершённый
+    // повтор получал сохранённый ответ, даже если состояние household с тех пор
+    // изменилось.
+    if let Some(key) = &idempotency_key {
+        let hash = request_hash.as_deref().unwrap_or_default();
+        match capture_requests::reserve(
+            &mut conn,
+            auth.household_id,
+            source,
+            key,
+            hash,
+            capture_id,
+            now,
+        )
+        .await
+        .map_err(database_error)?
+        {
+            Reserved::Acquired => {
+                *reservation = Some(capture_requests::Reservation::new(
+                    auth.household_id,
+                    source,
+                    key,
+                    capture_id,
+                ));
             }
-            None => None,
-        };
-
-        // Ключ резервируется отдельной короткой транзакцией до вызова LLM:
-        // параллельный повтор должен увидеть резерв, а не запустить второй
-        // разбор. Коммит делает `reserve` перед возвратом. Проверки квоты и
-        // предохранителя идут после резерва, чтобы завершённый повтор получал
-        // сохранённый ответ, даже если квота уже исчерпана.
-        if let Some(key) = &idempotency_key {
-            let hash = request_hash.as_deref().unwrap_or_default();
-            match capture_requests::reserve(
-                &mut conn,
-                auth.household_id,
-                source,
-                key,
-                hash,
-                capture_id,
-                now,
-            )
-            .await
-            .map_err(database_error)?
-            {
-                Reserved::Acquired => {
-                    *reservation = Some(capture_requests::Reservation::new(
-                        auth.household_id,
-                        source,
-                        key,
-                        capture_id,
-                    ));
-                }
-                Reserved::Completed(response) => {
-                    let response: CaptureResponse =
-                        serde_json::from_value(response).map_err(|error| {
-                            tracing::error!(%error, "stored idempotency response is corrupted");
-                            ApiError::internal("Database error")
-                        })?;
-                    log_capture(source, "replayed", response.capture_id);
-                    return Ok(Json(response));
-                }
-                Reserved::InProgress => {
-                    return Err(ApiError::conflict(
-                        "Capture with this Idempotency-Key is still in progress",
-                    )
-                    .with_retry_after(IN_PROGRESS_RETRY_AFTER));
-                }
-                Reserved::Mismatch => {
-                    return Err(ApiError::validation(
-                        "Idempotency-Key was already used with a different request",
-                    ));
-                }
+            Reserved::Completed(response) => {
+                let response: CaptureResponse =
+                    serde_json::from_value(response).map_err(|error| {
+                        tracing::error!(%error, "stored idempotency response is corrupted");
+                        ApiError::internal("Database error")
+                    })?;
+                log_capture(source, "replayed", response.capture_id);
+                return Ok(Json(response));
             }
-        }
-
-        let context = draft::load_context_for(&mut conn, auth.household_id, None, now).await?;
-
-        let used = llm_runs::count_since(&mut conn, auth.household_id, now - Duration::hours(24))
-            .await
-            .map_err(database_error)?;
-        if used >= i64::from(capture.quota) {
-            tracing::warn!(
-                metric = "capture_quota_exhausted",
-                "llm capture quota is exhausted"
-            );
-            if request.mode == CaptureMode::Auto && capture.config.voice_fallback_raw {
-                return apply_fallback(
-                    &mut conn,
-                    FallbackInput {
-                        household_id: auth.household_id,
-                        capture_id,
-                        source,
-                        idempotency_key: idempotency_key.as_deref(),
-                        request_hash: request_hash.as_deref(),
-                        text: &text,
-                        target_list: target_list.as_ref(),
-                        hint: request.hint,
-                        context: &context,
-                        now,
-                        reason: "quota_exhausted",
-                    },
-                    reservation,
+            Reserved::InProgress => {
+                return Err(ApiError::conflict(
+                    "Capture with this Idempotency-Key is still in progress",
                 )
-                .await;
+                .with_retry_after(IN_PROGRESS_RETRY_AFTER));
             }
-            log_capture(source, "unavailable", capture_id);
-            if request.mode == CaptureMode::Draft {
-                return Err(
-                    ApiError::rate_limited("Automatic capture quota is exhausted")
-                        .with_retry_after(QUOTA_RETRY_AFTER),
-                );
+            Reserved::Mismatch => {
+                return Err(ApiError::validation(
+                    "Idempotency-Key was already used with a different request",
+                ));
             }
-            return Err(ApiError::service_unavailable(
-                "Automatic capture quota is exhausted",
-            ));
         }
-        if !capture.breaker.allow(now) {
-            tracing::warn!(
-                metric = "capture_circuit_open",
-                "llm circuit breaker is open"
-            );
-            if request.mode == CaptureMode::Auto && capture.config.voice_fallback_raw {
-                return apply_fallback(
-                    &mut conn,
-                    FallbackInput {
-                        household_id: auth.household_id,
-                        capture_id,
-                        source,
-                        idempotency_key: idempotency_key.as_deref(),
-                        request_hash: request_hash.as_deref(),
-                        text: &text,
-                        target_list: target_list.as_ref(),
-                        hint: request.hint,
-                        context: &context,
-                        now,
-                        reason: "circuit_open",
-                    },
-                    reservation,
-                )
-                .await;
-            }
-            log_capture(source, "unavailable", capture_id);
-            return Err(ApiError::service_unavailable(
-                "Automatic capture is temporarily unavailable",
-            ));
-        }
+    }
 
-        (target_list, context)
+    // Конкретный список проверяется после резерва: чужой, отсутствующий и
+    // архивный список дают один и тот же 422, чтобы не раскрывать чужие данные.
+    let target_list = match request.list_id {
+        Some(list_id) => match lists::get_visible(&mut conn, auth.household_id, list_id).await {
+            Ok(list) => Some(list),
+            Err(DomainError::NotFound) => {
+                return Err(ApiError::validation("Unknown list"));
+            }
+            Err(error) => return Err(error.into()),
+        },
+        None => None,
     };
+
+    let context = draft::load_context_for(&mut conn, auth.household_id, None, now).await?;
+
+    // Один помощник на все ветки fallback: поля запроса и контекст одинаковы,
+    // различаются только причина и момент записи.
+    let fallback = Fallback {
+        household_id: auth.household_id,
+        capture_id,
+        source,
+        idempotency_key: idempotency_key.as_deref(),
+        request_hash: request_hash.as_deref(),
+        text: &text,
+        target_list: target_list.as_ref(),
+        hint: request.hint,
+        context: &context,
+    };
+
+    // Выключенная или не настроенная LLM — это недоступность LLM: `auto` с
+    // включённым fallback создаёт позицию из исходного текста, `draft` — 503.
+    let ai = match capture.ai.as_deref() {
+        Some(ai) => ai,
+        None => {
+            if request.mode == CaptureMode::Auto && capture.config.voice_fallback_raw {
+                return fallback
+                    .apply(&mut conn, now, "llm_disabled", reservation)
+                    .await;
+            }
+            log_capture(source, "unavailable", capture_id);
+            return Err(ApiError::service_unavailable(
+                "Automatic capture is not configured",
+            ));
+        }
+    };
+
+    let used = llm_runs::count_since(&mut conn, auth.household_id, now - Duration::hours(24))
+        .await
+        .map_err(database_error)?;
+    if used >= i64::from(capture.quota) {
+        tracing::warn!(
+            metric = "capture_quota_exhausted",
+            "llm capture quota is exhausted"
+        );
+        if request.mode == CaptureMode::Auto && capture.config.voice_fallback_raw {
+            return fallback
+                .apply(&mut conn, now, "quota_exhausted", reservation)
+                .await;
+        }
+        log_capture(source, "unavailable", capture_id);
+        if request.mode == CaptureMode::Draft {
+            return Err(
+                ApiError::rate_limited("Automatic capture quota is exhausted")
+                    .with_retry_after(QUOTA_RETRY_AFTER),
+            );
+        }
+        return Err(ApiError::service_unavailable(
+            "Automatic capture quota is exhausted",
+        ));
+    }
+    if !capture.breaker.allow(now) {
+        tracing::warn!(
+            metric = "capture_circuit_open",
+            "llm circuit breaker is open"
+        );
+        if request.mode == CaptureMode::Auto && capture.config.voice_fallback_raw {
+            return fallback
+                .apply(&mut conn, now, "circuit_open", reservation)
+                .await;
+        }
+        log_capture(source, "unavailable", capture_id);
+        return Err(ApiError::service_unavailable(
+            "Automatic capture is temporarily unavailable",
+        ));
+    }
+
+    // Вызов LLM не держит соединение пула.
+    drop(conn);
 
     // Некорректный ответ можно повторить один раз, но только внутри того же
     // общего таймаута: голосовой pipeline не должен ждать больше бюджета
@@ -560,7 +613,7 @@ async fn capture_inner(
     let mut outcome: Option<llm::Generated> = None;
     let mut last_failure: Option<Failure> = None;
     let mut last_finished_at = now;
-    let mut runs: Vec<(NewRun, DateTime<Utc>, bool)> = Vec::new();
+    let mut runs: Vec<PendingRun> = Vec::new();
 
     loop {
         attempt += 1;
@@ -577,8 +630,8 @@ async fn capture_inner(
         .await;
         match result {
             Ok(generated) => {
-                runs.push((
-                    NewRun {
+                runs.push(PendingRun {
+                    run: NewRun {
                         household_id: auth.household_id,
                         user_id: None,
                         source,
@@ -590,9 +643,9 @@ async fn capture_inner(
                         input_tokens: None,
                         output_tokens: None,
                     },
-                    generated.finished_at,
-                    true,
-                ));
+                    at: generated.finished_at,
+                    outcome: RunOutcome::Success,
+                });
                 outcome = Some(generated);
                 break;
             }
@@ -600,8 +653,8 @@ async fn capture_inner(
                 let retry = attempt == 1 && failed.failure.is_parse_retryable();
                 let time_left = deadline.saturating_duration_since(tokio::time::Instant::now());
                 let code = failed.failure.code();
-                runs.push((
-                    NewRun {
+                runs.push(PendingRun {
+                    run: NewRun {
                         household_id: auth.household_id,
                         user_id: None,
                         source,
@@ -613,12 +666,12 @@ async fn capture_inner(
                         input_tokens: None,
                         output_tokens: None,
                     },
-                    failed.finished_at,
-                    false,
-                ));
+                    at: failed.finished_at,
+                    outcome: RunOutcome::Failure,
+                });
                 last_finished_at = failed.finished_at;
                 last_failure = Some(failed.failure);
-                if retry && !time_left.is_zero() {
+                if retry && time_left >= MIN_RETRY_BUDGET {
                     continue;
                 }
                 break;
@@ -627,13 +680,14 @@ async fn capture_inner(
     }
 
     let mut conn = connection(state).await?;
-    for (run, at, success) in runs {
-        if success {
-            if let Err(error) = llm_runs::record(&mut conn, run, at).await {
-                return Err(database_error(error));
+    for pending in runs {
+        match pending.outcome {
+            RunOutcome::Success => {
+                if let Err(error) = llm_runs::record(&mut conn, pending.run, pending.at).await {
+                    return Err(database_error(error));
+                }
             }
-        } else {
-            record_failure(&mut conn, run, at).await;
+            RunOutcome::Failure => record_failure(&mut conn, pending.run, pending.at).await,
         }
     }
 
@@ -657,24 +711,9 @@ async fn capture_inner(
         }
 
         if request.mode == CaptureMode::Auto && capture.config.voice_fallback_raw {
-            return apply_fallback(
-                &mut conn,
-                FallbackInput {
-                    household_id: auth.household_id,
-                    capture_id,
-                    source,
-                    idempotency_key: idempotency_key.as_deref(),
-                    request_hash: request_hash.as_deref(),
-                    text: &text,
-                    target_list: target_list.as_ref(),
-                    hint: request.hint,
-                    context: &context,
-                    now: last_finished_at,
-                    reason: failure.code(),
-                },
-                reservation,
-            )
-            .await;
+            return fallback
+                .apply(&mut conn, last_finished_at, failure.code(), reservation)
+                .await;
         }
 
         log_capture(source, "unavailable", capture_id);
@@ -957,6 +996,63 @@ fn llm_timeout(config: &CaptureConfig, source: CaptureSource) -> StdDuration {
     }
 }
 
+/// Итог одного вызова LLM, ожидающий записи в журнал.
+struct PendingRun {
+    run: NewRun,
+    at: DateTime<Utc>,
+    outcome: RunOutcome,
+}
+
+/// Чем закончился вызов LLM.
+enum RunOutcome {
+    Success,
+    Failure,
+}
+
+/// Общие поля fallback-веток одного запроса.
+#[derive(Clone, Copy)]
+struct Fallback<'a> {
+    household_id: Uuid,
+    capture_id: Uuid,
+    source: CaptureSource,
+    idempotency_key: Option<&'a str>,
+    request_hash: Option<&'a str>,
+    text: &'a str,
+    target_list: Option<&'a List>,
+    hint: Option<RequestHint>,
+    context: &'a crate::capture::context::CaptureContext,
+}
+
+impl Fallback<'_> {
+    /// Создать fallback-позицию с причиной `reason`.
+    async fn apply(
+        self,
+        conn: &mut sqlx::PgConnection,
+        now: DateTime<Utc>,
+        reason: &'static str,
+        reservation: &mut Option<capture_requests::Reservation>,
+    ) -> Result<Json<CaptureResponse>, ApiError> {
+        apply_fallback(
+            conn,
+            FallbackInput {
+                household_id: self.household_id,
+                capture_id: self.capture_id,
+                source: self.source,
+                idempotency_key: self.idempotency_key,
+                request_hash: self.request_hash,
+                text: self.text,
+                target_list: self.target_list,
+                hint: self.hint,
+                context: self.context,
+                now,
+                reason,
+            },
+            reservation,
+        )
+        .await
+    }
+}
+
 /// Данные для fallback-позиции из исходного текста.
 struct FallbackInput<'a> {
     household_id: Uuid,
@@ -1085,8 +1181,13 @@ fn fallback_text(text: &str) -> (String, Option<String>) {
     if normalized.chars().count() <= MAX_TITLE {
         return (normalized, None);
     }
-    let mut title: String = normalized.chars().take(MAX_TITLE).collect();
-    if let Some(position) = title.rfind(char::is_whitespace) {
+    let mut chars = normalized.chars();
+    let mut title: String = chars.by_ref().take(MAX_TITLE).collect();
+    // Если следующий символ — пробел, слово закончилось ровно на пределе:
+    // обрезать его не нужно.
+    if chars.next().is_some_and(|next| !next.is_whitespace())
+        && let Some(position) = title.rfind(char::is_whitespace)
+    {
         title.truncate(position);
     }
     (title.trim_end().to_owned(), Some(full))
@@ -1473,6 +1574,19 @@ mod tests {
             ]),
             "Добавил 2 элемента."
         );
+    }
+
+    #[test]
+    fn a_word_that_ends_at_the_title_limit_is_not_cut() {
+        let prefix = "купить ";
+        let word = "а".repeat(MAX_TITLE - prefix.chars().count());
+        let text = format!("{prefix}{word} молоко");
+
+        let (title, notes) = fallback_text(&text);
+
+        assert_eq!(title, format!("{prefix}{word}"));
+        assert_eq!(title.chars().count(), MAX_TITLE);
+        assert_eq!(notes.as_deref(), Some(text.as_str()));
     }
 
     #[test]

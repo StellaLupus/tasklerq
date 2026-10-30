@@ -125,6 +125,38 @@ fn app(pool: &PgPool, ai: Arc<dyn AiTask>) -> Router {
     )))
 }
 
+fn app_with(
+    pool: &PgPool,
+    ai: Option<Arc<dyn AiTask>>,
+    config: CaptureConfig,
+    breaker: Arc<CircuitBreaker>,
+    quota: u32,
+) -> Router {
+    build_router(
+        AppState::new(pool.clone()).with_capture(CaptureState::new(config, ai, breaker, quota)),
+    )
+}
+
+/// Дождаться, пока фоновое освобождение удалит резерв.
+async fn wait_for_release(pool: &PgPool, household_id: Uuid) {
+    tokio::time::timeout(StdDuration::from_secs(10), async {
+        loop {
+            let count: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM capture_requests WHERE household_id = $1")
+                    .bind(household_id)
+                    .fetch_one(pool)
+                    .await
+                    .expect("count requests");
+            if count == 0 {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the reservation should be released");
+}
+
 /// Один ответ LLM: валидная покупка.
 fn shopping(title: &str) -> Value {
     json!({"items": [{"target_kind": "shopping", "title": title}]})
@@ -631,4 +663,299 @@ fn capture_request_hash(text: &str, source: &str, mode: &str) -> String {
         let _ = write!(hex, "{byte:02x}");
     }
     hex
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invalid_key_still_uses_the_rate_limit() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let mut config = config();
+    config.rate_limit_per_min = 2;
+    let ai = StubAi::new(vec![Ok(shopping("молоко"))]);
+    let app = app_with(
+        &db.pool,
+        Some(ai as Arc<dyn AiTask>),
+        config,
+        Arc::new(CircuitBreaker::default()),
+        200,
+    );
+    let payload = body("купить молоко", "ha_voice", "auto");
+
+    for _ in 0..2 {
+        let (status, _, json) = call_with_key(&app, &token, "bad key", payload.clone()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{json}");
+    }
+
+    let (status, headers, json) = call_with_key(&app, &token, "", payload).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{json}");
+    assert!(headers.get("retry-after").is_some(), "{headers:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_completed_repeat_ignores_a_list_archived_since_the_first_request() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(shopping("молоко"))]);
+    let app = app(&db.pool, ai.clone());
+    let list_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO lists (id, household_id, kind, name, is_default, position, created_at, updated_at)
+         VALUES ($1, $2, 'tasks', 'Работа', false, 10, now(), now())",
+    )
+    .bind(list_id)
+    .bind(household.household_id)
+    .execute(&db.pool)
+    .await
+    .expect("second list");
+    let key = Uuid::now_v7().to_string();
+    let mut payload = keyed(body("купить молоко", "api", "auto"), &key);
+    payload["list_id"] = json!(list_id);
+
+    let (status, _, first) = call_with_key(&app, &token, &key, payload.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+
+    sqlx::query("UPDATE lists SET is_archived = true WHERE id = $1")
+        .bind(list_id)
+        .execute(&db.pool)
+        .await
+        .expect("archive list");
+
+    let (status, _, repeat) = call_with_key(&app, &token, &key, payload.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{repeat}");
+    assert_eq!(repeat, first, "the saved response must be replayed");
+
+    let mut fresh = body("купить молоко", "api", "auto");
+    fresh["list_id"] = json!(list_id);
+    let (status, _, json) = call_inner(&app, &token, None, fresh).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{json}");
+    assert_validation(&json);
+    assert_eq!(ai.calls(), 1, "a replay must not call the LLM");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multiple_idempotency_headers_are_rejected() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(shopping("молоко"))]);
+    let app = app(&db.pool, ai.clone());
+    let payload = body("купить молоко", "ha_voice", "auto");
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/capture")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .header("idempotency-key", "first")
+        .header("idempotency-key", "second")
+        .body(Body::from(serde_json::to_vec(&payload).expect("json")))
+        .expect("request");
+    let response = app.oneshot(request).await.expect("response");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let json: Value = serde_json::from_slice(&bytes).expect("json");
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{json}");
+    assert_validation(&json);
+    assert_eq!(ai.calls(), 0);
+    assert_eq!(request_count(&db.pool, household.household_id).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_that_is_only_in_the_header_is_replayed() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(shopping("молоко"))]);
+    let app = app(&db.pool, ai.clone());
+    let key = Uuid::now_v7().to_string();
+    let payload = body("купить молоко", "ha_voice", "auto");
+
+    let (status, _, first) = call_with_key(&app, &token, &key, payload.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+
+    let (status, _, repeat) = call_with_key(&app, &token, &key, payload).await;
+    assert_eq!(status, StatusCode::OK, "{repeat}");
+    assert_eq!(repeat, first);
+    assert_eq!(ai.calls(), 1);
+    assert_eq!(item_count(&db.pool, household.household_id).await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hint_and_a_list_id_are_part_of_the_request_hash() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(shopping("молоко"))]);
+    let app = app(&db.pool, ai.clone());
+    let key = Uuid::now_v7().to_string();
+
+    let mut first = body("купить молоко", "api", "auto");
+    first["hint"] = json!("shopping");
+    let (status, _, json) = call_with_key(&app, &token, &key, first).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+
+    let mut other_hint = body("купить молоко", "api", "auto");
+    other_hint["hint"] = json!("tasks");
+    let (status, _, json) = call_with_key(&app, &token, &key, other_hint).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{json}");
+    assert_validation(&json);
+
+    let mut other_list = body("купить молоко", "api", "auto");
+    other_list["hint"] = json!("shopping");
+    other_list["list_id"] = json!(household.tasks_list_id);
+    let (status, _, json) = call_with_key(&app, &token, &key, other_list).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{json}");
+    assert_validation(&json);
+    assert_eq!(ai.calls(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quota_503_releases_the_key() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(shopping("молоко")), Ok(shopping("молоко"))]);
+    let app = app_with(
+        &db.pool,
+        Some(ai as Arc<dyn AiTask>),
+        config(),
+        Arc::new(CircuitBreaker::default()),
+        0,
+    );
+    let key = Uuid::now_v7().to_string();
+    let payload = keyed(body("купить молоко", "api", "auto"), &key);
+
+    for _ in 0..2 {
+        let (status, _, json) = call_with_key(&app, &token, &key, payload.clone()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+    }
+
+    assert_eq!(request_count(&db.pool, household.household_id).await, 0);
+    assert_eq!(item_count(&db.pool, household.household_id).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_open_breaker_503_releases_the_key() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let breaker = Arc::new(CircuitBreaker::default());
+    for _ in 0..5 {
+        breaker.record_failure(chrono::Utc::now());
+    }
+    let ai = StubAi::new(vec![Ok(shopping("молоко")), Ok(shopping("молоко"))]);
+    let app = app_with(
+        &db.pool,
+        Some(ai as Arc<dyn AiTask>),
+        config(),
+        breaker,
+        200,
+    );
+    let key = Uuid::now_v7().to_string();
+    let payload = keyed(body("купить молоко", "api", "auto"), &key);
+
+    for _ in 0..2 {
+        let (status, _, json) = call_with_key(&app, &token, &key, payload.clone()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+    }
+
+    assert_eq!(request_count(&db.pool, household.household_id).await, 0);
+    assert_eq!(item_count(&db.pool, household.household_id).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_concurrent_draft_repeat_gets_409() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = GatedAi::new(two_purchases());
+    let app = app(&db.pool, ai.clone());
+    let key = Uuid::now_v7().to_string();
+    let payload = keyed(body("купить молоко и хлеб", "api", "draft"), &key);
+
+    let first_app = app.clone();
+    let first_token = token.clone();
+    let first_key = key.clone();
+    let first_payload = payload.clone();
+    let first = tokio::spawn(async move {
+        call_with_key(&first_app, &first_token, &first_key, first_payload).await
+    });
+
+    tokio::time::timeout(StdDuration::from_secs(10), ai.started.notified())
+        .await
+        .expect("the llm call should start");
+
+    let (status, _, json) = call_with_key(&app, &token, &key, payload).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{json}");
+    assert_eq!(ai.calls(), 1);
+
+    ai.release.notify_one();
+    let (status, _, first_json) = tokio::time::timeout(StdDuration::from_secs(10), first)
+        .await
+        .expect("the first request should finish")
+        .expect("the first request should not panic");
+    assert_eq!(status, StatusCode::OK, "{first_json}");
+    assert_eq!(first_json["status"], "draft");
+    assert_eq!(draft_count(&db.pool, household.household_id).await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_request_releases_the_key() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = GatedAi::new(shopping("молоко"));
+    let app = app(&db.pool, ai.clone());
+    let key = Uuid::now_v7().to_string();
+    let payload = keyed(body("купить молоко", "ha_voice", "auto"), &key);
+
+    let first_app = app.clone();
+    let first_token = token.clone();
+    let first_key = key.clone();
+    let first_payload = payload.clone();
+    let first = tokio::spawn(async move {
+        call_with_key(&first_app, &first_token, &first_key, first_payload).await
+    });
+
+    tokio::time::timeout(StdDuration::from_secs(10), ai.started.notified())
+        .await
+        .expect("the llm call should start");
+    first.abort();
+    let _ = first.await;
+
+    wait_for_release(&db.pool, household.household_id).await;
+
+    let second_app = app.clone();
+    let second_token = token.clone();
+    let second_key = key.clone();
+    let second_payload = payload.clone();
+    let second = tokio::spawn(async move {
+        call_with_key(&second_app, &second_token, &second_key, second_payload).await
+    });
+
+    tokio::time::timeout(StdDuration::from_secs(10), ai.started.notified())
+        .await
+        .expect("the repeat should call the llm again");
+    ai.release.notify_one();
+
+    let (status, _, json) = tokio::time::timeout(StdDuration::from_secs(10), second)
+        .await
+        .expect("the repeat should finish")
+        .expect("the repeat should not panic");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the dropped request must release the key, not leave a 409: {json}"
+    );
+    assert_eq!(json["status"], "applied");
+    assert_eq!(ai.calls(), 2);
+    assert_eq!(item_count(&db.pool, household.household_id).await, 1);
 }
