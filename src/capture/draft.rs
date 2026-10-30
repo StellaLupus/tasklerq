@@ -91,6 +91,9 @@ pub enum DraftError {
     /// Ошибка базы данных.
     #[error("database error")]
     Database(#[from] sqlx::Error),
+    /// Ответ capture не удалось сериализовать.
+    #[error("capture response could not be serialized")]
+    Serialize(#[from] serde_json::Error),
 }
 
 /// Содержимое `capture_drafts.parsed`.
@@ -130,8 +133,10 @@ impl Stored {
 }
 
 /// Построитель сериализованного ответа, который сохраняется в резерве ключа
-/// идемпотентности в той же транзакции, что и строки capture.
-pub type Responder<'a, T> = Box<dyn FnOnce(&T) -> Value + Send + 'a>;
+/// идемпотентности в той же транзакции, что и строки capture. Ошибка
+/// сериализации не превращается в `null`: вызывающая сторона получает её как
+/// ошибку запроса.
+pub type Responder<'a, T> = Box<dyn FnOnce(&T) -> Result<Value, serde_json::Error> + Send + 'a>;
 
 /// Данные нового черновика.
 #[derive(Debug, Clone)]
@@ -264,24 +269,32 @@ pub async fn create(
     capture: NewCapture,
     now: DateTime<Utc>,
 ) -> Result<Draft, DomainError> {
-    create_with_responder(conn, capture, now, None).await
+    create_with_responder(conn, capture, now, None, None)
+        .await
+        .map_err(|error| match error {
+            DraftError::Domain(error) => error,
+            DraftError::Database(error) => error.into(),
+            // Без `responder` сюда попасть нельзя; остальные варианты —
+            // ошибки состояния, которых у нового черновика быть не может.
+            other => DomainError::Validation(other.to_string()),
+        })
 }
 
 /// Сохранить черновик и ответ для ключа идемпотентности одной транзакцией.
 ///
 /// `responder` вызывается после вставки черновика, но до коммита, поэтому ответ
 /// и `capture_drafts` коммитятся вместе. Вызывающая сторона должна передать
-/// соединение внутри транзакции, чтобы обе записи были атомарны.
+/// соединение внутри транзакции, чтобы обе записи были атомарны, и отметить
+/// резерв через [`capture_requests::Reservation::settle`] после коммита.
 pub async fn create_with_responder(
     conn: &mut PgConnection,
     capture: NewCapture,
     now: DateTime<Utc>,
     responder: Option<Responder<'_, Draft>>,
-) -> Result<Draft, DomainError> {
+    reservation: Option<&mut capture_requests::Reservation>,
+) -> Result<Draft, DraftError> {
     let stored = Stored::from_parsed(capture.parsed);
     let household_id = capture.household_id;
-    let source = capture.source;
-    let idempotency_key = capture.idempotency_key.clone();
     let draft = drafts::insert(
         conn,
         NewDraft {
@@ -289,7 +302,7 @@ pub async fn create_with_responder(
             household_id,
             user_id: capture.user_id,
             chat_id: capture.chat_id,
-            source,
+            source: capture.source,
             mode: capture.mode,
             idempotency_key: capture.idempotency_key,
             request_hash: capture.request_hash,
@@ -301,9 +314,9 @@ pub async fn create_with_responder(
         now,
     )
     .await?;
-    if let (Some(key), Some(responder)) = (idempotency_key.as_deref(), responder) {
-        let response = responder(&draft);
-        capture_requests::complete(conn, household_id, source, key, &response, now).await?;
+    if let (Some(responder), Some(reservation)) = (responder, reservation) {
+        let response = responder(&draft)?;
+        reservation.complete(conn, &response, now).await?;
     }
     Ok(draft)
 }
@@ -616,6 +629,7 @@ pub async fn confirm(
 /// capture. Любая ошибка откатывает всё: не остаётся ни элементов, ни событий,
 /// ни строки capture. Ответ для ключа идемпотентности пишется в той же
 /// транзакции через `responder`.
+#[allow(clippy::too_many_arguments)]
 pub async fn apply_auto(
     conn: &mut PgConnection,
     capture: NewCapture,
@@ -624,10 +638,10 @@ pub async fn apply_auto(
     items: Vec<DraftItem>,
     now: DateTime<Utc>,
     responder: Option<Responder<'_, Applied>>,
+    mut reservation: Option<&mut capture_requests::Reservation>,
 ) -> Result<Applied, DraftError> {
     let household_id = capture.household_id;
     let source = capture.source;
-    let idempotency_key = capture.idempotency_key.clone();
     let stored = Stored::from_parsed(capture.parsed);
 
     let mut tx = conn.begin().await?;
@@ -659,12 +673,20 @@ pub async fn apply_auto(
         capture_id: draft.id,
         items: created,
     };
-    if let (Some(key), Some(responder)) = (idempotency_key.as_deref(), responder) {
-        let response = responder(&applied);
-        capture_requests::complete(&mut tx, household_id, source, key, &response, now).await?;
+    let mut completed = false;
+    if let (Some(responder), Some(reservation)) = (responder, reservation.as_deref_mut()) {
+        let response = responder(&applied)?;
+        reservation.complete(&mut tx, &response, now).await?;
+        completed = true;
     }
 
     tx.commit().await?;
+
+    // Ответ и элементы закоммичены вместе: освобождать резерв нельзя, даже
+    // если вызывающая сторона потом обнаружит расхождение в ответе.
+    if completed && let Some(reservation) = reservation {
+        reservation.settle();
+    }
 
     for item in &mut applied.items {
         item.capture_id = Some(draft.id);

@@ -4,7 +4,7 @@
 //! вынесена сюда: тайминг, запись успеха/ошибки в [`CircuitBreaker`] и разбор
 //! формы ответа не должны расходиться между путями.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
@@ -12,7 +12,7 @@ use super::breaker::CircuitBreaker;
 use super::context::CaptureContext;
 use super::prompt;
 use super::schema::{ParseError, ParsedResponse, parse_response};
-use crate::home_assistant::{AiTask, GenerateData, HaError, MAX_GENERATE_TIMEOUT};
+use crate::home_assistant::{AiTask, GenerateData, HaError};
 
 /// Успешный разбор.
 #[derive(Debug)]
@@ -50,6 +50,13 @@ impl Failure {
             Self::Parse(_) => false,
         }
     }
+
+    /// Ответ пришёл, но не прошёл разбор схемы: такой вызов можно повторить
+    /// один раз. Слишком длинный список — ошибка пользователя, её повтор не
+    /// исправит.
+    pub fn is_parse_retryable(&self) -> bool {
+        matches!(self, Self::Parse(error) if !matches!(error, ParseError::TooManyItems { .. }))
+    }
 }
 
 /// Неудачный вызов; предохранитель уже учёл результат.
@@ -65,12 +72,18 @@ pub struct Failed {
 
 /// Вызвать LLM и разобрать ответ. `now` — время до вызова; результат получает
 /// время окончания, чтобы вызывающий не читал часы повторно.
+///
+/// `timeout` — бюджет ожидания источника. Он передаётся клиенту и
+/// дополнительно ограничивает сам вызов: зависший транспорт не должен держать
+/// голосовой запрос дольше бюджета. Превышение считается [`HaError::Timeout`],
+/// поэтому предохранитель видит обычный сбой.
 pub async fn generate(
     ai: &dyn AiTask,
     breaker: &CircuitBreaker,
     context: &CaptureContext,
     text: &str,
     now: DateTime<Utc>,
+    timeout: Duration,
 ) -> Result<Generated, Failed> {
     let instructions = prompt::build_instructions(context, text);
     let structure = prompt::response_structure();
@@ -80,7 +93,10 @@ pub async fn generate(
         structure: &structure,
     };
     let started = Instant::now();
-    let generated = ai.generate_data(&request, MAX_GENERATE_TIMEOUT).await;
+    let generated = match tokio::time::timeout(timeout, ai.generate_data(&request, timeout)).await {
+        Ok(result) => result,
+        Err(_) => Err(HaError::Timeout),
+    };
     let latency_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
     let finished_at = now + chrono::Duration::from_std(started.elapsed()).unwrap_or_default();
 

@@ -143,22 +143,29 @@ pub async fn reserve(
 /// Сохранить готовый ответ. Для `applied` и `draft` вызывается в транзакции
 /// создания `capture_drafts`/`items`, чтобы ответ и строки capture коммитились
 /// вместе.
+///
+/// `capture_id` — идентификатор владельца резерва: строку, которую успел
+/// перехватить другой запрос, менять нельзя.
+#[allow(clippy::too_many_arguments)]
 pub async fn complete(
     conn: &mut PgConnection,
     household_id: Uuid,
     source: CaptureSource,
     key: &str,
+    capture_id: Uuid,
     response: &Value,
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE capture_requests
-         SET response = $4, completed_at = $5
-         WHERE household_id = $1 AND source = $2 AND idempotency_key = $3",
+         SET response = $5, completed_at = $6
+         WHERE household_id = $1 AND source = $2 AND idempotency_key = $3
+           AND capture_id = $4",
     )
     .bind(household_id)
     .bind(source)
     .bind(key)
+    .bind(capture_id)
     .bind(response)
     .bind(now)
     .execute(conn)
@@ -166,21 +173,102 @@ pub async fn complete(
     Ok(())
 }
 
-/// Освободить ключ после ошибки: повтор обработается заново.
+/// Освободить ключ после ошибки: повтор обработается заново. Чужой резерв
+/// (перехваченный после 60 секунд) остаётся нетронутым.
 pub async fn release(
     conn: &mut PgConnection,
     household_id: Uuid,
     source: CaptureSource,
     key: &str,
+    capture_id: Uuid,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "DELETE FROM capture_requests
-         WHERE household_id = $1 AND source = $2 AND idempotency_key = $3",
+         WHERE household_id = $1 AND source = $2 AND idempotency_key = $3
+           AND capture_id = $4",
     )
     .bind(household_id)
     .bind(source)
     .bind(key)
+    .bind(capture_id)
     .execute(conn)
     .await?;
     Ok(())
+}
+
+/// Резерв ключа, занятый текущим запросом.
+///
+/// Пока резерв не завершён и не освобождён, он удерживает ключ. `complete`
+/// пишет ответ (в транзакции вызывающей стороны), [`Reservation::settle`]
+/// подтверждает, что транзакция закоммичена, а [`Reservation::release`]
+/// освобождает ключ после ошибки. Все операции идемпотентны и проверяют
+/// `capture_id`, поэтому перехваченный резерв не будет испорчен.
+#[derive(Debug)]
+pub struct Reservation {
+    household_id: Uuid,
+    source: CaptureSource,
+    key: String,
+    capture_id: Uuid,
+    /// Резерв больше не принадлежит этому запросу: ответ записан и закоммичен
+    /// либо ключ освобождён.
+    settled: bool,
+}
+
+impl Reservation {
+    /// Новый резерв уже занятого ключа.
+    pub fn new(household_id: Uuid, source: CaptureSource, key: &str, capture_id: Uuid) -> Self {
+        Self {
+            household_id,
+            source,
+            key: key.to_owned(),
+            capture_id,
+            settled: false,
+        }
+    }
+
+    /// Записать ответ; коммит остаётся за вызывающей стороной.
+    pub async fn complete(
+        &mut self,
+        conn: &mut PgConnection,
+        response: &Value,
+        now: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        if self.settled {
+            return Ok(());
+        }
+        complete(
+            conn,
+            self.household_id,
+            self.source,
+            &self.key,
+            self.capture_id,
+            response,
+            now,
+        )
+        .await
+    }
+
+    /// Ответ и строки capture закоммичены: освобождать нечего.
+    pub fn settle(&mut self) {
+        self.settled = true;
+    }
+
+    /// Освободить ключ после ошибки. Если ответ уже записан, ничего не делает.
+    pub async fn release(&mut self, conn: &mut PgConnection) {
+        if self.settled {
+            return;
+        }
+        if let Err(error) = release(
+            conn,
+            self.household_id,
+            self.source,
+            &self.key,
+            self.capture_id,
+        )
+        .await
+        {
+            tracing::error!(%error, "could not release the idempotency key");
+        }
+        self.settled = true;
+    }
 }

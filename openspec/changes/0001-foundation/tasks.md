@@ -66,12 +66,12 @@
 - [x] 5.10 Собрать golden set ≥30 русских фраз и скрипт оценки; проверить, что точность извлечения ≥90% и регрессия блокирует версию промпта.
   - Заметка (5.10): живой замер не выполнен, `tests/golden/baseline.json` пуст. Guard в `tests/golden_capture.rs` включится после первой записи baseline командой `tasklerq capture-eval`; до этого проверяются структура набора и юнит-тесты метрики.
 - [x] 5.11 Реализовать `POST /api/v1/capture` с `text`, `source`, `mode`, `hint`, `list_id`: Bearer `capture:write`, лимит тела 16 КБ, текст 2000, ответ `capture_id`/`status`/`fallback`/`speech`/`items`; проверить contract-тестами.
-  - Заметка (5.11): `auto` применяется одной транзакцией `items + capture_drafts + item_events` (`draft::apply_auto`). `idempotency_key` обрабатывается по правилам идемпотентности (5.13). Сбой LLM, квоты или предохранителя даёт `503` без fallback до 5.15; `fallback` в ответе всегда `false`.
+  - Заметка (5.11): `auto` применяется одной транзакцией `items + capture_drafts + item_events` (`draft::apply_auto`). `idempotency_key` обрабатывается по правилам идемпотентности (5.13). С 5.15 сбой LLM, квоты или предохранителя в `auto` даёт fallback-позицию (`fallback=true`), если он включён.
   - Заметка (ревью 5.11): слишком много элементов → `status=rejected`; `CAPTURE_MAX_TEXT_CHARS` ≤ 2000; неверный `Content-Type` → 415.
 - [x] 5.12 Реализовать `auto`-режим: одна транзакция `items` + `capture_drafts` + `item_events`, без `outbox` и Telegram; проверить тестами успешное применение и отсутствие частичного создания при ошибке.
 - [x] 5.13 Реализовать `Idempotency-Key`: UNIQUE `(household_id, source, idempotency_key)`, возврат первого результата при повторе, `409` пока первый запрос обрабатывается, `422` при другом теле; проверить тестами одинаковые и разные ключи и параллельный повтор.
 - [x] 5.14 Реализовать `draft`-режим внешнего capture и эндпоинты `confirm`/`cancel`/`undo` с TTL 15 минут и идемпотентностью; проверить тестами истёкший черновик и повторную отмену.
-- [ ] 5.15 Реализовать fallback внешнего capture: таймаут 8 с для `ha_voice`, 20 с для остальных, одна позиция из текста при сбое LLM/квоте, `fallback=true`, `speech` ≤200 символов; проверить тестами.
+- [x] 5.15 Реализовать fallback внешнего capture: таймаут 8 с для `ha_voice`, 20 с для остальных, одна позиция из текста при сбое LLM/квоте, `fallback=true`, `speech` ≤200 символов; проверить тестами.
 - [ ] 5.16 Реализовать `tasklerq.undo_last_capture` на стороне API: последний capture `ha_voice` за 10 минут, `409` при изменённых элементах; проверить тестами.
 
 ## 6. Home Assistant custom component

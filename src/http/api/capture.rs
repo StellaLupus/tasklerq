@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration as StdDuration;
 
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
@@ -15,7 +16,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 use sqlx::Connection;
 use uuid::Uuid;
 
@@ -24,12 +25,13 @@ use crate::capture::breaker::CircuitBreaker;
 use crate::capture::draft::{self, Applied, NewCapture, Responder};
 use crate::capture::llm::{self, Failure};
 use crate::capture::prompt::PROMPT_VERSION;
-use crate::capture::schema::{ParseError, ParsedResponse};
+use crate::capture::schema::{ParseError, ParsedResponse, RawItem};
 use crate::capture::validate::{DraftItem, ValidationMode, validate_items_in};
 use crate::config::CaptureConfig;
 use crate::domain::error::DomainError;
 use crate::domain::models::{CaptureMode, CaptureSource, Item, List, ListKind};
-use crate::home_assistant::AiTask;
+use crate::domain::validation::{MAX_TITLE, sanitize};
+use crate::home_assistant::{AiTask, MAX_GENERATE_TIMEOUT};
 use crate::storage::repositories::capture_requests;
 use crate::storage::repositories::capture_requests::Reserved;
 use crate::storage::repositories::drafts::Draft;
@@ -324,6 +326,10 @@ const IDEMPOTENCY_HEADER: &str = "idempotency-key";
 const IDEMPOTENCY_KEY_MAX: usize = 128;
 /// Через сколько секунд повторять запрос, пока первый обрабатывается.
 const IN_PROGRESS_RETRY_AFTER: u64 = 2;
+/// Через сколько секунд предлагать повторить `draft` при исчерпанной квоте.
+/// Точный момент смены суток зависит от часового пояса household, поэтому
+/// используется консервативный час: раньше квота не восстановится.
+const QUOTA_RETRY_AFTER: u64 = 3_600;
 
 /// Обработать внешний capture.
 pub async fn capture(
@@ -332,7 +338,32 @@ pub async fn capture(
     headers: HeaderMap,
     ApiJson(request): ApiJson<CaptureRequest>,
 ) -> Result<Json<CaptureResponse>, ApiError> {
-    let auth = auth.0;
+    let mut reservation: Option<capture_requests::Reservation> = None;
+    let result = capture_inner(&state, auth.0, &headers, request, &mut reservation).await;
+
+    // Единственное место освобождения резерва: любая ветка ошибки после
+    // `reserve`, не записавшая ответ, возвращает ключ. `Reservation::release`
+    // не трогает уже завершённый или перехваченный резерв.
+    if result.is_err()
+        && let Some(reservation) = reservation.as_mut()
+    {
+        match connection(&state).await {
+            Ok(mut conn) => reservation.release(&mut conn).await,
+            Err(error) => {
+                tracing::error!(?error, "could not release the idempotency key");
+            }
+        }
+    }
+    result
+}
+
+async fn capture_inner(
+    state: &AppState,
+    auth: AuthContext,
+    headers: &HeaderMap,
+    request: CaptureRequest,
+    reservation: &mut Option<capture_requests::Reservation>,
+) -> Result<Json<CaptureResponse>, ApiError> {
     let capture = state
         .capture
         .as_ref()
@@ -378,7 +409,7 @@ pub async fn capture(
     // Соединение нужно только для коротких чтений до вызова LLM: сам вызов
     // занимает до 20 секунд и не должен держать соединение пула.
     let (target_list, context) = {
-        let mut conn = connection(&state).await?;
+        let mut conn = connection(state).await?;
         // Конкретный список проверяется до LLM: чужой, отсутствующий и
         // архивный список дают один и тот же 422, чтобы не раскрывать чужие
         // данные.
@@ -414,7 +445,14 @@ pub async fn capture(
             .await
             .map_err(database_error)?
             {
-                Reserved::Acquired => {}
+                Reserved::Acquired => {
+                    *reservation = Some(capture_requests::Reservation::new(
+                        auth.household_id,
+                        source,
+                        key,
+                        capture_id,
+                    ));
+                }
                 Reserved::Completed(response) => {
                     let response: CaptureResponse =
                         serde_json::from_value(response).map_err(|error| {
@@ -438,138 +476,213 @@ pub async fn capture(
             }
         }
 
-        let used =
-            match llm_runs::count_since(&mut conn, auth.household_id, now - Duration::hours(24))
-                .await
-            {
-                Ok(used) => used,
-                Err(error) => {
-                    release_key(
-                        &mut conn,
-                        auth.household_id,
-                        source,
-                        idempotency_key.as_deref(),
-                    )
-                    .await;
-                    return Err(database_error(error));
-                }
-            };
+        let context = draft::load_context_for(&mut conn, auth.household_id, None, now).await?;
+
+        let used = llm_runs::count_since(&mut conn, auth.household_id, now - Duration::hours(24))
+            .await
+            .map_err(database_error)?;
         if used >= i64::from(capture.quota) {
-            release_key(
-                &mut conn,
-                auth.household_id,
-                source,
-                idempotency_key.as_deref(),
-            )
-            .await;
             tracing::warn!(
                 metric = "capture_quota_exhausted",
                 "llm capture quota is exhausted"
             );
+            if request.mode == CaptureMode::Auto && capture.config.voice_fallback_raw {
+                return apply_fallback(
+                    &mut conn,
+                    FallbackInput {
+                        household_id: auth.household_id,
+                        capture_id,
+                        source,
+                        idempotency_key: idempotency_key.as_deref(),
+                        request_hash: request_hash.as_deref(),
+                        text: &text,
+                        target_list: target_list.as_ref(),
+                        hint: request.hint,
+                        context: &context,
+                        now,
+                        reason: "quota_exhausted",
+                    },
+                    reservation,
+                )
+                .await;
+            }
             log_capture(source, "unavailable", capture_id);
+            if request.mode == CaptureMode::Draft {
+                return Err(
+                    ApiError::rate_limited("Automatic capture quota is exhausted")
+                        .with_retry_after(QUOTA_RETRY_AFTER),
+                );
+            }
             return Err(ApiError::service_unavailable(
                 "Automatic capture quota is exhausted",
             ));
         }
         if !capture.breaker.allow(now) {
-            release_key(
-                &mut conn,
-                auth.household_id,
-                source,
-                idempotency_key.as_deref(),
-            )
-            .await;
             tracing::warn!(
                 metric = "capture_circuit_open",
                 "llm circuit breaker is open"
             );
+            if request.mode == CaptureMode::Auto && capture.config.voice_fallback_raw {
+                return apply_fallback(
+                    &mut conn,
+                    FallbackInput {
+                        household_id: auth.household_id,
+                        capture_id,
+                        source,
+                        idempotency_key: idempotency_key.as_deref(),
+                        request_hash: request_hash.as_deref(),
+                        text: &text,
+                        target_list: target_list.as_ref(),
+                        hint: request.hint,
+                        context: &context,
+                        now,
+                        reason: "circuit_open",
+                    },
+                    reservation,
+                )
+                .await;
+            }
             log_capture(source, "unavailable", capture_id);
             return Err(ApiError::service_unavailable(
                 "Automatic capture is temporarily unavailable",
             ));
         }
-
-        let context = match draft::load_context_for(&mut conn, auth.household_id, None, now).await {
-            Ok(context) => context,
-            Err(error) => {
-                release_key(
-                    &mut conn,
-                    auth.household_id,
-                    source,
-                    idempotency_key.as_deref(),
-                )
-                .await;
-                return Err(error.into());
-            }
-        };
 
         (target_list, context)
     };
 
-    let outcome = llm::generate(ai, capture.breaker.as_ref(), &context, &text, now).await;
-    let mut conn = connection(&state).await?;
-    let (mut parsed, latency_ms, finished_at) = match outcome {
-        Ok(generated) => (
-            generated.parsed,
-            generated.latency_ms,
-            generated.finished_at,
-        ),
-        Err(failed) => {
-            let code = failed.failure.code();
-            match &failed.failure {
-                Failure::Ai(error) => {
-                    tracing::warn!(error = error.code(), "llm capture request failed");
-                }
-                Failure::Parse(error) => {
-                    tracing::warn!(error = error.code(), "llm capture response rejected");
-                }
-            }
-            let run = NewRun {
-                household_id: auth.household_id,
-                user_id: None,
-                source,
-                mode: request.mode,
-                prompt_version: Some(PROMPT_VERSION),
-                status: FAILURE,
-                error_code: Some(code),
-                latency_ms: failed.latency_ms,
-                input_tokens: None,
-                output_tokens: None,
-            };
-            record_failure(&mut conn, run, failed.finished_at).await;
+    // Некорректный ответ можно повторить один раз, но только внутри того же
+    // общего таймаута: голосовой pipeline не должен ждать больше бюджета
+    // источника. Ошибки HA (сеть, таймаут, 401, 5xx) не повторяются.
+    let timeout = llm_timeout(&capture.config, source);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut attempt = 0u8;
+    let mut outcome: Option<llm::Generated> = None;
+    let mut last_failure: Option<Failure> = None;
+    let mut last_finished_at = now;
+    let mut runs: Vec<(NewRun, DateTime<Utc>, bool)> = Vec::new();
 
-            if matches!(
-                failed.failure,
-                Failure::Parse(ParseError::TooManyItems { .. })
-            ) {
-                let response =
-                    rejected_response(capture_id, TOO_MANY_ITEMS_SPEECH.to_owned(), Vec::new());
-                store_response(
-                    &mut conn,
-                    auth.household_id,
-                    source,
-                    idempotency_key.as_deref(),
-                    &response,
+    loop {
+        attempt += 1;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let attempt_timeout = if attempt == 1 { timeout } else { remaining };
+        let result = llm::generate(
+            ai,
+            capture.breaker.as_ref(),
+            &context,
+            &text,
+            Utc::now(),
+            attempt_timeout,
+        )
+        .await;
+        match result {
+            Ok(generated) => {
+                runs.push((
+                    NewRun {
+                        household_id: auth.household_id,
+                        user_id: None,
+                        source,
+                        mode: request.mode,
+                        prompt_version: Some(PROMPT_VERSION),
+                        status: SUCCESS,
+                        error_code: None,
+                        latency_ms: generated.latency_ms,
+                        input_tokens: None,
+                        output_tokens: None,
+                    },
+                    generated.finished_at,
+                    true,
+                ));
+                outcome = Some(generated);
+                break;
+            }
+            Err(failed) => {
+                let retry = attempt == 1 && failed.failure.is_parse_retryable();
+                let time_left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let code = failed.failure.code();
+                runs.push((
+                    NewRun {
+                        household_id: auth.household_id,
+                        user_id: None,
+                        source,
+                        mode: request.mode,
+                        prompt_version: Some(PROMPT_VERSION),
+                        status: FAILURE,
+                        error_code: Some(code),
+                        latency_ms: failed.latency_ms,
+                        input_tokens: None,
+                        output_tokens: None,
+                    },
                     failed.finished_at,
-                )
-                .await?;
-                log_capture(source, "rejected", capture_id);
-                return Ok(Json(response));
+                    false,
+                ));
+                last_finished_at = failed.finished_at;
+                last_failure = Some(failed.failure);
+                if retry && !time_left.is_zero() {
+                    continue;
+                }
+                break;
             }
+        }
+    }
 
-            release_key(
+    let mut conn = connection(state).await?;
+    for (run, at, success) in runs {
+        if success {
+            if let Err(error) = llm_runs::record(&mut conn, run, at).await {
+                return Err(database_error(error));
+            }
+        } else {
+            record_failure(&mut conn, run, at).await;
+        }
+    }
+
+    let Some(generated) = outcome else {
+        let failure = last_failure.expect("a completed loop without a result stores a failure");
+        match &failure {
+            Failure::Ai(error) => {
+                tracing::warn!(error = error.code(), "llm capture request failed");
+            }
+            Failure::Parse(error) => {
+                tracing::warn!(error = error.code(), "llm capture response rejected");
+            }
+        }
+
+        if matches!(failure, Failure::Parse(ParseError::TooManyItems { .. })) {
+            let response =
+                rejected_response(capture_id, TOO_MANY_ITEMS_SPEECH.to_owned(), Vec::new());
+            store_response(&mut conn, reservation, &response, last_finished_at).await?;
+            log_capture(source, "rejected", capture_id);
+            return Ok(Json(response));
+        }
+
+        if request.mode == CaptureMode::Auto && capture.config.voice_fallback_raw {
+            return apply_fallback(
                 &mut conn,
-                auth.household_id,
-                source,
-                idempotency_key.as_deref(),
+                FallbackInput {
+                    household_id: auth.household_id,
+                    capture_id,
+                    source,
+                    idempotency_key: idempotency_key.as_deref(),
+                    request_hash: request_hash.as_deref(),
+                    text: &text,
+                    target_list: target_list.as_ref(),
+                    hint: request.hint,
+                    context: &context,
+                    now: last_finished_at,
+                    reason: failure.code(),
+                },
+                reservation,
             )
             .await;
-            log_capture(source, "unavailable", capture_id);
-            return Err(ApiError::service_unavailable(
-                "Automatic capture is temporarily unavailable",
-            ));
         }
+
+        log_capture(source, "unavailable", capture_id);
+        return Err(ApiError::service_unavailable(
+            "Automatic capture is temporarily unavailable",
+        ));
     };
+    let (mut parsed, finished_at) = (generated.parsed, generated.finished_at);
 
     apply_target(&mut parsed, target_list.as_ref(), request.hint);
 
@@ -580,44 +693,13 @@ pub async fn capture(
     };
     let validated = validate_items_in(&context, item_source, parsed.clone(), validation);
 
-    let run = NewRun {
-        household_id: auth.household_id,
-        user_id: None,
-        source,
-        mode: request.mode,
-        prompt_version: Some(PROMPT_VERSION),
-        status: SUCCESS,
-        error_code: None,
-        latency_ms,
-        input_tokens: None,
-        output_tokens: None,
-    };
-    if let Err(error) = llm_runs::record(&mut conn, run, finished_at).await {
-        release_key(
-            &mut conn,
-            auth.household_id,
-            source,
-            idempotency_key.as_deref(),
-        )
-        .await;
-        return Err(database_error(error));
-    }
-
     if validated.items.is_empty() {
         let response = rejected_response(
             capture_id,
             rejected_speech(&validated.items),
             validated.clarifications.clone(),
         );
-        store_response(
-            &mut conn,
-            auth.household_id,
-            source,
-            idempotency_key.as_deref(),
-            &response,
-            finished_at,
-        )
-        .await?;
+        store_response(&mut conn, reservation, &response, finished_at).await?;
         log_capture(source, "rejected", capture_id);
         return Ok(Json(response));
     }
@@ -630,15 +712,7 @@ pub async fn capture(
                     rejected_speech(&validated.items),
                     validated.clarifications.clone(),
                 );
-                store_response(
-                    &mut conn,
-                    auth.household_id,
-                    source,
-                    idempotency_key.as_deref(),
-                    &response,
-                    finished_at,
-                )
-                .await?;
+                store_response(&mut conn, reservation, &response, finished_at).await?;
                 log_capture(source, "rejected", capture_id);
                 return Ok(Json(response));
             }
@@ -653,9 +727,8 @@ pub async fn capture(
                     &kinds_for_response,
                     clarifications,
                 ))
-                .unwrap_or(Value::Null)
             });
-            let applied = match draft::apply_auto(
+            let applied = draft::apply_auto(
                 &mut conn,
                 NewCapture {
                     id: idempotency_key.as_ref().map(|_| capture_id),
@@ -676,30 +749,14 @@ pub async fn capture(
                 validated.items,
                 finished_at,
                 Some(responder),
+                reservation.as_mut(),
             )
             .await
-            {
-                Ok(applied) => applied,
-                Err(error) => {
-                    release_key(
-                        &mut conn,
-                        auth.household_id,
-                        source,
-                        idempotency_key.as_deref(),
-                    )
-                    .await;
-                    return Err(draft_error(error));
-                }
-            };
+            .map_err(draft_error)?;
             if applied.items.len() != expected_items {
+                // Ответ и элементы уже закоммичены: резерв завершён и не
+                // освобождается, иначе повтор создал бы дубликаты.
                 tracing::error!("applied capture item count does not match the parse");
-                release_key(
-                    &mut conn,
-                    auth.household_id,
-                    source,
-                    idempotency_key.as_deref(),
-                )
-                .await;
                 return Err(ApiError::internal("Database error"));
             }
             log_capture(source, "applied", applied.capture_id);
@@ -715,7 +772,6 @@ pub async fn capture(
             let clarifications = validated.clarifications.clone();
             let responder: Responder<'_, Draft> = Box::new(move |draft| {
                 serde_json::to_value(draft_response(draft, draft_items, clarifications))
-                    .unwrap_or(Value::Null)
             });
             // Ответ и черновик пишутся одной транзакцией: падение между ними не
             // должно оставить ключ в состоянии «обрабатывается» после коммита.
@@ -738,33 +794,23 @@ pub async fn capture(
                 },
                 finished_at,
                 Some(responder),
+                reservation.as_mut(),
             )
             .await;
             let draft = match created {
                 Ok(draft) => {
                     if let Err(error) = tx.commit().await {
-                        let mut fresh = connection(&state).await?;
-                        release_key(
-                            &mut fresh,
-                            auth.household_id,
-                            source,
-                            idempotency_key.as_deref(),
-                        )
-                        .await;
+                        // Резерв освободит общий обработчик ошибки.
                         return Err(database_error(error));
+                    }
+                    if let Some(reservation) = reservation.as_mut() {
+                        reservation.settle();
                     }
                     draft
                 }
                 Err(error) => {
                     let _ = tx.rollback().await;
-                    release_key(
-                        &mut conn,
-                        auth.household_id,
-                        source,
-                        idempotency_key.as_deref(),
-                    )
-                    .await;
-                    return Err(error.into());
+                    return Err(draft_error(error));
                 }
             };
             log_capture(source, "draft", draft.id);
@@ -899,46 +945,196 @@ fn draft_response(
     }
 }
 
-/// Сохранить ответ в резерве ключа. После ошибки записи резерв освобождается,
-/// чтобы повтор не ждал истечения.
+/// Таймаут LLM для источника.
+///
+/// `ha_voice` укладывается в восьмисекундный бюджет Home Assistant; остальные
+/// источники получают общий предел вызова. Telegram-путь сюда не попадает: он
+/// всегда использует [`MAX_GENERATE_TIMEOUT`].
+fn llm_timeout(config: &CaptureConfig, source: CaptureSource) -> StdDuration {
+    match source {
+        CaptureSource::HaVoice => StdDuration::from_millis(u64::from(config.voice_timeout_ms)),
+        _ => MAX_GENERATE_TIMEOUT,
+    }
+}
+
+/// Данные для fallback-позиции из исходного текста.
+struct FallbackInput<'a> {
+    household_id: Uuid,
+    capture_id: Uuid,
+    source: CaptureSource,
+    idempotency_key: Option<&'a str>,
+    request_hash: Option<&'a str>,
+    text: &'a str,
+    target_list: Option<&'a List>,
+    hint: Option<RequestHint>,
+    context: &'a crate::capture::context::CaptureContext,
+    now: DateTime<Utc>,
+    /// Код причины без пользовательского текста.
+    reason: &'static str,
+}
+
+/// Создать одну позицию из исходного текста без LLM.
+///
+/// Список выбирается так же, как для обычного разбора: явный `list_id`,
+/// затем `hint` (список по умолчанию своего типа), затем список задач по
+/// умолчанию. Срок, исполнитель и теги не задаются. Черновик и ответ
+/// коммитятся той же транзакцией через [`draft::apply_auto`].
+async fn apply_fallback(
+    conn: &mut sqlx::PgConnection,
+    input: FallbackInput<'_>,
+    reservation: &mut Option<capture_requests::Reservation>,
+) -> Result<Json<CaptureResponse>, ApiError> {
+    let requested_kind = input
+        .target_list
+        .map(|list| list.kind)
+        .or_else(|| input.hint.map(ListKind::from))
+        .unwrap_or(ListKind::Tasks);
+    // Подсказка могла указать тип, для которого в household нет списка
+    // (например, чек-лист): тогда используется список задач по умолчанию.
+    let kind = if input.context.default_list(requested_kind).is_some() {
+        requested_kind
+    } else {
+        ListKind::Tasks
+    };
+    let (title, notes) = fallback_text(input.text);
+    let parsed = ParsedResponse {
+        items: vec![RawItem {
+            target_kind: kind,
+            target_list: input.target_list.map(|list| list.name.clone()),
+            title,
+            notes,
+            due_date: None,
+            due_time: None,
+            priority: None,
+            assignee: None,
+            assignee_id: None,
+            tags: Vec::new(),
+            quantity: None,
+            unit: None,
+            subtasks: Vec::new(),
+            recurrence: None,
+        }],
+        clarifications: Vec::new(),
+    };
+    let item_source = draft::item_source(input.source);
+    let validated = validate_items_in(
+        input.context,
+        item_source,
+        parsed.clone(),
+        ValidationMode::Auto,
+    );
+    if !validated.is_valid() {
+        // Текст из одних управляющих символов нормализуется в пустое название.
+        tracing::warn!("fallback text cannot be stored as is");
+        return Err(ApiError::validation("Capture text cannot be stored as is"));
+    }
+
+    let actor = integration_actor(item_source);
+    let responder: Responder<'_, Applied> =
+        Box::new(move |applied| serde_json::to_value(fallback_response(applied, kind)));
+    let applied = draft::apply_auto(
+        conn,
+        NewCapture {
+            id: input.idempotency_key.map(|_| input.capture_id),
+            household_id: input.household_id,
+            user_id: None,
+            chat_id: None,
+            source: input.source,
+            mode: CaptureMode::Auto,
+            idempotency_key: input.idempotency_key.map(str::to_owned),
+            request_hash: input.request_hash.map(str::to_owned),
+            raw_text: input.text.to_owned(),
+            parsed: parsed.clone(),
+            fallback: true,
+            prompt_version: Some(PROMPT_VERSION.to_owned()),
+        },
+        &actor,
+        input.context,
+        validated.items,
+        input.now,
+        Some(responder),
+        reservation.as_mut(),
+    )
+    .await
+    .map_err(draft_error)?;
+
+    if applied.items.len() != 1 {
+        // Ответ и элементы уже закоммичены: резерв не освобождается.
+        tracing::error!("fallback applied an unexpected number of items");
+        return Err(ApiError::internal("Internal error"));
+    }
+
+    tracing::warn!(
+        metric = "capture_fallback_total",
+        reason = input.reason,
+        source = source_name(input.source),
+        "capture fell back to the raw text"
+    );
+    log_capture(input.source, "fallback", applied.capture_id);
+    Ok(Json(fallback_response(&applied, kind)))
+}
+
+/// Название fallback-позиции и заметка с полным текстом.
+///
+/// Управляющие символы удаляются, пробелы нормализуются. Длинный текст
+/// обрезается по границе слова до [`MAX_TITLE`], а полный текст кладётся в
+/// заметку: текст запроса не больше [`crate::domain::validation::MAX_NOTES`].
+fn fallback_text(text: &str) -> (String, Option<String>) {
+    let full = sanitize(text).trim().to_owned();
+    let normalized = full.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= MAX_TITLE {
+        return (normalized, None);
+    }
+    let mut title: String = normalized.chars().take(MAX_TITLE).collect();
+    if let Some(position) = title.rfind(char::is_whitespace) {
+        title.truncate(position);
+    }
+    (title.trim_end().to_owned(), Some(full))
+}
+
+fn fallback_response(applied: &Applied, kind: ListKind) -> CaptureResponse {
+    let items: Vec<CaptureItem> = applied
+        .items
+        .iter()
+        .map(|item| item_response(item, kind))
+        .collect();
+    let speech = match items.first() {
+        Some(item) => format!("Записал как есть: {}", item.title),
+        None => "Записал как есть.".to_owned(),
+    };
+    CaptureResponse {
+        capture_id: applied.capture_id,
+        status: Status::Applied,
+        fallback: true,
+        speech: fit_speech(speech),
+        items,
+        draft_id: None,
+        expires_at: None,
+        clarifications: Vec::new(),
+    }
+}
+
+/// Сохранить ответ в резерве ключа. Ошибка записи возвращается вызывающей
+/// стороне; резерв освобождает общий обработчик ошибки.
 async fn store_response(
     conn: &mut sqlx::PgConnection,
-    household_id: Uuid,
-    source: CaptureSource,
-    key: Option<&str>,
+    reservation: &mut Option<capture_requests::Reservation>,
     response: &CaptureResponse,
     now: DateTime<Utc>,
 ) -> Result<(), ApiError> {
-    let Some(key) = key else {
+    let Some(reservation) = reservation.as_mut() else {
         return Ok(());
     };
     let value = serde_json::to_value(response).map_err(|error| {
         tracing::error!(%error, "capture response could not be serialized");
-        ApiError::internal("Database error")
+        ApiError::internal("Internal error")
     })?;
-    if let Err(error) =
-        capture_requests::complete(conn, household_id, source, key, &value, now).await
-    {
+    if let Err(error) = reservation.complete(conn, &value, now).await {
         tracing::error!(%error, "could not store the idempotency response");
-        release_key(conn, household_id, source, Some(key)).await;
         return Err(database_error(error));
     }
+    reservation.settle();
     Ok(())
-}
-
-/// Освободить ключ после ошибки, чтобы повтор обработался заново.
-async fn release_key(
-    conn: &mut sqlx::PgConnection,
-    household_id: Uuid,
-    source: CaptureSource,
-    key: Option<&str>,
-) {
-    let Some(key) = key else {
-        return;
-    };
-    if let Err(error) = capture_requests::release(conn, household_id, source, key).await {
-        tracing::error!(%error, "could not release the idempotency key");
-    }
 }
 
 /// Конкретный список или подсказка меняют цель элементов до валидации.
@@ -1137,6 +1333,10 @@ fn draft_error(error: draft::DraftError) -> ApiError {
         draft::DraftError::Invalid(_) => {
             tracing::warn!("capture items became invalid before they could be applied");
             ApiError::validation("Capture items are no longer valid")
+        }
+        draft::DraftError::Serialize(error) => {
+            tracing::error!(%error, "capture response could not be serialized");
+            ApiError::internal("Internal error")
         }
         other => {
             tracing::error!(%other, "capture could not be applied");

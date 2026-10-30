@@ -24,7 +24,7 @@ use crate::capture::prompt::PROMPT_VERSION;
 use crate::capture::schema::{ParseError, ParsedResponse};
 use crate::domain::error::DomainError;
 use crate::domain::models::{CaptureMode, Household, User};
-use crate::home_assistant::AiTask;
+use crate::home_assistant::{AiTask, MAX_GENERATE_TIMEOUT};
 use crate::storage::repositories::capture_jobs::{self, Failure, Job};
 use crate::storage::repositories::llm_runs::{self, FAILURE, NewRun, SUCCESS};
 use crate::storage::repositories::{households, users};
@@ -210,6 +210,7 @@ impl CaptureWorker {
             &prepared.context,
             &text,
             now,
+            MAX_GENERATE_TIMEOUT,
         )
         .await;
         match outcome {
