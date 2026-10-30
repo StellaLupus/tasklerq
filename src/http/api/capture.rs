@@ -102,28 +102,31 @@ impl RateLimiter {
         }
     }
 
-    /// Убрать из очереди ключа отметки вне окна. Если очередь опустела,
-    /// ключ удаляется, чтобы [`RateLimiter`] не хранил пустые записи.
-    fn prune(hits: &mut HashMap<Uuid, VecDeque<DateTime<Utc>>>, key: Uuid, cutoff: DateTime<Utc>) {
-        let Some(queue) = hits.get_mut(&key) else {
-            return;
-        };
-        while queue.front().is_some_and(|at| *at <= cutoff) {
-            queue.pop_front();
-        }
-        if queue.is_empty() {
-            hits.remove(&key);
-        }
+    /// Хранится ли ключ `key` в карте; только для тестов.
+    #[cfg(test)]
+    fn tracks(&self, key: Uuid) -> bool {
+        self.hits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&key)
     }
 
     /// Учесть запрос токена `key` в момент `now`.
+    ///
+    /// Перед учётом из карты удаляются ключи без отметок внутри окна: токены
+    /// отзываются и пересоздаются, и их записи иначе остались бы навсегда.
     pub fn check(&self, key: Uuid, now: DateTime<Utc>) -> RateDecision {
         let cutoff = now - Duration::seconds(RATE_WINDOW_SECONDS);
         let mut hits = self
             .hits
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Self::prune(&mut hits, key, cutoff);
+        hits.retain(|_, queue| {
+            while queue.front().is_some_and(|at| *at <= cutoff) {
+                queue.pop_front();
+            }
+            !queue.is_empty()
+        });
         let queue = hits.entry(key).or_default();
         if queue.len() >= self.limit as usize {
             let wait = queue
@@ -812,19 +815,51 @@ mod tests {
     }
 
     #[test]
-    fn a_fully_stale_key_is_removed_from_the_rate_limiter() {
+    fn a_key_outside_the_window_is_removed_from_the_rate_limiter() {
         let limiter = RateLimiter::new(10);
-        let key = Uuid::now_v7();
-        limiter
-            .hits
-            .lock()
-            .expect("lock")
-            .insert(key, VecDeque::from([at(1_000)]));
+        let stale = Uuid::now_v7();
+        let fresh = Uuid::now_v7();
 
-        let mut hits = limiter.hits.lock().expect("lock");
-        RateLimiter::prune(&mut hits, key, at(1_061));
+        assert!(limiter.check(stale, at(1_000)).allowed);
+        assert!(limiter.check(fresh, at(1_061)).allowed);
 
-        assert!(!hits.contains_key(&key));
+        assert!(
+            !limiter.tracks(stale),
+            "a stale key must not stay in the map"
+        );
+        assert!(limiter.tracks(fresh));
+    }
+
+    #[test]
+    fn a_key_still_inside_the_window_keeps_its_hits() {
+        let limiter = RateLimiter::new(10);
+        let first = Uuid::now_v7();
+        let second = Uuid::now_v7();
+
+        assert!(limiter.check(first, at(1_000)).allowed);
+        assert!(limiter.check(second, at(1_030)).allowed);
+
+        assert!(limiter.tracks(first));
+        assert!(limiter.tracks(second));
+    }
+
+    #[test]
+    fn a_removed_key_counts_its_limit_from_zero() {
+        let limiter = RateLimiter::new(2);
+        let stale = Uuid::now_v7();
+        let fresh = Uuid::now_v7();
+        let start = at(1_000);
+
+        assert!(limiter.check(stale, start).allowed);
+        assert!(limiter.check(stale, start + Duration::seconds(1)).allowed);
+        assert!(!limiter.check(stale, start + Duration::seconds(2)).allowed);
+
+        assert!(limiter.check(fresh, start + Duration::seconds(61)).allowed);
+        assert!(!limiter.tracks(stale));
+
+        assert!(limiter.check(stale, start + Duration::seconds(61)).allowed);
+        assert!(limiter.check(stale, start + Duration::seconds(62)).allowed);
+        assert!(!limiter.check(stale, start + Duration::seconds(63)).allowed);
     }
 
     #[test]
