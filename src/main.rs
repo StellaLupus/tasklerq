@@ -3,17 +3,20 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tasklerq::admin;
+use tasklerq::capture::breaker::CircuitBreaker;
 use tasklerq::capture::{eval, prompt};
 use tasklerq::config::{self, Config, DatabaseConfig, LlmConfig};
 use tasklerq::domain::error::DomainError;
 use tasklerq::domain::models::UserRole;
 use tasklerq::home_assistant::{AiTask, GenerateData, HttpAiTask, MAX_GENERATE_TIMEOUT};
+use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
 use tasklerq::http::server;
 use tasklerq::storage;
@@ -227,9 +230,17 @@ async fn serve() -> Result<()> {
         .context("failed to read the bound address")?;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let telegram = tasklerq::telegram::runtime::start(&config, &pool, shutdown_rx)
-        .await
-        .context("telegram startup failed")?;
+    let ai = tasklerq::telegram::runtime::build_ai(&config.llm);
+    let breaker = Arc::new(CircuitBreaker::default());
+    let telegram = tasklerq::telegram::runtime::start(
+        &config,
+        &pool,
+        shutdown_rx,
+        ai.clone(),
+        breaker.clone(),
+    )
+    .await
+    .context("telegram startup failed")?;
     let mut state = AppState::new(pool);
     let mut workers = Vec::new();
     if let Some(runtime) = telegram {
@@ -238,6 +249,14 @@ async fn serve() -> Result<()> {
         }
         state = state.with_queue_lag_limit(config.queue.ready_lag_seconds);
         workers = runtime.tasks;
+    }
+    if config.capture.enabled {
+        state = state.with_capture(CaptureState::new(
+            config.capture,
+            ai,
+            breaker,
+            config.llm.daily_quota,
+        ));
     }
     tracing::info!(
         mode = config.telegram.mode.as_str(),

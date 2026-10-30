@@ -19,11 +19,12 @@ use tokio::sync::{Notify, watch};
 use crate::capture::breaker::CircuitBreaker;
 use crate::capture::context::CaptureContext;
 use crate::capture::draft::{self, NewCapture};
-use crate::capture::prompt::{self, PROMPT_VERSION};
-use crate::capture::schema::{ParseError, ParsedResponse, parse_response};
+use crate::capture::llm::{self, Failure as LlmFailure};
+use crate::capture::prompt::PROMPT_VERSION;
+use crate::capture::schema::{ParseError, ParsedResponse};
 use crate::domain::error::DomainError;
 use crate::domain::models::{CaptureMode, Household, User};
-use crate::home_assistant::{AiTask, GenerateData, MAX_GENERATE_TIMEOUT};
+use crate::home_assistant::AiTask;
 use crate::storage::repositories::capture_jobs::{self, Failure, Job};
 use crate::storage::repositories::llm_runs::{self, FAILURE, NewRun, SUCCESS};
 use crate::storage::repositories::{households, users};
@@ -203,47 +204,20 @@ impl CaptureWorker {
                 .await;
         }
 
-        let instructions = prompt::build_instructions(&prepared.context, &text);
-        let structure = prompt::response_structure();
-        let request = GenerateData {
-            task_name: prompt::TASK_NAME,
-            instructions: &instructions,
-            structure: &structure,
-        };
-        let started = std::time::Instant::now();
-        let generated = self.ai.generate_data(&request, MAX_GENERATE_TIMEOUT).await;
-        let latency_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
-
-        // Результат записывается моментом «после вызова»: к `now` прибавляется
-        // длительность вызова, а не берутся новые часы, чтобы время под
-        // управлением вызывающего (тесты, replay) не расходилось.
-        let now = now + chrono::Duration::from_std(started.elapsed()).unwrap_or_default();
-        match generated {
-            Err(error) => {
-                self.breaker.record_failure(now);
-                tracing::warn!(
-                    error = error.code(),
-                    attempt = job.attempts,
-                    "llm capture request failed"
-                );
-                let run = self.run_record(&job, &prepared, FAILURE, Some(error.code()), latency_ms);
-                self.fail(
-                    &job,
-                    &prepared,
-                    Issue {
-                        text: &text,
-                        code: error.code(),
-                        retryable: error.is_retryable(),
-                        message: FAILED,
-                        run: Some(run),
-                    },
-                    now,
-                )
-                .await
-            }
-            Ok(data) => match parse_response(&data) {
-                Ok(parsed) if parsed.items.is_empty() => {
-                    self.breaker.record_success(now);
+        let outcome = llm::generate(
+            self.ai.as_ref(),
+            &self.breaker,
+            &prepared.context,
+            &text,
+            now,
+        )
+        .await;
+        match outcome {
+            Ok(generated) => {
+                let now = generated.finished_at;
+                let latency_ms = generated.latency_ms;
+                let parsed = generated.parsed;
+                if parsed.items.is_empty() {
                     let run = self.run_record(&job, &prepared, SUCCESS, None, latency_ms);
                     self.fail(
                         &job,
@@ -258,42 +232,71 @@ impl CaptureWorker {
                         now,
                     )
                     .await
-                }
-                Ok(parsed) => {
-                    self.breaker.record_success(now);
+                } else {
                     let run = self.run_record(&job, &prepared, SUCCESS, None, latency_ms);
                     self.finish(&job, &prepared, &text, parsed, now, run).await
                 }
-                Err(error) => {
-                    // Слишком длинный список — ошибка пользователя, а не сбой
-                    // LLM: предохранитель на неё не размыкается.
-                    if matches!(error, ParseError::TooManyItems { .. }) {
-                        self.breaker.record_success(now);
-                    } else {
-                        self.breaker.record_failure(now);
+            }
+            Err(failed) => {
+                let now = failed.finished_at;
+                let latency_ms = failed.latency_ms;
+                match failed.failure {
+                    LlmFailure::Ai(error) => {
+                        tracing::warn!(
+                            error = error.code(),
+                            attempt = job.attempts,
+                            "llm capture request failed"
+                        );
+                        let run = self.run_record(
+                            &job,
+                            &prepared,
+                            FAILURE,
+                            Some(error.code()),
+                            latency_ms,
+                        );
+                        self.fail(
+                            &job,
+                            &prepared,
+                            Issue {
+                                text: &text,
+                                code: error.code(),
+                                retryable: error.is_retryable(),
+                                message: FAILED,
+                                run: Some(run),
+                            },
+                            now,
+                        )
+                        .await
                     }
-                    tracing::warn!(error = error.code(), "llm capture response rejected");
-                    let message = match error {
-                        ParseError::TooManyItems { .. } => TOO_MANY,
-                        _ => FAILED,
-                    };
-                    let run =
-                        self.run_record(&job, &prepared, FAILURE, Some(error.code()), latency_ms);
-                    self.fail(
-                        &job,
-                        &prepared,
-                        Issue {
-                            text: &text,
-                            code: error.code(),
-                            retryable: false,
-                            message,
-                            run: Some(run),
-                        },
-                        now,
-                    )
-                    .await
+                    LlmFailure::Parse(error) => {
+                        tracing::warn!(error = error.code(), "llm capture response rejected");
+                        let message = match error {
+                            ParseError::TooManyItems { .. } => TOO_MANY,
+                            _ => FAILED,
+                        };
+                        let run = self.run_record(
+                            &job,
+                            &prepared,
+                            FAILURE,
+                            Some(error.code()),
+                            latency_ms,
+                        );
+                        self.fail(
+                            &job,
+                            &prepared,
+                            Issue {
+                                text: &text,
+                                code: error.code(),
+                                retryable: false,
+                                message,
+                                run: Some(run),
+                            },
+                            now,
+                        )
+                        .await
+                    }
                 }
-            },
+            }
         }
     }
 

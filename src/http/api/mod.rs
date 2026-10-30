@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod calendar;
+pub mod capture;
 pub mod dto;
 pub mod household;
 pub mod items;
@@ -10,6 +11,7 @@ pub mod search;
 pub mod snapshot;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, patch, post};
 use sqlx::Transaction;
 use sqlx::postgres::Postgres;
@@ -21,8 +23,8 @@ use super::error::ApiError;
 use super::router::AppState;
 
 /// Собрать маршруты `/api/v1`.
-pub fn router() -> Router<AppState> {
-    Router::new()
+pub fn router(state: &AppState) -> Router<AppState> {
+    let mut router = Router::new()
         .route("/household", get(household::get))
         .route("/lists", get(lists::list).post(lists::create))
         .route("/lists/{id}", patch(lists::update).delete(lists::delete))
@@ -36,7 +38,20 @@ pub fn router() -> Router<AppState> {
         .route("/items/{id}/undo", post(items::undo))
         .route("/search", get(search::search))
         .route("/calendar", get(calendar::calendar))
-        .route("/snapshot", get(snapshot::snapshot))
+        .route("/snapshot", get(snapshot::snapshot));
+    // Выключенный capture выглядит как отсутствующий маршрут: 404 в общем
+    // конверте, без вызова LLM и без разбора тела.
+    if state
+        .capture
+        .as_ref()
+        .is_some_and(|capture| capture.config.enabled)
+    {
+        router = router.route(
+            "/capture",
+            post(capture::capture).layer(DefaultBodyLimit::max(capture::BODY_LIMIT_BYTES)),
+        );
+    }
+    router
 }
 
 /// Проверить scope на чтение.
@@ -49,6 +64,12 @@ pub fn require_read(auth: &AuthContext) -> Result<(), ApiError> {
 pub fn require_write(auth: &AuthContext) -> Result<(), ApiError> {
     auth.require_scope("ha:write")
         .map_err(|_| ApiError::forbidden("Token is missing scope ha:write"))
+}
+
+/// Проверить scope на внешний capture.
+pub fn require_capture(auth: &AuthContext) -> Result<(), ApiError> {
+    auth.require_scope("capture:write")
+        .map_err(|_| ApiError::forbidden("Token is missing scope capture:write"))
 }
 
 /// Получить соединение из пула.

@@ -65,7 +65,8 @@
 - [x] 5.9 Реализовать `llm_runs` без исходного текста, retention 90 дней и redaction логов; проверить тестом перехвата логов.
 - [x] 5.10 Собрать golden set ≥30 русских фраз и скрипт оценки; проверить, что точность извлечения ≥90% и регрессия блокирует версию промпта.
   - Заметка (5.10): живой замер не выполнен, `tests/golden/baseline.json` пуст. Guard в `tests/golden_capture.rs` включится после первой записи baseline командой `tasklerq capture-eval`; до этого проверяются структура набора и юнит-тесты метрики.
-- [ ] 5.11 Реализовать `POST /api/v1/capture` с `text`, `source`, `mode`, `hint`, `list_id`: Bearer `capture:write`, лимит тела 16 КБ, текст 2000, ответ `capture_id`/`status`/`fallback`/`speech`/`items`; проверить contract-тестами.
+- [x] 5.11 Реализовать `POST /api/v1/capture` с `text`, `source`, `mode`, `hint`, `list_id`: Bearer `capture:write`, лимит тела 16 КБ, текст 2000, ответ `capture_id`/`status`/`fallback`/`speech`/`items`; проверить contract-тестами.
+  - Заметка (5.11): `auto` применяется через `draft::create` + `draft::confirm`; одна транзакция `items + capture_drafts + item_events` — в 5.12. `idempotency_key` принимается, но не сохраняется и не проверяется до 5.13. Сбой LLM, квоты или предохранителя даёт `503` без fallback до 5.15; `fallback` в ответе всегда `false`.
 - [ ] 5.12 Реализовать `auto`-режим: одна транзакция `items` + `capture_drafts` + `item_events`, без `outbox` и Telegram; проверить тестами успешное применение и отсутствие частичного создания при ошибке.
 - [ ] 5.13 Реализовать `Idempotency-Key`: UNIQUE `(household_id, source, idempotency_key)`, возврат первого результата при повторе, `409` пока первый запрос обрабатывается, `422` при другом теле; проверить тестами одинаковые и разные ключи и параллельный повтор.
 - [ ] 5.14 Реализовать `draft`-режим внешнего capture и эндпоинты `confirm`/`cancel`/`undo` с TTL 15 минут и идемпотентностью; проверить тестами истёкший черновик и повторную отмену.

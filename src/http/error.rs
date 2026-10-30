@@ -62,6 +62,7 @@ pub struct ApiError {
     code: ErrorCode,
     message: String,
     details: Value,
+    retry_after: Option<u64>,
 }
 
 impl ApiError {
@@ -72,7 +73,14 @@ impl ApiError {
             code,
             message: message.into(),
             details: json!({}),
+            retry_after: None,
         }
+    }
+
+    /// Добавить заголовок `Retry-After` (секунды).
+    pub fn with_retry_after(mut self, seconds: u64) -> Self {
+        self.retry_after = Some(seconds);
+        self
     }
 
     /// Добавить машиночитаемые детали.
@@ -206,6 +214,13 @@ impl IntoResponse for ApiError {
         });
 
         let mut response = (self.status, Json(body)).into_response();
+        if let Some(seconds) = self.retry_after
+            && let Ok(value) = HeaderValue::from_str(&seconds.to_string())
+        {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, value);
+        }
         if let Some(id) = request_id
             && let Ok(value) = HeaderValue::from_str(&id)
         {
