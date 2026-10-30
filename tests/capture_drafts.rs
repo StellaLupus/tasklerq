@@ -778,6 +778,39 @@ async fn same_named_members(pool: &PgPool, household: &TestHousehold) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn telegram_draft_still_rejects_an_unknown_assignee() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let mut item = raw("Купить торт", ListKind::Shopping);
+    item.assignee = Some("Мария".into());
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let id = draft::create(&mut conn, capture(&household, vec![item]), now)
+        .await
+        .expect("draft")
+        .id;
+
+    let view = draft::view(&mut conn, household.household_id, id, now)
+        .await
+        .expect("view");
+    assert_eq!(view.validated.items[0].errors[0].code, "assignee_unknown");
+    assert!(!view.validated.is_valid());
+
+    let error = draft::confirm(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        id,
+        now,
+    )
+    .await
+    .expect_err("an unknown assignee must block confirmation");
+    assert!(matches!(error, DraftError::Invalid(_)));
+    assert_eq!(item_count(&db.pool, &household).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn assignee_answer_accepts_only_a_candidate_and_only_an_open_question() {
     let db = support::db().await;
     let household = support::create_household(&db.pool).await;

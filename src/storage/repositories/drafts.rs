@@ -99,13 +99,35 @@ pub async fn insert(
     draft: NewDraft,
     now: DateTime<Utc>,
 ) -> Result<Draft, DomainError> {
+    insert_with_status(conn, draft, DraftStatus::Pending, now).await
+}
+
+/// Создать уже применённый capture: строка сразу в статусе `applied`.
+///
+/// Нужен внешнему `auto`, где элементы, события и сама строка пишутся одной
+/// транзакцией и промежуточного `pending`-состояния нет.
+pub async fn insert_applied(
+    conn: &mut PgConnection,
+    draft: NewDraft,
+    now: DateTime<Utc>,
+) -> Result<Draft, DomainError> {
+    insert_with_status(conn, draft, DraftStatus::Applied, now).await
+}
+
+async fn insert_with_status(
+    conn: &mut PgConnection,
+    draft: NewDraft,
+    status: DraftStatus,
+    now: DateTime<Utc>,
+) -> Result<Draft, DomainError> {
+    let applied_at = (status == DraftStatus::Applied).then_some(now);
     let row = sqlx::query_as::<_, Draft>(&format!(
         "INSERT INTO capture_drafts (
              id, household_id, user_id, chat_id, source, mode, idempotency_key,
              request_hash, raw_text, parsed, status, fallback, prompt_version,
-             created_at, expires_at
+             created_at, expires_at, applied_at
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11, $12, $13, $14)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
          RETURNING {COLUMNS}"
     ))
     .bind(draft.id)
@@ -118,10 +140,12 @@ pub async fn insert(
     .bind(draft.request_hash)
     .bind(draft.raw_text)
     .bind(draft.parsed)
+    .bind(status)
     .bind(draft.fallback)
     .bind(draft.prompt_version)
     .bind(now)
     .bind(now + Duration::minutes(DRAFT_TTL_MINUTES))
+    .bind(applied_at)
     .fetch_one(conn)
     .await?;
 

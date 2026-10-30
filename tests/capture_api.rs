@@ -16,6 +16,7 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tasklerq::capture::breaker::CircuitBreaker;
+use tasklerq::capture::draft;
 use tasklerq::config::CaptureConfig;
 use tasklerq::home_assistant::{AiTask, GenerateData, HaError};
 use tasklerq::http::api::capture::CaptureState;
@@ -204,6 +205,17 @@ async fn draft_count(pool: &PgPool, household_id: Uuid) -> i64 {
         .fetch_one(pool)
         .await
         .expect("count drafts")
+}
+
+async fn created_event_count(pool: &PgPool, household_id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM item_events
+         WHERE household_id = $1 AND event_type = 'created'",
+    )
+    .bind(household_id)
+    .fetch_one(pool)
+    .await
+    .expect("count created events")
 }
 
 fn assert_error_envelope(json: &Value, code: &str) {
@@ -524,6 +536,31 @@ async fn auto_applies_two_purchases_and_returns_the_full_contract() {
             .await
             .expect("count outbox rows");
     assert_eq!(leaked_into_outbox, 0, "capture must not write to outbox");
+
+    let (draft_status, draft_mode, applied_at, parser_version): (
+        String,
+        String,
+        Option<DateTime<Utc>>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT status::text, mode::text, applied_at, prompt_version FROM capture_drafts
+         WHERE id = $1 AND household_id = $2",
+    )
+    .bind(Uuid::parse_str(capture_id).expect("uuid"))
+    .bind(household.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("capture row");
+    assert_eq!(draft_status, "applied");
+    assert_eq!(draft_mode, "auto");
+    assert!(applied_at.is_some(), "applied capture must have applied_at");
+    assert_eq!(parser_version.as_deref(), Some("capture-v2"));
+
+    assert_eq!(
+        created_event_count(&db.pool, household.household_id).await,
+        2,
+        "each created item must have one created event"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -555,10 +592,274 @@ async fn auto_rejects_the_whole_capture_when_one_item_is_invalid() {
     assert!(json["expires_at"].is_null());
     let speech = json["speech"].as_str().expect("speech");
     assert!(speech.starts_with("Не смог добавить:"), "{speech}");
+    assert!(speech.contains("дата уже прошла"), "{speech}");
+    assert!(!speech.contains("date_past"), "{speech}");
     assert!(speech.chars().count() <= 200);
 
     assert_eq!(item_count(&db.pool, household.household_id).await, 0);
     assert_eq!(draft_count(&db.pool, household.household_id).await, 0);
+    assert_eq!(
+        created_event_count(&db.pool, household.household_id).await,
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_rolls_back_items_events_and_the_capture_row_on_a_midway_failure() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+
+    // Триггер ломает вставку только для этого названия; база отдельная, потому
+    // что DDL на `items` подвесил бы параллельные тесты общей базы.
+    let marker = format!("boom-{}", Uuid::now_v7());
+    let suffix = marker.replace('-', "_");
+    sqlx::query(&format!(
+        "CREATE FUNCTION fail_{suffix}() RETURNS trigger AS $$
+         BEGIN
+             IF NEW.title = '{marker}' THEN
+                 RAISE EXCEPTION 'forced failure';
+             END IF;
+             RETURN NEW;
+         END $$ LANGUAGE plpgsql"
+    ))
+    .execute(&db.pool)
+    .await
+    .expect("function");
+    sqlx::query(&format!(
+        "CREATE TRIGGER fail_{suffix} BEFORE INSERT ON items
+         FOR EACH ROW EXECUTE FUNCTION fail_{suffix}()"
+    ))
+    .execute(&db.pool)
+    .await
+    .expect("trigger");
+
+    let ai = StubAi::new(vec![Ok(json!({"items": [
+        {"target_kind": "shopping", "title": "молоко"},
+        {"target_kind": "shopping", "title": marker}
+    ]}))]);
+    let app = app(&db.pool, ai.clone(), config());
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(body("купить молоко и хлеб", "ha_voice", "auto")),
+    )
+    .await;
+
+    sqlx::query(&format!("DROP TRIGGER fail_{suffix} ON items"))
+        .execute(&db.pool)
+        .await
+        .expect("drop trigger");
+    sqlx::query(&format!("DROP FUNCTION fail_{suffix}()"))
+        .execute(&db.pool)
+        .await
+        .expect("drop function");
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_error_envelope(&json, "internal_error");
+    assert_eq!(item_count(&db.pool, household.household_id).await, 0);
+    assert_eq!(
+        created_event_count(&db.pool, household.household_id).await,
+        0
+    );
+    assert_eq!(draft_count(&db.pool, household.household_id).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_creates_an_item_without_an_assignee_when_the_name_is_unknown() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(json!({"items": [
+        {"target_kind": "tasks", "title": "позвонить маме", "assignee": "Мария"}
+    ]}))]);
+    let app = app(&db.pool, ai.clone(), config());
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(body("позвонить маме", "ha_voice", "auto")),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["status"], "applied");
+    assert_eq!(json["items"].as_array().expect("items").len(), 1);
+    let capture_id =
+        Uuid::parse_str(json["capture_id"].as_str().expect("capture_id")).expect("uuid");
+    let assignee: Option<Uuid> =
+        sqlx::query_scalar("SELECT assignee_user_id FROM items WHERE capture_id = $1")
+            .bind(capture_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("item assignee");
+    assert!(assignee.is_none(), "unknown assignee must be dropped");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_creates_an_item_without_an_assignee_when_the_name_is_ambiguous() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    sqlx::query("UPDATE users SET display_name = 'Алексей' WHERE household_id = $1")
+        .bind(household.household_id)
+        .execute(&db.pool)
+        .await
+        .expect("same-named members");
+    let ai = StubAi::new(vec![Ok(json!({"items": [
+        {"target_kind": "tasks", "title": "позвонить маме", "assignee": "Алексей"}
+    ]}))]);
+    let app = app(&db.pool, ai.clone(), config());
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(body("позвонить маме", "ha_voice", "auto")),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["status"], "applied");
+    let capture_id =
+        Uuid::parse_str(json["capture_id"].as_str().expect("capture_id")).expect("uuid");
+    let assignee: Option<Uuid> =
+        sqlx::query_scalar("SELECT assignee_user_id FROM items WHERE capture_id = $1")
+            .bind(capture_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("item assignee");
+    assert!(assignee.is_none(), "ambiguous assignee must be dropped");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn draft_mode_keeps_the_strict_assignee_check() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(json!({"items": [
+        {"target_kind": "tasks", "title": "позвонить маме", "assignee": "Мария"}
+    ]}))]);
+    let app = app(&db.pool, ai.clone(), config());
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(body("позвонить маме", "api", "draft")),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["status"], "draft");
+    assert!(json["items"][0]["id"].is_null());
+    let capture_id =
+        Uuid::parse_str(json["capture_id"].as_str().expect("capture_id")).expect("uuid");
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let view = draft::view(&mut conn, household.household_id, capture_id, Utc::now())
+        .await
+        .expect("draft view");
+    assert_eq!(view.validated.items[0].errors[0].code, "assignee_unknown");
+    assert!(!view.validated.is_valid());
+    assert_eq!(item_count(&db.pool, household.household_id).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_drops_empty_optionals_and_returns_clarifications_without_blocking() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(json!({
+        "items": [{
+            "target_kind": "shopping",
+            "title": "молоко",
+            "notes": "   ",
+            "tags": ["", "  "],
+            "subtasks": [" ", ""]
+        }],
+        "clarifications": ["Какой объём?"]
+    }))]);
+    let app = app(&db.pool, ai.clone(), config());
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(body("купить молоко", "ha_voice", "auto")),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["status"], "applied");
+    assert_eq!(json["clarifications"], json!(["Какой объём?"]));
+    assert_eq!(json["items"].as_array().expect("items").len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_puts_an_item_into_the_default_list_when_the_named_list_is_unknown() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(json!({"items": [
+        {"target_kind": "tasks", "target_list": "Несуществующий список",
+         "title": "позвонить маме"}
+    ]}))]);
+    let app = app(&db.pool, ai.clone(), config());
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(body("позвонить маме", "ha_voice", "auto")),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["status"], "applied");
+    assert_eq!(
+        json["items"][0]["list_id"],
+        household.tasks_list_id.to_string()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_five_item_capture_speaks_only_the_count() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let items: Vec<Value> = ["молоко", "хлеб", "сыр", "яйца", "масло"]
+        .into_iter()
+        .map(|title| json!({"target_kind": "shopping", "title": title}))
+        .collect();
+    let ai = StubAi::new(vec![Ok(json!({"items": items}))]);
+    let app = app(&db.pool, ai.clone(), config());
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(body("купить пять продуктов", "ha_voice", "auto")),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["status"], "applied");
+    let speech = json["speech"].as_str().expect("speech");
+    assert!(speech.contains('5'), "{speech}");
+    for title in ["молоко", "хлеб", "сыр", "яйца", "масло"] {
+        assert!(!speech.contains(title), "{speech}");
+    }
+    assert!(speech.chars().count() <= 200, "{speech}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

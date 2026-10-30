@@ -196,6 +196,15 @@ pub struct Confirmed {
     pub replayed: bool,
 }
 
+/// Результат применения внешнего `auto`.
+#[derive(Debug, Clone)]
+pub struct Applied {
+    /// Строка `capture_drafts`; она же `capture_id` ответа.
+    pub capture_id: Uuid,
+    /// Созданные элементы в порядке разбора.
+    pub items: Vec<Item>,
+}
+
 /// Правка элемента черновика. Строки — «как у LLM»: проверка идёт тем же
 /// кодом, что и для ответа модели.
 #[derive(Debug, Clone, Default)]
@@ -545,35 +554,15 @@ pub async fn confirm(
         return Err(DraftError::Invalid(invalid));
     }
 
-    let today = view.context.today();
-    let timezone = view.context.timezone.name();
-    let mut created = Vec::with_capacity(view.validated.items.len());
-    for draft_item in view.validated.items {
-        let Some(new_item) = draft_item.item else {
-            return Err(DraftError::Invalid(Vec::new()));
-        };
-        let list_kind = view
-            .context
-            .lists
-            .iter()
-            .find(|list| list.id == new_item.list_id)
-            .map(|list| list.kind)
-            .ok_or(DomainError::NotFound)?;
-        let list_id = new_item.list_id;
-        let assignee = new_item.assignee_user_id;
-        let validated = validate_new_item(list_kind, timezone, new_item, today)?;
-        let item = items::create(
-            &mut tx,
-            household_id,
-            actor,
-            list_id,
-            validated,
-            assignee,
-            now,
-        )
-        .await?;
-        created.push(item);
-    }
+    let mut created = create_items(
+        &mut tx,
+        household_id,
+        &view.context,
+        view.validated.items,
+        actor,
+        now,
+    )
+    .await?;
 
     let ids: Vec<Uuid> = created.iter().map(|item| item.id).collect();
     drafts::link_items(&mut tx, household_id, draft_id, &ids).await?;
@@ -588,6 +577,93 @@ pub async fn confirm(
         items: created,
         replayed: false,
     })
+}
+
+/// Применить внешний `auto` одной транзакцией.
+///
+/// Строка `capture_drafts` сразу пишется в статусе `applied`, затем в той же
+/// транзакции создаются элементы (вместе с их событиями) и привязываются к
+/// capture. Любая ошибка откатывает всё: не остаётся ни элементов, ни событий,
+/// ни строки capture.
+pub async fn apply_auto(
+    conn: &mut PgConnection,
+    capture: NewCapture,
+    actor: &Actor,
+    context: &CaptureContext,
+    items: Vec<DraftItem>,
+    now: DateTime<Utc>,
+) -> Result<Applied, DraftError> {
+    let household_id = capture.household_id;
+    let stored = Stored::from_parsed(capture.parsed);
+
+    let mut tx = conn.begin().await?;
+    let draft = drafts::insert_applied(
+        &mut tx,
+        NewDraft {
+            id: Uuid::now_v7(),
+            household_id,
+            user_id: capture.user_id,
+            chat_id: capture.chat_id,
+            source: capture.source,
+            mode: capture.mode,
+            idempotency_key: capture.idempotency_key,
+            request_hash: capture.request_hash,
+            raw_text: sanitize(&capture.raw_text),
+            parsed: stored.to_value(),
+            fallback: capture.fallback,
+            prompt_version: capture.prompt_version,
+        },
+        now,
+    )
+    .await?;
+
+    let mut created = create_items(&mut tx, household_id, context, items, actor, now).await?;
+    let ids: Vec<Uuid> = created.iter().map(|item| item.id).collect();
+    drafts::link_items(&mut tx, household_id, draft.id, &ids).await?;
+    tx.commit().await?;
+
+    for item in &mut created {
+        item.capture_id = Some(draft.id);
+    }
+    Ok(Applied {
+        capture_id: draft.id,
+        items: created,
+    })
+}
+
+/// Создать элементы проверенного черновика в уже открытой транзакции.
+///
+/// Общая часть [`confirm`] и [`apply_auto`]: доменная проверка повторяется,
+/// чтобы репозиторий и валидация не разошлись.
+async fn create_items(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    context: &CaptureContext,
+    items: Vec<DraftItem>,
+    actor: &Actor,
+    now: DateTime<Utc>,
+) -> Result<Vec<Item>, DraftError> {
+    let today = context.today();
+    let timezone = context.timezone.name();
+    let mut created = Vec::with_capacity(items.len());
+    for draft_item in items {
+        let Some(new_item) = draft_item.item else {
+            return Err(DraftError::Invalid(Vec::new()));
+        };
+        let list_kind = context
+            .lists
+            .iter()
+            .find(|list| list.id == new_item.list_id)
+            .map(|list| list.kind)
+            .ok_or(DomainError::NotFound)?;
+        let list_id = new_item.list_id;
+        let assignee = new_item.assignee_user_id;
+        let validated = validate_new_item(list_kind, timezone, new_item, today)?;
+        let item =
+            items::create(conn, household_id, actor, list_id, validated, assignee, now).await?;
+        created.push(item);
+    }
+    Ok(created)
 }
 
 /// Отменить черновик. Повторная отмена и отмена истёкшего — не ошибка;

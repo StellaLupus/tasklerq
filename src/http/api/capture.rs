@@ -23,7 +23,7 @@ use crate::capture::draft::{self, NewCapture};
 use crate::capture::llm::{self, Failure};
 use crate::capture::prompt::PROMPT_VERSION;
 use crate::capture::schema::{ParseError, ParsedResponse};
-use crate::capture::validate::{DraftItem, validate_items};
+use crate::capture::validate::{DraftItem, ValidationMode, validate_items_in};
 use crate::config::CaptureConfig;
 use crate::domain::error::DomainError;
 use crate::domain::models::{CaptureMode, CaptureSource, Item, List, ListKind};
@@ -455,7 +455,11 @@ pub async fn capture(
     apply_target(&mut parsed, target_list.as_ref(), request.hint);
 
     let item_source = draft::item_source(source);
-    let validated = validate_items(&context, item_source, parsed.clone());
+    let validation = match request.mode {
+        CaptureMode::Auto => ValidationMode::Auto,
+        CaptureMode::Draft => ValidationMode::Strict,
+    };
+    let validated = validate_items_in(&context, item_source, parsed.clone(), validation);
 
     let run = NewRun {
         household_id: auth.household_id,
@@ -492,7 +496,10 @@ pub async fn capture(
                     validated.clarifications,
                 ));
             }
-            let draft = draft::create(
+            let item_kinds: Vec<ListKind> = validated.items.iter().map(|item| item.kind).collect();
+            let expected_items = item_kinds.len();
+            let actor = integration_actor(item_source);
+            let applied = draft::apply_auto(
                 &mut conn,
                 NewCapture {
                     household_id: auth.household_id,
@@ -507,27 +514,26 @@ pub async fn capture(
                     fallback: false,
                     prompt_version: Some(PROMPT_VERSION.to_owned()),
                 },
+                &actor,
+                &context,
+                validated.items,
                 finished_at,
             )
-            .await?;
-            let actor = integration_actor(item_source);
-            let confirmed =
-                draft::confirm(&mut conn, auth.household_id, &actor, draft.id, finished_at)
-                    .await
-                    .map_err(draft_error)?;
-            if confirmed.items.len() != validated.items.len() {
-                tracing::error!("confirmed capture item count does not match the draft");
+            .await
+            .map_err(draft_error)?;
+            if applied.items.len() != expected_items {
+                tracing::error!("applied capture item count does not match the parse");
                 return Err(ApiError::internal("Database error"));
             }
-            let items: Vec<CaptureItem> = confirmed
+            let items: Vec<CaptureItem> = applied
                 .items
                 .iter()
-                .zip(&validated.items)
-                .map(|(item, draft)| item_response(item, draft.kind))
+                .zip(&item_kinds)
+                .map(|(item, kind)| item_response(item, *kind))
                 .collect();
-            log_capture(source, "applied", draft.id);
+            log_capture(source, "applied", applied.capture_id);
             Ok(Json(CaptureResponse {
-                capture_id: draft.id,
+                capture_id: applied.capture_id,
                 status: Status::Applied,
                 fallback: false,
                 speech: fit_speech(applied_speech(&items)),
