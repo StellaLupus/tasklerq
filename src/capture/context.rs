@@ -46,6 +46,9 @@ pub struct CaptureContext {
     pub lists: Vec<ListRef>,
     /// Активные участники.
     pub members: Vec<MemberRef>,
+    /// Автор заметки, если он известен. Нужен, чтобы «мне»/«я» в тексте
+    /// разрешались в него, а не оставались неизвестным исполнителем.
+    pub author: Option<MemberRef>,
 }
 
 impl CaptureContext {
@@ -81,7 +84,17 @@ impl CaptureContext {
             timezone: parse_timezone(timezone)?,
             lists,
             members,
+            author: None,
         })
+    }
+
+    /// Указать автора заметки. Автор обязан быть активным участником: иначе
+    /// «мне» нельзя назначить задачу, и поле остаётся пустым.
+    #[must_use]
+    pub fn with_author(mut self, author_id: Option<Uuid>) -> Self {
+        self.author =
+            author_id.and_then(|id| self.members.iter().find(|member| member.id == id).cloned());
+        self
     }
 
     /// Текущий момент с точностью до минуты: так время видит модель в промпте,

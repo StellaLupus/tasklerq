@@ -8,9 +8,9 @@
 
 use uuid::Uuid;
 
-use crate::capture::draft::{self, DraftError, DraftView};
+use crate::capture::draft::{self, DraftError, DraftView, DueChoice};
 use crate::capture::schema::{RawItem, RawRecurrence};
-use crate::capture::validate::{parse_date, parse_time};
+use crate::capture::validate::{DraftItem, parse_date, parse_time};
 use crate::domain::models::{
     DraftStatus, ItemPriority, ListKind, MonthRule, NewItem, RecurrenceFreq,
 };
@@ -27,6 +27,8 @@ use super::model::{
 };
 use super::screens::back_button;
 use super::{Ctx, Fail};
+
+mod clarify;
 
 /// Максимальная длина текста на разбор.
 pub const MAX_TEXT: usize = 2_000;
@@ -165,6 +167,8 @@ fn card(ctx: &Ctx<'_>, view: &DraftView) -> Ui {
         ui = ui.text("Все элементы удалены. Отмените черновик или отправьте текст заново.");
     }
 
+    ui = clarify::clarification(ui, view);
+
     let until = view
         .draft
         .expires_at
@@ -183,12 +187,7 @@ fn card(ctx: &Ctx<'_>, view: &DraftView) -> Ui {
     ui.row(buttons)
 }
 
-fn details(
-    ctx: &Ctx<'_>,
-    view: &DraftView,
-    draft_item: &crate::capture::validate::DraftItem,
-    item: &NewItem,
-) -> Vec<String> {
+fn details(ctx: &Ctx<'_>, view: &DraftView, draft_item: &DraftItem, item: &NewItem) -> Vec<String> {
     let mut lines = Vec::new();
 
     if let Some(list) = view
@@ -317,6 +316,13 @@ fn fail(error: DraftError) -> Fail {
         DraftError::NoSuchItem(_) => {
             Fail::User("Такого элемента в черновике уже нет. Показываю актуальный.".into())
         }
+        DraftError::ClarificationLimit => Fail::User(
+            "Больше трёх уточнений не задаю. Откройте «Изменить» и поправьте элемент вручную."
+                .into(),
+        ),
+        DraftError::NoClarification => {
+            Fail::User("Этот вопрос уже неактуален. Показываю актуальный черновик.".into())
+        }
         DraftError::Invalid(_) => {
             Fail::User("Исправьте или удалите отмеченные элементы, чтобы сохранить.".into())
         }
@@ -337,6 +343,50 @@ pub async fn save(ctx: &mut Ctx<'_>, draft_id: Uuid) -> Result<(), Fail> {
     } else {
         "Сохранено"
     });
+    ctx.present(Screen::Draft { draft_id }).await
+}
+
+/// Ответ на вопрос об исполнителе.
+pub async fn assign(
+    ctx: &mut Ctx<'_>,
+    draft_id: Uuid,
+    index: usize,
+    user_id: Uuid,
+) -> Result<(), Fail> {
+    let household_id = ctx.household()?.id;
+    draft::answer_assignee(
+        &mut *ctx.conn,
+        household_id,
+        draft_id,
+        index,
+        user_id,
+        ctx.now,
+    )
+    .await
+    .map_err(fail)?;
+    ctx.toast("Исполнитель выбран");
+    ctx.present(Screen::Draft { draft_id }).await
+}
+
+/// Ответ на вопрос о дате: «сегодня» или «завтра».
+pub async fn due(
+    ctx: &mut Ctx<'_>,
+    draft_id: Uuid,
+    index: usize,
+    choice: DueChoice,
+) -> Result<(), Fail> {
+    let household_id = ctx.household()?.id;
+    draft::answer_due_date(
+        &mut *ctx.conn,
+        household_id,
+        draft_id,
+        index,
+        choice,
+        ctx.now,
+    )
+    .await
+    .map_err(fail)?;
+    ctx.toast("Срок уточнён");
     ctx.present(Screen::Draft { draft_id }).await
 }
 
@@ -380,6 +430,20 @@ pub async fn undo(ctx: &mut Ctx<'_>, draft_id: Uuid) -> Result<(), Fail> {
 
 /// «Изменить»: форма создания, заполненная элементом черновика.
 pub async fn edit(ctx: &mut Ctx<'_>, draft_id: Uuid, index: usize) -> Result<(), Fail> {
+    open_edit(ctx, draft_id, index, Step::Preview).await
+}
+
+/// «Выбрать дату» в уточняющем вопросе: та же форма, сразу на шаге срока.
+pub async fn edit_due(ctx: &mut Ctx<'_>, draft_id: Uuid, index: usize) -> Result<(), Fail> {
+    open_edit(ctx, draft_id, index, Step::Due).await
+}
+
+async fn open_edit(
+    ctx: &mut Ctx<'_>,
+    draft_id: Uuid,
+    index: usize,
+    step: Step,
+) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
     let view = draft::view(&mut *ctx.conn, household_id, draft_id, ctx.now).await?;
     if !view.is_open(ctx.now) {
@@ -401,11 +465,7 @@ pub async fn edit(ctx: &mut Ctx<'_>, draft_id: Uuid, index: usize) -> Result<(),
         ItemForm {
             list_id,
             kind,
-            step: if list_id.is_some() {
-                Step::Preview
-            } else {
-                Step::List
-            },
+            step: if list_id.is_some() { step } else { Step::List },
             draft: draft_item,
             from_preview: false,
             error: None,

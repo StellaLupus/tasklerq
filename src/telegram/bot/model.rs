@@ -9,6 +9,7 @@ use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::capture::draft::DueChoice;
 use crate::domain::error::DomainError;
 use crate::domain::models::{
     Field, Item, ItemPatch, ItemPriority, ItemStatus, ListKind, MonthRule, NewItem, Recurrence,
@@ -464,6 +465,31 @@ pub enum Action {
     },
     /// Убрать элемент из черновика.
     DraftRemove {
+        /// Черновик.
+        draft_id: Uuid,
+        /// Номер элемента с нуля.
+        index: usize,
+    },
+    /// Выбрать исполнителя в ответ на уточняющий вопрос.
+    DraftAssign {
+        /// Черновик.
+        draft_id: Uuid,
+        /// Номер элемента с нуля.
+        index: usize,
+        /// Выбранный участник.
+        user_id: Uuid,
+    },
+    /// Выбрать «сегодня» или «завтра» в ответ на вопрос о дате.
+    DraftDue {
+        /// Черновик.
+        draft_id: Uuid,
+        /// Номер элемента с нуля.
+        index: usize,
+        /// Какой день выбрать.
+        choice: DueChoice,
+    },
+    /// Открыть форму правки сразу на шаге срока.
+    DraftEditDue {
         /// Черновик.
         draft_id: Uuid,
         /// Номер элемента с нуля.

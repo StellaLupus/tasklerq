@@ -1,4 +1,4 @@
-//! Промпт `capture-v1` и структура ответа для `ai_task.generate_data`.
+//! Промпт `capture-v2` и структура ответа для `ai_task.generate_data`.
 //!
 //! Шаблон лежит в отдельном файле, чтобы его изменение было видно в диффе, а
 //! тест `prompt_template_is_pinned_to_version` не давал поменять текст без
@@ -12,12 +12,12 @@ use super::context::CaptureContext;
 use crate::domain::models::ListKind;
 
 /// Версия промпта; пишется в `llm_runs` и `capture_drafts`.
-pub const PROMPT_VERSION: &str = "capture-v1";
+pub const PROMPT_VERSION: &str = "capture-v2";
 
 /// Имя задачи в журнале Home Assistant.
 pub const TASK_NAME: &str = "Разбор заметки Tasklerq";
 
-const TEMPLATE: &str = include_str!("prompts/capture-v1.txt");
+const TEMPLATE: &str = include_str!("prompts/capture-v2.txt");
 
 const TEXT_OPEN: &str = "<<<USER_TEXT";
 const TEXT_CLOSE: &str = "USER_TEXT>>>";
@@ -61,6 +61,11 @@ pub fn build_instructions(context: &CaptureContext, text: &str) -> String {
             .iter()
             .map(|member| quote(&member.display_name)),
     );
+    let author = context
+        .author
+        .as_ref()
+        .map(|author| quote(&author.display_name))
+        .unwrap_or_else(|| "—".to_owned());
     let text = neutralize_text(text);
 
     render(TEMPLATE, |name| match name {
@@ -68,6 +73,7 @@ pub fn build_instructions(context: &CaptureContext, text: &str) -> String {
         "timezone" => Some(context.timezone.name().to_owned()),
         "lists" => Some(lists.clone()),
         "members" => Some(members.clone()),
+        "author" => Some(author.clone()),
         "text" => Some(text.clone()),
         _ => None,
     })
@@ -171,17 +177,17 @@ mod tests {
     use super::*;
     use crate::capture::test_support::{context, list, member};
 
-    const SNAPSHOT: &str = include_str!("prompts/capture-v1.snapshot.txt");
+    const SNAPSHOT: &str = include_str!("prompts/capture-v2.snapshot.txt");
 
     /// Хеш шаблона привязан к версии. Если тест упал, значит текст промпта
-    /// изменился: заведите новую версию (`capture-v2`), прогоните golden set и
+    /// изменился: заведите новую версию (`capture-v3`), прогоните golden set и
     /// только потом обновите константы.
     const TEMPLATE_SHA256: &str =
-        "70f3a222201de8b6fbcfeaaddc2c6ffc3bb8cfc7a014d06c1f39a92e9378fea1";
+        "2b4372fc364b2bda0786352ee37c89f637f8cb23a6381ba97e6c1743920515a0";
 
     #[test]
     fn prompt_template_is_pinned_to_version() {
-        assert_eq!(PROMPT_VERSION, "capture-v1");
+        assert_eq!(PROMPT_VERSION, "capture-v2");
         let digest = Sha256::digest(TEMPLATE.as_bytes());
         let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
         assert_eq!(
@@ -212,6 +218,16 @@ mod tests {
             assert!(rendered.contains(&format!("\"{}\"", member.display_name)));
             assert!(!rendered.contains(&member.id.to_string()));
         }
+        assert!(!rendered.contains("anna"));
+    }
+
+    #[test]
+    fn prompt_includes_the_author_name_but_not_their_username() {
+        let context = context();
+        let author = context.author.clone().expect("author");
+        let rendered = build_instructions(&context, "напомни мне позвонить");
+
+        assert!(rendered.contains(&format!("- Автор заметки: \"{}\"", author.display_name)));
         assert!(!rendered.contains("anna"));
     }
 

@@ -31,6 +31,7 @@ pub fn member(display_name: &str, username: Option<&str>) -> MemberRef {
 
 /// Household «Москва»: списки «Задачи», «Покупки», «Дача»; участники Анна и Пётр.
 pub fn context() -> CaptureContext {
+    let members = vec![member("Анна", Some("anna")), member("Пётр", None)];
     CaptureContext {
         now: now(),
         timezone: Moscow,
@@ -39,6 +40,7 @@ pub fn context() -> CaptureContext {
             list("Покупки", ListKind::Shopping, true),
             list("Дача", ListKind::Tasks, false),
         ],
-        members: vec![member("Анна", Some("anna")), member("Пётр", None)],
+        author: members.first().cloned(),
+        members,
     }
 }

@@ -140,6 +140,50 @@ impl Stand {
     }
 }
 
+async fn household_id(pool: &PgPool, chat: i64) -> uuid::Uuid {
+    sqlx::query_scalar("SELECT household_id FROM users WHERE telegram_user_id = $1")
+        .bind(chat)
+        .fetch_one(pool)
+        .await
+        .expect("household")
+}
+
+async fn rename_member(pool: &PgPool, chat: i64, name: &str, username: &str) {
+    sqlx::query("UPDATE users SET display_name = $2, username = $3 WHERE telegram_user_id = $1")
+        .bind(chat)
+        .bind(name)
+        .bind(username)
+        .execute(pool)
+        .await
+        .expect("rename");
+}
+
+async fn add_member(
+    pool: &PgPool,
+    household_id: uuid::Uuid,
+    name: &str,
+    username: &str,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    let telegram_id = support::next_telegram_id();
+    sqlx::query(
+        "INSERT INTO users (
+             id, household_id, telegram_user_id, telegram_chat_id, display_name,
+             username, role, settings, created_at, updated_at
+         )
+         VALUES ($1, $2, $3, $3, $4, $5, 'member', '{}'::jsonb, now(), now())",
+    )
+    .bind(id)
+    .bind(household_id)
+    .bind(telegram_id)
+    .bind(name)
+    .bind(username)
+    .execute(pool)
+    .await
+    .expect("member");
+    id
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn text_is_queued_and_the_card_replaces_the_waiting_screen() {
     let db = db().await;
@@ -458,6 +502,172 @@ async fn card_shows_the_due_date_the_domain_will_assign_to_a_series() {
     .expect("due");
     assert_eq!(due.len(), 1);
     assert!(due[0].is_some(), "the saved item has the shown due date");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ambiguous_assignee_asks_and_the_choice_updates_the_draft_without_llm() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Торт", "assignee": "Алексей"}
+        ]}))],
+    )
+    .await;
+    let household = household_id(&db.pool, stand.bot.chat).await;
+    rename_member(&db.pool, stand.bot.chat, "Алексей", "alex_a").await;
+    let chosen = add_member(&db.pool, household, "Алексей", "alex_b").await;
+
+    stand.capture("назначить Алексею купить торт").await;
+
+    stand.bot.assert_screen_contains("Какой исполнитель");
+    stand.bot.assert_has_button("alex_a");
+    stand.bot.assert_has_button("alex_b");
+    assert!(
+        stand.bot.find_button("Сохранить всё").is_none(),
+        "ambiguous assignee must block saving:\n{}",
+        stand.bot.screen()
+    );
+    let calls = stand.ai.calls();
+
+    stand.bot.press("alex_b").await;
+
+    assert_eq!(
+        stand.ai.calls(),
+        calls,
+        "the answer must not call the LLM again"
+    );
+    assert!(!stand.bot.screen().contains("Какой исполнитель"));
+    stand.bot.assert_has_button("Сохранить всё");
+
+    stand.bot.press("Сохранить всё").await;
+    let assignee: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT i.assignee_user_id FROM items i JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1",
+    )
+    .bind(stand.bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("assignee");
+    assert_eq!(assignee, Some(chosen));
+}
+
+/// Карточка с прошедшей датой и вопросом о сроке.
+async fn ambiguous_date_stand(db: &support::TestDb) -> (Stand, chrono::NaiveDate) {
+    let timezone = chrono_tz::Europe::Moscow;
+    let today = Utc::now().with_timezone(&timezone).date_naive();
+    let past = (today - Duration::days(2)).format("%Y-%m-%d").to_string();
+    let answer = json!({"items": [
+        {"target_kind": "tasks", "title": "Оплатить счёт", "due_date": past}
+    ]});
+    let mut stand = stand(&db.pool, vec![Ok(answer)]).await;
+    stand.capture("оплатить счёт позавчера").await;
+    (stand, today)
+}
+
+async fn saved_due_date(stand: &Stand) -> Option<chrono::NaiveDate> {
+    sqlx::query_scalar(
+        "SELECT i.due_date FROM items i JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1",
+    )
+    .bind(stand.bot.chat)
+    .fetch_one(&stand.bot.pool)
+    .await
+    .expect("due date")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ambiguous_date_offers_today_and_tomorrow_without_guessing() {
+    let db = db().await;
+    let (mut stand, today) = ambiguous_date_stand(&db).await;
+
+    stand.bot.assert_screen_contains("Уточните срок");
+    stand.bot.assert_has_button("Сегодня");
+    stand.bot.assert_has_button("Завтра");
+    stand.bot.assert_has_button("Выбрать дату");
+    assert!(
+        stand.bot.find_button("Сохранить всё").is_none(),
+        "an ambiguous date must block saving:\n{}",
+        stand.bot.screen()
+    );
+    let calls = stand.ai.calls();
+
+    stand.bot.press("Завтра").await;
+
+    assert_eq!(
+        stand.ai.calls(),
+        calls,
+        "the answer must not call the LLM again"
+    );
+    assert!(!stand.bot.screen().contains("Уточните срок"));
+    stand.bot.assert_has_button("Сохранить всё");
+
+    stand.bot.press("Сохранить всё").await;
+    assert_eq!(
+        saved_due_date(&stand).await,
+        Some(today + Duration::days(1))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn choosing_today_saves_todays_due_date() {
+    let db = db().await;
+    let (mut stand, today) = ambiguous_date_stand(&db).await;
+
+    stand.bot.press("Сегодня").await;
+
+    assert!(!stand.bot.screen().contains("Уточните срок"));
+    stand.bot.assert_has_button("Сохранить всё");
+    stand.bot.press("Сохранить всё").await;
+    assert_eq!(saved_due_date(&stand).await, Some(today));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn choosing_a_date_opens_the_form_on_the_due_step() {
+    let db = db().await;
+    let (mut stand, _) = ambiguous_date_stand(&db).await;
+
+    stand.bot.press("Выбрать дату").await;
+
+    stand.bot.assert_screen_contains("Когда сделать?");
+    stand.bot.assert_has_button("📅 Дата и время");
+    assert_eq!(
+        stand.ai.calls(),
+        1,
+        "opening the form must not parse the text again"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn after_three_clarifications_the_bot_offers_manual_editing() {
+    let db = db().await;
+    let items: Vec<Value> = (0..4)
+        .map(|n| {
+            json!({"target_kind": "tasks", "title": format!("Дело {n}"), "assignee": "Алексей"})
+        })
+        .collect();
+    let mut stand = stand(&db.pool, vec![Ok(json!({"items": items}))]).await;
+    let household = household_id(&db.pool, stand.bot.chat).await;
+    rename_member(&db.pool, stand.bot.chat, "Алексей", "alex_a").await;
+    add_member(&db.pool, household, "Алексей", "alex_b").await;
+
+    stand.capture("четыре дела для Алексея").await;
+
+    for _ in 0..3 {
+        stand.bot.assert_screen_contains("Какой исполнитель");
+        stand.bot.press("alex_b").await;
+    }
+
+    stand
+        .bot
+        .assert_screen_contains("Больше не буду уточнять автоматически");
+    stand.bot.assert_screen_contains("Изменить");
+    assert!(
+        stand.bot.find_button("alex_b").is_none(),
+        "no fourth question expected:\n{}",
+        stand.bot.screen()
+    );
+    assert_eq!(stand.ai.calls(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

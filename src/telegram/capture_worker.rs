@@ -181,7 +181,8 @@ impl CaptureWorker {
         let loaded = async {
             let user = users::get(&mut conn, job.household_id, user_id).await?;
             let household = households::get(&mut conn, job.household_id).await?;
-            let context = draft::load_context(&mut conn, job.household_id, now).await?;
+            let context =
+                draft::load_context_for(&mut conn, job.household_id, Some(user_id), now).await?;
             Ok::<_, DomainError>(Prepared {
                 user,
                 household,

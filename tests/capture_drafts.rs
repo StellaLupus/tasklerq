@@ -3,10 +3,11 @@
 
 mod support;
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use sqlx::PgPool;
-use tasklerq::capture::draft::{self, DraftError, ItemEdit, NewCapture};
+use tasklerq::capture::draft::{self, DraftError, DueChoice, ItemEdit, NewCapture};
 use tasklerq::capture::schema::{ParsedResponse, RawItem};
+use tasklerq::capture::validate::ASSIGNEE_AMBIGUOUS;
 use tasklerq::domain::error::DomainError;
 use tasklerq::domain::models::{CaptureMode, CaptureSource, DraftStatus, Field, ListKind};
 use tasklerq::storage::repositories::drafts;
@@ -688,4 +689,261 @@ async fn item_count_live(pool: &PgPool, household: &TestHousehold) -> i64 {
         .fetch_one(pool)
         .await
         .expect("count live items")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn date_clarification_edits_the_draft_and_stops_after_three_answers() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let mut items = Vec::new();
+    for n in 0..4 {
+        let mut item = raw(&format!("Дело {n}"), ListKind::Tasks);
+        item.due_date = Some(date_in_days(now, -2));
+        items.push(item);
+    }
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let id = draft::create(&mut conn, capture(&household, items), now)
+        .await
+        .expect("draft")
+        .id;
+
+    let view = draft::view(&mut conn, household.household_id, id, now)
+        .await
+        .expect("view");
+    assert_eq!(view.validated.items[0].errors[0].code, "date_past");
+
+    let view = draft::answer_due_date(
+        &mut conn,
+        household.household_id,
+        id,
+        0,
+        DueChoice::Today,
+        now,
+    )
+    .await
+    .expect("answer 1");
+    assert_eq!(view.clarifications_answered, 1);
+    assert!(view.validated.items[0].is_valid());
+    assert_eq!(view.validated.items[1].errors[0].code, "date_past");
+
+    draft::answer_due_date(
+        &mut conn,
+        household.household_id,
+        id,
+        1,
+        DueChoice::Today,
+        now,
+    )
+    .await
+    .expect("answer 2");
+    let view = draft::answer_due_date(
+        &mut conn,
+        household.household_id,
+        id,
+        2,
+        DueChoice::Today,
+        now,
+    )
+    .await
+    .expect("answer 3");
+    assert_eq!(view.clarifications_answered, 3);
+    assert_eq!(view.clarifications_left(), 0);
+
+    let blocked = draft::answer_due_date(
+        &mut conn,
+        household.household_id,
+        id,
+        3,
+        DueChoice::Today,
+        now,
+    )
+    .await
+    .expect_err("fourth answer");
+    assert!(matches!(blocked, DraftError::ClarificationLimit));
+    let stored = draft::view(&mut conn, household.household_id, id, now)
+        .await
+        .expect("view");
+    assert_eq!(stored.clarifications_answered, 3);
+    assert_eq!(stored.validated.items[3].errors[0].code, "date_past");
+}
+
+/// Два участника с одинаковым именем: LLM не может выбрать одного.
+async fn same_named_members(pool: &PgPool, household: &TestHousehold) {
+    sqlx::query("UPDATE users SET display_name = 'Алексей' WHERE household_id = $1")
+        .bind(household.household_id)
+        .execute(pool)
+        .await
+        .expect("rename members");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn assignee_answer_accepts_only_a_candidate_and_only_an_open_question() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    same_named_members(&db.pool, &household).await;
+    let now = Utc::now();
+    let mut item = raw("Купить торт", ListKind::Shopping);
+    item.assignee = Some("Алексей".into());
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let id = draft::create(&mut conn, capture(&household, vec![item]), now)
+        .await
+        .expect("draft")
+        .id;
+
+    let view = draft::view(&mut conn, household.household_id, id, now)
+        .await
+        .expect("view");
+    assert_eq!(view.validated.items[0].assignee_candidates.len(), 2);
+    assert_eq!(view.validated.items[0].errors[0].code, ASSIGNEE_AMBIGUOUS);
+
+    // Подделанный токен: участник не входит в неоднозначный набор.
+    let outsider = Uuid::now_v7();
+    let error = draft::answer_assignee(&mut conn, household.household_id, id, 0, outsider, now)
+        .await
+        .expect_err("outsider");
+    assert!(matches!(error, DraftError::NoClarification));
+
+    // Ответ не потратил попытку и не изменил черновик.
+    let stored = draft::view(&mut conn, household.household_id, id, now)
+        .await
+        .expect("view");
+    assert_eq!(stored.clarifications_answered, 0);
+    assert_eq!(stored.validated.items[0].errors[0].code, ASSIGNEE_AMBIGUOUS);
+
+    // У элемента без вопроса ответ отклоняется и для исполнителя, и для даты.
+    let plain = raw("Просто дело", ListKind::Tasks);
+    let plain_id = draft::create(&mut conn, capture(&household, vec![plain]), now)
+        .await
+        .expect("plain draft")
+        .id;
+    let error = draft::answer_assignee(
+        &mut conn,
+        household.household_id,
+        plain_id,
+        0,
+        household.member_id,
+        now,
+    )
+    .await
+    .expect_err("no assignee question");
+    assert!(matches!(error, DraftError::NoClarification));
+
+    let error = draft::answer_due_date(
+        &mut conn,
+        household.household_id,
+        plain_id,
+        0,
+        DueChoice::Today,
+        now,
+    )
+    .await
+    .expect_err("no date question");
+    assert!(matches!(error, DraftError::NoClarification));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn assignee_clarification_stops_after_three_answers() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    same_named_members(&db.pool, &household).await;
+    let now = Utc::now();
+    let items = (0..4)
+        .map(|n| {
+            let mut item = raw(&format!("Дело {n}"), ListKind::Tasks);
+            item.assignee = Some("Алексей".into());
+            item
+        })
+        .collect();
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let id = draft::create(&mut conn, capture(&household, items), now)
+        .await
+        .expect("draft")
+        .id;
+
+    for index in 0..3 {
+        draft::answer_assignee(
+            &mut conn,
+            household.household_id,
+            id,
+            index,
+            household.member_id,
+            now,
+        )
+        .await
+        .expect("answer");
+    }
+    let view = draft::view(&mut conn, household.household_id, id, now)
+        .await
+        .expect("view");
+    assert_eq!(view.clarifications_left(), 0);
+    assert!(view.validated.items[..3].iter().all(|item| item.is_valid()));
+    assert_eq!(view.validated.items[3].errors[0].code, ASSIGNEE_AMBIGUOUS);
+
+    let blocked = draft::answer_assignee(
+        &mut conn,
+        household.household_id,
+        id,
+        3,
+        household.member_id,
+        now,
+    )
+    .await
+    .expect_err("fourth answer");
+    assert!(matches!(blocked, DraftError::ClarificationLimit));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn date_answer_keeps_the_time_and_reports_it_when_it_has_passed() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    // 12:00 по Москве: время 18:00 ещё впереди, 10:00 уже прошло.
+    let now = Utc.with_ymd_and_hms(2026, 3, 10, 9, 0, 0).unwrap();
+    let today = now.with_timezone(&chrono_tz::Europe::Moscow).date_naive();
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let mut future = raw("Позвонить", ListKind::Tasks);
+    future.due_date = Some((today - Duration::days(2)).format("%Y-%m-%d").to_string());
+    future.due_time = Some("18:00".into());
+    let future_id = draft::create(&mut conn, capture(&household, vec![future]), now)
+        .await
+        .expect("draft")
+        .id;
+    let view = draft::answer_due_date(
+        &mut conn,
+        household.household_id,
+        future_id,
+        0,
+        DueChoice::Today,
+        now,
+    )
+    .await
+    .expect("answer");
+    assert_eq!(view.raw[0].due_time.as_deref(), Some("18:00"));
+    assert!(view.validated.items[0].is_valid());
+
+    let mut past = raw("Позвонить", ListKind::Tasks);
+    past.due_date = Some((today - Duration::days(2)).format("%Y-%m-%d").to_string());
+    past.due_time = Some("10:00".into());
+    let past_id = draft::create(&mut conn, capture(&household, vec![past]), now)
+        .await
+        .expect("draft")
+        .id;
+    let view = draft::answer_due_date(
+        &mut conn,
+        household.household_id,
+        past_id,
+        0,
+        DueChoice::Today,
+        now,
+    )
+    .await
+    .expect("answer");
+    assert_eq!(view.raw[0].due_time.as_deref(), Some("10:00"));
+    assert!(
+        view.validated.items[0]
+            .errors
+            .iter()
+            .any(|error| error.code == "time_past")
+    );
 }

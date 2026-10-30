@@ -308,6 +308,19 @@ fn ambiguous_assignee_is_not_guessed() {
 }
 
 #[test]
+fn self_reference_is_resolved_to_the_author() {
+    let context = context();
+    let author = context.author.clone().expect("author");
+    let mut raw = task();
+    raw.assignee = Some("мне".to_owned());
+
+    let draft = validate_item(&context, ItemSource::Telegram, raw);
+
+    assert!(draft.is_valid(), "{:?}", draft.errors);
+    assert_eq!(draft.item.expect("item").assignee_user_id, Some(author.id));
+}
+
+#[test]
 fn chosen_member_resolves_an_ambiguous_name() {
     let mut context = context();
     context.members = vec![

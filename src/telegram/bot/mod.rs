@@ -781,6 +781,17 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
         Action::NoticeUndo { item_id } => notify::undo(ctx, message_id, item_id).await,
 
         Action::DraftEdit { draft_id, index } => capture::edit(ctx, draft_id, index).await,
+        Action::DraftAssign {
+            draft_id,
+            index,
+            user_id,
+        } => capture::assign(ctx, draft_id, index, user_id).await,
+        Action::DraftDue {
+            draft_id,
+            index,
+            choice,
+        } => capture::due(ctx, draft_id, index, choice).await,
+        Action::DraftEditDue { draft_id, index } => capture::edit_due(ctx, draft_id, index).await,
         Action::DraftRemove { draft_id, index } => capture::remove(ctx, draft_id, index).await,
         Action::DraftSave { draft_id } => capture::save(ctx, draft_id).await,
         Action::DraftCancel { draft_id } => capture::cancel(ctx, draft_id).await,

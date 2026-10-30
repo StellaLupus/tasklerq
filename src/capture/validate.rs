@@ -42,6 +42,10 @@ pub struct ItemError {
 
 /// Код ошибки «исполнитель неоднозначен»: по нему экран предложит выбор.
 pub const ASSIGNEE_AMBIGUOUS: &str = "assignee_ambiguous";
+/// Код ошибки «дата уже прошла».
+pub const DATE_PAST: &str = "date_past";
+/// Код ошибки «дата не разобрана».
+pub const DATE_INVALID: &str = "date_invalid";
 
 /// Элемент черновика после проверки.
 #[derive(Debug, Clone)]
@@ -72,6 +76,24 @@ impl DraftItem {
     /// Элемент можно сохранять.
     pub fn is_valid(&self) -> bool {
         self.errors.is_empty()
+    }
+
+    /// Карточка должна спросить, какой из одноимённых участников имеется в
+    /// виду. Условие одно и для показа кнопок, и для приёма ответа.
+    pub fn has_assignee_question(&self) -> bool {
+        !self.assignee_candidates.is_empty()
+            && self
+                .errors
+                .iter()
+                .any(|error| error.code == ASSIGNEE_AMBIGUOUS)
+    }
+
+    /// Карточка должна предложить другой срок: дата не разобрана или прошла.
+    /// `time_past` сюда не входит: это отдельная ошибка времени.
+    pub fn has_date_question(&self) -> bool {
+        self.errors.iter().any(|error| {
+            error.field == "due_date" && (error.code == DATE_PAST || error.code == DATE_INVALID)
+        })
     }
 }
 
@@ -361,9 +383,18 @@ enum Assignee {
     Ambiguous(Vec<Uuid>),
 }
 
+/// Слова, которыми автор говорит о себе. LLM иногда возвращает их вместо имени,
+/// даже если в контексте есть автор.
+const SELF_NAMES: [&str; 7] = ["мне", "меня", "я", "мной", "себе", "себя", "собой"];
+
 /// Участник по отображаемому имени или username; только точное совпадение.
 fn resolve_assignee(context: &CaptureContext, name: &str) -> Assignee {
     let name = fold(name.trim().trim_start_matches('@'));
+    if SELF_NAMES.contains(&name.as_str())
+        && let Some(author) = &context.author
+    {
+        return Assignee::Found(author.id);
+    }
     let mut matches: Vec<Uuid> = Vec::new();
     for member in &context.members {
         let by_name = fold(&member.display_name) == name;
@@ -689,7 +720,7 @@ fn resolve_due(
     let date = match (date, &time) {
         (Parsed::Valid(date), _) => date,
         (Parsed::Invalid, time) => {
-            fail(errors, "due_date", "date_invalid", "Неверная дата");
+            fail(errors, "due_date", DATE_INVALID, "Неверная дата");
             if matches!(time, Parsed::Invalid) {
                 fail(errors, "due_time", "time_invalid", "Неверное время");
             }
@@ -712,7 +743,7 @@ fn resolve_due(
     };
 
     if date < today {
-        fail(errors, "due_date", "date_past", "Дата уже прошла");
+        fail(errors, "due_date", DATE_PAST, "Дата уже прошла");
     } else if date > horizon(today) {
         fail(errors, "due_date", "date_far", "Слишком далёкая дата");
     }

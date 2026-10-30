@@ -170,7 +170,7 @@ pub async fn set_parsed(
     conn: &mut PgConnection,
     household_id: Uuid,
     draft_id: Uuid,
-    parsed: Value,
+    parsed: &Value,
 ) -> Result<(), DomainError> {
     sqlx::query(
         "UPDATE capture_drafts SET parsed = $3
