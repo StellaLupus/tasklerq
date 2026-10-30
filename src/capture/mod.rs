@@ -3,6 +3,7 @@
 pub mod breaker;
 pub mod context;
 pub mod draft;
+pub mod eval;
 pub mod prompt;
 pub mod schema;
 pub mod validate;
