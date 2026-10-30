@@ -261,7 +261,7 @@ curl -sS -X POST \
 | `CAPTURE_VOICE_TIMEOUT_MS` | нет | `8000` | Таймаут LLM для `source=ha_voice`. |
 | `CAPTURE_VOICE_FALLBACK_RAW` | нет | `true` | Создавать позицию из текста при сбое LLM, таймауте, исчерпанной квоте или открытом предохранителе. Действует на весь внешний `auto`, не только на `ha_voice`; в `draft` fallback не применяется. |
 | `CAPTURE_RATE_LIMIT_PER_MIN` | нет | `10` | Capture в минуту на токен. |
-| `CAPTURE_MAX_TEXT_CHARS` | нет | `2000` | Максимальная длина текста, не больше 2000. |
+| `CAPTURE_MAX_TEXT_CHARS` | нет | `2000` | Максимальная длина текста, от 100 до 2000. |
 | `HA_BASE_URL` | при LLM | `http://host.docker.internal:8123` | Home Assistant из контейнера Tasklerq. |
 | `HA_TOKEN` | при LLM | `eyJ...` | Long-lived token HA. |
 | `HA_AI_TASK_ENTITY_ID` | при LLM | `ai_task.google_ai_task_2` | AI Task. |
@@ -278,6 +278,10 @@ curl -sS -X POST \
 | `RETENTION_AUDIT_DAYS` | нет | `365` | События членства и безопасности, а также использованные, отозванные и истёкшие приглашения. Не меньше 90: столько дней показывает «Журнал». |
 | `RUST_LOG` | нет | `info,tasklerq=debug` | Логи. |
 | `TZ` | нет | `UTC` | Часовой пояс логов. |
+
+`CAPTURE_MAX_TEXT_CHARS` принимает значения от 100 до 2000. В старых
+конфигурациях могли остаться значения 2001–16000: теперь они не проходят
+проверку, и сервис не стартует. Уменьшите значение до 2000 или ниже.
 
 `HA_BASE_URL` — это адрес **Home Assistant для Tasklerq**, а не наоборот.
 Поскольку HA работает в host-режиме, из bridge-контейнера Tasklerq используйте

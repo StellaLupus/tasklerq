@@ -106,6 +106,50 @@ impl AiTask for GatedAi {
     }
 }
 
+/// Заглушка, которая держит только первый вызов LLM: тест успевает перехватить
+/// резерв, а второй (новый владелец) завершается сразу.
+struct TakeoverAi {
+    answer: Value,
+    started: Notify,
+    release: Notify,
+    calls: AtomicUsize,
+}
+
+impl TakeoverAi {
+    fn new(answer: Value) -> Arc<Self> {
+        Arc::new(Self {
+            answer,
+            started: Notify::new(),
+            release: Notify::new(),
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl AiTask for TakeoverAi {
+    async fn check_entity(&self) -> Result<(), HaError> {
+        Ok(())
+    }
+
+    async fn generate_data(
+        &self,
+        _request: &GenerateData<'_>,
+        _timeout: StdDuration,
+    ) -> Result<Value, HaError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == 1 {
+            self.started.notify_one();
+            self.release.notified().await;
+        }
+        Ok(self.answer.clone())
+    }
+}
+
 fn config() -> CaptureConfig {
     CaptureConfig {
         enabled: true,
@@ -905,6 +949,238 @@ async fn a_concurrent_draft_repeat_gets_409() {
     assert_eq!(status, StatusCode::OK, "{first_json}");
     assert_eq!(first_json["status"], "draft");
     assert_eq!(draft_count(&db.pool, household.household_id).await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_taken_over_reservation_does_not_commit_the_capture() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = TakeoverAi::new(shopping("молоко"));
+    let app = app(&db.pool, ai.clone());
+    let key = Uuid::now_v7().to_string();
+    let payload = keyed(body("купить молоко", "ha_voice", "auto"), &key);
+
+    let first_app = app.clone();
+    let first_token = token.clone();
+    let first_key = key.clone();
+    let first_payload = payload.clone();
+    let first = tokio::spawn(async move {
+        call_with_key(&first_app, &first_token, &first_key, first_payload).await
+    });
+
+    tokio::time::timeout(StdDuration::from_secs(10), ai.started.notified())
+        .await
+        .expect("the llm call should start");
+
+    // Другой запрос успел перехватить резерв: у строки чужой `capture_id`, и
+    // она уже считается зависшей.
+    sqlx::query(
+        "UPDATE capture_requests
+         SET capture_id = $1, created_at = now() - interval '61 seconds'
+         WHERE household_id = $2 AND source = 'ha_voice' AND idempotency_key = $3",
+    )
+    .bind(Uuid::now_v7())
+    .bind(household.household_id)
+    .bind(&key)
+    .execute(&db.pool)
+    .await
+    .expect("take over reservation");
+
+    ai.release.notify_one();
+    let (status, headers, json) = tokio::time::timeout(StdDuration::from_secs(10), first)
+        .await
+        .expect("the first request should finish")
+        .expect("the first request should not panic");
+
+    assert_eq!(status, StatusCode::CONFLICT, "{json}");
+    assert_eq!(json["error"]["code"], "conflict");
+    assert!(
+        headers.get("retry-after").is_some(),
+        "Retry-After is required"
+    );
+    assert_eq!(
+        item_count(&db.pool, household.household_id).await,
+        0,
+        "the late request must not create items"
+    );
+    assert_eq!(
+        draft_count(&db.pool, household.household_id).await,
+        0,
+        "the late request must not commit capture_drafts"
+    );
+
+    // Новый владелец резерва завершает запрос успешно, а повтор возвращает
+    // именно его ответ.
+    let (status, _, second) = call_with_key(&app, &token, &key, payload.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["status"], "applied");
+    assert_eq!(item_count(&db.pool, household.household_id).await, 1);
+    assert_eq!(draft_count(&db.pool, household.household_id).await, 1);
+
+    let (status, _, repeat) = call_with_key(&app, &token, &key, payload).await;
+    assert_eq!(status, StatusCode::OK, "{repeat}");
+    assert_eq!(
+        repeat, second,
+        "the repeat must return the new owner's answer"
+    );
+    assert_eq!(ai.calls(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_taken_over_reservation_does_not_overwrite_the_new_response() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    // Дата в прошлом делает ответ `rejected`, поэтому проверяется запись
+    // ответа вне транзакции элементов (`store_response`), а не `apply_auto`.
+    let ai = TakeoverAi::new(json!({"items": [
+        {"target_kind": "shopping", "title": "хлеб", "due_date": "2000-01-01"}
+    ]}));
+    let app = app(&db.pool, ai.clone());
+    let key = Uuid::now_v7().to_string();
+    let payload = keyed(body("купить хлеб", "ha_voice", "auto"), &key);
+
+    let first_app = app.clone();
+    let first_token = token.clone();
+    let first_key = key.clone();
+    let first_payload = payload.clone();
+    let first = tokio::spawn(async move {
+        call_with_key(&first_app, &first_token, &first_key, first_payload).await
+    });
+
+    tokio::time::timeout(StdDuration::from_secs(10), ai.started.notified())
+        .await
+        .expect("the llm call should start");
+
+    // Новый владелец уже записал свой ответ: опоздавший не должен его затереть
+    // и не должен ответить успехом.
+    let new_response = json!({
+        "capture_id": Uuid::now_v7(),
+        "status": "rejected",
+        "fallback": false,
+        "speech": "new owner",
+        "items": [],
+        "draft_id": null,
+        "expires_at": null,
+        "clarifications": [],
+    });
+    sqlx::query(
+        "UPDATE capture_requests
+         SET capture_id = $1, response = $2, completed_at = now()
+         WHERE household_id = $3 AND source = 'ha_voice' AND idempotency_key = $4",
+    )
+    .bind(Uuid::now_v7())
+    .bind(&new_response)
+    .bind(household.household_id)
+    .bind(&key)
+    .execute(&db.pool)
+    .await
+    .expect("take over reservation");
+
+    ai.release.notify_one();
+    let (status, _, json) = tokio::time::timeout(StdDuration::from_secs(10), first)
+        .await
+        .expect("the first request should finish")
+        .expect("the first request should not panic");
+
+    assert_eq!(status, StatusCode::CONFLICT, "{json}");
+    assert_eq!(
+        item_count(&db.pool, household.household_id).await,
+        0,
+        "a rejected late request must not create items"
+    );
+    assert_eq!(
+        draft_count(&db.pool, household.household_id).await,
+        0,
+        "a rejected late request must not commit capture_drafts"
+    );
+    assert_eq!(ai.calls(), 1, "the rejected path runs the LLM once");
+
+    let stored: Value = sqlx::query_scalar(
+        "SELECT response FROM capture_requests
+         WHERE household_id = $1 AND source = 'ha_voice' AND idempotency_key = $2",
+    )
+    .bind(household.household_id)
+    .bind(&key)
+    .fetch_one(&db.pool)
+    .await
+    .expect("stored response");
+    assert_eq!(stored, new_response, "the new owner's response is kept");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_request_gets_409_after_the_new_owner_has_committed() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = GatedAi::new(shopping("молоко"));
+    let gated_app = app(&db.pool, ai.clone());
+    let key = Uuid::now_v7().to_string();
+    let payload = keyed(body("купить молоко", "ha_voice", "auto"), &key);
+
+    let first_app = gated_app.clone();
+    let first_token = token.clone();
+    let first_key = key.clone();
+    let first_payload = payload.clone();
+    let first = tokio::spawn(async move {
+        call_with_key(&first_app, &first_token, &first_key, first_payload).await
+    });
+
+    tokio::time::timeout(StdDuration::from_secs(10), ai.started.notified())
+        .await
+        .expect("the llm call should start");
+
+    // Новый владелец перехватывает зависший резерв...
+    sqlx::query(
+        "UPDATE capture_requests
+         SET capture_id = $1, created_at = now() - interval '61 seconds'
+         WHERE household_id = $2 AND source = 'ha_voice' AND idempotency_key = $3",
+    )
+    .bind(Uuid::now_v7())
+    .bind(household.household_id)
+    .bind(&key)
+    .execute(&db.pool)
+    .await
+    .expect("take over reservation");
+
+    // ...и полностью завершает запрос: `capture_drafts`, элементы и ответ уже
+    // закоммичены, когда опоздавший запрос возобновляется.
+    let owner_ai = StubAi::new(vec![Ok(shopping("молоко"))]);
+    let owner_app = app(&db.pool, owner_ai.clone());
+    let (status, _, owner) = call_with_key(&owner_app, &token, &key, payload.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{owner}");
+    assert_eq!(owner["status"], "applied");
+    assert_eq!(item_count(&db.pool, household.household_id).await, 1);
+    assert_eq!(draft_count(&db.pool, household.household_id).await, 1);
+
+    ai.release.notify_one();
+    let (status, headers, json) = tokio::time::timeout(StdDuration::from_secs(10), first)
+        .await
+        .expect("the first request should finish")
+        .expect("the first request should not panic");
+
+    assert_eq!(status, StatusCode::CONFLICT, "{json}");
+    assert_eq!(json["error"]["code"], "conflict");
+    assert!(
+        headers.get("retry-after").is_some(),
+        "Retry-After is required"
+    );
+    assert_eq!(
+        item_count(&db.pool, household.household_id).await,
+        1,
+        "the late request must not create duplicate items"
+    );
+    assert_eq!(
+        draft_count(&db.pool, household.household_id).await,
+        1,
+        "the late request must not create another capture row"
+    );
+    assert_eq!(owner_ai.calls(), 1);
+
+    let (status, _, repeat) = call_with_key(&owner_app, &token, &key, payload).await;
+    assert_eq!(status, StatusCode::OK, "{repeat}");
+    assert_eq!(repeat, owner, "the repeat returns the new owner's answer");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

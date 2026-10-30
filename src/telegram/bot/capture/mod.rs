@@ -347,11 +347,6 @@ fn fail(error: DraftError) -> Fail {
         }
         DraftError::Domain(error) => error.into(),
         DraftError::Database(error) => Fail::Infra(error),
-        // Telegram не сохраняет ответ для ключа идемпотентности, поэтому сюда
-        // попасть не может; на всякий случай показываем общую ошибку.
-        DraftError::Serialize(_) => {
-            Fail::User("Не получилось сохранить черновик. Попробуйте ещё раз.".into())
-        }
     }
 }
 

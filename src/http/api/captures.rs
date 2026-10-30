@@ -4,6 +4,8 @@
 //! источниками: Telegram-черновик живёт в боте и через API не виден. Чужой,
 //! несуществующий и не внешний capture не отличаются в ответе — все дают `404`.
 
+use std::collections::{HashMap, HashSet};
+
 use axum::Json;
 use axum::extract::{Path, State};
 use chrono::Utc;
@@ -239,17 +241,25 @@ async fn list_kinds(
     household_id: Uuid,
     items: &[Item],
 ) -> Result<Vec<ListKind>, ApiError> {
-    let mut kinds = Vec::with_capacity(items.len());
-    for item in items {
-        let kind = lists::kind(conn, household_id, item.list_id)
-            .await?
-            .ok_or_else(|| {
+    let list_ids: Vec<Uuid> = items
+        .iter()
+        .map(|item| item.list_id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let found: HashMap<Uuid, ListKind> = lists::kinds(conn, household_id, &list_ids)
+        .await?
+        .into_iter()
+        .collect();
+    items
+        .iter()
+        .map(|item| {
+            found.get(&item.list_id).copied().ok_or_else(|| {
                 tracing::error!(item_id = %item.id, "capture item has no list");
                 ApiError::internal("Database error")
-            })?;
-        kinds.push(kind);
-    }
-    Ok(kinds)
+            })
+        })
+        .collect()
 }
 
 /// Фраза ответа об отмене capture.

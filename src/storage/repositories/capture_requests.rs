@@ -9,6 +9,7 @@
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 use sqlx::{Connection, FromRow, PgConnection};
+use thiserror::Error;
 use uuid::Uuid;
 
 use crate::domain::models::CaptureSource;
@@ -140,6 +141,18 @@ pub async fn reserve(
     Ok(Reserved::InProgress)
 }
 
+/// Ошибка сохранения ответа в резерве.
+#[derive(Debug, Error)]
+pub enum CompleteError {
+    /// Резерв перехвачен другим запросом: коммитить capture опоздавшего
+    /// запроса нельзя.
+    #[error("the idempotency reservation was taken over by another request")]
+    Lost,
+    /// Ошибка базы данных.
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+}
+
 /// Сохранить готовый ответ. Для `applied` и `draft` вызывается в транзакции
 /// создания `capture_drafts`/`items`, чтобы ответ и строки capture коммитились
 /// вместе.
@@ -155,8 +168,8 @@ pub async fn complete(
     capture_id: Uuid,
     response: &Value,
     now: DateTime<Utc>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
+) -> Result<(), CompleteError> {
+    let updated = sqlx::query(
         "UPDATE capture_requests
          SET response = $5, completed_at = $6
          WHERE household_id = $1 AND source = $2 AND idempotency_key = $3
@@ -170,6 +183,9 @@ pub async fn complete(
     .bind(now)
     .execute(conn)
     .await?;
+    if updated.rows_affected() != 1 {
+        return Err(CompleteError::Lost);
+    }
     Ok(())
 }
 
@@ -232,7 +248,7 @@ impl Reservation {
         conn: &mut PgConnection,
         response: &Value,
         now: DateTime<Utc>,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), CompleteError> {
         if self.settled {
             return Ok(());
         }
@@ -246,6 +262,31 @@ impl Reservation {
             now,
         )
         .await
+    }
+
+    /// Проверить, что резерв всё ещё принадлежит запросу, и заблокировать
+    /// строку до конца транзакции.
+    ///
+    /// Вызывается перед записью capture: блокировка сериализует опоздавшего и
+    /// нового владельца, поэтому вставка `capture_drafts` не падает на
+    /// уникальном индексе вместо [`CompleteError::Lost`].
+    pub async fn verify(&self, conn: &mut PgConnection) -> Result<(), CompleteError> {
+        let owned = sqlx::query_scalar::<_, i32>(
+            "SELECT 1 FROM capture_requests
+             WHERE household_id = $1 AND source = $2 AND idempotency_key = $3
+               AND capture_id = $4
+             FOR UPDATE",
+        )
+        .bind(self.household_id)
+        .bind(self.source)
+        .bind(&self.key)
+        .bind(self.capture_id)
+        .fetch_optional(conn)
+        .await?;
+        if owned.is_none() {
+            return Err(CompleteError::Lost);
+        }
+        Ok(())
     }
 
     /// Ответ и строки capture закоммичены: освобождать нечего.

@@ -69,23 +69,24 @@ async fn get_with_deleted(
     .ok_or(DomainError::NotFound)
 }
 
-/// Вид списка, включая мягко удалённый.
+/// Виды списков household, включая мягко удалённые.
 ///
 /// Нужен повторному подтверждению capture: его элементы переживают удаление
-/// списка, и ответ обязан сохранить их исходный вид.
-pub async fn kind(
+/// списка, и ответ обязан сохранить их исходный вид. Один запрос на весь
+/// capture вместо запроса на каждый элемент.
+pub async fn kinds(
     conn: &mut PgConnection,
     household_id: Uuid,
-    list_id: Uuid,
-) -> Result<Option<ListKind>, DomainError> {
-    let kind = sqlx::query_scalar::<_, ListKind>(
-        "SELECT kind FROM lists WHERE id = $1 AND household_id = $2",
+    list_ids: &[Uuid],
+) -> Result<Vec<(Uuid, ListKind)>, DomainError> {
+    let kinds = sqlx::query_as::<_, (Uuid, ListKind)>(
+        "SELECT id, kind FROM lists WHERE household_id = $1 AND id = ANY($2)",
     )
-    .bind(list_id)
     .bind(household_id)
-    .fetch_optional(conn)
+    .bind(list_ids)
+    .fetch_all(conn)
     .await?;
-    Ok(kind)
+    Ok(kinds)
 }
 
 /// Создать дополнительный список.

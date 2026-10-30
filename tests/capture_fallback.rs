@@ -705,7 +705,7 @@ async fn an_error_after_the_reservation_releases_the_key() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn complete_and_release_ignore_a_taken_over_reservation() {
+async fn a_taken_over_reservation_rejects_the_old_owner_and_release_ignores_it() {
     let db = db().await;
     let household = support::create_household(&db.pool).await;
     let mut conn = db.pool.acquire().await.expect("connection");
@@ -741,7 +741,7 @@ async fn complete_and_release_ignore_a_taken_over_reservation() {
     .await
     .expect("take over");
 
-    tasklerq::storage::repositories::capture_requests::complete(
+    let error = tasklerq::storage::repositories::capture_requests::complete(
         &mut conn,
         household.household_id,
         tasklerq::domain::models::CaptureSource::Api,
@@ -751,7 +751,11 @@ async fn complete_and_release_ignore_a_taken_over_reservation() {
         Utc::now(),
     )
     .await
-    .expect("complete the old owner");
+    .expect_err("the old owner must not complete a taken over reservation");
+    assert!(matches!(
+        error,
+        tasklerq::storage::repositories::capture_requests::CompleteError::Lost
+    ));
 
     let (capture_id, response): (Uuid, Option<Value>) = sqlx::query_as(
         "SELECT capture_id, response FROM capture_requests

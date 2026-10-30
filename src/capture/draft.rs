@@ -91,9 +91,46 @@ pub enum DraftError {
     /// Ошибка базы данных.
     #[error("database error")]
     Database(#[from] sqlx::Error),
+}
+
+/// Ошибка сохранения черновика вместе с ответом ключа идемпотентности.
+///
+/// Появляется только на пути с `responder`: ошибка сериализации ответа и
+/// потеря резерва невозможны в [`create`], поэтому Telegram-код их не видит.
+#[derive(Debug, Error)]
+pub enum StoreError {
+    /// Ошибка домена, базы данных или состояния черновика.
+    #[error(transparent)]
+    Draft(#[from] DraftError),
     /// Ответ capture не удалось сериализовать.
     #[error("capture response could not be serialized")]
     Serialize(#[from] serde_json::Error),
+    /// Резерв ключа перехвачен другим запросом.
+    #[error("the idempotency reservation was taken over by another request")]
+    ReservationLost,
+}
+
+impl From<DomainError> for StoreError {
+    fn from(error: DomainError) -> Self {
+        Self::Draft(error.into())
+    }
+}
+
+impl From<sqlx::Error> for StoreError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Draft(DraftError::Database(error))
+    }
+}
+
+impl From<capture_requests::CompleteError> for StoreError {
+    fn from(error: capture_requests::CompleteError) -> Self {
+        match error {
+            capture_requests::CompleteError::Lost => Self::ReservationLost,
+            capture_requests::CompleteError::Database(error) => {
+                Self::Draft(DraftError::Database(error))
+            }
+        }
+    }
 }
 
 /// Содержимое `capture_drafts.parsed`.
@@ -264,20 +301,16 @@ pub async fn load_context_for(
 }
 
 /// Сохранить черновик со сроком жизни 15 минут.
+///
+/// Без `responder` возможны только ошибки вставки (`Domain`), поэтому путь
+/// возвращает [`DomainError`] и не маскирует недостижимые варианты под ошибку
+/// валидации.
 pub async fn create(
     conn: &mut PgConnection,
     capture: NewCapture,
     now: DateTime<Utc>,
 ) -> Result<Draft, DomainError> {
-    create_with_responder(conn, capture, now, None, None)
-        .await
-        .map_err(|error| match error {
-            DraftError::Domain(error) => error,
-            DraftError::Database(error) => error.into(),
-            // Без `responder` сюда попасть нельзя; остальные варианты —
-            // ошибки состояния, которых у нового черновика быть не может.
-            other => DomainError::Validation(other.to_string()),
-        })
+    drafts::insert(conn, new_draft(capture), now).await
 }
 
 /// Сохранить черновик и ответ для ключа идемпотентности одной транзакцией.
@@ -291,34 +324,37 @@ pub async fn create_with_responder(
     capture: NewCapture,
     now: DateTime<Utc>,
     responder: Option<Responder<'_, Draft>>,
-    reservation: Option<&mut capture_requests::Reservation>,
-) -> Result<Draft, DraftError> {
-    let stored = Stored::from_parsed(capture.parsed);
-    let household_id = capture.household_id;
-    let draft = drafts::insert(
-        conn,
-        NewDraft {
-            id: capture.id.unwrap_or_else(Uuid::now_v7),
-            household_id,
-            user_id: capture.user_id,
-            chat_id: capture.chat_id,
-            source: capture.source,
-            mode: capture.mode,
-            idempotency_key: capture.idempotency_key,
-            request_hash: capture.request_hash,
-            raw_text: sanitize(&capture.raw_text),
-            parsed: stored.to_value(),
-            fallback: capture.fallback,
-            prompt_version: capture.prompt_version,
-        },
-        now,
-    )
-    .await?;
+    mut reservation: Option<&mut capture_requests::Reservation>,
+) -> Result<Draft, StoreError> {
+    if let Some(reservation) = reservation.as_deref_mut() {
+        reservation.verify(conn).await?;
+    }
+    let draft = drafts::insert(conn, new_draft(capture), now).await?;
     if let (Some(responder), Some(reservation)) = (responder, reservation) {
         let response = responder(&draft)?;
         reservation.complete(conn, &response, now).await?;
     }
     Ok(draft)
+}
+
+/// Строка `capture_drafts` из данных capture: общая часть [`create`],
+/// [`create_with_responder`] и [`apply_auto`].
+fn new_draft(capture: NewCapture) -> NewDraft {
+    let stored = Stored::from_parsed(capture.parsed);
+    NewDraft {
+        id: capture.id.unwrap_or_else(Uuid::now_v7),
+        household_id: capture.household_id,
+        user_id: capture.user_id,
+        chat_id: capture.chat_id,
+        source: capture.source,
+        mode: capture.mode,
+        idempotency_key: capture.idempotency_key,
+        request_hash: capture.request_hash,
+        raw_text: sanitize(&capture.raw_text),
+        parsed: stored.to_value(),
+        fallback: capture.fallback,
+        prompt_version: capture.prompt_version,
+    }
 }
 
 /// Черновик с проверенными элементами; чужой черновик — `NotFound`.
@@ -639,31 +675,15 @@ pub async fn apply_auto(
     now: DateTime<Utc>,
     responder: Option<Responder<'_, Applied>>,
     mut reservation: Option<&mut capture_requests::Reservation>,
-) -> Result<Applied, DraftError> {
+) -> Result<Applied, StoreError> {
     let household_id = capture.household_id;
-    let source = capture.source;
-    let stored = Stored::from_parsed(capture.parsed);
+    let current = new_draft(capture);
 
     let mut tx = conn.begin().await?;
-    let draft = drafts::insert_applied(
-        &mut tx,
-        NewDraft {
-            id: capture.id.unwrap_or_else(Uuid::now_v7),
-            household_id,
-            user_id: capture.user_id,
-            chat_id: capture.chat_id,
-            source,
-            mode: capture.mode,
-            idempotency_key: capture.idempotency_key,
-            request_hash: capture.request_hash,
-            raw_text: sanitize(&capture.raw_text),
-            parsed: stored.to_value(),
-            fallback: capture.fallback,
-            prompt_version: capture.prompt_version,
-        },
-        now,
-    )
-    .await?;
+    if let Some(reservation) = reservation.as_deref_mut() {
+        reservation.verify(&mut tx).await?;
+    }
+    let draft = drafts::insert_applied(&mut tx, current, now).await?;
 
     let created = create_items(&mut tx, household_id, context, items, actor, now).await?;
     let ids: Vec<Uuid> = created.iter().map(|item| item.id).collect();
