@@ -23,5 +23,6 @@ opencode.json
 # Кэш индекса Token Savior
 .token-savior-cache.json
 
-# Артефакты конвейера opencode <-> Claude
+# Конвейер opencode <-> Claude: не часть проекта, живёт отдельно
 .dual-loop/
+tools/dual-loop/
