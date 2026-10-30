@@ -962,7 +962,7 @@ fn apply_target(parsed: &mut ParsedResponse, list: Option<&List>, hint: Option<R
     }
 }
 
-fn item_response(item: &Item, kind: ListKind) -> CaptureItem {
+pub(super) fn item_response(item: &Item, kind: ListKind) -> CaptureItem {
     CaptureItem {
         id: Some(item.id),
         title: item.title.clone(),
@@ -985,7 +985,7 @@ fn draft_item_response(item: &DraftItem) -> CaptureItem {
     }
 }
 
-fn applied_speech(items: &[CaptureItem]) -> String {
+pub(super) fn applied_speech(items: &[CaptureItem]) -> String {
     let count = items.len();
     match common_kind(items) {
         Some(kind) if count == 1 => {
@@ -1076,7 +1076,7 @@ fn titles(items: &[CaptureItem]) -> String {
         .join(", ")
 }
 
-fn elements(count: usize) -> String {
+pub(super) fn elements(count: usize) -> String {
     format!(
         "{count} {}",
         crate::telegram::ru::plural(count as i64, "элемент", "элемента", "элементов")
@@ -1092,7 +1092,7 @@ fn lowercase_first(value: &str) -> String {
 }
 
 /// Ограничить фразу 200 символами по границе слова.
-fn fit_speech(text: String) -> String {
+pub(super) fn fit_speech(text: String) -> String {
     const LIMIT: usize = 200;
     if text.chars().count() <= LIMIT {
         return text;

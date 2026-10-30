@@ -25,6 +25,8 @@ pub enum ErrorCode {
     NotFound,
     /// Конфликт версий или состояния.
     Conflict,
+    /// Ресурс больше не доступен: например, срок жизни черновика истёк.
+    Gone,
     /// Превышен лимит частоты.
     RateLimited,
     /// Внутренняя ошибка.
@@ -48,6 +50,7 @@ impl ErrorCode {
             Self::Forbidden => "forbidden",
             Self::NotFound => "not_found",
             Self::Conflict => "conflict",
+            Self::Gone => "gone",
             Self::RateLimited => "rate_limited",
             Self::InternalError => "internal_error",
             Self::ServiceUnavailable => "service_unavailable",
@@ -119,6 +122,11 @@ impl ApiError {
     /// `409 conflict`.
     pub fn conflict(message: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, ErrorCode::Conflict, message)
+    }
+
+    /// `410 gone`.
+    pub fn gone(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::GONE, ErrorCode::Gone, message)
     }
 
     /// `429 rate_limited`.
@@ -255,6 +263,7 @@ mod tests {
         assert_eq!(ErrorCode::Forbidden.as_str(), "forbidden");
         assert_eq!(ErrorCode::NotFound.as_str(), "not_found");
         assert_eq!(ErrorCode::Conflict.as_str(), "conflict");
+        assert_eq!(ErrorCode::Gone.as_str(), "gone");
         assert_eq!(ErrorCode::RateLimited.as_str(), "rate_limited");
         assert_eq!(ErrorCode::InternalError.as_str(), "internal_error");
         assert_eq!(
@@ -276,6 +285,7 @@ mod tests {
         assert_eq!(ApiError::forbidden("x").status().as_u16(), 403);
         assert_eq!(ApiError::not_found("x").status().as_u16(), 404);
         assert_eq!(ApiError::conflict("x").status().as_u16(), 409);
+        assert_eq!(ApiError::gone("x").status().as_u16(), 410);
         assert_eq!(ApiError::rate_limited("x").status().as_u16(), 429);
         assert_eq!(ApiError::internal("x").status().as_u16(), 500);
         assert_eq!(ApiError::service_unavailable("x").status().as_u16(), 503);

@@ -1345,3 +1345,460 @@ async fn a_shortcut_capture_creates_items_with_the_api_source() {
     .expect("item source");
     assert_eq!(source, "api");
 }
+
+/// Создать внешний черновик из двух покупок и вернуть его `capture_id`.
+async fn draft_capture(app: &Router, token: &str) -> Uuid {
+    let (status, _, json) = call(
+        app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(token),
+        Some(body("купить молоко и хлеб", "api", "draft")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["status"], "draft");
+    Uuid::parse_str(json["capture_id"].as_str().expect("capture_id")).expect("uuid")
+}
+
+/// Создать внешний `auto`-capture из двух покупок и вернуть его `capture_id`.
+async fn auto_capture(app: &Router, token: &str) -> Uuid {
+    let (status, _, json) = call(
+        app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(token),
+        Some(body("купить молоко и хлеб", "api", "auto")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["status"], "applied");
+    Uuid::parse_str(json["capture_id"].as_str().expect("capture_id")).expect("uuid")
+}
+
+fn action_uri(capture_id: Uuid, action: &str) -> String {
+    format!("/api/v1/captures/{capture_id}/{action}")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirm_applies_the_draft_and_repeats_idempotently() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(two_purchases())]);
+    let app = app(&db.pool, ai.clone(), config());
+    let capture_id = draft_capture(&app, &token).await;
+
+    let (status, _, confirmed) = call(
+        &app,
+        Method::POST,
+        &action_uri(capture_id, "confirm"),
+        Some(&token),
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{confirmed}");
+    assert_eq!(confirmed["capture_id"], capture_id.to_string());
+    assert_eq!(confirmed["status"], "applied");
+    assert_eq!(confirmed["fallback"], false);
+    assert!(confirmed["draft_id"].is_null());
+    assert!(confirmed["expires_at"].is_null());
+    assert_eq!(confirmed["clarifications"], json!([]));
+    let items = confirmed["items"].as_array().expect("items");
+    assert_eq!(items.len(), 2);
+    for item in items {
+        assert!(item["id"].is_string(), "{item}");
+        assert_eq!(item["kind"], "shopping");
+    }
+    let speech = confirmed["speech"].as_str().expect("speech");
+    assert!(speech.chars().count() <= 200, "{speech}");
+
+    let linked: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM items
+         WHERE household_id = $1 AND capture_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(household.household_id)
+    .bind(capture_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("count linked items");
+    assert_eq!(linked, 2);
+
+    let first_ids: Vec<Value> = items.iter().map(|item| item["id"].clone()).collect();
+    let (status, _, repeated) = call(
+        &app,
+        Method::POST,
+        &action_uri(capture_id, "confirm"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{repeated}");
+    let second_ids: Vec<Value> = repeated["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|item| item["id"].clone())
+        .collect();
+    assert_eq!(first_ids, second_ids);
+    assert_eq!(item_count(&db.pool, household.household_id).await, 2);
+
+    // Применённый capture отменяется только через undo.
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        &action_uri(capture_id, "cancel"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{json}");
+    assert_error_envelope(&json, "conflict");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirming_an_expired_draft_returns_gone_and_creates_nothing() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(two_purchases())]);
+    let app = app(&db.pool, ai.clone(), config());
+    let capture_id = draft_capture(&app, &token).await;
+
+    sqlx::query("UPDATE capture_drafts SET expires_at = now() - interval '1 minute' WHERE id = $1")
+        .bind(capture_id)
+        .execute(&db.pool)
+        .await
+        .expect("expire draft");
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        &action_uri(capture_id, "confirm"),
+        Some(&token),
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::GONE, "{json}");
+    assert_error_envelope(&json, "gone");
+    assert_eq!(item_count(&db.pool, household.household_id).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_is_repeatable_and_blocks_confirmation() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(two_purchases())]);
+    let app = app(&db.pool, ai.clone(), config());
+    let capture_id = draft_capture(&app, &token).await;
+
+    let (status, _, cancelled) = call(
+        &app,
+        Method::POST,
+        &action_uri(capture_id, "cancel"),
+        Some(&token),
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{cancelled}");
+    assert_eq!(cancelled["capture_id"], capture_id.to_string());
+    assert_eq!(cancelled["status"], "cancelled");
+    let speech = cancelled["speech"].as_str().expect("speech");
+    assert!(speech.chars().count() <= 200, "{speech}");
+
+    let (status, _, repeated) = call(
+        &app,
+        Method::POST,
+        &action_uri(capture_id, "cancel"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{repeated}");
+    assert_eq!(repeated["status"], "cancelled");
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        &action_uri(capture_id, "confirm"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{json}");
+    assert_error_envelope(&json, "conflict");
+    assert_eq!(item_count(&db.pool, household.household_id).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirming_an_invalid_draft_returns_validation_error() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(json!({"items": [
+        {"target_kind": "shopping", "title": "молоко"},
+        {"target_kind": "shopping", "title": "хлеб", "due_date": "2000-01-01"}
+    ]}))]);
+    let app = app(&db.pool, ai.clone(), config());
+    let capture_id = draft_capture(&app, &token).await;
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        &action_uri(capture_id, "confirm"),
+        Some(&token),
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{json}");
+    assert_error_envelope(&json, "validation_error");
+    assert_eq!(item_count(&db.pool, household.household_id).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undo_removes_only_the_items_of_its_own_capture() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(two_purchases()), Ok(shopping("сыр"))]);
+    let app = app(&db.pool, ai.clone(), config());
+    let first = auto_capture(&app, &token).await;
+    let second = auto_capture(&app, &token).await;
+
+    let (status, _, undone) = call(
+        &app,
+        Method::POST,
+        &action_uri(first, "undo"),
+        Some(&token),
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{undone}");
+    assert_eq!(undone["capture_id"], first.to_string());
+    assert_eq!(undone["status"], "undone");
+    assert_eq!(undone["removed"], 2);
+    let speech = undone["speech"].as_str().expect("speech");
+    assert!(speech.chars().count() <= 200, "{speech}");
+    assert_eq!(item_count(&db.pool, household.household_id).await, 1);
+    let remaining: Uuid = sqlx::query_scalar(
+        "SELECT capture_id FROM items WHERE household_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(household.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("remaining item");
+    assert_eq!(remaining, second);
+
+    let (status, _, repeated) = call(
+        &app,
+        Method::POST,
+        &action_uri(first, "undo"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{repeated}");
+    assert_eq!(repeated["status"], "undone");
+    assert_eq!(repeated["removed"], 0);
+    let speech = repeated["speech"].as_str().expect("speech");
+    assert!(speech.chars().count() <= 200, "{speech}");
+    assert_eq!(item_count(&db.pool, household.household_id).await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undo_is_blocked_when_one_item_was_changed() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let write = issue_token(&db.pool, household.household_id, &["ha:write"]).await;
+    let ai = StubAi::new(vec![Ok(two_purchases())]);
+    let app = app(&db.pool, ai.clone(), config());
+    let capture_id = auto_capture(&app, &token).await;
+
+    let item_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM items WHERE household_id = $1 AND capture_id = $2 LIMIT 1",
+    )
+    .bind(household.household_id)
+    .bind(capture_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("item");
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        &format!("/api/v1/items/{item_id}/complete"),
+        Some(&write),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        &action_uri(capture_id, "undo"),
+        Some(&token),
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "{json}");
+    assert_error_envelope(&json, "conflict");
+    assert_eq!(item_count(&db.pool, household.household_id).await, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undo_is_closed_after_ten_minutes() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(two_purchases())]);
+    let app = app(&db.pool, ai.clone(), config());
+    let capture_id = auto_capture(&app, &token).await;
+
+    sqlx::query(
+        "UPDATE capture_drafts SET applied_at = now() - interval '11 minutes' WHERE id = $1",
+    )
+    .bind(capture_id)
+    .execute(&db.pool)
+    .await
+    .expect("age capture");
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        &action_uri(capture_id, "undo"),
+        Some(&token),
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "{json}");
+    assert_error_envelope(&json, "conflict");
+    assert_eq!(item_count(&db.pool, household.household_id).await, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capture_actions_hide_foreign_telegram_and_unknown_captures() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let stranger = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let stranger_token = issue_token(&db.pool, stranger.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(two_purchases())]);
+    let app = app(&db.pool, ai.clone(), config());
+    let capture_id = draft_capture(&app, &token).await;
+
+    let telegram_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO capture_drafts (
+             id, household_id, user_id, chat_id, source, mode, raw_text, parsed,
+             status, fallback, created_at, expires_at
+         )
+         VALUES ($1, $2, $3, 1, 'telegram', 'draft', 'позвонить маме',
+                 '{\"items\": [], \"clarifications\": []}'::jsonb,
+                 'pending', false, now(), now() + interval '15 minutes')",
+    )
+    .bind(telegram_id)
+    .bind(household.household_id)
+    .bind(household.owner_id)
+    .execute(&db.pool)
+    .await
+    .expect("telegram draft");
+
+    for action in ["confirm", "cancel", "undo"] {
+        let (status, _, json) = call(
+            &app,
+            Method::POST,
+            &action_uri(capture_id, action),
+            Some(&stranger_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{action}: {json}");
+        assert_error_envelope(&json, "not_found");
+
+        let (status, _, json) = call(
+            &app,
+            Method::POST,
+            &action_uri(telegram_id, action),
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{action}: {json}");
+        assert_error_envelope(&json, "not_found");
+
+        let (status, _, json) = call(
+            &app,
+            Method::POST,
+            &action_uri(Uuid::now_v7(), action),
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{action}: {json}");
+        assert_error_envelope(&json, "not_found");
+    }
+
+    assert_eq!(item_count(&db.pool, household.household_id).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capture_actions_require_the_scope_and_an_enabled_route() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let weak = issue_token(&db.pool, household.household_id, &["ha:write"]).await;
+    let ai = StubAi::new(vec![Ok(two_purchases())]);
+    let enabled_app = app(&db.pool, ai.clone(), config());
+    let capture_id = draft_capture(&enabled_app, &token).await;
+
+    for action in ["confirm", "cancel", "undo"] {
+        let (status, _, json) = call(
+            &enabled_app,
+            Method::POST,
+            &action_uri(capture_id, action),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{action}: {json}");
+        assert_error_envelope(&json, "unauthorized");
+
+        let (status, _, json) = call(
+            &enabled_app,
+            Method::POST,
+            &action_uri(capture_id, action),
+            Some(&weak),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{action}: {json}");
+        assert_error_envelope(&json, "forbidden");
+    }
+
+    let mut disabled = config();
+    disabled.enabled = false;
+    let disabled_app = app(&db.pool, ai.clone(), disabled);
+    for action in ["confirm", "cancel", "undo"] {
+        let (status, _, json) = call(
+            &disabled_app,
+            Method::POST,
+            &action_uri(capture_id, action),
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{action}: {json}");
+        assert_error_envelope(&json, "not_found");
+    }
+
+    assert_eq!(item_count(&db.pool, household.household_id).await, 0);
+}

@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod calendar;
 pub mod capture;
+pub mod captures;
 pub mod dto;
 pub mod household;
 pub mod items;
@@ -50,6 +51,10 @@ pub fn router(state: &AppState) -> Router<AppState> {
             "/capture",
             post(capture::capture).layer(DefaultBodyLimit::max(capture::BODY_LIMIT_BYTES)),
         );
+        router = router
+            .route("/captures/{id}/confirm", post(captures::confirm))
+            .route("/captures/{id}/cancel", post(captures::cancel))
+            .route("/captures/{id}/undo", post(captures::undo));
     }
     router
 }
