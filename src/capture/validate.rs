@@ -18,8 +18,8 @@ use crate::domain::models::{
 };
 use crate::domain::recurrence::resolve_local;
 use crate::domain::validation::{
-    MAX_NOTES, MAX_SUBTASKS, MAX_TAG, MAX_TAGS, MAX_TITLE, MAX_UNIT, sanitize, validate_new_item,
-    validate_quantity,
+    MAX_NOTES, MAX_SUBTASKS, MAX_TAG, MAX_TAGS, MAX_TITLE, MAX_UNIT, normalize_due_for_recurrence,
+    normalize_recurrence, sanitize, validate_new_item, validate_quantity,
 };
 
 /// Максимальное количество позиции.
@@ -60,6 +60,12 @@ pub struct DraftItem {
     pub assignee_candidates: Vec<Uuid>,
     /// Данные для создания; `Some` только у валидного элемента.
     pub item: Option<NewItem>,
+    /// Срок со временем таким, каким он станет после сохранения: домен
+    /// подставляет первое вхождение серии без срока и сдвигает срок серии
+    /// «в последний день месяца». Показывать нужно его, а не `item.due_at`.
+    pub effective_due_at: Option<DateTime<Utc>>,
+    /// Вседневный срок после сохранения (см. [`DraftItem::effective_due_at`]).
+    pub effective_due_date: Option<NaiveDate>,
 }
 
 impl DraftItem {
@@ -133,24 +139,7 @@ pub fn validate_item(context: &CaptureContext, source: ItemSource, raw: RawItem)
         );
     }
 
-    let priority = match raw.priority.as_deref().map(fold) {
-        None => ItemPriority::Normal,
-        Some(value) => match value.as_str() {
-            "low" => ItemPriority::Low,
-            "normal" => ItemPriority::Normal,
-            "high" => ItemPriority::High,
-            "urgent" => ItemPriority::Urgent,
-            _ => {
-                fail(
-                    &mut errors,
-                    "priority",
-                    "priority_unknown",
-                    "Неизвестный приоритет",
-                );
-                ItemPriority::Normal
-            }
-        },
-    };
+    let priority = parse_priority(raw.priority.as_deref(), &mut errors);
 
     let (list, list_auto_selected) = resolve_list(context, &raw);
     if list.is_none() {
@@ -162,9 +151,24 @@ pub fn validate_item(context: &CaptureContext, source: ItemSource, raw: RawItem)
         );
     }
 
-    let (assignee_user_id, assignee_candidates) = match raw.assignee.as_deref() {
-        None => (None, Vec::new()),
-        Some(name) => match resolve_assignee(context, name) {
+    let (assignee_user_id, assignee_candidates) = match (raw.assignee_id, raw.assignee.as_deref()) {
+        // Выбор пользователя в форме правки: проверяем только, что участник
+        // всё ещё в household.
+        (Some(id), _) => {
+            if context.members.iter().any(|member| member.id == id) {
+                (Some(id), Vec::new())
+            } else {
+                fail(
+                    &mut errors,
+                    "assignee",
+                    "assignee_unknown",
+                    "Такого участника нет",
+                );
+                (None, Vec::new())
+            }
+        }
+        (None, None) => (None, Vec::new()),
+        (None, Some(name)) => match resolve_assignee(context, name) {
             Assignee::Found(id) => (Some(id), Vec::new()),
             Assignee::Unknown => {
                 fail(
@@ -187,58 +191,13 @@ pub fn validate_item(context: &CaptureContext, source: ItemSource, raw: RawItem)
         },
     };
 
-    // Признак `all_day` не читается: булево поле модели часто заполняется
-    // значением по умолчанию. Срок определяют только дата и время — дата без
-    // времени даёт вседневный срок, дата со временем — момент.
-    let mut due_date = None;
-    let mut due_at = None;
-    let date = raw.due_date.as_deref().map(parse_date);
-    let time = raw.due_time.as_deref().map(parse_time);
-    match (date, time) {
-        (Some(Some(date)), time) => {
-            if date < today {
-                fail(&mut errors, "due_date", "date_past", "Дата уже прошла");
-            } else if date > horizon(today) {
-                fail(&mut errors, "due_date", "date_far", "Слишком далёкая дата");
-            }
-            match time {
-                None => due_date = Some(date),
-                Some(None) => fail(&mut errors, "due_time", "time_invalid", "Неверное время"),
-                Some(Some(time)) => match resolve_local(context.timezone, date, time) {
-                    Ok(at) => due_at = Some(at),
-                    Err(_) => fail(&mut errors, "due_time", "time_invalid", "Неверное время"),
-                },
-            }
-        }
-        (Some(None), time) => {
-            fail(&mut errors, "due_date", "date_invalid", "Неверная дата");
-            if matches!(time, Some(None)) {
-                fail(&mut errors, "due_time", "time_invalid", "Неверное время");
-            }
-        }
-        (None, Some(parsed)) => {
-            if parsed.is_none() {
-                fail(&mut errors, "due_time", "time_invalid", "Неверное время");
-            } else {
-                fail(
-                    &mut errors,
-                    "due_time",
-                    "time_without_date",
-                    "Укажите дату для времени",
-                );
-            }
-        }
-        (None, None) => {}
-    }
+    let (due_at, due_date) = resolve_due(context, &raw, &mut errors);
 
     let tags = clean_tags(&raw.tags, &mut errors);
     let subtasks = clean_subtasks(&raw.subtasks, &mut errors);
 
     let quantity = raw.quantity.and_then(|quantity| {
-        let in_range = quantity.is_finite() && quantity > 0.0 && quantity <= MAX_QUANTITY;
-        if in_range && validate_quantity(Some(quantity)).is_ok() {
-            Some(quantity)
-        } else {
+        if !(quantity.is_finite() && quantity > 0.0 && quantity <= MAX_QUANTITY) {
             fail(
                 &mut errors,
                 "quantity",
@@ -246,6 +205,16 @@ pub fn validate_item(context: &CaptureContext, source: ItemSource, raw: RawItem)
                 "Количество вне диапазона",
             );
             None
+        } else if validate_quantity(Some(quantity)).is_err() {
+            fail(
+                &mut errors,
+                "quantity",
+                "quantity_precision",
+                "Не больше трёх знаков после запятой",
+            );
+            None
+        } else {
+            Some(quantity)
         }
     });
     // Как и `normalize_unit` в домене, слишком длинную единицу усекаем молча:
@@ -261,10 +230,20 @@ pub fn validate_item(context: &CaptureContext, source: ItemSource, raw: RawItem)
         let start = due_date
             .or_else(|| due_at.map(|at| local_date(context, at)))
             .unwrap_or(today);
-        validate_recurrence(recurrence, raw.target_kind, start, &mut errors)
+        validate_recurrence(
+            recurrence,
+            raw.target_kind,
+            Schedule {
+                context,
+                start,
+                due_at,
+                due_date,
+            },
+            &mut errors,
+        )
     });
 
-    let item = match (list, errors.is_empty()) {
+    let confirmed = match (list, errors.is_empty()) {
         (Some(list), true) => {
             let item = NewItem {
                 list_id: list.id,
@@ -285,6 +264,14 @@ pub fn validate_item(context: &CaptureContext, source: ItemSource, raw: RawItem)
         }
         _ => None,
     };
+    let (item, effective_due_at, effective_due_date) = match confirmed {
+        Some(Normalized {
+            item,
+            due_at,
+            due_date,
+        }) => (Some(item), due_at, due_date),
+        None => (None, due_at, due_date),
+    };
 
     DraftItem {
         kind: raw.target_kind,
@@ -294,22 +281,39 @@ pub fn validate_item(context: &CaptureContext, source: ItemSource, raw: RawItem)
         errors,
         assignee_candidates,
         item,
+        effective_due_at,
+        effective_due_date,
     }
+}
+
+/// Элемент, принятый доменом, и срок после нормализации.
+struct Normalized {
+    item: NewItem,
+    due_at: Option<DateTime<Utc>>,
+    due_date: Option<NaiveDate>,
 }
 
 /// Страховка: доменная проверка репозитория должна согласиться с нашей, иначе
 /// ошибка всплыла бы только при сохранении. Расхождение — ошибка в коде, а не
 /// во вводе, поэтому причину пишем в журнал: текст ошибки домена фиксирован и
 /// содержимого заметки не включает.
+///
+/// Возвращает элемент и срок после нормализации домена: его покажет карточка.
+/// Сам `NewItem` остаётся исходным — при сохранении домен проходит по нему
+/// заново и получает тот же результат, а подмена срока сдвинула бы якорь серии.
 fn confirm_domain(
     context: &CaptureContext,
     list_kind: ListKind,
     item: NewItem,
     today: NaiveDate,
     errors: &mut Vec<ItemError>,
-) -> Option<NewItem> {
+) -> Option<Normalized> {
     match validate_new_item(list_kind, context.timezone.name(), item.clone(), today) {
-        Ok(_) => Some(item),
+        Ok(validated) => Some(Normalized {
+            item,
+            due_at: validated.due_at,
+            due_date: validated.due_date,
+        }),
         Err(error) => {
             tracing::warn!(%error, "domain rejected a capture item that passed validation");
             fail(
@@ -433,12 +437,22 @@ fn clean_subtasks(subtasks: &[String], errors: &mut Vec<ItemError>) -> Vec<Subta
         .collect()
 }
 
+/// Срок элемента, к которому привязывается серия.
+struct Schedule<'a> {
+    context: &'a CaptureContext,
+    /// Дата начала серии: срок, а без срока — сегодня.
+    start: NaiveDate,
+    due_at: Option<DateTime<Utc>>,
+    due_date: Option<NaiveDate>,
+}
+
 fn validate_recurrence(
     raw: &RawRecurrence,
     list_kind: ListKind,
-    start: NaiveDate,
+    schedule: Schedule<'_>,
     errors: &mut Vec<ItemError>,
 ) -> Option<RecurrenceInput> {
+    let Schedule { start, .. } = schedule;
     let errors_before = errors.len();
 
     if list_kind != ListKind::Tasks {
@@ -546,7 +560,7 @@ fn validate_recurrence(
     if errors.len() > errors_before {
         return None;
     }
-    Some(RecurrenceInput {
+    let input = RecurrenceInput {
         freq: freq?,
         interval: i16::try_from(interval).ok(),
         byweekday: weekdays
@@ -557,7 +571,41 @@ fn validate_recurrence(
         timezone: None,
         anchor_date: None,
         month_rule,
-    })
+    };
+
+    // Отдельные поля верны, но вместе они могут не дать ни одного вхождения:
+    // первое вхождение позже даты окончания. Домен отвергает такое при
+    // сохранении, поэтому объясняем это здесь, а не общим «элемент не прошёл
+    // проверку». Других причин отказа после проверок выше сейчас нет; если они
+    // появятся, сообщение и код нужно разделить.
+    let today = schedule.context.today();
+    let timezone = schedule.context.timezone.name();
+    let fits = normalize_recurrence(
+        input.clone(),
+        timezone,
+        schedule.due_at,
+        schedule.due_date,
+        today,
+    )
+    .and_then(|rule| {
+        normalize_due_for_recurrence(
+            schedule.due_at,
+            schedule.due_date,
+            Some(&rule),
+            timezone,
+            today,
+        )
+    });
+    if fits.is_err() {
+        fail(
+            errors,
+            "recurrence",
+            "recurrence_range",
+            "Серия закончится раньше первого повторения",
+        );
+        return None;
+    }
+    Some(input)
 }
 
 /// Убрать управляющие символы и крайние пробелы.
@@ -570,15 +618,126 @@ fn fold(value: &str) -> String {
     value.trim().to_lowercase().replace('ё', "е")
 }
 
-fn parse_date(value: &str) -> Option<NaiveDate> {
-    NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d").ok()
+/// Дата строго `YYYY-MM-DD`: `chrono` принимает и `2026-1-3`, и `+2026-11-03`,
+/// а контракт промпта требует ровно десять символов.
+pub(crate) fn parse_date(value: &str) -> Option<NaiveDate> {
+    let value = value.trim();
+    if value.len() != 10 {
+        return None;
+    }
+    NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()
 }
 
-fn parse_time(value: &str) -> Option<NaiveTime> {
+/// Время `HH:MM`; секунды (`HH:MM:SS`) принимаются, потому что модели их
+/// добавляют сами, а отказывать из-за них нет смысла.
+pub(crate) fn parse_time(value: &str) -> Option<NaiveTime> {
     let value = value.trim();
-    NaiveTime::parse_from_str(value, "%H:%M")
-        .or_else(|_| NaiveTime::parse_from_str(value, "%H:%M:%S"))
-        .ok()
+    match value.len() {
+        5 => NaiveTime::parse_from_str(value, "%H:%M").ok(),
+        8 => NaiveTime::parse_from_str(value, "%H:%M:%S").ok(),
+        _ => None,
+    }
+}
+
+/// Результат разбора необязательной строки LLM.
+enum Parsed<T> {
+    /// Поля нет.
+    Absent,
+    /// Поле есть, но не разобралось.
+    Invalid,
+    Valid(T),
+}
+
+impl<T> Parsed<T> {
+    fn of(value: Option<&str>, parse: fn(&str) -> Option<T>) -> Self {
+        match value {
+            None => Self::Absent,
+            Some(value) => parse(value).map_or(Self::Invalid, Self::Valid),
+        }
+    }
+}
+
+fn parse_priority(value: Option<&str>, errors: &mut Vec<ItemError>) -> ItemPriority {
+    match value.map(fold).as_deref() {
+        None | Some("normal") => ItemPriority::Normal,
+        Some("low") => ItemPriority::Low,
+        Some("high") => ItemPriority::High,
+        Some("urgent") => ItemPriority::Urgent,
+        Some(_) => {
+            fail(
+                errors,
+                "priority",
+                "priority_unknown",
+                "Неизвестный приоритет",
+            );
+            ItemPriority::Normal
+        }
+    }
+}
+
+/// Срок по дате и времени из ответа LLM: дата без времени даёт вседневный
+/// срок, дата со временем — момент.
+fn resolve_due(
+    context: &CaptureContext,
+    raw: &RawItem,
+    errors: &mut Vec<ItemError>,
+) -> (Option<DateTime<Utc>>, Option<NaiveDate>) {
+    let today = context.today();
+    let date = Parsed::of(raw.due_date.as_deref(), parse_date);
+    let time = Parsed::of(raw.due_time.as_deref(), parse_time);
+
+    let date = match (date, &time) {
+        (Parsed::Valid(date), _) => date,
+        (Parsed::Invalid, time) => {
+            fail(errors, "due_date", "date_invalid", "Неверная дата");
+            if matches!(time, Parsed::Invalid) {
+                fail(errors, "due_time", "time_invalid", "Неверное время");
+            }
+            return (None, None);
+        }
+        (Parsed::Absent, Parsed::Invalid) => {
+            fail(errors, "due_time", "time_invalid", "Неверное время");
+            return (None, None);
+        }
+        (Parsed::Absent, Parsed::Valid(_)) => {
+            fail(
+                errors,
+                "due_time",
+                "time_without_date",
+                "Укажите дату для времени",
+            );
+            return (None, None);
+        }
+        (Parsed::Absent, Parsed::Absent) => return (None, None),
+    };
+
+    if date < today {
+        fail(errors, "due_date", "date_past", "Дата уже прошла");
+    } else if date > horizon(today) {
+        fail(errors, "due_date", "date_far", "Слишком далёкая дата");
+    }
+    match time {
+        Parsed::Absent => (None, Some(date)),
+        Parsed::Invalid => {
+            fail(errors, "due_time", "time_invalid", "Неверное время");
+            (None, None)
+        }
+        Parsed::Valid(time) => match resolve_local(context.timezone, date, time) {
+            Ok(at) => {
+                // Прошедшая дата уже названа ошибкой; здесь — сегодняшнее время,
+                // которое уже наступило. Сравнение по минутам: модель видит
+                // время без секунд.
+                if date >= today && at < context.now_minute() {
+                    fail(errors, "due_time", "time_past", "Это время уже прошло");
+                }
+                (Some(at), None)
+            }
+            Err(_) => {
+                fail(errors, "due_time", "time_invalid", "Неверное время");
+                (None, None)
+            }
+        },
+    }
 }
 
 /// Самая поздняя допустимая дата: пять лет от `from`.

@@ -135,7 +135,6 @@ pub fn response_structure() -> Value {
                 "notes": {"selector": {"text": {"multiline": true}}},
                 "due_date": {"selector": {"text": null}},
                 "due_time": {"selector": {"text": null}},
-                "all_day": {"selector": {"boolean": null}},
                 "priority": {"selector": {"select": {"options": ["low", "normal", "high", "urgent"]}}},
                 "assignee": {"selector": {"text": null}},
                 "tags": {"selector": {"object": {"multiple": true, "fields": {
@@ -178,7 +177,7 @@ mod tests {
     /// изменился: заведите новую версию (`capture-v2`), прогоните golden set и
     /// только потом обновите константы.
     const TEMPLATE_SHA256: &str =
-        "ced0156df8520098c71a3e138a13fedffa86e0bee249f8cbcb78e96caf4d6302";
+        "70f3a222201de8b6fbcfeaaddc2c6ffc3bb8cfc7a014d06c1f39a92e9378fea1";
 
     #[test]
     fn prompt_template_is_pinned_to_version() {
@@ -282,7 +281,6 @@ mod tests {
             "notes",
             "due_date",
             "due_time",
-            "all_day",
             "priority",
             "assignee",
             "tags",

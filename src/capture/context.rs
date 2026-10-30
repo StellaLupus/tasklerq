@@ -3,7 +3,7 @@
 //! Один и тот же контекст идёт в промпт (только имена) и в серверную
 //! валидацию (идентификаторы). Идентификаторы в промпт не попадают.
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, DurationRound, NaiveDate, TimeDelta, Utc};
 use chrono_tz::Tz;
 use uuid::Uuid;
 
@@ -82,6 +82,14 @@ impl CaptureContext {
             lists,
             members,
         })
+    }
+
+    /// Текущий момент с точностью до минуты: так время видит модель в промпте,
+    /// поэтому «в 14:05» в 14:05:30 ещё не прошло.
+    pub fn now_minute(&self) -> DateTime<Utc> {
+        self.now
+            .duration_trunc(TimeDelta::minutes(1))
+            .unwrap_or(self.now)
     }
 
     /// Сегодняшняя дата в часовом поясе household.

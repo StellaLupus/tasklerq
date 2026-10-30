@@ -3,6 +3,7 @@
 pub mod api;
 pub mod bot;
 pub mod callbacks;
+pub mod capture_worker;
 pub mod outbox;
 pub mod queue;
 pub mod rich;

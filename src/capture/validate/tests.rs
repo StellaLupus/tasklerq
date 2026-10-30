@@ -11,9 +11,9 @@ fn raw(kind: ListKind, title: &str) -> RawItem {
         notes: None,
         due_date: None,
         due_time: None,
-        all_day: None,
         priority: None,
         assignee: None,
+        assignee_id: None,
         tags: Vec::new(),
         quantity: None,
         unit: None,
@@ -114,6 +114,46 @@ fn past_date_is_an_item_error_and_today_is_allowed() {
 }
 
 #[test]
+fn time_earlier_today_is_an_item_error() {
+    // Сейчас 14:05 по Москве: прошедшее время недопустимо, текущая минута и
+    // позже — допустимы, как и в ручной форме. Секунды не важны: модель видит
+    // время с точностью до минуты, поэтому «в 14:05» в 14:05:59 ещё не прошло.
+    for seconds in [0, 1, 30, 59] {
+        let mut context = context();
+        context.now += chrono::Duration::seconds(seconds);
+        for (time, valid) in [
+            ("00:00", false),
+            ("14:04", false),
+            ("14:05", true),
+            ("14:06", true),
+            ("23:59", true),
+        ] {
+            let mut raw = task();
+            raw.due_date = Some("2026-10-30".to_owned());
+            raw.due_time = Some(time.to_owned());
+            let draft = validate_item(&context, ItemSource::Api, raw);
+            assert_eq!(draft.is_valid(), valid, "{time} at +{seconds}s");
+            if !valid {
+                assert_eq!(codes(&draft), ["time_past"], "{time} at +{seconds}s");
+                assert_eq!(draft.errors[0].message, "Это время уже прошло");
+            }
+        }
+    }
+
+    // Завтрашнее раннее время — в будущем.
+    let mut tomorrow = task();
+    tomorrow.due_date = Some("2026-10-31".to_owned());
+    tomorrow.due_time = Some("00:00".to_owned());
+    assert!(check(tomorrow).is_valid());
+
+    // Прошедшая дата уже названа ошибкой, время не дублирует её.
+    let mut yesterday = task();
+    yesterday.due_date = Some("2026-10-29".to_owned());
+    yesterday.due_time = Some("09:00".to_owned());
+    assert_eq!(codes(&check(yesterday)), ["date_past"]);
+}
+
+#[test]
 fn date_horizon_is_five_years() {
     let mut edge = task();
     edge.due_date = Some("2031-10-30".to_owned());
@@ -156,7 +196,6 @@ fn date_and_time_become_utc_moment_in_household_timezone() {
     let mut raw = task();
     raw.due_date = Some("2026-10-30".to_owned());
     raw.due_time = Some("18:00".to_owned());
-    raw.all_day = Some(true);
 
     let item = check(raw).item.unwrap();
 
@@ -168,15 +207,46 @@ fn date_and_time_become_utc_moment_in_household_timezone() {
 }
 
 #[test]
-fn date_without_time_is_all_day_even_if_flag_says_otherwise() {
+fn date_without_time_is_an_all_day_due() {
     let mut raw = task();
     raw.due_date = Some("2026-10-31".to_owned());
-    raw.all_day = Some(false);
 
     let item = check(raw).item.unwrap();
 
     assert_eq!(item.due_at, None);
     assert_eq!(item.due_date, NaiveDate::from_ymd_opt(2026, 10, 31));
+}
+
+#[test]
+fn every_priority_maps_to_its_domain_value() {
+    for (value, expected) in [
+        ("low", ItemPriority::Low),
+        ("normal", ItemPriority::Normal),
+        ("high", ItemPriority::High),
+        ("urgent", ItemPriority::Urgent),
+        (" URGENT ", ItemPriority::Urgent),
+    ] {
+        let mut raw = task();
+        raw.priority = Some(value.to_owned());
+        let item = check(raw).item.expect("valid item");
+        assert_eq!(item.priority, expected, "{value}");
+    }
+    assert_eq!(check(task()).item.unwrap().priority, ItemPriority::Normal);
+}
+
+#[test]
+fn invalid_date_and_invalid_time_are_both_reported() {
+    let mut raw = task();
+    raw.due_date = Some("вчера".to_owned());
+    raw.due_time = Some("25:00".to_owned());
+
+    assert_eq!(codes(&check(raw)), ["date_invalid", "time_invalid"]);
+
+    // Верное время при неверной дате второй ошибки не даёт.
+    let mut raw = task();
+    raw.due_date = Some("вчера".to_owned());
+    raw.due_time = Some("18:00".to_owned());
+    assert_eq!(codes(&check(raw)), ["date_invalid"]);
 }
 
 #[test]
@@ -238,6 +308,34 @@ fn ambiguous_assignee_is_not_guessed() {
 }
 
 #[test]
+fn chosen_member_resolves_an_ambiguous_name() {
+    let mut context = context();
+    context.members = vec![
+        member("Алексей", Some("alex_a")),
+        member("Алексей", Some("alex_b")),
+    ];
+    let chosen = context.members[1].id;
+    let mut raw = task();
+    raw.assignee = Some("Алексей".to_owned());
+    raw.assignee_id = Some(chosen);
+
+    let draft = validate_item(&context, ItemSource::Api, raw);
+
+    assert!(draft.is_valid(), "{:?}", draft.errors);
+    assert_eq!(draft.item.expect("item").assignee_user_id, Some(chosen));
+}
+
+#[test]
+fn chosen_member_who_left_the_household_is_rejected() {
+    let mut raw = task();
+    raw.assignee_id = Some(Uuid::now_v7());
+
+    let draft = check(raw);
+
+    assert_eq!(codes(&draft), ["assignee_unknown"]);
+}
+
+#[test]
 fn username_and_display_name_of_one_member_are_not_ambiguous() {
     let mut context = context();
     context.members = vec![member("Anna", Some("anna")), member("Борис", Some("boris"))];
@@ -268,12 +366,18 @@ fn tags_are_limited_in_count_and_length() {
 
 #[test]
 fn quantity_must_be_positive_and_at_most_9999() {
-    for quantity in [0.0, -1.0, 10_000.0, 9_999.5, 0.0001, 1.2345] {
+    for quantity in [0.0, -1.0, 10_000.0, 9_999.5] {
         let mut raw = raw(ListKind::Shopping, "Молоко");
         raw.quantity = Some(quantity);
         let draft = check(raw);
         assert_eq!(codes(&draft), ["quantity_range"], "{quantity}");
         assert_eq!(draft.errors[0].message, "Количество вне диапазона");
+    }
+    // В диапазоне, но с лишними знаками: причина называется честно.
+    for quantity in [0.0001, 1.2345] {
+        let mut raw = raw(ListKind::Shopping, "Молоко");
+        raw.quantity = Some(quantity);
+        assert_eq!(codes(&check(raw)), ["quantity_precision"], "{quantity}");
     }
     for quantity in [0.001, 2.0, 2.5, 9_999.0] {
         let mut raw = raw(ListKind::Shopping, "Молоко");
@@ -326,15 +430,30 @@ fn recurrence_interval_zero_is_rejected() {
 }
 
 #[test]
-fn recurrence_interval_upper_bound() {
-    for (interval, valid) in [(365, true), (366, false)] {
+fn recurrence_interval_bounds() {
+    for interval in [1, 365] {
         let mut raw = task();
         raw.recurrence = Some(RawRecurrence {
             freq: Some("daily".to_owned()),
             interval: Some(interval),
             ..RawRecurrence::default()
         });
-        assert_eq!(check(raw).is_valid(), valid, "{interval}");
+        assert!(check(raw).is_valid(), "{interval}");
+    }
+    // Код ошибки обязателен: без него отказ страховки `domain_rejected`
+    // неотличим от настоящей проверки.
+    for interval in [-1, 0, 366] {
+        let mut raw = task();
+        raw.recurrence = Some(RawRecurrence {
+            freq: Some("daily".to_owned()),
+            interval: Some(interval),
+            ..RawRecurrence::default()
+        });
+        assert_eq!(
+            codes(&check(raw)),
+            ["recurrence_interval"],
+            "interval {interval}"
+        );
     }
 }
 
@@ -346,9 +465,11 @@ fn weekly_recurrence_needs_valid_weekdays() {
     assert_eq!(codes(&draft), ["recurrence_weekdays"]);
     assert_eq!(draft.errors[0].message, "Укажите дни недели");
 
-    let mut raw = task();
-    raw.recurrence = Some(weekly(&[2, 8]));
-    assert_eq!(codes(&check(raw)), ["recurrence_weekdays"]);
+    for days in [&[2, 8][..], &[0][..], &[-1, 3][..]] {
+        let mut raw = task();
+        raw.recurrence = Some(weekly(days));
+        assert_eq!(codes(&check(raw)), ["recurrence_weekdays"], "{days:?}");
+    }
 
     let mut raw = task();
     raw.due_date = Some("2026-11-03".to_owned());
@@ -608,26 +729,6 @@ fn long_unit_is_truncated_like_the_domain_does() {
 }
 
 #[test]
-fn all_day_flag_is_ignored() {
-    for all_day in [None, Some(true), Some(false)] {
-        let mut dated = task();
-        dated.due_date = Some("2026-10-31".to_owned());
-        dated.all_day = all_day;
-        let item = check(dated).item.unwrap();
-        assert_eq!(item.due_date, NaiveDate::from_ymd_opt(2026, 10, 31));
-        assert_eq!(item.due_at, None);
-
-        let mut timed = task();
-        timed.due_date = Some("2026-10-31".to_owned());
-        timed.due_time = Some("09:30".to_owned());
-        timed.all_day = all_day;
-        let item = check(timed).item.unwrap();
-        assert_eq!(item.due_date, None);
-        assert!(item.due_at.is_some());
-    }
-}
-
-#[test]
 fn leading_at_sign_is_not_stripped_from_list_names() {
     let mut context = context();
     context.lists.push(list("@дом", ListKind::Tasks, false));
@@ -672,10 +773,12 @@ fn domain_disagreement_becomes_an_item_error() {
     );
 }
 
-/// Дублирование правил домена закреплено тестом: всё, что принимает слой
-/// capture, принимает и домен, то есть `domain_rejected` недостижим.
+/// Перечень граничных случаев, а не property-тест: каждый из них слой capture
+/// принимает, и домен обязан согласиться, иначе сработает страховка
+/// `domain_rejected`. Это не доказывает, что страховка недостижима для всех
+/// входов; новый найденный случай добавляется сюда.
 #[test]
-fn domain_never_rejects_what_validation_accepts() {
+fn domain_accepts_every_enumerated_valid_item() {
     let long = |n: usize| "я".repeat(n);
     let mut cases: Vec<RawItem> = vec![
         task(),
@@ -697,7 +800,7 @@ fn domain_never_rejects_what_validation_accepts() {
 
     for (date, time) in [
         ("2026-10-30", None),
-        ("2026-10-30", Some("00:00")),
+        ("2026-10-30", Some("14:05")),
         ("2026-10-30", Some("23:59:59")),
         ("2026-11-01", Some("18:00")),
         ("2031-10-30", None),
@@ -768,6 +871,48 @@ fn domain_never_rejects_what_validation_accepts() {
         cases.push(raw);
     }
 
+    // Серии без срока: домен сам подставляет первое вхождение.
+    for (freq, month_rule) in [
+        ("daily", None),
+        ("monthly", None),
+        ("monthly", Some("last_day")),
+        ("yearly", None),
+    ] {
+        for until in [None, Some("2026-12-31"), Some("2031-10-30")] {
+            let mut raw = task();
+            raw.recurrence = Some(RawRecurrence {
+                freq: Some(freq.to_owned()),
+                month_rule: month_rule.map(str::to_owned),
+                until: until.map(str::to_owned),
+                ..RawRecurrence::default()
+            });
+            cases.push(raw);
+        }
+    }
+    // Ежедневная серия, которая заканчивается в день создания: одно вхождение.
+    let mut one_day = task();
+    one_day.recurrence = Some(RawRecurrence {
+        freq: Some("daily".to_owned()),
+        until: Some("2026-10-30".to_owned()),
+        ..RawRecurrence::default()
+    });
+    cases.push(one_day);
+    // Повтор дня недели в списке, в том числе без срока.
+    for due in [None, Some("2026-11-03")] {
+        let mut raw = task();
+        raw.due_date = due.map(str::to_owned);
+        raw.recurrence = Some(weekly(&[2, 2, 5]));
+        cases.push(raw);
+    }
+    // Срок не на день недели серии и `until` ровно на нём.
+    let mut off_weekday = task();
+    off_weekday.due_date = Some("2026-10-30".to_owned());
+    off_weekday.recurrence = Some(RawRecurrence {
+        until: Some("2026-10-30".to_owned()),
+        ..weekly(&[2])
+    });
+    cases.push(off_weekday);
+
     let mut named = task();
     named.target_list = Some("Дача".to_owned());
     named.assignee = Some("@Anna".to_owned());
@@ -823,4 +968,153 @@ fn dst_gap_and_overlap_resolve_in_household_timezone() {
             "{date} {time}"
         );
     }
+}
+
+fn monthly_last_day() -> RawRecurrence {
+    RawRecurrence {
+        freq: Some("monthly".to_owned()),
+        month_rule: Some("last_day".to_owned()),
+        ..RawRecurrence::default()
+    }
+}
+
+#[test]
+fn effective_due_shows_the_first_occurrence_of_a_series_without_a_date() {
+    let mut raw = task();
+    raw.recurrence = Some(RawRecurrence {
+        freq: Some("daily".to_owned()),
+        ..RawRecurrence::default()
+    });
+
+    let draft = check(raw);
+
+    assert!(draft.is_valid(), "{:?}", draft.errors);
+    // Домен подставит первое вхождение при сохранении, карточка показывает его.
+    assert_eq!(
+        draft.effective_due_date,
+        Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 30).unwrap())
+    );
+    // Сам `NewItem` остаётся исходным: домен нормализует его заново.
+    assert_eq!(draft.item.expect("item").due_date, None);
+}
+
+#[test]
+fn effective_due_follows_the_last_day_of_the_month_rule() {
+    let mut raw = task();
+    raw.due_date = Some("2026-11-03".to_owned());
+    raw.recurrence = Some(monthly_last_day());
+
+    let draft = check(raw);
+
+    assert!(draft.is_valid(), "{:?}", draft.errors);
+    assert_eq!(
+        draft.effective_due_date,
+        Some(chrono::NaiveDate::from_ymd_opt(2026, 11, 30).unwrap())
+    );
+    assert_eq!(
+        draft.item.expect("item").due_date,
+        Some(chrono::NaiveDate::from_ymd_opt(2026, 11, 3).unwrap())
+    );
+}
+
+#[test]
+fn effective_due_of_a_plain_item_is_its_own() {
+    let mut raw = task();
+    raw.due_date = Some("2026-11-03".to_owned());
+
+    let draft = check(raw);
+
+    assert_eq!(
+        draft.effective_due_date,
+        Some(chrono::NaiveDate::from_ymd_opt(2026, 11, 3).unwrap())
+    );
+    assert_eq!(draft.effective_due_at, None);
+}
+
+#[test]
+fn series_that_ends_before_its_first_occurrence_has_its_own_error() {
+    // 2026-10-30 — пятница, вторник наступит 3 ноября, после `until`.
+    let mut raw = task();
+    raw.recurrence = Some(RawRecurrence {
+        until: Some("2026-10-31".to_owned()),
+        ..weekly(&[2])
+    });
+
+    let draft = check(raw);
+
+    assert_eq!(codes(&draft), ["recurrence_range"]);
+    assert_eq!(
+        draft.errors[0].message,
+        "Серия закончится раньше первого повторения"
+    );
+}
+
+#[test]
+fn series_with_a_due_date_is_valid_even_if_the_next_weekday_is_after_until() {
+    // Сам срок (пятница) остаётся единственным вхождением.
+    let mut raw = task();
+    raw.due_date = Some("2026-10-30".to_owned());
+    raw.recurrence = Some(RawRecurrence {
+        until: Some("2026-10-31".to_owned()),
+        ..weekly(&[2])
+    });
+
+    assert!(check(raw).is_valid());
+}
+
+#[test]
+fn dates_must_be_exactly_yyyy_mm_dd() {
+    for date in [
+        "+2026-11-03",
+        "2026-1-3",
+        "2026-11-3",
+        "03.11.2026",
+        "2026-11-03T10:00",
+    ] {
+        let mut raw = task();
+        raw.due_date = Some(date.to_owned());
+        assert_eq!(codes(&check(raw)), ["date_invalid"], "{date}");
+    }
+}
+
+#[test]
+fn times_are_hh_mm_with_optional_seconds() {
+    for time in ["9:05", "18", "18:0", "18:00:0", "1800"] {
+        let mut raw = task();
+        raw.due_date = Some("2026-11-03".to_owned());
+        raw.due_time = Some(time.to_owned());
+        assert_eq!(codes(&check(raw)), ["time_invalid"], "{time}");
+    }
+    for time in ["09:05", "18:00:30"] {
+        let mut raw = task();
+        raw.due_date = Some("2026-11-03".to_owned());
+        raw.due_time = Some(time.to_owned());
+        assert!(check(raw).is_valid(), "{time}");
+    }
+}
+
+#[test]
+fn quantity_precision_has_its_own_message() {
+    let mut raw = raw(ListKind::Shopping, "Молоко");
+    raw.quantity = Some(1.2345);
+    let draft = check(raw);
+    assert_eq!(codes(&draft), ["quantity_precision"]);
+    assert_eq!(
+        draft.errors[0].message,
+        "Не больше трёх знаков после запятой"
+    );
+
+    for quantity in [0.0, -1.0, 10_000.0, f64::NAN] {
+        let mut raw = raw_shopping();
+        raw.quantity = Some(quantity);
+        assert_eq!(codes(&check(raw)), ["quantity_range"], "{quantity}");
+    }
+
+    let mut raw = raw_shopping();
+    raw.quantity = Some(1.234);
+    assert!(check(raw).is_valid());
+}
+
+fn raw_shopping() -> RawItem {
+    raw(ListKind::Shopping, "Молоко")
 }

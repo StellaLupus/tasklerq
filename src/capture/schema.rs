@@ -10,8 +10,10 @@
 //! `target_kind` и `title`, необязательно. Лишние поля, включая любые
 //! идентификаторы, не читаются вовсе.
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::domain::models::ListKind;
 
@@ -67,7 +69,8 @@ impl ParseError {
 }
 
 /// Правило повторения «как сказала LLM», до проверки диапазонов.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RawRecurrence {
     /// `daily`/`weekly`/`monthly`/`yearly`.
     pub freq: Option<String>,
@@ -81,8 +84,10 @@ pub struct RawRecurrence {
     pub until: Option<String>,
 }
 
-/// Элемент черновика «как сказала LLM».
-#[derive(Debug, Clone, PartialEq)]
+/// Элемент черновика «как сказала LLM». Хранится в `capture_drafts.parsed`,
+/// поэтому новые поля должны иметь `#[serde(default)]`: черновик, записанный до
+/// обновления, не должен переставать читаться.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RawItem {
     /// Тип списка.
     pub target_kind: ListKind,
@@ -96,20 +101,23 @@ pub struct RawItem {
     pub due_date: Option<String>,
     /// Время `HH:MM`.
     pub due_time: Option<String>,
-    /// Вседневный срок. Принимается по контракту, но валидацией намеренно
-    /// игнорируется: срок определяют только дата и время.
-    pub all_day: Option<bool>,
     /// Приоритет.
     pub priority: Option<String>,
     /// Исполнитель.
     pub assignee: Option<String>,
+    /// Участник, выбранный пользователем при правке черновика. Парсер ответа
+    /// LLM это поле не заполняет: идентификаторы из ответа модели игнорируются.
+    #[serde(default)]
+    pub assignee_id: Option<Uuid>,
     /// Теги.
+    #[serde(default)]
     pub tags: Vec<String>,
     /// Количество.
     pub quantity: Option<f64>,
     /// Единица.
     pub unit: Option<String>,
     /// Названия подзадач.
+    #[serde(default)]
     pub subtasks: Vec<String>,
     /// Повторение.
     pub recurrence: Option<RawRecurrence>,
@@ -199,9 +207,9 @@ fn parse_item(index: usize, value: &Value) -> Result<RawItem, ParseError> {
         notes: optional_text(object, at, "notes")?,
         due_date: optional_text(object, at, "due_date")?,
         due_time: optional_text(object, at, "due_time")?,
-        all_day: optional_bool(object, at, "all_day")?,
         priority: optional_text(object, at, "priority")?,
         assignee: optional_text(object, at, "assignee")?,
+        assignee_id: None,
         tags: text_list(object.get("tags"), at, "tags", "value")?,
         quantity: optional_number(object, at, "quantity")?,
         unit: optional_text(object, at, "unit")?,
@@ -231,18 +239,6 @@ fn optional_text(
         Some(Value::Null) | None => Ok(None),
         Some(Value::String(text)) if text.trim().is_empty() => Ok(None),
         Some(Value::String(text)) => Ok(Some(text.clone())),
-        Some(_) => Err(ParseError::InvalidField { index, field }),
-    }
-}
-
-fn optional_bool(
-    object: &Map<String, Value>,
-    index: Option<usize>,
-    field: &'static str,
-) -> Result<Option<bool>, ParseError> {
-    match object.get(field) {
-        Some(Value::Null) | None => Ok(None),
-        Some(Value::Bool(flag)) => Ok(Some(*flag)),
         Some(_) => Err(ParseError::InvalidField { index, field }),
     }
 }
@@ -402,7 +398,6 @@ mod tests {
                 "notes": null,
                 "due_date": "2026-10-30",
                 "due_time": null,
-                "all_day": true,
                 "priority": "normal",
                 "assignee": null,
                 "tags": ["продукты"],
@@ -423,11 +418,20 @@ mod tests {
         assert_eq!(item.title, "Молоко");
         assert_eq!(item.due_date.as_deref(), Some("2026-10-30"));
         assert_eq!(item.due_time, None);
-        assert_eq!(item.all_day, Some(true));
         assert_eq!(item.tags, ["продукты"]);
         assert_eq!(item.quantity, Some(2.0));
         assert_eq!(item.unit.as_deref(), Some("л"));
         assert!(parsed.clarifications.is_empty());
+    }
+
+    #[test]
+    fn a_stray_all_day_field_is_ignored_whatever_its_type() {
+        // Поля `all_day` в схеме нет, но модель или старый кэш могут его вернуть.
+        for value in [json!(true), json!(false), json!("yes"), json!(null)] {
+            let item = parse_one(json!({"all_day": value, "due_date": "2026-10-31"})).unwrap();
+            assert_eq!(item.due_date.as_deref(), Some("2026-10-31"));
+            assert_eq!(item.due_time, None);
+        }
     }
 
     #[test]
@@ -438,7 +442,6 @@ mod tests {
         assert_eq!(item.title, "Позвонить маме");
         assert_eq!(item.target_list, None);
         assert_eq!(item.priority, None);
-        assert_eq!(item.all_day, None);
         assert!(item.tags.is_empty());
         assert!(item.subtasks.is_empty());
         assert_eq!(item.recurrence, None);
@@ -521,7 +524,6 @@ mod tests {
             (json!({"target_kind": 1}), "target_kind"),
             (json!({"title": 5}), "title"),
             (json!({"notes": ["a"]}), "notes"),
-            (json!({"all_day": "yes"}), "all_day"),
             (json!({"quantity": "много"}), "quantity"),
             (json!({"tags": "продукты"}), "tags"),
             (json!({"tags": [1]}), "tags"),

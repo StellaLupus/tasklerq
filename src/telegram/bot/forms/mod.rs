@@ -68,6 +68,11 @@ async fn open(ctx: &mut Ctx<'_>, form: Form) -> Result<(), Fail> {
 // Входы в формы
 // ---------------------------------------------------------------------
 
+/// Открыть готовую форму создания (правка элемента черновика capture).
+pub async fn open_create(ctx: &mut Ctx<'_>, form: ItemForm) -> Result<(), Fail> {
+    open(ctx, Form::Create(form)).await
+}
+
 /// Начать создание элемента.
 pub async fn start_create(
     ctx: &mut Ctx<'_>,
@@ -103,6 +108,7 @@ pub async fn start_create(
             from_preview: false,
             error: None,
             duplicate: None,
+            target: None,
         }),
     )
     .await
@@ -141,6 +147,7 @@ pub async fn quick_add(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
             from_preview: false,
             error: None,
             duplicate: None,
+            target: None,
         }),
     )
     .await

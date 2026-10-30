@@ -6,6 +6,7 @@
 //! быстрый ответ на callback (`answerCallbackQuery`) возвращается наружу и
 //! отправляется после коммита.
 
+mod capture;
 mod card;
 mod forms;
 pub mod model;
@@ -54,11 +55,24 @@ pub struct Outcome {
     pub answer: Option<Answer>,
 }
 
+/// Адресат экрана, показываемого вне обработки его обновления.
+#[derive(Debug, Clone, Copy)]
+pub struct Recipient<'a> {
+    /// Участник.
+    pub user: &'a User,
+    /// Его household.
+    pub household: &'a Household,
+    /// Чат, куда выводится экран.
+    pub chat_id: i64,
+}
+
 /// Бот: настройки, не зависящие от обновления.
 #[derive(Debug, Clone)]
 pub struct Bot {
     /// Имя бота для ссылок-приглашений.
     pub username: String,
+    /// Свободный текст уходит на разбор в LLM, а не в быстрое добавление.
+    pub llm_capture: bool,
 }
 
 /// Сбой обработки: инфраструктурный (повторить) или объяснимый пользователю.
@@ -122,6 +136,8 @@ pub struct Ctx<'a> {
     pub toast: Option<(String, bool)>,
     /// Сообщение над следующим экраном.
     pub banner: Option<String>,
+    /// Свободный текст уходит на разбор в LLM.
+    pub llm_capture: bool,
 }
 
 impl Ctx<'_> {
@@ -324,7 +340,59 @@ impl Bot {
     pub fn new(username: impl Into<String>) -> Self {
         Self {
             username: username.into(),
+            llm_capture: false,
         }
+    }
+
+    /// Показать экран пользователю вне обработки его обновления: так воркер
+    /// разбора заменяет «Разбираю…» карточкой черновика. Экран попадает в
+    /// `outbox` в транзакции вызывающего; ожидаемые отказы (например, чужой
+    /// экран) не считаются сбоем и только пишутся в журнал.
+    pub async fn present_to(
+        &self,
+        conn: &mut PgConnection,
+        now: DateTime<Utc>,
+        to: Recipient<'_>,
+        screen: Screen,
+        banner: Option<String>,
+    ) -> Result<(), sqlx::Error> {
+        let Recipient {
+            user,
+            household,
+            chat_id,
+        } = to;
+        let mut ctx = Ctx {
+            conn,
+            now,
+            bot_username: &self.username,
+            chat_id,
+            sender: Sender {
+                id: user.telegram_user_id,
+                display_name: user.display_name.clone(),
+                username: user.username.clone(),
+            },
+            user: Some(user.clone()),
+            household: Some(household.clone()),
+            tz: display_timezone(Some(user), Some(household)),
+            toast: None,
+            banner,
+            llm_capture: self.llm_capture,
+        };
+        match ctx.present(screen).await {
+            Ok(()) => Ok(()),
+            Err(Fail::Infra(error)) => Err(error),
+            Err(Fail::User(_)) => {
+                tracing::debug!("screen could not be presented to the user");
+                Ok(())
+            }
+        }
+    }
+
+    /// Включить или выключить разбор свободного текста через LLM.
+    #[must_use]
+    pub fn with_llm_capture(mut self, enabled: bool) -> Self {
+        self.llm_capture = enabled;
+        self
     }
 
     /// Обработать обновление. Вызывать в транзакции; при `Err` её нужно
@@ -368,6 +436,7 @@ impl Bot {
             tz,
             toast: None,
             banner: None,
+            llm_capture: self.llm_capture,
         };
 
         let query_id = match &incoming {
@@ -470,7 +539,11 @@ async fn on_text(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
             if ctx.user.is_none() {
                 return forms::start_onboarding(ctx).await;
             }
-            forms::quick_add(ctx, text).await
+            if ctx.llm_capture {
+                capture::intake(ctx, text).await
+            } else {
+                forms::quick_add(ctx, text).await
+            }
         }
     }
 }
@@ -706,5 +779,11 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
         }
         Action::NoticeOpen { item_id } => notify::open(ctx, item_id).await,
         Action::NoticeUndo { item_id } => notify::undo(ctx, message_id, item_id).await,
+
+        Action::DraftEdit { draft_id, index } => capture::edit(ctx, draft_id, index).await,
+        Action::DraftRemove { draft_id, index } => capture::remove(ctx, draft_id, index).await,
+        Action::DraftSave { draft_id } => capture::save(ctx, draft_id).await,
+        Action::DraftCancel { draft_id } => capture::cancel(ctx, draft_id).await,
+        Action::DraftUndo { draft_id } => capture::undo(ctx, draft_id).await,
     }
 }

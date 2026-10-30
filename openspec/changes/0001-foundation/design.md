@@ -137,6 +137,7 @@ households 1─* capture_drafts 1─* llm_runs
 | `conversation_states` | Пошаговая форма пользователя, TTL. |
 | `callback_tokens` | Хеш одноразового callback-токена, действие, payload, version, TTL. |
 | `capture_drafts` | Исходный текст, структура LLM, статус, TTL, `source`, `mode`, `idempotency_key`, `capture_id`; хранит и черновики, и применённые capture. |
+| `capture_jobs` | Очередь разбора текста: аренда, попытки, `input_kind`/`payload`; текст затирается после завершения. |
 | `llm_runs` | Метаданные разбора без исходного текста. |
 | `outbox` | Исходящие сообщения, retry, message_id. |
 | `notification_deliveries` | Дедупликация напоминаний и сводок. |
@@ -282,6 +283,20 @@ Telegram text
   → transaction: create items + event + outbox result
 ```
 
+**Очередь разбора.** Вызов HA занимает до 20 с, поэтому он не выполняется в
+транзакции воркера обновлений (она держала бы блокировки и очередь `webhook`).
+Бот проверяет длину текста, ставит строку в `capture_jobs` и показывает экран
+«Разбираю…». Отдельный воркер захватывает задание арендой (`locked_until`, 60 с;
+счётчик попыток растёт при захвате, поэтому «ядовитое» задание исчерпает
+попытки), читает контекст коротким запросом, вызывает HA вне транзакции и
+одной транзакцией создаёт `capture_drafts`, завершает задание и заменяет экран
+карточкой через `outbox`. Повторяются только `5xx` и сетевые ошибки (три
+попытки, задержка 2/4/… с); таймаут, отказ HA и некорректный ответ завершают
+задание с объяснением пользователю. Текст задания затирается при завершении.
+`input_kind` и `payload` общие, чтобы другие виды входа (например, голосовые
+сообщения) добавлялись без изменения таблицы. Брокер (Redis) не нужен: очередь
+в PostgreSQL сохраняет атомарность с доменными эффектами и `outbox`.
+
 **Запрос.** `task_name` — «Разбор заметки Tasklerq». `instructions` содержит
 правила, текущие дату/время/часовой пояс, списки, участников и
 пользовательский текст в разделителях. `structure` — вложенный
@@ -300,7 +315,6 @@ Telegram text
           "notes": {"selector": {"text": {"multiline": true}}},
           "due_date": {"selector": {"text": null}},
           "due_time": {"selector": {"text": null}},
-          "all_day": {"selector": {"boolean": null}},
           "priority": {"selector": {"select": {"options": ["low", "normal", "high", "urgent"]}}},
           "assignee": {"selector": {"text": null}},
           "tags": {"selector": {"object": {"multiple": true, "fields": {"value": {"selector": {"text": null}}}}}},

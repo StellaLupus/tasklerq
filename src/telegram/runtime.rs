@@ -6,10 +6,12 @@ use sqlx::PgPool;
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 
-use crate::config::{Config, TelegramMode};
+use crate::config::{Config, LlmConfig, TelegramMode};
+use crate::home_assistant::{AiTask, HttpAiTask};
 
 use super::api::{DEFAULT_BASE_URL, HttpTelegramApi, TelegramApi};
 use super::bot::Bot;
+use super::capture_worker::CaptureWorker;
 use super::outbox::OutboxWorker;
 use super::webhook::Ingress;
 use super::worker::{UpdateWorker, poll};
@@ -73,7 +75,12 @@ pub async fn start(
         TelegramMode::Disabled => {}
     }
 
-    let bot = Bot::new(telegram.bot_username.clone());
+    let ai = build_ai(&config.llm);
+    let bot = Bot::new(telegram.bot_username.clone()).with_llm_capture(ai.is_some());
+    if let Some(ai) = ai {
+        let capture = CaptureWorker::new(pool.clone(), ai, bot.clone(), wake_outbox.clone());
+        tasks.push(tokio::spawn(capture.run(shutdown.clone())));
+    }
     let updates = UpdateWorker::new(
         pool.clone(),
         Arc::new(bot),
@@ -87,4 +94,27 @@ pub async fn start(
     tasks.push(tokio::spawn(outbox.run(wake_outbox, shutdown)));
 
     Ok(Some(Runtime { ingress, tasks }))
+}
+
+/// Клиент Home Assistant для разбора текста; `None`, если разбор выключен или
+/// настроен неверно (тогда свободный текст идёт в быстрое добавление).
+fn build_ai(llm: &LlmConfig) -> Option<Arc<dyn AiTask>> {
+    if !llm.enabled {
+        return None;
+    }
+    let (Some(url), Some(token), Some(entity)) =
+        (&llm.base_url, &llm.token, &llm.ai_task_entity_id)
+    else {
+        return None;
+    };
+    match HttpAiTask::new(url.as_str(), token.clone(), entity) {
+        Ok(client) => Some(Arc::new(client)),
+        Err(error) => {
+            tracing::warn!(
+                error = error.code(),
+                "LLM capture is disabled: bad HA settings"
+            );
+            None
+        }
+    }
 }
