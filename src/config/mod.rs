@@ -357,7 +357,7 @@ impl Config {
             voice_timeout_ms: source.u32("CAPTURE_VOICE_TIMEOUT_MS", 8_000, 1_000, 60_000)?,
             voice_fallback_raw: source.bool("CAPTURE_VOICE_FALLBACK_RAW", true)?,
             rate_limit_per_min: source.u32("CAPTURE_RATE_LIMIT_PER_MIN", 10, 1, 1_000)?,
-            max_text_chars: source.u32("CAPTURE_MAX_TEXT_CHARS", 2_000, 100, 16_000)?,
+            max_text_chars: source.u32("CAPTURE_MAX_TEXT_CHARS", 2_000, 100, 2_000)?,
         };
 
         let llm = Self::llm_config(source)?;

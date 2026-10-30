@@ -22,7 +22,7 @@ use crate::capture::breaker::CircuitBreaker;
 use crate::capture::draft::{self, NewCapture};
 use crate::capture::llm::{self, Failure};
 use crate::capture::prompt::PROMPT_VERSION;
-use crate::capture::schema::ParsedResponse;
+use crate::capture::schema::{ParseError, ParsedResponse};
 use crate::capture::validate::{DraftItem, validate_items};
 use crate::config::CaptureConfig;
 use crate::domain::error::DomainError;
@@ -102,6 +102,20 @@ impl RateLimiter {
         }
     }
 
+    /// Убрать из очереди ключа отметки вне окна. Если очередь опустела,
+    /// ключ удаляется, чтобы [`RateLimiter`] не хранил пустые записи.
+    fn prune(hits: &mut HashMap<Uuid, VecDeque<DateTime<Utc>>>, key: Uuid, cutoff: DateTime<Utc>) {
+        let Some(queue) = hits.get_mut(&key) else {
+            return;
+        };
+        while queue.front().is_some_and(|at| *at <= cutoff) {
+            queue.pop_front();
+        }
+        if queue.is_empty() {
+            hits.remove(&key);
+        }
+    }
+
     /// Учесть запрос токена `key` в момент `now`.
     pub fn check(&self, key: Uuid, now: DateTime<Utc>) -> RateDecision {
         let cutoff = now - Duration::seconds(RATE_WINDOW_SECONDS);
@@ -109,10 +123,8 @@ impl RateLimiter {
             .hits
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::prune(&mut hits, key, cutoff);
         let queue = hits.entry(key).or_default();
-        while queue.front().is_some_and(|at| *at <= cutoff) {
-            queue.pop_front();
-        }
         if queue.len() >= self.limit as usize {
             let wait = queue
                 .front()
@@ -171,10 +183,12 @@ where
 }
 
 fn json_error(rejection: JsonRejection) -> ApiError {
-    if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
-        ApiError::payload_too_large("Request body is too large")
-    } else {
-        ApiError::validation("Invalid request body")
+    match rejection.status() {
+        StatusCode::PAYLOAD_TOO_LARGE => ApiError::payload_too_large("Request body is too large"),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => {
+            ApiError::unsupported_media_type("Content-Type must be application/json")
+        }
+        _ => ApiError::validation("Invalid request body"),
     }
 }
 
@@ -306,7 +320,6 @@ pub async fn capture(
     let capture = state
         .capture
         .as_ref()
-        .filter(|capture| capture.config.enabled)
         .ok_or_else(|| ApiError::not_found("Route not found"))?;
 
     let text = request.text.trim().to_owned();
@@ -332,7 +345,9 @@ pub async fn capture(
 
     let Some(ai) = capture.ai.as_deref() else {
         log_capture(source, "unavailable", capture_id);
-        return Err(unavailable("Automatic capture is not configured"));
+        return Err(ApiError::service_unavailable(
+            "Automatic capture is not configured",
+        ));
     };
 
     // Соединение нужно только для коротких чтений до вызова LLM: сам вызов
@@ -364,7 +379,9 @@ pub async fn capture(
                 "llm capture quota is exhausted"
             );
             log_capture(source, "unavailable", capture_id);
-            return Err(unavailable("Automatic capture quota is exhausted"));
+            return Err(ApiError::service_unavailable(
+                "Automatic capture quota is exhausted",
+            ));
         }
         if !capture.breaker.allow(now) {
             tracing::warn!(
@@ -372,7 +389,9 @@ pub async fn capture(
                 "llm circuit breaker is open"
             );
             log_capture(source, "unavailable", capture_id);
-            return Err(unavailable("Automatic capture is temporarily unavailable"));
+            return Err(ApiError::service_unavailable(
+                "Automatic capture is temporarily unavailable",
+            ));
         }
 
         let context = draft::load_context_for(&mut conn, auth.household_id, None, now).await?;
@@ -381,7 +400,7 @@ pub async fn capture(
 
     let outcome = llm::generate(ai, capture.breaker.as_ref(), &context, &text, now).await;
     let mut conn = connection(&state).await?;
-    let (parsed, latency_ms, finished_at) = match outcome {
+    let (mut parsed, latency_ms, finished_at) = match outcome {
         Ok(generated) => (
             generated.parsed,
             generated.latency_ms,
@@ -389,7 +408,7 @@ pub async fn capture(
         ),
         Err(failed) => {
             let code = failed.failure.code();
-            match failed.failure {
+            match &failed.failure {
                 Failure::Ai(error) => {
                     tracing::warn!(error = error.code(), "llm capture request failed");
                 }
@@ -411,12 +430,25 @@ pub async fn capture(
             };
             record_failure(&mut conn, run, failed.finished_at).await;
 
+            if matches!(
+                failed.failure,
+                Failure::Parse(ParseError::TooManyItems { .. })
+            ) {
+                log_capture(source, "rejected", capture_id);
+                return Ok(rejected_response(
+                    capture_id,
+                    TOO_MANY_ITEMS_SPEECH.to_owned(),
+                    Vec::new(),
+                ));
+            }
+
             log_capture(source, "unavailable", capture_id);
-            return Err(unavailable("Automatic capture is temporarily unavailable"));
+            return Err(ApiError::service_unavailable(
+                "Automatic capture is temporarily unavailable",
+            ));
         }
     };
 
-    let mut parsed: ParsedResponse = parsed;
     apply_target(&mut parsed, target_list.as_ref(), request.hint);
 
     let item_source = draft::item_source(source);
@@ -440,32 +472,22 @@ pub async fn capture(
 
     if validated.items.is_empty() {
         log_capture(source, "rejected", capture_id);
-        return Ok(Json(CaptureResponse {
+        return Ok(rejected_response(
             capture_id,
-            status: Status::Rejected,
-            fallback: false,
-            speech: rejected_speech(&validated.items),
-            items: Vec::new(),
-            draft_id: None,
-            expires_at: None,
-            clarifications: validated.clarifications,
-        }));
+            rejected_speech(&validated.items),
+            validated.clarifications,
+        ));
     }
 
     match request.mode {
         CaptureMode::Auto => {
             if !validated.is_valid() {
                 log_capture(source, "rejected", capture_id);
-                return Ok(Json(CaptureResponse {
+                return Ok(rejected_response(
                     capture_id,
-                    status: Status::Rejected,
-                    fallback: false,
-                    speech: rejected_speech(&validated.items),
-                    items: Vec::new(),
-                    draft_id: None,
-                    expires_at: None,
-                    clarifications: validated.clarifications,
-                }));
+                    rejected_speech(&validated.items),
+                    validated.clarifications,
+                ));
             }
             let draft = draft::create(
                 &mut conn,
@@ -638,6 +660,27 @@ fn draft_speech(items: &[CaptureItem]) -> String {
     }
 }
 
+/// Фраза для случая, когда LLM вернула больше элементов, чем допускает схема.
+const TOO_MANY_ITEMS_SPEECH: &str =
+    "Слишком много элементов. Разделите текст на части и отправьте их по отдельности.";
+
+fn rejected_response(
+    capture_id: Uuid,
+    speech: String,
+    clarifications: Vec<String>,
+) -> Json<CaptureResponse> {
+    Json(CaptureResponse {
+        capture_id,
+        status: Status::Rejected,
+        fallback: false,
+        speech,
+        items: Vec::new(),
+        draft_id: None,
+        expires_at: None,
+        clarifications,
+    })
+}
+
 fn rejected_speech(items: &[DraftItem]) -> String {
     let reason = items
         .iter()
@@ -716,10 +759,6 @@ async fn record_failure(conn: &mut sqlx::PgConnection, run: NewRun, now: DateTim
     }
 }
 
-fn unavailable(message: &'static str) -> ApiError {
-    ApiError::service_unavailable(message)
-}
-
 fn draft_error(error: draft::DraftError) -> ApiError {
     match error {
         draft::DraftError::Domain(error) => error.into(),
@@ -770,6 +809,22 @@ mod tests {
 
         // Через минуту окно освобождается.
         assert!(limiter.check(key, start + Duration::seconds(61)).allowed);
+    }
+
+    #[test]
+    fn a_fully_stale_key_is_removed_from_the_rate_limiter() {
+        let limiter = RateLimiter::new(10);
+        let key = Uuid::now_v7();
+        limiter
+            .hits
+            .lock()
+            .expect("lock")
+            .insert(key, VecDeque::from([at(1_000)]));
+
+        let mut hits = limiter.hits.lock().expect("lock");
+        RateLimiter::prune(&mut hits, key, at(1_061));
+
+        assert!(!hits.contains_key(&key));
     }
 
     #[test]

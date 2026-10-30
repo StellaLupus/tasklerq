@@ -261,7 +261,7 @@ curl -sS -X POST \
 | `CAPTURE_VOICE_TIMEOUT_MS` | нет | `8000` | Таймаут LLM для `source=ha_voice`. |
 | `CAPTURE_VOICE_FALLBACK_RAW` | нет | `true` | Создавать позицию из текста при сбое LLM. |
 | `CAPTURE_RATE_LIMIT_PER_MIN` | нет | `10` | Capture в минуту на токен. |
-| `CAPTURE_MAX_TEXT_CHARS` | нет | `2000` | Максимальная длина текста. |
+| `CAPTURE_MAX_TEXT_CHARS` | нет | `2000` | Максимальная длина текста, не больше 2000. |
 | `HA_BASE_URL` | при LLM | `http://host.docker.internal:8123` | Home Assistant из контейнера Tasklerq. |
 | `HA_TOKEN` | при LLM | `eyJ...` | Long-lived token HA. |
 | `HA_AI_TASK_ENTITY_ID` | при LLM | `ai_task.google_ai_task_2` | AI Task. |

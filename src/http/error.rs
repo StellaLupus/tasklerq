@@ -33,6 +33,8 @@ pub enum ErrorCode {
     ServiceUnavailable,
     /// Тело запроса слишком велико.
     PayloadTooLarge,
+    /// Неподдерживаемый тип тела запроса.
+    UnsupportedMediaType,
     /// Метод не поддерживается маршрутом.
     MethodNotAllowed,
 }
@@ -50,6 +52,7 @@ impl ErrorCode {
             Self::InternalError => "internal_error",
             Self::ServiceUnavailable => "service_unavailable",
             Self::PayloadTooLarge => "payload_too_large",
+            Self::UnsupportedMediaType => "unsupported_media_type",
             Self::MethodNotAllowed => "method_not_allowed",
         }
     }
@@ -154,6 +157,15 @@ impl ApiError {
         )
     }
 
+    /// `415 unsupported_media_type`.
+    pub fn unsupported_media_type(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ErrorCode::UnsupportedMediaType,
+            message,
+        )
+    }
+
     /// `405 method_not_allowed`.
     pub fn method_not_allowed(message: impl Into<String>) -> Self {
         Self::new(
@@ -250,6 +262,10 @@ mod tests {
             "service_unavailable"
         );
         assert_eq!(ErrorCode::PayloadTooLarge.as_str(), "payload_too_large");
+        assert_eq!(
+            ErrorCode::UnsupportedMediaType.as_str(),
+            "unsupported_media_type"
+        );
         assert_eq!(ErrorCode::MethodNotAllowed.as_str(), "method_not_allowed");
     }
 
@@ -264,6 +280,7 @@ mod tests {
         assert_eq!(ApiError::internal("x").status().as_u16(), 500);
         assert_eq!(ApiError::service_unavailable("x").status().as_u16(), 503);
         assert_eq!(ApiError::payload_too_large("x").status().as_u16(), 413);
+        assert_eq!(ApiError::unsupported_media_type("x").status().as_u16(), 415);
         assert_eq!(ApiError::method_not_allowed("x").status().as_u16(), 405);
     }
 }

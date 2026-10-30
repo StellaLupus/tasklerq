@@ -154,16 +154,29 @@ async fn call(
 }
 
 async fn raw(app: &Router, token: &str, payload: &str) -> (StatusCode, Value) {
-    let request = Request::builder()
+    raw_with_content_type(app, token, Some("application/json"), payload).await
+}
+
+async fn raw_with_content_type(
+    app: &Router,
+    token: &str,
+    content_type: Option<&str>,
+    payload: &str,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
         .method(Method::POST)
         .uri("/api/v1/capture")
-        .header("authorization", format!("Bearer {token}"))
-        .header("content-type", "application/json")
-        .body(Body::from(payload.to_owned()))
-        .expect("request");
+        .header("authorization", format!("Bearer {token}"));
+    if let Some(content_type) = content_type {
+        builder = builder.header("content-type", content_type);
+    }
     let response = app
         .clone()
-        .oneshot(request)
+        .oneshot(
+            builder
+                .body(Body::from(payload.to_owned()))
+                .expect("request"),
+        )
         .await
         .expect("router should respond");
     let status = response.status();
@@ -373,6 +386,25 @@ async fn invalid_request_fields_are_rejected_before_the_llm() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_or_wrong_content_type_is_rejected_before_the_llm() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(two_purchases())]);
+    let app = app(&db.pool, ai.clone(), config());
+    let payload = serde_json::to_string(&body("купить молоко", "ha_voice", "auto")).expect("json");
+
+    for content_type in [None, Some("text/plain")] {
+        let (status, json) = raw_with_content_type(&app, &token, content_type, &payload).await;
+
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{json}");
+        assert_error_envelope(&json, "unsupported_media_type");
+    }
+    assert_eq!(ai.calls(), 0);
+    assert_eq!(item_count(&db.pool, household.household_id).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_eleventh_capture_in_a_minute_is_rate_limited_per_token() {
     let db = db().await;
     let household = support::create_household(&db.pool).await;
@@ -527,6 +559,61 @@ async fn auto_rejects_the_whole_capture_when_one_item_is_invalid() {
 
     assert_eq!(item_count(&db.pool, household.household_id).await, 0);
     assert_eq!(draft_count(&db.pool, household.household_id).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn too_many_items_is_a_rejected_input_and_does_not_open_the_breaker() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let items: Vec<Value> = (0..21)
+        .map(|n| json!({"target_kind": "tasks", "title": format!("задача {n}")}))
+        .collect();
+    let ai = StubAi::new(vec![Ok(json!({"items": items}))]);
+    let breaker = Arc::new(CircuitBreaker::default());
+    // Один сбой до порога: если ошибка ввода считалась бы сбоем LLM,
+    // предохранитель разомкнулся бы этим вызовом.
+    for _ in 0..4 {
+        breaker.record_failure(Utc::now());
+    }
+    let app = app_with(&db.pool, Some(ai.clone()), config(), breaker.clone(), 200);
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(body("двадцать одна задача", "ha_voice", "auto")),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["status"], "rejected");
+    assert_eq!(json["fallback"], false);
+    assert_eq!(json["items"], json!([]));
+    assert!(json["capture_id"].is_string());
+    assert!(json["draft_id"].is_null());
+    assert!(json["expires_at"].is_null());
+    let speech = json["speech"].as_str().expect("speech");
+    assert!(speech.chars().count() <= 200, "{speech}");
+    assert!(speech.contains("Слишком много"), "{speech}");
+    assert!(!speech.contains("too_many_items"), "{speech}");
+
+    assert_eq!(item_count(&db.pool, household.household_id).await, 0);
+    assert_eq!(draft_count(&db.pool, household.household_id).await, 0);
+    assert!(
+        breaker.allow(Utc::now()),
+        "an input error must not open the breaker"
+    );
+
+    let (run_status, error_code): (String, Option<String>) =
+        sqlx::query_as("SELECT status::text, error_code FROM llm_runs WHERE household_id = $1")
+            .bind(household.household_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("llm run row");
+    assert_eq!(run_status, "failure");
+    assert_eq!(error_code.as_deref(), Some("too_many_items"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
