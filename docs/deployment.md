@@ -307,8 +307,7 @@ chmod 600 .env
 ```yaml
 services:
   tasklerq:
-    build: .
-    image: tasklerq:0.1.0
+    image: stellalupus/tasklerq:0.1.0
     container_name: tasklerq
     restart: unless-stopped
     env_file: .env
@@ -343,6 +342,28 @@ networks:
     external: true
 ```
 
+Образ берётся из Docker Hub; `build: .` в production-compose не нужен.
+Теги публикует workflow
+[`.github/workflows/docker.yml`](../.github/workflows/docker.yml):
+
+| Триггер | Теги |
+| --- | --- |
+| push в `main` | `main`, `sha-<короткий sha>` |
+| push тега `v*` без пререлизного суффикса (например, `v0.1.0`) | `0.1.0`, `0.1`, `latest` |
+| push тега `v*` с пререлизным суффиксом (например, `v0.2.0-rc1`) | только точная версия: `0.2.0-rc1` |
+| `workflow_dispatch` с любой ветки | `sha-<короткий sha>` |
+| `pull_request` | только сборка, без публикации |
+
+`latest` указывает на последний релиз. Тег `<версия>` появляется после первого
+релиза (`v0.1.0`), до него деплой — по тегу `sha-…` из ручного запуска workflow
+или `main`. Для деплоя ветки до мержа запустите workflow вручную и укажите в
+`image:` тег `sha-…` из лога запуска (см.
+[«Публикация образа»](#публикация-образа)).
+
+Если Docker Hub недоступен, запасной вариант — собрать на месте: добавьте
+`build: .` и задайте `image: tasklerq:<версия>` (локальный тег); вместо
+`docker compose pull` используйте `docker compose build tasklerq`.
+
 Особенности:
 
 - Внутренний порт контейнера — `8080`; host-порт — `18080`, потому что `8080`
@@ -372,6 +393,37 @@ sudo ss -ltnp | grep -E ':18080|:8080'
 
 Ожидаемо: `18080` слушает Tasklerq на `127.0.0.1`, `8080` — Zigbee2MQTT на
 `0.0.0.0`.
+
+### Публикация образа
+
+Workflow `.github/workflows/docker.yml` собирает `linux/amd64` и публикует
+`stellalupus/tasklerq` в Docker Hub. В настройках репозитория должны быть
+секреты:
+
+- `DOCKERHUB_USERNAME` — логин Docker Hub (`stellalupus`);
+- `DOCKERHUB_TOKEN` — access token Docker Hub с правом **Read & Write**
+  (не пароль от аккаунта; создаётся в **Account Settings → Security →
+  New Access Token**).
+
+Выпуск релиза:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+После публикации в Docker Hub появятся теги `0.1.0`, `0.1` и `latest`;
+в `image:` указывайте `stellalupus/tasklerq:0.1.0`, если нужна конкретная
+версия, или `:latest` для последнего релиза.
+
+Сборка ветки до мержа:
+
+```bash
+gh workflow run docker.yml --ref <ветка>
+```
+
+Workflow опубликует только тег `sha-<короткий sha>`; его видно в логе шага
+«Extract metadata» и в списке тегов Docker Hub.
 
 ## 8. Миграции
 
@@ -517,11 +569,13 @@ sudo /usr/local/bin/docker exec -i postgres \
 
 ## 12. Обновления и откат
 
+Обновление — это смена тега образа, а не пересборка на NAS.
+
 ```bash
 # 1. Backup
 /usr/local/bin/tasklerq-backup.sh
 
-# 2. Новый образ
+# 2. Сменить тег в image: (например, 0.1.0 → 0.2.0)
 sudo /usr/local/bin/docker compose pull tasklerq
 sudo /usr/local/bin/docker compose run --rm tasklerq migrate
 sudo /usr/local/bin/docker compose up -d tasklerq
@@ -531,13 +585,19 @@ curl -fsS http://127.0.0.1:18080/health/ready
 sudo /usr/local/bin/docker compose logs --tail=100 tasklerq
 ```
 
-Откат:
+Порядок backup → pull → migrate → up сохраняется: backup делается до
+скачивания, migrate — до запуска новой версии.
+
+Откат — вернуть прежний тег в `image:`:
 
 ```bash
-sudo /usr/local/bin/docker compose down
 # изменить image на предыдущий тег
+sudo /usr/local/bin/docker compose pull tasklerq
 sudo /usr/local/bin/docker compose up -d tasklerq
 ```
+
+Если в `image:` стоит `latest`, зафиксируйте версию конкретным тегом, иначе
+откат неоднозначен.
 
 Схема должна быть совместима с предыдущей версией (expand/contract). Если
 миграция разрушительная — откат только через restore backup.
