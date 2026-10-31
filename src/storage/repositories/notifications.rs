@@ -23,6 +23,19 @@ pub enum NotificationKind {
     Digest,
     /// Назначение исполнителя.
     Assignment,
+    /// Отложенное напоминание; ключ включает время snooze.
+    Snooze,
+}
+
+/// Ключ snooze-доставки: время, на которое пользователь отложил напоминание.
+pub fn snooze_key(deliver_at: DateTime<Utc>) -> String {
+    format!("snooze:{}", deliver_at.timestamp())
+}
+
+/// Время из ключа snooze-доставки.
+pub fn snooze_key_time(key: &str) -> Option<DateTime<Utc>> {
+    let seconds = key.strip_prefix("snooze:")?.parse::<i64>().ok()?;
+    DateTime::from_timestamp(seconds, 0)
 }
 
 /// Новая запись доставки.
@@ -146,4 +159,23 @@ pub async fn notify_assignment(
         scheduled_at: now,
     };
     Ok(insert(conn, &delivery, now).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snooze_key_roundtrips_whole_seconds() {
+        let at = DateTime::<Utc>::from_timestamp(1_800_000_000, 0).expect("timestamp");
+        assert_eq!(snooze_key_time(&snooze_key(at)), Some(at));
+    }
+
+    #[test]
+    fn snooze_key_rejects_foreign_and_malformed_values() {
+        assert_eq!(snooze_key_time("reminder:1800000000"), None);
+        assert_eq!(snooze_key_time("snooze:not-a-number"), None);
+        assert_eq!(snooze_key_time("snooze:"), None);
+        assert_eq!(snooze_key_time(""), None);
+    }
 }

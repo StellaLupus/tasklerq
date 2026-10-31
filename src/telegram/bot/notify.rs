@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::models::{Item, ItemStatus, List};
 use crate::domain::recurrence::resolve_local;
+use crate::storage::repositories::notifications::{self, NewDelivery, NotificationKind};
 use crate::storage::repositories::{items, lists};
 use crate::telegram::callbacks::Scope;
 use crate::telegram::outbox::{self, Outgoing};
@@ -232,7 +233,7 @@ async fn show_current(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> Resu
         }
         None => {
             let ui = Ui::new()
-                .heading("Задача удалена")
+                .heading("Задача больше недоступна")
                 .row(vec![back_button("📋 В меню", Screen::Menu)]);
             edit_notice(ctx, message_id, &ui).await
         }
@@ -271,7 +272,12 @@ pub async fn complete(
         }
         Err(DomainError::Conflict { .. } | DomainError::NotFound) => {
             // Задачу успели изменить: кнопки обновляются, действие не повторяется.
-            ctx.toast("Задача уже изменилась");
+            let toast = match load(ctx, item_id).await? {
+                None => "Задача больше недоступна",
+                Some((item, _)) if item.status == ItemStatus::Done => "Задача уже выполнена",
+                Some(_) => "Задача уже изменилась",
+            };
+            ctx.toast(toast);
             show_current(ctx, message_id, item_id).await
         }
         Err(error) => Err(error.into()),
@@ -291,10 +297,10 @@ pub async fn undo(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> Result<(
 }
 
 /// «Открыть» из уведомления: карточка задачи в экране навигации.
-pub async fn open(ctx: &mut Ctx<'_>, item_id: Uuid) -> Result<(), Fail> {
+pub async fn open(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> Result<(), Fail> {
     if load(ctx, item_id).await?.is_none() {
-        ctx.toast("Задача удалена");
-        return ctx.present(Screen::Menu).await;
+        ctx.toast("Задача больше недоступна");
+        return show_current(ctx, message_id, item_id).await;
     }
     ctx.present(Screen::Item {
         item_id,
@@ -308,18 +314,21 @@ fn snooze_time(
     tz: Tz,
     now: DateTime<Utc>,
 ) -> Result<DateTime<Utc>, DomainError> {
-    match until {
-        SnoozeUntil::OneHour => Ok(now + Duration::hours(1)),
+    let at = match until {
+        SnoozeUntil::OneHour => now + Duration::hours(1),
         SnoozeUntil::TomorrowMorning => {
             let tomorrow = now.with_timezone(&tz).date_naive() + Duration::days(1);
             let morning =
                 NaiveTime::from_hms_opt(MORNING.0, MORNING.1, 0).unwrap_or(NaiveTime::MIN);
-            resolve_local(tz, tomorrow, morning)
+            resolve_local(tz, tomorrow, morning)?
         }
-    }
+    };
+    // Ключ snooze хранит время с точностью до секунды; усечём и `scheduled_at`,
+    // чтобы первому тику не пришлось перезаписывать его из-за долей секунды.
+    Ok(DateTime::<Utc>::from_timestamp(at.timestamp(), 0).unwrap_or(at))
 }
 
-/// «Отложить»: напоминание придёт позже новым сообщением.
+/// «Отложить»: создаёт отдельную доставку, которую отправит планировщик.
 pub async fn snooze(
     ctx: &mut Ctx<'_>,
     message_id: i64,
@@ -327,8 +336,9 @@ pub async fn snooze(
     until: SnoozeUntil,
 ) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
-    let Some((item, list)) = load(ctx, item_id).await? else {
-        ctx.toast("Задача удалена");
+    let user_id = ctx.user()?.id;
+    let Some((item, _)) = load(ctx, item_id).await? else {
+        ctx.toast("Задача больше недоступна");
         return show_current(ctx, message_id, item_id).await;
     };
     if item.status == ItemStatus::Done {
@@ -337,29 +347,18 @@ pub async fn snooze(
     }
 
     let deliver_at = snooze_time(until, ctx.tz, ctx.now)?;
-    // Кнопки нового напоминания живут 24 часа от момента доставки.
-    let ui = reminder_ui(&item, &list, ctx.tz, deliver_at, None);
-    let html = render_notice(&mut *ctx.conn, ctx.sender.id, household_id, &ui, deliver_at).await?;
-    let key = format!(
-        "snooze:{}:{item_id}:{}",
-        ctx.sender.id,
-        deliver_at.timestamp()
-    );
-    if let Some(seq) = outbox::enqueue(
-        &mut *ctx.conn,
-        ctx.chat_id,
-        &Outgoing::Message { html, rich: true },
-        Some(&key),
-        ctx.now,
-    )
-    .await?
-    {
-        sqlx::query("UPDATE outbox SET next_attempt_at = $2 WHERE seq = $1")
-            .bind(seq)
-            .bind(deliver_at)
-            .execute(&mut *ctx.conn)
-            .await?;
-    }
+    // Ключ включает время snooze, поэтому повторное нажатие той же кнопки не
+    // создаёт вторую доставку, а планировщик не путает её с вхождением срока.
+    let occurrence_key = notifications::snooze_key(deliver_at);
+    let delivery = NewDelivery {
+        household_id,
+        user_id,
+        item_id: Some(item_id),
+        kind: NotificationKind::Snooze,
+        occurrence_key: &occurrence_key,
+        scheduled_at: deliver_at,
+    };
+    notifications::insert(&mut *ctx.conn, &delivery, ctx.now).await?;
 
     let local = deliver_at.with_timezone(&ctx.tz);
     ctx.toast("Отложено");
@@ -401,6 +400,17 @@ mod tests {
             snooze_time(SnoozeUntil::TomorrowMorning, tz, late).expect("time"),
             Utc.with_ymd_and_hms(2026, 11, 1, 6, 0, 0).unwrap()
         );
+    }
+
+    #[test]
+    fn snooze_time_is_truncated_to_whole_seconds() {
+        let tz: Tz = "Europe/Moscow".parse().expect("tz");
+        let now =
+            Utc.with_ymd_and_hms(2026, 10, 30, 20, 30, 0).unwrap() + Duration::milliseconds(750);
+
+        let at = snooze_time(SnoozeUntil::OneHour, tz, now).expect("time");
+        assert_eq!(at.timestamp_subsec_nanos(), 0);
+        assert_eq!(at, Utc.with_ymd_and_hms(2026, 10, 30, 21, 30, 0).unwrap());
     }
 
     #[test]

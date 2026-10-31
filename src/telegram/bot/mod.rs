@@ -810,7 +810,7 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
         Action::NoticeComplete { item_id, version } => {
             notify::complete(ctx, message_id, item_id, version).await
         }
-        Action::NoticeOpen { item_id } => notify::open(ctx, item_id).await,
+        Action::NoticeOpen { item_id } => notify::open(ctx, message_id, item_id).await,
         Action::NoticeUndo { item_id } => notify::undo(ctx, message_id, item_id).await,
 
         Action::DraftEdit { draft_id, index } => capture::edit(ctx, draft_id, index).await,

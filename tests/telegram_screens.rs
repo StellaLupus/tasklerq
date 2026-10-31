@@ -815,8 +815,23 @@ async fn notification_actions_are_idempotent() {
     use tasklerq::telegram::bot::notify;
     use tasklerq::telegram::outbox::{self, Outgoing};
 
-    let db = db().await;
+    let db = support::isolated_db().await;
     let mut bot = onboarded_named(&db.pool, "Alice").await;
+    // Планировщик не должен прислать сводку или отложить snooze тихими часами.
+    sqlx::query(
+        "UPDATE users
+         SET settings = jsonb_set(
+             settings,
+             '{notifications}',
+             '{\"digest_enabled\": false, \"quiet_hours_enabled\": false}'::jsonb,
+             true
+         )
+         WHERE telegram_user_id = $1",
+    )
+    .bind(bot.chat)
+    .execute(&db.pool)
+    .await
+    .expect("notification settings");
     let household = household_for(&db.pool, bot.chat).await;
     let actor = Actor::user(household.owner_id, UserRole::Owner);
     let item = create_item(
@@ -866,13 +881,18 @@ async fn notification_actions_are_idempotent() {
     };
     let done = button_of("Готово");
 
-    // Отложить: исходное сообщение обновляется, новое придёт позже.
+    // Отложить: исходное сообщение обновляется, а доставку создаёт планировщик.
     let snooze = button_of("на час");
     bot.press_data(&snooze, notice_id).await;
     bot.assert_latest_contains("Напомню");
     let scheduled: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM outbox WHERE chat_id = $1 AND status = 'pending' AND next_attempt_at > $2",
-    ).bind(bot.chat).bind(bot.now + Duration::minutes(59)).fetch_one(&db.pool).await.expect("count");
+        "SELECT count(*) FROM notification_deliveries
+         WHERE item_id = $1 AND kind = 'snooze' AND status = 'pending'",
+    )
+    .bind(item.id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("snooze deliveries");
     assert_eq!(scheduled, 1);
 
     // «Готово» выполняется один раз; повторное нажатие ничего не делает.
@@ -916,13 +936,17 @@ async fn notification_actions_are_idempotent() {
     bot.assert_latest_contains("⏰");
 
     // Отложенное напоминание приходит после наступления времени.
-    bot.advance(Duration::minutes(61));
+    let deliver_at = bot.now + Duration::minutes(61);
+    scheduler(&db.pool)
+        .tick(deliver_at)
+        .await
+        .expect("snooze tick");
+    bot.advance(deliver_at - bot.now);
     bot.fake.clear_calls();
     bot.deliver().await;
     assert!(bot.fake.calls().iter().any(
         |call| matches!(call, Call::SendRich { html, .. } if html.contains("Оплатить интернет"))
     ));
-    let _ = Utc::now();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -15,10 +15,13 @@
 -- outbox ссылка обнуляется, а запись доставки остаётся для аудита дедупликации.
 --
 -- `kind` уже содержит значения для следующих пунктов (`digest`, `assignment`),
--- чтобы добавлять источники без изменения типа. Статус `sent` означает
--- «передано в outbox»; фактическую доставку и `message_id` ведёт outbox.
+-- чтобы добавлять источники без изменения типа. `snooze` — отдельная доставка
+-- отложенного напоминания: её ключ включает время snooze и не совпадает с
+-- `occurrence_key` срока, поэтому она не отменяется как устаревшее вхождение.
+-- Статус `sent` означает «передано в outbox»; фактическую доставку и
+-- `message_id` ведёт outbox.
 
-CREATE TYPE notification_kind AS ENUM ('reminder', 'digest', 'assignment');
+CREATE TYPE notification_kind AS ENUM ('reminder', 'digest', 'assignment', 'snooze');
 CREATE TYPE notification_status AS ENUM ('pending', 'sent', 'cancelled');
 
 CREATE TABLE notification_deliveries (
