@@ -98,14 +98,15 @@
 - [x] 6.8 Реализовать diagnostics с redaction токена и без контента задач; проверить pytest-тестом.
   - Заметка: реализовано в репозитории `tasklerq-ha`, коммит `556432d`.
 - [ ] 6.9 Проверить установку на HA Container (HACS и вручную), появление сущностей и синхронизацию в обе стороны; зафиксировать результат в чек-листе.
+  - Заметка: проверено через HACS на HA 2026.10.4 2026-10-31, чек-лист — `docs/home-assistant.md` §10.1; ручная установка отдельно не проверялась.
 - [x] 6.10 Реализовать сервисы `tasklerq.capture` (`text`, `source`, `mode`, `hint`, `list_id`, `idempotency_key`), `confirm_capture`, `cancel_capture`, `undo_last_capture` с `SupportsResponse.OPTIONAL`, русскими ошибками и ответом `status`/`speech`/`items`/`draft_id`/`capture_id`; проверить pytest-тестами.
   - Заметка: реализовано в репозитории `tasklerq-ha`, коммит `437777f`.
 - [x] 6.11 Реализовать генерацию `idempotency_key` на вызов сервиса и повторное использование при сетевом retry; проверить тестом отсутствия дубликатов.
   - Заметка: реализовано в репозитории `tasklerq-ha`, коммит `437777f`.
-- [ ] 6.12 Подготовить пример пакета `conversation.intents` + `intent_script` для HA Assist и проверить голосовые сценарии «купи …», «добавь задачу …», «отмени последнее добавление».
-  - Заметка: пример — custom sentences + intent_script (в `conversation: intents:` нет wildcard-слотов); файлы в `tasklerq-ha/examples/assist`.
+- [x] 6.12 Подготовить пример пакета пользовательских предложений Assist (custom sentences) + `intent_script` для HA Assist и проверить голосовые сценарии «купи …», «добавь задачу …», «отмени последнее добавление».
+  - Заметка: пример — custom sentences + intent_script (в `conversation: intents:` нет wildcard-слотов); файлы в `tasklerq-ha/examples/assist`. Голосовые сценарии проверены на HA 2026.10.4 2026-10-31, чек-лист — `docs/home-assistant.md` §10.1.
 - [x] 6.13 Проверить работу компонента при `TELEGRAM_MODE=disabled` и без токена бота; зафиксировать, что `todo`/`calendar` и capture доступны.
-  - Заметка: серверная часть проверена тестом `tests/headless_ha.rs`; компонент — в репозитории `tasklerq-ha`.
+  - Заметка: серверная часть проверена тестом `tests/headless_ha.rs`; компонент — в репозитории `tasklerq-ha`; живая проверка компонента — в 6.9.
 
 ## 7. Уведомления и планировщик
 

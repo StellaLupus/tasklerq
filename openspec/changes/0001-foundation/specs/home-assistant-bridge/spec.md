@@ -188,7 +188,7 @@ AI Task.
 
 #### Scenario: LLM-агент в Assist
 
-- **WHEN** в Assist выбран LLM-агент, который не использует `conversation.intents`
+- **WHEN** в Assist выбран LLM-агент, который не использует пользовательские предложения (custom sentences) Assist
 - **THEN** документация предлагает отдельный pipeline с агентом Home Assistant
   или явное действие агента
 - **AND** разбор Tasklerq продолжает работать без Assist-инструментов
