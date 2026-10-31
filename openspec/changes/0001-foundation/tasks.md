@@ -98,8 +98,10 @@
 - [x] 6.8 Реализовать diagnostics с redaction токена и без контента задач; проверить pytest-тестом.
   - Заметка: реализовано в репозитории `tasklerq-ha`, коммит `556432d`.
 - [ ] 6.9 Проверить установку на HA Container (HACS и вручную), появление сущностей и синхронизацию в обе стороны; зафиксировать результат в чек-листе.
-- [ ] 6.10 Реализовать сервисы `tasklerq.capture` (`text`, `source`, `mode`, `hint`, `list_id`, `idempotency_key`), `confirm_capture`, `cancel_capture`, `undo_last_capture` с `SupportsResponse.OPTIONAL`, русскими ошибками и ответом `status`/`speech`/`items`/`draft_id`/`capture_id`; проверить pytest-тестами.
-- [ ] 6.11 Реализовать генерацию `idempotency_key` на вызов сервиса и повторное использование при сетевом retry; проверить тестом отсутствия дубликатов.
+- [x] 6.10 Реализовать сервисы `tasklerq.capture` (`text`, `source`, `mode`, `hint`, `list_id`, `idempotency_key`), `confirm_capture`, `cancel_capture`, `undo_last_capture` с `SupportsResponse.OPTIONAL`, русскими ошибками и ответом `status`/`speech`/`items`/`draft_id`/`capture_id`; проверить pytest-тестами.
+  - Заметка: реализовано в репозитории `tasklerq-ha`, коммит `437777f`.
+- [x] 6.11 Реализовать генерацию `idempotency_key` на вызов сервиса и повторное использование при сетевом retry; проверить тестом отсутствия дубликатов.
+  - Заметка: реализовано в репозитории `tasklerq-ha`, коммит `437777f`.
 - [ ] 6.12 Подготовить пример пакета `conversation.intents` + `intent_script` для HA Assist и проверить голосовые сценарии «купи …», «добавь задачу …», «отмени последнее добавление».
 - [x] 6.13 Проверить работу компонента при `TELEGRAM_MODE=disabled` и без токена бота; зафиксировать, что `todo`/`calendar` и capture доступны.
   - Заметка: серверная часть проверена тестом `tests/headless_ha.rs`; компонент — в репозитории `tasklerq-ha`.
