@@ -274,7 +274,7 @@ curl -sS -X POST \
 | `RETENTION_LLM_RUNS_DAYS` | нет | `90` | Метаданные LLM. |
 | `RETENTION_EVENTS_DAYS` | нет | `365` | События задач. |
 | `RETENTION_DELETED_DAYS` | нет | `30` | Мягко удалённые данные. |
-| `RETENTION_OUTBOX_DAYS` | нет | `30` | Завершённый outbox: sent, skipped, dead. |
+| `RETENTION_OUTBOX_DAYS` | нет | `30` | Завершённый outbox (`sent`, `skipped`, `dead`) и завершённые записи `notification_deliveries` (`sent`, `cancelled`); `pending` не удаляются. |
 | `RETENTION_AUDIT_DAYS` | нет | `365` | События членства и безопасности, а также использованные, отозванные и истёкшие приглашения. Не меньше 90: столько дней показывает «Журнал». |
 | `RUST_LOG` | нет | `info,tasklerq=debug` | Логи. |
 | `TZ` | нет | `UTC` | Часовой пояс логов. |
@@ -676,6 +676,7 @@ curl -fsS http://127.0.0.1:18080/health/ready
 | `item_events` | 365 дней | `RETENTION_EVENTS_DAYS` |
 | soft-deleted items | 30 дней | `RETENTION_DELETED_DAYS` |
 | outbox: отправленные, пропущенные и `dead` (текст затирается при отправке, пропуске и переводе в `dead`) | 30 дней | `RETENTION_OUTBOX_DAYS` |
+| `notification_deliveries` завершённые: `sent` и `cancelled`; `pending`, в том числе отложенные тихими часами, не удаляются никогда | 30 дней | `RETENTION_OUTBOX_DAYS` |
 | `audit_events`, использованные и истёкшие `invites` | 365 дней (не меньше 90) | `RETENTION_AUDIT_DAYS` |
 
 Текст обновлений и сообщений затирается (`payload = {"redacted": true}`)
@@ -684,8 +685,12 @@ curl -fsS http://127.0.0.1:18080/health/ready
 и число попыток. Пользователь повторяет действие в боте сам.
 
 Исходный текст LLM-черновика (`raw_text`) хранится **30 дней** (подтверждено).
-Фоновое задание запускается ежедневно. Перед изменением сроков проверьте
-требования к аудиту и backup.
+Задание retention запускает сам сервер при старте (первый прогон — примерно
+через минуту) и затем раз в сутки, независимо от режима Telegram. Прогон идёт
+под advisory-блокировкой PostgreSQL: если её держит другой экземпляр, прогон
+пропускается без ошибки. Ошибка или паника одного прогона логируется и не
+останавливает цикл. Перед изменением сроков проверьте требования к аудиту и
+backup.
 
 ## 15. Security checklist
 

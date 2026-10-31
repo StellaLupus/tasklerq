@@ -295,7 +295,8 @@ occurrence_key, kind)`. `kind` — `reminder`, `digest`, `assignment` или
 `(user_id, household_id)` и `(item_id, household_id)` не дают записать
 получателя или элемент из чужого household. `outbox_seq` ссылается на
 поставленное сообщение; после retention outbox ссылка обнуляется, а запись
-доставки остаётся для аудита дедупликации.
+доставки остаётся для аудита дедупликации. Завершённые доставки (`sent`,
+`cancelled`) хранятся 30 дней (`RETENTION_OUTBOX_DAYS`); `pending` не удаляются.
 
 ### 3.13 `audit_events`
 

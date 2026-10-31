@@ -14,20 +14,22 @@ use crate::capture::breaker::CircuitBreaker;
 use crate::config::Config;
 use crate::http::api::capture::CaptureState;
 use crate::http::router::{AppState, build_router};
+use crate::jobs::retention::RetentionWorker;
 use crate::telegram::runtime::{self, StartError};
 
 /// Собранное приложение и его фоновые задачи.
 pub struct Application {
     /// Готовый HTTP-роутер.
     pub router: Router,
-    /// Фоновые задачи Telegram; в режиме `disabled` список пуст.
+    /// Фоновые задачи: Telegram (в режиме `disabled` их нет) и retention.
     pub workers: Vec<JoinHandle<()>>,
 }
 
 /// Собрать состояние и роутер так же, как это делает `serve()`.
 ///
 /// В режиме `TELEGRAM_MODE=disabled` без токена [`runtime::start`] ничего не
-/// запускает: ingress и воркеры отсутствуют, а HTTP API и capture работают.
+/// запускает: ingress и воркеры Telegram отсутствуют, а HTTP API и capture
+/// работают. Retention запускается всегда и попадает в [`Application::workers`].
 pub async fn build_application(
     config: &Config,
     pool: PgPool,
@@ -35,9 +37,10 @@ pub async fn build_application(
 ) -> Result<Application, StartError> {
     let ai = runtime::build_ai(&config.llm);
     let breaker = Arc::new(CircuitBreaker::default());
-    let telegram = runtime::start(config, &pool, shutdown, ai.clone(), breaker.clone()).await?;
+    let telegram =
+        runtime::start(config, &pool, shutdown.clone(), ai.clone(), breaker.clone()).await?;
 
-    let mut state = AppState::new(pool);
+    let mut state = AppState::new(pool.clone());
     let mut workers = Vec::new();
     if let Some(runtime) = telegram {
         if let Some(ingress) = runtime.ingress {
@@ -54,6 +57,11 @@ pub async fn build_application(
             config.llm.daily_quota,
         ));
     }
+
+    // Retention не зависит от Telegram: чистит базу и без токена бота.
+    workers.push(tokio::spawn(
+        RetentionWorker::new(pool, config.retention).run(shutdown),
+    ));
 
     Ok(Application {
         router: build_router(state),

@@ -80,9 +80,10 @@ async fn headless_disabled_telegram_serves_the_home_assistant_scenario() {
     let application = build_application(&config, db.pool.clone(), shutdown_rx)
         .await
         .expect("application should build in disabled mode");
-    assert!(
-        application.workers.is_empty(),
-        "disabled Telegram must not start workers"
+    assert_eq!(
+        application.workers.len(),
+        1,
+        "disabled Telegram starts only the retention worker"
     );
     let app = application.router;
 
