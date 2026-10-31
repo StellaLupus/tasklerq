@@ -85,7 +85,8 @@
   - Заметка: реализовано в репозитории `tasklerq-ha`, коммит `cece4dc`.
 - [x] 6.2 Реализовать config flow (URL + token), проверку токена и household через `GET /api/v1/household`, unique_id household, reauth и options; проверить pytest-тестами.
   - Заметка: реализовано в репозитории `tasklerq-ha`, коммит `bfd54f3`.
-- [ ] 6.3 Реализовать API-клиент и координатор со snapshot `since`, полной синхронизацией и backoff; проверить тестами курсор, восстановление и daily resync.
+- [x] 6.3 Реализовать API-клиент и координатор со snapshot `since`, полной синхронизацией и backoff; проверить тестами курсор, восстановление и daily resync.
+  - Заметка: реализовано в репозитории `tasklerq-ha`, коммит `f19dc97`.
 - [ ] 6.4 Реализовать `TodoListEntity` на каждый список: create/update/delete/complete, due date/datetime, description и стабильный unique_id; проверить pytest-тестами.
 - [ ] 6.5 Реализовать атрибут `tasklerq_items` с priority/tags/assignee/recurrence; проверить, что нативные обновления не теряют поля.
 - [ ] 6.6 Реализовать `CalendarEntity`: all-day/timed события, повторения на горизонте, read-only; проверить pytest-тестами.
