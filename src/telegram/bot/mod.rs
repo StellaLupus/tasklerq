@@ -813,6 +813,27 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
         Action::NoticeOpen { item_id } => notify::open(ctx, message_id, item_id).await,
         Action::NoticeUndo { item_id } => notify::undo(ctx, message_id, item_id).await,
 
+        Action::BatchPage { batch_id, page } => {
+            notify::batch_page(ctx, message_id, batch_id, page).await
+        }
+        Action::BatchComplete {
+            batch_id,
+            item_id,
+            version,
+        } => notify::batch_complete(ctx, message_id, batch_id, item_id, version).await,
+        Action::BatchSnooze { batch_id, item_id } => {
+            notify::batch_snooze(ctx, message_id, batch_id, item_id).await
+        }
+        Action::BatchOpen { batch_id, item_id } => {
+            notify::batch_open(ctx, message_id, batch_id, item_id).await
+        }
+        Action::BatchCompleteAll { batch_id } => {
+            notify::batch_complete_all(ctx, message_id, batch_id).await
+        }
+        Action::BatchSnoozeAll { batch_id } => {
+            notify::batch_snooze_all(ctx, message_id, batch_id).await
+        }
+
         Action::DraftEdit { draft_id, index } => capture::edit(ctx, draft_id, index).await,
         Action::DraftAssign {
             draft_id,

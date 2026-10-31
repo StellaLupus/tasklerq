@@ -45,6 +45,9 @@ use crate::storage::repositories::notifications::{
 use crate::storage::repositories::{items, lists};
 use crate::telegram::bot::notify;
 use crate::telegram::outbox::{self, Outgoing};
+use crate::telegram::ru;
+
+use super::notice::{NOTICE_ROW_COLUMNS, NOTICE_ROW_FROM, NoticeRow};
 
 /// Интервал планировщика.
 pub const TICK_INTERVAL: StdDuration = StdDuration::from_secs(30);
@@ -104,7 +107,11 @@ impl Scheduler {
         digest::reschedule(&self.pool, now).await?;
         assignment::reschedule(&self.pool, now).await?;
 
-        let delivered = deliver_due(&self.pool, now).await?
+        // Сначала собираем отложенные тихими часами уведомления в одно
+        // сообщение; одиночные и неотложенные записи затем уходят обычным
+        // путём. Сводка в батч не входит и доставляется отдельно.
+        let delivered = deliver_batches(&self.pool, now).await?
+            + deliver_due(&self.pool, now).await?
             + digest::deliver_due(&self.pool, now).await?
             + assignment::deliver_due(&self.pool, now).await?;
 
@@ -294,24 +301,26 @@ pub(crate) async fn postpone_for_quiet(
 ///
 /// Время берётся из срока и настроек, а не из старой `scheduled_at`: смена
 /// lead time, времени вседневного напоминания или пояса сдвигает ещё не
-/// доставленную запись. Запись, уже отложенная тихими часами, тоже
-/// пересчитывается — если тихие часы выключили, она уйдёт на следующем тике.
+/// доставленную запись. Уже отложенная тихими часами запись не
+/// пересчитывается: её время зафиксировано до выпуска.
 async fn reschedule_reminders(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error> {
     let sql = format!(
-        "SELECT {REMINDER_ROW_COLUMNS}
-         FROM notification_deliveries d
-         LEFT JOIN items i ON i.id = d.item_id
-         LEFT JOIN lists l ON l.id = i.list_id
-         LEFT JOIN users u ON u.id = d.user_id
-         LEFT JOIN households h ON h.id = d.household_id
+        "SELECT {NOTICE_ROW_COLUMNS}
+         {NOTICE_ROW_FROM}
          WHERE d.status = 'pending' AND d.kind IN ('reminder', 'snooze')"
     );
-    let rows: Vec<ReminderRow> = sqlx::query_as(&sql).fetch_all(pool).await?;
+    let rows: Vec<NoticeRow> = sqlx::query_as(&sql).fetch_all(pool).await?;
 
     let mut conn = pool.acquire().await?;
     let mut rescheduled = 0;
     for row in rows {
-        let settings = NotificationSettings::from_settings(&row.recipient_settings);
+        // Момент выпуска отложенного тихими часами уведомления фиксируется при
+        // переносе. Последующие тики не пересчитывают его: выключение или
+        // смена границ тихих часов не ускоряет уже отложенную доставку.
+        if row.deferred {
+            continue;
+        }
+        let settings = row.settings();
         let timezone = row.timezone();
         let intended = if row.is_snooze() {
             // Время snooze зафиксировано в ключе: повторный расчёт не должен
@@ -326,7 +335,7 @@ async fn reschedule_reminders(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, 
             {
                 continue;
             }
-            match (row.due_at, row.due_date) {
+            match (row.item_due_at, row.item_due_date) {
                 (Some(due_at), None) => {
                     due_at - Duration::minutes(i64::from(settings.lead_minutes))
                 }
@@ -507,174 +516,14 @@ async fn insert_reminder(
     notifications::insert(conn, &delivery, now).await
 }
 
-#[derive(FromRow)]
-struct ReminderRow {
-    id: Uuid,
-    household_id: Uuid,
-    user_id: Uuid,
-    occurrence_key: String,
-    kind: String,
-    deferred: bool,
-    title: Option<String>,
-    item_id: Option<Uuid>,
-    item_status: Option<String>,
-    item_deleted_at: Option<DateTime<Utc>>,
-    due_at: Option<DateTime<Utc>>,
-    due_date: Option<NaiveDate>,
-    assignee_user_id: Option<Uuid>,
-    created_by_user_id: Option<Uuid>,
-    list_id: Option<Uuid>,
-    list_kind: Option<String>,
-    list_deleted_at: Option<DateTime<Utc>>,
-    list_archived: Option<bool>,
-    recipient_id: Option<Uuid>,
-    recipient_deleted_at: Option<DateTime<Utc>>,
-    recipient_household_id: Option<Uuid>,
-    recipient_timezone: Option<String>,
-    recipient_settings: serde_json::Value,
-    telegram_user_id: Option<i64>,
-    telegram_chat_id: Option<i64>,
-    household_found: Option<Uuid>,
-    household_deleted_at: Option<DateTime<Utc>>,
-    household_timezone: Option<String>,
-}
-
-impl ReminderRow {
-    /// Пояс получателя, иначе household, иначе UTC.
-    fn timezone(&self) -> Tz {
-        resolved_timezone(
-            self.recipient_timezone.as_deref(),
-            self.household_timezone.as_deref(),
-        )
-    }
-
-    /// Ключ текущего вхождения элемента.
-    fn current_key(&self) -> Option<String> {
-        match (self.due_at, self.due_date) {
-            (Some(due_at), None) => Some(occurrence_key(due_at)),
-            (None, Some(due_date)) => Some(all_day_occurrence_key(due_date)),
-            _ => None,
-        }
-    }
-
-    /// Отложенное напоминание, а не напоминание о текущем вхождении срока.
-    fn is_snooze(&self) -> bool {
-        self.kind == "snooze"
-    }
-
-    /// Элемент существует, открыт и лежит в неархивном списке задач.
-    ///
-    /// Срок не требуется: snooze остаётся актуальным, даже если у задачи
-    /// поменяли срок после нажатия.
-    fn item_alive(&self) -> bool {
-        self.item_id.is_some()
-            && self.item_deleted_at.is_none()
-            && self.item_status.as_deref() == Some("open")
-            && self.title.is_some()
-            && self.list_id.is_some()
-            && self.list_kind.as_deref() == Some("tasks")
-            && self.list_deleted_at.is_none()
-            && self.list_archived != Some(true)
-    }
-
-    /// У напоминания о сроке есть ровно один вид срока.
-    fn item_valid(&self) -> bool {
-        self.item_alive() && (self.due_at.is_some() ^ self.due_date.is_some())
-    }
-
-    /// Получатель существует и всё ещё в том же household.
-    fn recipient_alive(&self) -> bool {
-        self.recipient_id.is_some()
-            && self.recipient_deleted_at.is_none()
-            && self.recipient_household_id == Some(self.household_id)
-    }
-
-    /// Получатель напоминания всё ещё выбран по правилу
-    /// исполнитель → автор → участники.
-    fn recipient_valid(&self) -> bool {
-        if !self.recipient_alive() {
-            return false;
-        }
-
-        match self.assignee_user_id.or(self.created_by_user_id) {
-            Some(selected) => selected == self.user_id,
-            // Оба поля пусты — получателем может быть любой активный участник.
-            None => true,
-        }
-    }
-
-    /// Напоминания включены у получателя.
-    fn reminders_enabled(&self) -> bool {
-        NotificationSettings::from_settings(&self.recipient_settings).reminders_enabled
-    }
-
-    /// Household существует.
-    fn household_valid(&self) -> bool {
-        self.household_found.is_some() && self.household_deleted_at.is_none()
-    }
-
-    /// Вседневное напоминание живёт до конца локального дня срока.
-    ///
-    /// Перенесённое тихими часами через полночь напоминание не отменяется:
-    /// оно уходит утром следующего дня, хотя локальная дата уже сменилась.
-    fn in_window(&self, now: DateTime<Utc>) -> bool {
-        match self.due_date {
-            Some(due_date) => {
-                let today = now.with_timezone(&self.timezone()).date_naive();
-                due_date == today || (self.deferred && due_date + Duration::days(1) == today)
-            }
-            None => true,
-        }
-    }
-
-    /// Запись больше не должна быть доставлена.
-    ///
-    /// Snooze не сверяется с текущим `occurrence_key`: его ключ — время
-    /// отложенной доставки. Он отменяется только вместе с задачей, списком,
-    /// household, получателем или выключенными напоминаниями: выключение
-    /// настройки отменяет и отложенное пользователем напоминание.
-    fn is_stale(&self, now: DateTime<Utc>) -> bool {
-        if !self.item_alive() || !self.recipient_alive() || !self.household_valid() {
-            return true;
-        }
-        if !self.reminders_enabled() {
-            return true;
-        }
-        if self.is_snooze() {
-            return false;
-        }
-        !self.item_valid()
-            || !self.recipient_valid()
-            || self.current_key().as_deref() != Some(self.occurrence_key.as_str())
-            || !self.in_window(now)
-    }
-}
-
-pub(crate) const REMINDER_ROW_COLUMNS: &str = "d.id, d.household_id, d.user_id, d.occurrence_key,
-        d.kind::text AS kind, d.deferred,
-        i.title, i.id AS item_id, i.status::text AS item_status,
-        i.deleted_at AS item_deleted_at, i.due_at, i.due_date,
-        i.assignee_user_id, i.created_by_user_id,
-        l.id AS list_id, l.kind::text AS list_kind, l.deleted_at AS list_deleted_at,
-        l.is_archived AS list_archived,
-        u.id AS recipient_id, u.deleted_at AS recipient_deleted_at,
-        u.household_id AS recipient_household_id, u.timezone AS recipient_timezone,
-        u.settings AS recipient_settings, u.telegram_user_id, u.telegram_chat_id,
-        h.id AS household_found, h.deleted_at AS household_deleted_at,
-        h.timezone AS household_timezone";
-
 /// Отменить `pending`-доставки, вхождение которых больше не актуально.
 async fn cancel_stale(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error> {
     let sql = format!(
-        "SELECT {REMINDER_ROW_COLUMNS}
-         FROM notification_deliveries d
-         LEFT JOIN items i ON i.id = d.item_id
-         LEFT JOIN lists l ON l.id = i.list_id
-         LEFT JOIN users u ON u.id = d.user_id
-         LEFT JOIN households h ON h.id = d.household_id
+        "SELECT {NOTICE_ROW_COLUMNS}
+         {NOTICE_ROW_FROM}
          WHERE d.status = 'pending' AND d.kind IN ('reminder', 'snooze')"
     );
-    let rows: Vec<ReminderRow> = sqlx::query_as(&sql).fetch_all(pool).await?;
+    let rows: Vec<NoticeRow> = sqlx::query_as(&sql).fetch_all(pool).await?;
 
     let mut cancelled = 0;
     for row in rows {
@@ -766,10 +615,261 @@ pub(crate) async fn cancel_delivery(
     mark_cancelled(&mut conn, id, now).await
 }
 
+/// Отложенная тихими часами доставка и её блок сводного сообщения.
+struct BatchCandidate {
+    delivery_id: Uuid,
+    scheduled_at: DateTime<Utc>,
+    entry: notify::BatchEntry,
+}
+
+/// Получатель и чат сводного сообщения.
+struct BatchIdentity {
+    household_id: Uuid,
+    chat_id: i64,
+    telegram_user_id: i64,
+    timezone: Tz,
+}
+
+/// Собрать одно сводное сообщение на получателя из отложенных доставок.
+///
+/// Сборка и смена статусов выполняются в одной транзакции, а строки
+/// блокируются `FOR UPDATE SKIP LOCKED`, поэтому два экземпляра планировщика не
+/// отправят батч дважды. Если после проверки актуальности осталась одна
+/// доставка, она не отправляется здесь: её доставит обычный путь.
+async fn deliver_batches(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error> {
+    let users: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT user_id
+         FROM notification_deliveries
+         WHERE status = 'pending' AND deferred AND scheduled_at <= $1
+           AND kind IN ('reminder', 'snooze', 'assignment')
+         ORDER BY user_id
+         LIMIT $2",
+    )
+    .bind(now)
+    .bind(DELIVERY_BATCH)
+    .fetch_all(pool)
+    .await?;
+
+    let mut delivered = 0;
+    for user_id in users {
+        match deliver_batch_for_user(pool, user_id, now).await {
+            Ok(rows) => delivered += rows,
+            Err(error) => tracing::error!(
+                %user_id,
+                %error,
+                "failed to deliver notification batch"
+            ),
+        }
+    }
+    Ok(delivered)
+}
+
+/// SQL отложенных доставок получателя для сборки сводного сообщения.
+fn batch_row_sql() -> String {
+    format!(
+        "SELECT {NOTICE_ROW_COLUMNS}
+         {NOTICE_ROW_FROM}
+         WHERE d.user_id = $1 AND d.status = 'pending' AND d.deferred
+           AND d.scheduled_at <= $2
+           AND d.kind IN ('reminder', 'snooze', 'assignment')
+         ORDER BY d.scheduled_at, d.id
+         FOR UPDATE OF d SKIP LOCKED"
+    )
+}
+
+/// Взять транзакционную блокировку получателя.
+///
+/// Все пути доставки берут её до блокировки строк: тогда два экземпляра
+/// планировщика не соберут сводное сообщение из части отложенных строк
+/// (`SKIP LOCKED` пропустил бы строки, которые в этот момент доставляет
+/// одиночный путь). Ключ — первые восемь байт `user_id`; коллизии двух UUID
+/// практически невозможны. Блокировка не ждёт: занятого получателя тик
+/// пропускает.
+pub(crate) async fn try_recipient_lock(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let key = i64::from_be_bytes(
+        user_id.as_bytes()[..8]
+            .try_into()
+            .expect("uuid has at least eight bytes"),
+    );
+    sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(key)
+        .fetch_one(conn)
+        .await
+}
+
+async fn deliver_batch_for_user(
+    pool: &PgPool,
+    user_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    if !try_recipient_lock(&mut tx, user_id).await? {
+        return Ok(0);
+    }
+    let rows: Vec<NoticeRow> = sqlx::query_as(&batch_row_sql())
+        .bind(user_id)
+        .bind(now)
+        .fetch_all(&mut *tx)
+        .await?;
+
+    let mut identity: Option<BatchIdentity> = None;
+    let mut candidates = Vec::new();
+    for row in rows {
+        if row.is_stale(now) {
+            mark_cancelled(&mut tx, row.id, now).await?;
+            continue;
+        }
+        // Границы могли сдвинуть после переноса: в момент выпуска тихие часы
+        // проверяются ещё раз и доставка снова фиксируется на их конце.
+        if let Some(settings) = row.recipient_settings.as_ref()
+            && postpone_for_quiet(&mut tx, row.id, settings, row.timezone(), now).await?
+        {
+            continue;
+        }
+        let (Some(item_id), Some(chat_id), Some(telegram_user_id)) =
+            (row.item_id, row.telegram_chat_id, row.telegram_user_id)
+        else {
+            mark_cancelled(&mut tx, row.id, now).await?;
+            continue;
+        };
+        let item = match items::get(&mut tx, row.household_id, item_id).await {
+            Ok(item) => item,
+            Err(DomainError::Database(error)) => return Err(error),
+            Err(_) => {
+                mark_cancelled(&mut tx, row.id, now).await?;
+                continue;
+            }
+        };
+        let list = match lists::get(&mut tx, row.household_id, item.list_id).await {
+            Ok(list) => list,
+            Err(DomainError::Database(error)) => return Err(error),
+            Err(_) => {
+                mark_cancelled(&mut tx, row.id, now).await?;
+                continue;
+            }
+        };
+        let Some(kind) = notify::BatchKind::from_kind(row.kind) else {
+            mark_cancelled(&mut tx, row.id, now).await?;
+            continue;
+        };
+        if identity.is_none() {
+            identity = Some(BatchIdentity {
+                household_id: row.household_id,
+                chat_id,
+                telegram_user_id,
+                timezone: row.timezone(),
+            });
+        }
+        candidates.push(BatchCandidate {
+            delivery_id: row.id,
+            scheduled_at: row.scheduled_at,
+            entry: notify::BatchEntry {
+                item_id,
+                kind,
+                title: item.title.clone(),
+                when: batch_when(&item, &list, row.timezone(), now),
+                version: item.version,
+                state: notify::BatchEntryState::Open,
+            },
+        });
+    }
+
+    if candidates.len() < 2 {
+        tx.commit().await?;
+        return Ok(0);
+    }
+    let Some(identity) = identity else {
+        tx.commit().await?;
+        return Ok(0);
+    };
+    candidates.sort_by_key(|candidate| (candidate.scheduled_at, candidate.delivery_id));
+    let entries: Vec<notify::BatchEntry> = candidates
+        .iter()
+        .map(|candidate| candidate.entry.clone())
+        .collect();
+
+    let batch_id = Uuid::now_v7();
+    notifications::create_batch(
+        &mut tx,
+        batch_id,
+        identity.household_id,
+        user_id,
+        identity.chat_id,
+        now,
+    )
+    .await?;
+    let page = &entries[..entries.len().min(notify::BATCH_PAGE_SIZE)];
+    let ui = notify::batch_ui(batch_id, 0, page, entries.len(), None, identity.timezone);
+    let html = notify::render_notice(
+        &mut tx,
+        identity.telegram_user_id,
+        identity.household_id,
+        &ui,
+        now,
+    )
+    .await?;
+    let dedupe_key = format!("notification:batch:{batch_id}");
+    let seq = enqueue_message(&mut tx, identity.chat_id, &dedupe_key, html, true, now).await?;
+    for candidate in candidates {
+        mark_batch_sent(
+            &mut tx,
+            candidate.delivery_id,
+            seq,
+            batch_id,
+            candidate.entry.version,
+            now,
+        )
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(1)
+}
+
+fn batch_when(
+    item: &crate::domain::models::Item,
+    list: &crate::domain::models::List,
+    timezone: Tz,
+    now: DateTime<Utc>,
+) -> String {
+    match ru::due_label(item.due_at, item.due_date, timezone, now) {
+        Some(due) => format!("{} · {}", ru::capitalize(&due), list.name),
+        None => list.name.clone(),
+    }
+}
+
+/// Пометить доставку переданной в outbox вместе со сводным сообщением.
+async fn mark_batch_sent(
+    conn: &mut PgConnection,
+    id: Uuid,
+    seq: i64,
+    batch_id: Uuid,
+    version: i32,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE notification_deliveries
+         SET status = 'sent', outbox_seq = $2, batch_id = $3, batch_version = $4,
+             batch_state = NULL, batch_snoozed_until = NULL, updated_at = $5
+         WHERE id = $1 AND status = 'pending'",
+    )
+    .bind(id)
+    .bind(seq)
+    .bind(batch_id)
+    .bind(version)
+    .bind(now)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 /// Передать готовые напоминания в outbox.
 async fn deliver_due(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error> {
-    let ids: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM notification_deliveries
+    let ids: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT id, user_id FROM notification_deliveries
          WHERE status = 'pending' AND kind IN ('reminder', 'snooze')
            AND scheduled_at <= $1
          ORDER BY scheduled_at, id
@@ -781,8 +881,8 @@ async fn deliver_due(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Err
     .await?;
 
     let mut delivered = 0;
-    for id in ids {
-        match deliver_one(pool, id, now).await {
+    for (id, user_id) in ids {
+        match deliver_one(pool, id, user_id, now).await {
             Ok(rows) => delivered += rows,
             Err(error) => tracing::error!(
                 delivery_id = %id,
@@ -801,21 +901,27 @@ async fn deliver_due(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Err
 /// идентификатора доставки, поэтому даже повторная постановка не создаст второе
 /// сообщение. Недоступный получатель или устаревшее вхождение переводят запись
 /// в `cancelled`, а не оставляют её навсегда в `pending`.
-async fn deliver_one(pool: &PgPool, id: Uuid, now: DateTime<Utc>) -> Result<u64, sqlx::Error> {
+async fn deliver_one(
+    pool: &PgPool,
+    id: Uuid,
+    user_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
     let mut tx = pool.begin().await?;
+    // Тот же получатель не должен одновременно собираться в сводное другим
+    // экземпляром планировщика.
+    if !try_recipient_lock(&mut tx, user_id).await? {
+        return Ok(0);
+    }
     let sql = format!(
-        "SELECT {REMINDER_ROW_COLUMNS}
-         FROM notification_deliveries d
-         LEFT JOIN items i ON i.id = d.item_id
-         LEFT JOIN lists l ON l.id = i.list_id
-         LEFT JOIN users u ON u.id = d.user_id
-         LEFT JOIN households h ON h.id = d.household_id
+        "SELECT {NOTICE_ROW_COLUMNS}
+         {NOTICE_ROW_FROM}
          WHERE d.id = $1 AND d.status = 'pending'
            AND d.kind IN ('reminder', 'snooze')
            AND d.scheduled_at <= $2
          FOR UPDATE OF d SKIP LOCKED"
     );
-    let row: Option<ReminderRow> = sqlx::query_as(&sql)
+    let row: Option<NoticeRow> = sqlx::query_as(&sql)
         .bind(id)
         .bind(now)
         .fetch_optional(&mut *tx)
@@ -833,7 +939,9 @@ async fn deliver_one(pool: &PgPool, id: Uuid, now: DateTime<Utc>) -> Result<u64,
     let timezone = row.timezone();
     // Проверка под блокировкой закрывает гонку с другим экземпляром
     // планировщика: даже «сброшенная» запись не уйдёт внутри тихих часов.
-    if postpone_for_quiet(&mut tx, row.id, &row.recipient_settings, timezone, now).await? {
+    if let Some(settings) = row.recipient_settings.as_ref()
+        && postpone_for_quiet(&mut tx, row.id, settings, timezone, now).await?
+    {
         tx.commit().await?;
         return Ok(0);
     }
@@ -869,17 +977,17 @@ async fn deliver_one(pool: &PgPool, id: Uuid, now: DateTime<Utc>) -> Result<u64,
     // Snooze и вседневное напоминание показывают «Пора». Для timed-задачи
     // заголовок считает фактическое время до срока: тихие часы или поздний тик
     // уже могли сдвинуть доставку ближе к сроку.
-    let lead_minutes = if row.is_snooze() || row.due_date.is_some() {
+    let lead_minutes = if row.is_snooze() || row.item_due_date.is_some() {
         None
     } else {
-        row.due_at.and_then(|due| {
+        row.item_due_at.and_then(|due| {
             let seconds = (due - now).num_seconds();
             (seconds > 0).then_some((seconds + 59) / 60)
         })
     };
     let ui = notify::reminder_ui(&item, &list, timezone, now, lead_minutes);
     let html = notify::render_notice(&mut tx, telegram_user_id, row.household_id, &ui, now).await?;
-    let dedupe_key = delivery_dedupe_key(row.id, &row.kind);
+    let dedupe_key = delivery_dedupe_key(row.id, row.kind);
 
     let seq = enqueue_message(&mut tx, chat_id, &dedupe_key, html, true, now).await?;
     mark_sent(&mut tx, row.id, seq, now).await?;
@@ -888,6 +996,6 @@ async fn deliver_one(pool: &PgPool, id: Uuid, now: DateTime<Utc>) -> Result<u64,
     Ok(1)
 }
 
-fn delivery_dedupe_key(id: Uuid, kind: &str) -> String {
-    format!("notification:{kind}:{id}")
+fn delivery_dedupe_key(id: Uuid, kind: NotificationKind) -> String {
+    format!("notification:{}:{id}", kind.as_str())
 }

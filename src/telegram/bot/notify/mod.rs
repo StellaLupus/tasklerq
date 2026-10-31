@@ -24,6 +24,13 @@ use super::model::{Action, Screen, SnoozeUntil, Ui};
 use super::screens::{back_button, clip};
 use super::{Ctx, Fail, issue_and_render};
 
+mod batch;
+
+pub use batch::{
+    BATCH_PAGE_SIZE, BatchEntry, BatchEntryState, BatchKind, batch_complete, batch_complete_all,
+    batch_open, batch_page, batch_snooze, batch_snooze_all, batch_ui,
+};
+
 /// Час, на который переносится напоминание «до завтра».
 const MORNING: (u32, u32) = (9, 0);
 
@@ -206,7 +213,7 @@ async fn load(ctx: &mut Ctx<'_>, item_id: Uuid) -> Result<Option<(Item, List)>, 
 }
 
 /// Заменить содержимое сообщения-уведомления.
-async fn edit_notice(ctx: &mut Ctx<'_>, message_id: i64, ui: &Ui) -> Result<(), Fail> {
+pub(super) async fn edit_notice(ctx: &mut Ctx<'_>, message_id: i64, ui: &Ui) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
     let html = render_notice(&mut *ctx.conn, ctx.sender.id, household_id, ui, ctx.now).await?;
     outbox::enqueue(
@@ -297,7 +304,7 @@ pub async fn undo(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> Result<(
 }
 
 /// «Открыть» из уведомления: карточка задачи в экране навигации.
-pub async fn open(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> Result<(), Fail> {
+pub(super) async fn open(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> Result<(), Fail> {
     if load(ctx, item_id).await?.is_none() {
         ctx.toast("Задача больше недоступна");
         return show_current(ctx, message_id, item_id).await;
@@ -309,7 +316,7 @@ pub async fn open(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> Result<(
     .await
 }
 
-fn snooze_time(
+pub(super) fn snooze_time(
     until: SnoozeUntil,
     tz: Tz,
     now: DateTime<Utc>,

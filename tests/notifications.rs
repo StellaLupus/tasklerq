@@ -3166,7 +3166,7 @@ async fn quiet_hours_use_the_recipient_timezone_not_the_household() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn disabled_quiet_hours_deliver_on_time_and_release_deferred_on_the_next_tick() {
+async fn disabled_quiet_hours_do_not_release_a_deferred_reminder_early() {
     let db = support::isolated_db().await;
     let household = household_without_digest(&db).await;
     let moscow = chrono_tz::Europe::Moscow;
@@ -3201,7 +3201,7 @@ async fn disabled_quiet_hours_deliver_on_time_and_release_deferred_on_the_next_t
     let second = create_task(
         &db,
         &household,
-        "Отложено, но тихие часы выключили",
+        "Отложено до утра",
         Some(local_utc(moscow, day + Duration::days(1), 23, 45)),
         Some(household.owner_id),
         None,
@@ -3216,6 +3216,12 @@ async fn disabled_quiet_hours_deliver_on_time_and_release_deferred_on_the_next_t
             .delivered,
         0
     );
+    assert_eq!(
+        scheduled_at(&db.pool, second.id, household.owner_id).await,
+        Some(local_utc(moscow, day + Duration::days(2), 8, 0))
+    );
+
+    // Отключение тихих часов не ускоряет уже отложенную доставку.
     set_notifications_without_digest(
         &db.pool,
         household.owner_id,
@@ -3226,7 +3232,23 @@ async fn disabled_quiet_hours_deliver_on_time_and_release_deferred_on_the_next_t
         scheduler
             .tick(local_utc(moscow, day + Duration::days(1), 23, 31))
             .await
-            .expect("release tick")
+            .expect("disabled tick")
+            .delivered,
+        0
+    );
+    assert_eq!(messages(&db.pool, chat).await.len(), 1);
+    assert_eq!(
+        delivery_status(&db.pool, second.id, household.owner_id)
+            .await
+            .as_deref(),
+        Some("pending")
+    );
+
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day + Duration::days(2), 8, 0))
+            .await
+            .expect("fixed release tick")
             .delivered,
         1
     );
@@ -3726,7 +3748,7 @@ async fn digest_time_change_after_midnight_does_not_send_two_digests_in_one_morn
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn disabled_quiet_hours_release_a_deferred_digest_on_the_next_tick() {
+async fn disabled_quiet_hours_do_not_release_a_deferred_digest_early() {
     let db = support::isolated_db().await;
     let household = household_without_digest(&db).await;
     let moscow = chrono_tz::Europe::Moscow;
@@ -3755,6 +3777,10 @@ async fn disabled_quiet_hours_release_a_deferred_digest_on_the_next_tick() {
             .delivered,
         0
     );
+    assert_eq!(
+        digest_rows(&db.pool, household.owner_id).await[0].1,
+        "pending"
+    );
     set_notifications(
         &db.pool,
         household.owner_id,
@@ -3765,11 +3791,23 @@ async fn disabled_quiet_hours_release_a_deferred_digest_on_the_next_tick() {
         }),
     )
     .await;
+    // Выключение тихих часов не ускоряет отложенную сводку: её время
+    // зафиксировано на конце тихих часов.
     assert_eq!(
         scheduler
             .tick(local_utc(moscow, next_day, 0, 30))
             .await
-            .expect("release tick")
+            .expect("disabled tick")
+            .delivered,
+        0
+    );
+    assert!(messages(&db.pool, chat).await.is_empty());
+
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, next_day, 8, 0))
+            .await
+            .expect("fixed release tick")
             .delivered,
         1
     );
@@ -3780,7 +3818,7 @@ async fn disabled_quiet_hours_release_a_deferred_digest_on_the_next_tick() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn disabled_quiet_hours_release_a_deferred_assignment_on_the_next_tick() {
+async fn disabled_quiet_hours_do_not_release_a_deferred_assignment_early() {
     let db = support::isolated_db().await;
     let household = household_without_digest(&db).await;
     let moscow = chrono_tz::Europe::Moscow;
@@ -3818,7 +3856,17 @@ async fn disabled_quiet_hours_release_a_deferred_assignment_on_the_next_tick() {
         scheduler
             .tick(night + Duration::seconds(2))
             .await
-            .expect("release tick")
+            .expect("disabled tick")
+            .delivered,
+        0
+    );
+    assert!(messages(&db.pool, chat).await.is_empty());
+
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day + Duration::days(1), 8, 0))
+            .await
+            .expect("fixed release tick")
             .delivered,
         1
     );

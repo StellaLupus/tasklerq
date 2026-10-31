@@ -459,6 +459,46 @@ pub enum Action {
         /// Элемент.
         item_id: Uuid,
     },
+    /// Перелистнуть сводное сообщение после тихих часов.
+    BatchPage {
+        /// Сводное сообщение.
+        batch_id: Uuid,
+        /// Страница с нуля.
+        page: u32,
+    },
+    /// Завершить задачу из блока сводного сообщения.
+    BatchComplete {
+        /// Сводное сообщение.
+        batch_id: Uuid,
+        /// Элемент.
+        item_id: Uuid,
+        /// Версия на момент выпуска.
+        version: i32,
+    },
+    /// Отложить задачу из блока сводного сообщения на час.
+    BatchSnooze {
+        /// Сводное сообщение.
+        batch_id: Uuid,
+        /// Элемент.
+        item_id: Uuid,
+    },
+    /// Открыть задачу из блока сводного сообщения.
+    BatchOpen {
+        /// Сводное сообщение.
+        batch_id: Uuid,
+        /// Элемент.
+        item_id: Uuid,
+    },
+    /// Завершить все ещё открытые задачи сводного сообщения.
+    BatchCompleteAll {
+        /// Сводное сообщение.
+        batch_id: Uuid,
+    },
+    /// Отложить все ещё открытые задачи сводного сообщения на час.
+    BatchSnoozeAll {
+        /// Сводное сообщение.
+        batch_id: Uuid,
+    },
     /// Обновить текущий экран.
     Refresh,
     /// Исправить элемент черновика в форме.
@@ -573,7 +613,8 @@ impl Action {
         match self {
             Self::Complete { version, .. }
             | Self::Reopen { version, .. }
-            | Self::NoticeComplete { version, .. } => Some(*version),
+            | Self::NoticeComplete { version, .. }
+            | Self::BatchComplete { version, .. } => Some(*version),
             Self::Form {
                 act: FormAct::Increase { version, .. },
             } => Some(*version),

@@ -171,21 +171,23 @@ pub async fn plan(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error>
 /// Пересчитать время ещё не доставленных сводок по текущим настройкам.
 ///
 /// Базой служит время сводки из `occurrence_key` и текущего `digest_time`, а не
-/// `created_at`: поздний тик не должен навсегда сдвигать сводку. Повторный
-/// расчёт идемпотентен, пока запись остаётся в том же тихом интервале.
+/// `created_at`: поздний тик не должен навсегда сдвигать сводку. Отложенная
+/// тихими часами сводка не пересчитывается вовсе: она уходит в своё
+/// зафиксированное время, а выключение тихих часов её не ускоряет.
 pub async fn reschedule(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error> {
     #[derive(FromRow)]
     struct PendingDigest {
         id: Uuid,
         occurrence_key: String,
         created_at: DateTime<Utc>,
+        deferred: bool,
         settings: serde_json::Value,
         user_timezone: Option<String>,
         household_timezone: String,
     }
 
     let rows: Vec<PendingDigest> = sqlx::query_as(
-        "SELECT d.id, d.occurrence_key, d.created_at, u.settings,
+        "SELECT d.id, d.occurrence_key, d.created_at, d.deferred, u.settings,
                 u.timezone AS user_timezone, h.timezone AS household_timezone
          FROM notification_deliveries d
          JOIN users u ON u.id = d.user_id
@@ -198,6 +200,9 @@ pub async fn reschedule(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::
     let mut conn = pool.acquire().await?;
     let mut rescheduled = 0;
     for row in rows {
+        if row.deferred {
+            continue;
+        }
         let settings = NotificationSettings::from_settings(&row.settings);
         let timezone =
             resolved_timezone(row.user_timezone.as_deref(), Some(&row.household_timezone));

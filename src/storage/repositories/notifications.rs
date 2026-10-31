@@ -6,8 +6,8 @@
 //! от выбора `EventType` и не теряется при обновлении, меняющем несколько
 //! полей сразу.
 
-use chrono::{DateTime, Utc};
-use sqlx::PgConnection;
+use chrono::{DateTime, NaiveDate, Utc};
+use sqlx::{FromRow, PgConnection};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -27,9 +27,49 @@ pub enum NotificationKind {
     Snooze,
 }
 
+impl NotificationKind {
+    /// Значение типа для подписей и ключей.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reminder => "reminder",
+            Self::Digest => "digest",
+            Self::Assignment => "assignment",
+            Self::Snooze => "snooze",
+        }
+    }
+}
+
 /// Ключ snooze-доставки: время, на которое пользователь отложил напоминание.
 pub fn snooze_key(deliver_at: DateTime<Utc>) -> String {
     format!("snooze:{}", deliver_at.timestamp())
+}
+
+/// Итог действия над блоком сводного сообщения.
+///
+/// Хранится в `notification_deliveries.batch_state`; строка без состояния —
+/// блок ещё открыт. Значение `changed` намеренно отсутствует: задача,
+/// изменившаяся после выпуска, перерисовывается по текущему состоянию, а не
+/// замирает без кнопок.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
+pub enum BatchState {
+    /// Задача завершена действием из сводного сообщения.
+    Done,
+    /// Задача отложена действием из сводного сообщения.
+    Snoozed,
+    /// Задача удалена или недоступна.
+    Missing,
+}
+
+impl BatchState {
+    /// Значение для записи в `batch_state`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Snoozed => "snoozed",
+            Self::Missing => "missing",
+        }
+    }
 }
 
 /// Время из ключа snooze-доставки.
@@ -64,12 +104,33 @@ pub async fn insert(
     delivery: &NewDelivery<'_>,
     now: DateTime<Utc>,
 ) -> Result<u64, sqlx::Error> {
+    insert_with_deferred(conn, delivery, false, now).await
+}
+
+/// Вставить доставку, сразу помеченную как отложенную.
+///
+/// Так создаются snooze-доставки действия «Отложить все на час»: через час они
+/// собираются в одно сводное сообщение, если актуальны две и более.
+pub async fn insert_deferred(
+    conn: &mut PgConnection,
+    delivery: &NewDelivery<'_>,
+    now: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
+    insert_with_deferred(conn, delivery, true, now).await
+}
+
+async fn insert_with_deferred(
+    conn: &mut PgConnection,
+    delivery: &NewDelivery<'_>,
+    deferred: bool,
+    now: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
     Ok(sqlx::query(
         "INSERT INTO notification_deliveries (
              id, household_id, user_id, item_id, occurrence_key, kind,
-             status, scheduled_at, created_at, updated_at
+             status, scheduled_at, deferred, created_at, updated_at
          )
-         SELECT $1, $2, $3, $4, $5, $6, 'pending', $7, $8, $8
+         SELECT $1, $2, $3, $4, $5, $6, 'pending', $7, $8, $9, $9
          WHERE NOT EXISTS (
              SELECT 1 FROM notification_deliveries d
              WHERE d.user_id = $3 AND d.item_id IS NOT DISTINCT FROM $4
@@ -80,7 +141,7 @@ pub async fn insert(
          DO UPDATE SET
              status = 'pending',
              scheduled_at = EXCLUDED.scheduled_at,
-             deferred = false,
+             deferred = EXCLUDED.deferred,
              outbox_seq = NULL,
              updated_at = EXCLUDED.updated_at
          WHERE notification_deliveries.status = 'cancelled'",
@@ -92,10 +153,188 @@ pub async fn insert(
     .bind(delivery.occurrence_key)
     .bind(delivery.kind)
     .bind(delivery.scheduled_at)
+    .bind(deferred)
     .bind(now)
     .execute(conn)
     .await?
     .rows_affected())
+}
+
+/// Сводное сообщение, выпущенное после тихих часов.
+#[derive(Debug, Clone, FromRow)]
+pub struct Batch {
+    /// Идентификатор.
+    pub id: Uuid,
+    /// Household получателя.
+    pub household_id: Uuid,
+    /// Получатель.
+    pub user_id: Uuid,
+    /// Чат получателя.
+    pub chat_id: i64,
+    /// Текущая страница с нуля.
+    pub page: i32,
+    /// Сколько задач завершило «Завершить все».
+    pub result_completed: Option<i32>,
+    /// Сколько задач уже изменились к моменту «Завершить все».
+    pub result_changed: Option<i32>,
+}
+
+/// Создать запись сводного сообщения.
+pub async fn create_batch(
+    conn: &mut PgConnection,
+    id: Uuid,
+    household_id: Uuid,
+    user_id: Uuid,
+    chat_id: i64,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO notification_batches
+             (id, household_id, user_id, chat_id, page, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 0, $5, $5)",
+    )
+    .bind(id)
+    .bind(household_id)
+    .bind(user_id)
+    .bind(chat_id)
+    .bind(now)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Получить сводное сообщение.
+pub async fn get_batch(conn: &mut PgConnection, id: Uuid) -> Result<Option<Batch>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id, household_id, user_id, chat_id, page, result_completed, result_changed
+         FROM notification_batches WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(conn)
+    .await
+}
+
+/// Запомнить текущую страницу сводного сообщения.
+pub async fn set_batch_page(
+    conn: &mut PgConnection,
+    id: Uuid,
+    page: i32,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE notification_batches SET page = $2, updated_at = $3 WHERE id = $1")
+        .bind(id)
+        .bind(page)
+        .bind(now)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Запомнить итог «Завершить все».
+pub async fn set_batch_result(
+    conn: &mut PgConnection,
+    id: Uuid,
+    completed: i32,
+    changed: i32,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE notification_batches
+         SET result_completed = $2, result_changed = $3, updated_at = $4
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(completed)
+    .bind(changed)
+    .bind(now)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Доставка, входящая в сводное сообщение, с текущим состоянием задачи.
+#[derive(Debug, Clone, FromRow)]
+pub struct BatchDelivery {
+    /// Идентификатор доставки.
+    pub id: Uuid,
+    /// Элемент; у сводки пусто, у батча всегда есть.
+    pub item_id: Option<Uuid>,
+    /// Тип уведомления.
+    pub kind: String,
+    /// Версия задачи на момент выпуска.
+    pub batch_version: Option<i32>,
+    /// Итог действия над блоком.
+    pub batch_state: Option<BatchState>,
+    /// Время нового snooze.
+    pub batch_snoozed_until: Option<DateTime<Utc>>,
+    /// Момент выпуска.
+    pub scheduled_at: DateTime<Utc>,
+    /// Название задачи.
+    pub title: Option<String>,
+    /// Статус задачи.
+    pub item_status: Option<String>,
+    /// Задача удалена.
+    pub item_deleted_at: Option<DateTime<Utc>>,
+    /// Текущая версия задачи.
+    pub item_version: Option<i32>,
+    /// Срок со временем.
+    pub due_at: Option<DateTime<Utc>>,
+    /// Срок на весь день.
+    pub due_date: Option<NaiveDate>,
+    /// Название списка.
+    pub list_name: Option<String>,
+    /// Список удалён.
+    pub list_deleted_at: Option<DateTime<Utc>>,
+    /// Список в архиве.
+    pub list_archived: Option<bool>,
+}
+
+/// Доставки сводного сообщения в порядке выпуска.
+pub async fn batch_deliveries(
+    conn: &mut PgConnection,
+    batch_id: Uuid,
+) -> Result<Vec<BatchDelivery>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT d.id, d.item_id, d.kind::text AS kind, d.batch_version,
+                d.batch_state, d.batch_snoozed_until, d.scheduled_at,
+                i.title, i.status::text AS item_status,
+                i.deleted_at AS item_deleted_at, i.version AS item_version,
+                i.due_at, i.due_date,
+                l.name AS list_name, l.deleted_at AS list_deleted_at,
+                l.is_archived AS list_archived
+         FROM notification_deliveries d
+         LEFT JOIN items i ON i.id = d.item_id
+         LEFT JOIN lists l ON l.id = i.list_id
+         WHERE d.batch_id = $1
+         ORDER BY d.scheduled_at, d.id",
+    )
+    .bind(batch_id)
+    .fetch_all(conn)
+    .await
+}
+
+/// Пометить все доставки задачи в сводном сообщении итогом действия.
+pub async fn set_batch_state(
+    conn: &mut PgConnection,
+    batch_id: Uuid,
+    item_id: Uuid,
+    state: BatchState,
+    snoozed_until: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE notification_deliveries
+         SET batch_state = $3, batch_snoozed_until = $4, updated_at = $5
+         WHERE batch_id = $1 AND item_id = $2",
+    )
+    .bind(batch_id)
+    .bind(item_id)
+    .bind(state.as_str())
+    .bind(snoozed_until)
+    .bind(now)
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 /// Параметры уведомления о назначении.

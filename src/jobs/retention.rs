@@ -56,6 +56,8 @@ pub struct RetentionStats {
     pub purged_outbox: u64,
     /// Удалённые завершённые записи доставки уведомлений.
     pub purged_notification_deliveries: u64,
+    /// Удалённые сводные сообщения уведомлений.
+    pub purged_notification_batches: u64,
     /// Удалённые просроченные формы.
     pub purged_conversations: u64,
 }
@@ -215,6 +217,22 @@ async fn run_in_tx(
     .await?
     .rows_affected();
 
+    // Сводные сообщения живут столько же, сколько их доставки. Батч без
+    // `pending`-доставок больше не может быть перерисован; связанные `pending`
+    // не трогаем, как и сами доставки.
+    let purged_notification_batches = sqlx::query(
+        "DELETE FROM notification_batches b
+         WHERE b.updated_at < $1
+           AND NOT EXISTS (
+               SELECT 1 FROM notification_deliveries d
+               WHERE d.batch_id = b.id AND d.status = 'pending'
+           )",
+    )
+    .bind(now - Duration::days(i64::from(config.outbox_days)))
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+
     let purged_conversations = crate::telegram::views::purge_conversations(&mut *conn, now).await?;
 
     Ok(RetentionStats {
@@ -233,6 +251,7 @@ async fn run_in_tx(
         purged_callback_tokens,
         purged_outbox,
         purged_notification_deliveries,
+        purged_notification_batches,
         purged_conversations,
     })
 }
@@ -275,6 +294,7 @@ impl RetentionWorker {
                 purged_callback_tokens = stats.purged_callback_tokens,
                 purged_outbox = stats.purged_outbox,
                 purged_notification_deliveries = stats.purged_notification_deliveries,
+                purged_notification_batches = stats.purged_notification_batches,
                 purged_conversations = stats.purged_conversations,
                 "retention finished"
             );
