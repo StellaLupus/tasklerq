@@ -112,6 +112,7 @@ pub fn digest_ui(
     shopping_list: Option<Uuid>,
 ) -> Ui {
     const MAX_LINES: usize = 20;
+    let total_tasks = today.len() + overdue.len();
     let mut ui = Ui::new().heading("☀️ Доброе утро!");
     let line = |entry: &DigestLine| format!("☐ {} · {}", clip(&entry.title, 60), entry.when);
     let mut budget = MAX_LINES;
@@ -131,7 +132,11 @@ pub fn digest_ui(
         ui = ui.bold(title).text(lines.join("\n"));
     }
     if today.is_empty() && overdue.is_empty() {
-        ui = ui.text("На сегодня задач нет.");
+        ui = if shopping_open == 0 {
+            ui.text("День свободен.")
+        } else {
+            ui.text("На сегодня задач нет.")
+        };
     }
     if shopping_open > 0 {
         ui = ui.text(format!("Покупки: {}", ru::positions(shopping_open)));
@@ -142,6 +147,14 @@ pub fn digest_ui(
     }
     if let Some(list_id) = shopping_list {
         row.push(back_button("🛒 Покупки", Screen::List { list_id, page: 0 }));
+    }
+    if total_tasks > MAX_LINES
+        && let Some(list_id) = tasks_list
+    {
+        row.push(back_button(
+            "Показать ещё",
+            Screen::List { list_id, page: 0 },
+        ));
     }
     ui.row(row)
 }
@@ -398,18 +411,30 @@ mod tests {
                 when: "сегодня".into(),
             })
             .collect();
-        let ui = digest_ui(&lines, &[], 0, None, None);
-        let html = crate::telegram::rich::render(&ui, &[]).html;
+        let ui = digest_ui(&lines, &[], 0, Some(Uuid::now_v7()), None);
+        assert_eq!(ui.button_count(), 2);
+        let tokens = vec!["t:AAAAAAAAAAAAAAAA".to_owned(); 2];
+        let html = crate::telegram::rich::render(&ui, &tokens).html;
 
         assert_eq!(html.matches("☐ Задача").count(), 20);
         assert!(html.contains("…и ещё 5 задач"));
+        assert!(html.contains("Показать ещё"));
     }
 
     #[test]
-    fn empty_digest_says_so() {
+    fn empty_digest_says_the_day_is_free() {
+        let ui = digest_ui(&[], &[], 0, None, None);
+        let html = crate::telegram::rich::render(&ui, &[]).html;
+        assert!(html.contains("День свободен."));
+        assert!(!html.contains("Сегодня"));
+        assert!(!html.contains("Просрочено"));
+        assert!(!html.contains("Покупки"));
+    }
+
+    #[test]
+    fn digest_with_only_shopping_keeps_the_purchase_count() {
         let ui = digest_ui(&[], &[], 7, None, None);
         let html = crate::telegram::rich::render(&ui, &[]).html;
-        assert!(html.contains("На сегодня задач нет."));
         assert!(html.contains("Покупки: 7 позиций"));
     }
 }
