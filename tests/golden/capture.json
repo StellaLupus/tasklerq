@@ -198,9 +198,9 @@
       "expect": {
         "items": [
           {
-            "title": "Купить подарки",
-            "kind": "tasks",
-            "list": "Задачи",
+            "title": "Подарки",
+            "kind": "shopping",
+            "list": "Покупки",
             "due_date": "2026-12-31"
           }
         ]
@@ -245,6 +245,7 @@
         "items": [
           {
             "title": "Сделать зарядку",
+            "alt_titles": ["Зарядка"],
             "kind": "tasks",
             "list": "Задачи",
             "due_date": "2026-10-31",
@@ -277,6 +278,7 @@
         "items": [
           {
             "title": "Встреча с врачом",
+            "alt_titles": ["Встретиться с врачом"],
             "kind": "tasks",
             "list": "Задачи",
             "due_date": "2026-11-04",
@@ -293,6 +295,7 @@
         "items": [
           {
             "title": "Принимать витамины",
+            "alt_titles": ["Принять витамины"],
             "kind": "tasks",
             "list": "Задачи",
             "due_date": "2026-10-30",
@@ -309,6 +312,7 @@
         "items": [
           {
             "title": "Поливать цветы",
+            "alt_titles": ["Полить цветы"],
             "kind": "tasks",
             "list": "Задачи",
             "due_date": "2026-10-30",
@@ -325,6 +329,7 @@
         "items": [
           {
             "title": "Ходить в спортзал",
+            "alt_titles": ["Сходить в спортзал"],
             "kind": "tasks",
             "list": "Задачи",
             "due_date": "2026-11-03",
@@ -341,6 +346,7 @@
         "items": [
           {
             "title": "Оплачивать квартиру",
+            "alt_titles": ["Оплатить квартиру", "Оплата квартиры"],
             "kind": "tasks",
             "list": "Задачи",
             "due_date": "2026-10-30",
@@ -438,7 +444,7 @@
     {
       "id": "ambiguity-alexey-documents",
       "category": "ambiguity",
-      "text": "отнести документы Алексею",
+      "text": "Алексей, отнеси документы",
       "context": {
         "now": "2026-10-30T11:05:00Z",
         "timezone": "Europe/Moscow",
@@ -468,6 +474,7 @@
         "items": [
           {
             "title": "Встретиться с врачом",
+            "alt_titles": ["Встреча с врачом"],
             "kind": "tasks",
             "list": "Задачи",
             "due_date": "2026-10-31"
@@ -482,7 +489,8 @@
       "text": "встреча с врачом",
       "expect": {
         "items": [
-          { "title": "Встреча с врачом", "kind": "tasks", "list": "Задачи" }
+          { "title": "Встреча с врачом",
+            "alt_titles": ["Встретиться с врачом"], "kind": "tasks", "list": "Задачи" }
         ],
         "clarifications": ["due_date"]
       }

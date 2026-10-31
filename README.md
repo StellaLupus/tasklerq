@@ -66,7 +66,7 @@ flowchart LR
 | HTTP | axum + tower + tokio |
 | БД | PostgreSQL 18 (`postgres:18-alpine`), sqlx |
 | Telegram | webhook + собственный RichMessage-адаптер, типы `teloxide-core` |
-| LLM | Home Assistant `ai_task.generate_data`, AI Task `ai_task.google_ai_task_2`, Google Gemini |
+| LLM | Home Assistant `ai_task.generate_data`, AI Task `ai_task.anthropic_claude_haiku_5_5` (OpenRouter, Claude Haiku 5.5) |
 | HA-интеграция | Python custom component, `DataUpdateCoordinator` |
 | Развёртывание | Docker Compose на Synology NAS, PostgreSQL 18 в сети `shared-db`, Synology Reverse Proxy |
 | Наблюдаемость | `tracing` JSON, health/readiness, метрики |

@@ -554,7 +554,7 @@ async fn auto_applies_two_purchases_and_returns_the_full_contract() {
     assert_eq!(draft_status, "applied");
     assert_eq!(draft_mode, "auto");
     assert!(applied_at.is_some(), "applied capture must have applied_at");
-    assert_eq!(parser_version.as_deref(), Some("capture-v2"));
+    assert_eq!(parser_version.as_deref(), Some("capture-v3"));
 
     assert_eq!(
         created_event_count(&db.pool, household.household_id).await,

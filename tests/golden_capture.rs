@@ -230,6 +230,45 @@ fn guesses_without_a_clarification_do_not_pass() {
 }
 
 #[test]
+fn alternative_titles_match_but_other_titles_do_not() {
+    let expected = json!([{
+        "title": "Оплачивать квартиру",
+        "alt_titles": ["Оплатить квартиру"],
+        "kind": "tasks",
+        "list": "Задачи"
+    }]);
+
+    let alt = judge_one(&expected, &json!([]), response("Оплатить квартиру"));
+    assert!(alt.passed(), "{:?}", alt.problems);
+
+    let other = judge_one(&expected, &json!([]), response("Квартира"));
+    assert!(!other.passed());
+}
+
+#[test]
+fn due_question_is_recognized_in_any_word_form() {
+    for question in [
+        "На какую дату и время назначена встреча с врачом?",
+        "Уточните время встречи",
+        "Какое число подойдёт?",
+    ] {
+        let result = judge_one(
+            &json!([{"title": "Позвонить маме", "kind": "tasks", "list": "Задачи"}]),
+            &json!(["due_date"]),
+            json!({
+                "items": [{"target_kind": "tasks", "title": "Позвонить маме", "target_list": "Задачи"}],
+                "clarifications": [question]
+            }),
+        );
+        assert!(
+            result.clarifications_ok,
+            "{question}: {:?}",
+            result.problems
+        );
+    }
+}
+
+#[test]
 fn compound_question_covers_both_topics() {
     let result = judge_one(
         &json!([{"title": "Позвонить маме", "kind": "tasks", "list": "Задачи"}]),

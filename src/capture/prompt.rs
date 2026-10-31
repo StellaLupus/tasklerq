@@ -1,4 +1,4 @@
-//! Промпт `capture-v2` и структура ответа для `ai_task.generate_data`.
+//! Промпт `capture-v3` и структура ответа для `ai_task.generate_data`.
 //!
 //! Шаблон лежит в отдельном файле, чтобы его изменение было видно в диффе, а
 //! тест `prompt_template_is_pinned_to_version` не давал поменять текст без
@@ -12,12 +12,12 @@ use super::context::CaptureContext;
 use crate::domain::models::ListKind;
 
 /// Версия промпта; пишется в `llm_runs` и `capture_drafts`.
-pub const PROMPT_VERSION: &str = "capture-v2";
+pub const PROMPT_VERSION: &str = "capture-v3";
 
 /// Имя задачи в журнале Home Assistant.
 pub const TASK_NAME: &str = "Разбор заметки Tasklerq";
 
-const TEMPLATE: &str = include_str!("prompts/capture-v2.txt");
+const TEMPLATE: &str = include_str!("prompts/capture-v3.txt");
 
 const TEXT_OPEN: &str = "<<<USER_TEXT";
 const TEXT_CLOSE: &str = "USER_TEXT>>>";
@@ -131,17 +131,23 @@ fn neutralize_text(text: &str) -> String {
 ///
 /// Диапазоны `min`/`max` — подсказка модели; Gemini может их игнорировать,
 /// поэтому границы повторно проверяются при валидации.
+///
+/// `required` нужен не только ради заполнения. Gemini без обязательных полей
+/// отдаёт огрызки вроде `{"assignee": ""}`. OpenRouter в strict-режиме делает
+/// необязательные поля nullable, а nullable-enum (`["string", "null"]` + enum)
+/// Anthropic и OpenAI отклоняют, поэтому все select-поля обязательны.
 pub fn response_structure() -> Value {
     json!({
         "items": {
+            "required": true,
             "selector": {"object": {"multiple": true, "fields": {
-                "target_kind": {"selector": {"select": {"options": ["tasks", "shopping", "checklist"]}}},
-                "target_list": {"selector": {"text": null}},
-                "title": {"selector": {"text": null}},
+                "target_kind": {"required": true, "selector": {"select": {"options": ["tasks", "shopping", "checklist"]}}},
+                "target_list": {"required": true, "selector": {"text": null}},
+                "title": {"required": true, "selector": {"text": null}},
                 "notes": {"selector": {"text": {"multiline": true}}},
                 "due_date": {"selector": {"text": null}},
                 "due_time": {"selector": {"text": null}},
-                "priority": {"selector": {"select": {"options": ["low", "normal", "high", "urgent"]}}},
+                "priority": {"required": true, "selector": {"select": {"options": ["low", "normal", "high", "urgent"]}}},
                 "assignee": {"selector": {"text": null}},
                 "tags": {"selector": {"object": {"multiple": true, "fields": {
                     "value": {"selector": {"text": null}}
@@ -152,9 +158,9 @@ pub fn response_structure() -> Value {
                     "title": {"selector": {"text": null}}
                 }}}},
                 "recurrence": {"selector": {"object": {"fields": {
-                    "freq": {"selector": {"select": {"options": ["daily", "weekly", "monthly", "yearly"]}}},
+                    "freq": {"required": true, "selector": {"select": {"options": ["daily", "weekly", "monthly", "yearly"]}}},
                     "interval": {"selector": {"number": {"min": 1, "max": 365, "mode": "box"}}},
-                    "month_rule": {"selector": {"select": {"options": ["anchor_day", "last_day"]}}},
+                    "month_rule": {"required": true, "selector": {"select": {"options": ["anchor_day", "last_day"]}}},
                     "weekdays": {"selector": {"object": {"multiple": true, "fields": {
                         "day": {"selector": {"number": {"min": 1, "max": 7, "mode": "box"}}}
                     }}}},
@@ -177,17 +183,17 @@ mod tests {
     use super::*;
     use crate::capture::test_support::{context, list, member};
 
-    const SNAPSHOT: &str = include_str!("prompts/capture-v2.snapshot.txt");
+    const SNAPSHOT: &str = include_str!("prompts/capture-v3.snapshot.txt");
 
     /// Хеш шаблона привязан к версии. Если тест упал, значит текст промпта
-    /// изменился: заведите новую версию (`capture-v3`), прогоните golden set и
+    /// изменился: заведите новую версию (`capture-v4`), прогоните golden set и
     /// только потом обновите константы.
     const TEMPLATE_SHA256: &str =
-        "2b4372fc364b2bda0786352ee37c89f637f8cb23a6381ba97e6c1743920515a0";
+        "801b8177a0ce78271018669da14557d1e5c0255126a18f27d2fb22a44c249ccd";
 
     #[test]
     fn prompt_template_is_pinned_to_version() {
-        assert_eq!(PROMPT_VERSION, "capture-v2");
+        assert_eq!(PROMPT_VERSION, "capture-v3");
         let digest = Sha256::digest(TEMPLATE.as_bytes());
         let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
         assert_eq!(

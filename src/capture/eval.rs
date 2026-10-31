@@ -179,6 +179,10 @@ pub struct Expectation {
 pub struct ExpectedItem {
     /// Заголовок.
     pub title: String,
+    /// Равноценные формулировки заголовка: «Оплатить квартиру» вместо
+    /// «Оплачивать квартиру» — не ошибка разбора.
+    #[serde(default)]
+    pub alt_titles: Vec<String>,
     /// Тип списка.
     pub kind: ListKind,
     /// Название списка.
@@ -561,7 +565,10 @@ impl ActualItem {
 
 /// Совпадение одного ожидаемого элемента с фактическим.
 fn item_matches(expected: &ExpectedItem, actual: &ActualItem) -> bool {
-    fold(&expected.title) == fold(&actual.title)
+    let title = fold(&actual.title);
+    std::iter::once(&expected.title)
+        .chain(&expected.alt_titles)
+        .any(|candidate| fold(candidate) == title)
         && expected.kind == actual.kind
         && fold(&expected.list) == actual.list.as_deref().map(fold).unwrap_or_default()
         && expected.assignee.as_deref().map(fold) == actual.assignee.as_deref().map(fold)
@@ -687,13 +694,15 @@ fn actual_topics(
 /// исполнителя только если вопрос не про дату: «когда позвонить Алексею?» —
 /// это вопрос о времени, а не о том, кому звонить.
 fn clarification_topics(question: &str, context: &CaptureContext) -> BTreeSet<ClarificationTopic> {
+    // Основы слов, а не словоформы: модель спрашивает «на какую дату»,
+    // «уточните время», «какое число».
     const DUE: [&str; 8] = [
         "когда",
         "во сколько",
-        "какого числа",
         "какой день",
-        "какое время",
-        "дата",
+        "дат",
+        "врем",
+        "числ",
         "срок",
         "deadline",
     ];
@@ -743,7 +752,7 @@ pub struct BaselineEntry {
     pub passed: usize,
 }
 
-/// Baseline по версиям промпта: `{"capture-v2": {...}}`.
+/// Baseline по версиям промпта: `{"capture-v3": {...}}`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Baseline(pub BTreeMap<String, BaselineEntry>);

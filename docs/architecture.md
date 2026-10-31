@@ -66,7 +66,7 @@ flowchart TB
 | **Telegram adapter** | RichMessage, вызовы Bot API | reqwest, teloxide-core types |
 | **PostgreSQL** | Source of truth, очередь обновлений, outbox, черновики | PostgreSQL 18 (`postgres:18-alpine`) |
 | **HA custom component** | Мост между REST API и сущностями HA | Python, aiohttp, HA integration |
-| **HA AI Task** | Структурированный вызов Gemini | `ai_task.google_ai_task_2`, `ai_task.generate_data` |
+| **HA AI Task** | Структурированный вызов LLM (Claude Haiku 5.5 через OpenRouter) | `ai_task.anthropic_claude_haiku_5_5`, `ai_task.generate_data` |
 | **Reverse proxy** | TLS, публикация webhook | Synology DSM Reverse Proxy |
 
 ## 3. Потоки данных

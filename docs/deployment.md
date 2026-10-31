@@ -60,7 +60,7 @@
 | Reverse Proxy | Запись создана: `HTTPS tasklerq.stellalupus.ru:443` → `http://localhost:18080`; без приложения отвечает `502` | Ничего; при `502` после запуска заменить `localhost` на `127.0.0.1`. |
 | PostgreSQL | `postgres:18-alpine` (18.6), сеть `shared-db`, порт `15433`; роль `tasklerq` (не суперпользователь) и БД `tasklerq` с `pg_trgm 1.6` созданы 2026-10-29 | Пароль из `DATABASE_URL` положить в `.env` (0600). |
 | Home Assistant | `2026.10.4`, host network, HACS | Установить custom component. |
-| AI Task | `ai_task.google_ai_task_2` | Проверить вызов в Developer Tools. |
+| AI Task | `ai_task.anthropic_claude_haiku_5_5` | Проверить вызов в Developer Tools. |
 | Telegram | Бот `@tasklerqbot` создан | Получить токен в BotFather и заполнить `.env`. |
 | Tasklerq | Кода ещё нет | Реализовать по `tasks.md`. |
 
@@ -264,7 +264,7 @@ curl -sS -X POST \
 | `CAPTURE_MAX_TEXT_CHARS` | нет | `2000` | Максимальная длина текста, от 100 до 2000. |
 | `HA_BASE_URL` | при LLM | `http://host.docker.internal:8123` | Home Assistant из контейнера Tasklerq. |
 | `HA_TOKEN` | при LLM | `eyJ...` | Long-lived token HA. |
-| `HA_AI_TASK_ENTITY_ID` | при LLM | `ai_task.google_ai_task_2` | AI Task. |
+| `HA_AI_TASK_ENTITY_ID` | при LLM | `ai_task.anthropic_claude_haiku_5_5` | AI Task. |
 | `LLM_CAPTURE_ENABLED` | нет | `true` | Включить разбор. |
 | `LLM_DAILY_QUOTA` | нет | `200` | Разборов в сутки на household. |
 | `QUEUE_MAX_ATTEMPTS` | нет | `10` | Попытки обработки update. |
@@ -618,7 +618,7 @@ curl -fsS http://127.0.0.1:18080/health/ready
 - [ ] `Idempotency-Key` уникален; повтор не создаёт дубликаты.
 - [ ] `TELEGRAM_MODE=webhook` в production; для headless — `disabled` без
   `TELEGRAM_BOT_TOKEN`.
-- [ ] AI Task `ai_task.google_ai_task_2` не имеет Assist-инструментов.
+- [ ] AI Task `ai_task.anthropic_claude_haiku_5_5` не имеет Assist-инструментов.
 - [ ] `LLM_CAPTURE_ENABLED` соответствует политике семьи.
 - [ ] Логи не содержат текст сообщений и токены; для capture — только `source`,
   `status`, `capture_id`.
@@ -702,7 +702,7 @@ curl -fsS http://127.0.0.1:18080/health/ready
 
 ### 16.8. LLM не работает
 
-1. Проверьте `HA_AI_TASK_ENTITY_ID=ai_task.google_ai_task_2`.
+1. Проверьте `HA_AI_TASK_ENTITY_ID=ai_task.anthropic_claude_haiku_5_5`.
 2. Вызовите `ai_task.generate_data` в Developer Tools.
 3. Проверьте `HA_TOKEN` и срок действия.
 4. Проверьте квоту Gemini и лимиты.

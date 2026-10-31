@@ -232,7 +232,7 @@ HA coordinator ──GET /api/v1/snapshot?since=cursor──▶ Tasklerq
 Tasklerq вызывает `ai_task.generate_data` в HA. В этой инсталляции уже есть:
 
 - интеграция **Google Generative AI**;
-- AI Task `ai_task.google_ai_task_2` (подынтеграция `Google AI Task`);
+- AI Task `ai_task.anthropic_claude_haiku_5_5` (подынтеграция `Google AI Task`);
 - conversation-подынтеграции с моделями `models/gemini-3.5-flash-lite` и
   `models/gemini-3.7-flash`.
 
@@ -242,7 +242,7 @@ Tasklerq вызывает `ai_task.generate_data` в HA. В этой инста�
 
 Настройка:
 
-1. Проверьте сущность `ai_task.google_ai_task_2` в **Developer Tools → States**.
+1. Проверьте сущность `ai_task.anthropic_claude_haiku_5_5` в **Developer Tools → States**.
 2. Проверьте действие **Developer Tools → Actions → `ai_task.generate_data`**.
 3. Создайте long-lived token HA.
 4. Укажите в Tasklerq:
@@ -250,7 +250,7 @@ Tasklerq вызывает `ai_task.generate_data` в HA. В этой инста�
 ```dotenv
 HA_BASE_URL=http://host.docker.internal:8123
 HA_TOKEN=eyJ...
-HA_AI_TASK_ENTITY_ID=ai_task.google_ai_task_2
+HA_AI_TASK_ENTITY_ID=ai_task.anthropic_claude_haiku_5_5
 LLM_CAPTURE_ENABLED=true
 ```
 
@@ -485,8 +485,8 @@ action:
 | Сущности `unavailable` | Tasklerq недоступен | Проверить `/health/ready`, логи, сеть. |
 | Нет событий в календаре | Нет задач со сроком или горизонт мал | Добавить срок, увеличить горизонт. |
 | Дубли `unique_id` | Старая интеграция не удалена | Удалить старую запись, перезапустить HA. |
-| Нет `ai_task` | Google Generative AI не настроена | Проверить `ai_task.google_ai_task_2` в Developer Tools. |
-| LLM всегда fallback | `HA_AI_TASK_ENTITY_ID` или `HA_BASE_URL` неверный | Проверить `ai_task.google_ai_task_2`, `http://host.docker.internal:8123` и `HA_TOKEN`. |
+| Нет `ai_task` | Google Generative AI не настроена | Проверить `ai_task.anthropic_claude_haiku_5_5` в Developer Tools. |
+| LLM всегда fallback | `HA_AI_TASK_ENTITY_ID` или `HA_BASE_URL` неверный | Проверить `ai_task.anthropic_claude_haiku_5_5`, `http://host.docker.internal:8123` и `HA_TOKEN`. |
 | Время сдвинуто | Разные timezone HA и Tasklerq | Проверить timezone household/пользователя и HA. |
 | Нет priority/tags в карточке | Ограничение HA | Использовать `tasklerq_items`. |
 | Конфликт при записи | Позиция изменена в Telegram | Обновить и повторить. |
