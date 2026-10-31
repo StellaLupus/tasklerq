@@ -270,7 +270,7 @@ impl TelegramApi for HttpTelegramApi {
         let sent: SentMessage = self
             .call(
                 "sendRichMessage",
-                &json!({"chat_id": chat_id, "html": message.html}),
+                &json!({"chat_id": chat_id, "rich_message": {"html": message.html}}),
                 None,
             )
             .await?;
@@ -283,10 +283,15 @@ impl TelegramApi for HttpTelegramApi {
         message_id: i64,
         message: &RichMessage,
     ) -> Result<(), TelegramError> {
-        // Ответ содержит сообщение или `true`; содержимое не нужно.
+        // Богатое сообщение редактируется тем же методом, что и текст:
+        // отдельного `editRichMessage` в Bot API нет.
         self.call::<Value>(
-            "editRichMessage",
-            &json!({"chat_id": chat_id, "message_id": message_id, "html": message.html}),
+            "editMessageText",
+            &json!({
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "rich_message": {"html": message.html}
+            }),
             None,
         )
         .await

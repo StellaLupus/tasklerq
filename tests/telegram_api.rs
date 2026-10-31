@@ -23,7 +23,9 @@ async fn send_rich_message_posts_html_and_returns_message_id() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(format!("/bot{TOKEN}/sendRichMessage")))
-        .and(body_json(json!({"chat_id": 42, "html": "<h3>Привет</h3>"})))
+        .and(body_json(
+            json!({"chat_id": 42, "rich_message": {"html": "<h3>Привет</h3>"}}),
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "ok": true,
             "result": {"message_id": 77, "chat": {"id": 42}}
@@ -44,10 +46,12 @@ async fn send_rich_message_posts_html_and_returns_message_id() {
 async fn edit_rich_and_plain_messages_use_matching_methods() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path(format!("/bot{TOKEN}/editRichMessage")))
-        .and(body_json(
-            json!({"chat_id": 42, "message_id": 7, "html": "<p>x</p>"}),
-        ))
+        .and(path(format!("/bot{TOKEN}/editMessageText")))
+        .and(body_json(json!({
+            "chat_id": 42,
+            "message_id": 7,
+            "rich_message": {"html": "<p>x</p>"}
+        })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true, "result": true})))
         .expect(1)
         .mount(&server)
