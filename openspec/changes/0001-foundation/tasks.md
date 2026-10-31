@@ -78,6 +78,9 @@
 
 ## 6. Home Assistant custom component
 
+Компонент реализуется в отдельном репозитории `tasklerq-ha` (решение
+2026-10-31); контракт API — `docs/ha-api.md`.
+
 - [ ] 6.1 Создать скелет `custom_components/tasklerq`: `manifest.json`, `__init__.py`, `const.py`, `services.py`, `services.yaml`, `strings.json`, `translations/ru.json`; проверить загрузку через `pytest-homeassistant-custom-component`.
 - [ ] 6.2 Реализовать config flow (URL + token), проверку токена и household через `GET /api/v1/household`, unique_id household, reauth и options; проверить pytest-тестами.
 - [ ] 6.3 Реализовать API-клиент и координатор со snapshot `since`, полной синхронизацией и backoff; проверить тестами курсор, восстановление и daily resync.

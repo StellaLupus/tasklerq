@@ -770,7 +770,7 @@ ngrok http 8080
 cargo test
 cargo clippy -- -D warnings
 cargo fmt --check
-pytest custom_components/tasklerq
+# Python-тесты компонента запускаются в репозитории tasklerq-ha
 openspec validate --strict
 ```
 

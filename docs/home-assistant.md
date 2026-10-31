@@ -35,7 +35,8 @@ Container.
 ### Вариант A. HACS (рекомендуется)
 
 1. HACS → **Integrations** → меню → **Custom repositories**.
-2. Добавьте репозиторий Tasklerq, категория **Integration**.
+2. Добавьте репозиторий `https://github.com/StellaLupus/tasklerq-ha`,
+   категория **Integration**.
 3. Установите **Tasklerq**.
 4. Перезапустите Home Assistant.
 5. **Настройки → Устройства и службы → Добавить интеграцию → Tasklerq**.
@@ -45,7 +46,9 @@ HACS уже установлен в этой инсталляции HA. Если
 
 ### Вариант B. Вручную
 
-1. Скопируйте каталог `custom_components/tasklerq` в
+1. Скопируйте каталог `custom_components/tasklerq` из репозитория
+   [`tasklerq-ha`](https://github.com/StellaLupus/tasklerq-ha) (или из его
+   релиза) в
    `/volume2/docker/homeassistant/custom_components/tasklerq` на NAS
    (внутри контейнера HA это `/config/custom_components/tasklerq`).
 2. Проверьте структуру:
@@ -207,7 +210,7 @@ tasklerq_items:
 ```text
 HA coordinator ──GET /api/v1/snapshot?since=cursor──▶ Tasklerq
       │                                                   │
-      │◀──────── lists, items, deleted_ids, next_since ────┘
+      │◀──────── lists, items, deleted_item_ids, next_since ────┘
       │
       ├── обновляет todo/calendar
       │

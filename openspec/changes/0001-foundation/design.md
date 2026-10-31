@@ -494,10 +494,12 @@ retention.
 Компонент — единственный способ получить нативные `todo`/`calendar` в HA
 Container.
 
-**Структура компонента:**
+**Репозиторий и структура компонента.** Компонент поставляется из отдельного
+репозитория `tasklerq-ha` с собственными релизами и тегами: HACS берёт версии
+из тегов/релизов, а Python-тулчейн и CI не смешиваются с тегами Rust-сервера.
 
 ```text
-custom_components/tasklerq/
+tasklerq-ha/custom_components/tasklerq/
   __init__.py          # setup, coordinator, service registration
   manifest.json        # domain, version, requirements, iot_class
   config_flow.py       # URL + token, reauth, options
@@ -562,7 +564,9 @@ custom_components/tasklerq/
 сущности `unavailable`. При `401` — reauth. Запись инициирует refresh, чтобы
 UI обновился быстрее.
 
-**Установка.** HACS custom repository (HACS уже установлен) или копирование в
+**Установка.** HACS custom repository
+`https://github.com/StellaLupus/tasklerq-ha` (категория Integration) или
+копирование `custom_components/tasklerq` из репозитория `tasklerq-ha`/релиза в
 `/volume2/docker/homeassistant/custom_components/tasklerq` (внутри HA —
 `/config/custom_components/tasklerq`); перезапуск HA; добавить интеграцию.
 В текущей среде HA работает в `network_mode: host`, поэтому URL Tasklerq —
@@ -726,16 +730,16 @@ API-токены: 32 байта случайности, префикс `tlq_`, S
 - **Contract:** mock Telegram (`wiremock`) и mock HA; проверка схемы
   `ai_task.generate_data`; формат запросов RichMessage; capture API
   (auto/draft/idempotency/undo) и HA-сервисы.
-- **Python:** `pytest-homeassistant-custom-component`; config flow, todo,
-  calendar, diagnostics, конфликты.
+- **Python (в `tasklerq-ha`):** `pytest-homeassistant-custom-component`;
+  config flow, todo, calendar, diagnostics, конфликты.
 - **E2E:** docker compose + fake Telegram + fake HA; сценарии «создать задачу»,
   «подтвердить черновик», «голосовой capture без Telegram», «завершить из HA»,
   «напоминание».
 - **LLM golden set:** ≥30 русских фраз, проверка извлечения элементов ≥90%;
   версия промпта обязательна.
 - **CI:** `cargo fmt --check`, `clippy -D warnings`, `cargo test`,
-  `sqlx prepare --check`, `cargo audit`; Python `ruff`, `mypy`, `pytest`;
-  `openspec validate --strict`.
+  `sqlx prepare --check`, `cargo audit`; Python `ruff`, `mypy`, `pytest` — в
+  `tasklerq-ha`; `openspec validate --strict`.
 - **Нагрузка:** 10 пользователей, 10 000 задач, 50 webhook/с; проверить
   latency webhook <100 мс (без LLM), очередь не растёт бесконечно.
 - **Ручной чек-лист:** Telegram iOS/Android/Desktop, HA Companion, русские

@@ -92,7 +92,6 @@ tasklerq/
 │   ├── jobs/
 │   └── admin/
 ├── migrations/
-├── custom_components/tasklerq/
 ├── tests/
 ├── docs/
 ├── openspec/
@@ -100,6 +99,11 @@ tasklerq/
 ├── Dockerfile
 └── README.md
 ```
+
+Компонент Home Assistant живёт в отдельном репозитории
+[`StellaLupus/tasklerq-ha`](https://github.com/StellaLupus/tasklerq-ha): HACS
+берёт версии из его тегов и релизов, а Python-тулчейн и CI не смешиваются с
+Rust-сервером. Контракт API для клиента — [`docs/ha-api.md`](docs/ha-api.md).
 
 ## Документация
 

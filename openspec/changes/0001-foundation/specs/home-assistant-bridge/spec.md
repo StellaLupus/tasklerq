@@ -10,17 +10,18 @@ Tasklerq как сущности `todo` и задачи со сроком как
 
 ### Requirement: Установка и совместимость
 
-Система SHALL поставлять custom component `tasklerq` для Home Assistant,
-устанавливаемый через HACS как пользовательский репозиторий или ручным
-копированием в `custom_components/tasklerq`. Компонент MUST поддерживать Home
-Assistant Container и MUST NOT требовать Supervisor, add-on или ingress.
-Компонент MUST объявлять минимальную поддерживаемую версию Home Assistant и
-MUST предупреждать пользователя при несовместимой версии.
+Система SHALL поставлять custom component `tasklerq` из отдельного репозитория
+`tasklerq-ha` со своими версиями и релизами; установка — HACS как
+пользовательский репозиторий или копирование в `custom_components/tasklerq`.
+Компонент MUST поддерживать Home Assistant Container и MUST NOT требовать
+Supervisor, add-on или ingress. Компонент MUST объявлять минимальную
+поддерживаемую версию Home Assistant и MUST предупреждать пользователя при
+несовместимой версии.
 
 #### Scenario: Установка через HACS
 
-- **WHEN** пользователь добавляет репозиторий Tasklerq в HACS и устанавливает
-  компонент
+- **WHEN** пользователь добавляет репозиторий `tasklerq-ha` в HACS и
+  устанавливает компонент
 - **THEN** Home Assistant обнаруживает `custom_components/tasklerq`
 - **AND** после перезапуска доступна интеграция Tasklerq
 
