@@ -129,6 +129,20 @@ impl HttpAiTask {
             entity_id: entity_id.to_owned(),
         })
     }
+
+    /// Отправить запрос с токеном; транспортная ошибка и ошибочный статус
+    /// становятся [`HaError`].
+    async fn send(&self, request: reqwest::RequestBuilder) -> Result<reqwest::Response, HaError> {
+        let response = request
+            .bearer_auth(self.token.expose())
+            .send()
+            .await
+            .map_err(classify_transport)?;
+        match classify_status(response.status().as_u16()) {
+            Some(error) => Err(error),
+            None => Ok(response),
+        }
+    }
 }
 
 /// `ai_task.<object_id>`: только строчные латинские буквы, цифры и `_`.
@@ -196,16 +210,8 @@ impl AiTask for HttpAiTask {
     async fn check_entity(&self) -> Result<(), HaError> {
         let url = format!("{}/api/states/{}", self.base_url, self.entity_id);
         let response = self
-            .client
-            .get(url)
-            .bearer_auth(self.token.expose())
-            .timeout(CHECK_TIMEOUT)
-            .send()
-            .await
-            .map_err(classify_transport)?;
-        if let Some(error) = classify_status(response.status().as_u16()) {
-            return Err(error);
-        }
+            .send(self.client.get(url).timeout(CHECK_TIMEOUT))
+            .await?;
         let state: StateResponse = response.json().await.map_err(|_| HaError::BadResponse)?;
         // У ai_task состояние — время последнего использования или `unknown`;
         // недоступной сущность делает только `unavailable`.
@@ -231,17 +237,13 @@ impl AiTask for HttpAiTask {
             "structure": request.structure,
         });
         let response = self
-            .client
-            .post(url)
-            .bearer_auth(self.token.expose())
-            .timeout(effective_timeout(timeout))
-            .json(&body)
-            .send()
-            .await
-            .map_err(classify_transport)?;
-        if let Some(error) = classify_status(response.status().as_u16()) {
-            return Err(error);
-        }
+            .send(
+                self.client
+                    .post(url)
+                    .timeout(effective_timeout(timeout))
+                    .json(&body),
+            )
+            .await?;
         let text = response.text().await.map_err(classify_transport)?;
         extract_data(&text)
     }

@@ -26,7 +26,7 @@ Assistant. Бот при этом не обязателен: задачи мож
 - **Home Assistant.** Тонкий custom component: `todo`-сущность на каждый список
   и read-only `calendar` для задач со сроком.
 - **LLM-capture.** Свободный текст → структурированный черновик через
-  `ai_task.generate_data` Home Assistant (Google Gemini). LLM только разбирает;
+  `ai_task.generate_data` Home Assistant (Claude Haiku 5.5 через OpenRouter). LLM только разбирает;
   в Telegram данные применяются после подтверждения.
 - **Capture без бота.** Голос через HA Assist, автоматизации и HTTP API:
   `POST /api/v1/capture`, сервис `tasklerq.capture`, режим `auto` с
@@ -52,7 +52,7 @@ flowchart LR
     APP -->|REST + Bearer| HA[Home Assistant<br/>custom component]
     HA -->|todo / calendar| HAU[HA UI / автоматизации]
     APP -->|ai_task.generate_data| HAI[HA AI Task]
-    HAI -->|structured output| GEM[Google Gemini]
+    HAI -->|structured output| GEM[OpenRouter → Claude Haiku]
     APP -->|snapshot / write| HA
 ```
 
@@ -66,7 +66,7 @@ flowchart LR
 | HTTP | axum + tower + tokio |
 | БД | PostgreSQL 18 (`postgres:18-alpine`), sqlx |
 | Telegram | webhook + собственный RichMessage-адаптер, типы `teloxide-core` |
-| LLM | Home Assistant `ai_task.generate_data`, AI Task `ai_task.google_ai_task_2`, Google Gemini |
+| LLM | Home Assistant `ai_task.generate_data`, AI Task `ai_task.anthropic_claude_haiku_5_5` (OpenRouter, Claude Haiku 5.5) |
 | HA-интеграция | Python custom component, `DataUpdateCoordinator` |
 | Развёртывание | Docker Compose на Synology NAS, PostgreSQL 18 в сети `shared-db`, Synology Reverse Proxy |
 | Наблюдаемость | `tracing` JSON, health/readiness, метрики |
@@ -109,7 +109,7 @@ tasklerq/
 | [`docs/domain-model.md`](docs/domain-model.md) | Таблицы, инварианты, состояния, повторения, timezone. |
 | [`docs/telegram-ux.md`](docs/telegram-ux.md) | Экраны, RichMessage, callback-токены, тексты. |
 | [`docs/llm-capture.md`](docs/llm-capture.md) | Промпт, схема, валидация, подтверждение, деградация. |
-| [`docs/home-assistant.md`](docs/home-assistant.md) | Установка компонента, сущности, Gemini, ограничения. |
+| [`docs/home-assistant.md`](docs/home-assistant.md) | Установка компонента, сущности, LLM, ограничения. |
 | [`docs/deployment.md`](docs/deployment.md) | Docker, PostgreSQL, TLS, webhook, backup, runbooks. |
 | [`docs/roadmap.md`](docs/roadmap.md) | Этапы, backlog, метрики, риски. |
 

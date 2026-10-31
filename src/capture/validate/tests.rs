@@ -308,6 +308,28 @@ fn ambiguous_assignee_is_not_guessed() {
 }
 
 #[test]
+fn auto_mode_drops_an_unknown_or_ambiguous_assignee_instead_of_failing() {
+    let mut context = context();
+    context.members = vec![
+        member("Алексей", Some("alex_a")),
+        member("Алексей", Some("alex_b")),
+    ];
+    for name in ["Мария", "Алексей"] {
+        let mut raw = task();
+        raw.assignee = Some(name.to_owned());
+
+        let draft = validate_item_in(&context, ItemSource::HaVoice, raw, ValidationMode::Auto);
+
+        assert_eq!(codes(&draft), Vec::<&str>::new(), "{name}");
+        assert!(draft.assignee_candidates.is_empty(), "{name}");
+        assert!(
+            draft.item.expect("item").assignee_user_id.is_none(),
+            "{name}: the item must be created without an assignee"
+        );
+    }
+}
+
+#[test]
 fn self_reference_is_resolved_to_the_author() {
     let context = context();
     let author = context.author.clone().expect("author");

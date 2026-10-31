@@ -23,5 +23,6 @@ opencode.json
 # Кэш индекса Token Savior
 .token-savior-cache.json
 
-# Артефакты конвейера opencode <-> Claude
-.dual-loop/
+# Конвейер llm-loop (github.com/StellaLupus/llm-loop-coder): не часть проекта
+.llm-loop/
+.llm-loop.toml

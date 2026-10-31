@@ -69,6 +69,26 @@ async fn get_with_deleted(
     .ok_or(DomainError::NotFound)
 }
 
+/// Виды списков household, включая мягко удалённые.
+///
+/// Нужен повторному подтверждению capture: его элементы переживают удаление
+/// списка, и ответ обязан сохранить их исходный вид. Один запрос на весь
+/// capture вместо запроса на каждый элемент.
+pub async fn kinds(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    list_ids: &[Uuid],
+) -> Result<Vec<(Uuid, ListKind)>, DomainError> {
+    let kinds = sqlx::query_as::<_, (Uuid, ListKind)>(
+        "SELECT id, kind FROM lists WHERE household_id = $1 AND id = ANY($2)",
+    )
+    .bind(household_id)
+    .bind(list_ids)
+    .fetch_all(conn)
+    .await?;
+    Ok(kinds)
+}
+
 /// Создать дополнительный список.
 ///
 /// Проверка лимита сериализуется блокировкой строки household (`FOR NO KEY

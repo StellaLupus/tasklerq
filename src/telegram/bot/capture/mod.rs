@@ -289,15 +289,12 @@ async fn saved(ctx: &mut Ctx<'_>, view: &DraftView) -> Result<Ui, Fail> {
         ru::positions(i64::try_from(created.len()).unwrap_or(0))
     ));
     for item in &created {
-        let icon = match view
+        let icon = view
             .context
             .lists
             .iter()
             .find(|list| list.id == item.list_id)
-        {
-            Some(list) => kind_icon(list.kind),
-            None => "•",
-        };
+            .map_or("•", |list| kind_icon(list.kind));
         ui = ui.text(format!("{icon} {}", item.title));
     }
 
@@ -478,7 +475,7 @@ async fn open_edit(
 
     let kind = checked.kind;
     let list_id = checked.list_id;
-    let draft_item = seed(raw, &view, ctx.tz);
+    let draft_item = seed(raw, &view);
     forms::open_create(
         ctx,
         ItemForm {
@@ -557,7 +554,7 @@ fn parse_priority(value: &str) -> ItemPriority {
 
 /// Заполнить форму по элементу черновика. Что не удалось понять, остаётся
 /// пустым: пользователь увидит это в предпросмотре и поправит.
-fn seed(raw: &RawItem, view: &DraftView, _tz: chrono_tz::Tz) -> ItemDraft {
+fn seed(raw: &RawItem, view: &DraftView) -> ItemDraft {
     let date = raw.due_date.as_deref().and_then(parse_date);
     let time = date.and(raw.due_time.as_deref().and_then(parse_time));
     let assignee = raw.assignee_id.or_else(|| {

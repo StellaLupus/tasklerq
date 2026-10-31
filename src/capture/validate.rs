@@ -113,17 +113,41 @@ impl ValidatedDraft {
     }
 }
 
+/// Насколько строго проверять необязательные поля.
+///
+/// Распознавание списка по умолчанию и отбрасывание пустых необязательных
+/// полей одинаковы в обоих режимах. `Auto` дополнительно снимает неизвестного
+/// или неоднозначного исполнителя: внешний capture применяется без
+/// подтверждения и не может задать уточняющий вопрос.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationMode {
+    /// Ошибки элемента не исправляются (Telegram и `draft`).
+    Strict,
+    /// Неизвестный или неоднозначный исполнитель снимается.
+    Auto,
+}
+
 /// Проверить разобранный ответ LLM. `source` — источник создаваемых элементов.
 pub fn validate_items(
     context: &CaptureContext,
     source: ItemSource,
     parsed: ParsedResponse,
 ) -> ValidatedDraft {
+    validate_items_in(context, source, parsed, ValidationMode::Strict)
+}
+
+/// Проверить разобранный ответ LLM с явным режимом.
+pub fn validate_items_in(
+    context: &CaptureContext,
+    source: ItemSource,
+    parsed: ParsedResponse,
+    mode: ValidationMode,
+) -> ValidatedDraft {
     ValidatedDraft {
         items: parsed
             .items
             .into_iter()
-            .map(|raw| validate_item(context, source, raw))
+            .map(|raw| validate_item_in(context, source, raw, mode))
             .collect(),
         clarifications: parsed.clarifications,
     }
@@ -131,6 +155,15 @@ pub fn validate_items(
 
 /// Проверить один элемент.
 pub fn validate_item(context: &CaptureContext, source: ItemSource, raw: RawItem) -> DraftItem {
+    validate_item_in(context, source, raw, ValidationMode::Strict)
+}
+
+fn validate_item_in(
+    context: &CaptureContext,
+    source: ItemSource,
+    raw: RawItem,
+    mode: ValidationMode,
+) -> DraftItem {
     let mut errors = Vec::new();
     let today = context.today();
 
@@ -193,22 +226,28 @@ pub fn validate_item(context: &CaptureContext, source: ItemSource, raw: RawItem)
         (None, Some(name)) => match resolve_assignee(context, name) {
             Assignee::Found(id) => (Some(id), Vec::new()),
             Assignee::Unknown => {
-                fail(
-                    &mut errors,
-                    "assignee",
-                    "assignee_unknown",
-                    "Такого участника нет",
-                );
+                if mode == ValidationMode::Strict {
+                    fail(
+                        &mut errors,
+                        "assignee",
+                        "assignee_unknown",
+                        "Такого участника нет",
+                    );
+                }
                 (None, Vec::new())
             }
             Assignee::Ambiguous(candidates) => {
-                fail(
-                    &mut errors,
-                    "assignee",
-                    ASSIGNEE_AMBIGUOUS,
-                    "Уточните исполнителя: подходит несколько участников",
-                );
-                (None, candidates)
+                if mode == ValidationMode::Strict {
+                    fail(
+                        &mut errors,
+                        "assignee",
+                        ASSIGNEE_AMBIGUOUS,
+                        "Уточните исполнителя: подходит несколько участников",
+                    );
+                    (None, candidates)
+                } else {
+                    (None, Vec::new())
+                }
             }
         },
     };
@@ -532,7 +571,7 @@ fn validate_recurrence(
 
     // Дни недели и правило месяца имеют смысл только для своей частоты; у
     // остальных частот их заполняет модель по привычке, и это не ошибка.
-    let weekdays = if freq == Some(RecurrenceFreq::Weekly) {
+    let weekdays: &[i64] = if freq == Some(RecurrenceFreq::Weekly) {
         if raw.weekdays.is_empty() {
             fail(
                 errors,
@@ -548,9 +587,9 @@ fn validate_recurrence(
                 "День недели — от 1 до 7",
             );
         }
-        raw.weekdays.clone()
+        &raw.weekdays
     } else {
-        Vec::new()
+        &[]
     };
 
     let month_rule = if freq == Some(RecurrenceFreq::Monthly) {
@@ -595,8 +634,8 @@ fn validate_recurrence(
         freq: freq?,
         interval: i16::try_from(interval).ok(),
         byweekday: weekdays
-            .into_iter()
-            .filter_map(|day| i16::try_from(day).ok())
+            .iter()
+            .filter_map(|&day| i16::try_from(day).ok())
             .collect(),
         until,
         timezone: None,

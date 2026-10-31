@@ -14,8 +14,8 @@ Tasklerq — семейный сервис, который работает на
 
 Сервис не является SaaS: один экземпляр обслуживает один household (семью).
 Данные хранятся в PostgreSQL, который уже есть на сервере пользователя.
-LLM-разбор выполняет Home Assistant через `ai_task.generate_data` и Google
-Gemini; Tasklerq не вызывает Gemini напрямую. Задачу можно создать из Telegram
+LLM-разбор выполняет Home Assistant через `ai_task.generate_data` (сейчас
+Claude Haiku 5.5 через OpenRouter); Tasklerq не вызывает LLM напрямую. Задачу можно создать из Telegram
 или без него — голосом, автоматизацией или прямым HTTP-запросом.
 
 ### Ограничения
@@ -27,7 +27,7 @@ Gemini; Tasklerq не вызывает Gemini напрямую. Задачу м�
 | Telegram webhook | Нужен публичный HTTPS и reverse proxy. |
 | RichMessage — молодой API | Собственный адаптер и contract-тесты. |
 | HA Container | Custom component, без add-on/ingress. |
-| Gemini через HA | LLM-клиент — HA REST, не прямой API. |
+| LLM через HA | LLM-клиент — HA REST, не прямой API. |
 | Capture без Telegram | Отдельный API, HA-сервис и auto-режим; бот не обязателен. |
 | Семейный масштаб | Монолит, один экземпляр, без шардирования. |
 
@@ -37,7 +37,7 @@ Gemini; Tasklerq не вызывает Gemini напрямую. Задачу м�
 flowchart TB
     subgraph Internet
         TG[Telegram Bot API]
-        GEM[Google Gemini]
+        GEM[OpenRouter → Claude Haiku]
     end
 
     subgraph Host["Synology NAS 192.168.10.110"]
@@ -66,7 +66,7 @@ flowchart TB
 | **Telegram adapter** | RichMessage, вызовы Bot API | reqwest, teloxide-core types |
 | **PostgreSQL** | Source of truth, очередь обновлений, outbox, черновики | PostgreSQL 18 (`postgres:18-alpine`) |
 | **HA custom component** | Мост между REST API и сущностями HA | Python, aiohttp, HA integration |
-| **HA AI Task** | Структурированный вызов Gemini | `ai_task.google_ai_task_2`, `ai_task.generate_data` |
+| **HA AI Task** | Структурированный вызов LLM (Claude Haiku 5.5 через OpenRouter) | `ai_task.anthropic_claude_haiku_5_5`, `ai_task.generate_data` |
 | **Reverse proxy** | TLS, публикация webhook | Synology DSM Reverse Proxy |
 
 ## 3. Потоки данных
@@ -112,7 +112,7 @@ sequenceDiagram
     participant B as Bot
     participant C as Capture service
     participant HA as Home Assistant
-    participant LLM as Gemini
+    participant LLM as LLM (OpenRouter)
     participant DB as PostgreSQL
 
     U->>B: «завтра купить молоко и позвонить маме»
@@ -450,7 +450,7 @@ Telegram ──443──▶ Synology Reverse Proxy ──▶ 127.0.0.1:18080 tas
                     ▲                               │
                     └──────── SQL ─────────────────┤
                                                     ▼
-                                             HA AI Task → Gemini
+                                             HA AI Task → OpenRouter
 ```
 
 - Tasklerq — bridge-контейнер; host-порт `18080` публикуется только на
@@ -542,4 +542,4 @@ Proxy, домен `tasklerq.stellalupus.ru`, бот `@tasklerqbot`, часово
 
 Осталось уточнить:
 
-- бюджет Gemini при квоте 200 разборов в сутки (модель AI Task выбирается в HA).
+- бюджет LLM при квоте 200 разборов в сутки (модель AI Task выбирается в HA).

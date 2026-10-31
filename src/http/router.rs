@@ -5,6 +5,7 @@ use axum::routing::{get, post};
 use sqlx::PgPool;
 
 use super::api;
+use super::api::capture::CaptureState;
 use super::error::ApiError;
 use super::health;
 use super::middleware::request_id;
@@ -20,6 +21,8 @@ pub struct AppState {
     /// Допустимый возраст необработанного обновления Telegram; `None`, если
     /// воркер обновлений не запущен и очередь не проверяется.
     pub queue_lag_limit: Option<chrono::Duration>,
+    /// Внешний capture; `None`, если маршрут выключен.
+    pub capture: Option<CaptureState>,
 }
 
 impl AppState {
@@ -29,7 +32,14 @@ impl AppState {
             pool,
             telegram: None,
             queue_lag_limit: None,
+            capture: None,
         }
+    }
+
+    /// Включить `POST /api/v1/capture`.
+    pub fn with_capture(mut self, capture: CaptureState) -> Self {
+        self.capture = Some(capture);
+        self
     }
 
     /// Считать сервис неготовым, если обновление ждёт обработки дольше `seconds`.
@@ -50,7 +60,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health/live", get(health::live))
         .route("/health/ready", get(health::ready))
-        .nest("/api/v1", api::router())
+        .nest("/api/v1", api::router(&state))
         .route("/webhooks/telegram", post(webhook::receive))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)

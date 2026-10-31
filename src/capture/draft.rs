@@ -13,6 +13,7 @@
 
 use chrono::{DateTime, Days, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sqlx::{Connection, PgConnection};
 use thiserror::Error;
 use uuid::Uuid;
@@ -26,7 +27,7 @@ use crate::domain::models::{
 };
 use crate::domain::validation::{sanitize, validate_new_item};
 use crate::storage::repositories::drafts::{self, Draft, NewDraft};
-use crate::storage::repositories::{households, items, lists, users};
+use crate::storage::repositories::{capture_requests, households, items, lists, users};
 
 /// Источник элементов, созданных из capture с данным источником.
 pub fn item_source(source: CaptureSource) -> ItemSource {
@@ -92,6 +93,46 @@ pub enum DraftError {
     Database(#[from] sqlx::Error),
 }
 
+/// Ошибка сохранения черновика вместе с ответом ключа идемпотентности.
+///
+/// Появляется только на пути с `responder`: ошибка сериализации ответа и
+/// потеря резерва невозможны в [`create`], поэтому Telegram-код их не видит.
+#[derive(Debug, Error)]
+pub enum StoreError {
+    /// Ошибка домена, базы данных или состояния черновика.
+    #[error(transparent)]
+    Draft(#[from] DraftError),
+    /// Ответ capture не удалось сериализовать.
+    #[error("capture response could not be serialized")]
+    Serialize(#[from] serde_json::Error),
+    /// Резерв ключа перехвачен другим запросом.
+    #[error("the idempotency reservation was taken over by another request")]
+    ReservationLost,
+}
+
+impl From<DomainError> for StoreError {
+    fn from(error: DomainError) -> Self {
+        Self::Draft(error.into())
+    }
+}
+
+impl From<sqlx::Error> for StoreError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Draft(DraftError::Database(error))
+    }
+}
+
+impl From<capture_requests::CompleteError> for StoreError {
+    fn from(error: capture_requests::CompleteError) -> Self {
+        match error {
+            capture_requests::CompleteError::Lost => Self::ReservationLost,
+            capture_requests::CompleteError::Database(error) => {
+                Self::Draft(DraftError::Database(error))
+            }
+        }
+    }
+}
+
 /// Содержимое `capture_drafts.parsed`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Stored {
@@ -128,9 +169,18 @@ impl Stored {
     }
 }
 
+/// Построитель сериализованного ответа, который сохраняется в резерве ключа
+/// идемпотентности в той же транзакции, что и строки capture. Ошибка
+/// сериализации не превращается в `null`: вызывающая сторона получает её как
+/// ошибку запроса.
+pub type Responder<'a, T> = Box<dyn FnOnce(&T) -> Result<Value, serde_json::Error> + Send + 'a>;
+
 /// Данные нового черновика.
 #[derive(Debug, Clone)]
 pub struct NewCapture {
+    /// Идентификатор, зарезервированный вызывающей стороной (ключ
+    /// идемпотентности); иначе генерируется новый.
+    pub id: Option<Uuid>,
     /// Household.
     pub household_id: Uuid,
     /// Автор; у голосового capture его нет.
@@ -196,6 +246,15 @@ pub struct Confirmed {
     pub replayed: bool,
 }
 
+/// Результат применения внешнего `auto`.
+#[derive(Debug, Clone)]
+pub struct Applied {
+    /// Строка `capture_drafts`; она же `capture_id` ответа.
+    pub capture_id: Uuid,
+    /// Созданные элементы в порядке разбора.
+    pub items: Vec<Item>,
+}
+
 /// Правка элемента черновика. Строки — «как у LLM»: проверка идёт тем же
 /// кодом, что и для ответа модели.
 #[derive(Debug, Clone, Default)]
@@ -242,31 +301,60 @@ pub async fn load_context_for(
 }
 
 /// Сохранить черновик со сроком жизни 15 минут.
+///
+/// Без `responder` возможны только ошибки вставки (`Domain`), поэтому путь
+/// возвращает [`DomainError`] и не маскирует недостижимые варианты под ошибку
+/// валидации.
 pub async fn create(
     conn: &mut PgConnection,
     capture: NewCapture,
     now: DateTime<Utc>,
 ) -> Result<Draft, DomainError> {
+    drafts::insert(conn, new_draft(capture), now).await
+}
+
+/// Сохранить черновик и ответ для ключа идемпотентности одной транзакцией.
+///
+/// `responder` вызывается после вставки черновика, но до коммита, поэтому ответ
+/// и `capture_drafts` коммитятся вместе. Вызывающая сторона должна передать
+/// соединение внутри транзакции, чтобы обе записи были атомарны, и отметить
+/// резерв через [`capture_requests::Reservation::settle`] после коммита.
+pub async fn create_with_responder(
+    conn: &mut PgConnection,
+    capture: NewCapture,
+    now: DateTime<Utc>,
+    responder: Option<Responder<'_, Draft>>,
+    mut reservation: Option<&mut capture_requests::Reservation>,
+) -> Result<Draft, StoreError> {
+    if let Some(reservation) = reservation.as_deref_mut() {
+        reservation.verify(conn).await?;
+    }
+    let draft = drafts::insert(conn, new_draft(capture), now).await?;
+    if let (Some(responder), Some(reservation)) = (responder, reservation) {
+        let response = responder(&draft)?;
+        reservation.complete(conn, &response, now).await?;
+    }
+    Ok(draft)
+}
+
+/// Строка `capture_drafts` из данных capture: общая часть [`create`],
+/// [`create_with_responder`] и [`apply_auto`].
+fn new_draft(capture: NewCapture) -> NewDraft {
     let stored = Stored::from_parsed(capture.parsed);
-    drafts::insert(
-        conn,
-        NewDraft {
-            id: Uuid::now_v7(),
-            household_id: capture.household_id,
-            user_id: capture.user_id,
-            chat_id: capture.chat_id,
-            source: capture.source,
-            mode: capture.mode,
-            idempotency_key: capture.idempotency_key,
-            request_hash: capture.request_hash,
-            raw_text: sanitize(&capture.raw_text),
-            parsed: stored.to_value(),
-            fallback: capture.fallback,
-            prompt_version: capture.prompt_version,
-        },
-        now,
-    )
-    .await
+    NewDraft {
+        id: capture.id.unwrap_or_else(Uuid::now_v7),
+        household_id: capture.household_id,
+        user_id: capture.user_id,
+        chat_id: capture.chat_id,
+        source: capture.source,
+        mode: capture.mode,
+        idempotency_key: capture.idempotency_key,
+        request_hash: capture.request_hash,
+        raw_text: sanitize(&capture.raw_text),
+        parsed: stored.to_value(),
+        fallback: capture.fallback,
+        prompt_version: capture.prompt_version,
+    }
 }
 
 /// Черновик с проверенными элементами; чужой черновик — `NotFound`.
@@ -324,8 +412,7 @@ pub async fn edit_item(
         .get_mut(index)
         .ok_or(DraftError::NoSuchItem(index))?;
     apply(raw, edit);
-    let draft = persist(&mut tx, draft, &stored).await?;
-    let view = build_view(&mut tx, draft, now).await?;
+    let view = save_and_view(&mut tx, draft, stored, now).await?;
     tx.commit().await?;
     Ok(view)
 }
@@ -345,8 +432,7 @@ pub async fn remove_item(
         return Err(DraftError::NoSuchItem(index));
     }
     stored.items.remove(index);
-    let draft = persist(&mut tx, draft, &stored).await?;
-    let view = build_view(&mut tx, draft, now).await?;
+    let view = save_and_view(&mut tx, draft, stored, now).await?;
     tx.commit().await?;
     Ok(view)
 }
@@ -369,8 +455,7 @@ pub async fn replace_item(
         .ok_or(DraftError::NoSuchItem(index))?;
     scrub(&mut item);
     *slot = item;
-    let draft = persist(&mut tx, draft, &stored).await?;
-    let view = build_view(&mut tx, draft, now).await?;
+    let view = save_and_view(&mut tx, draft, stored, now).await?;
     tx.commit().await?;
     Ok(view)
 }
@@ -447,7 +532,7 @@ async fn answer(
     let mut tx = conn.begin().await?;
     let draft = open_for_change(&mut tx, household_id, draft_id, now).await?;
     let mut stored = Stored::read(&draft)?;
-    reserve_clarification(&stored)?;
+    ensure_clarification_left(&stored)?;
 
     let view = build_view(&mut tx, draft.clone(), now).await?;
     let checked = view
@@ -470,7 +555,7 @@ async fn answer(
     Ok(view)
 }
 
-fn reserve_clarification(stored: &Stored) -> Result<(), DraftError> {
+fn ensure_clarification_left(stored: &Stored) -> Result<(), DraftError> {
     if clarifications_left(stored.clarifications_answered) == 0 {
         Err(DraftError::ClarificationLimit)
     } else {
@@ -545,35 +630,15 @@ pub async fn confirm(
         return Err(DraftError::Invalid(invalid));
     }
 
-    let today = view.context.today();
-    let timezone = view.context.timezone.name();
-    let mut created = Vec::with_capacity(view.validated.items.len());
-    for draft_item in view.validated.items {
-        let Some(new_item) = draft_item.item else {
-            return Err(DraftError::Invalid(Vec::new()));
-        };
-        let list_kind = view
-            .context
-            .lists
-            .iter()
-            .find(|list| list.id == new_item.list_id)
-            .map(|list| list.kind)
-            .ok_or(DomainError::NotFound)?;
-        let list_id = new_item.list_id;
-        let assignee = new_item.assignee_user_id;
-        let validated = validate_new_item(list_kind, timezone, new_item, today)?;
-        let item = items::create(
-            &mut tx,
-            household_id,
-            actor,
-            list_id,
-            validated,
-            assignee,
-            now,
-        )
-        .await?;
-        created.push(item);
-    }
+    let mut created = create_items(
+        &mut tx,
+        household_id,
+        &view.context,
+        view.validated.items,
+        actor,
+        now,
+    )
+    .await?;
 
     let ids: Vec<Uuid> = created.iter().map(|item| item.id).collect();
     drafts::link_items(&mut tx, household_id, draft_id, &ids).await?;
@@ -588,6 +653,97 @@ pub async fn confirm(
         items: created,
         replayed: false,
     })
+}
+
+/// Применить внешний `auto` одной транзакцией.
+///
+/// Строка `capture_drafts` сразу пишется в статусе `applied`, затем в той же
+/// транзакции создаются элементы (вместе с их событиями) и привязываются к
+/// capture. Любая ошибка откатывает всё: не остаётся ни элементов, ни событий,
+/// ни строки capture. Ответ для ключа идемпотентности пишется в той же
+/// транзакции через `responder`.
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_auto(
+    conn: &mut PgConnection,
+    capture: NewCapture,
+    actor: &Actor,
+    context: &CaptureContext,
+    items: Vec<DraftItem>,
+    now: DateTime<Utc>,
+    responder: Option<Responder<'_, Applied>>,
+    mut reservation: Option<&mut capture_requests::Reservation>,
+) -> Result<Applied, StoreError> {
+    let household_id = capture.household_id;
+    let current = new_draft(capture);
+
+    let mut tx = conn.begin().await?;
+    if let Some(reservation) = reservation.as_deref_mut() {
+        reservation.verify(&mut tx).await?;
+    }
+    let draft = drafts::insert_applied(&mut tx, current, now).await?;
+
+    let created = create_items(&mut tx, household_id, context, items, actor, now).await?;
+    let ids: Vec<Uuid> = created.iter().map(|item| item.id).collect();
+    drafts::link_items(&mut tx, household_id, draft.id, &ids).await?;
+
+    let mut applied = Applied {
+        capture_id: draft.id,
+        items: created,
+    };
+    let mut completed = false;
+    if let (Some(responder), Some(reservation)) = (responder, reservation.as_deref_mut()) {
+        let response = responder(&applied)?;
+        reservation.complete(&mut tx, &response, now).await?;
+        completed = true;
+    }
+
+    tx.commit().await?;
+
+    // Ответ и элементы закоммичены вместе: освобождать резерв нельзя, даже
+    // если вызывающая сторона потом обнаружит расхождение в ответе.
+    if completed && let Some(reservation) = reservation {
+        reservation.settle();
+    }
+
+    for item in &mut applied.items {
+        item.capture_id = Some(draft.id);
+    }
+    Ok(applied)
+}
+
+/// Создать элементы проверенного черновика в уже открытой транзакции.
+///
+/// Общая часть [`confirm`] и [`apply_auto`]: доменная проверка повторяется,
+/// чтобы репозиторий и валидация не разошлись.
+async fn create_items(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    context: &CaptureContext,
+    items: Vec<DraftItem>,
+    actor: &Actor,
+    now: DateTime<Utc>,
+) -> Result<Vec<Item>, DraftError> {
+    let today = context.today();
+    let timezone = context.timezone.name();
+    let mut created = Vec::with_capacity(items.len());
+    for draft_item in items {
+        let Some(new_item) = draft_item.item else {
+            return Err(DraftError::Invalid(Vec::new()));
+        };
+        let list_kind = context
+            .lists
+            .iter()
+            .find(|list| list.id == new_item.list_id)
+            .map(|list| list.kind)
+            .ok_or(DomainError::NotFound)?;
+        let list_id = new_item.list_id;
+        let assignee = new_item.assignee_user_id;
+        let validated = validate_new_item(list_kind, timezone, new_item, today)?;
+        let item =
+            items::create(conn, household_id, actor, list_id, validated, assignee, now).await?;
+        created.push(item);
+    }
+    Ok(created)
 }
 
 /// Отменить черновик. Повторная отмена и отмена истёкшего — не ошибка;
@@ -705,11 +861,7 @@ fn apply(raw: &mut RawItem, edit: ItemEdit) {
     }
     set(&mut raw.due_date, edit.due_date);
     set(&mut raw.due_time, edit.due_time);
-    match edit.quantity {
-        Field::Missing => {}
-        Field::Null => raw.quantity = None,
-        Field::Value(value) => raw.quantity = Some(value),
-    }
+    set(&mut raw.quantity, edit.quantity);
     if let Some(tags) = edit.tags {
         raw.tags = tags;
     }

@@ -6,6 +6,7 @@ use sqlx::PgPool;
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 
+use crate::capture::breaker::CircuitBreaker;
 use crate::config::{Config, LlmConfig, TelegramMode};
 use crate::home_assistant::{AiTask, HttpAiTask};
 
@@ -38,6 +39,8 @@ pub async fn start(
     config: &Config,
     pool: &PgPool,
     shutdown: watch::Receiver<bool>,
+    ai: Option<Arc<dyn AiTask>>,
+    breaker: Arc<CircuitBreaker>,
 ) -> Result<Option<Runtime>, StartError> {
     let telegram = &config.telegram;
     let Some(token) = telegram.bot_token.clone() else {
@@ -75,11 +78,11 @@ pub async fn start(
         TelegramMode::Disabled => {}
     }
 
-    let ai = build_ai(&config.llm);
     let bot = Bot::new(telegram.bot_username.clone()).with_llm_capture(ai.is_some());
     if let Some(ai) = ai {
         let capture = CaptureWorker::new(pool.clone(), ai, bot.clone(), wake_outbox.clone())
-            .with_quota(config.llm.daily_quota);
+            .with_quota(config.llm.daily_quota)
+            .with_breaker(breaker);
         tasks.push(tokio::spawn(capture.run(shutdown.clone())));
     }
     let updates = UpdateWorker::new(
@@ -99,7 +102,7 @@ pub async fn start(
 
 /// Клиент Home Assistant для разбора текста; `None`, если разбор выключен или
 /// настроен неверно (тогда свободный текст идёт в быстрое добавление).
-fn build_ai(llm: &LlmConfig) -> Option<Arc<dyn AiTask>> {
+pub fn build_ai(llm: &LlmConfig) -> Option<Arc<dyn AiTask>> {
     if !llm.enabled {
         return None;
     }

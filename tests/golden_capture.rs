@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use tasklerq::capture::eval::{
     Baseline, BaselineEntry, Category, GoldenSet, GuardOutcome, MIN_ACCURACY, PhraseResult,
-    check_baseline, judge, prompt_hash,
+    check_baseline, evaluate, judge, prompt_hash,
 };
 use tasklerq::capture::prompt::PROMPT_VERSION;
 
@@ -30,7 +30,7 @@ fn golden() -> GoldenSet {
 }
 
 /// Набор из одной фразы: так юнит-тесты метрики не зависят от данных набора.
-fn judge_one(expected: &Value, clarifications: &Value, response: Value) -> PhraseResult {
+fn one_phrase(expected: &Value, clarifications: &Value) -> GoldenSet {
     let text = json!({
         "version": 1,
         "context": serde_json::from_str::<Value>(CONTEXT).expect("context"),
@@ -41,7 +41,11 @@ fn judge_one(expected: &Value, clarifications: &Value, response: Value) -> Phras
             "expect": {"items": expected, "clarifications": clarifications}
         }]
     });
-    let set = GoldenSet::parse(&text.to_string()).expect("set");
+    GoldenSet::parse(&text.to_string()).expect("set")
+}
+
+fn judge_one(expected: &Value, clarifications: &Value, response: Value) -> PhraseResult {
+    let set = one_phrase(expected, clarifications);
     judge(&set.context, &set.phrases[0], &response)
 }
 
@@ -227,6 +231,103 @@ fn guesses_without_a_clarification_do_not_pass() {
     assert!(asked.passed(), "{:?}", asked.problems);
     assert!(asked.clarifications_ok);
     assert!((asked.accuracy() - 1.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn missing_response_counts_expected_clarifications() {
+    let item = json!([{"title": "Позвонить маме", "kind": "tasks", "list": "Задачи"}]);
+    for (items, clarifications, expected) in [
+        (json!([]), json!(["assignee"]), 1),
+        (item, json!(["due_date"]), 2),
+    ] {
+        let set = one_phrase(&items, &clarifications);
+        let report = evaluate(&set, &Default::default());
+
+        let result = &report.results[0];
+        assert_eq!(result.totals.expected, expected, "элементы и уточнения");
+        assert_eq!(result.accuracy(), 0.0, "фраза без ответа не угадана");
+    }
+}
+
+#[test]
+fn alternative_titles_match_but_other_titles_do_not() {
+    let expected = json!([{
+        "title": "Оплачивать квартиру",
+        "alt_titles": ["Оплатить квартиру"],
+        "kind": "tasks",
+        "list": "Задачи"
+    }]);
+
+    let alt = judge_one(&expected, &json!([]), response("Оплатить квартиру"));
+    assert!(alt.passed(), "{:?}", alt.problems);
+
+    let other = judge_one(&expected, &json!([]), response("Квартира"));
+    assert!(!other.passed());
+}
+
+/// Фраза с одним ожидаемым уточнением и заданным вопросом модели.
+fn judge_question(topic: &str, question: &str) -> PhraseResult {
+    judge_one(
+        &json!([{"title": "Позвонить маме", "kind": "tasks", "list": "Задачи"}]),
+        &json!([topic]),
+        json!({
+            "items": [{"target_kind": "tasks", "title": "Позвонить маме", "target_list": "Задачи"}],
+            "clarifications": [question]
+        }),
+    )
+}
+
+#[test]
+fn due_question_is_recognized_in_any_word_form() {
+    for question in [
+        "На какую дату и время назначена встреча с врачом?",
+        "Уточните время встречи",
+        "Какое число подойдёт?",
+        "До какого срока?",
+    ] {
+        let result = judge_question("due_date", question);
+        assert!(
+            result.clarifications_ok,
+            "{question}: {:?}",
+            result.problems
+        );
+    }
+}
+
+#[test]
+fn words_that_only_contain_a_due_stem_are_not_due_questions() {
+    for question in [
+        "Кому передать документы?",
+        "Что нужно сдать?",
+        "Сделать это вовремя?",
+    ] {
+        let result = judge_question("due_date", question);
+        assert!(!result.clarifications_ok, "{question}");
+    }
+}
+
+#[test]
+fn assignee_question_is_recognized_in_any_word_form() {
+    for question in [
+        "Кому поручить?",
+        "Какому из них поручить?",
+        "Кем это будет сделано?",
+        "Кто-то из вас?",
+    ] {
+        let result = judge_question("assignee", question);
+        assert!(
+            result.clarifications_ok,
+            "{question}: {:?}",
+            result.problems
+        );
+    }
+}
+
+#[test]
+fn member_name_counts_as_assignee_question_next_to_a_verb_like_peredat() {
+    let result = judge_question("assignee", "Пётр или Анна должен передать документы?");
+
+    assert!(result.clarifications_ok, "{:?}", result.problems);
 }
 
 #[test]

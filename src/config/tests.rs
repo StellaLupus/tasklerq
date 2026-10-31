@@ -563,7 +563,7 @@ fn numeric_limits_are_enforced() {
     for (name, too_small, too_large) in [
         ("CAPTURE_VOICE_TIMEOUT_MS", "999", "60001"),
         ("CAPTURE_RATE_LIMIT_PER_MIN", "0", "1001"),
-        ("CAPTURE_MAX_TEXT_CHARS", "99", "16001"),
+        ("CAPTURE_MAX_TEXT_CHARS", "99", "2001"),
         ("QUEUE_MAX_ATTEMPTS", "0", "101"),
         ("QUEUE_READY_LAG_SECONDS", "0", "86401"),
         ("RETENTION_EVENTS_DAYS", "0", "3651"),

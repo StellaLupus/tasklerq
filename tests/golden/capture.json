@@ -198,9 +198,9 @@
       "expect": {
         "items": [
           {
-            "title": "Купить подарки",
-            "kind": "tasks",
-            "list": "Задачи",
+            "title": "Подарки",
+            "kind": "shopping",
+            "list": "Покупки",
             "due_date": "2026-12-31"
           }
         ]
@@ -245,6 +245,7 @@
         "items": [
           {
             "title": "Сделать зарядку",
+            "alt_titles": ["Зарядка"],
             "kind": "tasks",
             "list": "Задачи",
             "due_date": "2026-10-31",
@@ -277,6 +278,7 @@
         "items": [
           {
             "title": "Встреча с врачом",
+            "alt_titles": ["Встретиться с врачом"],
             "kind": "tasks",
             "list": "Задачи",
             "due_date": "2026-11-04",
@@ -293,6 +295,7 @@
         "items": [
           {
             "title": "Принимать витамины",
+            "alt_titles": ["Принять витамины"],
             "kind": "tasks",
             "list": "Задачи",
             "due_date": "2026-10-30",
@@ -309,6 +312,7 @@
         "items": [
           {
             "title": "Поливать цветы",
+            "alt_titles": ["Полить цветы"],
             "kind": "tasks",
             "list": "Задачи",
             "due_date": "2026-10-30",
@@ -325,6 +329,7 @@
         "items": [
           {
             "title": "Ходить в спортзал",
+            "alt_titles": ["Сходить в спортзал"],
             "kind": "tasks",
             "list": "Задачи",
             "due_date": "2026-11-03",
@@ -341,6 +346,7 @@
         "items": [
           {
             "title": "Оплачивать квартиру",
+            "alt_titles": ["Оплатить квартиру", "Оплата квартиры"],
             "kind": "tasks",
             "list": "Задачи",
             "due_date": "2026-10-30",
@@ -411,6 +417,20 @@
       }
     },
     {
+      "id": "assignee-recipient-pyotr",
+      "category": "assignees",
+      "text": "отнести документы Петру",
+      "expect": {
+        "items": [
+          {
+            "title": "Отнести документы Петру",
+            "kind": "tasks",
+            "list": "Задачи"
+          }
+        ]
+      }
+    },
+    {
       "id": "ambiguity-alexey-dishes",
       "category": "ambiguity",
       "text": "поручить Алексею помыть посуду",
@@ -438,7 +458,7 @@
     {
       "id": "ambiguity-alexey-documents",
       "category": "ambiguity",
-      "text": "отнести документы Алексею",
+      "text": "Алексей, отнеси документы",
       "context": {
         "now": "2026-10-30T11:05:00Z",
         "timezone": "Europe/Moscow",
@@ -468,6 +488,7 @@
         "items": [
           {
             "title": "Встретиться с врачом",
+            "alt_titles": ["Встреча с врачом"],
             "kind": "tasks",
             "list": "Задачи",
             "due_date": "2026-10-31"
@@ -482,7 +503,8 @@
       "text": "встреча с врачом",
       "expect": {
         "items": [
-          { "title": "Встреча с врачом", "kind": "tasks", "list": "Задачи" }
+          { "title": "Встреча с врачом",
+            "alt_titles": ["Встретиться с врачом"], "kind": "tasks", "list": "Задачи" }
         ],
         "clarifications": ["due_date"]
       }
@@ -510,6 +532,142 @@
       "category": "garbage",
       "text": "сегодня хорошая погода",
       "expect": { "items": [] }
+    },
+    {
+      "id": "holdout-shopping-potatoes-toothpaste",
+      "category": "shopping",
+      "text": "купить 3 кг картошки и зубную пасту",
+      "expect": {
+        "items": [
+          {
+            "title": "Картошка",
+            "alt_titles": [
+              "Картофель"
+            ],
+            "kind": "shopping",
+            "list": "Покупки"
+          },
+          {
+            "title": "Зубная паста",
+            "kind": "shopping",
+            "list": "Покупки"
+          }
+        ]
+      }
+    },
+    {
+      "id": "holdout-saturday-dacha-leaves",
+      "category": "dates_relative",
+      "text": "в субботу на даче убрать листья",
+      "expect": {
+        "items": [
+          {
+            "title": "Убрать листья",
+            "kind": "tasks",
+            "list": "Дача",
+            "due_date": "2026-10-31"
+          }
+        ]
+      }
+    },
+    {
+      "id": "holdout-in-three-days-subscription",
+      "category": "dates_relative",
+      "text": "через 3 дня продлить подписку",
+      "expect": {
+        "items": [
+          {
+            "title": "Продлить подписку",
+            "kind": "tasks",
+            "list": "Задачи",
+            "due_date": "2026-11-02"
+          }
+        ]
+      }
+    },
+    {
+      "id": "holdout-pyotr-parcel-tomorrow",
+      "category": "assignees",
+      "text": "Пётр, забери посылку завтра до 19:00",
+      "expect": {
+        "items": [
+          {
+            "title": "Забрать посылку",
+            "kind": "tasks",
+            "list": "Задачи",
+            "assignee": "Пётр",
+            "due_date": "2026-10-31",
+            "due_time": "19:00"
+          }
+        ]
+      }
+    },
+    {
+      "id": "holdout-me-tax-november-10",
+      "category": "time_of_day",
+      "text": "напомни мне 10 ноября в 12:00 оплатить налог",
+      "expect": {
+        "items": [
+          {
+            "title": "Оплатить налог",
+            "kind": "tasks",
+            "list": "Задачи",
+            "assignee": "Анна",
+            "due_date": "2026-11-10",
+            "due_time": "12:00"
+          }
+        ]
+      }
+    },
+    {
+      "id": "holdout-sunday-grandma",
+      "category": "recurrence",
+      "text": "каждое воскресенье звонить бабушке",
+      "expect": {
+        "items": [
+          {
+            "title": "Звонить бабушке",
+            "alt_titles": [
+              "Позвонить бабушке"
+            ],
+            "kind": "tasks",
+            "list": "Задачи",
+            "due_date": "2026-11-01",
+            "recurrence": {
+              "freq": "weekly",
+              "weekdays": [
+                7
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "holdout-dentist-thursday",
+      "category": "ambiguity",
+      "text": "приём у стоматолога в четверг",
+      "expect": {
+        "items": [
+          {
+            "title": "Приём у стоматолога",
+            "kind": "tasks",
+            "list": "Задачи",
+            "due_date": "2026-11-05"
+          }
+        ],
+        "clarifications": [
+          "due_date"
+        ]
+      }
+    },
+    {
+      "id": "holdout-garbage-ok",
+      "category": "garbage",
+      "text": "ок, понял",
+      "expect": {
+        "items": []
+      }
     }
   ]
 }

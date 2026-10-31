@@ -179,7 +179,7 @@ Telegram; конфликт версий обрабатывается; голос
   NOT NULL, значения переносятся в идентичности.
 - **Алиасы.** Таблица `user_aliases` (`user_id`, `alias`; UNIQUE
   `(household_id, lower(alias))`). Алиасы попадают в контекст промпта новой
-  версией (`capture-v2`); сервер по-прежнему сам сопоставляет `assignee` с
+  версией (после `capture-v3`); сервер по-прежнему сам сопоставляет `assignee` с
   участниками, при неоднозначности работает уточняющий вопрос.
 - **Говорящий.** В `POST /api/v1/capture` необязательное поле (например,
   `ha_user_id`); `tasklerq.capture` берёт пользователя HA из контекста вызова (у
@@ -287,11 +287,11 @@ Telegram; конфликт версий обрабатывается; голос
 Среда определена: Synology NAS, Synology Reverse Proxy, домен
 `tasklerq.stellalupus.ru`, PostgreSQL 18 в сети `shared-db`, HA Container
 `2026.10.4` в `network_mode: host`, HACS, AI Task
-`ai_task.google_ai_task_2`, бот `@tasklerqbot`, часовой пояс `Europe/Moscow`,
+`ai_task.anthropic_claude_haiku_5_5`, бот `@tasklerqbot`, часовой пояс `Europe/Moscow`,
 хранение `raw_text` 30 дней, backup — Hyper Backup на внешний диск.
 
 Осталось уточнить:
 
-- бюджет Gemini при квоте 200 разборов в сутки;
+- бюджет LLM при квоте 200 разборов в сутки;
 - нужен ли веб-UI уже в v0.2 или позже;
 - нужна ли интеграция с CalDAV в v0.3 или достаточно ICS-экспорта.

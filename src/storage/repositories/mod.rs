@@ -5,6 +5,7 @@
 
 pub mod audit;
 pub mod capture_jobs;
+pub mod capture_requests;
 pub mod drafts;
 pub mod events;
 pub mod households;

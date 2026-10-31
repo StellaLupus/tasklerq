@@ -39,7 +39,7 @@
              └────┬─────┘
                   │ ai_task.generate_data
                   ▼
-             Google Gemini
+             OpenRouter → Claude Haiku
 ```
 
 Принципы:
@@ -60,7 +60,7 @@
 | Reverse Proxy | Запись создана: `HTTPS tasklerq.stellalupus.ru:443` → `http://localhost:18080`; без приложения отвечает `502` | Ничего; при `502` после запуска заменить `localhost` на `127.0.0.1`. |
 | PostgreSQL | `postgres:18-alpine` (18.6), сеть `shared-db`, порт `15433`; роль `tasklerq` (не суперпользователь) и БД `tasklerq` с `pg_trgm 1.6` созданы 2026-10-29 | Пароль из `DATABASE_URL` положить в `.env` (0600). |
 | Home Assistant | `2026.10.4`, host network, HACS | Установить custom component. |
-| AI Task | `ai_task.google_ai_task_2` | Проверить вызов в Developer Tools. |
+| AI Task | `ai_task.anthropic_claude_haiku_5_5` | Проверить вызов в Developer Tools. |
 | Telegram | Бот `@tasklerqbot` создан | Получить токен в BotFather и заполнить `.env`. |
 | Tasklerq | Кода ещё нет | Реализовать по `tasks.md`. |
 
@@ -259,12 +259,12 @@ curl -sS -X POST \
 | `TELEGRAM_MODE` | нет | `webhook` | `webhook`/`polling` (dev)/`disabled` (headless). |
 | `CAPTURE_API_ENABLED` | нет | `true` | Включить `POST /api/v1/capture`. |
 | `CAPTURE_VOICE_TIMEOUT_MS` | нет | `8000` | Таймаут LLM для `source=ha_voice`. |
-| `CAPTURE_VOICE_FALLBACK_RAW` | нет | `true` | Создавать позицию из текста при сбое LLM. |
+| `CAPTURE_VOICE_FALLBACK_RAW` | нет | `true` | Создавать позицию из текста при сбое LLM, таймауте, исчерпанной квоте или открытом предохранителе. Действует на весь внешний `auto`, не только на `ha_voice`; в `draft` fallback не применяется. |
 | `CAPTURE_RATE_LIMIT_PER_MIN` | нет | `10` | Capture в минуту на токен. |
-| `CAPTURE_MAX_TEXT_CHARS` | нет | `2000` | Максимальная длина текста. |
+| `CAPTURE_MAX_TEXT_CHARS` | нет | `2000` | Максимальная длина текста, от 100 до 2000. |
 | `HA_BASE_URL` | при LLM | `http://host.docker.internal:8123` | Home Assistant из контейнера Tasklerq. |
 | `HA_TOKEN` | при LLM | `eyJ...` | Long-lived token HA. |
-| `HA_AI_TASK_ENTITY_ID` | при LLM | `ai_task.google_ai_task_2` | AI Task. |
+| `HA_AI_TASK_ENTITY_ID` | при LLM | `ai_task.anthropic_claude_haiku_5_5` | AI Task. |
 | `LLM_CAPTURE_ENABLED` | нет | `true` | Включить разбор. |
 | `LLM_DAILY_QUOTA` | нет | `200` | Разборов в сутки на household. |
 | `QUEUE_MAX_ATTEMPTS` | нет | `10` | Попытки обработки update. |
@@ -278,6 +278,10 @@ curl -sS -X POST \
 | `RETENTION_AUDIT_DAYS` | нет | `365` | События членства и безопасности, а также использованные, отозванные и истёкшие приглашения. Не меньше 90: столько дней показывает «Журнал». |
 | `RUST_LOG` | нет | `info,tasklerq=debug` | Логи. |
 | `TZ` | нет | `UTC` | Часовой пояс логов. |
+
+`CAPTURE_MAX_TEXT_CHARS` принимает значения от 100 до 2000. В старых
+конфигурациях могли остаться значения 2001–16000: теперь они не проходят
+проверку, и сервис не стартует. Уменьшите значение до 2000 или ниже.
 
 `HA_BASE_URL` — это адрес **Home Assistant для Tasklerq**, а не наоборот.
 Поскольку HA работает в host-режиме, из bridge-контейнера Tasklerq используйте
@@ -568,7 +572,7 @@ curl -fsS http://127.0.0.1:18080/health/ready
 | --- | --- |
 | `/health/ready` ≠ 200 > 2 мин | Проверить БД, очередь, логи. |
 | queue lag > 5 мин | Проверить воркеры и БД. |
-| LLM errors > 20% за 15 мин | Проверить HA AI Task, квоту, Gemini. |
+| LLM errors > 20% за 15 мин | Проверить HA AI Task, квоту, OpenRouter. |
 | webhook 401 > 50 за 5 мин | Проверить секрет и источник запросов. |
 | backup failed | Проверить диск, права, PostgreSQL. |
 | disk > 80% | Очистить старые backup/логи. |
@@ -614,7 +618,7 @@ curl -fsS http://127.0.0.1:18080/health/ready
 - [ ] `Idempotency-Key` уникален; повтор не создаёт дубликаты.
 - [ ] `TELEGRAM_MODE=webhook` в production; для headless — `disabled` без
   `TELEGRAM_BOT_TOKEN`.
-- [ ] AI Task `ai_task.google_ai_task_2` не имеет Assist-инструментов.
+- [ ] AI Task `ai_task.anthropic_claude_haiku_5_5` не имеет Assist-инструментов.
 - [ ] `LLM_CAPTURE_ENABLED` соответствует политике семьи.
 - [ ] Логи не содержат текст сообщений и токены; для capture — только `source`,
   `status`, `capture_id`.
@@ -698,10 +702,10 @@ curl -fsS http://127.0.0.1:18080/health/ready
 
 ### 16.8. LLM не работает
 
-1. Проверьте `HA_AI_TASK_ENTITY_ID=ai_task.google_ai_task_2`.
+1. Проверьте `HA_AI_TASK_ENTITY_ID=ai_task.anthropic_claude_haiku_5_5`.
 2. Вызовите `ai_task.generate_data` в Developer Tools.
 3. Проверьте `HA_TOKEN` и срок действия.
-4. Проверьте квоту Gemini и лимиты.
+4. Проверьте баланс и лимиты OpenRouter.
 5. Посмотрите `llm_runs` (без текста).
 6. При необходимости `LLM_CAPTURE_ENABLED=false` — ручная форма.
 
@@ -774,8 +778,7 @@ openspec validate --strict
 
 ## 18. Что осталось уточнить
 
-- Бюджет Gemini при квоте `200` разборов в сутки; модель AI Task выбирается в
-  HA (в conversation-подынтеграциях видны `models/gemini-3.5-flash-lite` и
-  `models/gemini-3.7-flash`).
+- Бюджет LLM при квоте `200` разборов в сутки; модель AI Task выбирается в
+  HA (сейчас Claude Haiku 5.5 через OpenRouter, ~$0.0003 за разбор).
 - Инфраструктура готова: домен, reverse proxy, сертификат, роль и БД `tasklerq`.
   Блокирующих вопросов до реализации нет.

@@ -512,7 +512,7 @@ pub(super) fn to_json<T: serde::Serialize>(value: &T) -> Result<serde_json::Valu
     serde_json::to_value(value).map_err(|error| sqlx::Error::Encode(Box::new(error)))
 }
 
-fn into_sqlx(error: DomainError) -> sqlx::Error {
+pub(super) fn into_sqlx(error: DomainError) -> sqlx::Error {
     match error {
         DomainError::Database(error) => error,
         other => sqlx::Error::Protocol(format!("unexpected domain error: {other}")),

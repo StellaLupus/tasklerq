@@ -26,9 +26,7 @@ use uuid::Uuid;
 use super::context::{CaptureContext, ListRef, MemberRef};
 use super::prompt;
 use super::schema::parse_response;
-use super::validate::{
-    ASSIGNEE_AMBIGUOUS, DATE_INVALID, DATE_PAST, DraftItem, ValidatedDraft, validate_items,
-};
+use super::validate::{DraftItem, ValidatedDraft, validate_items};
 use crate::domain::models::{ItemSource, ListKind, MonthRule, RecurrenceFreq, RecurrenceInput};
 use crate::domain::recurrence::parse_timezone;
 
@@ -102,16 +100,17 @@ impl ContextSpec {
                 username: member.username.clone(),
             })
             .collect();
-        let author = match &self.author {
-            None => None,
-            Some(name) => Some(
+        let author = self
+            .author
+            .as_ref()
+            .map(|name| {
                 members
                     .iter()
                     .find(|member| &member.display_name == name)
                     .cloned()
-                    .ok_or_else(|| format!("автор «{name}» не входит в участников"))?,
-            ),
-        };
+                    .ok_or_else(|| format!("автор «{name}» не входит в участников"))
+            })
+            .transpose()?;
         Ok(CaptureContext {
             now,
             timezone,
@@ -179,6 +178,10 @@ pub struct Expectation {
 pub struct ExpectedItem {
     /// Заголовок.
     pub title: String,
+    /// Равноценные формулировки заголовка: «Оплатить квартиру» вместо
+    /// «Оплачивать квартиру» — не ошибка разбора.
+    #[serde(default)]
+    pub alt_titles: Vec<String>,
     /// Тип списка.
     pub kind: ListKind,
     /// Название списка.
@@ -406,8 +409,10 @@ pub fn evaluate(set: &GoldenSet, responses: &BTreeMap<String, Value>) -> Report 
             None => PhraseResult {
                 id: phrase.id.clone(),
                 category: phrase.category,
+                // Как в `judge`: ожидаемые уточнения тоже в знаменателе, иначе
+                // фраза без ответа не снижает точность.
                 totals: Totals {
-                    expected: phrase.expect.items.len(),
+                    expected: phrase.expect.items.len() + phrase.expect.clarifications.len(),
                     ..Totals::default()
                 },
                 clarifications_ok: false,
@@ -423,11 +428,12 @@ pub fn evaluate(set: &GoldenSet, responses: &BTreeMap<String, Value>) -> Report 
 pub fn judge(default_context: &ContextSpec, phrase: &GoldenPhrase, data: &Value) -> PhraseResult {
     let expected_items = phrase.expect.items.len();
     let expected_topics = phrase.expect.clarifications.len();
+    let expected = expected_items + expected_topics;
     let mut result = PhraseResult {
         id: phrase.id.clone(),
         category: phrase.category,
         totals: Totals {
-            expected: expected_items + expected_topics,
+            expected,
             ..Totals::default()
         },
         clarifications_ok: expected_topics == 0,
@@ -498,7 +504,7 @@ pub fn judge(default_context: &ContextSpec, phrase: &GoldenPhrase, data: &Value)
     // без вопроса снижает точность, а не только помечает фразу.
     result.totals = Totals {
         matched: matched + clarifications_matched,
-        expected: expected_items + expected_topics,
+        expected,
         extra,
     };
 
@@ -561,7 +567,10 @@ impl ActualItem {
 
 /// Совпадение одного ожидаемого элемента с фактическим.
 fn item_matches(expected: &ExpectedItem, actual: &ActualItem) -> bool {
-    fold(&expected.title) == fold(&actual.title)
+    let title = fold(&actual.title);
+    std::iter::once(&expected.title)
+        .chain(&expected.alt_titles)
+        .any(|candidate| fold(candidate) == title)
         && expected.kind == actual.kind
         && fold(&expected.list) == actual.list.as_deref().map(fold).unwrap_or_default()
         && expected.assignee.as_deref().map(fold) == actual.assignee.as_deref().map(fold)
@@ -664,14 +673,11 @@ fn actual_topics(
 ) -> BTreeSet<ClarificationTopic> {
     let mut topics = BTreeSet::new();
     for item in &validated.items {
-        for error in &item.errors {
-            if error.code == ASSIGNEE_AMBIGUOUS {
-                topics.insert(ClarificationTopic::Assignee);
-            }
-            if error.field == "due_date" && (error.code == DATE_PAST || error.code == DATE_INVALID)
-            {
-                topics.insert(ClarificationTopic::DueDate);
-            }
+        if item.has_assignee_question() {
+            topics.insert(ClarificationTopic::Assignee);
+        }
+        if item.has_date_question() {
+            topics.insert(ClarificationTopic::DueDate);
         }
     }
     for question in &validated.clarifications {
@@ -687,21 +693,33 @@ fn actual_topics(
 /// исполнителя только если вопрос не про дату: «когда позвонить Алексею?» —
 /// это вопрос о времени, а не о том, кому звонить.
 fn clarification_topics(question: &str, context: &CaptureContext) -> BTreeSet<ClarificationTopic> {
-    const DUE: [&str; 8] = [
-        "когда",
-        "во сколько",
-        "какого числа",
-        "какой день",
-        "какое время",
-        "дата",
-        "срок",
-        "deadline",
-    ];
-    const ASSIGNEE: [&str; 5] = ["кто", "кому", "кого", "исполнител", "участник"];
+    // Сравниваются слова, а не подстроки: «дат» нашлось бы в «передать» и
+    // «сдать», «врем» — в «вовремя». Формы «даты» перечислены явно, у
+    // остальных основ достаточно начала слова: «время», «числа», «сроки».
+    const DUE_WORDS: [&str; 7] = ["когда", "дата", "дату", "даты", "дате", "датой", "deadline"];
+    const DUE_PREFIXES: [&str; 3] = ["врем", "числ", "срок"];
+    const DUE_PHRASES: [[&str; 2]; 2] = [["во", "сколько"], ["какой", "день"]];
+    const ASSIGNEE_WORDS: [&str; 5] = ["кто", "кому", "кого", "какому", "кем"];
+    const ASSIGNEE_PREFIXES: [&str; 2] = ["исполнител", "участник"];
 
     let text = fold(question);
-    let asks_due = DUE.iter().any(|needle| text.contains(needle));
-    let asks_assignee = ASSIGNEE.iter().any(|needle| text.contains(needle));
+    let words: Vec<&str> = text
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let has_word = |list: &[&str]| words.iter().any(|word| list.contains(word));
+    let has_prefix = |list: &[&str]| {
+        words
+            .iter()
+            .any(|word| list.iter().any(|prefix| word.starts_with(prefix)))
+    };
+
+    let asks_due = has_word(&DUE_WORDS)
+        || has_prefix(&DUE_PREFIXES)
+        || words
+            .windows(2)
+            .any(|pair| DUE_PHRASES.iter().any(|phrase| pair == phrase));
+    let asks_assignee = has_word(&ASSIGNEE_WORDS) || has_prefix(&ASSIGNEE_PREFIXES);
     let names_member = !asks_due
         && context.members.iter().any(|member| {
             let name = fold(&member.display_name);
@@ -743,7 +761,7 @@ pub struct BaselineEntry {
     pub passed: usize,
 }
 
-/// Baseline по версиям промпта: `{"capture-v2": {...}}`.
+/// Baseline по версиям промпта: `{"capture-v3": {...}}`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Baseline(pub BTreeMap<String, BaselineEntry>);

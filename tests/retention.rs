@@ -454,3 +454,42 @@ async fn retention_purges_finished_telegram_data_but_keeps_pending() {
     .expect("forms");
     assert_eq!(forms, 1);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_purges_capture_request_reservations_with_the_drafts() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let old = now - Duration::days(8);
+    let recent = now - Duration::days(1);
+
+    for (key, created_at) in [("old", old), ("recent", recent)] {
+        sqlx::query(
+            "INSERT INTO capture_requests (
+                 household_id, source, idempotency_key, request_hash, capture_id,
+                 response, created_at, completed_at
+             )
+             VALUES ($1, 'api', $2, 'hash', $3, NULL, $4, NULL)",
+        )
+        .bind(household.household_id)
+        .bind(key)
+        .bind(Uuid::now_v7())
+        .bind(created_at)
+        .execute(&db.pool)
+        .await
+        .expect("capture request");
+    }
+
+    let stats = retention::run(&db.pool, &config(), now)
+        .await
+        .expect("retention");
+
+    assert_eq!(stats.purged_capture_requests, 1);
+    let remaining: Vec<(String,)> =
+        sqlx::query_as("SELECT idempotency_key FROM capture_requests WHERE household_id = $1")
+            .bind(household.household_id)
+            .fetch_all(&db.pool)
+            .await
+            .expect("remaining reservations");
+    assert_eq!(remaining, [("recent".to_owned(),)]);
+}

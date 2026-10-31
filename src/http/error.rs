@@ -25,6 +25,8 @@ pub enum ErrorCode {
     NotFound,
     /// Конфликт версий или состояния.
     Conflict,
+    /// Ресурс больше не доступен: например, срок жизни черновика истёк.
+    Gone,
     /// Превышен лимит частоты.
     RateLimited,
     /// Внутренняя ошибка.
@@ -33,6 +35,8 @@ pub enum ErrorCode {
     ServiceUnavailable,
     /// Тело запроса слишком велико.
     PayloadTooLarge,
+    /// Неподдерживаемый тип тела запроса.
+    UnsupportedMediaType,
     /// Метод не поддерживается маршрутом.
     MethodNotAllowed,
 }
@@ -46,10 +50,12 @@ impl ErrorCode {
             Self::Forbidden => "forbidden",
             Self::NotFound => "not_found",
             Self::Conflict => "conflict",
+            Self::Gone => "gone",
             Self::RateLimited => "rate_limited",
             Self::InternalError => "internal_error",
             Self::ServiceUnavailable => "service_unavailable",
             Self::PayloadTooLarge => "payload_too_large",
+            Self::UnsupportedMediaType => "unsupported_media_type",
             Self::MethodNotAllowed => "method_not_allowed",
         }
     }
@@ -62,6 +68,7 @@ pub struct ApiError {
     code: ErrorCode,
     message: String,
     details: Value,
+    retry_after: Option<u64>,
 }
 
 impl ApiError {
@@ -72,7 +79,14 @@ impl ApiError {
             code,
             message: message.into(),
             details: json!({}),
+            retry_after: None,
         }
+    }
+
+    /// Добавить заголовок `Retry-After` (секунды).
+    pub fn with_retry_after(mut self, seconds: u64) -> Self {
+        self.retry_after = Some(seconds);
+        self
     }
 
     /// Добавить машиночитаемые детали.
@@ -110,6 +124,11 @@ impl ApiError {
         Self::new(StatusCode::CONFLICT, ErrorCode::Conflict, message)
     }
 
+    /// `410 gone`.
+    pub fn gone(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::GONE, ErrorCode::Gone, message)
+    }
+
     /// `429 rate_limited`.
     pub fn rate_limited(message: impl Into<String>) -> Self {
         Self::new(
@@ -142,6 +161,15 @@ impl ApiError {
         Self::new(
             StatusCode::PAYLOAD_TOO_LARGE,
             ErrorCode::PayloadTooLarge,
+            message,
+        )
+    }
+
+    /// `415 unsupported_media_type`.
+    pub fn unsupported_media_type(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ErrorCode::UnsupportedMediaType,
             message,
         )
     }
@@ -206,6 +234,11 @@ impl IntoResponse for ApiError {
         });
 
         let mut response = (self.status, Json(body)).into_response();
+        if let Some(seconds) = self.retry_after {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, HeaderValue::from(seconds));
+        }
         if let Some(id) = request_id
             && let Ok(value) = HeaderValue::from_str(&id)
         {
@@ -228,6 +261,7 @@ mod tests {
         assert_eq!(ErrorCode::Forbidden.as_str(), "forbidden");
         assert_eq!(ErrorCode::NotFound.as_str(), "not_found");
         assert_eq!(ErrorCode::Conflict.as_str(), "conflict");
+        assert_eq!(ErrorCode::Gone.as_str(), "gone");
         assert_eq!(ErrorCode::RateLimited.as_str(), "rate_limited");
         assert_eq!(ErrorCode::InternalError.as_str(), "internal_error");
         assert_eq!(
@@ -235,6 +269,10 @@ mod tests {
             "service_unavailable"
         );
         assert_eq!(ErrorCode::PayloadTooLarge.as_str(), "payload_too_large");
+        assert_eq!(
+            ErrorCode::UnsupportedMediaType.as_str(),
+            "unsupported_media_type"
+        );
         assert_eq!(ErrorCode::MethodNotAllowed.as_str(), "method_not_allowed");
     }
 
@@ -245,10 +283,12 @@ mod tests {
         assert_eq!(ApiError::forbidden("x").status().as_u16(), 403);
         assert_eq!(ApiError::not_found("x").status().as_u16(), 404);
         assert_eq!(ApiError::conflict("x").status().as_u16(), 409);
+        assert_eq!(ApiError::gone("x").status().as_u16(), 410);
         assert_eq!(ApiError::rate_limited("x").status().as_u16(), 429);
         assert_eq!(ApiError::internal("x").status().as_u16(), 500);
         assert_eq!(ApiError::service_unavailable("x").status().as_u16(), 503);
         assert_eq!(ApiError::payload_too_large("x").status().as_u16(), 413);
+        assert_eq!(ApiError::unsupported_media_type("x").status().as_u16(), 415);
         assert_eq!(ApiError::method_not_allowed("x").status().as_u16(), 405);
     }
 }

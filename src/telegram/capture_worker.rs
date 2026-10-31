@@ -19,17 +19,18 @@ use tokio::sync::{Notify, watch};
 use crate::capture::breaker::CircuitBreaker;
 use crate::capture::context::CaptureContext;
 use crate::capture::draft::{self, NewCapture};
-use crate::capture::prompt::{self, PROMPT_VERSION};
-use crate::capture::schema::{ParseError, ParsedResponse, parse_response};
+use crate::capture::llm::{self, Failure as LlmFailure};
+use crate::capture::prompt::PROMPT_VERSION;
+use crate::capture::schema::{ParseError, ParsedResponse};
 use crate::domain::error::DomainError;
 use crate::domain::models::{CaptureMode, Household, User};
-use crate::home_assistant::{AiTask, GenerateData, MAX_GENERATE_TIMEOUT};
+use crate::home_assistant::{AiTask, MAX_GENERATE_TIMEOUT};
 use crate::storage::repositories::capture_jobs::{self, Failure, Job};
 use crate::storage::repositories::llm_runs::{self, FAILURE, NewRun, SUCCESS};
 use crate::storage::repositories::{households, users};
 
 use super::bot::model::Screen;
-use super::bot::{Bot, Recipient};
+use super::bot::{Bot, Recipient, into_sqlx};
 
 /// Попыток на задание: повторяются только сбои на стороне HA и сети.
 pub const MAX_ATTEMPTS: u32 = 3;
@@ -155,9 +156,8 @@ impl CaptureWorker {
             return self.abandon(&job, "unusable_job", now).await;
         };
 
-        let prepared = match self.prepare(&job, user_id, now).await? {
-            Some(prepared) => prepared,
-            None => return self.abandon(&job, "user_gone", now).await,
+        let Some(prepared) = self.prepare(&job, user_id, now).await? else {
+            return self.abandon(&job, "user_gone", now).await;
         };
 
         // Квота и предохранитель проверяются до вызова: при отказе пользователь
@@ -203,48 +203,22 @@ impl CaptureWorker {
                 .await;
         }
 
-        let instructions = prompt::build_instructions(&prepared.context, &text);
-        let structure = prompt::response_structure();
-        let request = GenerateData {
-            task_name: prompt::TASK_NAME,
-            instructions: &instructions,
-            structure: &structure,
-        };
-        let started = std::time::Instant::now();
-        let generated = self.ai.generate_data(&request, MAX_GENERATE_TIMEOUT).await;
-        let latency_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
-
-        // Результат записывается моментом «после вызова»: к `now` прибавляется
-        // длительность вызова, а не берутся новые часы, чтобы время под
-        // управлением вызывающего (тесты, replay) не расходилось.
-        let now = now + chrono::Duration::from_std(started.elapsed()).unwrap_or_default();
-        match generated {
-            Err(error) => {
-                self.breaker.record_failure(now);
-                tracing::warn!(
-                    error = error.code(),
-                    attempt = job.attempts,
-                    "llm capture request failed"
-                );
-                let run = self.run_record(&job, &prepared, FAILURE, Some(error.code()), latency_ms);
-                self.fail(
-                    &job,
-                    &prepared,
-                    Issue {
-                        text: &text,
-                        code: error.code(),
-                        retryable: error.is_retryable(),
-                        message: FAILED,
-                        run: Some(run),
-                    },
-                    now,
-                )
-                .await
-            }
-            Ok(data) => match parse_response(&data) {
-                Ok(parsed) if parsed.items.is_empty() => {
-                    self.breaker.record_success(now);
-                    let run = self.run_record(&job, &prepared, SUCCESS, None, latency_ms);
+        let outcome = llm::generate(
+            self.ai.as_ref(),
+            &self.breaker,
+            &prepared.context,
+            &text,
+            now,
+            MAX_GENERATE_TIMEOUT,
+        )
+        .await;
+        match outcome {
+            Ok(generated) => {
+                let now = generated.finished_at;
+                let latency_ms = generated.latency_ms;
+                let parsed = generated.parsed;
+                let run = self.run_record(&job, &prepared, SUCCESS, None, latency_ms);
+                if parsed.items.is_empty() {
                     self.fail(
                         &job,
                         &prepared,
@@ -258,42 +232,45 @@ impl CaptureWorker {
                         now,
                     )
                     .await
-                }
-                Ok(parsed) => {
-                    self.breaker.record_success(now);
-                    let run = self.run_record(&job, &prepared, SUCCESS, None, latency_ms);
+                } else {
                     self.finish(&job, &prepared, &text, parsed, now, run).await
                 }
-                Err(error) => {
-                    // Слишком длинный список — ошибка пользователя, а не сбой
-                    // LLM: предохранитель на неё не размыкается.
-                    if matches!(error, ParseError::TooManyItems { .. }) {
-                        self.breaker.record_success(now);
-                    } else {
-                        self.breaker.record_failure(now);
+            }
+            Err(failed) => {
+                let now = failed.finished_at;
+                let failure = failed.failure;
+                match &failure {
+                    LlmFailure::Ai(error) => tracing::warn!(
+                        error = error.code(),
+                        attempt = job.attempts,
+                        "llm capture request failed"
+                    ),
+                    LlmFailure::Parse(error) => {
+                        tracing::warn!(error = error.code(), "llm capture response rejected");
                     }
-                    tracing::warn!(error = error.code(), "llm capture response rejected");
-                    let message = match error {
-                        ParseError::TooManyItems { .. } => TOO_MANY,
-                        _ => FAILED,
-                    };
-                    let run =
-                        self.run_record(&job, &prepared, FAILURE, Some(error.code()), latency_ms);
-                    self.fail(
-                        &job,
-                        &prepared,
-                        Issue {
-                            text: &text,
-                            code: error.code(),
-                            retryable: false,
-                            message,
-                            run: Some(run),
-                        },
-                        now,
-                    )
-                    .await
                 }
-            },
+                let message =
+                    if matches!(failure, LlmFailure::Parse(ParseError::TooManyItems { .. })) {
+                        TOO_MANY
+                    } else {
+                        FAILED
+                    };
+                let code = failure.code();
+                let run = self.run_record(&job, &prepared, FAILURE, Some(code), failed.latency_ms);
+                self.fail(
+                    &job,
+                    &prepared,
+                    Issue {
+                        text: &text,
+                        code,
+                        retryable: failure.is_retryable(),
+                        message,
+                        run: Some(run),
+                    },
+                    now,
+                )
+                .await
+            }
         }
     }
 
@@ -379,6 +356,7 @@ impl CaptureWorker {
         let created = draft::create(
             &mut tx,
             NewCapture {
+                id: None,
                 household_id: job.household_id,
                 user_id: Some(prepared.user.id),
                 chat_id: Some(job.chat_id),
@@ -495,12 +473,5 @@ impl CaptureWorker {
                 () = tokio::time::sleep(Duration::from_millis(500)) => {}
             }
         }
-    }
-}
-
-fn into_sqlx(error: DomainError) -> sqlx::Error {
-    match error {
-        DomainError::Database(error) => error,
-        other => sqlx::Error::Protocol(format!("unexpected domain error: {other}")),
     }
 }
