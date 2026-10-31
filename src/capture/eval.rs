@@ -699,7 +699,7 @@ fn clarification_topics(question: &str, context: &CaptureContext) -> BTreeSet<Cl
     // остальных основ достаточно начала слова: «время», «числа», «сроки».
     const DUE_WORDS: [&str; 7] = ["когда", "дата", "дату", "даты", "дате", "датой", "deadline"];
     const DUE_PREFIXES: [&str; 3] = ["врем", "числ", "срок"];
-    const DUE_PHRASES: [&str; 2] = ["во сколько", "какой день"];
+    const DUE_PHRASES: [[&str; 2]; 2] = [["во", "сколько"], ["какой", "день"]];
     const ASSIGNEE_WORDS: [&str; 5] = ["кто", "кому", "кого", "какому", "кем"];
     const ASSIGNEE_PREFIXES: [&str; 2] = ["исполнител", "участник"];
 
@@ -708,7 +708,6 @@ fn clarification_topics(question: &str, context: &CaptureContext) -> BTreeSet<Cl
         .split(|ch: char| !ch.is_alphanumeric())
         .filter(|word| !word.is_empty())
         .collect();
-    let joined = format!(" {} ", words.join(" "));
     let has_word = |list: &[&str]| words.iter().any(|word| list.contains(word));
     let has_prefix = |list: &[&str]| {
         words
@@ -718,9 +717,9 @@ fn clarification_topics(question: &str, context: &CaptureContext) -> BTreeSet<Cl
 
     let asks_due = has_word(&DUE_WORDS)
         || has_prefix(&DUE_PREFIXES)
-        || DUE_PHRASES
-            .iter()
-            .any(|phrase| joined.contains(&format!(" {phrase} ")));
+        || words
+            .windows(2)
+            .any(|pair| DUE_PHRASES.iter().any(|phrase| pair == phrase));
     let asks_assignee = has_word(&ASSIGNEE_WORDS) || has_prefix(&ASSIGNEE_PREFIXES);
     let names_member = !asks_due
         && context.members.iter().any(|member| {
