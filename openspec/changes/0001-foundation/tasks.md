@@ -83,7 +83,8 @@
 
 - [x] 6.1 Создать скелет `custom_components/tasklerq`: `manifest.json`, `__init__.py`, `const.py`, `services.py`, `services.yaml`, `strings.json`, `translations/ru.json`; проверить загрузку через `pytest-homeassistant-custom-component`.
   - Заметка: реализовано в репозитории `tasklerq-ha`, коммит `cece4dc`.
-- [ ] 6.2 Реализовать config flow (URL + token), проверку токена и household через `GET /api/v1/household`, unique_id household, reauth и options; проверить pytest-тестами.
+- [x] 6.2 Реализовать config flow (URL + token), проверку токена и household через `GET /api/v1/household`, unique_id household, reauth и options; проверить pytest-тестами.
+  - Заметка: реализовано в репозитории `tasklerq-ha`, коммит `bfd54f3`.
 - [ ] 6.3 Реализовать API-клиент и координатор со snapshot `since`, полной синхронизацией и backoff; проверить тестами курсор, восстановление и daily resync.
 - [ ] 6.4 Реализовать `TodoListEntity` на каждый список: create/update/delete/complete, due date/datetime, description и стабильный unique_id; проверить pytest-тестами.
 - [ ] 6.5 Реализовать атрибут `tasklerq_items` с priority/tags/assignee/recurrence; проверить, что нативные обновления не теряют поля.
