@@ -245,27 +245,52 @@ fn alternative_titles_match_but_other_titles_do_not() {
     assert!(!other.passed());
 }
 
+/// Фраза с одним ожидаемым уточнением и заданным вопросом модели.
+fn judge_question(topic: &str, question: &str) -> PhraseResult {
+    judge_one(
+        &json!([{"title": "Позвонить маме", "kind": "tasks", "list": "Задачи"}]),
+        &json!([topic]),
+        json!({
+            "items": [{"target_kind": "tasks", "title": "Позвонить маме", "target_list": "Задачи"}],
+            "clarifications": [question]
+        }),
+    )
+}
+
 #[test]
 fn due_question_is_recognized_in_any_word_form() {
     for question in [
         "На какую дату и время назначена встреча с врачом?",
         "Уточните время встречи",
         "Какое число подойдёт?",
+        "До какого срока?",
     ] {
-        let result = judge_one(
-            &json!([{"title": "Позвонить маме", "kind": "tasks", "list": "Задачи"}]),
-            &json!(["due_date"]),
-            json!({
-                "items": [{"target_kind": "tasks", "title": "Позвонить маме", "target_list": "Задачи"}],
-                "clarifications": [question]
-            }),
-        );
+        let result = judge_question("due_date", question);
         assert!(
             result.clarifications_ok,
             "{question}: {:?}",
             result.problems
         );
     }
+}
+
+#[test]
+fn words_that_only_contain_a_due_stem_are_not_due_questions() {
+    for question in [
+        "Кому передать документы?",
+        "Что нужно сдать?",
+        "Сделать это вовремя?",
+    ] {
+        let result = judge_question("due_date", question);
+        assert!(!result.clarifications_ok, "{question}");
+    }
+}
+
+#[test]
+fn member_name_counts_as_assignee_question_next_to_a_verb_like_peredat() {
+    let result = judge_question("assignee", "Пётр или Анна должен передать документы?");
+
+    assert!(result.clarifications_ok, "{:?}", result.problems);
 }
 
 #[test]

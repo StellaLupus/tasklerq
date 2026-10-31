@@ -2,8 +2,8 @@
   "capture-v3": {
     "accuracy": 1.0,
     "prompt_hash": "e75a284ab8a741bae2d0e4ae7463cdeb23340a877439d0069d51bfc8002ef030",
-    "date": "2026-10-31T00:21:48.441597835+00:00",
-    "phrases": 36,
-    "passed": 36
+    "date": "2026-10-31T00:39:58.921430927+00:00",
+    "phrases": 45,
+    "passed": 45
   }
 }

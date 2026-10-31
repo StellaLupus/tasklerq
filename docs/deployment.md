@@ -39,7 +39,7 @@
              └────┬─────┘
                   │ ai_task.generate_data
                   ▼
-             Google Gemini
+             OpenRouter → Claude Haiku
 ```
 
 Принципы:
@@ -572,7 +572,7 @@ curl -fsS http://127.0.0.1:18080/health/ready
 | --- | --- |
 | `/health/ready` ≠ 200 > 2 мин | Проверить БД, очередь, логи. |
 | queue lag > 5 мин | Проверить воркеры и БД. |
-| LLM errors > 20% за 15 мин | Проверить HA AI Task, квоту, Gemini. |
+| LLM errors > 20% за 15 мин | Проверить HA AI Task, квоту, OpenRouter. |
 | webhook 401 > 50 за 5 мин | Проверить секрет и источник запросов. |
 | backup failed | Проверить диск, права, PostgreSQL. |
 | disk > 80% | Очистить старые backup/логи. |
@@ -705,7 +705,7 @@ curl -fsS http://127.0.0.1:18080/health/ready
 1. Проверьте `HA_AI_TASK_ENTITY_ID=ai_task.anthropic_claude_haiku_5_5`.
 2. Вызовите `ai_task.generate_data` в Developer Tools.
 3. Проверьте `HA_TOKEN` и срок действия.
-4. Проверьте квоту Gemini и лимиты.
+4. Проверьте баланс и лимиты OpenRouter.
 5. Посмотрите `llm_runs` (без текста).
 6. При необходимости `LLM_CAPTURE_ENABLED=false` — ручная форма.
 
@@ -778,8 +778,7 @@ openspec validate --strict
 
 ## 18. Что осталось уточнить
 
-- Бюджет Gemini при квоте `200` разборов в сутки; модель AI Task выбирается в
-  HA (в conversation-подынтеграциях видны `models/gemini-3.5-flash-lite` и
-  `models/gemini-3.7-flash`).
+- Бюджет LLM при квоте `200` разборов в сутки; модель AI Task выбирается в
+  HA (сейчас Claude Haiku 5.5 через OpenRouter, ~$0.0003 за разбор).
 - Инфраструктура готова: домен, reverse proxy, сертификат, роль и БД `tasklerq`.
   Блокирующих вопросов до реализации нет.

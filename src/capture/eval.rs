@@ -694,23 +694,34 @@ fn actual_topics(
 /// исполнителя только если вопрос не про дату: «когда позвонить Алексею?» —
 /// это вопрос о времени, а не о том, кому звонить.
 fn clarification_topics(question: &str, context: &CaptureContext) -> BTreeSet<ClarificationTopic> {
-    // Основы слов, а не словоформы: модель спрашивает «на какую дату»,
-    // «уточните время», «какое число».
-    const DUE: [&str; 8] = [
-        "когда",
-        "во сколько",
-        "какой день",
-        "дат",
-        "врем",
-        "числ",
-        "срок",
-        "deadline",
-    ];
-    const ASSIGNEE: [&str; 5] = ["кто", "кому", "кого", "исполнител", "участник"];
+    // Сравниваются слова, а не подстроки: «дат» нашлось бы в «передать» и
+    // «сдать», «врем» — в «вовремя». Формы «даты» перечислены явно, у
+    // остальных основ достаточно начала слова: «время», «числа», «сроки».
+    const DUE_WORDS: [&str; 7] = ["когда", "дата", "дату", "даты", "дате", "датой", "deadline"];
+    const DUE_PREFIXES: [&str; 3] = ["врем", "числ", "срок"];
+    const DUE_PHRASES: [&str; 2] = ["во сколько", "какой день"];
+    const ASSIGNEE_WORDS: [&str; 3] = ["кто", "кому", "кого"];
+    const ASSIGNEE_PREFIXES: [&str; 2] = ["исполнител", "участник"];
 
     let text = fold(question);
-    let asks_due = DUE.iter().any(|needle| text.contains(needle));
-    let asks_assignee = ASSIGNEE.iter().any(|needle| text.contains(needle));
+    let words: Vec<&str> = text
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let joined = format!(" {} ", words.join(" "));
+    let has_word = |list: &[&str]| words.iter().any(|word| list.contains(word));
+    let has_prefix = |list: &[&str]| {
+        words
+            .iter()
+            .any(|word| list.iter().any(|prefix| word.starts_with(prefix)))
+    };
+
+    let asks_due = has_word(&DUE_WORDS)
+        || has_prefix(&DUE_PREFIXES)
+        || DUE_PHRASES
+            .iter()
+            .any(|phrase| joined.contains(&format!(" {phrase} ")));
+    let asks_assignee = has_word(&ASSIGNEE_WORDS) || has_prefix(&ASSIGNEE_PREFIXES);
     let names_member = !asks_due
         && context.members.iter().any(|member| {
             let name = fold(&member.display_name);

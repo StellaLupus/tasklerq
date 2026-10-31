@@ -135,7 +135,7 @@ fn neutralize_text(text: &str) -> String {
 /// `required` нужен не только ради заполнения. Gemini без обязательных полей
 /// отдаёт огрызки вроде `{"assignee": ""}`. OpenRouter в strict-режиме делает
 /// необязательные поля nullable, а nullable-enum (`["string", "null"]` + enum)
-/// Anthropic и OpenAI отклоняют, поэтому все select-поля обязательны.
+/// Anthropic отклоняет, поэтому все select-поля обязательны.
 pub fn response_structure() -> Value {
     json!({
         "items": {
