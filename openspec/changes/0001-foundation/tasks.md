@@ -93,8 +93,10 @@
   - Заметка: реализовано в репозитории `tasklerq-ha`, коммит `28901ea`.
 - [x] 6.6 Реализовать `CalendarEntity`: all-day/timed события, повторения на горизонте, read-only; проверить pytest-тестами.
   - Заметка: реализовано в репозитории `tasklerq-ha`, коммит `b0d8df9`.
-- [ ] 6.7 Реализовать обработку `409`, `401`, `5xx`, `unavailable` и `HomeAssistantError`; проверить тестами конфликт, reauth и восстановление.
-- [ ] 6.8 Реализовать diagnostics с redaction токена и без контента задач; проверить pytest-тестом.
+- [x] 6.7 Реализовать обработку `409`, `401`, `5xx`, `unavailable` и `HomeAssistantError`; проверить тестами конфликт, reauth и восстановление.
+  - Заметка: реализовано в репозитории `tasklerq-ha`, коммит `556432d`.
+- [x] 6.8 Реализовать diagnostics с redaction токена и без контента задач; проверить pytest-тестом.
+  - Заметка: реализовано в репозитории `tasklerq-ha`, коммит `556432d`.
 - [ ] 6.9 Проверить установку на HA Container (HACS и вручную), появление сущностей и синхронизацию в обе стороны; зафиксировать результат в чек-листе.
 - [ ] 6.10 Реализовать сервисы `tasklerq.capture` (`text`, `source`, `mode`, `hint`, `list_id`, `idempotency_key`), `confirm_capture`, `cancel_capture`, `undo_last_capture` с `SupportsResponse.OPTIONAL`, русскими ошибками и ответом `status`/`speech`/`items`/`draft_id`/`capture_id`; проверить pytest-тестами.
 - [ ] 6.11 Реализовать генерацию `idempotency_key` на вызов сервиса и повторное использование при сетевом retry; проверить тестом отсутствия дубликатов.
