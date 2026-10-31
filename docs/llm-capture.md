@@ -752,9 +752,9 @@ Tasklerq.
 - `llm_runs` — без текста, 90 дней;
 - логи — без текста и ответа LLM.
 
-**Раскрытие:** документация и onboarding сообщают, что текст уходит в Home
-Assistant, а оттуда через OpenRouter провайдеру модели (для Claude Haiku —
-Anthropic, Google Vertex AI или Azure). `LLM_CAPTURE_ENABLED=false` полностью отключает
+**Раскрытие:** документация сообщает, что текст уходит в Home Assistant, а
+оттуда через OpenRouter провайдеру модели (для Claude Haiku — Anthropic,
+Google Vertex AI или Azure). Onboarding в Telegram об этом пока не сообщает. `LLM_CAPTURE_ENABLED=false` полностью отключает
 автоматический разбор и запросы в HA; внешний `auto` переходит на
 fallback-создание (при `CAPTURE_VOICE_FALLBACK_RAW=false` — `503`), `draft`
 получает `503`.

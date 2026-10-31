@@ -700,7 +700,7 @@ fn clarification_topics(question: &str, context: &CaptureContext) -> BTreeSet<Cl
     const DUE_WORDS: [&str; 7] = ["когда", "дата", "дату", "даты", "дате", "датой", "deadline"];
     const DUE_PREFIXES: [&str; 3] = ["врем", "числ", "срок"];
     const DUE_PHRASES: [&str; 2] = ["во сколько", "какой день"];
-    const ASSIGNEE_WORDS: [&str; 3] = ["кто", "кому", "кого"];
+    const ASSIGNEE_WORDS: [&str; 5] = ["кто", "кому", "кого", "какому", "кем"];
     const ASSIGNEE_PREFIXES: [&str; 2] = ["исполнител", "участник"];
 
     let text = fold(question);

@@ -287,6 +287,23 @@ fn words_that_only_contain_a_due_stem_are_not_due_questions() {
 }
 
 #[test]
+fn assignee_question_is_recognized_in_any_word_form() {
+    for question in [
+        "Кому поручить?",
+        "Какому из них поручить?",
+        "Кем это будет сделано?",
+        "Кто-то из вас?",
+    ] {
+        let result = judge_question("assignee", question);
+        assert!(
+            result.clarifications_ok,
+            "{question}: {:?}",
+            result.problems
+        );
+    }
+}
+
+#[test]
 fn member_name_counts_as_assignee_question_next_to_a_verb_like_peredat() {
     let result = judge_question("assignee", "Пётр или Анна должен передать документы?");
 
