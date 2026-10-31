@@ -292,6 +292,20 @@ async fn list_and_item_crud_contract() {
             .expect("event count");
     assert_eq!(events_after, events_before);
 
+    // Проверка `version` идёт раньше определения no-op: тот же PATCH без
+    // фактических изменений, но с устаревшей `version`, даёт `409`, а не `200`.
+    let (status, body) = support::request(
+        &app,
+        Method::PATCH,
+        &format!("/api/v1/items/{item_id}"),
+        Some(&token),
+        Some(json!({"version": 1, "title": "Купить саморезы", "due_date": "2026-11-15"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "stale no-op patch: {body}");
+    assert_eq!(body["error"]["code"], "conflict");
+    assert_eq!(body["error"]["details"]["current_version"], 2);
+
     let (status, body) = support::request(
         &app,
         Method::PATCH,
