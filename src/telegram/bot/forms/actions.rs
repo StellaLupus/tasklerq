@@ -3,7 +3,9 @@
 use uuid::Uuid;
 
 use crate::domain::models::{Item, ItemStatus, List, ListKind, RecurrenceFreq};
-use crate::domain::settings::{NotificationSettingsUpdate, ProfileUpdate};
+use crate::domain::settings::{
+    NotificationSettings, NotificationSettingsUpdate, ProfileUpdate, parse_hhmm,
+};
 use crate::domain::validation::validate_new_item;
 use crate::storage::repositories::{items, lists, members, users};
 use crate::telegram::views::{self};
@@ -11,7 +13,7 @@ use crate::telegram::views::{self};
 use super::state::{advance, apply_choice, apply_text, today};
 use super::{MAX_QUERY, clear, load, open, start_onboarding};
 use crate::telegram::bot::model::{
-    Choice, EditForm, Form, FormAct, ItemDraft, ItemForm, Screen, Step,
+    Choice, EditForm, Form, FormAct, ItemDraft, ItemForm, Screen, Step, TimeField,
 };
 use crate::telegram::bot::onboarding;
 use crate::telegram::bot::{Ctx, Fail};
@@ -44,6 +46,7 @@ pub async fn on_text(ctx: &mut Ctx<'_>, form: Form, text: &str) -> Result<(), Fa
         Form::Rename => rename(ctx, text).await,
         Form::DeleteHousehold => delete_household(ctx, text).await,
         Form::Lead => set_lead(ctx, text).await,
+        Form::Time { field } => set_time(ctx, field, text).await,
     }
 }
 
@@ -105,6 +108,71 @@ async fn set_lead(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
         }
         Err(crate::domain::error::DomainError::Validation(_)) => {
             ctx.banner("Напоминание — от 5 минут до 24 часов (1440 минут).");
+            ctx.present(Screen::Form).await
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn set_time(ctx: &mut Ctx<'_>, field: TimeField, text: &str) -> Result<(), Fail> {
+    let household_id = ctx.household()?.id;
+    let actor = ctx.actor()?;
+    let value = text.trim().to_owned();
+
+    // Сравниваем границы до записи: не полагаемся на текст ошибки домена,
+    // который может измениться независимо от бота.
+    let current = NotificationSettings::from_settings(&ctx.user()?.settings);
+    let (start, end) = match field {
+        TimeField::QuietStart => (value.as_str(), current.quiet_end.as_str()),
+        TimeField::QuietEnd => (current.quiet_start.as_str(), value.as_str()),
+        TimeField::Digest | TimeField::AllDay => ("", ""),
+    };
+    if field != TimeField::Digest
+        && field != TimeField::AllDay
+        && let (Ok(start), Ok(end)) = (parse_hhmm(start, "time"), parse_hhmm(end, "time"))
+        && start == end
+    {
+        ctx.banner("Начало и конец тихих часов не должны совпадать.");
+        return ctx.present(Screen::Form).await;
+    }
+
+    let update = match field {
+        TimeField::Digest => NotificationSettingsUpdate {
+            digest_time: Some(value),
+            ..NotificationSettingsUpdate::default()
+        },
+        TimeField::AllDay => NotificationSettingsUpdate {
+            all_day_time: Some(value),
+            ..NotificationSettingsUpdate::default()
+        },
+        TimeField::QuietStart => NotificationSettingsUpdate {
+            quiet_start: Some(value),
+            ..NotificationSettingsUpdate::default()
+        },
+        TimeField::QuietEnd => NotificationSettingsUpdate {
+            quiet_end: Some(value),
+            ..NotificationSettingsUpdate::default()
+        },
+    };
+    let updated = users::update_profile(
+        &mut *ctx.conn,
+        household_id,
+        &actor,
+        ProfileUpdate {
+            notifications: Some(update),
+            ..ProfileUpdate::default()
+        },
+        ctx.now,
+    )
+    .await;
+    match updated {
+        Ok(user) => {
+            ctx.user = Some(user);
+            clear(ctx).await?;
+            ctx.present(Screen::Notifications).await
+        }
+        Err(crate::domain::error::DomainError::Validation(_)) => {
+            ctx.banner("Введите время в формате HH:MM, например 08:30.");
             ctx.present(Screen::Form).await
         }
         Err(error) => Err(error.into()),
@@ -241,11 +309,13 @@ pub async fn on_action(ctx: &mut Ctx<'_>, act: FormAct) -> Result<(), Fail> {
         | Form::Search
         | Form::Rename
         | Form::DeleteHousehold
-        | Form::Lead => {
+        | Form::Lead
+        | Form::Time { .. } => {
             // У остальных форм одна кнопка — отмена.
             clear(ctx).await?;
             let back = match form {
                 Form::Rename | Form::DeleteHousehold | Form::Lead => Screen::Settings,
+                Form::Time { .. } => Screen::Notifications,
                 _ => Screen::Menu,
             };
             if ctx.user.is_none() {

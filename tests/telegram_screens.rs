@@ -2,11 +2,18 @@
 
 mod support;
 
-use chrono::{Duration, Utc};
+use std::sync::Arc;
+
+use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc};
 use sqlx::PgPool;
 use support::telegram::{Call, Harness};
 use support::{TestHousehold, create_item, db, new_item, next_telegram_id};
 use tasklerq::domain::models::{Actor, UserRole};
+use tasklerq::domain::settings::NotificationSettings;
+use tasklerq::jobs::scheduler::Scheduler;
+use tasklerq::telegram::bot::model::Action;
+use tasklerq::telegram::callbacks::{self, NewToken, Scope};
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 async fn onboarded_named(pool: &PgPool, name: &str) -> Harness {
@@ -46,6 +53,40 @@ async fn household_for(pool: &PgPool, telegram_id: i64) -> TestHousehold {
         tasks_list_id: list("tasks").await,
         shopping_list_id: list("shopping").await,
     }
+}
+
+async fn notification_settings(pool: &PgPool, telegram_id: i64) -> NotificationSettings {
+    let value: serde_json::Value =
+        sqlx::query_scalar("SELECT settings FROM users WHERE telegram_user_id = $1")
+            .bind(telegram_id)
+            .fetch_one(pool)
+            .await
+            .expect("settings");
+    NotificationSettings::from_settings(&value)
+}
+
+async fn outbox_html(pool: &PgPool, chat_id: i64) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT payload->>'html' FROM outbox
+         WHERE chat_id = $1 AND payload ? 'html'
+         ORDER BY seq",
+    )
+    .bind(chat_id)
+    .fetch_all(pool)
+    .await
+    .expect("outbox messages")
+}
+
+fn scheduler(pool: &PgPool) -> Scheduler {
+    Scheduler::new(pool.clone(), Arc::new(Notify::new()))
+}
+
+fn local_utc(timezone: chrono_tz::Tz, date: NaiveDate, hour: u32, minute: u32) -> DateTime<Utc> {
+    timezone
+        .with_ymd_and_hms(date.year(), date.month(), date.day(), hour, minute, 0)
+        .single()
+        .expect("local time")
+        .with_timezone(&Utc)
 }
 
 /// Пригласить участника: возвращает его стенд, уже присоединившийся.
@@ -266,6 +307,230 @@ async fn settings_profile_timezone_and_notifications() {
     bot.assert_screen_contains("от 5 минут");
     bot.text("45").await;
     bot.assert_screen_contains("45");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_edit_notification_times_and_reject_invalid_values() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+
+    bot.press("Настройки").await;
+    bot.assert_screen_contains("Вседневное: 09:00");
+    bot.press("Уведомления").await;
+    bot.assert_has_button("Время сводки: 08:30");
+    bot.assert_has_button("Вседневные: 09:00");
+    bot.assert_has_button("Начало тихих: 22:00");
+    bot.assert_has_button("Конец тихих: 08:00");
+
+    // Время сводки: ошибки формата не меняют прежнее значение.
+    bot.press("Время сводки").await;
+    bot.assert_screen_contains("Во сколько присылать сводку");
+    for bad in ["25:00", "9-30"] {
+        bot.text(bad).await;
+        bot.assert_screen_contains("формате HH:MM");
+        let settings = notification_settings(&db.pool, bot.chat).await;
+        assert_eq!(settings.digest_time, "08:30", "{bad}");
+    }
+    bot.text("07:45").await;
+    bot.assert_screen_contains("Время сводки: 07:45");
+    assert_eq!(
+        notification_settings(&db.pool, bot.chat).await.digest_time,
+        "07:45"
+    );
+
+    // Время вседневного напоминания.
+    bot.press("Вседневные").await;
+    bot.text("10:15").await;
+    bot.assert_screen_contains("Вседневные: 10:15");
+    assert_eq!(
+        notification_settings(&db.pool, bot.chat).await.all_day_time,
+        "10:15"
+    );
+
+    // Начало и конец тихих часов не могут совпадать; прежний конец остаётся.
+    bot.press("Начало тихих").await;
+    bot.text("23:00").await;
+    bot.assert_screen_contains("Начало тихих: 23:00");
+    bot.press("Конец тихих").await;
+    bot.text("23:00").await;
+    bot.assert_screen_contains("не должны совпадать");
+    let settings = notification_settings(&db.pool, bot.chat).await;
+    assert_eq!(settings.quiet_start, "23:00");
+    assert_eq!(settings.quiet_end, "08:00");
+
+    bot.press("Отмена").await;
+    bot.assert_screen_contains("Конец тихих: 08:00");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notification_time_changes_apply_on_the_next_scheduler_tick() {
+    // Планировщик обрабатывает всю базу, поэтому нужна изолированная: иначе
+    // тик доставит сводки пользователям из параллельных тестов.
+    let db = support::isolated_db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = Utc::now().with_timezone(&moscow).date_naive() + Duration::days(1);
+
+    bot.press("Настройки").await;
+    bot.press("Уведомления").await;
+    bot.press("Время сводки").await;
+    bot.text("09:15").await;
+    bot.assert_screen_contains("Время сводки: 09:15");
+
+    let scheduler = scheduler(&db.pool);
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day, 9, 14))
+            .await
+            .expect("before digest")
+            .delivered,
+        0
+    );
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day, 9, 15))
+            .await
+            .expect("new digest time")
+            .delivered,
+        1
+    );
+    let sent = outbox_html(&db.pool, bot.chat).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(sent[0].contains("День свободен."), "{sent:?}");
+
+    // Выключаем сводку и меняем время вседневного напоминания тем же
+    // экземпляром планировщика — перезапуск не нужен.
+    bot.press("Сводка").await;
+    assert!(
+        !notification_settings(&db.pool, bot.chat)
+            .await
+            .digest_enabled
+    );
+    bot.press("Вседневные").await;
+    bot.text("14:00").await;
+
+    let due_date = day + Duration::days(1);
+    let mut item = new_item(household.tasks_list_id, "Вседневная задача");
+    item.due_date = Some(due_date);
+    item.assignee_user_id = Some(household.owner_id);
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &Actor::user(household.owner_id, UserRole::Owner),
+        item,
+    )
+    .await;
+
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, due_date, 13, 59))
+            .await
+            .expect("before all-day time")
+            .delivered,
+        0
+    );
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, due_date, 14, 0))
+            .await
+            .expect("new all-day time")
+            .delivered,
+        1
+    );
+    let sent = outbox_html(&db.pool, bot.chat).await;
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert!(sent[1].contains("Вседневная задача"), "{sent:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bot_answers_user_actions_during_quiet_hours() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let local = bot.now.with_timezone(&moscow);
+    let mut night = moscow
+        .with_ymd_and_hms(local.year(), local.month(), local.day(), 23, 30, 0)
+        .single()
+        .expect("night")
+        .with_timezone(&Utc);
+    if night <= bot.now {
+        night += Duration::days(1);
+    }
+    bot.advance(night - bot.now);
+    let household = household_for(&db.pool, bot.chat).await;
+    bot.fake.clear_calls();
+
+    bot.press("Настройки").await;
+    bot.assert_screen_contains("Настройки");
+    bot.assert_screen_contains("Тихие часы: 22:00–08:00");
+    assert!(
+        !bot.fake.calls().is_empty(),
+        "бот должен ответить ночью сразу, не дожидаясь конца тихих часов"
+    );
+    let deliveries: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM notification_deliveries WHERE household_id = $1")
+            .bind(household.household_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("deliveries");
+    assert_eq!(deliveries, 0);
+
+    bot.press("Уведомления").await;
+    bot.assert_screen_contains("Начало тихих: 22:00");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_timezone_from_a_button_is_rejected_and_the_previous_one_kept() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let action = Action::SetTimezone {
+        zone: "Mars/Olympus".into(),
+    };
+    let token = {
+        let mut conn = db.pool.acquire().await.expect("connection");
+        let tokens = callbacks::issue_many(
+            &mut conn,
+            &[NewToken {
+                telegram_user_id: bot.chat,
+                household_id: Some(household.household_id),
+                scope: Scope::Screen,
+                action: action.name(),
+                payload: serde_json::to_value(&action).expect("payload"),
+                version: None,
+            }],
+            Utc::now(),
+        )
+        .await
+        .expect("token");
+        tokens.into_iter().next().expect("token")
+    };
+    let message_id = bot
+        .fake
+        .messages(bot.chat)
+        .last()
+        .map(|(id, _)| *id)
+        .expect("active message");
+
+    bot.press_data(&token, message_id).await;
+
+    let timezone: Option<String> =
+        sqlx::query_scalar("SELECT timezone FROM users WHERE telegram_user_id = $1")
+            .bind(bot.chat)
+            .fetch_one(&db.pool)
+            .await
+            .expect("timezone");
+    assert_eq!(timezone.as_deref(), Some("Europe/Moscow"));
+    assert!(
+        bot.fake.answers().iter().any(|(_, text, _)| {
+            text.as_deref()
+                .is_some_and(|text| text.contains("проверьте введённые данные"))
+        }),
+        "бот должен сообщить об ошибке: {:?}",
+        bot.fake.answers()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

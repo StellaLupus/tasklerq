@@ -30,6 +30,10 @@ CREATE TABLE notification_deliveries (
     kind notification_kind NOT NULL,
     status notification_status NOT NULL DEFAULT 'pending',
     scheduled_at timestamptz NOT NULL,
+    -- Запись хотя бы раз откладывалась из-за тихих часов. Нужно, чтобы
+    -- перенесённая через полночь сводка или вседневное напоминание не
+    -- отменялись как устаревшие только из-за смены локальной даты.
+    deferred boolean NOT NULL DEFAULT false,
     outbox_seq bigint REFERENCES outbox (seq) ON DELETE SET NULL,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),

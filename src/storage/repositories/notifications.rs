@@ -67,6 +67,7 @@ pub async fn insert(
          DO UPDATE SET
              status = 'pending',
              scheduled_at = EXCLUDED.scheduled_at,
+             deferred = false,
              outbox_seq = NULL,
              updated_at = EXCLUDED.updated_at
          WHERE notification_deliveries.status = 'cancelled'",
@@ -111,10 +112,27 @@ pub async fn notify_assignment(
     notice: &AssignmentNotice<'_>,
     now: DateTime<Utc>,
 ) -> Result<u64, DomainError> {
+    if notice.previous_assignee == notice.assignee {
+        return Ok(0);
+    }
+
+    // Новое назначение вытесняет ещё не доставленные уведомления о прежних
+    // назначениях этого элемента, независимо от получателя. Иначе A→B→A до
+    // первого тика оставил бы A два одинаковых сообщения.
+    sqlx::query(
+        "UPDATE notification_deliveries
+         SET status = 'cancelled', updated_at = $2
+         WHERE item_id = $1 AND kind = 'assignment' AND status = 'pending'",
+    )
+    .bind(notice.item_id)
+    .bind(now)
+    .execute(&mut *conn)
+    .await?;
+
     let Some(assignee) = notice.assignee else {
         return Ok(0);
     };
-    if notice.previous_assignee == Some(assignee) || notice.actor.user_id == Some(assignee) {
+    if notice.actor.user_id == Some(assignee) {
         return Ok(0);
     }
 

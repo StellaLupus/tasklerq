@@ -377,6 +377,11 @@ pub enum Action {
     RenameStart,
     /// Открыть форму ввода времени напоминания.
     LeadStart,
+    /// Открыть форму ввода времени настройки уведомлений.
+    TimeStart {
+        /// Какое время редактируется.
+        field: TimeField,
+    },
     /// Выбрать часовой пояс пользователя.
     SetTimezone {
         /// IANA-идентификатор.
@@ -524,6 +529,20 @@ pub enum Setting {
     Assignment,
     /// Тихие часы.
     QuietHours,
+}
+
+/// Время настройки уведомлений, которое вводится текстом.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeField {
+    /// Время утренней сводки.
+    Digest,
+    /// Время вседневного напоминания.
+    AllDay,
+    /// Начало тихих часов.
+    QuietStart,
+    /// Конец тихих часов.
+    QuietEnd,
 }
 
 /// На сколько отложить напоминание.
@@ -789,6 +808,11 @@ pub enum Form {
     DeleteHousehold,
     /// Своё время напоминания в минутах.
     Lead,
+    /// Время настройки уведомлений в формате `HH:MM`.
+    Time {
+        /// Какое время редактируется.
+        field: TimeField,
+    },
 }
 
 /// Создание элемента.
@@ -862,6 +886,7 @@ impl Form {
             Self::Rename => "rename",
             Self::DeleteHousehold => "delete_household",
             Self::Lead => "lead",
+            Self::Time { .. } => "time",
         }
     }
 }

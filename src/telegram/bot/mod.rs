@@ -791,6 +791,7 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
         Action::SearchStart => forms::start_search(ctx).await,
         Action::RenameStart => forms::start_rename(ctx).await,
         Action::LeadStart => forms::start_lead(ctx).await,
+        Action::TimeStart { field } => forms::start_time(ctx, field).await,
         Action::HouseholdDeleteStart => forms::start_delete_household(ctx).await,
 
         Action::SetTimezone { zone } => settings::set_timezone(ctx, &zone).await,

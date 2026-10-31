@@ -11,7 +11,8 @@ use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
 use super::scheduler::{
-    DELIVERY_BATCH, cancel_delivery, enqueue_message, mark_cancelled, mark_sent, resolved_timezone,
+    DELIVERY_BATCH, cancel_delivery, desired_schedule, enqueue_message, mark_cancelled, mark_sent,
+    postpone_for_quiet, reschedule_if_changed, resolved_timezone,
 };
 use crate::domain::error::DomainError;
 use crate::domain::models::ItemStatus;
@@ -75,6 +76,45 @@ const ASSIGNMENT_ROW_COLUMNS: &str = "d.id, d.household_id, d.user_id, d.item_id
         h.timezone AS household_timezone,
         i.assignee_user_id AS item_assignee_user_id, i.status::text AS item_status,
         i.deleted_at AS item_deleted_at";
+
+/// Пересчитать время ещё не доставленных уведомлений о назначении.
+///
+/// Назначение живёт по моменту постановки записи: смена границ тихих часов
+/// сдвигает отложенное уведомление, а их отключение отпускает его на ближайшем
+/// тике.
+pub async fn reschedule(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error> {
+    #[derive(FromRow)]
+    struct PendingAssignment {
+        id: Uuid,
+        created_at: DateTime<Utc>,
+        settings: serde_json::Value,
+        user_timezone: Option<String>,
+        household_timezone: String,
+    }
+
+    let rows: Vec<PendingAssignment> = sqlx::query_as(
+        "SELECT d.id, d.created_at, u.settings, u.timezone AS user_timezone,
+                h.timezone AS household_timezone
+         FROM notification_deliveries d
+         JOIN users u ON u.id = d.user_id
+         JOIN households h ON h.id = d.household_id
+         WHERE d.status = 'pending' AND d.kind = 'assignment'",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut conn = pool.acquire().await?;
+    let mut rescheduled = 0;
+    for row in rows {
+        let settings = NotificationSettings::from_settings(&row.settings);
+        let timezone =
+            resolved_timezone(row.user_timezone.as_deref(), Some(&row.household_timezone));
+        let desired = desired_schedule(row.created_at, now, timezone, &settings);
+        let deferred = desired != row.created_at;
+        rescheduled += reschedule_if_changed(&mut conn, row.id, desired, deferred, now).await?;
+    }
+    Ok(rescheduled)
+}
 
 /// Отменить `pending`-уведомления о назначении, которые больше не актуальны.
 pub async fn cancel_stale(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error> {
@@ -157,6 +197,12 @@ async fn deliver_one(pool: &PgPool, id: Uuid, now: DateTime<Utc>) -> Result<u64,
     };
     if row.is_stale() {
         mark_cancelled(&mut tx, row.id, now).await?;
+        tx.commit().await?;
+        return Ok(0);
+    }
+    if let Some(settings) = row.settings.as_ref()
+        && postpone_for_quiet(&mut tx, row.id, settings, row.timezone(), now).await?
+    {
         tx.commit().await?;
         return Ok(0);
     }

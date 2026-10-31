@@ -12,7 +12,8 @@ use serde_json::json;
 use sqlx::PgPool;
 use support::{TestDb, TestHousehold};
 use tasklerq::domain::models::{
-    Actor, ActorType, Field, Item, ItemPatch, ItemSource, RecurrenceFreq, RecurrenceInput,
+    Actor, ActorType, Field, Item, ItemPatch, ItemPriority, ItemSource, RecurrenceFreq,
+    RecurrenceInput,
 };
 use tasklerq::jobs::scheduler::{Scheduler, all_day_occurrence_key, occurrence_key};
 use tasklerq::storage::repositories::items;
@@ -137,7 +138,10 @@ async fn add_member(pool: &PgPool, household_id: Uuid, name: &str, digest_enable
          )
          VALUES (
              $1, $2, $3, $3, $4, 'member',
-             jsonb_build_object('notifications', jsonb_build_object('digest_enabled', $5)),
+             jsonb_build_object(
+                 'notifications',
+                 jsonb_build_object('digest_enabled', $5, 'quiet_hours_enabled', false)
+             ),
              now(), now()
          )",
     )
@@ -320,7 +324,14 @@ async fn insert_digest_delivery(
 async fn household_without_digest(db: &TestDb) -> TestHousehold {
     let household = support::create_household(&db.pool).await;
     for user_id in [household.owner_id, household.member_id] {
-        set_notifications(&db.pool, user_id, json!({"digest_enabled": false})).await;
+        // Тихие часы выключены: большинство тестов использует реальное время
+        // запуска, а сценарии тихих часов задают границы и `now` явно.
+        set_notifications(
+            &db.pool,
+            user_id,
+            json!({"digest_enabled": false, "quiet_hours_enabled": false}),
+        )
+        .await;
     }
     household
 }
@@ -355,8 +366,60 @@ async fn set_notifications_without_digest(
         settings
             .entry("digest_enabled")
             .or_insert(serde_json::Value::Bool(false));
+        // Тесты без явного сценария тихих часов не должны зависеть от времени
+        // суток, в которое запущен набор.
+        settings
+            .entry("quiet_hours_enabled")
+            .or_insert(serde_json::Value::Bool(false));
     }
     set_notifications(pool, user_id, value).await;
+}
+
+async fn enable_quiet(pool: &PgPool, user_id: Uuid, start: &str, end: &str) {
+    set_notifications_without_digest(
+        pool,
+        user_id,
+        json!({
+            "quiet_hours_enabled": true,
+            "quiet_start": start,
+            "quiet_end": end
+        }),
+    )
+    .await;
+}
+
+async fn scheduled_at(pool: &PgPool, item_id: Uuid, user_id: Uuid) -> Option<DateTime<Utc>> {
+    sqlx::query_scalar(
+        "SELECT scheduled_at FROM notification_deliveries
+         WHERE item_id = $1 AND user_id = $2 AND kind = 'reminder'
+         ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(item_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .expect("scheduled at")
+}
+
+async fn create_task_with_priority(
+    db: &TestDb,
+    household: &TestHousehold,
+    title: &str,
+    due_at: DateTime<Utc>,
+    priority: ItemPriority,
+) -> Item {
+    let mut item = support::new_item(household.tasks_list_id, title);
+    item.due_at = Some(due_at);
+    item.priority = priority;
+    item.assignee_user_id = Some(household.owner_id);
+    support::create_item(
+        &db.pool,
+        household,
+        household.tasks_list_id,
+        &household.owner(),
+        item,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1723,7 +1786,11 @@ async fn digest_uses_the_user_digest_time_and_timezone() {
     set_notifications(
         &db.pool,
         household.owner_id,
-        json!({"digest_enabled": true, "digest_time": "07:15"}),
+        json!({
+            "digest_enabled": true,
+            "digest_time": "07:15",
+            "quiet_hours_enabled": false
+        }),
     )
     .await;
 
@@ -2515,7 +2582,9 @@ async fn reassigning_before_delivery_cancels_the_first_notification() {
         .tick(now + Duration::seconds(2))
         .await
         .expect("reassign tick");
-    assert_eq!(stats.cancelled, 1);
+    // Прежняя pending-запись отменена ещё при постановке нового назначения,
+    // поэтому тик её уже не считает.
+    assert_eq!(stats.cancelled, 0);
     assert_eq!(stats.delivered, 1);
 
     let member_rows = assignment_rows(&db.pool, item.id, household.member_id).await;
@@ -2779,4 +2848,972 @@ async fn creating_a_task_assigned_to_self_sends_nothing() {
             .await
             .is_empty()
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quiet_hours_defer_a_reminder_to_morning_and_send_it_once() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    enable_quiet(&db.pool, household.owner_id, "22:00", "08:00").await;
+    let due = local_utc(moscow, day, 23, 45);
+    let item = create_task(
+        &db,
+        &household,
+        "Ночное напоминание",
+        Some(due),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let scheduler = scheduler(&db.pool);
+
+    let night = scheduler
+        .tick(local_utc(moscow, day, 23, 30))
+        .await
+        .expect("night tick");
+    assert_eq!(night.planned, 1);
+    assert_eq!(night.delivered, 0);
+    assert!(messages(&db.pool, chat).await.is_empty());
+    assert_eq!(
+        scheduled_at(&db.pool, item.id, household.owner_id).await,
+        Some(local_utc(moscow, day + Duration::days(1), 8, 0))
+    );
+
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day + Duration::days(1), 7, 59))
+            .await
+            .expect("before end")
+            .delivered,
+        0
+    );
+    assert!(messages(&db.pool, chat).await.is_empty());
+
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day + Duration::days(1), 8, 0))
+            .await
+            .expect("morning tick")
+            .delivered,
+        1
+    );
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day + Duration::days(1), 8, 0))
+            .await
+            .expect("repeat tick")
+            .delivered,
+        0
+    );
+    assert_eq!(messages(&db.pool, chat).await.len(), 1);
+    assert_eq!(
+        delivery_status(&db.pool, item.id, household.owner_id)
+            .await
+            .as_deref(),
+        Some("sent")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quiet_hours_boundaries_are_start_inclusive_and_end_exclusive() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    enable_quiet(&db.pool, household.owner_id, "22:00", "08:00").await;
+
+    let before = create_task(
+        &db,
+        &household,
+        "До тихих часов",
+        Some(local_utc(moscow, day, 22, 14)),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let exactly_start = create_task(
+        &db,
+        &household,
+        "Ровно начало",
+        Some(local_utc(moscow, day, 22, 15)),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let exactly_end = create_task(
+        &db,
+        &household,
+        "Ровно конец",
+        Some(local_utc(moscow, day + Duration::days(1), 8, 15)),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let scheduler = scheduler(&db.pool);
+
+    let early = scheduler
+        .tick(local_utc(moscow, day, 21, 59))
+        .await
+        .expect("21:59 tick");
+    assert_eq!(early.delivered, 1);
+    assert_eq!(messages(&db.pool, chat).await.len(), 1);
+    assert_eq!(
+        delivery_status(&db.pool, before.id, household.owner_id)
+            .await
+            .as_deref(),
+        Some("sent")
+    );
+
+    let start = scheduler
+        .tick(local_utc(moscow, day, 22, 0))
+        .await
+        .expect("22:00 tick");
+    assert_eq!(start.delivered, 0);
+    assert_eq!(messages(&db.pool, chat).await.len(), 1);
+    assert_eq!(
+        delivery_status(&db.pool, exactly_start.id, household.owner_id)
+            .await
+            .as_deref(),
+        Some("pending")
+    );
+
+    let end = scheduler
+        .tick(local_utc(moscow, day + Duration::days(1), 8, 0))
+        .await
+        .expect("08:00 tick");
+    assert_eq!(end.delivered, 2);
+    let sent = messages(&db.pool, chat).await;
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    assert_eq!(
+        delivery_status(&db.pool, exactly_end.id, household.owner_id)
+            .await
+            .as_deref(),
+        Some("sent")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quiet_hours_work_for_a_user_interval_that_does_not_cross_midnight() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    enable_quiet(&db.pool, household.owner_id, "13:00", "15:00").await;
+    let item = create_task(
+        &db,
+        &household,
+        "Дневные тихие часы",
+        Some(local_utc(moscow, day, 13, 15)),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let scheduler = scheduler(&db.pool);
+
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day, 13, 0))
+            .await
+            .expect("13:00 tick")
+            .delivered,
+        0
+    );
+    assert!(messages(&db.pool, chat).await.is_empty());
+    assert_eq!(
+        scheduled_at(&db.pool, item.id, household.owner_id).await,
+        Some(local_utc(moscow, day, 15, 0))
+    );
+
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day, 14, 59))
+            .await
+            .expect("14:59 tick")
+            .delivered,
+        0
+    );
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day, 15, 0))
+            .await
+            .expect("15:00 tick")
+            .delivered,
+        1
+    );
+    assert_eq!(messages(&db.pool, chat).await.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quiet_hours_use_the_recipient_timezone_not_the_household() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let vladivostok = chrono_tz::Asia::Vladivostok;
+    let day = digest_day();
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    set_user_timezone(&db.pool, household.owner_id, "Asia/Vladivostok").await;
+    enable_quiet(&db.pool, household.owner_id, "22:00", "08:00").await;
+    let item = create_task(
+        &db,
+        &household,
+        "Пояс получателя",
+        Some(local_utc(vladivostok, day, 23, 45)),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let scheduler = scheduler(&db.pool);
+
+    assert_eq!(
+        scheduler
+            .tick(local_utc(vladivostok, day, 23, 30))
+            .await
+            .expect("night tick")
+            .delivered,
+        0
+    );
+    assert!(messages(&db.pool, chat).await.is_empty());
+    assert_eq!(
+        scheduled_at(&db.pool, item.id, household.owner_id).await,
+        Some(local_utc(vladivostok, day + Duration::days(1), 8, 0))
+    );
+
+    assert_eq!(
+        scheduler
+            .tick(local_utc(vladivostok, day + Duration::days(1), 7, 59))
+            .await
+            .expect("before end")
+            .delivered,
+        0
+    );
+    assert_eq!(
+        scheduler
+            .tick(local_utc(vladivostok, day + Duration::days(1), 8, 0))
+            .await
+            .expect("morning tick")
+            .delivered,
+        1
+    );
+    assert_eq!(messages(&db.pool, chat).await.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabled_quiet_hours_deliver_on_time_and_release_deferred_on_the_next_tick() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    let first = create_task(
+        &db,
+        &household,
+        "Без тихих часов",
+        Some(local_utc(moscow, day, 23, 45)),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let scheduler = scheduler(&db.pool);
+
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day, 23, 30))
+            .await
+            .expect("on time")
+            .delivered,
+        1
+    );
+    assert_eq!(
+        delivery_status(&db.pool, first.id, household.owner_id)
+            .await
+            .as_deref(),
+        Some("sent")
+    );
+
+    let second = create_task(
+        &db,
+        &household,
+        "Отложено, но тихие часы выключили",
+        Some(local_utc(moscow, day + Duration::days(1), 23, 45)),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    enable_quiet(&db.pool, household.owner_id, "22:00", "08:00").await;
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day + Duration::days(1), 23, 30))
+            .await
+            .expect("deferring tick")
+            .delivered,
+        0
+    );
+    set_notifications_without_digest(
+        &db.pool,
+        household.owner_id,
+        json!({"quiet_hours_enabled": false}),
+    )
+    .await;
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day + Duration::days(1), 23, 31))
+            .await
+            .expect("release tick")
+            .delivered,
+        1
+    );
+    assert_eq!(messages(&db.pool, chat).await.len(), 2);
+    assert_eq!(
+        delivery_status(&db.pool, second.id, household.owner_id)
+            .await
+            .as_deref(),
+        Some("sent")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_at_seven_is_deferred_to_eight_and_sent_once() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    set_notifications(
+        &db.pool,
+        household.owner_id,
+        json!({
+            "digest_enabled": true,
+            "digest_time": "07:00",
+            "quiet_hours_enabled": true,
+            "quiet_start": "22:00",
+            "quiet_end": "08:00"
+        }),
+    )
+    .await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let scheduler = scheduler(&db.pool);
+
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day, 7, 0))
+            .await
+            .expect("07:00 tick")
+            .delivered,
+        0
+    );
+    assert!(messages(&db.pool, chat).await.is_empty());
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day, 7, 59))
+            .await
+            .expect("07:59 tick")
+            .delivered,
+        0
+    );
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day, 8, 0))
+            .await
+            .expect("08:00 tick")
+            .delivered,
+        1
+    );
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day, 8, 0))
+            .await
+            .expect("repeat tick")
+            .delivered,
+        0
+    );
+
+    assert_eq!(messages(&db.pool, chat).await.len(), 1);
+    let rows = digest_rows(&db.pool, household.owner_id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, format!("digest:{day}"));
+    assert_eq!(rows[0].1, "sent");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_deferred_across_midnight_sends_once_next_morning_and_is_not_lost() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    let next_day = day + Duration::days(1);
+    set_notifications(
+        &db.pool,
+        household.owner_id,
+        json!({
+            "digest_enabled": true,
+            "digest_time": "23:00",
+            "quiet_hours_enabled": true,
+            "quiet_start": "22:00",
+            "quiet_end": "08:00"
+        }),
+    )
+    .await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let scheduler = scheduler(&db.pool);
+
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day, 23, 0))
+            .await
+            .expect("night digest tick")
+            .delivered,
+        0
+    );
+    assert!(messages(&db.pool, chat).await.is_empty());
+
+    // Полночь не отменяет отложенную сводку: она всё ещё ждёт 08:00.
+    let midnight = scheduler
+        .tick(local_utc(moscow, next_day, 0, 0))
+        .await
+        .expect("midnight tick");
+    assert_eq!(midnight.cancelled, 0);
+    assert_eq!(midnight.delivered, 0);
+    assert!(messages(&db.pool, chat).await.is_empty());
+
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, next_day, 8, 0))
+            .await
+            .expect("morning tick")
+            .delivered,
+        1
+    );
+    assert_eq!(messages(&db.pool, chat).await.len(), 1);
+
+    // Вечером следующего дня планируется уже новая сводка, и утром она
+    // приходит одна — двух сводок за одно утро нет.
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, next_day, 23, 0))
+            .await
+            .expect("next night tick")
+            .delivered,
+        0
+    );
+    assert_eq!(messages(&db.pool, chat).await.len(), 1);
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, next_day + Duration::days(1), 8, 0))
+            .await
+            .expect("next morning tick")
+            .delivered,
+        1
+    );
+    assert_eq!(messages(&db.pool, chat).await.len(), 2);
+
+    let rows = digest_rows(&db.pool, household.owner_id).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(rows.iter().all(|row| row.1 == "sent"), "{rows:?}");
+    assert_eq!(rows[0].0, format!("digest:{day}"));
+    assert_eq!(rows[1].0, format!("digest:{next_day}"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quiet_hours_defer_night_assignments_and_collapse_a_to_b_to_a() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let extra = add_member(&db.pool, household.household_id, "Extra member", false).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    for user_id in [household.member_id, extra] {
+        enable_quiet(&db.pool, user_id, "22:00", "08:00").await;
+    }
+    let item = create_task(&db, &household, "Ночное назначение", None, None, None).await;
+    let actor = household.owner();
+    let night = local_utc(moscow, day, 23, 30);
+
+    let first = update_assignee(
+        &db,
+        &household,
+        &actor,
+        &item,
+        Some(household.member_id),
+        night,
+    )
+    .await;
+    let second = update_assignee(
+        &db,
+        &household,
+        &actor,
+        &first,
+        Some(extra),
+        night + Duration::seconds(1),
+    )
+    .await;
+    update_assignee(
+        &db,
+        &household,
+        &actor,
+        &second,
+        Some(household.member_id),
+        night + Duration::seconds(2),
+    )
+    .await;
+
+    let member_chat = chat_id(&db.pool, household.member_id).await;
+    let extra_chat = chat_id(&db.pool, extra).await;
+    let scheduler = scheduler(&db.pool);
+
+    assert_eq!(
+        scheduler
+            .tick(night + Duration::seconds(3))
+            .await
+            .expect("night tick")
+            .delivered,
+        0
+    );
+    assert!(messages(&db.pool, member_chat).await.is_empty());
+    assert!(messages(&db.pool, extra_chat).await.is_empty());
+
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day + Duration::days(1), 7, 59))
+            .await
+            .expect("before end")
+            .delivered,
+        0
+    );
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day + Duration::days(1), 8, 0))
+            .await
+            .expect("morning tick")
+            .delivered,
+        1
+    );
+
+    let member_messages = messages(&db.pool, member_chat).await;
+    assert_eq!(member_messages.len(), 1, "{member_messages:?}");
+    assert!(messages(&db.pool, extra_chat).await.is_empty());
+    let member_rows = assignment_rows(&db.pool, item.id, household.member_id).await;
+    assert_eq!(member_rows.len(), 2, "{member_rows:?}");
+    assert_eq!(member_rows[0].0, "cancelled");
+    assert_eq!(member_rows[1].0, "sent");
+    let extra_rows = assignment_rows(&db.pool, item.id, extra).await;
+    assert_eq!(extra_rows.len(), 1, "{extra_rows:?}");
+    assert_eq!(extra_rows[0].0, "cancelled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn urgent_tasks_do_not_bypass_quiet_hours() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    enable_quiet(&db.pool, household.owner_id, "22:00", "08:00").await;
+    let item = create_task_with_priority(
+        &db,
+        &household,
+        "Срочная ночью",
+        local_utc(moscow, day, 23, 45),
+        ItemPriority::Urgent,
+    )
+    .await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let scheduler = scheduler(&db.pool);
+
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day, 23, 30))
+            .await
+            .expect("night tick")
+            .delivered,
+        0
+    );
+    assert!(messages(&db.pool, chat).await.is_empty());
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day + Duration::days(1), 8, 0))
+            .await
+            .expect("morning tick")
+            .delivered,
+        1
+    );
+    assert_eq!(messages(&db.pool, chat).await.len(), 1);
+    assert_eq!(
+        delivery_status(&db.pool, item.id, household.owner_id)
+            .await
+            .as_deref(),
+        Some("sent")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_reminder_is_recalculated_after_a_lead_time_change() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    let due = local_utc(moscow, day, 12, 0);
+    let item = create_task(
+        &db,
+        &household,
+        "Пересчитать напоминание",
+        Some(due),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    // Будущая pending-запись, какие остаются после отложенных тихих часов.
+    insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        Some(item.id),
+        &occurrence_key(due),
+        "pending",
+        due - Duration::minutes(15),
+    )
+    .await
+    .expect("pending delivery");
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let scheduler = scheduler(&db.pool);
+
+    set_notifications_without_digest(&db.pool, household.owner_id, json!({"lead_minutes": 60}))
+        .await;
+
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day, 10, 0))
+            .await
+            .expect("recalculate tick")
+            .delivered,
+        0
+    );
+    assert_eq!(
+        scheduled_at(&db.pool, item.id, household.owner_id).await,
+        Some(due - Duration::minutes(60))
+    );
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day, 10, 59))
+            .await
+            .expect("before new lead")
+            .delivered,
+        0
+    );
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day, 11, 0))
+            .await
+            .expect("new lead tick")
+            .delivered,
+        1
+    );
+    assert_eq!(messages(&db.pool, chat).await.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_day_reminder_deferred_across_midnight_is_not_cancelled() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    set_notifications_without_digest(
+        &db.pool,
+        household.owner_id,
+        json!({
+            "all_day_time": "23:00",
+            "quiet_hours_enabled": true,
+            "quiet_start": "22:00",
+            "quiet_end": "08:00"
+        }),
+    )
+    .await;
+    let item = create_all_day_task(
+        &db,
+        &household,
+        "Позднее вседневное",
+        day,
+        Some(household.owner_id),
+    )
+    .await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let scheduler = scheduler(&db.pool);
+
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day, 23, 0))
+            .await
+            .expect("night tick")
+            .delivered,
+        0
+    );
+    assert!(messages(&db.pool, chat).await.is_empty());
+
+    let midnight = scheduler
+        .tick(local_utc(moscow, day + Duration::days(1), 0, 0))
+        .await
+        .expect("midnight tick");
+    assert_eq!(midnight.cancelled, 0);
+    assert_eq!(midnight.delivered, 0);
+    assert_eq!(
+        delivery_status(&db.pool, item.id, household.owner_id)
+            .await
+            .as_deref(),
+        Some("pending")
+    );
+
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day + Duration::days(1), 8, 0))
+            .await
+            .expect("morning tick")
+            .delivered,
+        1
+    );
+    assert_eq!(messages(&db.pool, chat).await.len(), 1);
+    assert_eq!(
+        delivery_status(&db.pool, item.id, household.owner_id)
+            .await
+            .as_deref(),
+        Some("sent")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_time_change_after_midnight_does_not_send_two_digests_in_one_morning() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    let next_day = day + Duration::days(1);
+    set_notifications(
+        &db.pool,
+        household.owner_id,
+        json!({
+            "digest_enabled": true,
+            "digest_time": "23:00",
+            "quiet_hours_enabled": true,
+            "quiet_start": "22:00",
+            "quiet_end": "08:00"
+        }),
+    )
+    .await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let scheduler = scheduler(&db.pool);
+
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day, 23, 0))
+            .await
+            .expect("night tick")
+            .delivered,
+        0
+    );
+
+    // После полуночи меняем время сводки на 06:00: новая сводка тоже попадёт
+    // на 08:00, поэтому вчерашняя отменяется, а не приходит второй.
+    set_notifications(
+        &db.pool,
+        household.owner_id,
+        json!({
+            "digest_enabled": true,
+            "digest_time": "06:00",
+            "quiet_hours_enabled": true,
+            "quiet_start": "22:00",
+            "quiet_end": "08:00"
+        }),
+    )
+    .await;
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, next_day, 0, 30))
+            .await
+            .expect("after midnight tick")
+            .delivered,
+        0
+    );
+    let rows = digest_rows(&db.pool, household.owner_id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, format!("digest:{day}"));
+    assert_eq!(rows[0].1, "cancelled");
+
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, next_day, 6, 0))
+            .await
+            .expect("new digest time tick")
+            .delivered,
+        0
+    );
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, next_day, 8, 0))
+            .await
+            .expect("morning tick")
+            .delivered,
+        1
+    );
+    assert_eq!(messages(&db.pool, chat).await.len(), 1);
+
+    let rows = digest_rows(&db.pool, household.owner_id).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[1].0, format!("digest:{next_day}"));
+    assert_eq!(rows[1].1, "sent");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabled_quiet_hours_release_a_deferred_digest_on_the_next_tick() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    let next_day = day + Duration::days(1);
+    set_notifications(
+        &db.pool,
+        household.owner_id,
+        json!({
+            "digest_enabled": true,
+            "digest_time": "23:00",
+            "quiet_hours_enabled": true,
+            "quiet_start": "22:00",
+            "quiet_end": "08:00"
+        }),
+    )
+    .await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let scheduler = scheduler(&db.pool);
+
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day, 23, 0))
+            .await
+            .expect("night tick")
+            .delivered,
+        0
+    );
+    set_notifications(
+        &db.pool,
+        household.owner_id,
+        json!({
+            "digest_enabled": true,
+            "digest_time": "23:00",
+            "quiet_hours_enabled": false
+        }),
+    )
+    .await;
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, next_day, 0, 30))
+            .await
+            .expect("release tick")
+            .delivered,
+        1
+    );
+    assert_eq!(messages(&db.pool, chat).await.len(), 1);
+    let rows = digest_rows(&db.pool, household.owner_id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].1, "sent");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabled_quiet_hours_release_a_deferred_assignment_on_the_next_tick() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    enable_quiet(&db.pool, household.member_id, "22:00", "08:00").await;
+    let item = create_task(&db, &household, "Ночное назначение", None, None, None).await;
+    let night = local_utc(moscow, day, 23, 30);
+    update_assignee(
+        &db,
+        &household,
+        &household.owner(),
+        &item,
+        Some(household.member_id),
+        night,
+    )
+    .await;
+    let chat = chat_id(&db.pool, household.member_id).await;
+    let scheduler = scheduler(&db.pool);
+
+    assert_eq!(
+        scheduler
+            .tick(night + Duration::seconds(1))
+            .await
+            .expect("deferring tick")
+            .delivered,
+        0
+    );
+    set_notifications_without_digest(
+        &db.pool,
+        household.member_id,
+        json!({"quiet_hours_enabled": false}),
+    )
+    .await;
+    assert_eq!(
+        scheduler
+            .tick(night + Duration::seconds(2))
+            .await
+            .expect("release tick")
+            .delivered,
+        1
+    );
+    assert_eq!(messages(&db.pool, chat).await.len(), 1);
+    let rows = assignment_rows(&db.pool, item.id, household.member_id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "sent");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_time_is_independent_between_members() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    set_notifications(
+        &db.pool,
+        household.owner_id,
+        json!({
+            "digest_enabled": true,
+            "digest_time": "07:00",
+            "quiet_hours_enabled": false
+        }),
+    )
+    .await;
+    set_notifications(
+        &db.pool,
+        household.member_id,
+        json!({
+            "digest_enabled": true,
+            "digest_time": "09:00",
+            "quiet_hours_enabled": false
+        }),
+    )
+    .await;
+    let owner_chat = chat_id(&db.pool, household.owner_id).await;
+    let member_chat = chat_id(&db.pool, household.member_id).await;
+    let scheduler = scheduler(&db.pool);
+
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day, 7, 0))
+            .await
+            .expect("owner digest tick")
+            .delivered,
+        1
+    );
+    assert_eq!(messages(&db.pool, owner_chat).await.len(), 1);
+    assert!(messages(&db.pool, member_chat).await.is_empty());
+
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day, 9, 0))
+            .await
+            .expect("member digest tick")
+            .delivered,
+        1
+    );
+    assert_eq!(messages(&db.pool, owner_chat).await.len(), 1);
+    assert_eq!(messages(&db.pool, member_chat).await.len(), 1);
 }

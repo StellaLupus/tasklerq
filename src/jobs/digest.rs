@@ -6,7 +6,8 @@ use sqlx::{FromRow, PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::scheduler::{
-    DELIVERY_BATCH, cancel_delivery, enqueue_message, mark_cancelled, mark_sent, resolved_timezone,
+    DELIVERY_BATCH, cancel_delivery, desired_schedule, enqueue_message, mark_cancelled, mark_sent,
+    postpone_for_quiet, reschedule_if_changed, resolved_timezone,
 };
 use crate::domain::recurrence::resolve_local;
 use crate::domain::settings::{NotificationSettings, parse_hhmm};
@@ -24,6 +25,52 @@ pub fn digest_occurrence_key(date: NaiveDate) -> String {
 
 fn default_digest_time() -> NaiveTime {
     parse_hhmm(DEFAULT_DIGEST_TIME, "digest time").expect("valid default time")
+}
+
+/// Дата из ключа `digest:YYYY-MM-DD`.
+fn digest_key_date(key: &str) -> Option<NaiveDate> {
+    key.strip_prefix("digest:")
+        .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+}
+
+/// Отменить `pending deferred`-сводки, которые утром совпали бы с новой.
+async fn cancel_deferred_on_same_day(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+    current_key: &str,
+    timezone: Tz,
+    delivery_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
+    let rows: Vec<(Uuid, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT id, scheduled_at
+         FROM notification_deliveries
+         WHERE user_id = $1 AND kind = 'digest' AND status = 'pending'
+           AND deferred AND occurrence_key <> $2",
+    )
+    .bind(user_id)
+    .bind(current_key)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    let delivery_date = delivery_at.with_timezone(&timezone).date_naive();
+    let mut cancelled = 0;
+    for (id, scheduled_at) in rows {
+        if scheduled_at.with_timezone(&timezone).date_naive() != delivery_date {
+            continue;
+        }
+        cancelled += sqlx::query(
+            "UPDATE notification_deliveries
+             SET status = 'cancelled', updated_at = $2
+             WHERE id = $1 AND status = 'pending'",
+        )
+        .bind(id)
+        .bind(now)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+    }
+    Ok(cancelled)
 }
 
 #[derive(FromRow)]
@@ -76,11 +123,30 @@ pub async fn plan(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error>
                 continue;
             }
         };
+        let occurrence_key = digest_occurrence_key(local_date);
+
+        // Отложенная через полночь сводка прошлого дня и сегодняшняя не должны
+        // прийти одним утром. Если сегодняшняя (с учётом тихих часов) попадёт
+        // на ту же локальную дату, прошлую отменяем — её заменит новая.
+        // При выключенных тихих часах отложенную запись, наоборот, отпускаем
+        // на ближайшем тике.
+        if settings.quiet_hours_enabled {
+            let delivery_at = desired_schedule(scheduled_at, now, timezone, &settings);
+            cancel_deferred_on_same_day(
+                &mut conn,
+                candidate.user_id,
+                &occurrence_key,
+                timezone,
+                delivery_at,
+                now,
+            )
+            .await?;
+        }
+
         if scheduled_at > now {
             continue;
         }
 
-        let occurrence_key = digest_occurrence_key(local_date);
         let delivery = NewDelivery {
             household_id: candidate.household_id,
             user_id: candidate.user_id,
@@ -102,11 +168,57 @@ pub async fn plan(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error>
     Ok(planned)
 }
 
+/// Пересчитать время ещё не доставленных сводок по текущим настройкам.
+///
+/// Базой служит время сводки из `occurrence_key` и текущего `digest_time`, а не
+/// `created_at`: поздний тик не должен навсегда сдвигать сводку. Повторный
+/// расчёт идемпотентен, пока запись остаётся в том же тихом интервале.
+pub async fn reschedule(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error> {
+    #[derive(FromRow)]
+    struct PendingDigest {
+        id: Uuid,
+        occurrence_key: String,
+        created_at: DateTime<Utc>,
+        settings: serde_json::Value,
+        user_timezone: Option<String>,
+        household_timezone: String,
+    }
+
+    let rows: Vec<PendingDigest> = sqlx::query_as(
+        "SELECT d.id, d.occurrence_key, d.created_at, u.settings,
+                u.timezone AS user_timezone, h.timezone AS household_timezone
+         FROM notification_deliveries d
+         JOIN users u ON u.id = d.user_id
+         JOIN households h ON h.id = d.household_id
+         WHERE d.status = 'pending' AND d.kind = 'digest'",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut conn = pool.acquire().await?;
+    let mut rescheduled = 0;
+    for row in rows {
+        let settings = NotificationSettings::from_settings(&row.settings);
+        let timezone =
+            resolved_timezone(row.user_timezone.as_deref(), Some(&row.household_timezone));
+        let time = parse_hhmm(&settings.digest_time, "digest time")
+            .unwrap_or_else(|_| default_digest_time());
+        let base = digest_key_date(&row.occurrence_key)
+            .and_then(|date| resolve_local(timezone, date, time).ok())
+            .unwrap_or(row.created_at);
+        let desired = desired_schedule(base, now, timezone, &settings);
+        let deferred = desired != base;
+        rescheduled += reschedule_if_changed(&mut conn, row.id, desired, deferred, now).await?;
+    }
+    Ok(rescheduled)
+}
+
 #[derive(FromRow)]
 struct DigestDeliveryRow {
     id: Uuid,
     household_id: Uuid,
     occurrence_key: String,
+    deferred: bool,
     telegram_user_id: Option<i64>,
     telegram_chat_id: Option<i64>,
     settings: Option<serde_json::Value>,
@@ -136,17 +248,29 @@ impl DigestDeliveryRow {
 
     /// Запись ещё актуальна: пользователь и household живы, сводка включена,
     /// а ключ соответствует текущему локальному дню получателя.
+    ///
+    /// Сводка, отложенная тихими часами через полночь (например, в 23:00 при
+    /// тихих часах до 08:00), остаётся актуальной до утра: иначе она была бы
+    /// отменена в 00:00 и потерялась, а следующая сводка пришла бы только через
+    /// сутки. Утром уходит ровно одна такая сводка, и следующая планируется на
+    /// новый день.
     fn is_stale(&self, now: DateTime<Utc>) -> bool {
-        self.user_deleted_at.is_some()
+        if self.user_deleted_at.is_some()
             || self.user_household_id != Some(self.household_id)
             || self.household_deleted_at.is_some()
             || !self.digest_enabled()
-            || self.occurrence_key
-                != digest_occurrence_key(now.with_timezone(&self.timezone()).date_naive())
+        {
+            return true;
+        }
+        let today = now.with_timezone(&self.timezone()).date_naive();
+        let current = digest_occurrence_key(today);
+        self.occurrence_key != current
+            && !(self.deferred
+                && self.occurrence_key == digest_occurrence_key(today - chrono::Duration::days(1)))
     }
 }
 
-const DIGEST_ROW_COLUMNS: &str = "d.id, d.household_id, d.occurrence_key,
+const DIGEST_ROW_COLUMNS: &str = "d.id, d.household_id, d.occurrence_key, d.deferred,
         u.telegram_user_id, u.telegram_chat_id, u.settings,
         u.deleted_at AS user_deleted_at, u.household_id AS user_household_id,
         u.timezone AS user_timezone, h.deleted_at AS household_deleted_at,
@@ -353,6 +477,12 @@ async fn deliver_one(pool: &PgPool, id: Uuid, now: DateTime<Utc>) -> Result<u64,
     };
     if row.is_stale(now) {
         mark_cancelled(&mut tx, row.id, now).await?;
+        tx.commit().await?;
+        return Ok(0);
+    }
+    if let Some(settings) = row.settings.as_ref()
+        && postpone_for_quiet(&mut tx, row.id, settings, row.timezone(), now).await?
+    {
         tx.commit().await?;
         return Ok(0);
     }

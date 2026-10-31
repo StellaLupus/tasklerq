@@ -14,7 +14,7 @@ use crate::storage::repositories::{audit, invites, members, users};
 use crate::telegram::rich::{Span, button};
 use crate::telegram::ru;
 
-use super::model::{Action, PAGE_SIZE, Screen, Setting, Ui};
+use super::model::{Action, PAGE_SIZE, Screen, Setting, TimeField, Ui};
 use super::screens::{back_button, clip};
 use super::{Ctx, Fail, display_timezone};
 
@@ -80,6 +80,7 @@ fn settings(ctx: &Ctx<'_>) -> Result<Ui, Fail> {
             on_off(notifications.digest_enabled),
             notifications.digest_time
         ))
+        .text(format!("☀️ Вседневное: {}", notifications.all_day_time))
         .text(format!(
             "🌙 Тихие часы: {}",
             if notifications.quiet_hours_enabled {
@@ -139,10 +140,20 @@ fn notifications(ctx: &Ctx<'_>) -> Result<Ui, Fail> {
             settings.reminders_enabled,
             Setting::Reminders,
         )])
-        .row(vec![toggle(
-            "🌅 Сводка",
-            settings.digest_enabled,
-            Setting::Digest,
+        .row(vec![
+            toggle("🌅 Сводка", settings.digest_enabled, Setting::Digest),
+            button(
+                format!("🕗 Время сводки: {}", settings.digest_time),
+                Action::TimeStart {
+                    field: TimeField::Digest,
+                },
+            ),
+        ])
+        .row(vec![button(
+            format!("☀️ Вседневные: {}", settings.all_day_time),
+            Action::TimeStart {
+                field: TimeField::AllDay,
+            },
         )])
         .row(vec![toggle(
             "👤 О назначении",
@@ -154,6 +165,20 @@ fn notifications(ctx: &Ctx<'_>) -> Result<Ui, Fail> {
             settings.quiet_hours_enabled,
             Setting::QuietHours,
         )])
+        .row(vec![
+            button(
+                format!("Начало тихих: {}", settings.quiet_start),
+                Action::TimeStart {
+                    field: TimeField::QuietStart,
+                },
+            ),
+            button(
+                format!("Конец тихих: {}", settings.quiet_end),
+                Action::TimeStart {
+                    field: TimeField::QuietEnd,
+                },
+            ),
+        ])
         .row(vec![back_button("⬅️ Назад", Screen::Settings)]))
 }
 

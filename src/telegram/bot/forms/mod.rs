@@ -13,7 +13,7 @@ use crate::domain::validation::MAX_TITLE;
 use crate::storage::repositories::{items, lists};
 use crate::telegram::views::{self, Lookup};
 
-use super::model::{EditForm, Form, ItemDraft, ItemForm, Screen, Step};
+use super::model::{EditForm, Form, ItemDraft, ItemForm, Screen, Step, TimeField};
 use super::{Ctx, Fail};
 
 mod actions;
@@ -197,6 +197,12 @@ pub async fn start_delete_household(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
 pub async fn start_lead(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
     ctx.user()?;
     open(ctx, Form::Lead).await
+}
+
+/// Начать ввод времени настройки уведомлений.
+pub async fn start_time(ctx: &mut Ctx<'_>, field: TimeField) -> Result<(), Fail> {
+    ctx.user()?;
+    open(ctx, Form::Time { field }).await
 }
 
 /// Начать онбординг: шаг с названием.

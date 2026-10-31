@@ -91,6 +91,15 @@ impl Scheduler {
             + assignment::cancel_stale(&self.pool, now).await?;
         let planned =
             plan_reminders(&self.pool, now).await? + digest::plan(&self.pool, now).await?;
+
+        // Настройки читаются на каждом тике: новое время сводки, lead time,
+        // пояс или границы тихих часов применяются без перезапуска. Время
+        // считается идемпотентно, поэтому повторный тик не сбрасывает уже
+        // отложенную запись обратно в прошлое.
+        reschedule_reminders(&self.pool, now).await?;
+        digest::reschedule(&self.pool, now).await?;
+        assignment::reschedule(&self.pool, now).await?;
+
         let delivered = deliver_due(&self.pool, now).await?
             + digest::deliver_due(&self.pool, now).await?
             + assignment::deliver_due(&self.pool, now).await?;
@@ -136,6 +145,190 @@ pub(crate) fn resolved_timezone(
         .and_then(|value| parse_timezone(value).ok())
         .or_else(|| household_timezone.and_then(|value| parse_timezone(value).ok()))
         .unwrap_or(chrono_tz::UTC)
+}
+
+/// Ближайший конец тихих часов, если `instant` попадает в интервал.
+///
+/// Начало интервала включительно, конец исключительно. Интервал может
+/// переходить через полночь: 22:00–08:00 означает «с 22:00 до полуночи и с
+/// полуночи до 08:00». Время считается в поясе получателя.
+pub(crate) fn quiet_end_at(
+    instant: DateTime<Utc>,
+    timezone: Tz,
+    settings: &NotificationSettings,
+) -> Option<DateTime<Utc>> {
+    if !settings.quiet_hours_enabled {
+        return None;
+    }
+    let start = match parse_hhmm(&settings.quiet_start, "quiet hours start") {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, "invalid quiet hours start; delivering without quiet hours");
+            return None;
+        }
+    };
+    let end = match parse_hhmm(&settings.quiet_end, "quiet hours end") {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, "invalid quiet hours end; delivering without quiet hours");
+            return None;
+        }
+    };
+    if start == end {
+        tracing::warn!("quiet hours start equals end; delivering without quiet hours");
+        return None;
+    }
+
+    let local = instant.with_timezone(&timezone);
+    let time = local.time();
+    let date = local.date_naive();
+    let inside = if start < end {
+        time >= start && time < end
+    } else {
+        time >= start || time < end
+    };
+    if !inside {
+        return None;
+    }
+
+    // Конец в тот же день, кроме случая, когда мы уже после начала интервала,
+    // а конец — за полночь (22:00 → 08:00 следующего дня).
+    let end_date = if start < end || time < end {
+        date
+    } else {
+        date + Duration::days(1)
+    };
+    match resolve_local(timezone, end_date, end) {
+        Ok(end) => Some(end),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                %timezone,
+                %end_date,
+                "failed to resolve quiet hours end; delivering without quiet hours"
+            );
+            None
+        }
+    }
+}
+
+/// Стабильное время доставки по базовому времени и текущим тихим часам.
+///
+/// `base` — время, когда уведомление должно было уйти по своей природе
+/// (срок минус lead time, время сводки, момент назначения). Если оно ещё
+/// впереди, тихие часы применяются к нему. Если уже прошло — к текущему
+/// моменту: сервис мог проснуться внутри тихих часов.
+///
+/// Функция идемпотентна: пока запись остаётся в том же тихом интервале,
+/// повторный расчёт возвращает то же время.
+pub(crate) fn desired_schedule(
+    base: DateTime<Utc>,
+    now: DateTime<Utc>,
+    timezone: Tz,
+    settings: &NotificationSettings,
+) -> DateTime<Utc> {
+    if base > now {
+        quiet_end_at(base, timezone, settings).unwrap_or(base)
+    } else {
+        quiet_end_at(now, timezone, settings).unwrap_or(base)
+    }
+}
+
+/// Обновить `scheduled_at`, только если время или флаг переноса изменились.
+pub(crate) async fn reschedule_if_changed(
+    conn: &mut PgConnection,
+    id: Uuid,
+    desired: DateTime<Utc>,
+    deferred: bool,
+    now: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query(
+        "UPDATE notification_deliveries
+         SET scheduled_at = $2, deferred = deferred OR $3, updated_at = $4
+         WHERE id = $1 AND status = 'pending'
+           AND (scheduled_at <> $2 OR ($3 AND NOT deferred))",
+    )
+    .bind(id)
+    .bind(desired)
+    .bind(deferred)
+    .bind(now)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected())
+}
+
+/// Перенести уже заблокированную запись, если её момент доставки в тихих часах.
+///
+/// Вызывается в `deliver_one` под `FOR UPDATE`: даже если другой экземпляр
+/// планировщика успел поставить `scheduled_at <= now`, доставка не произойдёт
+/// внутри тихого интервала.
+pub(crate) async fn postpone_for_quiet(
+    conn: &mut PgConnection,
+    id: Uuid,
+    settings: &serde_json::Value,
+    timezone: Tz,
+    now: DateTime<Utc>,
+) -> Result<bool, sqlx::Error> {
+    let settings = NotificationSettings::from_settings(settings);
+    let Some(end) = quiet_end_at(now, timezone, &settings) else {
+        return Ok(false);
+    };
+    sqlx::query(
+        "UPDATE notification_deliveries
+         SET scheduled_at = $2, deferred = true, updated_at = $3
+         WHERE id = $1 AND status = 'pending'",
+    )
+    .bind(id)
+    .bind(end)
+    .bind(now)
+    .execute(&mut *conn)
+    .await?;
+    Ok(true)
+}
+
+/// Пересчитать `pending`-напоминания по текущим настройкам получателя.
+///
+/// Время берётся из срока и настроек, а не из старой `scheduled_at`: смена
+/// lead time, времени вседневного напоминания или пояса сдвигает ещё не
+/// доставленную запись. Запись, уже отложенная тихими часами, тоже
+/// пересчитывается — если тихие часы выключили, она уйдёт на следующем тике.
+async fn reschedule_reminders(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error> {
+    let sql = format!(
+        "SELECT {REMINDER_ROW_COLUMNS}
+         FROM notification_deliveries d
+         LEFT JOIN items i ON i.id = d.item_id
+         LEFT JOIN lists l ON l.id = i.list_id
+         LEFT JOIN users u ON u.id = d.user_id
+         LEFT JOIN households h ON h.id = d.household_id
+         WHERE d.status = 'pending' AND d.kind = 'reminder'"
+    );
+    let rows: Vec<ReminderRow> = sqlx::query_as(&sql).fetch_all(pool).await?;
+
+    let mut conn = pool.acquire().await?;
+    let mut rescheduled = 0;
+    for row in rows {
+        if !row.item_valid() || row.current_key().as_deref() != Some(row.occurrence_key.as_str()) {
+            continue;
+        }
+        let settings = NotificationSettings::from_settings(&row.recipient_settings);
+        let timezone = row.timezone();
+        let intended = match (row.due_at, row.due_date) {
+            (Some(due_at), None) => due_at - Duration::minutes(i64::from(settings.lead_minutes)),
+            (None, Some(due_date)) => {
+                let time = parse_hhmm(&settings.all_day_time, "all-day reminder time")
+                    .unwrap_or_else(|_| default_all_day_time());
+                match resolve_local(timezone, due_date, time) {
+                    Ok(at) => at,
+                    Err(_) => continue,
+                }
+            }
+            _ => continue,
+        };
+        let desired = desired_schedule(intended, now, timezone, &settings);
+        let deferred = desired != intended;
+        rescheduled += reschedule_if_changed(&mut conn, row.id, desired, deferred, now).await?;
+    }
+    Ok(rescheduled)
 }
 
 #[derive(FromRow)]
@@ -303,6 +496,7 @@ struct ReminderRow {
     household_id: Uuid,
     user_id: Uuid,
     occurrence_key: String,
+    deferred: bool,
     title: Option<String>,
     item_id: Option<Uuid>,
     item_status: Option<String>,
@@ -319,6 +513,7 @@ struct ReminderRow {
     recipient_deleted_at: Option<DateTime<Utc>>,
     recipient_household_id: Option<Uuid>,
     recipient_timezone: Option<String>,
+    recipient_settings: serde_json::Value,
     telegram_chat_id: Option<i64>,
     household_found: Option<Uuid>,
     household_deleted_at: Option<DateTime<Utc>>,
@@ -377,10 +572,16 @@ impl ReminderRow {
         self.household_found.is_some() && self.household_deleted_at.is_none()
     }
 
-    /// Вседневное напоминание живёт только до конца локального дня срока.
+    /// Вседневное напоминание живёт до конца локального дня срока.
+    ///
+    /// Перенесённое тихими часами через полночь напоминание не отменяется:
+    /// оно уходит утром следующего дня, хотя локальная дата уже сменилась.
     fn in_window(&self, now: DateTime<Utc>) -> bool {
         match self.due_date {
-            Some(due_date) => now.with_timezone(&self.timezone()).date_naive() == due_date,
+            Some(due_date) => {
+                let today = now.with_timezone(&self.timezone()).date_naive();
+                due_date == today || (self.deferred && due_date + Duration::days(1) == today)
+            }
             None => true,
         }
     }
@@ -396,6 +597,7 @@ impl ReminderRow {
 }
 
 pub(crate) const REMINDER_ROW_COLUMNS: &str = "d.id, d.household_id, d.user_id, d.occurrence_key,
+        d.deferred,
         i.title, i.id AS item_id, i.status::text AS item_status,
         i.deleted_at AS item_deleted_at, i.due_at, i.due_date,
         i.assignee_user_id, i.created_by_user_id,
@@ -403,7 +605,7 @@ pub(crate) const REMINDER_ROW_COLUMNS: &str = "d.id, d.household_id, d.user_id, 
         l.is_archived AS list_archived,
         u.id AS recipient_id, u.deleted_at AS recipient_deleted_at,
         u.household_id AS recipient_household_id, u.timezone AS recipient_timezone,
-        u.telegram_chat_id,
+        u.settings AS recipient_settings, u.telegram_chat_id,
         h.id AS household_found, h.deleted_at AS household_deleted_at,
         h.timezone AS household_timezone";
 
@@ -572,6 +774,13 @@ async fn deliver_one(pool: &PgPool, id: Uuid, now: DateTime<Utc>) -> Result<u64,
         tx.commit().await?;
         return Ok(0);
     }
+    let timezone = row.timezone();
+    // Проверка под блокировкой закрывает гонку с другим экземпляром
+    // планировщика: даже «сброшенная» запись не уйдёт внутри тихих часов.
+    if postpone_for_quiet(&mut tx, row.id, &row.recipient_settings, timezone, now).await? {
+        tx.commit().await?;
+        return Ok(0);
+    }
 
     // `is_stale` уже проверил эти поля; явная проверка не даёт отправить
     // сообщение в чат 0 или с пустым названием при будущих изменениях схемы.
@@ -580,7 +789,6 @@ async fn deliver_one(pool: &PgPool, id: Uuid, now: DateTime<Utc>) -> Result<u64,
         tx.commit().await?;
         return Ok(0);
     };
-    let timezone = row.timezone();
     let due = ru::due_label(row.due_at, row.due_date, timezone, now).unwrap_or_default();
     let html = format!(
         "🔔 <b>{}</b>\n{}",
