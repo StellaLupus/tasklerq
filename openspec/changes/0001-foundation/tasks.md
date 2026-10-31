@@ -87,8 +87,10 @@
   - Заметка: реализовано в репозитории `tasklerq-ha`, коммит `bfd54f3`.
 - [x] 6.3 Реализовать API-клиент и координатор со snapshot `since`, полной синхронизацией и backoff; проверить тестами курсор, восстановление и daily resync.
   - Заметка: реализовано в репозитории `tasklerq-ha`, коммит `f19dc97`.
-- [ ] 6.4 Реализовать `TodoListEntity` на каждый список: create/update/delete/complete, due date/datetime, description и стабильный unique_id; проверить pytest-тестами.
-- [ ] 6.5 Реализовать атрибут `tasklerq_items` с priority/tags/assignee/recurrence; проверить, что нативные обновления не теряют поля.
+- [x] 6.4 Реализовать `TodoListEntity` на каждый список: create/update/delete/complete, due date/datetime, description и стабильный unique_id; проверить pytest-тестами.
+  - Заметка: реализовано в репозитории `tasklerq-ha`, коммит `28901ea`.
+- [x] 6.5 Реализовать атрибут `tasklerq_items` с priority/tags/assignee/recurrence; проверить, что нативные обновления не теряют поля.
+  - Заметка: реализовано в репозитории `tasklerq-ha`, коммит `28901ea`.
 - [ ] 6.6 Реализовать `CalendarEntity`: all-day/timed события, повторения на горизонте, read-only; проверить pytest-тестами.
 - [ ] 6.7 Реализовать обработку `409`, `401`, `5xx`, `unavailable` и `HomeAssistantError`; проверить тестами конфликт, reauth и восстановление.
 - [ ] 6.8 Реализовать diagnostics с redaction токена и без контента задач; проверить pytest-тестом.
