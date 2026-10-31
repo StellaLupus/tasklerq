@@ -409,8 +409,10 @@ pub fn evaluate(set: &GoldenSet, responses: &BTreeMap<String, Value>) -> Report 
             None => PhraseResult {
                 id: phrase.id.clone(),
                 category: phrase.category,
+                // Как в `judge`: ожидаемые уточнения тоже в знаменателе, иначе
+                // фраза без ответа не снижает точность.
                 totals: Totals {
-                    expected: phrase.expect.items.len(),
+                    expected: phrase.expect.items.len() + phrase.expect.clarifications.len(),
                     ..Totals::default()
                 },
                 clarifications_ok: false,
