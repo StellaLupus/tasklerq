@@ -472,10 +472,10 @@ retention.
 (`text`, `source` (`ha_voice`/`ha_automation`, по умолчанию `ha_automation`),
 `mode`, `hint`, `list_id`, `idempotency_key`) и возвращает ответ через
 `SupportsResponse.OPTIONAL` (`ONLY` отклонил бы вызов из автоматизации без
-`response_variable`). Для HA Assist поставляется пример
-`conversation.intents` + `intent_script`, который вызывает сервис и озвучивает
-`response.speech`. Простой путь `todo.add_item` остаётся для команд без разбора
-дат/тегов; он создаёт элемент с `source=ha_todo`.
+`response_variable`). Для HA Assist поставляется пример пользовательских
+предложений (custom sentences) + `intent_script`, который вызывает сервис и
+озвучивает `speech` из ответа сервиса. Простой путь `todo.add_item` остаётся для
+команд без разбора дат/тегов; он создаёт элемент с `source=ha_todo`.
 
 **Почему не LLM-инструменты в HA.** AI Task не имеет Assist-инструментов, а
 разбор должен быть единым для Telegram и голоса, с общей валидацией, квотой,
@@ -521,8 +521,9 @@ tasklerq-ha/custom_components/tasklerq/
 `draft`, `tasklerq.undo_last_capture` отменяет последний голосовой capture.
 Сервисы объявляются с `SupportsResponse.OPTIONAL`; ошибки — `HomeAssistantError` с
 русским текстом. Для HA Assist в документации и примере пакета поставляются
-`conversation.intents` и `intent_script`, которые вызывают сервис и озвучивают
-`response.speech`; Python-код intent не нужен.
+пользовательские предложения (custom sentences) и `intent_script`, которые
+вызывают сервис и озвучивают `speech` из ответа сервиса; Python-код intent не
+нужен.
 
 **Snapshot API.** `GET /api/v1/snapshot?since=<cursor>&calendar_end=<date>`
 возвращает `lists`, `items`, `deleted_item_ids`, `calendar_events`,

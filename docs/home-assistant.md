@@ -285,7 +285,8 @@ LLM_CAPTURE_ENABLED=true
 Tasklerq можно использовать голосом без Telegram. HA Assist распознаёт речь,
 вызывает сервис `tasklerq.capture`, а Tasklerq разбирает текст через AI Task и
 создаёт задачи или покупки. Ответ озвучивается. Это основной голосовой сценарий;
-если Assist уже настроен, добавьте только предложения и `intent_script` ниже.
+если Assist уже настроен, добавьте только пользовательские предложения (custom
+sentences) и `intent_script` ниже.
 
 ### Сервис
 
@@ -315,52 +316,97 @@ response_variable: result
 
 ### Подключение к Assist
 
-Добавьте в `configuration.yaml` (или в package) предложения и `intent_script`:
+Нужны два файла: предложения в `custom_sentences` и пакет с `intent_script`.
+Объявить фразы в `conversation: intents:` нельзя: `{tasklerq_text}` остался бы
+ссылкой на несуществующий слот-лист, и hassil завершил бы разбор с
+`MissingListError`. В HA 2026.10 `speech` — это mapping с ключом `text`, а
+шаблон рендерится после действий: ответ сервиса доступен только как
+`action_response` (его возвращает `stop` с `response_variable`).
+
+`/config/custom_sentences/ru/tasklerq.yaml`:
 
 ```yaml
-conversation:
-  intents:
-    TasklerqAddTask:
-      - "добавь задачу {text}"
-      - "запиши задачу {text}"
-      - "напомни {text}"
-    TasklerqAddShopping:
-      - "добавь в покупки {text}"
-      - "купи {text}"
-      - "в список покупок {text}"
-    TasklerqUndo:
-      - "отмени последнее добавление"
-      - "убери последнюю задачу"
+language: ru
+intents:
+  TasklerqAddTask:
+    data:
+      - sentences:
+          - "добавь задачу {tasklerq_text}"
+          - "запиши задачу {tasklerq_text}"
+          - "напомни {tasklerq_text}"
 
+  TasklerqAddShopping:
+    data:
+      - sentences:
+          - "добавь в покупки {tasklerq_text}"
+          - "купи {tasklerq_text}"
+          - "в список покупок {tasklerq_text}"
+
+  TasklerqUndo:
+    data:
+      - sentences:
+          - "отмени последнее добавление"
+          - "убери последнюю задачу"
+
+lists:
+  tasklerq_text:
+    wildcard: true
+```
+
+`/config/packages/tasklerq_assist.yaml` (подключение пакетов — через
+`homeassistant: packages:` в `configuration.yaml`):
+
+```yaml
 intent_script:
   TasklerqAddTask:
-    speech: "{{ response.speech }}"
+    speech:
+      text: >-
+        {{ action_response.speech if action_response is defined and action_response.speech is defined and action_response.speech else 'Не удалось добавить задачу. Возможно, она не сохранена: проверьте список в Tasklerq.' }}
     action:
       - action: tasklerq.capture
         data:
-          text: "{{ text }}"
+          text: "{{ tasklerq_text }}"
           source: ha_voice
           mode: auto
           hint: tasks
         response_variable: response
+        continue_on_error: true
+      - stop: ""
+        response_variable: response
 
   TasklerqAddShopping:
-    speech: "{{ response.speech }}"
+    speech:
+      text: >-
+        {{ action_response.speech if action_response is defined and action_response.speech is defined and action_response.speech else 'Не удалось добавить покупки. Возможно, они не сохранены: проверьте список в Tasklerq.' }}
     action:
       - action: tasklerq.capture
         data:
-          text: "{{ text }}"
+          text: "{{ tasklerq_text }}"
           source: ha_voice
           mode: auto
           hint: shopping
         response_variable: response
+        continue_on_error: true
+      - stop: ""
+        response_variable: response
 
   TasklerqUndo:
-    speech: "{{ response.speech }}"
+    speech:
+      text: >-
+        {{ action_response.speech if action_response is defined and action_response.speech is defined and action_response.speech else 'Не удалось отменить последнее добавление. Проверьте Tasklerq.' }}
     action:
       - action: tasklerq.undo_last_capture
         response_variable: response
+        continue_on_error: true
+      - stop: ""
+        response_variable: response
 ```
+
+Если Tasklerq вернул ошибку, `continue_on_error` пропускает шаг,
+`action_response` не появляется, и озвучивается запасная фраза; причина
+остаётся в журнале и трассировке HA.
+
+Готовые файлы: [`tasklerq-ha/examples/assist`](https://github.com/StellaLupus/tasklerq-ha/tree/main/examples/assist).
 
 Перезапустите HA и проверьте в **Developer Tools → Assist**:
 
@@ -380,11 +426,11 @@ intent_script:
   создаются.
 - `todo.add_item` остаётся простым путём без разбора: он создаёт позицию с
   названием, но без дат, тегов и повторений.
-- Сценарий с `conversation.intents` использует встроенный распознаватель
-  намерений Home Assistant. Если в Assist выбран LLM-агент, создайте отдельный
-  pipeline с агентом Home Assistant или добавьте вызов `tasklerq.capture` как
-  действие, доступное агенту. AI Task разбора при этом остаётся без
-  `llm_hass_api`.
+- Сценарий с пользовательскими предложениями (custom sentences) использует
+  встроенный распознаватель намерений Home Assistant. Если в Assist выбран
+  LLM-агент, создайте отдельный pipeline с агентом Home Assistant или добавьте
+  вызов `tasklerq.capture` как действие, доступное агенту. AI Task разбора при
+  этом остаётся без `llm_hass_api`.
 
 ### Другие клиенты
 

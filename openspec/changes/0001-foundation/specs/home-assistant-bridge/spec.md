@@ -155,9 +155,9 @@ API-токен. При настройке компонент MUST провери
 ### Requirement: Голосовой сценарий Assist
 
 Система SHALL поддерживать сценарий Home Assistant Assist: пользовательские
-предложения `conversation.intents` вызывают `intent_script`, который вызывает
-`tasklerq.capture` и озвучивает `response.speech`. Пример конфигурации MUST
-поставляться в документации и примере пакета. Сценарий MUST работать без
+предложения Assist (custom sentences) вызывают `intent_script`, который вызывает
+`tasklerq.capture` и озвучивает `speech` из ответа сервиса. Пример конфигурации
+MUST поставляться в документации и примере пакета. Сценарий MUST работать без
 Telegram и MUST NOT требовать включения Assist-инструментов (`llm_hass_api`) у
 AI Task.
 

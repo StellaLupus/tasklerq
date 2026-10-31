@@ -433,7 +433,7 @@ curl -fsS -X POST http://127.0.0.1:18080/api/v1/capture \
 
 Ожидаемо: `status=applied`, две покупки и `speech` в ответе.
 
-13. Настройте Assist (пример `conversation.intents` + `intent_script` в
+13. Настройте Assist (пользовательские предложения + `intent_script`, пример в
     [`home-assistant.md`](home-assistant.md#71-голосовой-capture-через-assist)) и
     произнесите «купи молоко и хлеб». Убедитесь, что позиции появились в
     `todo.pokupki`, а Assist озвучил ответ.
@@ -717,9 +717,10 @@ curl -fsS http://127.0.0.1:18080/health/ready
 2. Вызовите `tasklerq.capture` в **Developer Tools → Actions** с
    `text`, `mode=auto`, `hint=shopping`; посмотрите ответ и ошибку.
 3. Проверьте `curl` к `POST /api/v1/capture` из контейнера HA.
-4. Проверьте `conversation.intents` и `intent_script`; после правки
-   перезапустите HA.
-5. Проверьте `response.speech` в ответе сервиса — Assist озвучивает именно его.
+4. Проверьте файл `custom_sentences/ru/tasklerq.yaml` и `intent_script`; после
+   правки перезапустите HA.
+5. Проверьте `speech` в ответе сервиса — Assist озвучивает его через
+   `action_response`.
 6. Если LLM отвечает дольше `CAPTURE_VOICE_TIMEOUT_MS`, должна создаваться
    fallback-позиция; проверьте `fallback=true` и `capture_fallback_total`.
 7. Если Tasklerq вернул `429`, проверьте лимит capture и суточную квоту LLM.

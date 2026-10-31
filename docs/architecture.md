@@ -449,7 +449,8 @@ custom_components/tasklerq/
 - `unique_id`: `tasklerq:<household_uuid>:<list_uuid>`.
 - Дополнительные поля — в атрибуте `tasklerq_items`.
 - Сервис `tasklerq.capture` вызывает `POST /api/v1/capture`; для HA Assist
-  поставляется пример `conversation.intents` + `intent_script`.
+  поставляется пример пользовательских предложений (custom sentences) +
+  `intent_script`.
 - Polling 60 с, backoff до 5 минут, reauth при 401.
 - Запись передаёт `version`; при 409 — refresh и ошибка.
 
