@@ -290,7 +290,9 @@ curl -sS -X POST \
 
 Если Telegram не нужен, установите `TELEGRAM_MODE=disabled`; `TELEGRAM_BOT_TOKEN`
 и webhook-секрет в этом режиме не требуются. HTTP API, HA-компонент и внешний
-capture продолжают работать.
+capture продолжают работать, а `POST /webhooks/telegram` отвечает `404`.
+Серверная часть этого сценария (`todo`, `calendar`, capture и undo без бота)
+проверяется тестом [`tests/headless_ha.rs`](../tests/headless_ha.rs).
 
 Секреты:
 

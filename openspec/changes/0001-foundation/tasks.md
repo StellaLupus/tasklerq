@@ -93,7 +93,8 @@
 - [ ] 6.10 Реализовать сервисы `tasklerq.capture` (`text`, `source`, `mode`, `hint`, `list_id`, `idempotency_key`), `confirm_capture`, `cancel_capture`, `undo_last_capture` с `SupportsResponse.OPTIONAL`, русскими ошибками и ответом `status`/`speech`/`items`/`draft_id`/`capture_id`; проверить pytest-тестами.
 - [ ] 6.11 Реализовать генерацию `idempotency_key` на вызов сервиса и повторное использование при сетевом retry; проверить тестом отсутствия дубликатов.
 - [ ] 6.12 Подготовить пример пакета `conversation.intents` + `intent_script` для HA Assist и проверить голосовые сценарии «купи …», «добавь задачу …», «отмени последнее добавление».
-- [ ] 6.13 Проверить работу компонента при `TELEGRAM_MODE=disabled` и без токена бота; зафиксировать, что `todo`/`calendar` и capture доступны.
+- [x] 6.13 Проверить работу компонента при `TELEGRAM_MODE=disabled` и без токена бота; зафиксировать, что `todo`/`calendar` и capture доступны.
+  - Заметка: серверная часть проверена тестом `tests/headless_ha.rs`; компонент — в репозитории `tasklerq-ha`.
 
 ## 7. Уведомления и планировщик
 

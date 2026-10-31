@@ -76,6 +76,16 @@ HACS уже установлен в этой инсталляции HA. Если
 - После обновления проверьте **Настройки → Устройства и службы → Tasklerq →
   Диагностика**.
 
+### Headless-режим без Telegram
+
+Компонент работает с сервисом, запущенным в `TELEGRAM_MODE=disabled` без
+`TELEGRAM_BOT_TOKEN` и webhook-секрета. В этом режиме доступны `todo`,
+`calendar`, внешний capture и отмена последнего голосового capture
+(`POST /api/v1/captures/undo-last`); Telegram-бот и исходящие
+Telegram-уведомления отключены. Серверная часть сценария из
+[`ha-api.md`](ha-api.md#9-минимальный-сценарий-клиента) проверяется
+интеграционным тестом [`tests/headless_ha.rs`](../tests/headless_ha.rs).
+
 ## 4. Настройка
 
 В config flow:
