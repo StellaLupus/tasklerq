@@ -229,7 +229,7 @@ impl TelegramApi for FakeTelegram {
 /// Разобрать кнопки сообщения: `(подпись, callback_data)`.
 pub fn buttons(html: &str) -> Vec<(String, String)> {
     let mut found = Vec::new();
-    let marker = "<tg-button callback_data=\"";
+    let marker = "<tg-button type=\"callback_data\" data=\"";
     let mut rest = html;
     while let Some(start) = rest.find(marker) {
         let after = &rest[start + marker.len()..];

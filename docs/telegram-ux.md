@@ -62,27 +62,27 @@ flowchart TD
 <p>Просрочено: <b>2</b> · На сегодня: <b>4</b></p>
 
 <tg-button-row>
-  <tg-button callback_data="t:AbCdEfGhIjKlMnOp">➕ Добавить</tg-button>
-  <tg-button callback_data="t:QrStUvWxYz012345">🛒 Покупки</tg-button>
+  <tg-button type="callback_data" data="t:AbCdEfGhIjKlMnOp">➕ Добавить</tg-button>
+  <tg-button type="callback_data" data="t:QrStUvWxYz012345">🛒 Покупки</tg-button>
 </tg-button-row>
 
 <hr/>
 
 <p><b>Просрочено</b></p>
 <tg-button-row>
-  <tg-button callback_data="t:...">☐</tg-button>
-  <tg-button callback_data="t:...">Оплатить интернет · 18:00</tg-button>
+  <tg-button type="callback_data" data="t:...">☐</tg-button>
+  <tg-button type="callback_data" data="t:...">Оплатить интернет · 18:00</tg-button>
 </tg-button-row>
 
 <p><b>Сегодня</b></p>
 <tg-button-row>
-  <tg-button callback_data="t:...">☐</tg-button>
-  <tg-button callback_data="t:...">Позвонить маме · 19:00</tg-button>
+  <tg-button type="callback_data" data="t:...">☐</tg-button>
+  <tg-button type="callback_data" data="t:...">Позвонить маме · 19:00</tg-button>
 </tg-button-row>
 
 <tg-button-row>
-  <tg-button callback_data="t:...">⬅️ Назад</tg-button>
-  <tg-button callback_data="t:...">⚙️ Настройки</tg-button>
+  <tg-button type="callback_data" data="t:...">⬅️ Назад</tg-button>
+  <tg-button type="callback_data" data="t:...">⚙️ Настройки</tg-button>
 </tg-button-row>
 ```
 
@@ -520,10 +520,13 @@ API и лимит по IP). Лимиты не блокируют действи�
 
 ## 14. Реализация: допущения и ограничения
 
-- **Схема RichMessage — допущение.** Адаптер `HttpTelegramApi` вызывает
-  `sendRichMessage` (`{chat_id, html}`) и `editRichMessage`
-  (`{chat_id, message_id, html}`); ответ — объект с `message_id`. Точные имена
-  методов и полей нужно сверить с живым Bot API; менять их придётся только в
+- **Схема RichMessage сверена с Bot API (2026-10-31).** Адаптер `HttpTelegramApi`
+  вызывает `sendRichMessage` (`{chat_id, rich_message: {html}}`) и
+  `editMessageText` (`{chat_id, message_id, rich_message: {html}}`); отдельного
+  метода `editRichMessage` в Bot API нет. Ответ — объект с `message_id`.
+  В `InputRichMessage` заполняется ровно одно поле (`html`). Кнопки размечаются
+  как `<tg-button type="callback_data" data="…">`, ряды — `<tg-button-row>`
+  (атрибут `align` необязателен). Менять схему нужно только в
   `src/telegram/api.rs`, контракт зафиксирован в `tests/telegram_api.rs`.
   Обычные сообщения (уведомления об изменении состава) идут через `sendMessage`.
 - **Имя бота** для ссылок-приглашений задаёт `TELEGRAM_BOT_USERNAME`

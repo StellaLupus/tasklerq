@@ -69,6 +69,12 @@ async fn edit_rich_and_plain_messages_use_matching_methods() {
         .await;
     Mock::given(method("POST"))
         .and(path(format!("/bot{TOKEN}/editMessageText")))
+        .and(body_json(json!({
+            "chat_id": 42,
+            "message_id": 8,
+            "text": "новый текст",
+            "parse_mode": "HTML"
+        })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true, "result": true})))
         .expect(1)
         .mount(&server)

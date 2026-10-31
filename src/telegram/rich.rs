@@ -223,7 +223,7 @@ pub fn render<A>(view: &View<A>, tokens: &[String]) -> RichMessage {
                     for button in chunk {
                         let token = tokens.next().expect("token count was checked");
                         row.push_str(&format!(
-                            "<tg-button callback_data=\"{}\">{}</tg-button>",
+                            "<tg-button type=\"callback_data\" data=\"{}\">{}</tg-button>",
                             escape(token),
                             escape_inline(&button.label)
                         ));
@@ -274,10 +274,10 @@ mod tests {
             "<h3>Задачи · 3</h3>\n\
              <p>Просрочено: <b>2</b></p>\n\
              <hr/>\n\
-             <tg-button-row><tg-button callback_data=\"t:0000000000000001\">A</tg-button>\
-             <tg-button callback_data=\"t:0000000000000002\">B</tg-button>\
-             <tg-button callback_data=\"t:0000000000000003\">C</tg-button></tg-button-row>\n\
-             <tg-button-row><tg-button callback_data=\"t:0000000000000004\">D</tg-button></tg-button-row>\n\
+             <tg-button-row><tg-button type=\"callback_data\" data=\"t:0000000000000001\">A</tg-button>\
+             <tg-button type=\"callback_data\" data=\"t:0000000000000002\">B</tg-button>\
+             <tg-button type=\"callback_data\" data=\"t:0000000000000003\">C</tg-button></tg-button-row>\n\
+             <tg-button-row><tg-button type=\"callback_data\" data=\"t:0000000000000004\">D</tg-button></tg-button-row>\n\
              <details><summary>Описание</summary>строка 1<br/>строка 2</details>"
         );
     }
