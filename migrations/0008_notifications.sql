@@ -9,10 +9,10 @@
 -- тем же пользователем, вхождением и типом считаются дублем. PostgreSQL 15+
 -- поддерживает такую форму напрямую, отдельный индекс не нужен.
 --
--- `occurrence_key` — срок вхождения в UTC (для timed-задач — `due_at`, для
--- повторяющихся он меняется вместе со сроком). `outbox_seq` ссылается на
--- поставленное сообщение; после retention outbox ссылка обнуляется, а запись
--- доставки остаётся для аудита дедупликации.
+-- `occurrence_key` — срок вхождения: `due_at` в UTC для timed-задач и
+-- `date:YYYY-MM-DD` для вседневных; у повторяющихся он меняется вместе со
+-- сроком. `outbox_seq` ссылается на поставленное сообщение; после retention
+-- outbox ссылка обнуляется, а запись доставки остаётся для аудита дедупликации.
 --
 -- `kind` уже содержит значения для следующих пунктов (`digest`, `assignment`),
 -- чтобы добавлять источники без изменения типа. Статус `sent` означает
@@ -24,8 +24,8 @@ CREATE TYPE notification_status AS ENUM ('pending', 'sent', 'cancelled');
 CREATE TABLE notification_deliveries (
     id uuid PRIMARY KEY,
     household_id uuid NOT NULL REFERENCES households (id) ON DELETE CASCADE,
-    user_id uuid NOT NULL REFERENCES users (id) ON DELETE CASCADE,
-    item_id uuid REFERENCES items (id) ON DELETE CASCADE,
+    user_id uuid NOT NULL,
+    item_id uuid,
     occurrence_key text NOT NULL,
     kind notification_kind NOT NULL,
     status notification_status NOT NULL DEFAULT 'pending',
@@ -33,6 +33,12 @@ CREATE TABLE notification_deliveries (
     outbox_seq bigint REFERENCES outbox (seq) ON DELETE SET NULL,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT notification_deliveries_user_household_fk
+        FOREIGN KEY (user_id, household_id)
+        REFERENCES users (id, household_id) ON DELETE CASCADE,
+    CONSTRAINT notification_deliveries_item_household_fk
+        FOREIGN KEY (item_id, household_id)
+        REFERENCES items (id, household_id) ON DELETE CASCADE,
     CONSTRAINT notification_deliveries_key_unique
         UNIQUE NULLS NOT DISTINCT (user_id, item_id, occurrence_key, kind)
 );
@@ -40,8 +46,4 @@ CREATE TABLE notification_deliveries (
 -- Выборка готовых к доставке записей и отмена устаревших pending.
 CREATE INDEX notification_deliveries_pending_idx
     ON notification_deliveries (scheduled_at)
-    WHERE status = 'pending';
-
-CREATE INDEX notification_deliveries_item_idx
-    ON notification_deliveries (item_id)
     WHERE status = 'pending';

@@ -6,12 +6,13 @@ mod support;
 
 use std::sync::Arc;
 
-use chrono::{DateTime, Duration, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Timelike, Utc};
+use chrono_tz::Tz;
 use serde_json::json;
 use sqlx::PgPool;
 use support::{TestDb, TestHousehold};
 use tasklerq::domain::models::{Item, RecurrenceFreq, RecurrenceInput};
-use tasklerq::jobs::scheduler::{Scheduler, occurrence_key};
+use tasklerq::jobs::scheduler::{Scheduler, all_day_occurrence_key, occurrence_key};
 use tasklerq::storage::repositories::items;
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -47,6 +48,109 @@ async fn create_task(
         item,
     )
     .await
+}
+
+async fn create_all_day_task(
+    db: &TestDb,
+    household: &TestHousehold,
+    title: &str,
+    due_date: NaiveDate,
+    assignee: Option<Uuid>,
+) -> Item {
+    let mut item = support::new_item(household.tasks_list_id, title);
+    item.due_date = Some(due_date);
+    item.assignee_user_id = assignee;
+    support::create_item(
+        &db.pool,
+        household,
+        household.tasks_list_id,
+        &household.owner(),
+        item,
+    )
+    .await
+}
+
+async fn clear_author(pool: &PgPool, item_id: Uuid) {
+    sqlx::query(
+        "UPDATE items
+         SET created_by_user_id = NULL, source = 'ha_voice'
+         WHERE id = $1",
+    )
+    .bind(item_id)
+    .execute(pool)
+    .await
+    .expect("clear author");
+}
+
+async fn set_user_timezone(pool: &PgPool, user_id: Uuid, timezone: &str) {
+    sqlx::query("UPDATE users SET timezone = $2 WHERE id = $1")
+        .bind(user_id)
+        .bind(timezone)
+        .execute(pool)
+        .await
+        .expect("user timezone");
+}
+
+async fn set_household_timezone(pool: &PgPool, household_id: Uuid, timezone: &str) {
+    sqlx::query("UPDATE households SET timezone = $2 WHERE id = $1")
+        .bind(household_id)
+        .bind(timezone)
+        .execute(pool)
+        .await
+        .expect("household timezone");
+}
+
+async fn add_member(pool: &PgPool, household_id: Uuid, name: &str) -> Uuid {
+    let id = Uuid::now_v7();
+    let telegram_id = support::next_telegram_id();
+    sqlx::query(
+        "INSERT INTO users (
+             id, household_id, telegram_user_id, telegram_chat_id, display_name,
+             role, settings, created_at, updated_at
+         )
+         VALUES ($1, $2, $3, $3, $4, 'member', '{}'::jsonb, now(), now())",
+    )
+    .bind(id)
+    .bind(household_id)
+    .bind(telegram_id)
+    .bind(name)
+    .execute(pool)
+    .await
+    .expect("extra member");
+    id
+}
+
+fn local_utc(timezone: Tz, date: NaiveDate, hour: u32, minute: u32) -> DateTime<Utc> {
+    timezone
+        .with_ymd_and_hms(date.year(), date.month(), date.day(), hour, minute, 0)
+        .single()
+        .expect("local time")
+        .with_timezone(&Utc)
+}
+
+async fn delivery_status(pool: &PgPool, item_id: Uuid, user_id: Uuid) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT status::text FROM notification_deliveries
+         WHERE item_id = $1 AND user_id = $2",
+    )
+    .bind(item_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .expect("delivery status")
+}
+
+async fn insert_outbox(pool: &PgPool, chat: i64, dedupe_key: &str) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO outbox (chat_id, kind, payload, dedupe_key, next_attempt_at, created_at)
+         VALUES ($1, 'message', jsonb_build_object('html', 'already', 'rich', false), $2, now(), now())
+         RETURNING seq",
+    )
+    .bind(chat)
+    .bind(dedupe_key)
+    .fetch_one(pool)
+    .await
+    .expect("outbox row")
 }
 
 async fn chat_id(pool: &PgPool, user_id: Uuid) -> i64 {
@@ -99,7 +203,8 @@ async fn insert_delivery(
     key: &str,
     status: &str,
     scheduled_at: DateTime<Utc>,
-) -> Result<(), sqlx::Error> {
+) -> Result<Uuid, sqlx::Error> {
+    let id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO notification_deliveries (
              id, household_id, user_id, item_id, occurrence_key, kind,
@@ -107,7 +212,7 @@ async fn insert_delivery(
          )
          VALUES ($1, $2, $3, $4, $5, 'reminder', $6::notification_status, $7, $7, $7)",
     )
-    .bind(Uuid::now_v7())
+    .bind(id)
     .bind(household_id)
     .bind(user_id)
     .bind(item_id)
@@ -116,7 +221,7 @@ async fn insert_delivery(
     .bind(scheduled_at)
     .execute(pool)
     .await
-    .map(|_| ())
+    .map(|_| id)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -553,4 +658,757 @@ async fn assignee_gets_the_reminder_and_author_does_not() {
             .await
             .expect("author delivery");
     assert_eq!(authored_user, household.owner_id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_day_reminder_fires_at_user_local_nine_and_only_on_due_day() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let vladivostok = chrono_tz::Asia::Vladivostok;
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    set_user_timezone(&db.pool, household.owner_id, "Asia/Vladivostok").await;
+    set_notifications(
+        &db.pool,
+        household.owner_id,
+        json!({"all_day_time": "09:00"}),
+    )
+    .await;
+
+    let due_date = Utc::now().with_timezone(&vladivostok).date_naive() + Duration::days(2);
+    let item = create_all_day_task(
+        &db,
+        &household,
+        "Сдать отчёт",
+        due_date,
+        Some(household.owner_id),
+    )
+    .await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let scheduler = scheduler(&db.pool);
+
+    let night = local_utc(vladivostok, due_date, 2, 0);
+    assert_eq!(
+        scheduler.tick(night).await.expect("night tick").delivered,
+        0
+    );
+    assert!(messages(&db.pool, chat).await.is_empty());
+
+    let early = local_utc(vladivostok, due_date, 8, 59);
+    assert_eq!(
+        scheduler.tick(early).await.expect("early tick").delivered,
+        0
+    );
+    assert!(messages(&db.pool, chat).await.is_empty());
+
+    let on_time = local_utc(vladivostok, due_date, 9, 0);
+    let stats = scheduler.tick(on_time).await.expect("on-time tick");
+    assert_eq!(stats.planned, 1);
+    assert_eq!(stats.delivered, 1);
+    let sent = messages(&db.pool, chat).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(sent[0].contains("Сдать отчёт"), "{sent:?}");
+    assert!(sent[0].contains("Сегодня"), "{sent:?}");
+
+    let rows = delivery_rows(&db.pool, item.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "sent");
+    assert_eq!(rows[0].1, all_day_occurrence_key(due_date));
+
+    let next_day = local_utc(vladivostok, due_date + Duration::days(1), 9, 0);
+    assert_eq!(
+        scheduler
+            .tick(next_day)
+            .await
+            .expect("next-day tick")
+            .delivered,
+        0
+    );
+    assert_eq!(messages(&db.pool, chat).await.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_day_reminder_is_not_created_on_the_next_day_if_the_service_missed_it() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let due_date = Utc::now().with_timezone(&moscow).date_naive();
+    set_notifications(
+        &db.pool,
+        household.owner_id,
+        json!({"all_day_time": "09:00"}),
+    )
+    .await;
+
+    let item = create_all_day_task(
+        &db,
+        &household,
+        "Пропущенный день",
+        due_date,
+        Some(household.owner_id),
+    )
+    .await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+
+    let next_day = local_utc(moscow, due_date + Duration::days(1), 9, 0);
+    let stats = scheduler(&db.pool)
+        .tick(next_day)
+        .await
+        .expect("missed tick");
+    assert_eq!(stats.planned, 0);
+    assert_eq!(stats.delivered, 0);
+    assert!(messages(&db.pool, chat).await.is_empty());
+    assert!(delivery_rows(&db.pool, item.id).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_all_day_delivery_expires_at_the_end_of_the_due_day() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let due_date = Utc::now().with_timezone(&moscow).date_naive();
+    let item = create_all_day_task(
+        &db,
+        &household,
+        "Просроченное напоминание",
+        due_date,
+        Some(household.owner_id),
+    )
+    .await;
+    insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        Some(item.id),
+        &all_day_occurrence_key(due_date),
+        "pending",
+        local_utc(moscow, due_date, 9, 0),
+    )
+    .await
+    .expect("pending all-day delivery");
+    let chat = chat_id(&db.pool, household.owner_id).await;
+
+    let next_day = local_utc(moscow, due_date + Duration::days(1), 9, 0);
+    let stats = scheduler(&db.pool)
+        .tick(next_day)
+        .await
+        .expect("expired tick");
+    assert_eq!(stats.cancelled, 1);
+    assert_eq!(stats.delivered, 0);
+    assert!(messages(&db.pool, chat).await.is_empty());
+    let rows = delivery_rows(&db.pool, item.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "cancelled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_day_task_created_after_reminder_time_still_fires_same_day() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let due_date = Utc::now().with_timezone(&moscow).date_naive();
+    set_notifications(
+        &db.pool,
+        household.owner_id,
+        json!({"all_day_time": "09:00"}),
+    )
+    .await;
+
+    let item = create_all_day_task(
+        &db,
+        &household,
+        "Позвонить врачу",
+        due_date,
+        Some(household.owner_id),
+    )
+    .await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+
+    let now = local_utc(moscow, due_date, 15, 0);
+    let stats = scheduler(&db.pool).tick(now).await.expect("afternoon tick");
+    assert_eq!(stats.planned, 1);
+    assert_eq!(stats.delivered, 1);
+    let sent = messages(&db.pool, chat).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(sent[0].contains("Позвонить врачу"), "{sent:?}");
+    assert!(sent[0].contains("Сегодня"), "{sent:?}");
+    assert_eq!(delivery_rows(&db.pool, item.id).await[0].0, "sent");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_without_assignee_or_author_notifies_every_enabled_member_once() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let extra_id = add_member(&db.pool, household.household_id, "Extra member").await;
+    set_notifications(
+        &db.pool,
+        household.member_id,
+        json!({"reminders_enabled": false}),
+    )
+    .await;
+
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(&db, &household, "Голосовая задача", Some(due), None, None).await;
+    clear_author(&db.pool, item.id).await;
+
+    let owner_chat = chat_id(&db.pool, household.owner_id).await;
+    let member_chat = chat_id(&db.pool, household.member_id).await;
+    let extra_chat = chat_id(&db.pool, extra_id).await;
+    let scheduler = scheduler(&db.pool);
+    let now = due - Duration::minutes(15);
+
+    let stats = scheduler.tick(now).await.expect("fallback tick");
+    assert_eq!(stats.planned, 2);
+    assert_eq!(stats.delivered, 2);
+    assert_eq!(messages(&db.pool, owner_chat).await.len(), 1);
+    assert_eq!(messages(&db.pool, extra_chat).await.len(), 1);
+    assert!(messages(&db.pool, member_chat).await.is_empty());
+
+    assert_eq!(scheduler.tick(now).await.expect("repeat tick").delivered, 0);
+    assert_eq!(messages(&db.pool, owner_chat).await.len(), 1);
+    assert_eq!(messages(&db.pool, extra_chat).await.len(), 1);
+    assert!(messages(&db.pool, member_chat).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changing_assignee_cancels_old_delivery_and_notifies_new_assignee() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(
+        &db,
+        &household,
+        "Передать задачу",
+        Some(due),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let now = due - Duration::minutes(15);
+    insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        Some(item.id),
+        &occurrence_key(due),
+        "pending",
+        now,
+    )
+    .await
+    .expect("old assignee delivery");
+    sqlx::query("UPDATE items SET assignee_user_id = $2 WHERE id = $1")
+        .bind(item.id)
+        .bind(household.member_id)
+        .execute(&db.pool)
+        .await
+        .expect("reassign item");
+
+    let owner_chat = chat_id(&db.pool, household.owner_id).await;
+    let member_chat = chat_id(&db.pool, household.member_id).await;
+    let stats = scheduler(&db.pool).tick(now).await.expect("reassign tick");
+    assert_eq!(stats.cancelled, 1);
+    assert_eq!(stats.planned, 1);
+    assert_eq!(stats.delivered, 1);
+    assert_eq!(
+        delivery_status(&db.pool, item.id, household.owner_id)
+            .await
+            .as_deref(),
+        Some("cancelled")
+    );
+    assert_eq!(
+        delivery_status(&db.pool, item.id, household.member_id)
+            .await
+            .as_deref(),
+        Some("sent")
+    );
+    assert!(messages(&db.pool, owner_chat).await.is_empty());
+    assert_eq!(messages(&db.pool, member_chat).await.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changing_due_at_cancels_pending_delivery_for_the_old_due() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(
+        &db,
+        &household,
+        "Перенести встречу",
+        Some(due),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let now = due - Duration::minutes(15);
+    insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        Some(item.id),
+        &occurrence_key(due),
+        "pending",
+        now,
+    )
+    .await
+    .expect("old due delivery");
+    sqlx::query("UPDATE items SET due_at = $2 WHERE id = $1")
+        .bind(item.id)
+        .bind(due + Duration::hours(2))
+        .execute(&db.pool)
+        .await
+        .expect("move due");
+
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let stats = scheduler(&db.pool).tick(now).await.expect("moved tick");
+    assert_eq!(stats.cancelled, 1);
+    assert_eq!(stats.delivered, 0);
+    assert!(messages(&db.pool, chat).await.is_empty());
+    let rows = delivery_rows(&db.pool, item.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "cancelled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lead_time_of_one_hour_shifts_the_delivery_moment() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    set_notifications(&db.pool, household.owner_id, json!({"lead_minutes": 60})).await;
+    let due = rounded_now() + Duration::hours(3);
+    create_task(
+        &db,
+        &household,
+        "За час",
+        Some(due),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let scheduler = scheduler(&db.pool);
+
+    assert_eq!(
+        scheduler
+            .tick(due - Duration::minutes(61))
+            .await
+            .expect("early")
+            .delivered,
+        0
+    );
+    assert!(messages(&db.pool, chat).await.is_empty());
+    assert_eq!(
+        scheduler
+            .tick(due - Duration::minutes(60))
+            .await
+            .expect("on time")
+            .delivered,
+        1
+    );
+    assert_eq!(messages(&db.pool, chat).await.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reminder_text_uses_user_timezone_and_escapes_the_title() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    set_user_timezone(&db.pool, household.owner_id, "Asia/Vladivostok").await;
+    let date = (Utc::now() + Duration::days(2)).date_naive();
+    let due = Utc
+        .with_ymd_and_hms(date.year(), date.month(), date.day(), 10, 0, 0)
+        .single()
+        .expect("due");
+    create_task(
+        &db,
+        &household,
+        "<b>Важно</b>",
+        Some(due),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+
+    assert_eq!(
+        scheduler(&db.pool)
+            .tick(due - Duration::minutes(15))
+            .await
+            .expect("tick")
+            .delivered,
+        1
+    );
+    let sent = messages(&db.pool, chat).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(sent[0].contains("20:00"), "{sent:?}");
+    assert!(!sent[0].contains("13:00"), "{sent:?}");
+    assert!(sent[0].contains("&lt;b&gt;Важно&lt;/b&gt;"), "{sent:?}");
+    assert!(!sent[0].contains("<b>Важно</b>"), "{sent:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn existing_outbox_row_marks_delivery_sent_without_a_second_message() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(
+        &db,
+        &household,
+        "Уже в очереди",
+        Some(due),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let now = due - Duration::minutes(15);
+    let delivery_id = insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        Some(item.id),
+        &occurrence_key(due),
+        "pending",
+        now,
+    )
+    .await
+    .expect("delivery");
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let existing_seq = insert_outbox(
+        &db.pool,
+        chat,
+        &format!("notification:reminder:{delivery_id}"),
+    )
+    .await;
+
+    let stats = scheduler(&db.pool).tick(now).await.expect("tick");
+    assert_eq!(stats.delivered, 1);
+    assert_eq!(messages(&db.pool, chat).await.len(), 1);
+    let rows = delivery_rows(&db.pool, item.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "sent");
+    assert_eq!(rows[0].2, Some(existing_seq));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_delivery_is_revived_when_the_same_due_becomes_relevant_again() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(
+        &db,
+        &household,
+        "Вернуть задачу",
+        Some(due),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        Some(item.id),
+        &occurrence_key(due),
+        "pending",
+        due - Duration::minutes(15),
+    )
+    .await
+    .expect("pending delivery");
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let scheduler = scheduler(&db.pool);
+    let mut conn = db.pool.acquire().await.expect("conn");
+
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        item.id,
+        None,
+        "Europe/Moscow",
+        due - Duration::minutes(30),
+    )
+    .await
+    .expect("complete");
+    let stats = scheduler
+        .tick(due - Duration::minutes(15))
+        .await
+        .expect("cancel tick");
+    assert_eq!(stats.cancelled, 1);
+    assert_eq!(stats.delivered, 0);
+    let rows = delivery_rows(&db.pool, item.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "cancelled");
+    assert!(messages(&db.pool, chat).await.is_empty());
+
+    items::reopen(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        item.id,
+        None,
+        due - Duration::minutes(10),
+    )
+    .await
+    .expect("reopen");
+    let stats = scheduler
+        .tick(due - Duration::minutes(9))
+        .await
+        .expect("revive tick");
+    assert_eq!(stats.planned, 1);
+    assert_eq!(stats.delivered, 1);
+    let rows = delivery_rows(&db.pool, item.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "sent");
+    assert_eq!(messages(&db.pool, chat).await.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_assignee_with_disabled_reminders_notifies_nobody() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    set_notifications(
+        &db.pool,
+        household.member_id,
+        json!({"reminders_enabled": false}),
+    )
+    .await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(
+        &db,
+        &household,
+        "Исполнитель без напоминаний",
+        Some(due),
+        Some(household.member_id),
+        None,
+    )
+    .await;
+    let owner_chat = chat_id(&db.pool, household.owner_id).await;
+    let member_chat = chat_id(&db.pool, household.member_id).await;
+
+    let stats = scheduler(&db.pool)
+        .tick(due - Duration::minutes(15))
+        .await
+        .expect("tick");
+    assert_eq!(stats.planned, 0);
+    assert_eq!(stats.delivered, 0);
+    assert!(messages(&db.pool, owner_chat).await.is_empty());
+    assert!(messages(&db.pool, member_chat).await.is_empty());
+    assert!(delivery_rows(&db.pool, item.id).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleted_list_cancels_pending_delivery() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(
+        &db,
+        &household,
+        "Задача в удалённом списке",
+        Some(due),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        Some(item.id),
+        &occurrence_key(due),
+        "pending",
+        due - Duration::minutes(15),
+    )
+    .await
+    .expect("pending delivery");
+    sqlx::query("UPDATE lists SET deleted_at = now() WHERE id = $1")
+        .bind(household.tasks_list_id)
+        .execute(&db.pool)
+        .await
+        .expect("delete list");
+    let chat = chat_id(&db.pool, household.owner_id).await;
+
+    let stats = scheduler(&db.pool)
+        .tick(due - Duration::minutes(15))
+        .await
+        .expect("tick");
+    assert_eq!(stats.cancelled, 1);
+    assert_eq!(stats.delivered, 0);
+    assert!(messages(&db.pool, chat).await.is_empty());
+    let rows = delivery_rows(&db.pool, item.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "cancelled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleted_household_cancels_pending_delivery() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(
+        &db,
+        &household,
+        "Задача в удалённом household",
+        Some(due),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        Some(item.id),
+        &occurrence_key(due),
+        "pending",
+        due - Duration::minutes(15),
+    )
+    .await
+    .expect("pending delivery");
+    sqlx::query("UPDATE households SET deleted_at = now() WHERE id = $1")
+        .bind(household.household_id)
+        .execute(&db.pool)
+        .await
+        .expect("delete household");
+    let chat = chat_id(&db.pool, household.owner_id).await;
+
+    let stats = scheduler(&db.pool)
+        .tick(due - Duration::minutes(15))
+        .await
+        .expect("tick");
+    assert_eq!(stats.cancelled, 1);
+    assert_eq!(stats.delivered, 0);
+    assert!(messages(&db.pool, chat).await.is_empty());
+    let rows = delivery_rows(&db.pool, item.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "cancelled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clearing_assignee_cancels_old_delivery_and_notifies_the_author() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(
+        &db,
+        &household,
+        "Вернуть автору",
+        Some(due),
+        Some(household.member_id),
+        None,
+    )
+    .await;
+    insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.member_id,
+        Some(item.id),
+        &occurrence_key(due),
+        "pending",
+        due - Duration::minutes(15),
+    )
+    .await
+    .expect("assignee delivery");
+    sqlx::query("UPDATE items SET assignee_user_id = NULL WHERE id = $1")
+        .bind(item.id)
+        .execute(&db.pool)
+        .await
+        .expect("clear assignee");
+    let owner_chat = chat_id(&db.pool, household.owner_id).await;
+    let member_chat = chat_id(&db.pool, household.member_id).await;
+
+    let stats = scheduler(&db.pool)
+        .tick(due - Duration::minutes(15))
+        .await
+        .expect("tick");
+    assert_eq!(stats.cancelled, 1);
+    assert_eq!(stats.delivered, 1);
+    assert_eq!(
+        delivery_status(&db.pool, item.id, household.member_id)
+            .await
+            .as_deref(),
+        Some("cancelled")
+    );
+    assert_eq!(
+        delivery_status(&db.pool, item.id, household.owner_id)
+            .await
+            .as_deref(),
+        Some("sent")
+    );
+    assert_eq!(messages(&db.pool, owner_chat).await.len(), 1);
+    assert!(messages(&db.pool, member_chat).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn soft_deleted_assignee_is_not_replaced_by_the_author() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(
+        &db,
+        &household,
+        "Удалённый исполнитель",
+        Some(due),
+        Some(household.member_id),
+        None,
+    )
+    .await;
+    sqlx::query("UPDATE users SET deleted_at = now() WHERE id = $1")
+        .bind(household.member_id)
+        .execute(&db.pool)
+        .await
+        .expect("delete assignee");
+    let owner_chat = chat_id(&db.pool, household.owner_id).await;
+    let member_chat = chat_id(&db.pool, household.member_id).await;
+
+    let stats = scheduler(&db.pool)
+        .tick(due - Duration::minutes(15))
+        .await
+        .expect("tick");
+    assert_eq!(stats.planned, 0);
+    assert_eq!(stats.delivered, 0);
+    assert!(messages(&db.pool, owner_chat).await.is_empty());
+    assert!(messages(&db.pool, member_chat).await.is_empty());
+    assert!(delivery_rows(&db.pool, item.id).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivery_for_a_deleted_user_is_cancelled() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(
+        &db,
+        &household,
+        "Удалённый получатель",
+        Some(due),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        Some(item.id),
+        &occurrence_key(due),
+        "pending",
+        due - Duration::minutes(15),
+    )
+    .await
+    .expect("pending delivery");
+    sqlx::query("UPDATE users SET deleted_at = now() WHERE id = $1")
+        .bind(household.owner_id)
+        .execute(&db.pool)
+        .await
+        .expect("delete user");
+    let chat = chat_id(&db.pool, household.owner_id).await;
+
+    let stats = scheduler(&db.pool)
+        .tick(due - Duration::minutes(15))
+        .await
+        .expect("tick");
+    assert_eq!(stats.cancelled, 1);
+    assert_eq!(stats.delivered, 0);
+    assert!(messages(&db.pool, chat).await.is_empty());
+    let rows = delivery_rows(&db.pool, item.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "cancelled");
 }
