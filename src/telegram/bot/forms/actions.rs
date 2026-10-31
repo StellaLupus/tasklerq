@@ -119,41 +119,41 @@ async fn set_time(ctx: &mut Ctx<'_>, field: TimeField, text: &str) -> Result<(),
     let actor = ctx.actor()?;
     let value = text.trim().to_owned();
 
-    // Сравниваем границы до записи: не полагаемся на текст ошибки домена,
-    // который может измениться независимо от бота.
-    let current = NotificationSettings::from_settings(&ctx.user()?.settings);
-    let (start, end) = match field {
-        TimeField::QuietStart => (value.as_str(), current.quiet_end.as_str()),
-        TimeField::QuietEnd => (current.quiet_start.as_str(), value.as_str()),
-        TimeField::Digest | TimeField::AllDay => ("", ""),
-    };
-    if field != TimeField::Digest
-        && field != TimeField::AllDay
-        && let (Ok(start), Ok(end)) = (parse_hhmm(start, "time"), parse_hhmm(end, "time"))
-        && start == end
-    {
-        ctx.banner("Начало и конец тихих часов не должны совпадать.");
-        return ctx.present(Screen::Form).await;
-    }
-
     let update = match field {
         TimeField::Digest => NotificationSettingsUpdate {
-            digest_time: Some(value),
+            digest_time: Some(value.clone()),
             ..NotificationSettingsUpdate::default()
         },
         TimeField::AllDay => NotificationSettingsUpdate {
-            all_day_time: Some(value),
+            all_day_time: Some(value.clone()),
             ..NotificationSettingsUpdate::default()
         },
         TimeField::QuietStart => NotificationSettingsUpdate {
-            quiet_start: Some(value),
+            quiet_start: Some(value.clone()),
             ..NotificationSettingsUpdate::default()
         },
         TimeField::QuietEnd => NotificationSettingsUpdate {
-            quiet_end: Some(value),
+            quiet_end: Some(value.clone()),
             ..NotificationSettingsUpdate::default()
         },
     };
+    let current = NotificationSettings::from_settings(&ctx.user()?.settings);
+    if let Err(error) = update.clone().apply(current) {
+        // Домен уже проверил и формат, и несовпадение границ. Формат ввода
+        // отличаем от совпавших границ по разбору самого значения.
+        let banner = match (&error, field) {
+            (
+                crate::domain::error::DomainError::Validation(_),
+                TimeField::QuietStart | TimeField::QuietEnd,
+            ) if parse_hhmm(&value, "time").is_ok() => {
+                "Начало и конец тихих часов не должны совпадать."
+            }
+            _ => "Введите время в формате HH:MM, например 08:30.",
+        };
+        ctx.banner(banner);
+        return ctx.present(Screen::Form).await;
+    }
+
     let updated = users::update_profile(
         &mut *ctx.conn,
         household_id,

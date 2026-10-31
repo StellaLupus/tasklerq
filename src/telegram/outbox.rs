@@ -349,12 +349,6 @@ impl OutboxWorker {
 
         let Some(outgoing) = Outgoing::from_row(&row.kind, &row.payload) else {
             mark_dead(&mut tx, row.seq, "invalid_payload", now).await?;
-            tracing::error!(
-                seq = row.seq,
-                error = "invalid_payload",
-                metric = "outbox_dead",
-                "outbox message moved to the dead-letter queue"
-            );
             tx.commit().await?;
             return Ok(Delivery::Dead);
         };
@@ -394,12 +388,6 @@ impl OutboxWorker {
                 let attempts = row.attempts + 1;
                 if attempts >= MAX_ATTEMPTS {
                     mark_dead(&mut tx, row.seq, error.code(), now).await?;
-                    tracing::error!(
-                        seq = row.seq,
-                        error = error.code(),
-                        metric = "outbox_dead",
-                        "outbox message moved to the dead-letter queue"
-                    );
                     Delivery::Dead
                 } else {
                     sqlx::query(
@@ -418,12 +406,6 @@ impl OutboxWorker {
             }
             Err(error) => {
                 mark_dead(&mut tx, row.seq, error.code(), now).await?;
-                tracing::warn!(
-                    seq = row.seq,
-                    error = error.code(),
-                    metric = "outbox_dead",
-                    "outbox message rejected and moved to the dead-letter queue"
-                );
                 Delivery::Dead
             }
         };
@@ -471,7 +453,7 @@ async fn mark_dead(
     code: &str,
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    let rows = sqlx::query(
         "UPDATE outbox
          SET status = 'dead', last_error = $2, dead_at = $3,
              payload = jsonb_build_object('redacted', true)
@@ -481,7 +463,20 @@ async fn mark_dead(
     .bind(code)
     .bind(now)
     .execute(conn)
-    .await?;
+    .await?
+    .rows_affected();
+    if rows > 0 {
+        // Единая метрика любого пути в dead-letter: код ошибки и seq, без
+        // текста сообщения и токенов. Уровень `error` одинаков для всех
+        // отказов, включая отказ Telegram: ручное разбирательство нужно в
+        // каждом случае.
+        tracing::error!(
+            seq,
+            error = code,
+            metric = "outbox_dead",
+            "outbox message moved to the dead-letter queue"
+        );
+    }
     Ok(())
 }
 

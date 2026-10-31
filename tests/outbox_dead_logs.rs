@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use chrono::{DateTime, Duration, Timelike, Utc};
+use serde_json::json;
 use support::telegram::FakeTelegram;
 use tasklerq::jobs::scheduler::Scheduler;
 use tasklerq::telegram::api::TelegramError;
@@ -128,5 +129,70 @@ fn dead_notification_logs_the_metric_and_code_without_its_text() {
     assert!(
         !captured.contains("СЕКРЕТНОЕ_НАЗВАНИЕ") && !captured.contains("blocked"),
         "the message text must not reach the logs:\n{captured}"
+    );
+}
+
+#[test]
+fn invalid_payload_is_dead_letter_with_time_and_metric() {
+    let logs = LogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(logs.clone())
+        .finish();
+
+    let now = rounded_now();
+    let (status, last_error, dead_at, seq) = tracing::subscriber::with_default(subscriber, || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async move {
+            let db = support::db().await;
+            let chat = support::next_telegram_id();
+            let seq: i64 = sqlx::query_scalar(
+                "INSERT INTO outbox (chat_id, kind, payload, next_attempt_at, created_at)
+                 VALUES ($1, 'message', $2, $3, $3)
+                 RETURNING seq",
+            )
+            .bind(chat)
+            .bind(json!({"html": 42}))
+            .bind(now)
+            .fetch_one(&db.pool)
+            .await
+            .expect("outbox row");
+
+            let fake = FakeTelegram::new();
+            let mut worker = OutboxWorker::new(db.pool.clone(), fake).only_chat(chat);
+            assert_eq!(
+                worker
+                    .run_once(now, Instant::now())
+                    .await
+                    .expect("outbox pass"),
+                0
+            );
+
+            let row: (String, Option<String>, Option<DateTime<Utc>>) = sqlx::query_as(
+                "SELECT status::text, last_error, dead_at FROM outbox WHERE seq = $1",
+            )
+            .bind(seq)
+            .fetch_one(&db.pool)
+            .await
+            .expect("outbox row");
+            (row.0, row.1, row.2, seq)
+        })
+    });
+
+    assert_eq!(status, "dead");
+    assert_eq!(last_error.as_deref(), Some("invalid_payload"));
+    assert_eq!(dead_at, Some(now), "dead-letter time must be stored");
+
+    let captured = logs.0.lock().expect("lock").clone();
+    let captured = String::from_utf8(captured).expect("utf8");
+    assert!(
+        captured.contains("\"metric\":\"outbox_dead\"")
+            && captured.contains("\"error\":\"invalid_payload\"")
+            && captured.contains(&format!("\"seq\":{seq}")),
+        "invalid payload must log the dead-letter metric and code:\n{captured}"
     );
 }

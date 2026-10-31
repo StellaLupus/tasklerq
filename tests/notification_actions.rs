@@ -456,6 +456,42 @@ async fn snooze_at_night_is_delivered_at_the_end_of_quiet_hours() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabling_reminders_cancels_a_snoozed_delivery() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(&db.pool, &household, "Позвонить маме", due, None).await;
+
+    tick_and_deliver(&mut bot, &db.pool, due - Duration::minutes(15)).await;
+    let (message_id, html) = bot.latest();
+    let snooze = button_of(&html, "на час");
+    bot.press_data(&snooze, message_id).await;
+    let deliver_at = snooze_rows(&db.pool, item.id).await[0].1;
+
+    // Snooze — явное действие пользователя, но выключение напоминаний
+    // отменяет и его: новых напоминаний быть не должно.
+    set_notifications(
+        &db.pool,
+        bot.chat,
+        json!({
+            "digest_enabled": false,
+            "quiet_hours_enabled": false,
+            "reminders_enabled": false
+        }),
+    )
+    .await;
+
+    let stats = tick_and_deliver(&mut bot, &db.pool, deliver_at).await;
+    assert!(stats.cancelled >= 1, "{stats:?}");
+    let rows = snooze_rows(&db.pool, item.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "cancelled");
+    assert_eq!(message_count(&bot, "Позвонить маме"), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn completing_the_task_cancels_the_snoozed_delivery() {
     let db = isolated_db().await;
     let mut bot = onboarded(&db.pool).await;

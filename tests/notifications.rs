@@ -2918,6 +2918,69 @@ async fn quiet_hours_defer_a_reminder_to_morning_and_send_it_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabling_reminders_cancels_a_deferred_reminder() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    enable_quiet(&db.pool, household.owner_id, "22:00", "08:00").await;
+    let item = create_task(
+        &db,
+        &household,
+        "Ночное напоминание",
+        Some(local_utc(moscow, day, 23, 45)),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let scheduler = scheduler(&db.pool);
+
+    let night = scheduler
+        .tick(local_utc(moscow, day, 23, 30))
+        .await
+        .expect("night tick");
+    assert_eq!(night.planned, 1);
+    assert_eq!(night.delivered, 0);
+    assert_eq!(
+        scheduled_at(&db.pool, item.id, household.owner_id).await,
+        Some(local_utc(moscow, day + Duration::days(1), 8, 0))
+    );
+
+    // Пользователь выключил напоминания уже после того, как тихие часы
+    // перенесли доставку на утро.
+    set_notifications_without_digest(
+        &db.pool,
+        household.owner_id,
+        json!({"reminders_enabled": false}),
+    )
+    .await;
+    let cancelled = scheduler
+        .tick(local_utc(moscow, day, 23, 30))
+        .await
+        .expect("disable tick");
+    assert_eq!(cancelled.cancelled, 1);
+    assert_eq!(cancelled.delivered, 0);
+    assert_eq!(
+        delivery_status(&db.pool, item.id, household.owner_id)
+            .await
+            .as_deref(),
+        Some("cancelled")
+    );
+    assert!(messages(&db.pool, chat).await.is_empty());
+
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day + Duration::days(1), 8, 0))
+            .await
+            .expect("morning tick")
+            .delivered,
+        0
+    );
+    assert!(messages(&db.pool, chat).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn quiet_hours_boundaries_are_start_inclusive_and_end_exclusive() {
     let db = support::isolated_db().await;
     let household = household_without_digest(&db).await;

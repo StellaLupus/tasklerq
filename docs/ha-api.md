@@ -168,6 +168,8 @@ Scopes не иерархичны: `ha:write` не даёт права на чт�
   позиций при `DELETE /lists/{id}`.
 - `PATCH /items/{id}` требует `version` в теле. Несовпадение → `409 conflict`
   с `details.current_version` и полной карточкой в `details.item`.
+- `PATCH /items/{id}` без фактических изменений возвращает `200` с текущей
+  позицией: `version` и `updated_at` не меняются, событие не создаётся.
 - `complete` и `reopen` принимают `version` необязательно: если передана и не
   совпала — `409`; если не передана — применяется к текущему состоянию.
 - Списки версии не имеют: `PATCH /lists/{id}` — last write wins.

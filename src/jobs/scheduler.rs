@@ -7,8 +7,8 @@
 //! Один тик делает три шага:
 //!
 //! 1. отменяет `pending`-доставки, вхождение которых больше не актуально
-//!    (задача завершена, удалена, срок сдвинулся, получатель сменился, сводка
-//!    выключена или элемент назначен другому);
+//!    (задача завершена, удалена, срок сдвинулся, получатель сменился,
+//!    напоминания или сводка выключены, элемент назначен другому);
 //! 2. планирует напоминания для открытых задач со временем, у которых наступил
 //!    момент `due_at - lead_minutes` получателя, для вседневных задач,
 //!    у которых наступило локальное `all_day_time` в день срока; сводки и
@@ -603,6 +603,11 @@ impl ReminderRow {
         }
     }
 
+    /// Напоминания включены у получателя.
+    fn reminders_enabled(&self) -> bool {
+        NotificationSettings::from_settings(&self.recipient_settings).reminders_enabled
+    }
+
     /// Household существует.
     fn household_valid(&self) -> bool {
         self.household_found.is_some() && self.household_deleted_at.is_none()
@@ -626,9 +631,13 @@ impl ReminderRow {
     ///
     /// Snooze не сверяется с текущим `occurrence_key`: его ключ — время
     /// отложенной доставки. Он отменяется только вместе с задачей, списком,
-    /// household или получателем.
+    /// household, получателем или выключенными напоминаниями: выключение
+    /// настройки отменяет и отложенное пользователем напоминание.
     fn is_stale(&self, now: DateTime<Utc>) -> bool {
         if !self.item_alive() || !self.recipient_alive() || !self.household_valid() {
+            return true;
+        }
+        if !self.reminders_enabled() {
             return true;
         }
         if self.is_snooze() {

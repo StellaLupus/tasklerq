@@ -277,11 +277,18 @@ CHECK ((recurrence_freq = 'monthly') = (recurrence_month_rule IS NOT NULL))
 
 `outbox`: `seq`, `chat_id`, `kind`, `payload jsonb`, `dedupe_key`, `status`,
 `attempts`, `next_attempt_at`, `message_id`, `last_error`, `created_at`,
-`sent_at`.
+`sent_at`, `dead_at`. `dead_at` заполняется при переводе в `dead` и пуст у
+остальных статусов.
 
 `notification_deliveries`: `id`, `household_id`, `user_id`, `item_id` (NULL для
-сводки), `occurrence_key`, `kind`, `status`, `scheduled_at`, `outbox_seq`,
-`created_at`, `updated_at`; UNIQUE `(user_id, item_id, occurrence_key, kind)`.
+сводки), `occurrence_key`, `kind`, `status`, `scheduled_at`, `deferred`,
+`outbox_seq`, `created_at`, `updated_at`; UNIQUE `(user_id, item_id,
+occurrence_key, kind)`. `kind` — `reminder`, `digest`, `assignment` или
+`snooze`; `status` — `pending`, `sent` или `cancelled`. `deferred` отмечает
+запись, хотя бы раз отложенную тихими часами: перенесённая через полночь
+сводка или вседневное напоминание не отменяются только из-за смены локальной
+даты. `snooze` — отдельная доставка отложенного напоминания, её ключ включает
+время snooze.
 Для сводок `item_id` равен NULL, поэтому уникальность обеспечивается
 `UNIQUE NULLS NOT DISTINCT` (PostgreSQL 15+). Составные внешние ключи
 `(user_id, household_id)` и `(item_id, household_id)` не дают записать
@@ -563,8 +570,10 @@ CREATE INDEX telegram_updates_ready_idx
   ON telegram_updates (available_at) WHERE status = 'pending';
 CREATE INDEX outbox_ready_idx
   ON outbox (next_attempt_at) WHERE status = 'pending';
-CREATE UNIQUE INDEX notification_delivery_key_idx
-  ON notification_deliveries (user_id, item_id, occurrence_key, kind);
+CREATE INDEX notification_deliveries_pending_idx
+  ON notification_deliveries (scheduled_at) WHERE status = 'pending';
+-- UNIQUE NULLS NOT DISTINCT (user_id, item_id, occurrence_key, kind)
+-- объявлен в 0008 как ограничение таблицы, а не отдельный индекс.
 
 -- events
 CREATE INDEX item_events_item_created_idx
