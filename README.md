@@ -92,7 +92,6 @@ tasklerq/
 │   ├── jobs/
 │   └── admin/
 ├── migrations/
-├── custom_components/tasklerq/
 ├── tests/
 ├── docs/
 ├── openspec/
@@ -100,6 +99,11 @@ tasklerq/
 ├── Dockerfile
 └── README.md
 ```
+
+Компонент Home Assistant живёт в отдельном репозитории
+[`StellaLupus/tasklerq-ha`](https://github.com/StellaLupus/tasklerq-ha): HACS
+берёт версии из его тегов и релизов, а Python-тулчейн и CI не смешиваются с
+Rust-сервером. Контракт API для клиента — [`docs/ha-api.md`](docs/ha-api.md).
 
 ## Документация
 
@@ -147,8 +151,9 @@ curl -X POST http://127.0.0.1:8080/api/v1/capture \
 Headless-режим без Telegram: `TELEGRAM_MODE=disabled` — HTTP API, HA-компонент
 и внешний capture продолжают работать.
 
-Production-развёртывание — через webhook и HTTPS; см.
-[`docs/deployment.md`](docs/deployment.md).
+Production-развёртывание — через webhook и HTTPS; готовый образ
+[`stellalupus/tasklerq`](https://hub.docker.com/r/stellalupus/tasklerq)
+публикуется в Docker Hub, см. [`docs/deployment.md`](docs/deployment.md).
 
 ## Вне рамок MVP
 

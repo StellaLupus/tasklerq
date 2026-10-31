@@ -290,7 +290,9 @@ curl -sS -X POST \
 
 Если Telegram не нужен, установите `TELEGRAM_MODE=disabled`; `TELEGRAM_BOT_TOKEN`
 и webhook-секрет в этом режиме не требуются. HTTP API, HA-компонент и внешний
-capture продолжают работать.
+capture продолжают работать, а `POST /webhooks/telegram` отвечает `404`.
+Серверная часть этого сценария (`todo`, `calendar`, capture и undo без бота)
+проверяется тестом [`tests/headless_ha.rs`](../tests/headless_ha.rs).
 
 Секреты:
 
@@ -305,8 +307,7 @@ chmod 600 .env
 ```yaml
 services:
   tasklerq:
-    build: .
-    image: tasklerq:0.1.0
+    image: stellalupus/tasklerq:0.1.0
     container_name: tasklerq
     restart: unless-stopped
     env_file: .env
@@ -341,6 +342,42 @@ networks:
     external: true
 ```
 
+Образ берётся из Docker Hub; `build: .` в production-compose не нужен.
+Тег `0.1.0` появится только после релиза `v0.1.0`; до него используйте
+`pr-<номер>` (для деплоя ветки PR), `sha-<короткий sha>` или `main` — см.
+[«Публикация образа»](#публикация-образа).
+Теги публикует workflow
+[`.github/workflows/docker.yml`](../.github/workflows/docker.yml):
+
+| Триггер | Теги | Публикация |
+| --- | --- | --- |
+| push в `main` | `main`, `sha-<короткий sha>` | да |
+| push тега `v*` без пререлизного суффикса (например, `v0.1.0`) | `0.1.0`, `0.1`, `latest` | да |
+| push тега `v*` с пререлизным суффиксом (например, `v0.2.0-rc1`) | только точная версия: `0.2.0-rc1` | да |
+| `pull_request` из этого репозитория | `pr-<номер>`, `sha-<короткий sha головы PR>` | да |
+| `pull_request` из форка | — | нет, только сборка |
+| `workflow_dispatch` с любой ветки | `sha-<короткий sha>` | да |
+
+`latest` указывает на последний релиз. Тег `<версия>` появляется после первого
+релиза (`v0.1.0`), до него деплой — по тегу `sha-…` из ручного запуска workflow
+или `main`. Ручной запуск `workflow_dispatch` по тегу публикует только
+`sha-<короткий sha>`, без тегов версии.
+
+Для деплоя ветки до мержа укажите в compose
+`image: stellalupus/tasklerq:pr-<номер>`: при каждом push в PR из этого
+репозитория образ публикуется автоматически, и тег `pr-<номер>`
+перезаписывается. После push выполните
+`docker compose pull tasklerq && docker compose up -d tasklerq` (на NAS — с
+префиксом `sudo /usr/local/bin/`). Ручной запуск workflow и тег `sha-…` —
+запасной вариант (см. [«Публикация образа»](#публикация-образа)). Из PR из
+форков образ не публикуется: GitHub не передаёт секреты запускам из форков,
+поэтому такие запуски только собирают образ.
+
+Если Docker Hub недоступен, запасной вариант — собрать на месте: добавьте
+`build: .` и задайте `image: tasklerq:<версия>` (локальный тег); вместо
+[`docker compose pull`](#12-обновления-и-откат) используйте
+`docker compose build tasklerq`.
+
 Особенности:
 
 - Внутренний порт контейнера — `8080`; host-порт — `18080`, потому что `8080`
@@ -370,6 +407,50 @@ sudo ss -ltnp | grep -E ':18080|:8080'
 
 Ожидаемо: `18080` слушает Tasklerq на `127.0.0.1`, `8080` — Zigbee2MQTT на
 `0.0.0.0`.
+
+### Публикация образа
+
+Workflow `.github/workflows/docker.yml` собирает `linux/amd64` и публикует
+`stellalupus/tasklerq` в Docker Hub. В настройках репозитория должны быть
+секреты:
+
+- `DOCKERHUB_USERNAME` — логин Docker Hub (`stellalupus`);
+- `DOCKERHUB_TOKEN` — access token Docker Hub с правом **Read & Write**
+  (не пароль от аккаунта; создаётся в **Account Settings → Security →
+  New Access Token**).
+
+Риск: секреты Docker Hub с правом **Read & Write** доступны workflow из
+любой ветки этого репозитория (PR из своих веток и ручной запуск), поэтому
+любой, у кого есть право push, может опубликовать произвольный тег, включая
+`latest`; право push давайте только доверенным, а при необходимости ограничьте
+публикацию через GitHub environment с разрешёнными ветками.
+
+Выпуск релиза:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+После публикации в Docker Hub появятся теги `0.1.0`, `0.1` и `latest`;
+в `image:` указывайте `stellalupus/tasklerq:0.1.0`, если нужна конкретная
+версия, или `:latest` для последнего релиза.
+
+Публикация PR-образа:
+
+- PR из этого репозитория публикует dev-образ автоматически при каждом push:
+  теги `pr-<номер>` и `sha-<короткий sha головы PR>`. Для деплоя ветки до мержа
+  укажите `stellalupus/tasklerq:pr-<номер>`.
+- PR из форков только собираются: секреты Docker Hub им недоступны.
+
+Ручной запуск — запасной вариант:
+
+```bash
+gh workflow run docker.yml --ref <ветка>
+```
+
+Workflow опубликует только тег `sha-<короткий sha>`; его видно в логе шага
+«Extract metadata» и в списке тегов Docker Hub.
 
 ## 8. Миграции
 
@@ -431,7 +512,7 @@ curl -fsS -X POST http://127.0.0.1:18080/api/v1/capture \
 
 Ожидаемо: `status=applied`, две покупки и `speech` в ответе.
 
-13. Настройте Assist (пример `conversation.intents` + `intent_script` в
+13. Настройте Assist (пользовательские предложения + `intent_script`, пример в
     [`home-assistant.md`](home-assistant.md#71-голосовой-capture-через-assist)) и
     произнесите «купи молоко и хлеб». Убедитесь, что позиции появились в
     `todo.pokupki`, а Assist озвучил ответ.
@@ -515,11 +596,13 @@ sudo /usr/local/bin/docker exec -i postgres \
 
 ## 12. Обновления и откат
 
+Обновление — это смена тега образа, а не пересборка на NAS.
+
 ```bash
 # 1. Backup
 /usr/local/bin/tasklerq-backup.sh
 
-# 2. Новый образ
+# 2. Сменить тег в image: (например, 0.1.0 → 0.2.0)
 sudo /usr/local/bin/docker compose pull tasklerq
 sudo /usr/local/bin/docker compose run --rm tasklerq migrate
 sudo /usr/local/bin/docker compose up -d tasklerq
@@ -529,13 +612,19 @@ curl -fsS http://127.0.0.1:18080/health/ready
 sudo /usr/local/bin/docker compose logs --tail=100 tasklerq
 ```
 
-Откат:
+Порядок backup → pull → migrate → up сохраняется: backup делается до
+скачивания, migrate — до запуска новой версии.
+
+Откат — вернуть прежний тег в `image:`:
 
 ```bash
-sudo /usr/local/bin/docker compose down
 # изменить image на предыдущий тег
+sudo /usr/local/bin/docker compose pull tasklerq
 sudo /usr/local/bin/docker compose up -d tasklerq
 ```
+
+Если в `image:` стоит `latest`, зафиксируйте версию конкретным тегом, иначе
+откат неоднозначен.
 
 Схема должна быть совместима с предыдущей версией (expand/contract). Если
 миграция разрушительная — откат только через restore backup.
@@ -715,9 +804,10 @@ curl -fsS http://127.0.0.1:18080/health/ready
 2. Вызовите `tasklerq.capture` в **Developer Tools → Actions** с
    `text`, `mode=auto`, `hint=shopping`; посмотрите ответ и ошибку.
 3. Проверьте `curl` к `POST /api/v1/capture` из контейнера HA.
-4. Проверьте `conversation.intents` и `intent_script`; после правки
-   перезапустите HA.
-5. Проверьте `response.speech` в ответе сервиса — Assist озвучивает именно его.
+4. Проверьте файл `custom_sentences/ru/tasklerq.yaml` и `intent_script`; после
+   правки перезапустите HA.
+5. Проверьте `speech` в ответе сервиса — Assist озвучивает его через
+   `action_response`.
 6. Если LLM отвечает дольше `CAPTURE_VOICE_TIMEOUT_MS`, должна создаваться
    fallback-позиция; проверьте `fallback=true` и `capture_fallback_total`.
 7. Если Tasklerq вернул `429`, проверьте лимит capture и суточную квоту LLM.
@@ -726,11 +816,11 @@ curl -fsS http://127.0.0.1:18080/health/ready
 
 ### 16.10. Откат релиза
 
-1. Backup.
-2. Остановить Tasklerq.
-3. Указать предыдущий image tag.
-4. Запустить.
-5. Проверить `/health/ready`, задачи, HA.
+1. Backup: `/usr/local/bin/tasklerq-backup.sh`.
+2. Вернуть прежний тег в `image:` (см. [§12](#12-обновления-и-откат)).
+3. `sudo /usr/local/bin/docker compose pull tasklerq`.
+4. `sudo /usr/local/bin/docker compose up -d tasklerq`.
+5. Проверить `/health/ready`, логи, задачи и HA.
 6. Если схема несовместима — restore backup.
 
 ## 17. Локальная разработка
@@ -770,7 +860,7 @@ ngrok http 8080
 cargo test
 cargo clippy -- -D warnings
 cargo fmt --check
-pytest custom_components/tasklerq
+# Python-тесты компонента запускаются в репозитории tasklerq-ha
 openspec validate --strict
 ```
 

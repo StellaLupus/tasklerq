@@ -81,13 +81,15 @@
 ## Impact
 
 - **Новый код:** Rust-сервис (`tasklerq`), Python custom component
-  (`custom_components/tasklerq`), миграции PostgreSQL, Docker-образ и compose.
+  (отдельный репозиторий `tasklerq-ha`, каталог
+  `custom_components/tasklerq`), миграции PostgreSQL, Docker-образ и compose.
 - **Новые зависимости:** axum, tokio, sqlx, reqwest, serde, tracing, chrono,
   uuid, teloxide-core (типы Telegram), testcontainers/wiremock для тестов;
   Python: `homeassistant`, `aiohttp`, `pytest-homeassistant-custom-component`.
 - **Новые интерфейсы:** `POST /api/v1/capture` и подтверждение/отмена/undo
   capture; сервисы `tasklerq.capture`, `tasklerq.undo_last_capture`; пример
-  `conversation.intents` + `intent_script` для HA Assist.
+  пользовательских предложений (custom sentences) + `intent_script` для HA
+  Assist.
 - **Инфраструктура:** существующий PostgreSQL (новая БД/роль), публичный
   HTTPS-домен, reverse proxy, сеть Docker между Tasklerq и HA Container.
 - **Внешние системы:** Telegram Bot API (RichMessage, webhook), Home Assistant

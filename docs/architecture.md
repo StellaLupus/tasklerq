@@ -171,7 +171,7 @@ sequenceDiagram
 
     loop every 60 s
         HA->>API: GET /api/v1/snapshot?since=cursor
-        API->>DB: lists + changed items + deleted ids
+        API->>DB: lists + changed items + deleted_item_ids
         DB-->>API: rows
         API-->>HA: snapshot + next_since
         HA->>HA: update todo/calendar entities
@@ -359,9 +359,13 @@ src/
 | `POST` | `/api/v1/captures/{id}/confirm` | Подтвердить внешний черновик. |
 | `POST` | `/api/v1/captures/{id}/cancel` | Отменить внешний черновик. |
 | `POST` | `/api/v1/captures/{id}/undo` | Отменить применённый capture. |
+| `POST` | `/api/v1/captures/undo-last` | Отменить последний голосовой capture. |
 | `GET` | `/api/v1/search` | Поиск. |
 | `GET` | `/api/v1/calendar` | Вхождения за интервал. |
 | `GET` | `/api/v1/snapshot` | Инкрементальный снапшот для HA. |
+
+Точный контракт для клиента Home Assistant — поля, коды и семантика
+курсора: [`ha-api.md`](ha-api.md).
 
 Ошибки:
 
@@ -377,9 +381,13 @@ src/
 ```
 
 Коды: `validation_error` (422), `unauthorized` (401), `forbidden` (403),
-`not_found` (404), `conflict` (409), `rate_limited` (429),
-`internal_error` (500). Сообщения API — английские для разработчиков; бот и HA
-переводят их на русский.
+`not_found` (404), `conflict` (409), `gone` (410), `rate_limited` (429),
+`internal_error` (500), `service_unavailable` (503),
+`payload_too_large` (413), `unsupported_media_type` (415),
+`method_not_allowed` (405). Сообщения API — английские для разработчиков; бот
+и HA переводят их на русский. Отказы разбора JSON-тела на маршрутах списков
+и позиций приходят от axum как текст с `400`/`415`/`422`, без этого конверта;
+`POST /capture` всегда отдаёт конверт.
 
 ### Snapshot
 
@@ -388,7 +396,7 @@ src/
 ```json
 {
   "server_time": "2026-11-03T12:00:00Z",
-  "next_since": "2026-11-03T12:00:00Z",
+  "next_since": "2026-11-03T11:59:55Z",
   "lists": [],
   "items": [],
   "deleted_item_ids": [],
@@ -398,9 +406,15 @@ src/
 ```
 
 `since` — курсор из предыдущего ответа. При первом запросе или смене токена
-передаётся пустой `since`, и возвращается полный снапшот. `next_since` — это
-`server_time` минус 5 секунд перекрытия (защита от конкурентных коммитов);
-компонент применяет изменения идемпотентно по `id` и `version`.
+параметр `since` не передаётся (пустая строка — ошибка `422`), и возвращается
+полный снапшот. `next_since` — это `server_time` минус 5 секунд перекрытия
+(защита от конкурентных коммитов); компонент применяет изменения
+идемпотентно по `id`, а `version` использует для записи и проверки конфликтов.
+
+`lists` в снапшоте всегда полный (включая архивные) и не зависит от `since`;
+отдельного массива удалённых списков нет — компонент сравнивает набор `id` с
+локальным. `deleted_item_ids` приходит только в инкрементальном ответе; при
+полной синхронизации удаления определяются отсутствием позиции в `items`.
 
 `calendar_events` возвращаются, только если передан `calendar_end` (не позже
 366 дней от сегодня). Календарь в снапшоте вспомогательный: при более чем 1000
@@ -409,6 +423,9 @@ true`, а не ошибка, чтобы синхронизация `todo` не �
 горизонт компонент берёт через `GET /api/v1/calendar`.
 
 ## 8. Home Assistant component
+
+Компонент поставляется из отдельного репозитория `tasklerq-ha`; ниже —
+структура его каталога.
 
 ```text
 custom_components/tasklerq/
@@ -432,7 +449,8 @@ custom_components/tasklerq/
 - `unique_id`: `tasklerq:<household_uuid>:<list_uuid>`.
 - Дополнительные поля — в атрибуте `tasklerq_items`.
 - Сервис `tasklerq.capture` вызывает `POST /api/v1/capture`; для HA Assist
-  поставляется пример `conversation.intents` + `intent_script`.
+  поставляется пример пользовательских предложений (custom sentences) +
+  `intent_script`.
 - Polling 60 с, backoff до 5 минут, reauth при 401.
 - Запись передаёт `version`; при 409 — refresh и ошибка.
 

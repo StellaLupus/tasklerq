@@ -20,12 +20,17 @@ discovery. Шаблонные сенсоры и `rest`-интеграция да
 
 | Требование | Значение |
 | --- | --- |
-| Home Assistant | 2026.10.4 (текущая); минимум 2025.7+ для AI Task |
+| Home Assistant | 2026.10.4 (проверено); минимум 2026.10.0 |
 | Тип установки | HA Container (Docker), `network_mode: host` |
 | Python | Версия, поддерживаемая вашей версией HA |
 | HACS | Установлен |
 | Tasklerq | 0.1.0+ |
 | Сеть | HA → Tasklerq: `http://127.0.0.1:18080`; Tasklerq → HA: `http://host.docker.internal:8123` |
+
+Минимум `2026.10.0` задан в `hacs.json` ключом `homeassistant` и
+проверяется при установке компонента в репозитории
+[`tasklerq-ha`](https://github.com/StellaLupus/tasklerq-ha); проверено на
+2026.10.4.
 
 Компонент **не требует** Supervisor, add-on или ingress. Это важно для HA
 Container.
@@ -35,7 +40,8 @@ Container.
 ### Вариант A. HACS (рекомендуется)
 
 1. HACS → **Integrations** → меню → **Custom repositories**.
-2. Добавьте репозиторий Tasklerq, категория **Integration**.
+2. Добавьте репозиторий `https://github.com/StellaLupus/tasklerq-ha`,
+   категория **Integration**.
 3. Установите **Tasklerq**.
 4. Перезапустите Home Assistant.
 5. **Настройки → Устройства и службы → Добавить интеграцию → Tasklerq**.
@@ -45,7 +51,9 @@ HACS уже установлен в этой инсталляции HA. Если
 
 ### Вариант B. Вручную
 
-1. Скопируйте каталог `custom_components/tasklerq` в
+1. Скопируйте каталог `custom_components/tasklerq` из репозитория
+   [`tasklerq-ha`](https://github.com/StellaLupus/tasklerq-ha) (или из его
+   релиза) в
    `/volume2/docker/homeassistant/custom_components/tasklerq` на NAS
    (внутри контейнера HA это `/config/custom_components/tasklerq`).
 2. Проверьте структуру:
@@ -72,6 +80,16 @@ HACS уже установлен в этой инсталляции HA. Если
 - Вручную: заменить каталог и перезапустить HA.
 - После обновления проверьте **Настройки → Устройства и службы → Tasklerq →
   Диагностика**.
+
+### Headless-режим без Telegram
+
+Компонент работает с сервисом, запущенным в `TELEGRAM_MODE=disabled` без
+`TELEGRAM_BOT_TOKEN` и webhook-секрета. В этом режиме доступны `todo`,
+`calendar`, внешний capture и отмена последнего голосового capture
+(`POST /api/v1/captures/undo-last`); Telegram-бот и исходящие
+Telegram-уведомления отключены. Серверная часть сценария из
+[`ha-api.md`](ha-api.md#9-минимальный-сценарий-клиента) проверяется
+интеграционным тестом [`tests/headless_ha.rs`](../tests/headless_ha.rs).
 
 ## 4. Настройка
 
@@ -207,7 +225,7 @@ tasklerq_items:
 ```text
 HA coordinator ──GET /api/v1/snapshot?since=cursor──▶ Tasklerq
       │                                                   │
-      │◀──────── lists, items, deleted_ids, next_since ────┘
+      │◀──────── lists, items, deleted_item_ids, next_since ────┘
       │
       ├── обновляет todo/calendar
       │
@@ -272,7 +290,8 @@ LLM_CAPTURE_ENABLED=true
 Tasklerq можно использовать голосом без Telegram. HA Assist распознаёт речь,
 вызывает сервис `tasklerq.capture`, а Tasklerq разбирает текст через AI Task и
 создаёт задачи или покупки. Ответ озвучивается. Это основной голосовой сценарий;
-если Assist уже настроен, добавьте только предложения и `intent_script` ниже.
+если Assist уже настроен, добавьте только пользовательские предложения (custom
+sentences) и `intent_script` ниже.
 
 ### Сервис
 
@@ -302,52 +321,103 @@ response_variable: result
 
 ### Подключение к Assist
 
-Добавьте в `configuration.yaml` (или в package) предложения и `intent_script`:
+Нужны два файла: предложения в `custom_sentences` и пакет с `intent_script`.
+Объявить фразы в `conversation: intents:` нельзя: `{tasklerq_text}` остался бы
+ссылкой на несуществующий слот-лист, и hassil завершил бы разбор с
+`MissingListError`. В HA 2026.10 `speech` — это mapping с ключом `text`, а
+шаблон рендерится после действий: ответ сервиса доступен только как
+`action_response` (его возвращает `stop` с `response_variable`).
+
+`/config/custom_sentences/ru/tasklerq.yaml`:
 
 ```yaml
-conversation:
-  intents:
-    TasklerqAddTask:
-      - "добавь задачу {text}"
-      - "запиши задачу {text}"
-      - "напомни {text}"
-    TasklerqAddShopping:
-      - "добавь в покупки {text}"
-      - "купи {text}"
-      - "в список покупок {text}"
-    TasklerqUndo:
-      - "отмени последнее добавление"
-      - "убери последнюю задачу"
+language: ru
+intents:
+  TasklerqAddTask:
+    data:
+      - sentences:
+          - "добавь задачу {tasklerq_text}"
+          - "запиши задачу {tasklerq_text}"
+          - "напомни {tasklerq_text}"
 
+  TasklerqAddShopping:
+    data:
+      - sentences:
+          - "добавь в покупки {tasklerq_text}"
+          - "купи {tasklerq_text}"
+          - "в список покупок {tasklerq_text}"
+
+  TasklerqUndo:
+    data:
+      - sentences:
+          - "отмени последнее добавление"
+          - "убери последнюю задачу"
+
+lists:
+  tasklerq_text:
+    wildcard: true
+```
+
+Подключите каталог пакетов в `configuration.yaml`:
+
+```yaml
+homeassistant:
+  packages: !include_dir_named packages
+```
+
+`/config/packages/tasklerq_assist.yaml`:
+
+```yaml
 intent_script:
   TasklerqAddTask:
-    speech: "{{ response.speech }}"
+    speech:
+      text: >-
+        {{ action_response.speech if action_response is defined and action_response.speech is defined and action_response.speech else 'Не удалось добавить задачу. Возможно, она не сохранена: проверьте список в Tasklerq.' }}
     action:
       - action: tasklerq.capture
         data:
-          text: "{{ text }}"
+          text: "{{ tasklerq_text }}"
           source: ha_voice
           mode: auto
           hint: tasks
         response_variable: response
+        continue_on_error: true
+      - stop: ""
+        response_variable: response
 
   TasklerqAddShopping:
-    speech: "{{ response.speech }}"
+    speech:
+      text: >-
+        {{ action_response.speech if action_response is defined and action_response.speech is defined and action_response.speech else 'Не удалось добавить покупки. Возможно, они не сохранены: проверьте список в Tasklerq.' }}
     action:
       - action: tasklerq.capture
         data:
-          text: "{{ text }}"
+          text: "{{ tasklerq_text }}"
           source: ha_voice
           mode: auto
           hint: shopping
         response_variable: response
+        continue_on_error: true
+      - stop: ""
+        response_variable: response
 
   TasklerqUndo:
-    speech: "{{ response.speech }}"
+    speech:
+      text: >-
+        {{ action_response.speech if action_response is defined and action_response.speech is defined and action_response.speech else 'Не удалось отменить последнее добавление. Проверьте Tasklerq.' }}
     action:
       - action: tasklerq.undo_last_capture
         response_variable: response
+        continue_on_error: true
+      - stop: ""
+        response_variable: response
 ```
+
+Если Tasklerq вернул ошибку, `continue_on_error` пропускает шаг,
+`action_response` не появляется, и озвучивается запасная фраза; причина
+остаётся в журнале и трассировке HA.
+
+Готовые файлы: [`tasklerq-ha/examples/assist`](https://github.com/StellaLupus/tasklerq-ha/tree/main/examples/assist).
 
 Перезапустите HA и проверьте в **Developer Tools → Assist**:
 
@@ -363,15 +433,16 @@ intent_script:
 - При недоступности LLM создаётся одна позиция из исходного текста; Assist
   отвечает «Записал как есть».
 - Таймаут голосового разбора — 8 секунд, чтобы pipeline успел ответить.
-- Если Tasklerq недоступен, Assist сообщает об ошибке; частичные данные не
-  создаются.
+- Если Tasklerq недоступен, Assist озвучивает запасную фразу («Не удалось
+  добавить …»), причина остаётся в журнале и трассировке HA; частичные данные
+  не создаются.
 - `todo.add_item` остаётся простым путём без разбора: он создаёт позицию с
   названием, но без дат, тегов и повторений.
-- Сценарий с `conversation.intents` использует встроенный распознаватель
-  намерений Home Assistant. Если в Assist выбран LLM-агент, создайте отдельный
-  pipeline с агентом Home Assistant или добавьте вызов `tasklerq.capture` как
-  действие, доступное агенту. AI Task разбора при этом остаётся без
-  `llm_hass_api`.
+- Сценарий с пользовательскими предложениями (custom sentences) использует
+  встроенный распознаватель намерений Home Assistant. Если в Assist выбран
+  LLM-агент, создайте отдельный pipeline с агентом Home Assistant или добавьте
+  вызов `tasklerq.capture` как действие, доступное агенту. AI Task разбора при
+  этом остаётся без `llm_hass_api`.
 
 ### Другие клиенты
 
@@ -475,6 +546,26 @@ action:
 - последнюю ошибку (код и время).
 
 Токен, названия задач и имена участников в diagnostics не попадают.
+
+### 10.1. Проверка на живой установке
+
+Проверено 2026-10-31: Home Assistant 2026.10.4, HA Container, amd64, Python
+3.14.9; сервер — образ `stellalupus/tasklerq:pr-3` в Docker на том же NAS, URL
+интеграции `http://127.0.0.1:18080`. Компонент 0.1.0 установлен через HACS
+(custom repository `StellaLupus/tasklerq-ha`). Сервер работал с
+`TELEGRAM_MODE=disabled`: бот выключен, токена бота в окружении сервера не
+было.
+
+- [x] Интеграция добавлена через UI (URL и токен), состояние `loaded`, заголовок — имя household.
+- [x] Сущности `todo.zadachi`, `todo.pokupki` и `calendar.tasklerq` созданы и доступны.
+- [x] HA → Tasklerq: создание задачи со сроком-датой и описанием (позиция получила id сервера), переименование, перенос на дату со временем (10:30 МСК сохранено как 07:30Z), завершение и возврат, удаление.
+- [x] Tasklerq → HA: `tasklerq.capture` «купить молоко и хлеб» через LLM (AI Task, без fallback) создал две позиции в `todo.pokupki`; после `undo_last_capture` для capture с `source: ha_voice` удалённая на сервере позиция исчезла из HA.
+- [x] Календарь: all-day событие для срока-даты, timed-событие 10:30–11:30 после переноса на время.
+- [x] Diagnostics: URL, интервал 60 с, горизонт 30 дней, время синхронизации, `last_sync_error: null`; токена, названий задач и имён нет.
+- [x] Логи HA: ошибок компонента нет.
+- [x] Assist (агент Home Assistant, `conversation.process`, язык ru) с файлами из `tasklerq-ha/examples/assist`: «купи молоко и хлеб» → «Добавил 2 покупки: Молоко, Хлеб.» (две позиции с `source: ha_voice`); «добавь задачу позвонить маме завтра» → «Добавил задачу: Позвонить маме.», срок — завтрашняя дата; «отмени последнее добавление» → «Отменил добавление: 1 элемент.», задача удалена.
+- [ ] Ручная установка копированием каталога: отдельно не проверялась.
+- [ ] Подхват изменений, сделанных на сервере через бота, плановым опросом: не проверено — бот на момент проверки был выключен (`TELEGRAM_MODE=disabled`).
 
 ## 11. Troubleshooting
 

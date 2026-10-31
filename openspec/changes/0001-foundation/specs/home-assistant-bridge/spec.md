@@ -10,17 +10,18 @@ Tasklerq как сущности `todo` и задачи со сроком как
 
 ### Requirement: Установка и совместимость
 
-Система SHALL поставлять custom component `tasklerq` для Home Assistant,
-устанавливаемый через HACS как пользовательский репозиторий или ручным
-копированием в `custom_components/tasklerq`. Компонент MUST поддерживать Home
-Assistant Container и MUST NOT требовать Supervisor, add-on или ingress.
-Компонент MUST объявлять минимальную поддерживаемую версию Home Assistant и
-MUST предупреждать пользователя при несовместимой версии.
+Система SHALL поставлять custom component `tasklerq` из отдельного репозитория
+`tasklerq-ha` со своими версиями и релизами; установка — HACS как
+пользовательский репозиторий или копирование в `custom_components/tasklerq`.
+Компонент MUST поддерживать Home Assistant Container и MUST NOT требовать
+Supervisor, add-on или ingress. Компонент MUST объявлять минимальную
+поддерживаемую версию Home Assistant и MUST предупреждать пользователя при
+несовместимой версии.
 
 #### Scenario: Установка через HACS
 
-- **WHEN** пользователь добавляет репозиторий Tasklerq в HACS и устанавливает
-  компонент
+- **WHEN** пользователь добавляет репозиторий `tasklerq-ha` в HACS и
+  устанавливает компонент
 - **THEN** Home Assistant обнаруживает `custom_components/tasklerq`
 - **AND** после перезапуска доступна интеграция Tasklerq
 
@@ -154,9 +155,9 @@ API-токен. При настройке компонент MUST провери
 ### Requirement: Голосовой сценарий Assist
 
 Система SHALL поддерживать сценарий Home Assistant Assist: пользовательские
-предложения `conversation.intents` вызывают `intent_script`, который вызывает
-`tasklerq.capture` и озвучивает `response.speech`. Пример конфигурации MUST
-поставляться в документации и примере пакета. Сценарий MUST работать без
+предложения Assist (custom sentences) вызывают `intent_script`, который вызывает
+`tasklerq.capture` и озвучивает `speech` из ответа сервиса. Пример конфигурации
+MUST поставляться в документации и примере пакета. Сценарий MUST работать без
 Telegram и MUST NOT требовать включения Assist-инструментов (`llm_hass_api`) у
 AI Task.
 
@@ -187,7 +188,7 @@ AI Task.
 
 #### Scenario: LLM-агент в Assist
 
-- **WHEN** в Assist выбран LLM-агент, который не использует `conversation.intents`
+- **WHEN** в Assist выбран LLM-агент, который не использует пользовательские предложения (custom sentences) Assist
 - **THEN** документация предлагает отдельный pipeline с агентом Home Assistant
   или явное действие агента
 - **AND** разбор Tasklerq продолжает работать без Assist-инструментов

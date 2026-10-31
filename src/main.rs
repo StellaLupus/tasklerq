@@ -3,21 +3,18 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tasklerq::admin;
-use tasklerq::capture::breaker::CircuitBreaker;
+use tasklerq::app::build_application;
 use tasklerq::capture::{eval, prompt};
 use tasklerq::config::{self, Config, DatabaseConfig, LlmConfig};
 use tasklerq::domain::error::DomainError;
 use tasklerq::domain::models::UserRole;
 use tasklerq::home_assistant::{AiTask, GenerateData, HttpAiTask, MAX_GENERATE_TIMEOUT};
-use tasklerq::http::api::capture::CaptureState;
-use tasklerq::http::router::{AppState, build_router};
 use tasklerq::http::server;
 use tasklerq::storage;
 use tokio::net::TcpListener;
@@ -230,41 +227,17 @@ async fn serve() -> Result<()> {
         .context("failed to read the bound address")?;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let ai = tasklerq::telegram::runtime::build_ai(&config.llm);
-    let breaker = Arc::new(CircuitBreaker::default());
-    let telegram = tasklerq::telegram::runtime::start(
-        &config,
-        &pool,
-        shutdown_rx,
-        ai.clone(),
-        breaker.clone(),
-    )
-    .await
-    .context("telegram startup failed")?;
-    let mut state = AppState::new(pool);
-    let mut workers = Vec::new();
-    if let Some(runtime) = telegram {
-        if let Some(ingress) = runtime.ingress {
-            state = state.with_telegram(ingress);
-        }
-        state = state.with_queue_lag_limit(config.queue.ready_lag_seconds);
-        workers = runtime.tasks;
-    }
-    if config.capture.enabled {
-        state = state.with_capture(CaptureState::new(
-            config.capture,
-            ai,
-            breaker,
-            config.llm.daily_quota,
-        ));
-    }
+    let application = build_application(&config, pool, shutdown_rx)
+        .await
+        .context("telegram startup failed")?;
+    let workers = application.workers;
+    let app = application.router;
     tracing::info!(
         mode = config.telegram.mode.as_str(),
         workers = workers.len(),
         "telegram configured"
     );
 
-    let app = build_router(state);
     tracing::info!(%address, "http server listening");
 
     server::serve(listener, app, async move {

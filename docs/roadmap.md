@@ -109,7 +109,8 @@ capture создаёт элементы без Telegram; fallback работае
 - `todo` по спискам, `calendar`.
 - Сервисы `tasklerq.capture`, `confirm_capture`, `cancel_capture`,
   `undo_last_capture`.
-- Пример `conversation.intents` + `intent_script` для HA Assist.
+- Пример пользовательских предложений (custom sentences) + `intent_script` для
+  HA Assist.
 - Snapshot, конфликты, diagnostics.
 - Установка через HACS и вручную.
 
