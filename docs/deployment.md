@@ -343,6 +343,9 @@ networks:
 ```
 
 Образ берётся из Docker Hub; `build: .` в production-compose не нужен.
+Тег `0.1.0` появится только после релиза `v0.1.0`; до него используйте
+`pr-<номер>` (для деплоя ветки PR), `sha-<короткий sha>` или `main` — см.
+[«Публикация образа»](#публикация-образа).
 Теги публикует workflow
 [`.github/workflows/docker.yml`](../.github/workflows/docker.yml):
 
@@ -415,6 +418,12 @@ Workflow `.github/workflows/docker.yml` собирает `linux/amd64` и пуб
 - `DOCKERHUB_TOKEN` — access token Docker Hub с правом **Read & Write**
   (не пароль от аккаунта; создаётся в **Account Settings → Security →
   New Access Token**).
+
+Риск: секреты Docker Hub с правом **Read & Write** доступны workflow из
+любой ветки этого репозитория (PR из своих веток и ручной запуск), поэтому
+любой, у кого есть право push, может опубликовать произвольный тег, включая
+`latest`; право push давайте только доверенным, а при необходимости ограничьте
+публикацию через GitHub environment с разрешёнными ветками.
 
 Выпуск релиза:
 
@@ -807,11 +816,11 @@ curl -fsS http://127.0.0.1:18080/health/ready
 
 ### 16.10. Откат релиза
 
-1. Backup.
-2. Остановить Tasklerq.
-3. Указать предыдущий image tag.
-4. Запустить.
-5. Проверить `/health/ready`, задачи, HA.
+1. Backup: `/usr/local/bin/tasklerq-backup.sh`.
+2. Вернуть прежний тег в `image:` (см. [§12](#12-обновления-и-откат)).
+3. `sudo /usr/local/bin/docker compose pull tasklerq`.
+4. `sudo /usr/local/bin/docker compose up -d tasklerq`.
+5. Проверить `/health/ready`, логи, задачи и HA.
 6. Если схема несовместима — restore backup.
 
 ## 17. Локальная разработка
