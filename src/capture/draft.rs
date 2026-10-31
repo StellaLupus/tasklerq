@@ -412,8 +412,7 @@ pub async fn edit_item(
         .get_mut(index)
         .ok_or(DraftError::NoSuchItem(index))?;
     apply(raw, edit);
-    let draft = persist(&mut tx, draft, &stored).await?;
-    let view = build_view(&mut tx, draft, now).await?;
+    let view = save_and_view(&mut tx, draft, stored, now).await?;
     tx.commit().await?;
     Ok(view)
 }
@@ -433,8 +432,7 @@ pub async fn remove_item(
         return Err(DraftError::NoSuchItem(index));
     }
     stored.items.remove(index);
-    let draft = persist(&mut tx, draft, &stored).await?;
-    let view = build_view(&mut tx, draft, now).await?;
+    let view = save_and_view(&mut tx, draft, stored, now).await?;
     tx.commit().await?;
     Ok(view)
 }
@@ -457,8 +455,7 @@ pub async fn replace_item(
         .ok_or(DraftError::NoSuchItem(index))?;
     scrub(&mut item);
     *slot = item;
-    let draft = persist(&mut tx, draft, &stored).await?;
-    let view = build_view(&mut tx, draft, now).await?;
+    let view = save_and_view(&mut tx, draft, stored, now).await?;
     tx.commit().await?;
     Ok(view)
 }
@@ -535,7 +532,7 @@ async fn answer(
     let mut tx = conn.begin().await?;
     let draft = open_for_change(&mut tx, household_id, draft_id, now).await?;
     let mut stored = Stored::read(&draft)?;
-    reserve_clarification(&stored)?;
+    ensure_clarification_left(&stored)?;
 
     let view = build_view(&mut tx, draft.clone(), now).await?;
     let checked = view
@@ -558,7 +555,7 @@ async fn answer(
     Ok(view)
 }
 
-fn reserve_clarification(stored: &Stored) -> Result<(), DraftError> {
+fn ensure_clarification_left(stored: &Stored) -> Result<(), DraftError> {
     if clarifications_left(stored.clarifications_answered) == 0 {
         Err(DraftError::ClarificationLimit)
     } else {
@@ -864,11 +861,7 @@ fn apply(raw: &mut RawItem, edit: ItemEdit) {
     }
     set(&mut raw.due_date, edit.due_date);
     set(&mut raw.due_time, edit.due_time);
-    match edit.quantity {
-        Field::Missing => {}
-        Field::Null => raw.quantity = None,
-        Field::Value(value) => raw.quantity = Some(value),
-    }
+    set(&mut raw.quantity, edit.quantity);
     if let Some(tags) = edit.tags {
         raw.tags = tags;
     }

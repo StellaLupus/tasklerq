@@ -571,7 +571,7 @@ fn validate_recurrence(
 
     // Дни недели и правило месяца имеют смысл только для своей частоты; у
     // остальных частот их заполняет модель по привычке, и это не ошибка.
-    let weekdays = if freq == Some(RecurrenceFreq::Weekly) {
+    let weekdays: &[i64] = if freq == Some(RecurrenceFreq::Weekly) {
         if raw.weekdays.is_empty() {
             fail(
                 errors,
@@ -587,9 +587,9 @@ fn validate_recurrence(
                 "День недели — от 1 до 7",
             );
         }
-        raw.weekdays.clone()
+        &raw.weekdays
     } else {
-        Vec::new()
+        &[]
     };
 
     let month_rule = if freq == Some(RecurrenceFreq::Monthly) {
@@ -634,8 +634,8 @@ fn validate_recurrence(
         freq: freq?,
         interval: i16::try_from(interval).ok(),
         byweekday: weekdays
-            .into_iter()
-            .filter_map(|day| i16::try_from(day).ok())
+            .iter()
+            .filter_map(|&day| i16::try_from(day).ok())
             .collect(),
         until,
         timezone: None,

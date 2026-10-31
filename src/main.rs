@@ -485,12 +485,13 @@ async fn capture_eval(args: CaptureEvalArgs) -> Result<()> {
     );
     print_report(&report);
 
+    let accuracy = report.overall().accuracy();
     let mut baseline = eval::Baseline::load(&args.baseline)
         .with_context(|| format!("не удалось прочитать {}", args.baseline.display()))?;
     baseline.record(
         prompt::PROMPT_VERSION,
         eval::BaselineEntry {
-            accuracy: report.overall().accuracy(),
+            accuracy,
             prompt_hash: eval::prompt_hash(),
             date: Utc::now().to_rfc3339(),
             phrases: set.phrases.len(),
@@ -501,7 +502,6 @@ async fn capture_eval(args: CaptureEvalArgs) -> Result<()> {
         .save(&args.baseline)
         .with_context(|| format!("не удалось записать {}", args.baseline.display()))?;
 
-    let accuracy = report.overall().accuracy();
     if accuracy < eval::MIN_ACCURACY {
         bail!(
             "точность {accuracy:.3} ниже минимальной {}: версия {} не годится",

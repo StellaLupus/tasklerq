@@ -44,7 +44,7 @@ use crate::storage::repositories::llm_runs::{self, FAILURE, NewRun, SUCCESS};
 
 use super::super::error::ApiError;
 use super::super::router::AppState;
-use super::{connection, integration_actor, require_capture};
+use super::{connection, database_error, integration_actor, require_capture};
 
 /// Предельный размер тела запроса.
 pub const BODY_LIMIT_BYTES: usize = 16 * 1024;
@@ -110,10 +110,10 @@ where
     type Rejection = ApiError;
 
     async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
-        match Json::<T>::from_request(request, state).await {
-            Ok(Json(value)) => Ok(Self(value)),
-            Err(rejection) => Err(json_error(rejection)),
-        }
+        Json::<T>::from_request(request, state)
+            .await
+            .map(|Json(value)| Self(value))
+            .map_err(json_error)
     }
 }
 
@@ -190,7 +190,7 @@ pub struct CaptureRequest {
     /// Конкретный список household для всех элементов.
     #[serde(default)]
     pub list_id: Option<Uuid>,
-    /// Ключ повтора. В 5.11 принимается, но не сохраняется: семантика — 5.13.
+    /// Ключ повтора; заголовок `Idempotency-Key` имеет приоритет над полем.
     #[serde(default)]
     pub idempotency_key: Option<String>,
 }
@@ -311,8 +311,8 @@ async fn capture_inner(
             .with_retry_after(decision.retry_after.unwrap_or(60)));
     }
 
-    let header_key = header_key(headers)?;
-    let idempotency_key = resolve_idempotency_key(header_key, request.idempotency_key.as_deref())?;
+    let header = header_key(headers)?;
+    let idempotency_key = resolve_idempotency_key(header, request.idempotency_key.as_deref())?;
     let request_hash = idempotency_key
         .as_ref()
         .map(|_| request_hash(&text, source, request.mode, request.hint, request.list_id));
@@ -327,8 +327,7 @@ async fn capture_inner(
     // предохранителя и доступности LLM идут после резерва, чтобы завершённый
     // повтор получал сохранённый ответ, даже если состояние household с тех пор
     // изменилось.
-    if let Some(key) = &idempotency_key {
-        let hash = request_hash.as_deref().unwrap_or_default();
+    if let (Some(key), Some(hash)) = (&idempotency_key, request_hash.as_deref()) {
         match capture_requests::reserve(
             &mut conn,
             auth.household_id,
@@ -401,19 +400,18 @@ async fn capture_inner(
         context: &context,
     };
 
+    let fallback_allowed = request.mode == CaptureMode::Auto && capture.config.voice_fallback_raw;
+
     // Выключенная или не настроенная LLM — это недоступность LLM: `auto` с
     // включённым fallback создаёт позицию из исходного текста, `draft` — 503.
-    let ai = match capture.ai.as_deref() {
-        Some(ai) => ai,
-        None => {
-            if request.mode == CaptureMode::Auto && capture.config.voice_fallback_raw {
-                return apply_fallback(&mut conn, fallback, now, "llm_disabled", reservation).await;
-            }
-            log_capture(source, "unavailable", capture_id);
-            return Err(ApiError::service_unavailable(
-                "Automatic capture is not configured",
-            ));
+    let Some(ai) = capture.ai.as_deref() else {
+        if fallback_allowed {
+            return apply_fallback(&mut conn, fallback, now, "llm_disabled", reservation).await;
         }
+        log_capture(source, "unavailable", capture_id);
+        return Err(ApiError::service_unavailable(
+            "Automatic capture is not configured",
+        ));
     };
 
     let used = llm_runs::count_since(&mut conn, auth.household_id, now - Duration::hours(24))
@@ -424,7 +422,7 @@ async fn capture_inner(
             metric = "capture_quota_exhausted",
             "llm capture quota is exhausted"
         );
-        if request.mode == CaptureMode::Auto && capture.config.voice_fallback_raw {
+        if fallback_allowed {
             return apply_fallback(&mut conn, fallback, now, "quota_exhausted", reservation).await;
         }
         log_capture(source, "unavailable", capture_id);
@@ -443,7 +441,7 @@ async fn capture_inner(
             metric = "capture_circuit_open",
             "llm circuit breaker is open"
         );
-        if request.mode == CaptureMode::Auto && capture.config.voice_fallback_raw {
+        if fallback_allowed {
             return apply_fallback(&mut conn, fallback, now, "circuit_open", reservation).await;
         }
         log_capture(source, "unavailable", capture_id);
@@ -461,12 +459,9 @@ async fn capture_inner(
     let timeout = llm_timeout(&capture.config, source);
     let deadline = tokio::time::Instant::now() + timeout;
     let mut attempt = 0u8;
-    let mut outcome: Option<llm::Generated> = None;
-    let mut last_failure: Option<Failure> = None;
-    let mut last_finished_at = now;
     let mut runs: Vec<PendingRun> = Vec::new();
 
-    loop {
+    let outcome = loop {
         attempt += 1;
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let attempt_timeout = if attempt == 1 { timeout } else { remaining };
@@ -490,8 +485,7 @@ async fn capture_inner(
                     generated.latency_ms,
                     generated.finished_at,
                 ));
-                outcome = Some(generated);
-                break;
+                break Ok(generated);
             }
             Err(failed) => {
                 let retry = attempt == 1 && failed.failure.is_parse_retryable();
@@ -506,67 +500,67 @@ async fn capture_inner(
                     failed.latency_ms,
                     failed.finished_at,
                 ));
-                last_finished_at = failed.finished_at;
-                last_failure = Some(failed.failure);
                 if retry && time_left >= MIN_RETRY_BUDGET {
                     continue;
                 }
-                break;
+                break Err((failed.failure, failed.finished_at));
             }
         }
-    }
+    };
 
     let mut conn = connection(state).await?;
     for pending in runs {
         match pending.outcome {
             RunOutcome::Success => {
-                if let Err(error) = llm_runs::record(&mut conn, pending.run, pending.at).await {
-                    return Err(database_error(error));
-                }
+                llm_runs::record(&mut conn, pending.run, pending.at)
+                    .await
+                    .map_err(database_error)?;
             }
             RunOutcome::Failure => record_failure(&mut conn, pending.run, pending.at).await,
         }
     }
 
-    let Some(generated) = outcome else {
-        let failure = last_failure.expect("a completed loop without a result stores a failure");
-        match &failure {
-            Failure::Ai(error) => {
-                tracing::warn!(error = error.code(), "llm capture request failed");
+    let generated = match outcome {
+        Ok(generated) => generated,
+        Err((failure, last_finished_at)) => {
+            match &failure {
+                Failure::Ai(error) => {
+                    tracing::warn!(error = error.code(), "llm capture request failed");
+                }
+                Failure::Parse(error) => {
+                    tracing::warn!(error = error.code(), "llm capture response rejected");
+                }
             }
-            Failure::Parse(error) => {
-                tracing::warn!(error = error.code(), "llm capture response rejected");
+
+            if matches!(failure, Failure::Parse(ParseError::TooManyItems { .. })) {
+                return reject(
+                    &mut conn,
+                    reservation,
+                    capture_id,
+                    source,
+                    TOO_MANY_ITEMS_SPEECH.to_owned(),
+                    Vec::new(),
+                    last_finished_at,
+                )
+                .await;
             }
-        }
 
-        if matches!(failure, Failure::Parse(ParseError::TooManyItems { .. })) {
-            return reject(
-                &mut conn,
-                reservation,
-                capture_id,
-                source,
-                TOO_MANY_ITEMS_SPEECH.to_owned(),
-                Vec::new(),
-                last_finished_at,
-            )
-            .await;
-        }
+            if fallback_allowed {
+                return apply_fallback(
+                    &mut conn,
+                    fallback,
+                    last_finished_at,
+                    failure.code(),
+                    reservation,
+                )
+                .await;
+            }
 
-        if request.mode == CaptureMode::Auto && capture.config.voice_fallback_raw {
-            return apply_fallback(
-                &mut conn,
-                fallback,
-                last_finished_at,
-                failure.code(),
-                reservation,
-            )
-            .await;
+            log_capture(source, "unavailable", capture_id);
+            return Err(ApiError::service_unavailable(
+                "Automatic capture is temporarily unavailable",
+            ));
         }
-
-        log_capture(source, "unavailable", capture_id);
-        return Err(ApiError::service_unavailable(
-            "Automatic capture is temporarily unavailable",
-        ));
     };
     let (mut parsed, finished_at) = (generated.parsed, generated.finished_at);
 
@@ -579,14 +573,16 @@ async fn capture_inner(
     };
     let validated = validate_items_in(&context, item_source, parsed.clone(), validation);
 
-    if validated.items.is_empty() {
+    // Пустой разбор отклоняется в обоих режимах, невалидный — только в `auto`:
+    // черновик покажет ошибки пользователю.
+    if validated.items.is_empty() || (request.mode == CaptureMode::Auto && !validated.is_valid()) {
         return reject(
             &mut conn,
             reservation,
             capture_id,
             source,
             rejected_speech(&validated.items),
-            validated.clarifications.clone(),
+            validated.clarifications,
             finished_at,
         )
         .await;
@@ -594,18 +590,6 @@ async fn capture_inner(
 
     match request.mode {
         CaptureMode::Auto => {
-            if !validated.is_valid() {
-                return reject(
-                    &mut conn,
-                    reservation,
-                    capture_id,
-                    source,
-                    rejected_speech(&validated.items),
-                    validated.clarifications.clone(),
-                    finished_at,
-                )
-                .await;
-            }
             let item_kinds: Vec<ListKind> = validated.items.iter().map(|item| item.kind).collect();
             let expected_items = item_kinds.len();
             let actor = integration_actor(item_source);
@@ -627,10 +611,10 @@ async fn capture_inner(
                     chat_id: None,
                     source,
                     mode: CaptureMode::Auto,
-                    idempotency_key: idempotency_key.clone(),
-                    request_hash: request_hash.clone(),
-                    raw_text: text.clone(),
-                    parsed: parsed.clone(),
+                    idempotency_key,
+                    request_hash,
+                    raw_text: text,
+                    parsed,
                     fallback: false,
                     prompt_version: Some(PROMPT_VERSION.to_owned()),
                 },
@@ -675,8 +659,8 @@ async fn capture_inner(
                     chat_id: None,
                     source,
                     mode: CaptureMode::Draft,
-                    idempotency_key: idempotency_key.clone(),
-                    request_hash: request_hash.clone(),
+                    idempotency_key,
+                    request_hash,
                     raw_text: text,
                     parsed,
                     fallback: false,
@@ -689,10 +673,8 @@ async fn capture_inner(
             .await;
             let draft = match created {
                 Ok(draft) => {
-                    if let Err(error) = tx.commit().await {
-                        // Резерв освободит общий обработчик ошибки.
-                        return Err(database_error(error));
-                    }
+                    // Резерв освободит общий обработчик ошибки.
+                    tx.commit().await.map_err(database_error)?;
                     if let Some(reservation) = reservation.as_mut() {
                         reservation.settle();
                     }
@@ -898,7 +880,7 @@ async fn apply_fallback(
             idempotency_key: input.idempotency_key.map(str::to_owned),
             request_hash: input.request_hash.map(str::to_owned),
             raw_text: input.text.to_owned(),
-            parsed: parsed.clone(),
+            parsed,
             fallback: true,
             prompt_version: Some(PROMPT_VERSION.to_owned()),
         },
@@ -1074,20 +1056,7 @@ pub(super) fn applied_speech(items: &[CaptureItem]) -> String {
         }
         Some(kind) if count <= 3 => {
             let titles = titles(items);
-            match kind {
-                ListKind::Shopping => format!(
-                    "Добавил {}: {titles}.",
-                    crate::telegram::ru::purchases(count as i64)
-                ),
-                ListKind::Tasks => format!(
-                    "Добавил {}: {titles}.",
-                    crate::telegram::ru::tasks(count as i64)
-                ),
-                ListKind::Checklist => format!(
-                    "Добавил {}: {titles}.",
-                    crate::telegram::ru::positions(count as i64)
-                ),
-            }
+            format!("Добавил {}: {titles}.", kind_noun(kind, count))
         }
         _ => format!("Добавил {}.", elements(count)),
     }
@@ -1096,15 +1065,17 @@ pub(super) fn applied_speech(items: &[CaptureItem]) -> String {
 fn draft_speech(items: &[CaptureItem]) -> String {
     let count = items.len();
     match common_kind(items) {
-        Some(kind) if count <= 3 => format!(
-            "Сохранил черновик: {}.",
-            match kind {
-                ListKind::Shopping => crate::telegram::ru::purchases(count as i64),
-                ListKind::Tasks => crate::telegram::ru::tasks(count as i64),
-                ListKind::Checklist => crate::telegram::ru::positions(count as i64),
-            }
-        ),
+        Some(kind) if count <= 3 => format!("Сохранил черновик: {}.", kind_noun(kind, count)),
         _ => format!("Сохранил черновик: {}.", elements(count)),
+    }
+}
+
+/// «2 покупки», «3 задачи», «2 позиции» — число с существительным по типу списка.
+fn kind_noun(kind: ListKind, count: usize) -> String {
+    match kind {
+        ListKind::Shopping => crate::telegram::ru::purchases(count as i64),
+        ListKind::Tasks => crate::telegram::ru::tasks(count as i64),
+        ListKind::Checklist => crate::telegram::ru::positions(count as i64),
     }
 }
 
@@ -1132,8 +1103,7 @@ fn rejected_response(
 fn rejected_speech(items: &[DraftItem]) -> String {
     let reason = items
         .iter()
-        .flat_map(|item| item.errors.first())
-        .next()
+        .find_map(|item| item.errors.first())
         .map(|error| error.message)
         .unwrap_or("не нашёл задач или покупок");
     fit_speech(format!("Не смог добавить: {}.", lowercase_first(reason)))
@@ -1231,11 +1201,6 @@ fn store_error(error: draft::StoreError) -> ApiError {
 fn reservation_lost() -> ApiError {
     ApiError::conflict("Capture with this Idempotency-Key is being processed by another request")
         .with_retry_after(IN_PROGRESS_RETRY_AFTER)
-}
-
-fn database_error(error: sqlx::Error) -> ApiError {
-    tracing::error!(%error, "database operation failed");
-    ApiError::internal("Database error")
 }
 
 #[cfg(test)]

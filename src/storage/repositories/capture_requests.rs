@@ -53,6 +53,7 @@ pub async fn reserve(
     now: DateTime<Utc>,
 ) -> Result<Reserved, sqlx::Error> {
     let mut tx = conn.begin().await?;
+    let stale_before = now - Duration::seconds(STALE_SECONDS);
 
     // Строка могла исчезнуть между конфликтом вставки и чтением: её удалил
     // освободивший ключ запрос. Тогда вставку можно повторить.
@@ -104,7 +105,7 @@ pub async fn reserve(
             return Ok(Reserved::Completed(response));
         }
 
-        if existing.created_at >= now - Duration::seconds(STALE_SECONDS) {
+        if existing.created_at >= stale_before {
             tx.commit().await?;
             return Ok(Reserved::InProgress);
         }
@@ -125,7 +126,7 @@ pub async fn reserve(
         .bind(request_hash)
         .bind(capture_id)
         .bind(now)
-        .bind(now - Duration::seconds(STALE_SECONDS))
+        .bind(stale_before)
         .fetch_optional(&mut *tx)
         .await?;
 

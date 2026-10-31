@@ -26,9 +26,7 @@ use uuid::Uuid;
 use super::context::{CaptureContext, ListRef, MemberRef};
 use super::prompt;
 use super::schema::parse_response;
-use super::validate::{
-    ASSIGNEE_AMBIGUOUS, DATE_INVALID, DATE_PAST, DraftItem, ValidatedDraft, validate_items,
-};
+use super::validate::{DraftItem, ValidatedDraft, validate_items};
 use crate::domain::models::{ItemSource, ListKind, MonthRule, RecurrenceFreq, RecurrenceInput};
 use crate::domain::recurrence::parse_timezone;
 
@@ -102,16 +100,17 @@ impl ContextSpec {
                 username: member.username.clone(),
             })
             .collect();
-        let author = match &self.author {
-            None => None,
-            Some(name) => Some(
+        let author = self
+            .author
+            .as_ref()
+            .map(|name| {
                 members
                     .iter()
                     .find(|member| &member.display_name == name)
                     .cloned()
-                    .ok_or_else(|| format!("автор «{name}» не входит в участников"))?,
-            ),
-        };
+                    .ok_or_else(|| format!("автор «{name}» не входит в участников"))
+            })
+            .transpose()?;
         Ok(CaptureContext {
             now,
             timezone,
@@ -427,11 +426,12 @@ pub fn evaluate(set: &GoldenSet, responses: &BTreeMap<String, Value>) -> Report 
 pub fn judge(default_context: &ContextSpec, phrase: &GoldenPhrase, data: &Value) -> PhraseResult {
     let expected_items = phrase.expect.items.len();
     let expected_topics = phrase.expect.clarifications.len();
+    let expected = expected_items + expected_topics;
     let mut result = PhraseResult {
         id: phrase.id.clone(),
         category: phrase.category,
         totals: Totals {
-            expected: expected_items + expected_topics,
+            expected,
             ..Totals::default()
         },
         clarifications_ok: expected_topics == 0,
@@ -502,7 +502,7 @@ pub fn judge(default_context: &ContextSpec, phrase: &GoldenPhrase, data: &Value)
     // без вопроса снижает точность, а не только помечает фразу.
     result.totals = Totals {
         matched: matched + clarifications_matched,
-        expected: expected_items + expected_topics,
+        expected,
         extra,
     };
 
@@ -671,14 +671,11 @@ fn actual_topics(
 ) -> BTreeSet<ClarificationTopic> {
     let mut topics = BTreeSet::new();
     for item in &validated.items {
-        for error in &item.errors {
-            if error.code == ASSIGNEE_AMBIGUOUS {
-                topics.insert(ClarificationTopic::Assignee);
-            }
-            if error.field == "due_date" && (error.code == DATE_PAST || error.code == DATE_INVALID)
-            {
-                topics.insert(ClarificationTopic::DueDate);
-            }
+        if item.has_assignee_question() {
+            topics.insert(ClarificationTopic::Assignee);
+        }
+        if item.has_date_question() {
+            topics.insert(ClarificationTopic::DueDate);
         }
     }
     for question in &validated.clarifications {

@@ -110,19 +110,18 @@ fn member_label(member: &MemberRef, members: &[MemberRef]) -> String {
     if let Some(username) = member.username.as_deref() {
         return format!("{} (@{username})", member.display_name);
     }
-    let same_name = members
+    let namesakes: Vec<&MemberRef> = members
         .iter()
         .filter(|other| other.display_name == member.display_name)
-        .count();
-    if same_name <= 1 {
+        .collect();
+    if namesakes.len() <= 1 {
         return member.display_name.clone();
     }
     // Номер тёзки следует за порядком `users::list_active`. Карточка
     // перерисовывается после каждого ответа, поэтому подпись и токен кнопки
     // всегда берутся из одного снимка участников.
-    let number = members
+    let number = namesakes
         .iter()
-        .filter(|other| other.display_name == member.display_name)
         .position(|other| other.id == member.id)
         .map_or(1, |index| index + 1);
     format!("{} · {number}", member.display_name)

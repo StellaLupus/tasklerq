@@ -95,19 +95,6 @@ pub enum Failure {
     Dead,
 }
 
-/// Состояние очереди.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Counts {
-    /// Ждут обработки.
-    pub pending: i64,
-    /// В работе.
-    pub running: i64,
-    /// Обработаны.
-    pub done: i64,
-    /// Закончили ошибкой.
-    pub dead: i64,
-}
-
 /// Задержка перед повтором: 2, 4, 8, … секунд, не больше минуты.
 pub fn backoff(attempts: i32) -> Duration {
     let exponent = u32::try_from(attempts.clamp(1, 16)).unwrap_or(16);
@@ -162,8 +149,8 @@ pub async fn count_recent_for_user(
 /// Захватить следующее готовое задание на время [`LEASE`].
 ///
 /// Готово то, что ждёт и чьё время подошло, а также то, чья аренда истекла
-/// (воркер упал). Задания, исчерпавшие попытки, сначала переводятся в `dead`;
-/// их id возвращаются, чтобы вызывающий сообщил пользователю.
+/// (воркер упал). Задания, исчерпавшие попытки, сначала переводятся в `dead`
+/// и не возвращаются.
 ///
 /// `only_chat` ограничивает выборку одним чатом: тесты делят одну базу.
 pub async fn claim_next(
@@ -268,25 +255,6 @@ pub async fn record_failure(
     .execute(conn)
     .await?;
     Ok(Failure::Dead)
-}
-
-/// Количество заданий по статусам.
-pub async fn counts(conn: &mut PgConnection) -> Result<Counts, sqlx::Error> {
-    let rows: Vec<(String, i64)> =
-        sqlx::query_as("SELECT status::text, count(*) FROM capture_jobs GROUP BY status")
-            .fetch_all(conn)
-            .await?;
-    let mut counts = Counts::default();
-    for (status, count) in rows {
-        match status.as_str() {
-            "pending" => counts.pending = count,
-            "running" => counts.running = count,
-            "done" => counts.done = count,
-            "dead" => counts.dead = count,
-            _ => {}
-        }
-    }
-    Ok(counts)
 }
 
 /// Удалить завершённые задания старше `cutoff`.

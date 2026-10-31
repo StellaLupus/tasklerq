@@ -234,12 +234,10 @@ impl IntoResponse for ApiError {
         });
 
         let mut response = (self.status, Json(body)).into_response();
-        if let Some(seconds) = self.retry_after
-            && let Ok(value) = HeaderValue::from_str(&seconds.to_string())
-        {
+        if let Some(seconds) = self.retry_after {
             response
                 .headers_mut()
-                .insert(axum::http::header::RETRY_AFTER, value);
+                .insert(axum::http::header::RETRY_AFTER, HeaderValue::from(seconds));
         }
         if let Some(id) = request_id
             && let Ok(value) = HeaderValue::from_str(&id)

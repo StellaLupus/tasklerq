@@ -89,12 +89,13 @@ fn render(template: &str, value: impl Fn(&str) -> Option<String>) -> String {
             break;
         };
         let name = &rest[start + 2..start + 2 + length];
+        let end = start + 2 + length + 2;
         output.push_str(&rest[..start]);
         match value(name) {
             Some(replacement) => output.push_str(&replacement),
-            None => output.push_str(&rest[start..start + 2 + length + 2]),
+            None => output.push_str(&rest[start..end]),
         }
-        rest = &rest[start + 2 + length + 2..];
+        rest = &rest[end..];
     }
     output.push_str(rest);
     output

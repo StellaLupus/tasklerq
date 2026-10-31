@@ -93,12 +93,12 @@ pub async fn generate(
         structure: &structure,
     };
     let started = Instant::now();
-    let generated = match tokio::time::timeout(timeout, ai.generate_data(&request, timeout)).await {
-        Ok(result) => result,
-        Err(_) => Err(HaError::Timeout),
-    };
-    let latency_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
-    let finished_at = now + chrono::Duration::from_std(started.elapsed()).unwrap_or_default();
+    let generated = tokio::time::timeout(timeout, ai.generate_data(&request, timeout))
+        .await
+        .unwrap_or(Err(HaError::Timeout));
+    let elapsed = started.elapsed();
+    let latency_ms = i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX);
+    let finished_at = now + chrono::Duration::from_std(elapsed).unwrap_or_default();
 
     match generated {
         Err(error) => {
