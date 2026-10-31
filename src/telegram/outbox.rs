@@ -348,7 +348,13 @@ impl OutboxWorker {
         }
 
         let Some(outgoing) = Outgoing::from_row(&row.kind, &row.payload) else {
-            mark_dead(&mut tx, row.seq, "invalid_payload").await?;
+            mark_dead(&mut tx, row.seq, "invalid_payload", now).await?;
+            tracing::error!(
+                seq = row.seq,
+                error = "invalid_payload",
+                metric = "outbox_dead",
+                "outbox message moved to the dead-letter queue"
+            );
             tx.commit().await?;
             return Ok(Delivery::Dead);
         };
@@ -387,11 +393,12 @@ impl OutboxWorker {
             Err(error) if error.is_retryable() => {
                 let attempts = row.attempts + 1;
                 if attempts >= MAX_ATTEMPTS {
-                    mark_dead(&mut tx, row.seq, error.code()).await?;
+                    mark_dead(&mut tx, row.seq, error.code(), now).await?;
                     tracing::error!(
                         seq = row.seq,
                         error = error.code(),
-                        "outbox message is dead"
+                        metric = "outbox_dead",
+                        "outbox message moved to the dead-letter queue"
                     );
                     Delivery::Dead
                 } else {
@@ -410,11 +417,12 @@ impl OutboxWorker {
                 }
             }
             Err(error) => {
-                mark_dead(&mut tx, row.seq, error.code()).await?;
+                mark_dead(&mut tx, row.seq, error.code(), now).await?;
                 tracing::warn!(
                     seq = row.seq,
                     error = error.code(),
-                    "outbox message rejected"
+                    metric = "outbox_dead",
+                    "outbox message rejected and moved to the dead-letter queue"
                 );
                 Delivery::Dead
             }
@@ -457,14 +465,21 @@ impl OutboxWorker {
     }
 }
 
-async fn mark_dead(conn: &mut PgConnection, seq: i64, code: &str) -> Result<(), sqlx::Error> {
+async fn mark_dead(
+    conn: &mut PgConnection,
+    seq: i64,
+    code: &str,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE outbox
-         SET status = 'dead', last_error = $2, payload = jsonb_build_object('redacted', true)
+         SET status = 'dead', last_error = $2, dead_at = $3,
+             payload = jsonb_build_object('redacted', true)
          WHERE seq = $1",
     )
     .bind(seq)
     .bind(code)
+    .bind(now)
     .execute(conn)
     .await?;
     Ok(())

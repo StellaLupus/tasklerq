@@ -54,3 +54,8 @@ CREATE TABLE notification_deliveries (
 CREATE INDEX notification_deliveries_pending_idx
     ON notification_deliveries (scheduled_at)
     WHERE status = 'pending';
+
+-- Время перевода исходящего сообщения в очередь ошибок: у dead-letter должен
+-- быть не только код (`last_error`), но и момент отказа. У остальных статусов
+-- колонка пуста.
+ALTER TABLE outbox ADD COLUMN dead_at timestamptz;
