@@ -132,7 +132,7 @@
 - [x] 8.2 Реализовать защиту capture: `capture:write`, запрет query-токена, тело 16 КБ, текст 2000, `Idempotency-Key`, отсутствие текста в логах; проверить security-тестами.
 - [x] 8.3 Реализовать валидацию ввода, удаление управляющих символов, HTML-экранирование и параметризованные запросы; проверить security-тестами XSS/SQLi.
 - [x] 8.4 Реализовать redaction секретов в логах, diagnostics и ошибках; проверить тестом с токеном и паролем.
-- [ ] 8.5 Реализовать `/health/live`, `/health/ready`, JSON-логи и метрики очередей/LLM/capture; проверить endpoint-тестами и скрейпом метрик.
+- [x] 8.5 Реализовать `/health/live`, `/health/ready`, JSON-логи и метрики очередей/LLM/capture; проверить endpoint-тестами и скрейпом метрик.
 - [ ] 8.6 Реализовать миграции под advisory lock, backup-скрипт и restore-скрипт; проверить на тестовой базе.
 - [ ] 8.7 Реализовать `tasklerq admin token create/revoke`, `queue stats`, `webhook info`, `household create/list`, `user add`, `export`; проверить CLI-тестами и redaction вывода.
 - [ ] 8.8 Провести нагрузочный тест: 10 пользователей, 10 000 задач, 50 webhook/с; проверить latency webhook <100 мс и отсутствие роста очереди.

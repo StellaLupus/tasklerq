@@ -8,6 +8,7 @@ use super::api;
 use super::api::capture::CaptureState;
 use super::error::ApiError;
 use super::health;
+use super::metrics;
 use super::middleware::request_id;
 use crate::telegram::webhook::{self, Ingress};
 
@@ -60,6 +61,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health/live", get(health::live))
         .route("/health/ready", get(health::ready))
+        .route("/metrics", get(metrics::scrape))
         .nest("/api/v1", api::router(&state))
         .route("/webhooks/telegram", post(webhook::receive))
         .fallback(not_found)

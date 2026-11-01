@@ -33,6 +33,10 @@ fn scopes_are_validated_and_deduplicated() {
     ]))
     .expect("known scopes");
     assert_eq!(valid, scopes(&["ha:read", "ha:write", "capture:write"]));
+    assert_eq!(
+        validate_scopes(&scopes(&["metrics:read"])).expect("metrics scope"),
+        scopes(&["metrics:read"])
+    );
     assert!(validate_scopes(&[]).is_err());
     assert!(validate_scopes(&scopes(&["admin"])).is_err());
 }

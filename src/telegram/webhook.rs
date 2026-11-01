@@ -105,6 +105,7 @@ pub async fn receive(
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
     if !ingress.accepts(provided) {
+        crate::metrics::webhook_auth_failure();
         return Err(ApiError::unauthorized("Invalid webhook secret"));
     }
 

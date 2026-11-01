@@ -662,15 +662,34 @@ curl -fsS http://127.0.0.1:18080/health/ready
 - `error_code`;
 - `version`.
 
-Метрики (если включены):
+Метрики — `GET /metrics` в формате Prometheus exposition 0.0.4. Эндпоинт не
+публичный: нужен Bearer-токен со scope `metrics:read` (токен в query не
+принимается). Без токена — `401`, без scope — `403`. Токен выпускается
+командой `tasklerq admin token create` с этим scope.
+
+Пример скрейпа:
+
+```bash
+curl -fsS \
+  -H "Authorization: Bearer ${TASKERQ_METRICS_TOKEN}" \
+  http://127.0.0.1:18080/metrics
+```
+
+Набор метрик:
 
 - `telegram_updates_total{status}`;
 - `telegram_queue_lag_seconds`;
 - `outbox_pending`;
+- `outbox_dead_total`;
+- `capture_total{source,status}`;
+- `capture_fallback_total{source}`;
 - `llm_requests_total{status}`;
-- `llm_latency_seconds`;
-- `http_requests_total{route,status}`;
-- `db_pool_in_use`.
+- `llm_latency_seconds` (гистограмма);
+- `llm_validation_failures_total`;
+- `http_requests_total{route,status}` — `route` — шаблон маршрута, а не сырой
+  путь;
+- `db_pool_in_use`;
+- `webhook_auth_failures_total`.
 
 Алерты:
 

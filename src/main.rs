@@ -541,12 +541,12 @@ async fn healthcheck(url: &str) -> Result<()> {
         .build()
         .context("failed to build HTTP client")?;
 
-    let safe_url = redaction::redact_url(url);
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .with_context(|| format!("healthcheck request to {safe_url} failed"))?;
+    let response = client.get(url).send().await.with_context(|| {
+        format!(
+            "healthcheck request to {} failed",
+            redaction::redact_url(url)
+        )
+    })?;
 
     if !response.status().is_success() {
         bail!("healthcheck failed with status {}", response.status());

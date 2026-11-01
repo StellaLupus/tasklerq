@@ -930,6 +930,7 @@ async fn apply_fallback(
         source = source_name(input.source),
         "capture fell back to the raw text"
     );
+    crate::metrics::capture_fallback(source_name(input.source));
     log_capture(input.source, "fallback", applied.capture_id);
     Ok(Json(fallback_response(&applied, kind)))
 }
@@ -1187,8 +1188,10 @@ fn source_name(source: CaptureSource) -> &'static str {
 
 /// Одна строка на capture; текст, `speech` и заголовки сюда не попадают.
 fn log_capture(source: CaptureSource, status: &str, capture_id: Uuid) {
+    let source = source_name(source);
+    crate::metrics::capture(source, status);
     tracing::info!(
-        source = source_name(source),
+        source,
         status,
         capture_id = %capture_id,
         "capture finished"

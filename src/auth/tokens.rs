@@ -24,7 +24,7 @@ pub const TOKEN_PREFIX: &str = "tlq_";
 /// Длина видимого префикса, по которому токен узнают в списках.
 const VISIBLE_PREFIX_LEN: usize = 12;
 /// Поддерживаемые scopes.
-pub const SCOPES: [&str; 3] = ["ha:read", "ha:write", "capture:write"];
+pub const SCOPES: [&str; 4] = ["ha:read", "ha:write", "capture:write", "metrics:read"];
 
 /// Ошибка аутентификации или авторизации.
 #[derive(Debug, Error)]

@@ -30,8 +30,8 @@ pub async fn live() -> Json<HealthResponse> {
     })
 }
 
-/// `GET /health/ready`: база доступна и принимает запросы, а очередь обновлений
-/// Telegram не застряла (если воркер запущен).
+/// `GET /health/ready`: база доступна и принимает запросы, миграции применены,
+/// а очередь обновлений Telegram не застряла (если воркер запущен).
 pub async fn ready(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
     sqlx::query("SELECT 1")
         .execute(&state.pool)
@@ -40,6 +40,19 @@ pub async fn ready(State(state): State<AppState>) -> Result<Json<HealthResponse>
             tracing::warn!(error = %error, "readiness check failed");
             ApiError::service_unavailable("Database is unavailable")
         })?;
+
+    let migrations = crate::storage::migrations::all_applied(&state.pool)
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "readiness migration check failed");
+            ApiError::service_unavailable("Database migrations are not applied")
+        })?;
+    if !migrations {
+        tracing::warn!("not all embedded migrations are applied");
+        return Err(ApiError::service_unavailable(
+            "Database migrations are not applied",
+        ));
+    }
 
     let now = Utc::now();
     if let Some(limit) = state.queue_lag_limit {

@@ -25,6 +25,7 @@ use crate::capture::schema::{ParseError, ParsedResponse};
 use crate::domain::error::DomainError;
 use crate::domain::models::{CaptureMode, Household, User};
 use crate::home_assistant::{AiTask, MAX_GENERATE_TIMEOUT};
+use crate::metrics;
 use crate::storage::repositories::capture_jobs::{self, Failure, Job};
 use crate::storage::repositories::llm_runs::{self, FAILURE, NewRun, SUCCESS};
 use crate::storage::repositories::{households, users};
@@ -387,6 +388,7 @@ impl CaptureWorker {
             .await?;
         tx.commit().await?;
         self.wake_outbox.notify_one();
+        metrics::capture("telegram", "drafted");
         Ok(Pass::Drafted)
     }
 
@@ -434,6 +436,7 @@ impl CaptureWorker {
                     .await?;
                 tx.commit().await?;
                 self.wake_outbox.notify_one();
+                metrics::capture("telegram", "failed");
                 Ok(Pass::Dead)
             }
         }
@@ -448,6 +451,7 @@ impl CaptureWorker {
     ) -> Result<Pass, sqlx::Error> {
         let mut conn = self.pool.acquire().await?;
         capture_jobs::record_failure(&mut conn, job, code, false, MAX_ATTEMPTS, now).await?;
+        metrics::capture("telegram", "failed");
         Ok(Pass::Dead)
     }
 

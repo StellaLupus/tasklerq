@@ -7,7 +7,7 @@
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -15,6 +15,7 @@ use futures_util::FutureExt;
 use sqlx::PgPool;
 use tokio::sync::{Notify, watch};
 
+use crate::metrics;
 use crate::rate_limit::RateLimiter;
 
 use super::api::TelegramApi;
@@ -132,6 +133,7 @@ impl UpdateWorker {
         let Some(job) = queue::claim_next(&mut tx, now, self.only_chat).await? else {
             return Ok(Pass::Idle);
         };
+        let started = Instant::now();
 
         // Лимит проверяется до обработчика: обновление сверх лимита не должно
         // создавать или менять данные. Оно всё равно помечается обработанным,
@@ -146,6 +148,8 @@ impl UpdateWorker {
             tx.commit().await?;
             self.wake_outbox.notify_one();
             self.answer(outcome).await;
+            metrics::telegram_update("rate_limited");
+            log_update(job.update_id, "rate_limited", started);
             return Ok(Pass::Processed);
         }
 
@@ -161,6 +165,8 @@ impl UpdateWorker {
                 tx.commit().await?;
                 self.wake_outbox.notify_one();
                 self.answer(outcome).await;
+                metrics::telegram_update("processed");
+                log_update(job.update_id, "processed", started);
                 return Ok(Pass::Processed);
             }
             Ok(Err(error)) => {
@@ -191,6 +197,12 @@ impl UpdateWorker {
                 "telegram update moved to the dead-letter queue"
             );
         }
+        let status = match failure {
+            Failure::Dead => "dead",
+            Failure::Retry(_) => "failed",
+        };
+        metrics::telegram_update(status);
+        log_update(job.update_id, status, started);
         Ok(Pass::Failed(failure))
     }
 
@@ -304,6 +316,12 @@ impl UpdateWorker {
 /// Сообщение пользователю о превышении лимита; без пользовательского текста.
 fn rate_limited_text(retry_after: u64) -> String {
     format!("Слишком часто. Попробуйте через {retry_after} с.")
+}
+
+/// Строка журнала об исходе обновления: только идентификатор, статус и время.
+fn log_update(update_id: i64, status: &'static str, started: Instant) {
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(update_id, status, duration_ms, "telegram update finished");
 }
 
 /// Long polling для локальной разработки: те же обновления попадают в ту же

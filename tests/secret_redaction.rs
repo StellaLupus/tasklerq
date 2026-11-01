@@ -125,17 +125,22 @@ fn config_debug_display_and_startup_log_hide_every_secret() {
     let debug = format!("{config:?}");
     assert_no_secret(&debug, "Config Debug");
     assert!(debug.contains("<redacted>"));
-    assert!(
-        config.database.url.to_string() == "<redacted>"
-            && config.telegram.bot_token.as_ref().map(ToString::to_string)
-                == Some("<redacted>".to_owned())
-            && config
-                .telegram
-                .webhook_secret
-                .as_ref()
-                .map(ToString::to_string)
-                == Some("<redacted>".to_owned())
-            && config.llm.token.as_ref().map(ToString::to_string) == Some("<redacted>".to_owned())
+    assert_eq!(config.database.url.to_string(), "<redacted>");
+    assert_eq!(
+        config.telegram.bot_token.as_ref().map(ToString::to_string),
+        Some("<redacted>".to_owned())
+    );
+    assert_eq!(
+        config
+            .telegram
+            .webhook_secret
+            .as_ref()
+            .map(ToString::to_string),
+        Some("<redacted>".to_owned())
+    );
+    assert_eq!(
+        config.llm.token.as_ref().map(ToString::to_string),
+        Some("<redacted>".to_owned())
     );
 
     let logs = LogBuffer::default();
@@ -276,6 +281,19 @@ fn healthcheck_error_hides_credentials_in_the_url() {
     assert!(!output.status.success(), "{output:?}");
     let stderr = String::from_utf8(output.stderr).expect("utf8");
     assert_no_secret(&stderr, "healthcheck error");
+}
+
+#[test]
+fn healthcheck_error_hides_credentials_when_the_url_cannot_be_parsed() {
+    let url = format!("http://tasklerq:{DB_PASSWORD}@[::1");
+    let output = bin()
+        .args(["healthcheck", "--url", &url])
+        .output()
+        .expect("cli should run");
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).expect("utf8");
+    assert_no_secret(&stderr, "healthcheck parse error");
 }
 
 fn peer() -> SocketAddr {
