@@ -139,6 +139,9 @@ pub struct Ctx<'a> {
     pub toast: Option<(String, bool)>,
     /// Сообщение над следующим экраном.
     pub banner: Option<String>,
+    /// Правило видимости для следующего экрана. Обработчик выставляет его до
+    /// вызова [`Ctx::present`]/[`Ctx::show`]; по умолчанию — [`Placement::Visible`].
+    pub placement: Placement,
     /// Свободный текст уходит на разбор в LLM.
     pub llm_capture: bool,
     /// Журнал событий безопасности; `None` в тестах без пула.
@@ -215,7 +218,7 @@ impl Ctx<'_> {
             self.chat_id,
             &Outgoing::Screen {
                 html,
-                placement: Placement::Visible,
+                placement: self.placement,
             },
             None,
             self.now,
@@ -425,6 +428,7 @@ impl Bot {
             tz: display_timezone(Some(user), Some(household)),
             toast: None,
             banner,
+            placement: Placement::Visible,
             llm_capture: self.llm_capture,
             audit: self.audit.as_ref(),
         }
@@ -486,6 +490,7 @@ impl Bot {
             tz,
             toast: None,
             banner: None,
+            placement: Placement::Visible,
             llm_capture: self.llm_capture,
             audit: self.audit.as_ref(),
         };
@@ -672,8 +677,14 @@ fn parse_command(text: &str) -> Option<(String, &str)> {
 
 async fn on_command(ctx: &mut Ctx<'_>, command: &str, argument: &str) -> Result<(), Fail> {
     match command {
-        "start" => onboarding::on_start(ctx, argument).await,
+        "start" => {
+            // `/start` (включая онбординг и `/start <code>`) возвращает окно
+            // даже если якорь удалён у пользователя.
+            ctx.placement = Placement::Fresh;
+            onboarding::on_start(ctx, argument).await
+        }
         "menu" => {
+            ctx.placement = Placement::Fresh;
             views::clear_conversation(&mut *ctx.conn, ctx.chat_id).await?;
             ctx.menu_or_onboarding().await
         }
@@ -736,16 +747,18 @@ async fn on_callback(ctx: &mut Ctx<'_>, message_id: i64, data: &str) -> Result<(
     }
 
     // Кнопка заменённого сообщения экрана не выполняется: пользователь видит
-    // актуальный экран в активном сообщении.
+    // актуальный экран в активном сообщении. Кнопка на самом якоре правит его
+    // на месте, даже если якорь засыпан уведомлением.
     if token.scope == Scope::Screen {
         let active = views::get(&mut *ctx.conn, ctx.chat_id).await?;
         if let Some(active) = active
-            && active
-                .message_id
-                .is_some_and(|active_id| active_id != message_id)
+            && let Some(active_id) = active.message_id
         {
-            ctx.toast("Это сообщение устарело. Показываю актуальный экран.");
-            return ctx.refresh().await;
+            if active_id != message_id {
+                ctx.toast("Это сообщение устарело. Показываю актуальный экран.");
+                return ctx.refresh().await;
+            }
+            ctx.placement = Placement::InPlace;
         }
     }
 

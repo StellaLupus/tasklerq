@@ -39,6 +39,11 @@ pub const MAX_ATTEMPTS: i32 = 5;
 const BATCH: i64 = 50;
 
 /// Насколько новый экран должен быть виден в чате.
+///
+/// Порядок вариантов значим: `derive(Ord)` использует его, когда
+/// вытесняемые экраны наследуют самый сильный `placement`
+/// (`InPlace < Visible < Fresh`). Более сильный режим должен побеждать при
+/// любом порядке постановки в очередь.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Placement {
@@ -52,11 +57,16 @@ pub enum Placement {
 }
 
 impl Placement {
-    fn from_payload(payload: &Value) -> Self {
-        payload
-            .get("placement")
-            .and_then(|value| serde_json::from_value(value.clone()).ok())
-            .unwrap_or_default()
+    /// Разобрать `placement` из payload строки `screen`.
+    ///
+    /// Отсутствующее поле — старые строки — читается как [`Self::Visible`].
+    /// Неизвестное значение не подменяется умолчанием: строка не разбирается
+    /// и уходит в dead-letter как `invalid_payload`.
+    fn from_payload(payload: &Value) -> Option<Self> {
+        match payload.get("placement") {
+            None => Some(Self::Visible),
+            Some(value) => serde_json::from_value(value.clone()).ok(),
+        }
     }
 }
 
@@ -117,7 +127,7 @@ impl Outgoing {
         match kind {
             "screen" => Some(Self::Screen {
                 html: payload.get("html")?.as_str()?.to_owned(),
-                placement: Placement::from_payload(payload),
+                placement: Placement::from_payload(payload)?,
             }),
             "message" => Some(Self::Message {
                 html: payload.get("html")?.as_str()?.to_owned(),
@@ -153,27 +163,31 @@ pub async fn enqueue(
     now: DateTime<Utc>,
 ) -> Result<Option<i64>, sqlx::Error> {
     let outgoing = if let Outgoing::Screen { html, placement } = outgoing {
+        // Блокировка и вытеснение — один запрос: воркер не может доставить
+        // строку между чтением `placement` и её вытеснением, иначе новый
+        // экран унаследовал бы режим уже доставленного.
         let pending: Vec<Value> = sqlx::query_scalar(
-            "SELECT payload FROM outbox
-             WHERE chat_id = $1 AND status = 'pending' AND kind = 'screen'
-               AND message_id IS NULL",
+            "WITH evicted AS (
+                 SELECT seq, payload FROM outbox
+                 WHERE chat_id = $1 AND status = 'pending' AND kind = 'screen'
+                   AND message_id IS NULL
+                 FOR UPDATE
+             ),
+             skipped AS (
+                 UPDATE outbox o
+                 SET status = 'skipped', payload = jsonb_build_object('redacted', true)
+                 FROM evicted e
+                 WHERE o.seq = e.seq
+             )
+             SELECT payload FROM evicted",
         )
         .bind(chat_id)
         .fetch_all(&mut *conn)
         .await?;
         let placement = pending
             .iter()
-            .map(Placement::from_payload)
+            .filter_map(Placement::from_payload)
             .fold(*placement, std::cmp::max);
-
-        sqlx::query(
-            "UPDATE outbox SET status = 'skipped', payload = jsonb_build_object('redacted', true)
-             WHERE chat_id = $1 AND status = 'pending' AND kind = 'screen'
-               AND message_id IS NULL",
-        )
-        .bind(chat_id)
-        .execute(&mut *conn)
-        .await?;
 
         Outgoing::Screen {
             html: html.clone(),
@@ -620,20 +634,19 @@ async fn deliver(
                     Placement::Fresh => true,
                 };
 
-            let message_id = if replace {
-                let old_id = target.expect("replace requires an active message");
-                let message_id = api.send_rich_message(row.chat_id, &rich).await?;
-                // Новый экран уже отправлен: любая ошибка удаления старого
-                // якоря (включая «нельзя удалить») не делает строку мёртвой.
-                let _ = api.delete_message(row.chat_id, old_id).await;
-                message_id
-            } else {
-                replace_or_send(api, row.chat_id, target, &rich).await?
+            let (message_id, sent_new) = match target.filter(|_| replace) {
+                Some(old_id) => {
+                    let message_id = api.send_rich_message(row.chat_id, &rich).await?;
+                    // Новый экран уже отправлен: любая ошибка удаления старого
+                    // якоря (включая «нельзя удалить») не делает строку мёртвой.
+                    let _ = api.delete_message(row.chat_id, old_id).await;
+                    (message_id, true)
+                }
+                None => replace_or_send(api, row.chat_id, target, &rich).await?,
             };
 
             // Новое сообщение снимает признак засыпанности; правка на месте
             // оставляет его как было.
-            let sent_new = target != Some(message_id);
             let buried = !sent_new && buried;
             views::set_message(conn, row.chat_id, message_id, buried, now)
                 .await
@@ -650,7 +663,9 @@ async fn deliver(
         }
         Outgoing::Edit { message_id, html } => {
             let rich = RichMessage { html: html.clone() };
-            replace_or_send(api, row.chat_id, Some(*message_id), &rich).await
+            replace_or_send(api, row.chat_id, Some(*message_id), &rich)
+                .await
+                .map(|(message_id, _)| message_id)
         }
         Outgoing::Delete { message_id } => {
             match api.delete_message(row.chat_id, *message_id).await {
@@ -663,23 +678,23 @@ async fn deliver(
 }
 
 /// Отредактировать сообщение; если это невозможно — удалить старое и отправить
-/// новое.
+/// новое. Флаг в результате говорит, что было отправлено новое сообщение.
 async fn replace_or_send(
     api: &dyn TelegramApi,
     chat_id: i64,
     target: Option<i64>,
     message: &RichMessage,
-) -> Result<i64, TelegramError> {
+) -> Result<(i64, bool), TelegramError> {
     let Some(message_id) = target else {
-        return api.send_rich_message(chat_id, message).await;
+        return Ok((api.send_rich_message(chat_id, message).await?, true));
     };
 
     match api.edit_rich_message(chat_id, message_id, message).await {
-        Ok(()) | Err(TelegramError::NotModified) => Ok(message_id),
+        Ok(()) | Err(TelegramError::NotModified) => Ok((message_id, false)),
         Err(TelegramError::MessageGone) => {
             // Старое сообщение уже могло исчезнуть; ошибка удаления не мешает.
             let _ = api.delete_message(chat_id, message_id).await;
-            api.send_rich_message(chat_id, message).await
+            Ok((api.send_rich_message(chat_id, message).await?, true))
         }
         Err(error) => Err(error),
     }
@@ -806,5 +821,20 @@ mod tests {
                 placement: Placement::Visible,
             })
         );
+    }
+
+    #[test]
+    fn screen_row_with_unknown_placement_is_not_parsed() {
+        assert_eq!(
+            Outgoing::from_row("screen", &json!({"html": "a", "placement": "sometimes"})),
+            None,
+            "an unknown placement must become invalid_payload, not visible"
+        );
+    }
+
+    #[test]
+    fn placement_order_reflects_visibility_strength() {
+        assert!(Placement::InPlace < Placement::Visible);
+        assert!(Placement::Visible < Placement::Fresh);
     }
 }

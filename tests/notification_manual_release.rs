@@ -4,9 +4,27 @@ mod support;
 
 use chrono::{DateTime, Duration, Utc};
 use support::notifications::*;
-use support::telegram::{Call, buttons};
+use support::telegram::{Call, Harness, buttons};
 use tasklerq::jobs::digest::digest_occurrence_key;
 use uuid::Uuid;
+
+/// Сообщения, отправленные после `sent_before`, не должны быть уведомлениями.
+///
+/// Экран настроек после кнопки на засыпанном якоре правится на месте
+/// (`in_place`) и остаётся засыпанным, поэтому ответ формы приходит новым
+/// экраном. Это не выпуск отложенного snooze.
+fn assert_no_notification_sent(bot: &Harness, sent_before: usize, message: &str) {
+    let sent = &bot.fake.sent()[sent_before..];
+    for call in sent {
+        let (Call::SendRich { html, .. } | Call::Send { html, .. }) = call else {
+            panic!("sent() must contain only sends: {call:?}");
+        };
+        assert!(
+            !html.contains("Пора") && !html.contains("Пока были тихие часы"),
+            "{message}: {html}"
+        );
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disabling_quiet_hours_releases_three_notifications_and_the_digest() {
@@ -129,21 +147,16 @@ async fn one_deferred_notification_is_released_as_an_ordinary_message() {
         );
     }
 
-    // Повторное включение и выключение не выпускает уведомление снова. Сам
-    // экран может прийти новым сообщением: после выпуска уведомления он
-    // засыпан (`buried`), а `placement` пока остаётся `visible` (пункт 2.3).
+    // Повторное включение и выключение не выпускает уведомление снова. Кнопки
+    // нажаты на самом якоре, поэтому после 2.3 экран правится на месте
+    // (`in_place`) и новых сообщений нет даже при `buried = true`.
     let sent_after_release = bot.fake.sent().len();
     bot.press("Тихие часы: выкл").await;
     bot.press("Тихие часы: вкл").await;
-    let repeated = &bot.fake.sent()[sent_after_release..];
-    assert!(
-        repeated.iter().all(|call| match call {
-            Call::SendRich { html, .. } | Call::Send { html, .. } => {
-                !html.contains("Пока были тихие часы") && !html.contains("Одно напоминание")
-            }
-            Call::EditRich { .. } | Call::EditText { .. } | Call::Delete { .. } => true,
-        }),
-        "repeated toggling must not release the deferred notification again: {repeated:?}"
+    assert_eq!(
+        bot.fake.sent().len(),
+        sent_after_release,
+        "repeated toggling must not send anything, including another notification"
     );
     assert!(!bot.screen().contains("Накопилось"));
 }
@@ -525,10 +538,10 @@ async fn snooze_not_released_before_its_own_time(move_quiet_start: bool) {
     }
 
     assert!(!bot.screen().contains("Накопилось"), "{}", bot.screen());
-    assert_eq!(
-        bot.fake.sent().len(),
+    assert_no_notification_sent(
+        &bot,
         sent_before,
-        "snooze must not be released before its own time"
+        "snooze must not be released before its own time",
     );
     let (scheduled_at, deferred): (DateTime<Utc>, bool) =
         sqlx::query_as("SELECT scheduled_at, deferred FROM notification_deliveries WHERE id = $1")
@@ -617,10 +630,10 @@ async fn shortening_quiet_hours_does_not_release_a_snooze_early() {
     bot.text("22:00").await;
 
     assert!(!bot.screen().contains("Накопилось"), "{}", bot.screen());
-    assert_eq!(
-        bot.fake.sent().len(),
+    assert_no_notification_sent(
+        &bot,
         sent_before,
-        "snooze must not be sent before its own time"
+        "snooze must not be sent before its own time",
     );
     let (scheduled_at, deferred): (DateTime<Utc>, bool) =
         sqlx::query_as("SELECT scheduled_at, deferred FROM notification_deliveries WHERE id = $1")

@@ -56,6 +56,35 @@ impl Rig {
         .expect("seq")
     }
 
+    /// Поставить строку `screen` с произвольным payload (для старых или
+    /// испорченных записей).
+    async fn raw_screen(&self, payload: serde_json::Value) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO outbox (chat_id, kind, payload, next_attempt_at, created_at)
+             VALUES ($1, 'screen', $2, $3, $3)
+             RETURNING seq",
+        )
+        .bind(self.chat)
+        .bind(payload)
+        .bind(self.now)
+        .fetch_one(&self.pool)
+        .await
+        .expect("raw screen")
+    }
+
+    /// `placement` последней ожидающей строки экрана.
+    async fn pending_placement(&self) -> String {
+        sqlx::query_scalar(
+            "SELECT payload->>'placement' FROM outbox
+             WHERE chat_id = $1 AND status = 'pending' AND kind = 'screen'
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(self.chat)
+        .fetch_one(&self.pool)
+        .await
+        .expect("pending placement")
+    }
+
     async fn edit(&self, message_id: i64, html: &str) -> i64 {
         let mut conn = self.pool.acquire().await.expect("conn");
         outbox::enqueue(
@@ -488,6 +517,45 @@ async fn evicting_screen_keeps_the_strongest_placement() {
     );
     assert_eq!(rig.fake.messages(rig.chat).len(), 1);
     assert_eq!(rig.fake.messages(rig.chat)[0].1, "<p>кнопка</p>");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evicting_screen_takes_the_strongest_placement_in_any_order() {
+    for (first, second, expected) in [
+        (Placement::InPlace, Placement::Visible, "visible"),
+        (Placement::Visible, Placement::InPlace, "visible"),
+        (Placement::Visible, Placement::Fresh, "fresh"),
+        (Placement::Fresh, Placement::Visible, "fresh"),
+        (Placement::InPlace, Placement::Fresh, "fresh"),
+        (Placement::Fresh, Placement::InPlace, "fresh"),
+    ] {
+        let db = db().await;
+        let rig = Rig::new(&db.pool);
+        rig.screen_with("<p>первый</p>", first).await;
+        rig.screen_with("<p>второй</p>", second).await;
+
+        assert_eq!(
+            rig.pending_placement().await,
+            expected,
+            "{first:?} then {second:?} must end as {expected}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn screen_with_unknown_placement_is_dead_as_invalid_payload() {
+    let _dead = DEAD_METRIC.lock().await;
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    let seq = rig
+        .raw_screen(serde_json::json!({"html": "<p>экран</p>", "placement": "sometimes"}))
+        .await;
+
+    assert_eq!(rig.pass().await, 0);
+    assert_eq!(
+        rig.row(seq).await,
+        ("dead".into(), 0, Some("invalid_payload".into()), None)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

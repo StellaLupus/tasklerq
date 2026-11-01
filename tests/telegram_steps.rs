@@ -8,7 +8,7 @@ use sqlx::PgConnection;
 use support::{create_household, db, next_telegram_id};
 use tasklerq::storage::repositories::{households, users};
 use tasklerq::telegram::bot::{Ctx, Fail};
-use tasklerq::telegram::outbox::{self, Outgoing};
+use tasklerq::telegram::outbox::{self, Outgoing, Placement};
 use tasklerq::telegram::update::Sender;
 use tasklerq::telegram::views;
 
@@ -28,6 +28,7 @@ fn ctx(conn: &mut PgConnection, chat: i64) -> Ctx<'_> {
         tz: chrono_tz::UTC,
         toast: None,
         banner: None,
+        placement: Placement::Visible,
         llm_capture: false,
         audit: None,
     }
