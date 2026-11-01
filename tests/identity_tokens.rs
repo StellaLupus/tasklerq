@@ -313,9 +313,23 @@ async fn cli_creates_lists_and_revokes_tokens() {
     assert!(listing.contains(&id) && listing.contains("active"));
     assert!(!listing.contains(&token), "list must not print secrets");
 
-    let revoke = bin()
+    // Без TTY подтверждение не получить: без --yes токен остаётся активным.
+    let unconfirmed = bin()
         .env("DATABASE_URL", &url)
         .args(["admin", "token", "revoke", &id])
+        .output()
+        .await
+        .expect("cli should run");
+    assert!(!unconfirmed.status.success(), "{unconfirmed:?}");
+    let stderr = String::from_utf8(unconfirmed.stderr).expect("utf8");
+    assert!(stderr.contains("нужно подтверждение (--yes)"), "{stderr}");
+    let (status, _) =
+        support::request(&app, Method::GET, "/api/v1/lists", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK, "the token must stay active");
+
+    let revoke = bin()
+        .env("DATABASE_URL", &url)
+        .args(["admin", "token", "revoke", &id, "--yes"])
         .output()
         .await
         .expect("cli should run");

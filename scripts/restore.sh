@@ -40,6 +40,6 @@ existing="${existing//[[:space:]]/}"
 "$DOCKER" exec -i "$PG_CONTAINER" \
     pg_restore --username="$PG_USER" --dbname="$NEW_DB" --no-owner \
     --exit-on-error <"$DUMP_FILE" ||
-    fail "pg_restore failed for '$DUMP_FILE' into '$NEW_DB'"
+    fail "pg_restore failed for '$DUMP_FILE' into '$NEW_DB'; database '$NEW_DB' was created and remains, remove it with: $DOCKER exec $PG_CONTAINER dropdb --username=$PG_USER $NEW_DB"
 
 printf 'restored %s into %s\n' "$DUMP_FILE" "$NEW_DB"

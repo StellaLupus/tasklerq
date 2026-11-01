@@ -217,6 +217,8 @@ pub struct TelegramConfig {
     pub webhook_secret: Option<SecretString>,
     /// Публичный URL webhook; обязателен в режиме `webhook`.
     pub webhook_url: Option<Url>,
+    /// Базовый адрес Bot API; в тестах подменяется на mock-сервер.
+    pub api_base_url: Option<Url>,
     /// Имя бота без `@` для ссылок-приглашений.
     pub bot_username: String,
 }
@@ -455,11 +457,14 @@ impl Config {
             ));
         }
 
+        let api_base_url = source.url("TELEGRAM_API_BASE_URL", false)?;
+
         Ok(TelegramConfig {
             mode,
             bot_token,
             webhook_secret,
             webhook_url,
+            api_base_url,
             bot_username,
         })
     }

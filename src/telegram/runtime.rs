@@ -5,6 +5,7 @@ use std::sync::Arc;
 use sqlx::PgPool;
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
+use url::Url;
 
 use crate::capture::breaker::CircuitBreaker;
 use crate::config::{Config, LlmConfig, TelegramMode};
@@ -51,7 +52,13 @@ pub async fn start(
         return Ok(None);
     }
 
-    let api: Arc<dyn TelegramApi> = Arc::new(HttpTelegramApi::new(token, DEFAULT_BASE_URL)?);
+    let api: Arc<dyn TelegramApi> = Arc::new(HttpTelegramApi::new(
+        token,
+        telegram
+            .api_base_url
+            .as_ref()
+            .map_or(DEFAULT_BASE_URL, Url::as_str),
+    )?);
     let wake_updates = Arc::new(Notify::new());
     let wake_outbox = Arc::new(Notify::new());
     let mut tasks = Vec::new();

@@ -296,6 +296,36 @@ fn healthcheck_error_hides_credentials_when_the_url_cannot_be_parsed() {
     assert_no_secret(&stderr, "healthcheck parse error");
 }
 
+#[test]
+fn admin_cli_errors_hide_the_database_password_and_bot_token() {
+    let url = format!("postgres://tasklerq:{DB_PASSWORD}@127.0.0.1:1/tasklerq?sslmode=disable");
+    let cases: [&[&str]; 4] = [
+        &["admin", "queue", "stats"],
+        &["admin", "token", "list"],
+        &["admin", "export"],
+        &["admin", "webhook", "info"],
+    ];
+
+    for args in cases {
+        let output = bin()
+            .env("DATABASE_URL", &url)
+            .env("ENV", "development")
+            .env("PUBLIC_BASE_URL", "http://127.0.0.1:8080")
+            .env("TELEGRAM_MODE", "polling")
+            .env("TELEGRAM_BOT_TOKEN", BOT_TOKEN)
+            .env("TELEGRAM_API_BASE_URL", "http://127.0.0.1:1")
+            .env("LLM_CAPTURE_ENABLED", "false")
+            .args(args)
+            .output()
+            .expect("cli should run");
+
+        assert!(!output.status.success(), "{args:?}: {output:?}");
+        let mut combined = String::from_utf8(output.stdout).expect("utf8");
+        combined.push_str(&String::from_utf8(output.stderr).expect("utf8"));
+        assert_no_secret(&combined, &format!("admin CLI {args:?}"));
+    }
+}
+
 fn peer() -> SocketAddr {
     SocketAddr::from(([172, 18, 0, 1], 4040))
 }

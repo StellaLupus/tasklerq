@@ -1,7 +1,7 @@
 //! Точка входа Tasklerq.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -82,6 +82,16 @@ enum AdminCommand {
         #[command(subcommand)]
         command: TokenCommand,
     },
+    /// Очереди заданий.
+    Queue {
+        #[command(subcommand)]
+        command: QueueCommand,
+    },
+    /// Состояние webhook Telegram.
+    Webhook {
+        #[command(subcommand)]
+        command: WebhookCommand,
+    },
     /// Household.
     Household {
         #[command(subcommand)]
@@ -92,6 +102,30 @@ enum AdminCommand {
         #[command(subcommand)]
         command: UserCommand,
     },
+    /// Выгрузить данные household в JSON.
+    Export(ExportArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum QueueCommand {
+    /// Количество заданий по статусам и возраст самой старой готовой записи.
+    Stats,
+}
+
+#[derive(Debug, Subcommand)]
+enum WebhookCommand {
+    /// Показать состояние webhook без токена бота.
+    Info,
+}
+
+#[derive(Debug, Args)]
+struct ExportArgs {
+    /// Household; без значения используется единственный существующий.
+    #[arg(long)]
+    household: Option<Uuid>,
+    /// Файл выгрузки; без значения JSON печатается в stdout.
+    #[arg(long, value_name = "PATH")]
+    output: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -102,6 +136,9 @@ enum TokenCommand {
     Revoke {
         /// Идентификатор токена.
         id: Uuid,
+        /// Не спрашивать подтверждение.
+        #[arg(long)]
+        yes: bool,
     },
     /// Показать токены household без секретов.
     List {
@@ -119,8 +156,14 @@ struct TokenCreate {
     /// Название токена.
     #[arg(long)]
     name: String,
-    /// Scopes через запятую: ha:read, ha:write, capture:write.
-    #[arg(long, value_delimiter = ',', required = true)]
+    /// Scopes через запятую.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        required = true,
+        value_name = "SCOPE",
+        help = scopes_help()
+    )]
     scopes: Vec<String>,
     /// Срок действия в днях; без значения токен бессрочный.
     #[arg(long)]
@@ -138,6 +181,8 @@ enum HouseholdCommand {
         #[arg(long, default_value = "Europe/Moscow")]
         timezone: String,
     },
+    /// Показать household без секретов.
+    List,
 }
 
 #[derive(Debug, Subcommand)]
@@ -172,6 +217,15 @@ impl From<RoleArg> for UserRole {
             RoleArg::Member => Self::Member,
         }
     }
+}
+
+/// Справка `--scopes`, собранная из [`tasklerq::auth::tokens::SCOPES`], чтобы
+/// список не расходился с валидацией.
+fn scopes_help() -> String {
+    format!(
+        "Scopes через запятую: {}.",
+        tasklerq::auth::tokens::SCOPES.join(", ")
+    )
 }
 
 #[tokio::main]
@@ -296,6 +350,15 @@ async fn seed() -> Result<()> {
 async fn run_admin(command: AdminCommand) -> Result<()> {
     init_cli_tracing();
 
+    match command {
+        // Webhook не требует базы: команда работает даже при недоступном
+        // PostgreSQL и использует ту же конфигурацию Telegram, что сервис.
+        AdminCommand::Webhook { command } => webhook_info(command).await,
+        command => run_admin_database(command).await,
+    }
+}
+
+async fn run_admin_database(command: AdminCommand) -> Result<()> {
     let database = DatabaseConfig::from_env().context("invalid database configuration")?;
     let pool = storage::db::connect(&database)
         .await
@@ -325,7 +388,10 @@ async fn run_admin(command: AdminCommand) -> Result<()> {
                 println!("token: {}", issued.token);
                 eprintln!("Сохраните токен сейчас: повторно его показать нельзя.");
             }
-            TokenCommand::Revoke { id } => {
+            TokenCommand::Revoke { id, yes } => {
+                if !yes {
+                    require_confirmation(&format!("Отозвать токен {id}? [y/N] "))?;
+                }
                 let (token, revoked_now) =
                     admin::revoke_token(&pool, id, now).await.map_err(explain)?;
                 if revoked_now {
@@ -355,6 +421,39 @@ async fn run_admin(command: AdminCommand) -> Result<()> {
                 }
             }
         },
+        AdminCommand::Queue { command } => match command {
+            QueueCommand::Stats => {
+                let stats = admin::queue_stats(&pool, now).await.map_err(explain)?;
+                print_status_counts(
+                    "telegram_updates",
+                    &stats.telegram_updates,
+                    &["pending", "processed", "dead"],
+                );
+                print_status_counts(
+                    "outbox",
+                    &stats.outbox,
+                    &["pending", "sent", "dead", "skipped"],
+                );
+                print_status_counts(
+                    "capture_jobs",
+                    &stats.capture_jobs,
+                    &["pending", "running", "done", "dead"],
+                );
+                print_status_counts(
+                    "notification_deliveries",
+                    &stats.notification_deliveries,
+                    &["pending", "sent", "cancelled"],
+                );
+                match stats.oldest_ready {
+                    Some(oldest) => println!(
+                        "oldest_ready_age_seconds: {}",
+                        (stats.now - oldest).num_seconds().max(0)
+                    ),
+                    None => println!("oldest_ready_age_seconds: none"),
+                }
+            }
+        },
+        AdminCommand::Webhook { .. } => unreachable!("webhook handled before the database"),
         AdminCommand::Household { command } => match command {
             HouseholdCommand::Create { name, timezone } => {
                 let household = admin::create_household(&pool, &name, &timezone, now)
@@ -363,6 +462,18 @@ async fn run_admin(command: AdminCommand) -> Result<()> {
                 println!("id: {}", household.id);
                 println!("name: {}", household.name);
                 println!("timezone: {}", household.timezone);
+            }
+            HouseholdCommand::List => {
+                for household in admin::list_households(&pool).await.map_err(explain)? {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        household.id,
+                        household.name,
+                        household.timezone,
+                        household.members,
+                        household.created_at.to_rfc3339()
+                    );
+                }
             }
         },
         AdminCommand::User { command } => match command {
@@ -387,6 +498,146 @@ async fn run_admin(command: AdminCommand) -> Result<()> {
                 println!("telegram_id: {}", user.telegram_user_id);
             }
         },
+        AdminCommand::Export(args) => {
+            let export = admin::export(&pool, args.household, now)
+                .await
+                .map_err(explain)?;
+            let mut json =
+                serde_json::to_string_pretty(&export).context("failed to serialize the export")?;
+            json.push('\n');
+            match args.output {
+                Some(path) => write_export_file(&path, &json)?,
+                None => print!("{json}"),
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Спросить подтверждение в интерактивном терминале. Без TTY опасная команда
+/// выполняется только с `--yes`.
+fn require_confirmation(prompt: &str) -> Result<()> {
+    use std::io::{IsTerminal, Write};
+
+    if !std::io::stdin().is_terminal() {
+        bail!("нужно подтверждение (--yes); ничего не изменено");
+    }
+    eprint!("{prompt}");
+    std::io::stderr()
+        .flush()
+        .context("failed to write the confirmation prompt")?;
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("failed to read the confirmation")?;
+    if matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes" | "д" | "да"
+    ) {
+        Ok(())
+    } else {
+        bail!("отмена; ничего не изменено");
+    }
+}
+
+fn print_status_counts(name: &str, counts: &[(String, i64)], known: &[&str]) {
+    println!("{name}:");
+    for status in known {
+        let count = counts
+            .iter()
+            .find(|(value, _)| value == status)
+            .map_or(0, |(_, count)| *count);
+        println!("  {status}: {count}");
+    }
+    for (status, count) in counts {
+        if !known.contains(&status.as_str()) {
+            println!("  {status}: {count}");
+        }
+    }
+}
+
+async fn webhook_info(command: WebhookCommand) -> Result<()> {
+    match command {
+        WebhookCommand::Info => {}
+    }
+
+    let config = Config::from_env().context("invalid configuration")?;
+    let token = config
+        .telegram
+        .bot_token
+        .clone()
+        .context("TELEGRAM_BOT_TOKEN is not configured")?;
+    let base_url = config
+        .telegram
+        .api_base_url
+        .as_ref()
+        .map_or(tasklerq::telegram::api::DEFAULT_BASE_URL, |url| {
+            url.as_str()
+        });
+    let api = tasklerq::telegram::api::HttpTelegramApi::new(token, base_url)
+        .context("failed to build the Telegram client")?;
+    let info = tasklerq::telegram::api::TelegramApi::get_webhook_info(&api)
+        .await
+        .context("getWebhookInfo failed")?;
+
+    println!(
+        "url: {}",
+        redaction::sanitize(&redaction::redact_url(&info.url))
+    );
+    println!("pending_update_count: {}", info.pending_update_count);
+    match info.last_error_date {
+        Some(timestamp) => println!(
+            "last_error_date: {}",
+            chrono::DateTime::from_timestamp(timestamp, 0)
+                .map(|value| value.to_rfc3339())
+                .unwrap_or_else(|| timestamp.to_string())
+        ),
+        None => println!("last_error_date: none"),
+    }
+    println!(
+        "last_error_message: {}",
+        info.last_error_message
+            .as_deref()
+            .map_or_else(|| "none".to_owned(), redaction::sanitize)
+    );
+    match info.max_connections {
+        Some(max_connections) => println!("max_connections: {max_connections}"),
+        None => println!("max_connections: none"),
+    }
+    println!(
+        "ip_address: {}",
+        info.ip_address
+            .as_deref()
+            .map_or_else(|| "none".to_owned(), redaction::sanitize)
+    );
+
+    Ok(())
+}
+
+fn write_export_file(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    file.write_all(contents.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    drop(file);
+
+    // Режим при создании не меняет уже существующий файл: выставляем явно.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to set permissions on {}", path.display()))?;
     }
 
     Ok(())

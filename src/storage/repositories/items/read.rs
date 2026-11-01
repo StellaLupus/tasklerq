@@ -65,6 +65,30 @@ pub async fn calendar_items(
     hydrate_many(conn, rows).await
 }
 
+/// Все неудалённые элементы household вместе с неудалёнными списками.
+///
+/// Нужно административной выгрузке: архивные списки и выполненные задачи
+/// остаются, мягко удалённые — нет.
+pub async fn all_for_export(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+) -> Result<Vec<Item>, DomainError> {
+    let rows = sqlx::query_as::<_, ItemRow>(&format!(
+        "SELECT {ITEM_COLUMNS}
+         FROM items i
+         JOIN lists l ON l.id = i.list_id
+         WHERE i.household_id = $1
+           AND i.deleted_at IS NULL
+           AND l.deleted_at IS NULL
+         ORDER BY i.list_id, i.position, i.created_at, i.id"
+    ))
+    .bind(household_id)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    hydrate_many(conn, rows).await
+}
+
 /// Элементы для инкрементального снапшота и идентификаторы удалённых.
 pub async fn snapshot(
     conn: &mut PgConnection,

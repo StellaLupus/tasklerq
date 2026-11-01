@@ -79,9 +79,18 @@ pub struct WebhookInfo {
     /// Число необработанных обновлений на стороне Telegram.
     #[serde(default)]
     pub pending_update_count: u32,
+    /// Время последней ошибки доставки (Unix seconds).
+    #[serde(default)]
+    pub last_error_date: Option<i64>,
     /// Последняя ошибка доставки.
     #[serde(default)]
     pub last_error_message: Option<String>,
+    /// Максимум одновременных соединений Telegram с webhook.
+    #[serde(default)]
+    pub max_connections: Option<u32>,
+    /// IP-адрес, с которого Telegram доставлял обновления.
+    #[serde(default)]
+    pub ip_address: Option<String>,
 }
 
 /// Операции Bot API, которые нужны сервису.

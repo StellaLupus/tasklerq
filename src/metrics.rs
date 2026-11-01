@@ -68,10 +68,6 @@ fn add_counter(name: &'static str, labels: &[(&'static str, &str)]) {
     *lock().counters.entry(key(name, labels)).or_default() += 1;
 }
 
-fn set_gauge(name: &'static str, labels: &[(&'static str, &str)], value: f64) {
-    lock().gauges.insert(key(name, labels), value);
-}
-
 fn observe(name: &'static str, labels: &[(&'static str, &str)], value: f64) {
     let mut registry = lock();
     let histogram = registry.histograms.entry(key(name, labels)).or_default();
@@ -88,21 +84,6 @@ fn observe(name: &'static str, labels: &[(&'static str, &str)], value: f64) {
 /// Исход обработки обновления Telegram.
 pub fn telegram_update(status: &'static str) {
     add_counter("telegram_updates_total", &[("status", status)]);
-}
-
-/// Возраст самого старого готового pending-обновления, секунды.
-pub fn set_telegram_queue_lag(seconds: f64) {
-    set_gauge("telegram_queue_lag_seconds", &[], seconds.max(0.0));
-}
-
-/// Сколько сообщений outbox ждёт доставки.
-pub fn set_outbox_pending(count: i64) {
-    set_gauge("outbox_pending", &[], count.max(0) as f64);
-}
-
-/// Занятые соединения пула.
-pub fn set_db_pool_in_use(count: u32) {
-    set_gauge("db_pool_in_use", &[], f64::from(count));
 }
 
 /// Сообщение outbox переведено в dead-letter.
@@ -187,13 +168,6 @@ fn apply_database_gauges(registry: &mut Registry, gauges: DatabaseGauges) {
     registry
         .gauges
         .insert(key("db_pool_in_use", &[]), f64::from(gauges.pool_in_use));
-}
-
-/// Обновить gauges, которые считаются запросом к базе при скрейпе.
-pub async fn update_database_gauges(pool: &PgPool) -> Result<(), sqlx::Error> {
-    let gauges = database_gauges(pool).await?;
-    apply_database_gauges(&mut lock(), gauges);
-    Ok(())
 }
 
 /// Текст в формате Prometheus exposition 0.0.4.

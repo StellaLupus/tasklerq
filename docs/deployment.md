@@ -273,6 +273,7 @@ curl -sS -X POST \
 | `TELEGRAM_WEBHOOK_SECRET` | при `webhook` | `hex` | Секрет webhook. |
 | `TELEGRAM_WEBHOOK_URL` | при `webhook` | `https://tasklerq.stellalupus.ru/webhooks/telegram` | Регистрация webhook. |
 | `TELEGRAM_BOT_USERNAME` | нет | `tasklerqbot` | Имя бота без `@` для ссылок-приглашений. |
+| `TELEGRAM_API_BASE_URL` | нет | `https://api.telegram.org` | Базовый адрес Bot API; подменяется на mock-сервер в тестах. |
 | `TELEGRAM_MODE` | нет | `webhook` | `webhook`/`polling` (dev)/`disabled` (headless). |
 | `CAPTURE_API_ENABLED` | нет | `true` | Включить `POST /api/v1/capture`. |
 | `CAPTURE_VOICE_TIMEOUT_MS` | нет | `8000` | Таймаут LLM для `source=ha_voice`. |
@@ -534,6 +535,38 @@ curl -fsS -X POST http://127.0.0.1:18080/api/v1/capture \
     произнесите «купи молоко и хлеб». Убедитесь, что позиции появились в
     `todo.pokupki`, а Assist озвучил ответ.
 
+### 9.1. Административный CLI
+
+Команды `tasklerq admin` читают то же окружение, что сервис, и выводят ошибки
+без секретов. `--household` можно опустить, если household единственный.
+
+| Команда | Назначение |
+| --- | --- |
+| `tasklerq admin token create --name "Home Assistant" --scopes ha:read,ha:write` | Выпустить токен. Значение показывается один раз, в базе хранится только хеш. `--scopes`: `ha:read`, `ha:write`, `capture:write`, `metrics:read`. `--expires-in-days N` задаёт срок. |
+| `tasklerq admin token list [--household <id>]` | id, префикс, состояние, scopes и название без секретов. |
+| `tasklerq admin token revoke <id> [--yes]` | Отозвать токен. Опасная команда: без `--yes` спрашивает `y/N` в терминале; без TTY завершается ошибкой и токен не меняет. |
+| `tasklerq admin household create --name "Семья" --timezone Europe/Moscow` | Создать household и списки «Задачи»/«Покупки». |
+| `tasklerq admin household list` | id, название, часовой пояс, число участников и дата создания. |
+| `tasklerq admin user add --telegram-id <id> --role owner\|member [--name "Имя"] [--household <id>]` | Добавить участника, записать `member_joined`, отклонить занятый Telegram ID и второго `owner`. |
+| `tasklerq admin queue stats` | Количество заданий `telegram_updates`, `outbox`, `capture_jobs` и `notification_deliveries` по статусам, возраст самого старого готового обновления. Содержимое сообщений не печатается. |
+| `tasklerq admin webhook info` | `getWebhookInfo`: URL без учётных данных, `pending_update_count`, последняя ошибка, `max_connections`, `ip_address`. Токен бота не выводится. |
+| `tasklerq admin export [--household <id>] [--output <path>]` | JSON с household, участниками, списками и задачами (теги, повторения, напоминания, назначения, выполненные и архивные). Мягко удалённые не включаются. Без `--output` — stdout, с `--output` — файл с правами `0600`. |
+
+```bash
+# Очереди и webhook
+sudo /usr/local/bin/docker compose exec tasklerq tasklerq admin queue stats
+sudo /usr/local/bin/docker compose exec tasklerq tasklerq admin webhook info
+
+# Выгрузка перед удалением household
+sudo /usr/local/bin/docker compose exec tasklerq \
+  tasklerq admin export --household <id> --output /tmp/household.json
+```
+
+`export` не содержит хешей токенов, callback-токенов, outbox, очередей и
+`llm_runs`. В схеме нет отдельной таблицы настроек household, поэтому
+`household.settings` — пустой объект, а настройки уведомлений находятся в
+`members[].settings`.
+
 ## 10. Сеть с Home Assistant
 
 HA работает в `network_mode: host`, Tasklerq — в bridge-сети:
@@ -590,7 +623,8 @@ mkdir -p /volume2/backups/tasklerq
 атомарно переименовывает его в `tasklerq-YYYY-MM-DDTHHMMSS.dump`. Если
 `pg_dump` упал, итоговый файл не появляется, а временный удаляется. После
 успешного дампа скрипт удаляет `tasklerq-*.dump` старше
-`TASKLERQ_BACKUP_KEEP_DAYS`.
+`TASKLERQ_BACKUP_KEEP_DAYS`. На `INT`, `TERM` и `HUP` скрипт завершается с
+кодом 130, не переименовывая частичный дамп; `EXIT` удаляет временный файл.
 
 Cron:
 
@@ -616,7 +650,9 @@ sudo /usr/local/bin/tasklerq-restore.sh \
 
 Скрипт создаёт базу и выполняет
 `pg_restore --no-owner --exit-on-error`. При ошибке он завершается с
-ненулевым кодом и строкой в stderr.
+ненулевым кодом и строкой в stderr. База при этом уже создана и остаётся;
+сообщение содержит команду удаления, например
+`docker exec postgres dropdb --username=postgres tasklerq_restore`.
 
 Затем:
 

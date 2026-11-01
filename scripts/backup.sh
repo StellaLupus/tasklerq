@@ -30,14 +30,14 @@ partial="$(mktemp "$BACKUP_DIR/.tasklerq-$timestamp.XXXXXX")" ||
 cleanup() {
     rm -f -- "$partial"
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
 
 "$DOCKER" exec "$PG_CONTAINER" \
     pg_dump --username="$PG_USER" --format=custom "$DB" >"$partial" ||
     fail "pg_dump failed for database '$DB' in container '$PG_CONTAINER'"
 
 mv -f -- "$partial" "$target" || fail "cannot move the dump into place"
-trap - EXIT HUP INT TERM
 
 find "$BACKUP_DIR" -maxdepth 1 -type f -name 'tasklerq-*.dump' \
     -mtime "+$KEEP_DAYS" -delete ||

@@ -5,7 +5,9 @@ mod support;
 use anyhow::Context;
 use axum::http::{Method, StatusCode};
 use sqlx::migrate::Migrator;
+use sqlx::postgres::PgPoolOptions;
 use tasklerq::storage::migrations::{self, MIGRATOR};
+use tokio::process::Command;
 use uuid::Uuid;
 
 /// `sqlx::migrate!` не должен отключать advisory lock.
@@ -143,4 +145,59 @@ async fn a_failed_migration_reports_its_version_rolls_back_and_blocks_readiness(
     );
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+fn bin() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_tasklerq"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_migrate_applies_to_a_fresh_database_and_a_repeat_is_a_noop() {
+    let name = format!("migrate_cli_{}", Uuid::now_v7().simple());
+    support::create_database(&name).await;
+    let url = support::database_url_for(&name).await;
+
+    for attempt in 1..=2 {
+        let output = bin()
+            .env("DATABASE_URL", &url)
+            .env("RUST_LOG", "error")
+            .arg("migrate")
+            .output()
+            .await
+            .expect("the migrate CLI should run");
+        assert!(
+            output.status.success(),
+            "migrate run {attempt} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .expect("the migrated database should accept connections");
+    let rows: Vec<(i64, i64, bool)> = sqlx::query_as(
+        "SELECT version, count(*), bool_and(success)
+         FROM _sqlx_migrations
+         GROUP BY version
+         ORDER BY version",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("migration rows");
+
+    let expected: Vec<i64> = MIGRATOR.iter().map(|migration| migration.version).collect();
+    let applied: Vec<i64> = rows.iter().map(|(version, _, _)| *version).collect();
+    assert_eq!(applied, expected, "every embedded migration is recorded");
+    assert!(
+        rows.iter()
+            .all(|(_, count, success)| *count == 1 && *success),
+        "a repeated CLI run must not apply a migration twice: {rows:?}"
+    );
+    assert!(
+        migrations::all_applied(&pool).await.expect("applied check"),
+        "the fresh database is fully migrated"
+    );
+    pool.close().await;
 }
