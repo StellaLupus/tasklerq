@@ -57,8 +57,21 @@ enum SuppressKind {
     LlmValidationFailed,
 }
 
+/// Источник события для потолка записей.
+///
+/// Отказы webhook и API — один тип [`SuppressKind::AuthFailed`], но общий
+/// потолок позволял флуду webhook вытеснять события API. Поэтому потолок
+/// записей считается отдельно для этих источников.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RecordScope {
+    All,
+    Webhook,
+    Api,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Suppressed {
+    scope: RecordScope,
     last: DateTime<Utc>,
     suppressed: u64,
 }
@@ -67,11 +80,12 @@ struct Suppressed {
 #[derive(Debug, Default)]
 struct Suppression {
     entries: HashMap<(SuppressKind, String), Suppressed>,
-    /// Моменты записанных событий каждого типа для общего лимита в минуту.
-    records: HashMap<SuppressKind, VecDeque<DateTime<Utc>>>,
+    /// Моменты записанных событий каждого типа и источника для лимита в минуту.
+    records: HashMap<(SuppressKind, RecordScope), VecDeque<DateTime<Utc>>>,
     /// События, не записанные из-за потолка карты или лимита типа. Они
-    /// добавляются к `suppressed` следующего записанного события того же типа.
-    over_limit: HashMap<SuppressKind, u64>,
+    /// добавляются к `suppressed` следующего записанного события того же типа
+    /// и источника.
+    over_limit: HashMap<(SuppressKind, RecordScope), u64>,
     last_cleanup: Option<DateTime<Utc>>,
     /// Когда последний раз выселяли ключи с истёкшим окном. Проход по полной
     /// карте не должен повторяться на каждое событие с новым ключом.
@@ -86,9 +100,16 @@ impl Suppression {
     /// [`MAX_RECORDS_PER_WINDOW`] записей одного типа за окно и сверх
     /// [`MAX_SUPPRESSION_ENTRIES`] ключей события только считаются: их число
     /// попадёт в `suppressed` следующей разрешённой записи.
-    fn allow(&mut self, kind: SuppressKind, key: &str, now: DateTime<Utc>) -> Option<u64> {
+    fn allow(
+        &mut self,
+        kind: SuppressKind,
+        scope: RecordScope,
+        key: &str,
+        now: DateTime<Utc>,
+    ) -> Option<u64> {
         self.cleanup(now);
-        self.prune_records(kind, now);
+        let limit_key = (kind, scope);
+        self.prune_records(limit_key, now);
 
         let entry_key = (kind, key.to_owned());
         let window = Duration::seconds(SUPPRESSION_WINDOW_SECONDS);
@@ -111,19 +132,21 @@ impl Suppression {
             // ключей добавляем к агрегатному счётчику своего типа.
             self.evict_expired(now, window);
         }
-        if (!known && self.entries.len() >= MAX_SUPPRESSION_ENTRIES) || !self.record_available(kind)
+        if (!known && self.entries.len() >= MAX_SUPPRESSION_ENTRIES)
+            || !self.record_available(limit_key)
         {
-            *self.over_limit.entry(kind).or_default() += 1;
+            *self.over_limit.entry(limit_key).or_default() += 1;
             return None;
         }
 
-        let over_limit = self.over_limit.remove(&kind).unwrap_or(0);
+        let over_limit = self.over_limit.remove(&limit_key).unwrap_or(0);
         // Запись ключа, у которого истекло окно, тоже расходует лимит типа:
         // иначе истёкшие ключи писались бы сверх потолка в новом окне.
-        self.records.entry(kind).or_default().push_back(now);
+        self.records.entry(limit_key).or_default().push_back(now);
         if let Some(entry) = self.entries.get_mut(&entry_key) {
             let suppressed = entry.suppressed + over_limit;
             entry.last = now;
+            entry.scope = scope;
             entry.suppressed = 0;
             return Some(suppressed);
         }
@@ -131,6 +154,7 @@ impl Suppression {
         self.entries.insert(
             entry_key,
             Suppressed {
+                scope,
                 last: now,
                 suppressed: 0,
             },
@@ -149,32 +173,32 @@ impl Suppression {
         }
         self.last_eviction = Some(now);
 
-        let mut evicted: HashMap<SuppressKind, u64> = HashMap::new();
+        let mut evicted: HashMap<(SuppressKind, RecordScope), u64> = HashMap::new();
         self.entries.retain(|(kind, _), entry| {
             if now - entry.last < window {
                 return true;
             }
             if entry.suppressed > 0 {
-                *evicted.entry(*kind).or_default() += entry.suppressed;
+                *evicted.entry((*kind, entry.scope)).or_default() += entry.suppressed;
             }
             false
         });
-        for (kind, suppressed) in evicted {
-            *self.over_limit.entry(kind).or_default() += suppressed;
+        for (limit_key, suppressed) in evicted {
+            *self.over_limit.entry(limit_key).or_default() += suppressed;
         }
     }
 
-    /// Есть ли место для ещё одной записи этого типа в текущем окне.
-    fn record_available(&self, kind: SuppressKind) -> bool {
+    /// Есть ли место для ещё одной записи этого типа и источника в текущем окне.
+    fn record_available(&self, limit_key: (SuppressKind, RecordScope)) -> bool {
         self.records
-            .get(&kind)
+            .get(&limit_key)
             .is_none_or(|hits| hits.len() < MAX_RECORDS_PER_WINDOW)
     }
 
-    /// Удалить отметки типа старше окна.
-    fn prune_records(&mut self, kind: SuppressKind, now: DateTime<Utc>) {
+    /// Удалить отметки типа и источника старше окна.
+    fn prune_records(&mut self, limit_key: (SuppressKind, RecordScope), now: DateTime<Utc>) {
         let cutoff = now - Duration::seconds(SUPPRESSION_WINDOW_SECONDS);
-        if let Some(hits) = self.records.get_mut(&kind) {
+        if let Some(hits) = self.records.get_mut(&limit_key) {
             while hits.front().is_some_and(|at| *at <= cutoff) {
                 hits.pop_front();
             }
@@ -352,12 +376,18 @@ impl Audit {
         }
     }
 
-    fn check(&self, kind: SuppressKind, key: &str, now: DateTime<Utc>) -> Option<u64> {
+    fn check(
+        &self,
+        kind: SuppressKind,
+        scope: RecordScope,
+        key: &str,
+        now: DateTime<Utc>,
+    ) -> Option<u64> {
         self.inner
             .suppression
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .allow(kind, key, now)
+            .allow(kind, scope, key, now)
     }
 
     /// Записать событие отдельным соединением. Ошибка только журналируется.
@@ -401,7 +431,12 @@ impl Audit {
     pub async fn webhook_auth_failed(&self, reason: &'static str, ip: IpAddr, now: DateTime<Utc>) {
         metrics::webhook_auth_failure();
 
-        if let Some(suppressed) = self.check(SuppressKind::AuthFailed, &format!("ip:{ip}"), now) {
+        if let Some(suppressed) = self.check(
+            SuppressKind::AuthFailed,
+            RecordScope::Webhook,
+            &format!("ip:{ip}"),
+            now,
+        ) {
             self.record(
                 None,
                 &Actor::system(ActorType::System),
@@ -455,7 +490,8 @@ impl Audit {
             || format!("api:{reason}"),
             |(token_id, _)| format!("api:token:{token_id}:{reason}"),
         );
-        let Some(suppressed) = self.check(SuppressKind::AuthFailed, &key, now) else {
+        let Some(suppressed) = self.check(SuppressKind::AuthFailed, RecordScope::Api, &key, now)
+        else {
             return;
         };
 
@@ -491,7 +527,8 @@ impl Audit {
     /// Сработавший лимит частоты.
     pub async fn rate_limited(&self, event: RateLimitEvent, now: DateTime<Utc>) {
         let key = format!("{}:{}", event.limit, event.key.serialized());
-        let Some(suppressed) = self.check(SuppressKind::RateLimited, &key, now) else {
+        let Some(suppressed) = self.check(SuppressKind::RateLimited, RecordScope::All, &key, now)
+        else {
             return;
         };
 
@@ -515,7 +552,12 @@ impl Audit {
     /// Ответ LLM не прошёл валидацию. Ни текста пользователя, ни ответа LLM.
     pub async fn llm_validation_failed(&self, event: LlmValidation, now: DateTime<Utc>) {
         let key = format!("household:{}", event.household_id);
-        let Some(suppressed) = self.check(SuppressKind::LlmValidationFailed, &key, now) else {
+        let Some(suppressed) = self.check(
+            SuppressKind::LlmValidationFailed,
+            RecordScope::All,
+            &key,
+            now,
+        ) else {
             return;
         };
 
@@ -563,7 +605,7 @@ mod tests {
         let key = "ip:203.0.113.7";
 
         assert_eq!(
-            suppression.allow(SuppressKind::AuthFailed, key, start),
+            suppression.allow(SuppressKind::AuthFailed, RecordScope::All, key, start),
             Some(0),
             "the first event in a window is written"
         );
@@ -571,6 +613,7 @@ mod tests {
             assert_eq!(
                 suppression.allow(
                     SuppressKind::AuthFailed,
+                    RecordScope::All,
                     key,
                     start + Duration::seconds(offset)
                 ),
@@ -581,6 +624,7 @@ mod tests {
         assert_eq!(
             suppression.allow(
                 SuppressKind::AuthFailed,
+                RecordScope::All,
                 key,
                 start + Duration::seconds(SUPPRESSION_WINDOW_SECONDS + 1)
             ),
@@ -590,6 +634,7 @@ mod tests {
         assert_eq!(
             suppression.allow(
                 SuppressKind::AuthFailed,
+                RecordScope::All,
                 key,
                 start + Duration::seconds(SUPPRESSION_WINDOW_SECONDS + 2)
             ),
@@ -603,15 +648,30 @@ mod tests {
         let now = at(20_000);
 
         assert_eq!(
-            suppression.allow(SuppressKind::AuthFailed, "ip:1.1.1.1", now),
+            suppression.allow(
+                SuppressKind::AuthFailed,
+                RecordScope::All,
+                "ip:1.1.1.1",
+                now
+            ),
             Some(0)
         );
         assert_eq!(
-            suppression.allow(SuppressKind::AuthFailed, "ip:2.2.2.2", now),
+            suppression.allow(
+                SuppressKind::AuthFailed,
+                RecordScope::All,
+                "ip:2.2.2.2",
+                now
+            ),
             Some(0)
         );
         assert_eq!(
-            suppression.allow(SuppressKind::RateLimited, "ip:1.1.1.1", now),
+            suppression.allow(
+                SuppressKind::RateLimited,
+                RecordScope::All,
+                "ip:1.1.1.1",
+                now
+            ),
             Some(0)
         );
     }
@@ -622,12 +682,18 @@ mod tests {
         let start = at(30_000);
 
         assert_eq!(
-            suppression.allow(SuppressKind::AuthFailed, "ip:1.1.1.1", start),
+            suppression.allow(
+                SuppressKind::AuthFailed,
+                RecordScope::All,
+                "ip:1.1.1.1",
+                start
+            ),
             Some(0)
         );
         assert_eq!(
             suppression.allow(
                 SuppressKind::AuthFailed,
+                RecordScope::All,
                 "ip:2.2.2.2",
                 start + Duration::seconds(SUPPRESSION_KEY_TTL_SECONDS + 1)
             ),
@@ -649,14 +715,14 @@ mod tests {
             .collect();
 
         for key in &keys {
-            suppression.allow(SuppressKind::AuthFailed, key, start);
+            suppression.allow(SuppressKind::AuthFailed, RecordScope::All, key, start);
         }
 
         let later = start + Duration::seconds(SUPPRESSION_WINDOW_SECONDS + 1);
         let mut written = 0;
         for key in &keys {
             if suppression
-                .allow(SuppressKind::AuthFailed, key, later)
+                .allow(SuppressKind::AuthFailed, RecordScope::All, key, later)
                 .is_some()
             {
                 written += 1;
@@ -678,6 +744,7 @@ mod tests {
             suppression.entries.insert(
                 (SuppressKind::AuthFailed, format!("ip:10.1.{index}")),
                 Suppressed {
+                    scope: RecordScope::All,
                     last: expired,
                     suppressed: if index == 0 { 5 } else { 0 },
                 },
@@ -686,7 +753,12 @@ mod tests {
         assert_eq!(suppression.entries.len(), MAX_SUPPRESSION_ENTRIES);
 
         assert_eq!(
-            suppression.allow(SuppressKind::AuthFailed, "ip:203.0.113.9", start),
+            suppression.allow(
+                SuppressKind::AuthFailed,
+                RecordScope::All,
+                "ip:203.0.113.9",
+                start
+            ),
             Some(5),
             "a live event must be written after dead keys are evicted, \
              and their suppressed repeats count towards it"

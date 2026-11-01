@@ -16,6 +16,7 @@ use crate::domain::identity::{
     AuditEventType, Invite, Joined, MembershipNotice, NewMember, NoticeKind,
 };
 use crate::domain::models::{Actor, UserRole};
+use crate::rate_limit::retry_after_seconds;
 
 use super::{audit, households, users};
 
@@ -25,6 +26,8 @@ pub const TTL_HOURS: i64 = 72;
 pub const MAX_ACTIVE: i64 = 5;
 /// Максимум созданных приглашений в час на household.
 pub const MAX_PER_HOUR: i64 = 5;
+/// Код причины отказа в деталях конфликта.
+pub const RATE_LIMIT_REASON: &str = "invite_rate_limit";
 /// Окно часового лимита приглашений, часы.
 const RATE_WINDOW_HOURS: i64 = 1;
 /// Допустимая длина кода.
@@ -74,16 +77,10 @@ pub async fn create(
     .fetch_one(&mut *conn)
     .await?;
     if recent >= MAX_PER_HOUR {
-        let retry_after = oldest
-            .map(|at| {
-                let wait = at + Duration::hours(RATE_WINDOW_HOURS) - now;
-                let mut seconds = wait.num_seconds();
-                if wait.subsec_nanos() > 0 {
-                    seconds += 1;
-                }
-                seconds.max(1)
-            })
-            .unwrap_or_else(|| RATE_WINDOW_HOURS * 3_600);
+        let retry_after = oldest.map_or_else(
+            || retry_after_seconds(Duration::hours(RATE_WINDOW_HOURS)),
+            |at| retry_after_seconds(at + Duration::hours(RATE_WINDOW_HOURS) - now),
+        );
         tracing::warn!(
             household_id = %household_id,
             limit = MAX_PER_HOUR,
@@ -93,7 +90,7 @@ pub async fn create(
         return Err(DomainError::conflict_with(
             format!("at most {MAX_PER_HOUR} invites per hour are allowed"),
             json!({
-                "reason": "invite_rate_limit",
+                "reason": RATE_LIMIT_REASON,
                 "limit": MAX_PER_HOUR,
                 "retry_after": retry_after,
             }),

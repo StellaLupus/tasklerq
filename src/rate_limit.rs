@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Mutex;
 
 use chrono::{DateTime, Duration, Utc};
@@ -31,7 +32,15 @@ pub struct RateDecision {
 pub struct RateLimiter<K = Uuid> {
     limit: u32,
     window: Duration,
-    hits: Mutex<HashMap<K, VecDeque<DateTime<Utc>>>>,
+    state: Mutex<State<K>>,
+}
+
+#[derive(Debug)]
+struct State<K> {
+    hits: HashMap<K, VecDeque<DateTime<Utc>>>,
+    /// Когда последний раз чистили всю карту. Полный проход по карте не
+    /// должен повторяться на каждый запрос с новым ключом.
+    last_cleanup: Option<DateTime<Utc>>,
 }
 
 impl<K> RateLimiter<K> {
@@ -45,7 +54,10 @@ impl<K> RateLimiter<K> {
         Self {
             limit: limit.max(1),
             window: Duration::seconds(window_seconds.max(1)),
-            hits: Mutex::new(HashMap::new()),
+            state: Mutex::new(State {
+                hits: HashMap::new(),
+                last_cleanup: None,
+            }),
         }
     }
 
@@ -64,48 +76,97 @@ impl<K: Eq + Hash + Clone> RateLimiter<K> {
     /// Хранится ли ключ `key` в карте; только для тестов.
     #[cfg(test)]
     fn tracks(&self, key: &K) -> bool {
-        self.hits
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .hits
             .contains_key(key)
+    }
+
+    /// Сколько ключей сейчас в карте; только для тестов.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .hits
+            .len()
     }
 
     /// Учесть операцию ключа `key` в момент `now`.
     ///
-    /// Перед учётом из карты удаляются ключи без отметок внутри окна: токены
-    /// отзываются, пользователи и адреса меняются, и их записи иначе остались
-    /// бы навсегда.
+    /// Устаревшие ключи удаляются из карты не чаще раза в окно: полный проход
+    /// по карте на каждый запрос с новым ключом был бы квадратичным. Отметки
+    /// текущего ключа при этом обрезаются по окну всегда.
     pub fn check(&self, key: K, now: DateTime<Utc>) -> RateDecision {
         let cutoff = now - self.window;
-        let mut hits = self
-            .hits
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        hits.retain(|_, queue| {
-            while queue.front().is_some_and(|at| *at <= cutoff) {
-                queue.pop_front();
-            }
-            !queue.is_empty()
-        });
-        let queue = hits.entry(key).or_default();
+
+        if state
+            .last_cleanup
+            .is_none_or(|last| now - last >= self.window)
+        {
+            state.hits.retain(|_, queue| {
+                while queue.front().is_some_and(|at| *at <= cutoff) {
+                    queue.pop_front();
+                }
+                !queue.is_empty()
+            });
+            state.last_cleanup = Some(now);
+        }
+
+        let queue = state.hits.entry(key).or_default();
+        while queue.front().is_some_and(|at| *at <= cutoff) {
+            queue.pop_front();
+        }
         if queue.len() >= self.limit as usize {
             let wait = queue
                 .front()
                 .map(|at| *at + self.window - now)
                 .unwrap_or(self.window);
-            let mut seconds = wait.num_seconds();
-            if wait.subsec_nanos() > 0 {
-                seconds += 1;
-            }
             return RateDecision {
                 allowed: false,
-                retry_after: Some(u64::try_from(seconds.max(1)).unwrap_or(1)),
+                retry_after: Some(retry_after_seconds(wait)),
             };
         }
         queue.push_back(now);
         RateDecision {
             allowed: true,
             retry_after: None,
+        }
+    }
+}
+
+/// Округлить оставшееся время ожидания вверх до целых секунд.
+///
+/// Одна функция на все лимиты: `Retry-After`, ответ бота и поле
+/// `retry_after` в аудите должны считать одинаково.
+pub fn retry_after_seconds(wait: Duration) -> u64 {
+    let mut seconds = wait.num_seconds();
+    if wait.subsec_nanos() > 0 {
+        seconds += 1;
+    }
+    u64::try_from(seconds.max(1)).unwrap_or(1)
+}
+
+/// Ключ лимита webhook для адреса клиента.
+///
+/// IPv4 считается целиком, IPv6 — префиксом /64: у одного клиента почти
+/// всегда целая /64, и смена младших 64 бит не должна обходить лимит.
+pub fn ip_key(ip: IpAddr) -> IpAddr {
+    // IPv4-mapped адрес (`::ffff:203.0.113.7`) — это IPv4-клиент на
+    // dual-stack-сокете: без приведения обнуление младших бит свело бы всех
+    // таких клиентов в общий префикс `::`.
+    let ip = ip.to_canonical();
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(ip) => {
+            let mut octets = ip.octets();
+            octets[8..].fill(0);
+            IpAddr::V6(Ipv6Addr::from(octets))
         }
     }
 }
@@ -160,6 +221,71 @@ mod tests {
             "a stale key must not stay in the map"
         );
         assert!(limiter.tracks(&fresh));
+    }
+
+    #[test]
+    fn stale_keys_are_cleaned_up_once_per_window_not_on_every_call() {
+        let limiter = RateLimiter::new(10);
+        for _ in 0..50 {
+            assert!(limiter.check(Uuid::now_v7(), at(1_000)).allowed);
+        }
+        assert_eq!(limiter.len(), 50);
+
+        // Внутри окна новый ключ не запускает полный проход по карте.
+        assert!(limiter.check(Uuid::now_v7(), at(1_001)).allowed);
+        assert_eq!(
+            limiter.len(),
+            51,
+            "cleanup must not run on every call inside the window"
+        );
+
+        // После окна устаревшие ключи удаляются, остаётся только текущий.
+        assert!(limiter.check(Uuid::now_v7(), at(1_061)).allowed);
+        assert_eq!(
+            limiter.len(),
+            1,
+            "keys outside the window must be removed after the window"
+        );
+    }
+
+    #[test]
+    fn the_current_key_is_pruned_even_between_global_cleanups() {
+        let limiter = RateLimiter::with_window(2, 10);
+        let first = Uuid::now_v7();
+        let other = Uuid::now_v7();
+
+        // Первая чистка задаёт начало окна.
+        assert!(limiter.check(other, at(95)).allowed);
+        assert!(limiter.check(first, at(100)).allowed);
+        assert!(limiter.check(first, at(101)).allowed);
+        // Чистка через окно оставляет `first`: его отметки ещё внутри окна.
+        assert!(limiter.check(other, at(105)).allowed);
+        // Глобальная чистка ещё не наступила, но отметки `first` уже устарели.
+        assert!(
+            limiter.check(first, at(111)).allowed,
+            "the current key must be pruned on every call"
+        );
+    }
+
+    #[test]
+    fn ipv4_is_used_whole_and_ipv6_by_the_64_bit_prefix() {
+        let ipv4: IpAddr = "203.0.113.7".parse().expect("ipv4");
+        assert_eq!(ip_key(ipv4), ipv4);
+
+        let same_prefix: IpAddr = "2001:db8:1:2::1".parse().expect("ipv6");
+        let other_host: IpAddr = "2001:db8:1:2:ffff:ffff:ffff:ffff".parse().expect("ipv6");
+        assert_eq!(ip_key(same_prefix), ip_key(other_host));
+        assert_eq!(
+            ip_key(same_prefix),
+            "2001:db8:1:2::".parse::<IpAddr>().expect("network")
+        );
+
+        let other_prefix: IpAddr = "2001:db8:1:3::1".parse().expect("ipv6");
+        assert_ne!(ip_key(same_prefix), ip_key(other_prefix));
+
+        // IPv4-mapped адрес — это IPv4-клиент, а не общий префикс `::`.
+        let mapped: IpAddr = "::ffff:203.0.113.7".parse().expect("mapped");
+        assert_eq!(ip_key(mapped), ipv4);
     }
 
     #[test]

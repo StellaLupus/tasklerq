@@ -23,10 +23,15 @@ use tasklerq::security_audit::{Audit, MAX_RECORDS_PER_WINDOW, SUPPRESSION_WINDOW
 use tasklerq::telegram::webhook::{Ingress, SECRET_HEADER};
 use tokio::sync::Notify;
 use tower::ServiceExt;
+use uuid::Uuid;
 
 use support::isolated_db;
 
 const SECRET: &str = "configured-webhook-SECRET-value";
+
+/// Метрики — глобальные счётчики процесса, поэтому тесты этого файла нельзя
+/// запускать параллельно: один исказит дельту другого.
+static AUDIT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn peer() -> SocketAddr {
     SocketAddr::from(([172, 18, 0, 1], 4040))
@@ -78,6 +83,7 @@ fn counter(text: &str, name: &str) -> u64 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_burst_of_distinct_ips_is_capped_and_counted_by_the_metric() {
+    let _guard = AUDIT_TEST_LOCK.lock().await;
     let db = isolated_db().await;
     let audit = Audit::new(db.pool.clone());
     let app = app_with_webhook(&db.pool, audit.clone());
@@ -140,5 +146,46 @@ async fn a_burst_of_distinct_ips_is_capped_and_counted_by_the_metric() {
     assert!(
         last["suppressed"].as_u64().unwrap_or(0) >= 950,
         "over-limit events must be reported as suppressed: {last}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_webhook_flood_does_not_hide_api_auth_failures() {
+    let _guard = AUDIT_TEST_LOCK.lock().await;
+    let db = isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let audit = Audit::new(db.pool.clone());
+    let app = app_with_webhook(&db.pool, audit.clone());
+
+    // Потолок выбран так, чтобы флуд webhook исчерпал свой бюджет записей,
+    // но не бюджет API в том же окне подавления.
+    for index in 0..60 {
+        let ip = format!("198.51.100.{}", index % 256);
+        let status = post_webhook_from(&app, "wrong-Bearer-SECRET-value", &ip, b"{}").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    audit
+        .api_auth_failed(
+            "revoked_token",
+            "/api/v1/lists",
+            Some((Uuid::now_v7(), household.household_id)),
+            Utc::now(),
+        )
+        .await;
+
+    let events = payloads(&db.pool, "auth_failed").await;
+    let api_event = events
+        .iter()
+        .find(|payload| payload["source"] == "api")
+        .expect("an API auth failure must be recorded despite the webhook flood");
+    assert_eq!(api_event["reason"], "revoked_token");
+    let webhook_events = events
+        .iter()
+        .filter(|payload| payload["source"] == "webhook")
+        .count();
+    assert_eq!(
+        webhook_events, MAX_RECORDS_PER_WINDOW,
+        "the webhook flood must exhaust its own cap without touching the API budget"
     );
 }

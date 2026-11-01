@@ -132,7 +132,8 @@ tasklerq admin token create \
 новый токен. Старый можно отозвать:
 
 ```bash
-tasklerq admin token revoke --name "Home Assistant"
+tasklerq admin token list
+tasklerq admin token revoke <id> --yes
 ```
 
 ### Options

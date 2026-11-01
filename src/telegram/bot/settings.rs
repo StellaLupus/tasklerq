@@ -609,7 +609,7 @@ pub async fn invite_create(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
     let created = match invites::create(&mut *ctx.conn, household_id, &actor, ctx.now).await {
         Ok(created) => created,
         Err(DomainError::Conflict { details, .. }) => {
-            if details.get("reason").and_then(Value::as_str) == Some("invite_rate_limit") {
+            if details.get("reason").and_then(Value::as_str) == Some(invites::RATE_LIMIT_REASON) {
                 let seconds = details
                     .get("retry_after")
                     .and_then(Value::as_u64)

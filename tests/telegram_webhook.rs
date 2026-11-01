@@ -197,6 +197,43 @@ async fn the_121st_request_from_one_ip_is_rejected_and_not_queued() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_121st_request_from_one_ipv6_prefix_is_rejected_and_another_prefix_is_allowed() {
+    let db = db().await;
+    let app = app_with_window(&db.pool, peer(), 3_600);
+
+    // Все адреса принадлежат одной /64; смена младших 64 бит не должна
+    // обходить лимит.
+    for index in 0..120 {
+        let forwarded = format!("2001:db8:1:2::{index:x}");
+        let (status, retry_after) = post_forwarded(&app, None, &forwarded, b"{}".to_vec()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(retry_after.is_none());
+    }
+
+    let (status, retry_after) = post_forwarded(
+        &app,
+        Some(SECRET),
+        "2001:db8:1:2::78",
+        update(5_200_001, "private", 42),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(retry_after.is_some(), "Retry-After is required");
+    assert_eq!(stored(&db.pool, 5_200_001).await, 0);
+
+    // Другая /64 считается отдельным клиентом.
+    let (status, _) = post_forwarded(
+        &app,
+        Some(SECRET),
+        "2001:db8:1:3::1",
+        update(5_200_002, "private", 42),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stored(&db.pool, 5_200_002).await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn group_updates_are_acknowledged_but_not_stored() {
     let db = db().await;
     let app = app(&db.pool);

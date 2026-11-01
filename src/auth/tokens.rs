@@ -26,9 +26,23 @@ const VISIBLE_PREFIX_LEN: usize = 12;
 /// Поддерживаемые scopes.
 pub const SCOPES: [&str; 4] = ["ha:read", "ha:write", "capture:write", "metrics:read"];
 
-/// Ошибка аутентификации или авторизации.
+/// Ошибка авторизации: токену не хватает scope.
+///
+/// Ошибки проверки самого токена возвращает [`AuthenticateError`].
 #[derive(Debug, Error)]
 pub enum AuthError {
+    /// Токену не хватает scope.
+    #[error("token does not have the required scope: {0}")]
+    Forbidden(String),
+}
+
+/// Ошибка проверки Bearer-токена.
+///
+/// Уже, чем [`AuthError`]: проверка токена не может вернуть `Forbidden`, эта
+/// ветка есть только у [`AuthContext::require_scope`]. Отдельный тип не даёт
+/// HTTP-слою обрабатывать невозможный случай.
+#[derive(Debug, Error)]
+pub enum AuthenticateError {
     /// Токен отсутствует или неизвестен.
     #[error("unknown token")]
     Unknown,
@@ -48,9 +62,6 @@ pub enum AuthError {
         /// Household токена.
         household_id: Uuid,
     },
-    /// Токену не хватает scope.
-    #[error("token does not have the required scope: {0}")]
-    Forbidden(String),
     /// Ошибка базы данных.
     #[error("database error")]
     Database(#[from] sqlx::Error),
@@ -228,9 +239,9 @@ pub fn hash_token(token: &str) -> String {
 ///
 /// Отозванный и просроченный токены различаются в ошибке: HTTP-слой пишет
 /// причину отказа в журнал безопасности, не раскрывая её клиенту.
-pub async fn authenticate(pool: &PgPool, token: &str) -> Result<AuthContext, AuthError> {
+pub async fn authenticate(pool: &PgPool, token: &str) -> Result<AuthContext, AuthenticateError> {
     if !token.starts_with(TOKEN_PREFIX) {
-        return Err(AuthError::Unknown);
+        return Err(AuthenticateError::Unknown);
     }
 
     let token_hash = hash_token(token);
@@ -241,11 +252,11 @@ pub async fn authenticate(pool: &PgPool, token: &str) -> Result<AuthContext, Aut
         .await
         .map_err(database_error)?
     else {
-        return Err(AuthError::Unknown);
+        return Err(AuthenticateError::Unknown);
     };
 
     if record.revoked_at.is_some() {
-        return Err(AuthError::Revoked {
+        return Err(AuthenticateError::Revoked {
             token_id: record.id,
             household_id: record.household_id,
         });
@@ -254,7 +265,7 @@ pub async fn authenticate(pool: &PgPool, token: &str) -> Result<AuthContext, Aut
         .expires_at
         .is_some_and(|expires_at| expires_at <= now)
     {
-        return Err(AuthError::Expired {
+        return Err(AuthenticateError::Expired {
             token_id: record.id,
             household_id: record.household_id,
         });
@@ -277,10 +288,10 @@ pub async fn authenticate(pool: &PgPool, token: &str) -> Result<AuthContext, Aut
     })
 }
 
-fn database_error(error: DomainError) -> AuthError {
+fn database_error(error: DomainError) -> AuthenticateError {
     match error {
-        DomainError::Database(error) => AuthError::Database(error),
-        _ => AuthError::Unknown,
+        DomainError::Database(error) => AuthenticateError::Database(error),
+        _ => AuthenticateError::Unknown,
     }
 }
 

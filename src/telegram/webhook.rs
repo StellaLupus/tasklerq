@@ -92,7 +92,9 @@ pub async fn receive(
     // IP не должен доходить до парсинга и базы.
     let ip = client_ip(peer, forwarded_for(&headers).as_deref());
     let now = Utc::now();
-    let decision = ingress.rate.check(ip, now);
+    // IPv6-клиент почти всегда распоряжается целой /64: лимит должен считать
+    // префикс, иначе смена младших 64 бит обходит 120/с.
+    let decision = ingress.rate.check(crate::rate_limit::ip_key(ip), now);
     if !decision.allowed {
         tracing::warn!(
             ip = %ip,

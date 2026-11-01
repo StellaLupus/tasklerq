@@ -44,11 +44,13 @@ fn peer() -> SocketAddr {
 }
 
 fn app_with_webhook(pool: &PgPool, audit: Audit, per_second: u32) -> Router {
+    // Длинное окно, чтобы последовательные запросы теста не зависели от
+    // реального времени; скользящее окно проверяет unit-тест лимитера.
     let ingress = Ingress::with_rate_limit(
         &SecretString::new(SECRET),
         Arc::new(Notify::new()),
         per_second,
-        1,
+        3_600,
     );
     build_router(AppState::new(pool.clone(), audit).with_telegram(ingress))
         .layer(MockConnectInfo(peer()))

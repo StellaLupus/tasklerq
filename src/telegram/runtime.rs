@@ -46,6 +46,22 @@ pub async fn start(
     breaker: Arc<CircuitBreaker>,
     audit: Audit,
 ) -> Result<Option<Runtime>, StartError> {
+    start_with_update_limit(config, pool, shutdown, ai, breaker, audit, None).await
+}
+
+/// Запустить Telegram-часть с явным лимитом обновлений на пользователя.
+///
+/// `update_limit = None` использует боевой [`UPDATES_PER_MINUTE`]. Переопределение
+/// нужно нагрузочному тесту, который проверяет обработчик, а не ветку лимита.
+pub async fn start_with_update_limit(
+    config: &Config,
+    pool: &PgPool,
+    shutdown: watch::Receiver<bool>,
+    ai: Option<Arc<dyn AiTask>>,
+    breaker: Arc<CircuitBreaker>,
+    audit: Audit,
+    update_limit: Option<u32>,
+) -> Result<Option<Runtime>, StartError> {
     let telegram = &config.telegram;
     let Some(token) = telegram.bot_token.clone() else {
         return Ok(None);
@@ -111,7 +127,7 @@ pub async fn start(
         wake_outbox.clone(),
         audit,
     )
-    .with_rate_limit(UPDATES_PER_MINUTE);
+    .with_rate_limit(update_limit.unwrap_or(UPDATES_PER_MINUTE));
     tasks.push(tokio::spawn(updates.run(wake_updates, shutdown.clone())));
 
     let scheduler = Scheduler::new(pool.clone(), wake_outbox.clone());

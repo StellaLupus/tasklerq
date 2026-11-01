@@ -329,38 +329,40 @@ mod tests {
 
     #[test]
     fn counters_and_labels_render_in_prometheus_format() {
-        capture("api", "applied");
+        // Уникальные метки: глобальный реестр делят все unit-тесты процесса.
+        capture("unit-counter", "applied");
         let rendered = render();
         assert!(
             rendered.contains("# TYPE capture_total counter"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("capture_total{source=\"api\",status=\"applied\"} 1"),
+            rendered.contains("capture_total{source=\"unit-counter\",status=\"applied\"} 1"),
             "{rendered}"
         );
     }
 
     #[test]
     fn histograms_render_cumulative_buckets_sum_and_count() {
-        observe("llm_latency_seconds", &[], 0.3);
-        observe("llm_latency_seconds", &[], 9.0);
+        let labels = [("test", "unit-histogram")];
+        observe("llm_latency_seconds", &labels, 0.3);
+        observe("llm_latency_seconds", &labels, 9.0);
         let rendered = render();
 
         assert!(
-            rendered.contains("llm_latency_seconds_bucket{le=\"0.5\"} 1"),
+            rendered.contains("llm_latency_seconds_bucket{test=\"unit-histogram\",le=\"0.5\"} 1"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("llm_latency_seconds_bucket{le=\"13\"} 2"),
+            rendered.contains("llm_latency_seconds_bucket{test=\"unit-histogram\",le=\"13\"} 2"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("llm_latency_seconds_bucket{le=\"+Inf\"} 2"),
+            rendered.contains("llm_latency_seconds_bucket{test=\"unit-histogram\",le=\"+Inf\"} 2"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("llm_latency_seconds_count 2"),
+            rendered.contains("llm_latency_seconds_count{test=\"unit-histogram\"} 2"),
             "{rendered}"
         );
     }

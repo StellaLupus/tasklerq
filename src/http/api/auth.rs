@@ -5,7 +5,7 @@ use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use chrono::Utc;
 
-use crate::auth::tokens::{self, AuthContext, AuthError};
+use crate::auth::tokens::{self, AuthContext, AuthenticateError};
 
 use super::super::error::ApiError;
 use super::super::router::AppState;
@@ -39,16 +39,10 @@ impl FromRequestParts<AppState> for AuthContext {
                 context.route = Some(route);
                 Ok(context)
             }
-            Err(AuthError::Unknown) => {
+            Err(AuthenticateError::Unknown) => {
                 Err(reject(state, "unknown_token", &route, None, INVALID).await)
             }
-            // `authenticate` не проверяет scopes, поэтому эта ветка
-            // недостижима; `Forbidden` возвращает только `require_scope`
-            // после успешной аутентификации.
-            Err(AuthError::Forbidden(_)) => {
-                unreachable!("authenticate never checks scopes")
-            }
-            Err(AuthError::Revoked {
+            Err(AuthenticateError::Revoked {
                 token_id,
                 household_id,
             }) => Err(reject(
@@ -59,7 +53,7 @@ impl FromRequestParts<AppState> for AuthContext {
                 INVALID,
             )
             .await),
-            Err(AuthError::Expired {
+            Err(AuthenticateError::Expired {
                 token_id,
                 household_id,
             }) => Err(reject(
@@ -70,7 +64,7 @@ impl FromRequestParts<AppState> for AuthContext {
                 INVALID,
             )
             .await),
-            Err(AuthError::Database(error)) => {
+            Err(AuthenticateError::Database(error)) => {
                 tracing::error!(error = %error, "token authentication failed");
                 Err(ApiError::internal("Database error"))
             }

@@ -200,8 +200,11 @@ async fn a_failed_backup_leaves_no_dump_and_retention_removes_only_old_files() {
         "a failed backup must explain itself on stderr"
     );
     assert!(
-        dumps(missing.path()).is_empty(),
-        "a failed backup must not leave a final dump"
+        std::fs::read_dir(missing.path())
+            .expect("backup directory")
+            .next()
+            .is_none(),
+        "a failed backup must not leave a dump or a partial file in the directory"
     );
 
     let dir = TempDir::new("backup-retention");

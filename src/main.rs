@@ -106,6 +106,19 @@ enum AdminCommand {
     Export(ExportArgs),
 }
 
+/// Команды, для которых нужна база данных.
+///
+/// Отдельный тип не даёт передать в [`run_admin_database`] команду webhook,
+/// которая работает без базы.
+#[derive(Debug)]
+enum DatabaseCommand {
+    Token(TokenCommand),
+    Queue(QueueCommand),
+    Household(HouseholdCommand),
+    User(UserCommand),
+    Export(ExportArgs),
+}
+
 #[derive(Debug, Subcommand)]
 enum QueueCommand {
     /// Количество заданий по статусам и возраст самой старой готовой записи.
@@ -354,11 +367,21 @@ async fn run_admin(command: AdminCommand) -> Result<()> {
         // Webhook не требует базы: команда работает даже при недоступном
         // PostgreSQL и использует ту же конфигурацию Telegram, что сервис.
         AdminCommand::Webhook { .. } => webhook_info().await,
-        command => run_admin_database(command).await,
+        AdminCommand::Token { command } => {
+            run_admin_database(DatabaseCommand::Token(command)).await
+        }
+        AdminCommand::Queue { command } => {
+            run_admin_database(DatabaseCommand::Queue(command)).await
+        }
+        AdminCommand::Household { command } => {
+            run_admin_database(DatabaseCommand::Household(command)).await
+        }
+        AdminCommand::User { command } => run_admin_database(DatabaseCommand::User(command)).await,
+        AdminCommand::Export(args) => run_admin_database(DatabaseCommand::Export(args)).await,
     }
 }
 
-async fn run_admin_database(command: AdminCommand) -> Result<()> {
+async fn run_admin_database(command: DatabaseCommand) -> Result<()> {
     let database = DatabaseConfig::from_env().context("invalid database configuration")?;
     let pool = storage::db::connect(&database)
         .await
@@ -366,7 +389,7 @@ async fn run_admin_database(command: AdminCommand) -> Result<()> {
     let now = Utc::now();
 
     match command {
-        AdminCommand::Token { command } => match command {
+        DatabaseCommand::Token(command) => match command {
             TokenCommand::Create(args) => {
                 let issued = admin::create_token(
                     &pool,
@@ -421,7 +444,7 @@ async fn run_admin_database(command: AdminCommand) -> Result<()> {
                 }
             }
         },
-        AdminCommand::Queue { command } => match command {
+        DatabaseCommand::Queue(command) => match command {
             QueueCommand::Stats => {
                 let stats = admin::queue_stats(&pool, now).await.map_err(explain)?;
                 print_status_counts(
@@ -453,8 +476,7 @@ async fn run_admin_database(command: AdminCommand) -> Result<()> {
                 }
             }
         },
-        AdminCommand::Webhook { .. } => unreachable!("webhook handled before the database"),
-        AdminCommand::Household { command } => match command {
+        DatabaseCommand::Household(command) => match command {
             HouseholdCommand::Create { name, timezone } => {
                 let household = admin::create_household(&pool, &name, &timezone, now)
                     .await
@@ -476,7 +498,7 @@ async fn run_admin_database(command: AdminCommand) -> Result<()> {
                 }
             }
         },
-        AdminCommand::User { command } => match command {
+        DatabaseCommand::User(command) => match command {
             UserCommand::Add {
                 telegram_id,
                 role,
@@ -498,7 +520,7 @@ async fn run_admin_database(command: AdminCommand) -> Result<()> {
                 println!("telegram_id: {}", user.telegram_user_id);
             }
         },
-        AdminCommand::Export(args) => {
+        DatabaseCommand::Export(args) => {
             let export = admin::export(&pool, args.household, now)
                 .await
                 .map_err(explain)?;

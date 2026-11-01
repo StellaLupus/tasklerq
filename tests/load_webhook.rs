@@ -13,7 +13,7 @@ use chrono::Utc;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
-use tasklerq::app::build_application;
+use tasklerq::app::build_application_with_update_limit;
 use tasklerq::config::Config;
 use tasklerq::http::server;
 use tasklerq::metrics;
@@ -70,14 +70,14 @@ struct Updates {
 }
 
 impl Updates {
-    fn new(users: Vec<LoadUser>, callbacks: HashMap<i64, Vec<String>>) -> Self {
+    fn new(users: Vec<LoadUser>, callbacks: HashMap<i64, Vec<String>>, base: i64) -> Self {
         let next_callback = callbacks.keys().map(|chat| (*chat, 0)).collect();
         Self {
             users,
             callbacks,
             next_callback,
             sequence: 0,
-            update_id: 1_000_000_000,
+            update_id: base,
         }
     }
 
@@ -411,42 +411,67 @@ fn millis(value: StdDuration) -> f64 {
     value.as_secs_f64() * 1_000.0
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "load test: run with `make load`"]
-async fn webhook_keeps_latency_and_queue_under_load() {
-    let db = support::isolated_db().await;
-    let database_name: String = sqlx::query_scalar("SELECT current_database()")
-        .fetch_one(&db.pool)
-        .await
-        .expect("database name");
-    let database_url = support::database_url_for(&database_name).await;
-    let pool = PgPoolOptions::new()
-        .max_connections(10)
-        .connect(&database_url)
-        .await
-        .expect("load pool");
+#[derive(Clone, Copy)]
+struct Scenario {
+    name: &'static str,
+    update_base: i64,
+    update_limit: Option<u32>,
+    all_processed: bool,
+}
 
-    let household = support::create_household(&pool).await;
-    let users = seed_users(&pool, &household).await;
-    seed_items(&pool, &household, &users).await;
-    let callbacks = issue_callbacks(&pool, &household, &users).await;
+struct ScenarioResult {
+    name: &'static str,
+    processed: u64,
+    rate_limited: u64,
+    p50: StdDuration,
+    p95: StdDuration,
+    p99: StdDuration,
+    max: StdDuration,
+    drain: StdDuration,
+    /// Скорость обработки воркерами. Прогон открытый: поток 50 запросов/с,
+    /// поэтому величина упирается в него и не показывает запас воркера.
+    processed_rate: f64,
+}
 
-    let telegram = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "ok": true,
-            "result": {"message_id": 1}
-        })))
-        .mount(&telegram)
-        .await;
+/// Пропускает в stderr только строки о неудачных попытках воркера: остальной
+/// журнал под нагрузкой (тысячи предупреждений о лимите) только мешает.
+struct FailureLogs;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
-    let address = listener.local_addr().expect("address");
-    let public_url = format!("http://{address}");
-    let config = Config::from_map(vec![
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FailureLogs {
+    type Writer = FailureLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        FailureLogWriter
+    }
+}
+
+struct FailureLogWriter;
+
+impl std::io::Write for FailureLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        const MARKERS: [&str; 4] = [
+            "telegram update failed",
+            "telegram update handler panicked",
+            "telegram update pass failed",
+            "rollback failed",
+        ];
+        let text = String::from_utf8_lossy(buf);
+        if MARKERS.iter().any(|marker| text.contains(marker)) {
+            eprint!("{text}");
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn load_config(database_url: &str, telegram_url: &str, public_url: &str) -> Config {
+    Config::from_map(vec![
         ("ENV".to_owned(), "development".to_owned()),
-        ("PUBLIC_BASE_URL".to_owned(), public_url.clone()),
-        ("DATABASE_URL".to_owned(), database_url.clone()),
+        ("PUBLIC_BASE_URL".to_owned(), public_url.to_owned()),
+        ("DATABASE_URL".to_owned(), database_url.to_owned()),
         ("DATABASE_MAX_CONNECTIONS".to_owned(), "10".to_owned()),
         ("TELEGRAM_MODE".to_owned(), "webhook".to_owned()),
         ("TELEGRAM_BOT_TOKEN".to_owned(), "123:load-test".to_owned()),
@@ -455,16 +480,37 @@ async fn webhook_keeps_latency_and_queue_under_load() {
             "TELEGRAM_WEBHOOK_URL".to_owned(),
             format!("{public_url}/webhooks/telegram"),
         ),
-        ("TELEGRAM_API_BASE_URL".to_owned(), telegram.uri()),
+        ("TELEGRAM_API_BASE_URL".to_owned(), telegram_url.to_owned()),
         ("LLM_CAPTURE_ENABLED".to_owned(), "false".to_owned()),
         ("CAPTURE_API_ENABLED".to_owned(), "false".to_owned()),
     ])
-    .expect("load config");
+    .expect("load config")
+}
+
+async fn run_scenario(
+    scenario: Scenario,
+    pool: &PgPool,
+    database_url: &str,
+    telegram_url: &str,
+    household: &TestHousehold,
+    users: &[LoadUser],
+) -> ScenarioResult {
+    let callbacks = issue_callbacks(pool, household, users).await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let public_url = format!("http://{address}");
+    let config = load_config(database_url, telegram_url, &public_url);
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let application = build_application(&config, pool.clone(), shutdown_rx.clone())
-        .await
-        .expect("application");
+    let application = build_application_with_update_limit(
+        &config,
+        pool.clone(),
+        shutdown_rx.clone(),
+        scenario.update_limit,
+    )
+    .await
+    .expect("application");
     let router = application.router;
     let workers = application.workers;
     let mut server_shutdown = shutdown_rx;
@@ -477,8 +523,12 @@ async fn webhook_keeps_latency_and_queue_under_load() {
         .build()
         .expect("http client");
     let url = format!("http://{address}/webhooks/telegram");
-    let mut updates = Updates::new(users, callbacks);
+    let mut updates = Updates::new(users.to_vec(), callbacks, scenario.update_base);
     let before = metrics::render();
+    let queue_before = {
+        let mut conn = pool.acquire().await.expect("connection");
+        queue::counts(&mut conn).await.expect("queue counts")
+    };
 
     let started = Instant::now();
     let interval = StdDuration::from_micros(1_000_000 / REQUESTS_PER_SECOND);
@@ -548,13 +598,19 @@ async fn webhook_keeps_latency_and_queue_under_load() {
         }
         sleep(StdDuration::from_millis(100)).await;
     };
+    let drain = drain_started.elapsed();
+    // Воркеры успевают разгребать очередь: скорость — обработанные записи за
+    // всё время прогона, включая drain.
+    let worker_seconds = started.elapsed().as_secs_f64();
+    let processed_rows = counts.processed - queue_before.processed;
+    let processed_rate = processed_rows as f64 / worker_seconds;
 
     let _ = sample_stop_tx.send(true);
     let mut samples = tokio::time::timeout(StdDuration::from_secs(5), sampling)
         .await
         .expect("sampling task stops")
         .expect("sampling task");
-    samples.push(sample_queue(&pool, started).await);
+    samples.push(sample_queue(pool, started).await);
 
     let after = wait_for_metrics(&before, sent).await;
     let processed = metric_counter(&after, "processed") - metric_counter(&before, "processed");
@@ -563,6 +619,22 @@ async fn webhook_keeps_latency_and_queue_under_load() {
     let failed = metric_counter(&after, "failed") - metric_counter(&before, "failed");
     let dead = metric_counter(&after, "dead") - metric_counter(&before, "dead");
 
+    // `last_error` стирается при успешном повторе, поэтому сохраняем и сам
+    // факт попытки: по `attempts` видно, какое обновление упало, а текст
+    // ошибки приходит из журнала `FailureLogs`.
+    if failed > 0 {
+        let retried: Vec<(i64, String, i32, Option<String>)> = sqlx::query_as(
+            "SELECT update_id, status::text, attempts, last_error
+             FROM telegram_updates
+             WHERE attempts > 0
+             ORDER BY update_id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        println!("updates with failed attempts: {retried:?}");
+    }
+
     latencies.sort();
     let p50 = percentile(&latencies, 0.50);
     let p95 = percentile(&latencies, 0.95);
@@ -570,7 +642,8 @@ async fn webhook_keeps_latency_and_queue_under_load() {
     let max = latencies.last().copied().unwrap_or_default();
 
     println!(
-        "load: users={USERS} items={ITEMS} rate={REQUESTS_PER_SECOND}/s duration={LOAD_SECONDS}s"
+        "load scenario '{}': users={USERS} items={ITEMS} rate={REQUESTS_PER_SECOND}/s duration={LOAD_SECONDS}s update_limit={:?}",
+        scenario.name, scenario.update_limit
     );
     println!(
         "webhook latency ms: p50={:.3} p95={:.3} p99={:.3} max={:.3}",
@@ -581,6 +654,12 @@ async fn webhook_keeps_latency_and_queue_under_load() {
     );
     println!(
         "requests={sent} processed={processed} rate_limited={rate_limited} failed={failed} dead={dead}"
+    );
+    println!(
+        "worker: rows={processed_rows} elapsed={:.3}s processed_rate={:.1}/s drain={:.3}s",
+        worker_seconds,
+        processed_rate,
+        drain.as_secs_f64()
     );
     println!(
         "queue samples (at, pending, oldest_age_ms): {:?}",
@@ -602,11 +681,22 @@ async fn webhook_keeps_latency_and_queue_under_load() {
         sent >= REQUESTS_PER_SECOND * LOAD_SECONDS - 100,
         "the load loop must send the planned number of requests: {sent}"
     );
-    assert_eq!(
-        processed + rate_limited,
-        sent,
-        "every update is processed or rate_limited"
-    );
+    if scenario.all_processed {
+        assert_eq!(
+            processed, sent,
+            "every update must go through the handler when the user limit is raised"
+        );
+        assert_eq!(
+            rate_limited, 0,
+            "no update may be rate_limited when the user limit is raised"
+        );
+    } else {
+        assert_eq!(
+            processed + rate_limited,
+            sent,
+            "every update is processed or rate_limited"
+        );
+    }
     assert_eq!(failed, 0, "no update may fail under load");
     assert_eq!(dead, 0, "no update may reach the dead-letter queue");
     assert!(
@@ -643,4 +733,112 @@ async fn webhook_keeps_latency_and_queue_under_load() {
     for worker in workers {
         worker.abort();
     }
+
+    ScenarioResult {
+        name: scenario.name,
+        processed,
+        rate_limited,
+        p50,
+        p95,
+        p99,
+        max,
+        drain,
+        processed_rate,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "load test: run with `make load`"]
+async fn webhook_keeps_latency_and_queue_under_load() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("tasklerq=warn")),
+        )
+        .with_writer(FailureLogs)
+        .with_ansi(false)
+        .try_init();
+    let db = support::isolated_db().await;
+    let database_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&db.pool)
+        .await
+        .expect("database name");
+    let database_url = support::database_url_for(&database_name).await;
+    let pool = PgPoolOptions::new()
+        .max_connections(10)
+        .connect(&database_url)
+        .await
+        .expect("load pool");
+
+    let household = support::create_household(&pool).await;
+    let users = seed_users(&pool, &household).await;
+    seed_items(&pool, &household, &users).await;
+
+    let telegram = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "result": {"message_id": 1}
+        })))
+        .mount(&telegram)
+        .await;
+
+    // Первый прогон — боевой лимит 20 обновлений/мин на пользователя: большая
+    // часть обновлений завершается как `rate_limited`.
+    let limited = run_scenario(
+        Scenario {
+            name: "production limit",
+            update_base: 1_000_000_000,
+            update_limit: None,
+            all_processed: false,
+        },
+        &pool,
+        &database_url,
+        &telegram.uri(),
+        &household,
+        &users,
+    )
+    .await;
+
+    // Второй прогон — тот же поток и данные, но лимит пользователя поднят
+    // только в тесте: все обновления должны пройти через обработчик.
+    let processed = run_scenario(
+        Scenario {
+            name: "raised update limit",
+            update_base: 2_000_000_000,
+            update_limit: Some(100_000),
+            all_processed: true,
+        },
+        &pool,
+        &database_url,
+        &telegram.uri(),
+        &household,
+        &users,
+    )
+    .await;
+
+    println!(
+        "summary: '{}' p50={:.3} p95={:.3} p99={:.3} max={:.3} processed={} rate_limited={} \
+         drain={:.3}s processed_rate={:.1}/s | \
+         '{}' p50={:.3} p95={:.3} p99={:.3} max={:.3} processed={} rate_limited={} \
+         drain={:.3}s processed_rate={:.1}/s",
+        limited.name,
+        millis(limited.p50),
+        millis(limited.p95),
+        millis(limited.p99),
+        millis(limited.max),
+        limited.processed,
+        limited.rate_limited,
+        limited.drain.as_secs_f64(),
+        limited.processed_rate,
+        processed.name,
+        millis(processed.p50),
+        millis(processed.p95),
+        millis(processed.p99),
+        millis(processed.max),
+        processed.processed,
+        processed.rate_limited,
+        processed.drain.as_secs_f64(),
+        processed.processed_rate
+    );
 }
