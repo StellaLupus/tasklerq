@@ -18,6 +18,8 @@ pub struct RateDecision {
     pub allowed: bool,
     /// Через сколько секунд повторить; `None`, если операция разрешена.
     pub retry_after: Option<u64>,
+    /// Точный момент освобождения слота; `None`, если операция разрешена.
+    pub retry_at: Option<DateTime<Utc>>,
 }
 
 /// Лимит частоты на ключ.
@@ -123,19 +125,19 @@ impl<K: Eq + Hash + Clone> RateLimiter<K> {
             queue.pop_front();
         }
         if queue.len() >= self.limit as usize {
-            let wait = queue
-                .front()
-                .map(|at| *at + self.window - now)
-                .unwrap_or(self.window);
+            let retry_at = queue.front().map(|at| *at + self.window);
+            let wait = retry_at.map_or(self.window, |at| at - now);
             return RateDecision {
                 allowed: false,
                 retry_after: Some(retry_after_seconds(wait)),
+                retry_at,
             };
         }
         queue.push_back(now);
         RateDecision {
             allowed: true,
             retry_after: None,
+            retry_at: None,
         }
     }
 }
@@ -318,6 +320,49 @@ mod tests {
         assert!(limiter.check(stale, start + Duration::seconds(61)).allowed);
         assert!(limiter.check(stale, start + Duration::seconds(62)).allowed);
         assert!(!limiter.check(stale, start + Duration::seconds(63)).allowed);
+    }
+
+    #[test]
+    fn the_slot_release_moment_is_exact_and_two_denials_share_it() {
+        let limiter = RateLimiter::with_window(2, 60);
+        let key = 7_i64;
+        let start = at(1_000) + Duration::milliseconds(250);
+        assert!(limiter.check(key, start).allowed);
+        assert!(
+            limiter
+                .check(key, start + Duration::milliseconds(500))
+                .allowed
+        );
+
+        // Слот освобождает самая старая отметка в окне — без округления до
+        // целых секунд: иначе ответы формы могли бы переставиться.
+        let first = limiter.check(key, start + Duration::milliseconds(700));
+        assert!(!first.allowed);
+        assert_eq!(first.retry_at, Some(start + Duration::seconds(60)));
+        assert_eq!(first.retry_after, Some(60));
+
+        let second = limiter.check(key, start + Duration::seconds(5));
+        assert!(!second.allowed);
+        assert_eq!(second.retry_at, first.retry_at);
+
+        // В объявленный момент слот уже свободен.
+        assert!(limiter.check(key, start + Duration::seconds(60)).allowed);
+    }
+
+    #[test]
+    fn a_denied_check_does_not_consume_a_slot() {
+        let limiter = RateLimiter::with_window(1, 60);
+        let key = 7_i64;
+        let start = at(2_000) + Duration::milliseconds(100);
+        assert!(limiter.check(key, start).allowed);
+
+        let denied = limiter.check(key, start + Duration::seconds(30));
+        assert!(!denied.allowed);
+        assert_eq!(denied.retry_at, Some(start + Duration::seconds(60)));
+
+        // Если бы отказ записывался отметкой, в этот момент он ещё был бы в
+        // окне и снова запретил бы операцию.
+        assert!(limiter.check(key, start + Duration::seconds(60)).allowed);
     }
 
     #[test]

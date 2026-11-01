@@ -105,6 +105,28 @@ pub async fn claim_next(
     }))
 }
 
+/// Отложить обновление до `available_at`, не увеличивая счётчик попыток.
+///
+/// Отказ лимитера — не сбой: строка остаётся `pending`, `attempts` не растёт, а
+/// в момент освобождения слота обновление снова попадёт в [`claim_next`].
+pub async fn defer(
+    conn: &mut PgConnection,
+    update_id: i64,
+    available_at: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE telegram_updates
+         SET available_at = $2
+         WHERE update_id = $1 AND status = 'pending'",
+    )
+    .bind(update_id)
+    .bind(available_at)
+    .execute(conn)
+    .await?;
+
+    Ok(())
+}
+
 /// Пометить обновление обработанным. Сырое обновление (текст пользователя, код
 /// приглашения из `/start`) после обработки не хранится.
 pub async fn mark_processed(

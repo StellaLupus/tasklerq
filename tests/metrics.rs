@@ -350,7 +350,7 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
         Pass::Failed(_)
     ));
 
-    // Второе обновление сверх лимита помечается rate_limited.
+    // Второе обновление сверх лимита откладывается до освобождения слота.
     let limited_chat = next_telegram_id();
     for update_id in [6_000_020, 6_000_021] {
         let update = text_update(update_id, limited_chat, "часто");
@@ -375,7 +375,7 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
     );
     assert_eq!(
         limited_worker.run_once(now).await.expect("second limited"),
-        Pass::Processed
+        Pass::Deferred
     );
 
     // Capture из Telegram: отдельный household с реальным ботом.
@@ -503,11 +503,7 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
     assert_metric_at_least(&text, "telegram_updates_total{status=\"processed\"}", 1.0);
     assert_metric_at_least(&text, "telegram_updates_total{status=\"failed\"}", 1.0);
     assert_metric_at_least(&text, "telegram_updates_total{status=\"dead\"}", 1.0);
-    assert_metric_at_least(
-        &text,
-        "telegram_updates_total{status=\"rate_limited\"}",
-        1.0,
-    );
+    assert_metric_at_least(&text, "telegram_updates_total{status=\"deferred\"}", 1.0);
     assert_metric_at_least(&text, "telegram_queue_lag_seconds", 590.0);
     assert_metric_at_least(&text, "outbox_pending", 1.0);
     assert_metric_at_least(&text, "outbox_dead_total", 1.0);

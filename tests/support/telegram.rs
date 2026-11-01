@@ -404,7 +404,7 @@ impl Harness {
         self.tick();
         for _ in 0..50 {
             match self.updates.run_once(self.now).await.expect("update pass") {
-                Pass::Processed => {}
+                Pass::Processed | Pass::Deferred => {}
                 Pass::Idle | Pass::Failed(_) => break,
             }
         }

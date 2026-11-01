@@ -266,6 +266,28 @@ async fn empty_title_and_long_title_are_rejected() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_failure_still_deletes_the_incoming_text_and_shows_a_banner() {
+    let db = db().await;
+    let mut bot = Harness::new(&db.pool, next_telegram_id());
+
+    // `/settings` без household заканчивается `Fail::User` через `recover`.
+    let (message_id, rows) = send_text(&mut bot, "/settings").await;
+
+    // Удаление входящего стоит до шага и не откатывается вместе с ним.
+    let deleted = delete_seq(&rows, message_id);
+    let screen = rows
+        .iter()
+        .find(|(_, kind, _)| kind == "screen")
+        .unwrap_or_else(|| panic!("no screen row after user failure: {rows:?}"))
+        .0;
+    assert!(
+        deleted < screen,
+        "the incoming message must be deleted before the screen: {rows:?}"
+    );
+    bot.assert_screen_contains("Сначала создайте пространство");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn free_text_offers_a_draft_and_cancel_discards_it() {
     let db = db().await;
     let mut bot = onboarded(&db.pool).await;

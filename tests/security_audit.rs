@@ -370,11 +370,8 @@ async fn the_telegram_update_limit_is_audited() {
     }
     drop(conn);
 
-    for _ in 0..2 {
-        assert_eq!(
-            worker.run_once(Utc::now()).await.expect("pass"),
-            Pass::Processed
-        );
+    for expected in [Pass::Processed, Pass::Deferred] {
+        assert_eq!(worker.run_once(Utc::now()).await.expect("pass"), expected);
     }
 
     let limits = payloads(&db.pool, "rate_limited").await;

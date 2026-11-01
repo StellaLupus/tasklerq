@@ -21,9 +21,7 @@ use crate::security_audit::{Audit, LimitKey, RateLimitEvent};
 
 use super::api::TelegramApi;
 use super::bot::{Answer, Bot, Outcome};
-use super::outbox::{self, Outgoing};
 use super::queue::{self, Failure};
-use super::rich;
 use super::update::{self, Classified, Incoming};
 
 /// Сколько обновлений пользователя обрабатывается за минуту.
@@ -38,12 +36,15 @@ pub enum Pass {
     Idle,
     /// Обновление обработано.
     Processed,
+    /// Обновление отложено до освобождения слота лимитера.
+    Deferred,
     /// Обработка не удалась; повтор или `dead` записаны в очередь.
     Failed(Failure),
 }
 
-/// Пропущенное обновление и событие о сработавшем лимите.
+/// Отложенное обновление, событие о сработавшем лимите и ответ на callback.
 struct Limited {
+    retry_at: DateTime<Utc>,
     outcome: Outcome,
     event: RateLimitEvent,
 }
@@ -89,7 +90,6 @@ pub struct UpdateWorker {
     wake_outbox: Arc<Notify>,
     only_chat: Option<i64>,
     rate: Option<Arc<RateLimiter<i64>>>,
-    notices: Option<Arc<RateLimiter<i64>>>,
     audit: Audit,
 }
 
@@ -113,7 +113,6 @@ impl UpdateWorker {
             wake_outbox,
             only_chat: None,
             rate: None,
-            notices: None,
         }
     }
 
@@ -126,15 +125,15 @@ impl UpdateWorker {
 
     /// Ограничить обработку обновлений пользователя `per_minute` в минуту.
     ///
-    /// Сообщение о превышении в чат отправляется не чаще раза за окно; ответ
-    /// на callback уходит на каждое превышение, чтобы убрать «часики».
+    /// Обновление сверх лимита остаётся `pending` до освобождения слота и затем
+    /// выполняется как обычно. Ответ на callback уходит сразу, чтобы убрать
+    /// «часики».
     #[must_use]
     pub fn with_rate_limit(mut self, per_minute: u32) -> Self {
         self.rate = Some(Arc::new(RateLimiter::with_window(
             per_minute,
             UPDATE_WINDOW_SECONDS,
         )));
-        self.notices = Some(Arc::new(RateLimiter::with_window(1, UPDATE_WINDOW_SECONDS)));
         self
     }
 
@@ -147,24 +146,24 @@ impl UpdateWorker {
         let started = Instant::now();
 
         // Лимит проверяется до обработчика: обновление сверх лимита не должно
-        // создавать или менять данные. Оно всё равно помечается обработанным,
-        // чтобы Telegram не повторял доставку.
+        // создавать или менять данные. Оно остаётся `pending` до точного момента
+        // освобождения слота и затем выполняется как обычно; строка `message` в
+        // чат не ставится.
         //
         // Слот расходуется только на первой попытке: повтор уже учтённого
         // обновления не должен отнимать лимит у новых действий пользователя.
         if job.attempts == 0
-            && let Some(limited) = self.rate_limited(&mut tx, &job, now).await?
+            && let Some(limited) = self.rate_limited(&job, now).await?
         {
-            queue::mark_processed(&mut tx, job.update_id, now).await?;
+            queue::defer(&mut tx, job.update_id, limited.retry_at).await?;
             tx.commit().await?;
             // Событие пишется после коммита отдельным соединением: отказ не
             // должен исчезнуть вместе с транзакцией ответа.
             self.audit.rate_limited(limited.event, now).await;
-            self.wake_outbox.notify_one();
             self.answer(limited.outcome).await;
-            metrics::telegram_update("rate_limited");
-            log_update(job.update_id, "rate_limited", started);
-            return Ok(Pass::Processed);
+            metrics::telegram_update("deferred");
+            log_update(job.update_id, "deferred", started);
+            return Ok(Pass::Deferred);
         }
 
         // Паника обработчика считается неудачной попыткой, как и ошибка базы:
@@ -220,11 +219,10 @@ impl UpdateWorker {
         Ok(Pass::Failed(failure))
     }
 
-    /// Проверить лимит пользователя. `Some` — обновление пропущено, в нём
-    /// только ответ на callback; данные не изменены.
+    /// Проверить лимит пользователя. `Some` — обновление отложено до
+    /// `retry_at`; данные не изменены, на callback готов пустой ответ.
     async fn rate_limited(
         &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         job: &queue::Claimed,
         now: DateTime<Utc>,
     ) -> Result<Option<Limited>, sqlx::Error> {
@@ -244,6 +242,9 @@ impl UpdateWorker {
         if decision.allowed {
             return Ok(None);
         }
+        let Some(retry_at) = decision.retry_at else {
+            return Ok(None);
+        };
 
         let retry_after = decision
             .retry_after
@@ -255,36 +256,19 @@ impl UpdateWorker {
             "telegram user is rate limited"
         );
 
+        // Ответ на callback нужен сразу, чтобы убрать «часики»: после задержки
+        // Telegram его уже не примет. Действие выполнится позже, когда слот
+        // освободится.
         let answer = match incoming {
             Incoming::Callback { query_id, .. } => Some(Answer {
                 query_id,
-                text: Some(rate_limited_text(retry_after)),
+                text: None,
                 alert: false,
             }),
-            Incoming::Text {
-                chat_id, sender, ..
-            } => {
-                let notify = self
-                    .notices
-                    .as_ref()
-                    .is_some_and(|gate| gate.check(sender.id, now).allowed);
-                if notify {
-                    outbox::enqueue(
-                        tx,
-                        chat_id,
-                        &Outgoing::Message {
-                            html: rich::escape(&rate_limited_text(retry_after)),
-                            rich: false,
-                        },
-                        None,
-                        now,
-                    )
-                    .await?;
-                }
-                None
-            }
+            Incoming::Text { .. } => None,
         };
         Ok(Some(Limited {
+            retry_at,
             outcome: Outcome { answer },
             event: RateLimitEvent {
                 limit: crate::security_audit::TELEGRAM_LIMIT,
@@ -324,7 +308,7 @@ impl UpdateWorker {
                 .catch_unwind()
                 .await
             {
-                Ok(Ok(Pass::Processed)) => continue,
+                Ok(Ok(Pass::Processed | Pass::Deferred)) => continue,
                 Ok(Ok(Pass::Idle | Pass::Failed(_))) => {}
                 Ok(Err(error)) => tracing::error!(%error, "telegram update pass failed"),
                 Err(_) => tracing::error!("telegram update pass panicked"),
@@ -336,11 +320,6 @@ impl UpdateWorker {
             }
         }
     }
-}
-
-/// Сообщение пользователю о превышении лимита; без пользовательского текста.
-fn rate_limited_text(retry_after: u64) -> String {
-    format!("Слишком часто. Попробуйте через {retry_after} с.")
 }
 
 /// Строка журнала об исходе обновления: только идентификатор, статус и время.
