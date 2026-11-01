@@ -15,8 +15,16 @@
 -- Состояния «изменена» нет: изменившаяся задача остаётся открытым блоком с
 -- кнопками.
 --
+-- `deferred` означает «отложено тихими часами»: ручной выпуск, баннер и перенос
+-- при всё ещё тихом интервале работают только с такими доставками.
+-- `batched` — групповой snooze действия «Отложить все на час»: в свой срок он
+-- собирается в сводное вместе с отложенными тихими часами, но ручной выпуск его
+-- не ускоряет. Если его срок сам попадает в тихие часы, `deferred` выставляется
+-- общим правилом.
+--
 -- Retention чистит батчи вместе с доставками по тому же сроку
--- `RETENTION_OUTBOX_DAYS`; удаляются только батчи без `pending`-доставок.
+-- `RETENTION_OUTBOX_DAYS`; удаляются только батчи, на которые больше не
+-- ссылается ни одна доставка.
 
 CREATE TABLE notification_batches (
     id uuid PRIMARY KEY,
@@ -38,6 +46,7 @@ ALTER TABLE notification_deliveries
     ADD COLUMN batch_version integer,
     ADD COLUMN batch_state text,
     ADD COLUMN batch_snoozed_until timestamptz,
+    ADD COLUMN batched boolean NOT NULL DEFAULT false,
     ADD CONSTRAINT notification_deliveries_batch_state_check
         CHECK (batch_state IS NULL
                OR batch_state IN ('done', 'snoozed', 'missing'));

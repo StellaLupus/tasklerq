@@ -31,9 +31,7 @@ fn kind_label(kind: NotificationKind) -> &'static str {
         NotificationKind::Reminder => "⏰ напоминание",
         NotificationKind::Snooze => "😴 отложенное",
         NotificationKind::Assignment => "👤 назначение",
-        // Сводка в сводное сообщение не входит; подпись нужна только для
-        // исчерпывающего match.
-        NotificationKind::Digest => "☀️ сводка",
+        NotificationKind::Digest => unreachable!("digest is not a batch entry"),
     }
 }
 
@@ -472,8 +470,8 @@ fn blocked_toast(state: BatchEntryState) -> Option<&'static str> {
 
 /// Создать snooze-доставку одной задачи сводного сообщения.
 ///
-/// `batched` помечает доставку как отложенную, чтобы через час несколько таких
-/// задач пришли одним сводным сообщением.
+/// `batched` помечает доставку как групповой snooze: через час несколько таких
+/// задач приходят одним сводным сообщением, но ручной выпуск их не ускоряет.
 async fn snooze_batch_item(
     ctx: &mut Ctx<'_>,
     batch_id: Uuid,
@@ -508,7 +506,7 @@ async fn snooze_batch_item(
         scheduled_at: deliver_at,
     };
     if batched {
-        notifications::insert_deferred(&mut *ctx.conn, &delivery, ctx.now).await?;
+        notifications::insert_batched(&mut *ctx.conn, &delivery, ctx.now).await?;
     } else {
         notifications::insert(&mut *ctx.conn, &delivery, ctx.now).await?;
     }

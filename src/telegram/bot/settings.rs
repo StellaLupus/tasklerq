@@ -10,7 +10,7 @@ use crate::domain::settings::{
     NotificationSettings, NotificationSettingsUpdate, ProfileUpdate, SUGGESTED_TIMEZONES,
     validate_timezone,
 };
-use crate::jobs::scheduler;
+use crate::jobs::{batch, scheduler};
 use crate::storage::repositories::{audit, invites, members, users};
 use crate::telegram::rich::{Span, button};
 use crate::telegram::ru;
@@ -35,7 +35,11 @@ pub(super) enum ReleaseTrigger {
 }
 
 /// Баннер над экраном настроек после ручного выпуска.
-fn release_banner(trigger: ReleaseTrigger, settings: &NotificationSettings, count: u64) -> String {
+fn release_banner(
+    trigger: ReleaseTrigger,
+    settings: &NotificationSettings,
+    count: usize,
+) -> String {
     let reason = if !settings.quiet_hours_enabled {
         "Тихие часы выключены.".to_owned()
     } else if trigger == ReleaseTrigger::Timezone {
@@ -54,11 +58,12 @@ fn release_banner(trigger: ReleaseTrigger, settings: &NotificationSettings, coun
 }
 
 /// Показать экран после правки настроек и, если сейчас уже не тихо, сразу
-/// выпустить отложенные уведомления.
+/// выпустить отложенные тихими часами уведомления.
 ///
 /// Всё выполняется в транзакции обработчика: сохранение настройки, экран и
-/// выпуск фиксируются вместе. Записи забираются под advisory-блокировкой
-/// получателя, поэтому планировщик не отправит их второй раз.
+/// выпуск фиксируются вместе. Блокировка получателя ожидающая: планировщик
+/// держит её только на время одной транзакции тика, поэтому после коммита
+/// записи уже `sent` и дубля не будет.
 pub(super) async fn finish_settings_change(
     ctx: &mut Ctx<'_>,
     user: User,
@@ -74,25 +79,21 @@ pub(super) async fn finish_settings_change(
     let settings = NotificationSettings::from_settings(&ctx.user()?.settings);
     let timezone = ctx.tz;
 
-    // Занятый получатель: планировщик уже выпускает его записи. Второго
-    // сообщения не будет, экран показываем без баннера.
-    if !scheduler::try_recipient_lock(&mut *ctx.conn, user_id).await? {
-        return ctx.present(screen).await;
-    }
+    scheduler::recipient_lock(&mut *ctx.conn, user_id).await?;
 
     if let Some(end) = scheduler::quiet_end_at(ctx.now, timezone, &settings) {
         // По новым настройкам сейчас всё ещё тихо: не выпускаем, но переносим
         // отложенные на конец нового интервала.
-        scheduler::postpone_deferred_for_user(&mut *ctx.conn, user_id, end, ctx.now).await?;
+        batch::postpone_deferred_for_user(&mut *ctx.conn, user_id, end, ctx.now).await?;
         return ctx.present(screen).await;
     }
 
-    let count = scheduler::deferred_notice_count(&mut *ctx.conn, user_id, ctx.now).await?;
-    if count > 0 {
-        ctx.banner(release_banner(trigger, &settings, count));
+    let release = batch::prepare_release(&mut *ctx.conn, user_id, ctx.now).await?;
+    if !release.is_empty() {
+        ctx.banner(release_banner(trigger, &settings, release.notifications));
     }
     ctx.present(screen).await?;
-    scheduler::release_deferred_for_user(&mut *ctx.conn, user_id, ctx.now).await?;
+    batch::commit_release(&mut *ctx.conn, release, ctx.now).await?;
     Ok(())
 }
 

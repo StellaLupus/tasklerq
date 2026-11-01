@@ -204,6 +204,10 @@ async fn run_in_tx(
     // Завершённые доставки старше срока outbox. `pending` не трогаем никогда:
     // запись может ждать тихих часов или ещё не наступившего вхождения.
     //
+    // Доставки батча, который ещё жив (его `updated_at` обновило листание или
+    // действие), не удаляем: иначе страница сводного опустеет, хотя сообщение
+    // пользователь всё ещё открывает.
+    //
     // Для дедупликации безопасно: вхождение остаётся в таблице, пока его ещё
     // можно перепланировать, — timed до срока, вседневное и сводка до конца
     // локального дня; назначение и snooze вставляются однократно. Поэтому
@@ -216,23 +220,29 @@ async fn run_in_tx(
     // значений, пересмотреть очистку: строка `sent`/`cancelled` должна
     // пережить окно, в котором её вхождение ещё может быть перепланировано.
     let purged_notification_deliveries = sqlx::query(
-        "DELETE FROM notification_deliveries
-         WHERE status IN ('sent', 'cancelled') AND updated_at < $1",
+        "DELETE FROM notification_deliveries d
+         WHERE d.status IN ('sent', 'cancelled') AND d.updated_at < $1
+           AND NOT EXISTS (
+               SELECT 1 FROM notification_batches b
+               WHERE b.id = d.batch_id AND b.updated_at >= $1
+           )",
     )
     .bind(now - Duration::days(i64::from(config.outbox_days)))
     .execute(&mut *conn)
     .await?
     .rows_affected();
 
-    // Сводные сообщения живут столько же, сколько их доставки. Батч без
-    // `pending`-доставок больше не может быть перерисован; связанные `pending`
-    // не трогаем, как и сами доставки.
+    // Сводное сообщение живёт, пока на него ссылается хоть одна доставка:
+    // листание и действия обновляют `updated_at` батча и доставок в разное
+    // время, поэтому по одной метке нельзя решить, что батч уже не нужен.
+    // Завершённые доставки старше срока удалены выше; если ссылок не осталось и
+    // сам батч старше срока, его можно удалить.
     let purged_notification_batches = sqlx::query(
         "DELETE FROM notification_batches b
          WHERE b.updated_at < $1
            AND NOT EXISTS (
                SELECT 1 FROM notification_deliveries d
-               WHERE d.batch_id = b.id AND d.status = 'pending'
+               WHERE d.batch_id = b.id
            )",
     )
     .bind(now - Duration::days(i64::from(config.outbox_days)))

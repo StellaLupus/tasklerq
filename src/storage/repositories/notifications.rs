@@ -104,33 +104,35 @@ pub async fn insert(
     delivery: &NewDelivery<'_>,
     now: DateTime<Utc>,
 ) -> Result<u64, sqlx::Error> {
-    insert_with_deferred(conn, delivery, false, now).await
+    insert_with_flags(conn, delivery, false, false, now).await
 }
 
-/// Вставить доставку, сразу помеченную как отложенную.
+/// Вставить групповую snooze-доставку действия «Отложить все на час».
 ///
-/// Так создаются snooze-доставки действия «Отложить все на час»: через час они
-/// собираются в одно сводное сообщение, если актуальны две и более.
-pub async fn insert_deferred(
+/// `batched` означает «собрать в сводное в свой срок», но не «отложено тихими
+/// часами»: ручной выпуск и баннер такую доставку не трогают. Если её срок сам
+/// попадёт в тихие часы, тик выставит `deferred` по общему правилу.
+pub async fn insert_batched(
     conn: &mut PgConnection,
     delivery: &NewDelivery<'_>,
     now: DateTime<Utc>,
 ) -> Result<u64, sqlx::Error> {
-    insert_with_deferred(conn, delivery, true, now).await
+    insert_with_flags(conn, delivery, false, true, now).await
 }
 
-async fn insert_with_deferred(
+async fn insert_with_flags(
     conn: &mut PgConnection,
     delivery: &NewDelivery<'_>,
     deferred: bool,
+    batched: bool,
     now: DateTime<Utc>,
 ) -> Result<u64, sqlx::Error> {
     Ok(sqlx::query(
         "INSERT INTO notification_deliveries (
              id, household_id, user_id, item_id, occurrence_key, kind,
-             status, scheduled_at, deferred, created_at, updated_at
+             status, scheduled_at, deferred, batched, created_at, updated_at
          )
-         SELECT $1, $2, $3, $4, $5, $6, 'pending', $7, $8, $9, $9
+         SELECT $1, $2, $3, $4, $5, $6, 'pending', $7, $8, $9, $10, $10
          WHERE NOT EXISTS (
              SELECT 1 FROM notification_deliveries d
              WHERE d.user_id = $3 AND d.item_id IS NOT DISTINCT FROM $4
@@ -142,6 +144,7 @@ async fn insert_with_deferred(
              status = 'pending',
              scheduled_at = EXCLUDED.scheduled_at,
              deferred = EXCLUDED.deferred,
+             batched = EXCLUDED.batched,
              outbox_seq = NULL,
              updated_at = EXCLUDED.updated_at
          WHERE notification_deliveries.status = 'cancelled'",
@@ -154,6 +157,7 @@ async fn insert_with_deferred(
     .bind(delivery.kind)
     .bind(delivery.scheduled_at)
     .bind(deferred)
+    .bind(batched)
     .bind(now)
     .execute(conn)
     .await?

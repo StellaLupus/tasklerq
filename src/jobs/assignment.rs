@@ -11,13 +11,12 @@ use uuid::Uuid;
 
 use super::notice::{NOTICE_ROW_COLUMNS, NOTICE_ROW_FROM, NoticeRow};
 use super::scheduler::{
-    DELIVERY_BATCH, cancel_delivery, desired_schedule, enqueue_message, mark_cancelled, mark_sent,
-    postpone_for_quiet, reschedule_if_changed, resolved_timezone, try_recipient_lock,
+    DELIVERY_BATCH, cancel_delivery, desired_schedule, enqueue_message, load_item_and_list,
+    mark_cancelled, mark_sent, postpone_for_quiet, reschedule_if_changed, resolved_timezone,
+    try_recipient_lock,
 };
-use crate::domain::error::DomainError;
 use crate::domain::models::ItemStatus;
 use crate::domain::settings::NotificationSettings;
-use crate::storage::repositories::{items, lists};
 use crate::telegram::bot::notify;
 
 /// Пересчитать время ещё не доставленных уведомлений о назначении.
@@ -175,33 +174,19 @@ pub(crate) async fn deliver_one_in_conn(
     {
         return Ok(0);
     }
-    let (Some(chat_id), Some(telegram_user_id), Some(item_id)) =
-        (row.telegram_chat_id, row.telegram_user_id, row.item_id)
+    let (Some(chat_id), Some(telegram_user_id)) = (row.telegram_chat_id, row.telegram_user_id)
     else {
         mark_cancelled(&mut *conn, row.id, now).await?;
         return Ok(0);
     };
 
-    let item = match items::get(&mut *conn, row.household_id, item_id).await {
-        Ok(item) => item,
-        Err(DomainError::Database(error)) => return Err(error),
-        Err(_) => {
-            mark_cancelled(&mut *conn, row.id, now).await?;
-            return Ok(0);
-        }
+    let Some((item, list)) = load_item_and_list(&mut *conn, &row, now).await? else {
+        return Ok(0);
     };
     if item.status != ItemStatus::Open || item.assignee_user_id != Some(row.user_id) {
         mark_cancelled(&mut *conn, row.id, now).await?;
         return Ok(0);
     }
-    let list = match lists::get(&mut *conn, row.household_id, item.list_id).await {
-        Ok(list) => list,
-        Err(DomainError::Database(error)) => return Err(error),
-        Err(_) => {
-            mark_cancelled(&mut *conn, row.id, now).await?;
-            return Ok(0);
-        }
-    };
 
     let ui = notify::assignment_ui(&item, &list, row.timezone(), now);
     let html =
