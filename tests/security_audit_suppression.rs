@@ -5,7 +5,7 @@
 
 mod support;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::Router;
@@ -17,9 +17,14 @@ use futures_util::future::join_all;
 use serde_json::json;
 use sqlx::PgPool;
 use tasklerq::config::SecretString;
+use tasklerq::domain::models::{Actor, ActorType};
 use tasklerq::http::router::{AppState, build_router};
 use tasklerq::metrics;
-use tasklerq::security_audit::{Audit, MAX_RECORDS_PER_WINDOW, SUPPRESSION_WINDOW_SECONDS};
+use tasklerq::rate_limit::ip_key;
+use tasklerq::security_audit::{
+    Audit, CAPTURE_LIMIT, LimitKey, MAX_RECORDS_PER_WINDOW, RateLimitEvent,
+    SUPPRESSION_WINDOW_SECONDS, WEBHOOK_LIMIT,
+};
 use tasklerq::telegram::webhook::{Ingress, SECRET_HEADER};
 use tokio::sync::Notify;
 use tower::ServiceExt;
@@ -38,11 +43,15 @@ fn peer() -> SocketAddr {
 }
 
 fn app_with_webhook(pool: &PgPool, audit: Audit) -> Router {
+    app_with_webhook_limit(pool, audit, 100_000, 1)
+}
+
+fn app_with_webhook_limit(pool: &PgPool, audit: Audit, limit: u32, window_seconds: i64) -> Router {
     let ingress = Ingress::with_rate_limit(
         &SecretString::new(SECRET),
         Arc::new(Notify::new()),
-        100_000,
-        1,
+        limit,
+        window_seconds,
     );
     build_router(AppState::new(pool.clone(), audit).with_telegram(ingress))
         .layer(MockConnectInfo(peer()))
@@ -187,5 +196,124 @@ async fn a_webhook_flood_does_not_hide_api_auth_failures() {
     assert_eq!(
         webhook_events, MAX_RECORDS_PER_WINDOW,
         "the webhook flood must exhaust its own cap without touching the API budget"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_webhook_rate_limit_flood_does_not_hide_capture_rate_limits() {
+    let _guard = AUDIT_TEST_LOCK.lock().await;
+    let db = isolated_db().await;
+    let audit = Audit::new(db.pool.clone());
+    // Один запрос на /64, окно на весь тест: второй адрес той же /64 уже
+    // отклоняется по лимиту.
+    let app = app_with_webhook_limit(&db.pool, audit.clone(), 1, 3_600);
+
+    // 60 разных /64 дают 60 отказов по лимиту — больше потолка записей.
+    for index in 0..60 {
+        let first = format!("2001:db8:{index:x}:1::1");
+        let second = format!("2001:db8:{index:x}:1::2");
+        assert_eq!(
+            post_webhook_from(&app, "wrong-secret", &first, b"{}").await,
+            StatusCode::UNAUTHORIZED,
+            "the first request of a /64 is allowed by the rate limit"
+        );
+        assert_eq!(
+            post_webhook_from(&app, "wrong-secret", &second, b"{}").await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    let webhook_events = payloads(&db.pool, "rate_limited")
+        .await
+        .into_iter()
+        .filter(|payload| payload["limit"] == WEBHOOK_LIMIT)
+        .count();
+    assert_eq!(
+        webhook_events, MAX_RECORDS_PER_WINDOW,
+        "the webhook flood must exhaust its own rate-limit record budget"
+    );
+
+    // Превышение лимита capture в той же минуте должно попасть в журнал,
+    // несмотря на исчерпанный потолок webhook.
+    let recorded = audit
+        .rate_limited(
+            RateLimitEvent {
+                limit: CAPTURE_LIMIT,
+                key: LimitKey::Token(Uuid::now_v7()),
+                retry_after: 60,
+                household_id: None,
+                actor: Actor::system(ActorType::System),
+            },
+            Utc::now(),
+        )
+        .await;
+    assert!(
+        recorded,
+        "the capture rate-limit event must be recorded during a webhook flood"
+    );
+
+    let events = payloads(&db.pool, "rate_limited").await;
+    assert!(
+        events
+            .iter()
+            .any(|payload| payload["limit"] == CAPTURE_LIMIT),
+        "the capture rate-limit event must stay visible in the audit log: {events:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn addresses_from_one_ipv6_prefix_share_one_rate_limit_event() {
+    let _guard = AUDIT_TEST_LOCK.lock().await;
+    let db = isolated_db().await;
+    let audit = Audit::new(db.pool.clone());
+    let app = app_with_webhook_limit(&db.pool, audit.clone(), 1, 3_600);
+
+    // Первый запрос /64 разрешён, остальные отклоняются. Ротация младших бит
+    // не должна давать отдельное событие на каждый адрес.
+    for index in 0..5 {
+        let forwarded = format!("2001:db8:1:2::{index:x}");
+        assert_eq!(
+            post_webhook_from(&app, "wrong-secret", &forwarded, b"{}").await,
+            if index == 0 {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::TOO_MANY_REQUESTS
+            }
+        );
+    }
+
+    let events = payloads(&db.pool, "rate_limited").await;
+    assert_eq!(
+        events.len(),
+        1,
+        "one /64 must produce one event: {events:?}"
+    );
+    assert_eq!(events[0]["limit"], WEBHOOK_LIMIT);
+    assert_eq!(events[0]["ip"], "2001:db8:1:2::");
+    assert_eq!(events[0]["suppressed"], 0);
+
+    // Следующая запись после окна подавления сообщает, сколько повторов
+    // подавлено, и остаётся в том же ключе /64.
+    let next: IpAddr = "2001:db8:1:2:ffff::1".parse().expect("ip");
+    let recorded = audit
+        .rate_limited(
+            RateLimitEvent {
+                limit: WEBHOOK_LIMIT,
+                key: LimitKey::Ip(ip_key(next)),
+                retry_after: 1,
+                household_id: None,
+                actor: Actor::system(ActorType::System),
+            },
+            Utc::now() + Duration::seconds(SUPPRESSION_WINDOW_SECONDS + 1),
+        )
+        .await;
+    assert!(recorded, "the first event after the window is written");
+
+    let events = payloads(&db.pool, "rate_limited").await;
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[1]["ip"], "2001:db8:1:2::");
+    assert_eq!(
+        events[1]["suppressed"], 3,
+        "repeats from the same /64 are aggregated, not written per address"
     );
 }

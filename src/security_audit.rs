@@ -60,8 +60,9 @@ enum SuppressKind {
 /// Источник события для потолка записей.
 ///
 /// Отказы webhook и API — один тип [`SuppressKind::AuthFailed`], но общий
-/// потолок позволял флуду webhook вытеснять события API. Поэтому потолок
-/// записей считается отдельно для этих источников.
+/// потолок позволял флуду webhook вытеснять события API. Так же флуд webhook
+/// по лимиту частоты не должен выбирать потолок для `rate_limited` capture,
+/// Telegram и приглашений, поэтому webhook-события считаются отдельно.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum RecordScope {
     All,
@@ -391,6 +392,10 @@ impl Audit {
     }
 
     /// Записать событие отдельным соединением. Ошибка только журналируется.
+    ///
+    /// Возвращает `true`, только если событие действительно сохранено: по
+    /// этому признаку вызывающая сторона отличает записанное событие от
+    /// подавленного повтора или сбоя записи.
     async fn record(
         &self,
         household_id: Option<Uuid>,
@@ -398,7 +403,7 @@ impl Audit {
         event_type: AuditEventType,
         payload: Value,
         now: DateTime<Utc>,
-    ) {
+    ) -> bool {
         let written =
             tokio::time::timeout(std::time::Duration::from_millis(RECORD_TIMEOUT_MS), async {
                 let mut conn = self.inner.pool.acquire().await?;
@@ -412,17 +417,23 @@ impl Audit {
             .await;
 
         match written {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => tracing::warn!(
-                %error,
-                event_type = event_type.as_str(),
-                "security audit event was not recorded"
-            ),
-            Err(_) => tracing::warn!(
-                timeout_ms = RECORD_TIMEOUT_MS,
-                event_type = event_type.as_str(),
-                "security audit event timed out"
-            ),
+            Ok(Ok(_)) => true,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    %error,
+                    event_type = event_type.as_str(),
+                    "security audit event was not recorded"
+                );
+                false
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_ms = RECORD_TIMEOUT_MS,
+                    event_type = event_type.as_str(),
+                    "security audit event timed out"
+                );
+                false
+            }
         }
     }
 
@@ -525,11 +536,20 @@ impl Audit {
     }
 
     /// Сработавший лимит частоты.
-    pub async fn rate_limited(&self, event: RateLimitEvent, now: DateTime<Utc>) {
+    ///
+    /// `true` — событие записано; `false` — повтор подавлен или запись не
+    /// удалась. Метрики вызывающая сторона считает сама.
+    pub async fn rate_limited(&self, event: RateLimitEvent, now: DateTime<Utc>) -> bool {
+        // Превышения лимита webhook считаются отдельно: их флуд не должен
+        // выбирать потолок записей для capture, Telegram и приглашений.
+        let scope = if event.limit == WEBHOOK_LIMIT {
+            RecordScope::Webhook
+        } else {
+            RecordScope::All
+        };
         let key = format!("{}:{}", event.limit, event.key.serialized());
-        let Some(suppressed) = self.check(SuppressKind::RateLimited, RecordScope::All, &key, now)
-        else {
-            return;
+        let Some(suppressed) = self.check(SuppressKind::RateLimited, scope, &key, now) else {
+            return false;
         };
 
         let mut payload = json!({
@@ -546,7 +566,7 @@ impl Audit {
             payload,
             now,
         )
-        .await;
+        .await
     }
 
     /// Ответ LLM не прошёл валидацию. Ни текста пользователя, ни ответа LLM.

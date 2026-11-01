@@ -19,6 +19,7 @@ use crate::config::SecretString;
 use crate::domain::models::{Actor, ActorType};
 use crate::http::error::ApiError;
 use crate::http::router::AppState;
+use crate::metrics;
 use crate::rate_limit::RateLimiter;
 use crate::security_audit::{self, LimitKey, RateLimitEvent};
 
@@ -93,21 +94,21 @@ pub async fn receive(
     let ip = client_ip(peer, forwarded_for(&headers).as_deref());
     let now = Utc::now();
     // IPv6-клиент почти всегда распоряжается целой /64: лимит должен считать
-    // префикс, иначе смена младших 64 бит обходит 120/с.
-    let decision = ingress.rate.check(crate::rate_limit::ip_key(ip), now);
+    // префикс, иначе смена младших 64 бит обходит 120/с. Тот же префикс идёт в
+    // событие аудита, чтобы ротация адреса внутри /64 не давала новый ключ
+    // подавления на каждый запрос.
+    let key = crate::rate_limit::ip_key(ip);
+    let decision = ingress.rate.check(key, now);
     if !decision.allowed {
-        tracing::warn!(
-            ip = %ip,
-            limit = ingress.rate.limit(),
-            "webhook requests from one IP are rate limited"
-        );
+        // Метрика считает каждый отказ, включая подавленные в аудите.
+        metrics::webhook_rate_limited();
         let retry_after = decision.retry_after.unwrap_or(1);
-        state
+        let recorded = state
             .audit
             .rate_limited(
                 RateLimitEvent {
                     limit: security_audit::WEBHOOK_LIMIT,
-                    key: LimitKey::Ip(ip),
+                    key: LimitKey::Ip(key),
                     retry_after,
                     household_id: None,
                     actor: Actor::system(ActorType::System),
@@ -115,6 +116,21 @@ pub async fn receive(
                 now,
             )
             .await;
+        // Предупреждение только на записанное событие: иначе флуд сверх
+        // подавления засорял бы журнал строкой на каждый отклонённый запрос.
+        if recorded {
+            tracing::warn!(
+                ip = %ip,
+                limit = ingress.rate.limit(),
+                "webhook requests from one IP are rate limited"
+            );
+        } else {
+            tracing::debug!(
+                ip = %ip,
+                limit = ingress.rate.limit(),
+                "webhook requests from one IP are rate limited"
+            );
+        }
         return Err(
             ApiError::rate_limited("Too many webhook requests").with_retry_after(retry_after)
         );
@@ -194,13 +210,17 @@ fn forwarded_for(headers: &HeaderMap) -> Option<String> {
 /// bridge-шлюз (`172.x.0.1`), поэтому одного loopback недостаточно. Для
 /// остальных пиров заголовок игнорируется: клиент мог подделать его сам.
 fn client_ip(peer: SocketAddr, forwarded: Option<&str>) -> IpAddr {
-    if is_trusted_proxy(peer.ip())
+    // IPv4-mapped адрес (`::ffff:127.0.0.1`) — это тот же IPv4-клиент на
+    // dual-stack-сокете; без приведения loopback-пир не считался бы доверенным
+    // прокси и `X-Forwarded-For` игнорировался бы.
+    let peer_ip = peer.ip().to_canonical();
+    if is_trusted_proxy(peer_ip)
         && let Some(forwarded) = forwarded
         && let Ok(ip) = forwarded.trim().parse::<IpAddr>()
     {
         return ip;
     }
-    peer.ip()
+    peer_ip
 }
 
 /// Адрес доверенного reverse proxy: loopback, RFC1918 или IPv6 ULA.
@@ -255,5 +275,16 @@ mod tests {
             client_ip(peer([203, 0, 113, 9]), Some("198.51.100.7")),
             IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))
         );
+    }
+
+    #[test]
+    fn an_ipv4_mapped_loopback_peer_is_a_trusted_proxy() {
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:4040".parse().expect("mapped peer");
+        assert_eq!(
+            client_ip(mapped, Some("198.51.100.7")),
+            "198.51.100.7".parse::<IpAddr>().expect("ip")
+        );
+        // Без заголовка пир приводится к каноническому IPv4.
+        assert_eq!(client_ip(mapped, None), IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
 }
