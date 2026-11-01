@@ -3,8 +3,11 @@
 
 mod support;
 
+use std::net::SocketAddr;
+
 use axum::Router;
 use axum::body::Body;
+use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{Method, Request, StatusCode};
 use chrono::{Duration, Utc};
 use http_body_util::BodyExt;
@@ -85,7 +88,9 @@ async fn headless_disabled_telegram_serves_the_home_assistant_scenario() {
         1,
         "disabled Telegram starts only the retention worker"
     );
-    let app = application.router;
+    let app = application
+        .router
+        .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 4040))));
 
     let ha = support::issue_token(&db.pool, household.household_id, &["ha:read", "ha:write"]).await;
     let capture = support::issue_token(&db.pool, household.household_id, &["capture:write"]).await;

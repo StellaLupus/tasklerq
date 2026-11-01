@@ -23,6 +23,10 @@ use super::{audit, households, users};
 pub const TTL_HOURS: i64 = 72;
 /// Максимум активных приглашений в household.
 pub const MAX_ACTIVE: i64 = 5;
+/// Максимум созданных приглашений в час на household.
+pub const MAX_PER_HOUR: i64 = 5;
+/// Окно часового лимита приглашений, часы.
+const RATE_WINDOW_HOURS: i64 = 1;
 /// Допустимая длина кода.
 const CODE_LENGTH: std::ops::RangeInclusive<usize> = 8..=16;
 
@@ -57,6 +61,44 @@ pub async fn create(
     now: DateTime<Utc>,
 ) -> Result<CreatedInvite, DomainError> {
     let owner = users::lock_and_require_owner(conn, household_id, actor).await?;
+
+    // Часовой лимит считается по базе, включая отозванные и использованные
+    // приглашения, поэтому переживает рестарт сервиса.
+    let cutoff = now - Duration::hours(RATE_WINDOW_HOURS);
+    let (recent, oldest): (i64, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT count(*), MIN(created_at) FROM invites
+         WHERE household_id = $1 AND created_at > $2",
+    )
+    .bind(household_id)
+    .bind(cutoff)
+    .fetch_one(&mut *conn)
+    .await?;
+    if recent >= MAX_PER_HOUR {
+        let retry_after = oldest
+            .map(|at| {
+                let wait = at + Duration::hours(RATE_WINDOW_HOURS) - now;
+                let mut seconds = wait.num_seconds();
+                if wait.subsec_nanos() > 0 {
+                    seconds += 1;
+                }
+                seconds.max(1)
+            })
+            .unwrap_or_else(|| RATE_WINDOW_HOURS * 3_600);
+        tracing::warn!(
+            household_id = %household_id,
+            limit = MAX_PER_HOUR,
+            retry_after,
+            "invite creation is rate limited"
+        );
+        return Err(DomainError::conflict_with(
+            format!("at most {MAX_PER_HOUR} invites per hour are allowed"),
+            json!({
+                "reason": "invite_rate_limit",
+                "limit": MAX_PER_HOUR,
+                "retry_after": retry_after,
+            }),
+        ));
+    }
 
     let active: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM invites

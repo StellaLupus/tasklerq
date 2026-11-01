@@ -503,11 +503,14 @@ async fn concurrent_use_of_one_code_admits_one_user() {
 async fn at_most_five_active_invites() {
     let db = support::db().await;
     let household = support::create_household(&db.pool).await;
-    let now = Utc::now();
+    // Приглашения создаются с шагом в час, чтобы часовой лимит не мешал
+    // проверке лимита активных.
+    let start = Utc::now();
+    let now = start + Duration::hours(6);
 
     let mut created = Vec::new();
-    for _ in 0..5 {
-        created.push(create_invite(&db.pool, &household, now).await);
+    for index in 0..5 {
+        created.push(create_invite(&db.pool, &household, start + Duration::hours(index)).await);
     }
     let mut tx = db.pool.begin().await.expect("tx");
     let error = invites::create(&mut tx, household.household_id, &household.owner(), now)
@@ -553,6 +556,72 @@ async fn at_most_five_active_invites() {
     .await
     .expect("active");
     assert!(active.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn at_most_five_invites_per_hour_including_revoked_ones() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let mut tx = db.pool.begin().await.expect("tx");
+
+    let mut created = Vec::new();
+    for index in 0..5 {
+        created.push(
+            invites::create(
+                &mut tx,
+                household.household_id,
+                &household.owner(),
+                now + Duration::minutes(index * 5),
+            )
+            .await
+            .expect("invite"),
+        );
+    }
+    // Отозванные приглашения всё равно считаются в часовом окне.
+    for invite in &created {
+        invites::revoke(
+            &mut tx,
+            household.household_id,
+            &household.owner(),
+            invite.invite.id,
+            now + Duration::minutes(30),
+        )
+        .await
+        .expect("revoke");
+    }
+
+    let error = invites::create(
+        &mut tx,
+        household.household_id,
+        &household.owner(),
+        now + Duration::minutes(31),
+    )
+    .await
+    .expect_err("hourly limit");
+    assert_eq!(reason(&error).as_deref(), Some("invite_rate_limit"));
+    let details = match &error {
+        DomainError::Conflict { details, .. } => details,
+        other => panic!("unexpected error: {other:?}"),
+    };
+    let retry_after = details["retry_after"]
+        .as_u64()
+        .expect("retry_after in details");
+    assert!(
+        (1..=3_600).contains(&retry_after),
+        "retry_after must point inside the hour: {retry_after}"
+    );
+
+    // Через час окно освобождается.
+    invites::create(
+        &mut tx,
+        household.household_id,
+        &household.owner(),
+        now + Duration::hours(1) + Duration::seconds(1),
+    )
+    .await
+    .expect("the hour window has passed");
+    tx.commit().await.expect("commit");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

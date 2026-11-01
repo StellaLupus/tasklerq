@@ -16,7 +16,7 @@ use super::bot::Bot;
 use super::capture_worker::CaptureWorker;
 use super::outbox::OutboxWorker;
 use super::webhook::Ingress;
-use super::worker::{UpdateWorker, poll};
+use super::worker::{UPDATES_PER_MINUTE, UpdateWorker, poll};
 
 /// Запущенная Telegram-часть.
 pub struct Runtime {
@@ -92,7 +92,8 @@ pub async fn start(
         api.clone(),
         config.queue.max_attempts,
         wake_outbox.clone(),
-    );
+    )
+    .with_rate_limit(UPDATES_PER_MINUTE);
     tasks.push(tokio::spawn(updates.run(wake_updates, shutdown.clone())));
 
     let scheduler = Scheduler::new(pool.clone(), wake_outbox.clone());

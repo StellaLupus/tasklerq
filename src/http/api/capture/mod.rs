@@ -307,6 +307,11 @@ async fn capture_inner(
     // такой же запрос и тоже расходует лимит.
     let decision = capture.rate.check(auth.token_id, now);
     if !decision.allowed {
+        tracing::warn!(
+            limit = capture.rate.limit(),
+            household_id = %auth.household_id,
+            "capture requests are rate limited"
+        );
         return Err(ApiError::rate_limited("Too many capture requests")
             .with_retry_after(decision.retry_after.unwrap_or(60)));
     }

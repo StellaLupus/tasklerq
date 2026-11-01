@@ -606,10 +606,23 @@ pub async fn invite_create(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
     let actor = ctx.actor()?;
     let created = match invites::create(&mut *ctx.conn, household_id, &actor, ctx.now).await {
         Ok(created) => created,
-        Err(DomainError::Conflict { .. }) => {
-            return Err(Fail::User(
-                "Уже есть 5 активных приглашений. Отзовите ненужные и попробуйте снова.".into(),
-            ));
+        Err(DomainError::Conflict { details, .. }) => {
+            if details.get("reason").and_then(Value::as_str) == Some("invite_rate_limit") {
+                let seconds = details
+                    .get("retry_after")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(3_600);
+                let minutes = i64::try_from(seconds.div_ceil(60).max(1)).unwrap_or(60);
+                return Err(Fail::User(format!(
+                    "Не больше {} приглашений в час. Попробуйте через {}.",
+                    invites::MAX_PER_HOUR,
+                    ru::minutes(minutes)
+                )));
+            }
+            return Err(Fail::User(format!(
+                "Уже есть {} активных приглашений. Отзовите ненужные и попробуйте снова.",
+                invites::MAX_ACTIVE
+            )));
         }
         Err(error) => return Err(error.into()),
     };

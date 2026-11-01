@@ -9,6 +9,7 @@ pub mod domain;
 pub mod home_assistant;
 pub mod http;
 pub mod jobs;
+pub mod rate_limit;
 pub mod storage;
 pub mod telegram;
 

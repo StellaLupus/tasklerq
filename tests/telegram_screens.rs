@@ -611,6 +611,33 @@ async fn invites_can_be_revoked_and_are_single_use() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sixth_invite_within_an_hour_is_refused_with_retry_time() {
+    let db = db().await;
+    let mut owner = onboarded_named(&db.pool, "Алексей").await;
+    owner.press("Настройки").await;
+    owner.press("Семья").await;
+    owner.press("Пригласить").await;
+
+    for _ in 0..5 {
+        owner.press("Создать приглашение").await;
+        owner.press("Все приглашения").await;
+    }
+    owner.press("Создать приглашение").await;
+
+    let toast = owner
+        .fake
+        .answers()
+        .into_iter()
+        .filter_map(|(_, text, _)| text)
+        .find(|text| text.contains("приглашений в час"))
+        .expect("the owner should see the invite rate limit");
+    assert!(
+        toast.contains("Попробуйте через"),
+        "the toast must tell when to retry: {toast}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn removal_leaving_and_transfer_notify_participants() {
     let db = db().await;
     let mut owner = onboarded_named(&db.pool, "Алексей").await;

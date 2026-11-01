@@ -128,7 +128,7 @@
 
 ## 8. Безопасность и эксплуатация
 
-- [ ] 8.1 Реализовать rate limiting (20 updates/min, 10 capture/min, 5 invites/hour, 120 webhook/s на IP) с `Retry-After`; проверить тестами.
+- [x] 8.1 Реализовать rate limiting (20 updates/min, 10 capture/min, 5 invites/hour, 120 webhook/s на IP) с `Retry-After`; проверить тестами.
 - [ ] 8.2 Реализовать защиту capture: `capture:write`, запрет query-токена, тело 16 КБ, текст 2000, `Idempotency-Key`, отсутствие текста в логах; проверить security-тестами.
 - [ ] 8.3 Реализовать валидацию ввода, удаление управляющих символов, HTML-экранирование и параметризованные запросы; проверить security-тестами XSS/SQLi.
 - [ ] 8.4 Реализовать redaction секретов в логах, diagnostics и ошибках; проверить тестом с токеном и паролем.

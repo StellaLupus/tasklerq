@@ -2,10 +2,12 @@
 
 mod support;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
+use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -13,15 +15,34 @@ use sqlx::PgPool;
 use support::db;
 use tasklerq::config::SecretString;
 use tasklerq::http::router::{AppState, build_router};
-use tasklerq::telegram::webhook::{Ingress, MAX_BODY_BYTES, SECRET_HEADER};
+use tasklerq::telegram::webhook::{Ingress, MAX_BODY_BYTES, SECRET_HEADER, WEBHOOKS_PER_SECOND};
 use tokio::sync::Notify;
 use tower::ServiceExt;
 
 const SECRET: &str = "webhook-secret";
 
-fn app(pool: &PgPool) -> Router {
+/// Пир внутри контейнера — шлюз Docker bridge, как в `docker-compose.yml`.
+fn peer() -> SocketAddr {
+    SocketAddr::from(([172, 18, 0, 1], 4040))
+}
+
+fn app_for(pool: &PgPool, peer: SocketAddr) -> Router {
     let ingress = Ingress::new(&SecretString::new(SECRET), Arc::new(Notify::new()));
-    build_router(AppState::new(pool.clone()).with_telegram(ingress))
+    build_router(AppState::new(pool.clone()).with_telegram(ingress)).layer(MockConnectInfo(peer))
+}
+
+fn app_with_window(pool: &PgPool, peer: SocketAddr, window_seconds: i64) -> Router {
+    let ingress = Ingress::with_rate_limit(
+        &SecretString::new(SECRET),
+        Arc::new(Notify::new()),
+        WEBHOOKS_PER_SECOND,
+        window_seconds,
+    );
+    build_router(AppState::new(pool.clone()).with_telegram(ingress)).layer(MockConnectInfo(peer))
+}
+
+fn app(pool: &PgPool) -> Router {
+    app_for(pool, peer())
 }
 
 async fn post(app: &Router, secret: Option<&str>, body: Vec<u8>) -> (StatusCode, Value) {
@@ -45,6 +66,34 @@ async fn post(app: &Router, secret: Option<&str>, body: Vec<u8>) -> (StatusCode,
         status,
         serde_json::from_slice(&bytes).unwrap_or(Value::Null),
     )
+}
+
+async fn post_forwarded(
+    app: &Router,
+    secret: Option<&str>,
+    forwarded: &str,
+    body: Vec<u8>,
+) -> (StatusCode, Option<String>) {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/webhooks/telegram")
+        .header("x-forwarded-for", forwarded);
+    if let Some(secret) = secret {
+        request = request.header(SECRET_HEADER, secret);
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(Body::from(body)).expect("request"))
+        .await
+        .expect("response");
+    let status = response.status();
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let _ = response.into_body().collect().await;
+    (status, retry_after)
 }
 
 fn update(id: i64, chat_kind: &str, chat_id: i64) -> Vec<u8> {
@@ -107,6 +156,44 @@ async fn duplicate_update_id_is_stored_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_121st_request_from_one_ip_is_rejected_and_not_queued() {
+    let db = db().await;
+    // Окно расширено, чтобы 121 последовательный запрос гарантированно попал
+    // в одно окно; скользящее окно в секунду проверяется unit-тестом лимитера.
+    let app = app_with_window(&db.pool, peer(), 3_600);
+
+    // За прокси (шлюз Docker bridge) лимит считается по последнему
+    // X-Forwarded-For.
+    for _ in 0..120 {
+        let (status, retry_after) = post_forwarded(&app, None, "203.0.113.7", b"{}".to_vec()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(retry_after.is_none());
+    }
+
+    let (status, retry_after) = post_forwarded(
+        &app,
+        Some(SECRET),
+        "203.0.113.7",
+        update(5_100_001, "private", 42),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(retry_after.is_some(), "Retry-After is required");
+    assert_eq!(stored(&db.pool, 5_100_001).await, 0);
+
+    // Другой IP в ту же секунду обрабатывается как обычно.
+    let (status, _) = post_forwarded(
+        &app,
+        Some(SECRET),
+        "203.0.113.8",
+        update(5_100_002, "private", 42),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stored(&db.pool, 5_100_002).await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn group_updates_are_acknowledged_but_not_stored() {
     let db = db().await;
     let app = app(&db.pool);
@@ -142,7 +229,7 @@ async fn malformed_and_oversized_bodies_are_rejected() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn route_is_absent_when_webhook_mode_is_off() {
     let db = db().await;
-    let app = build_router(AppState::new(db.pool.clone()));
+    let app = build_router(AppState::new(db.pool.clone())).layer(MockConnectInfo(peer()));
 
     let (status, _) = post(&app, Some(SECRET), update(5_000_020, "private", 42)).await;
 

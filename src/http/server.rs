@@ -5,6 +5,7 @@
 
 use std::future::{Future, IntoFuture};
 use std::io;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use axum::Router;
@@ -35,11 +36,14 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let server = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let _ = shutdown_rx.await;
-        })
-        .into_future();
+    let server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = shutdown_rx.await;
+    })
+    .into_future();
     tokio::pin!(server);
 
     tokio::select! {
