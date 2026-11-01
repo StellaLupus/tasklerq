@@ -550,6 +550,241 @@ async fn moving_quiet_start_later_does_not_release_a_snooze_early() {
     snooze_not_released_before_its_own_time(true).await;
 }
 
+/// Сокращение тихих часов не выпускает snooze раньше его собственного срока:
+/// запись возвращается к своему сроку и снимает признак отложенности.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shortening_quiet_hours_does_not_release_a_snooze_early() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    let at = local_utc(moscow, day, 21, 30);
+    bot.advance(at - bot.now);
+    quiet_settings(&db.pool, household.owner_id, false).await;
+
+    let due = local_utc(moscow, day, 23, 0);
+    for title in ["Первая", "Вторая"] {
+        let item = create_task(&db.pool, &household, title, due, None).await;
+        deferred_reminder(&db.pool, &household, item.id, due, at).await;
+    }
+
+    tick_and_deliver(&mut bot, &db.pool, at).await;
+    let (message_id, html) = bot.latest();
+    let snooze = button_of(&html, "На час");
+    bot.press_data(&snooze, message_id).await;
+    let snoozed_at = local_utc(moscow, day, 22, 30);
+    let delivery_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM notification_deliveries
+         WHERE kind = 'snooze' AND status = 'pending'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("snooze delivery");
+
+    // 21:40: срок snooze (22:30) попал в тихие часы — общее правило переносит
+    // его на 08:00 и помечает отложенным тихими часами.
+    let morning = local_utc(moscow, day + Duration::days(1), 8, 0);
+    tick_and_deliver(&mut bot, &db.pool, at + Duration::minutes(10)).await;
+    let (scheduled_at, deferred): (DateTime<Utc>, bool) =
+        sqlx::query_as("SELECT scheduled_at, deferred FROM notification_deliveries WHERE id = $1")
+            .bind(delivery_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("deferred snooze");
+    assert_eq!(scheduled_at, morning);
+    assert!(deferred);
+
+    // 21:50: тихие часы меняют на 21:00–22:00. Всё ещё тихо, ручного выпуска
+    // нет, но snooze со сроком 22:30 не должен переехать на конец интервала.
+    bot.advance(local_utc(moscow, day, 21, 50) - bot.now);
+    open_notifications(&mut bot).await;
+    let sent_before = bot.fake.sent().len();
+    bot.press("Начало тихих").await;
+    bot.text("21:00").await;
+    bot.press("Конец тихих").await;
+    bot.text("22:00").await;
+
+    assert!(!bot.screen().contains("Накопилось"), "{}", bot.screen());
+    assert_eq!(
+        bot.fake.sent().len(),
+        sent_before,
+        "snooze must not be sent before its own time"
+    );
+    let (scheduled_at, deferred): (DateTime<Utc>, bool) =
+        sqlx::query_as("SELECT scheduled_at, deferred FROM notification_deliveries WHERE id = $1")
+            .bind(delivery_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("restored snooze");
+    assert_eq!(scheduled_at, snoozed_at);
+    assert!(!deferred);
+
+    // 22:00: конец тихого интервала ничего не выпускает — snooze ещё ждёт.
+    assert_eq!(
+        tick_and_deliver(&mut bot, &db.pool, local_utc(moscow, day, 22, 0))
+            .await
+            .delivered,
+        0
+    );
+    // 22:30: срок наступил — snooze приходит обычным сообщением.
+    assert_eq!(
+        tick_and_deliver(&mut bot, &db.pool, snoozed_at)
+            .await
+            .delivered,
+        1
+    );
+    let (_, next) = bot.latest();
+    assert!(!next.contains("Пока были тихие часы"), "{next}");
+    assert!(next.contains("Пора"), "{next}");
+}
+
+/// Snooze, собственный срок которого попадает в новый тихий интервал, ждёт
+/// конца интервала, а не уходит раньше своего срока.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snooze_inside_the_new_quiet_interval_waits_for_its_end() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    let at = local_utc(moscow, day, 21, 50);
+    bot.advance(at - bot.now);
+    quiet_settings(&db.pool, household.owner_id, false).await;
+
+    let due = local_utc(moscow, day, 23, 0);
+    let item = create_task(&db.pool, &household, "Отложенная", due, None).await;
+    let snoozed_at = local_utc(moscow, day, 21, 55);
+    let morning = local_utc(moscow, day + Duration::days(1), 8, 0);
+    let delivery_id = insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        item.id,
+        "snooze",
+        &format!("snooze:{}", snoozed_at.timestamp()),
+        morning,
+        true,
+    )
+    .await;
+
+    // 21:50–22:00: тихие часы сокращаются, срок snooze (21:55) внутри нового
+    // интервала — он ждёт конца, но не раньше своего срока.
+    open_notifications(&mut bot).await;
+    bot.press("Начало тихих").await;
+    bot.text("21:00").await;
+    bot.press("Конец тихих").await;
+    bot.text("22:00").await;
+
+    let (scheduled_at, deferred): (DateTime<Utc>, bool) =
+        sqlx::query_as("SELECT scheduled_at, deferred FROM notification_deliveries WHERE id = $1")
+            .bind(delivery_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("postponed snooze");
+    assert_eq!(scheduled_at, local_utc(moscow, day, 22, 0));
+    assert!(deferred);
+
+    // 22:00: конец интервала наступил — snooze приходит.
+    assert_eq!(
+        tick_and_deliver(&mut bot, &db.pool, local_utc(moscow, day, 21, 59))
+            .await
+            .delivered,
+        0
+    );
+    assert_eq!(
+        tick_and_deliver(&mut bot, &db.pool, local_utc(moscow, day, 22, 0))
+            .await
+            .delivered,
+        1
+    );
+}
+
+/// Ручной выпуск смешанного набора: два обычных отложенных уходят одним
+/// сводным, а snooze с будущим сроком возвращается к своему сроку и приходит
+/// тогда, когда должен.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_release_sends_deferred_as_one_batch_and_restores_a_future_snooze() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    let at = local_utc(moscow, day, 21, 50);
+    bot.advance(at - bot.now);
+    quiet_settings(&db.pool, household.owner_id, false).await;
+
+    let due = local_utc(moscow, day, 23, 0);
+    let morning = local_utc(moscow, day + Duration::days(1), 8, 0);
+    let mut items = Vec::new();
+    for title in ["Первая", "Вторая"] {
+        let item = create_task(&db.pool, &household, title, due, None).await;
+        deferred_reminder(&db.pool, &household, item.id, due, morning).await;
+        items.push(item);
+    }
+    let snoozed_at = local_utc(moscow, day, 22, 30);
+    let snooze_id = insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        items[0].id,
+        "snooze",
+        &format!("snooze:{}", snoozed_at.timestamp()),
+        morning,
+        true,
+    )
+    .await;
+
+    open_notifications(&mut bot).await;
+    let sent_before = bot.fake.sent().len();
+    bot.press("Тихие часы: вкл").await;
+
+    let screen = bot.screen();
+    assert!(screen.contains("Накопилось 2 уведомления"), "{screen}");
+    let messages = bot.fake.messages(bot.chat);
+    let batches: Vec<&(i64, String)> = messages
+        .iter()
+        .filter(|(_, html)| html.contains("Пока были тихие часы"))
+        .collect();
+    assert_eq!(batches.len(), 1, "manual release sends exactly one batch");
+    let (_, batch) = batches[0];
+    assert_eq!(block_count(batch, "⏰ напоминание"), 2, "{batch}");
+    assert_eq!(block_count(batch, "😴 отложенное"), 0, "{batch}");
+    assert!(
+        bot.fake.sent().len() > sent_before,
+        "the batch and the screen must be queued"
+    );
+
+    let (scheduled_at, deferred): (DateTime<Utc>, bool) =
+        sqlx::query_as("SELECT scheduled_at, deferred FROM notification_deliveries WHERE id = $1")
+            .bind(snooze_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("restored snooze");
+    assert_eq!(scheduled_at, snoozed_at);
+    assert!(!deferred);
+
+    // В 22:30 snooze приходит обычным сообщением, сводное не повторяется.
+    assert_eq!(
+        tick_and_deliver(&mut bot, &db.pool, snoozed_at)
+            .await
+            .delivered,
+        1
+    );
+    let (_, next) = bot.latest();
+    assert!(!next.contains("Пока были тихие часы"), "{next}");
+    assert!(next.contains("Пора"), "{next}");
+    let messages = bot.fake.messages(bot.chat);
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|(_, html)| html.contains("Пока были тихие часы"))
+            .count(),
+        1,
+        "the batch must not be sent again"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_release_sends_nothing_when_the_scheduler_already_delivered() {
     let db = support::isolated_db().await;

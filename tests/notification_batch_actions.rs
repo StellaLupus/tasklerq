@@ -695,6 +695,113 @@ async fn archived_list_block_has_its_own_label_and_does_nothing() {
     assert_eq!(completed_events(&db.pool, first.id).await, 0);
 }
 
+/// После «Завершить все» блоки, по которым действие уже невозможно, не меняются.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn complete_all_keeps_done_missing_and_archived_blocks_unchanged() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = bot.now.with_timezone(&moscow).date_naive();
+    let morning = local_utc(moscow, day, 8, 0);
+    let due = local_utc(moscow, day, 9, 0);
+
+    let done = create_task(&db.pool, &household, "Выполнят заранее", due, None).await;
+    let deleted = create_task(&db.pool, &household, "Удалят", due, None).await;
+    let open = create_task(&db.pool, &household, "Останется", due, None).await;
+    // Отдельный список задач, который после выпуска отправят в архив.
+    let archived_list = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO lists (id, household_id, kind, name) VALUES ($1, $2, 'tasks', 'Архивный')",
+    )
+    .bind(archived_list)
+    .bind(household.household_id)
+    .execute(&db.pool)
+    .await
+    .expect("archived list");
+    let mut archived_item = support::new_item(archived_list, "В архиве");
+    archived_item.due_at = Some(due);
+    archived_item.assignee_user_id = Some(household.owner_id);
+    let archived = support::create_item(
+        &db.pool,
+        &household,
+        archived_list,
+        &household.owner(),
+        archived_item,
+    )
+    .await;
+
+    for item in [&done, &deleted, &open, &archived] {
+        deferred_reminder(&db.pool, &household, item.id, due, morning).await;
+    }
+    tick_and_deliver(&mut bot, &db.pool, morning).await;
+    let (message_id, html) = bot.latest();
+    assert_eq!(block_count(&html, "⏰ напоминание"), 4, "{html}");
+
+    let mut conn = db.pool.acquire().await.expect("conn");
+    items::soft_delete(
+        &mut conn,
+        household.household_id,
+        &Actor::user(household.owner_id, UserRole::Owner),
+        deleted.id,
+        bot.now,
+    )
+    .await
+    .expect("delete");
+    sqlx::query("UPDATE lists SET is_archived = true WHERE id = $1")
+        .bind(archived_list)
+        .execute(&db.pool)
+        .await
+        .expect("archive list");
+
+    let done_button = button_of(&html, "Готово");
+    bot.press_data(&done_button, message_id).await;
+    let before = batch_message(&bot, message_id);
+    assert!(before.contains("✅ Выполнено"), "{before}");
+    assert!(before.contains("Задача удалена"), "{before}");
+    assert!(before.contains("Список в архиве"), "{before}");
+    let done_version = item_status(&db.pool, done.id).await.1;
+    let archived_version = item_status(&db.pool, archived.id).await.1;
+
+    let complete_all = button_of(&before, "Завершить все");
+    bot.press_data(&complete_all, message_id).await;
+
+    assert_eq!(item_status(&db.pool, open.id).await.0, "done");
+    assert_eq!(item_status(&db.pool, done.id).await.1, done_version);
+    assert_eq!(item_status(&db.pool, archived.id).await.1, archived_version);
+    assert_eq!(item_status(&db.pool, archived.id).await.0, "open");
+    let deleted_at: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT deleted_at FROM items WHERE id = $1")
+            .bind(deleted.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("deleted item");
+    assert!(deleted_at.is_some());
+
+    let after = batch_message(&bot, message_id);
+    assert!(after.contains("Выполнено 1"), "{after}");
+    assert!(after.contains("✅ Выполнено"), "{after}");
+    assert!(after.contains("Задача удалена"), "{after}");
+    assert!(after.contains("Список в архиве"), "{after}");
+
+    let again = button_of(&after, "Завершить все");
+    bot.press_data(&again, message_id).await;
+    // Кнопки получают новые callback-токены на каждую отрисовку: сравниваем
+    // видимую часть сообщения.
+    let visible = |html: &str| {
+        html.split("<tg-button-row>")
+            .next()
+            .unwrap_or(html)
+            .to_owned()
+    };
+    assert_eq!(
+        visible(&batch_message(&bot, message_id)),
+        visible(&after),
+        "a repeated «Завершить все» must not change the message"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn assignment_from_an_archived_list_keeps_its_actions_in_a_block() {
     let db = support::isolated_db().await;

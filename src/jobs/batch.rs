@@ -312,11 +312,11 @@ async fn prepare_deferred_batch(
     })
 }
 
-/// Вернуть отложенный тихими часами snooze его собственному сроку.
+/// Вернуть snooze его собственному сроку.
 ///
-/// Ручной выпуск выполняется, когда сейчас уже не тихо, но срок snooze может
-/// быть ещё впереди: выпускать запись раньше нельзя. Она остаётся `pending`, и
-/// обычный путь доставит её в срок или снова отложит, если тогда тихо.
+/// Вызывается, когда срок ещё впереди: ручным выпуском или переносом после
+/// правки тихих часов. Выпускать запись раньше нельзя. Она остаётся `pending`,
+/// и обычный путь доставит её в срок или снова отложит, если тогда тихо.
 async fn restore_snooze_time(
     conn: &mut PgConnection,
     id: Uuid,
@@ -408,16 +408,54 @@ async fn deliver_single_deferred(
 /// по-прежнему тихо: выпускать нечего, но старое зафиксированное время больше
 /// не соответствует новому интервалу. Групповой snooze не переносится: он ждёт
 /// своего срока.
+///
+/// Snooze никогда не уходит раньше собственного срока: ему ставится
+/// `max(конец интервала, свой срок)`. Если собственный срок позже конца нового
+/// интервала, он и возвращается записи, а признак отложенности снимается — так
+/// же, как при ручном выпуске.
 pub(crate) async fn postpone_deferred_for_user(
     conn: &mut PgConnection,
     user_id: Uuid,
     end: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> Result<u64, sqlx::Error> {
-    Ok(sqlx::query(
+    let mut postponed = 0;
+    let snoozes: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, occurrence_key FROM notification_deliveries
+         WHERE user_id = $1 AND status = 'pending' AND deferred AND kind = 'snooze'",
+    )
+    .bind(user_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    for (id, occurrence_key) in snoozes {
+        match notifications::snooze_key_time(&occurrence_key) {
+            // Свой срок вне нового интервала: вернуть его и снять признак
+            // отложенности, иначе запись ушла бы раньше срока.
+            Some(at) if at > end => {
+                restore_snooze_time(&mut *conn, id, at, now).await?;
+                postponed += 1;
+            }
+            _ => {
+                postponed += sqlx::query(
+                    "UPDATE notification_deliveries
+                     SET scheduled_at = $2, deferred = true, updated_at = $3
+                     WHERE id = $1 AND status = 'pending' AND scheduled_at <> $2",
+                )
+                .bind(id)
+                .bind(end)
+                .bind(now)
+                .execute(&mut *conn)
+                .await?
+                .rows_affected();
+            }
+        }
+    }
+
+    postponed += sqlx::query(
         "UPDATE notification_deliveries
          SET scheduled_at = $2, deferred = true, updated_at = $3
          WHERE user_id = $1 AND status = 'pending' AND deferred
+           AND kind <> 'snooze'
            AND scheduled_at <> $2",
     )
     .bind(user_id)
@@ -425,7 +463,8 @@ pub(crate) async fn postpone_deferred_for_user(
     .bind(now)
     .execute(&mut *conn)
     .await?
-    .rows_affected())
+    .rows_affected();
+    Ok(postponed)
 }
 
 /// Отобрать отложенные тихими часами уведомления для ручного выпуска.
