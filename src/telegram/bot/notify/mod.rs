@@ -51,6 +51,12 @@ pub(crate) fn when_line(
     }
 }
 
+/// Название задачи в уведомлении или блоке сводного сообщения: жирным и
+/// обрезанным до 120 символов.
+pub(super) fn title_spans(title: &str) -> Vec<Span> {
+    vec![Span::bold(clip(title, 120))]
+}
+
 /// Напоминание о сроке.
 pub fn reminder_ui(
     item: &Item,
@@ -65,7 +71,7 @@ pub fn reminder_ui(
     };
     Ui::new()
         .heading(heading)
-        .spans(vec![Span::bold(clip(&item.title, 120))])
+        .spans(title_spans(&item.title))
         .text(when_line(item.due_at, item.due_date, &list.name, tz, now))
         .row(vec![
             button(
@@ -99,7 +105,7 @@ pub fn reminder_ui(
 pub fn assignment_ui(item: &Item, list: &List, tz: Tz, now: DateTime<Utc>) -> Ui {
     Ui::new()
         .heading("👤 Вам назначили задачу")
-        .spans(vec![Span::bold(clip(&item.title, 120))])
+        .spans(title_spans(&item.title))
         .text(when_line(item.due_at, item.due_date, &list.name, tz, now))
         .row(vec![
             button("📋 Открыть", Action::NoticeOpen { item_id: item.id }),
@@ -345,6 +351,35 @@ pub(super) fn snooze_time(
     Ok(DateTime::<Utc>::from_timestamp(at.timestamp(), 0).unwrap_or(at))
 }
 
+/// Поставить snooze-доставку задачи на `deliver_at`.
+///
+/// `batched` — групповой snooze: несколько таких задач приходят одним сводным
+/// сообщением. Ключ включает время snooze, поэтому повторное нажатие той же
+/// кнопки не создаёт вторую доставку, а планировщик не путает её с вхождением
+/// срока.
+pub(super) async fn insert_snooze(
+    ctx: &mut Ctx<'_>,
+    item_id: Uuid,
+    deliver_at: DateTime<Utc>,
+    batched: bool,
+) -> Result<(), Fail> {
+    let occurrence_key = notifications::snooze_key(deliver_at);
+    let delivery = NewDelivery {
+        household_id: ctx.household()?.id,
+        user_id: ctx.user()?.id,
+        item_id: Some(item_id),
+        kind: NotificationKind::Snooze,
+        occurrence_key: &occurrence_key,
+        scheduled_at: deliver_at,
+    };
+    if batched {
+        notifications::insert_batched(&mut *ctx.conn, &delivery, ctx.now).await?;
+    } else {
+        notifications::insert(&mut *ctx.conn, &delivery, ctx.now).await?;
+    }
+    Ok(())
+}
+
 /// «Отложить»: создаёт отдельную доставку, которую отправит планировщик.
 pub async fn snooze(
     ctx: &mut Ctx<'_>,
@@ -352,8 +387,6 @@ pub async fn snooze(
     item_id: Uuid,
     until: SnoozeUntil,
 ) -> Result<(), Fail> {
-    let household_id = ctx.household()?.id;
-    let user_id = ctx.user()?.id;
     let Some((item, _)) = load(ctx, item_id).await? else {
         ctx.toast("Задача больше недоступна");
         return show_current(ctx, message_id, item_id).await;
@@ -364,18 +397,7 @@ pub async fn snooze(
     }
 
     let deliver_at = snooze_time(until, ctx.tz, ctx.now)?;
-    // Ключ включает время snooze, поэтому повторное нажатие той же кнопки не
-    // создаёт вторую доставку, а планировщик не путает её с вхождением срока.
-    let occurrence_key = notifications::snooze_key(deliver_at);
-    let delivery = NewDelivery {
-        household_id,
-        user_id,
-        item_id: Some(item_id),
-        kind: NotificationKind::Snooze,
-        occurrence_key: &occurrence_key,
-        scheduled_at: deliver_at,
-    };
-    notifications::insert(&mut *ctx.conn, &delivery, ctx.now).await?;
+    insert_snooze(ctx, item_id, deliver_at, false).await?;
 
     let local = deliver_at.with_timezone(&ctx.tz);
     ctx.toast("Отложено");

@@ -3,9 +3,7 @@
 use uuid::Uuid;
 
 use crate::domain::models::{Item, ItemStatus, List, ListKind, RecurrenceFreq};
-use crate::domain::settings::{
-    NotificationSettings, NotificationSettingsUpdate, ProfileUpdate, parse_hhmm,
-};
+use crate::domain::settings::{NotificationSettingsUpdate, ProfileUpdate, parse_hhmm};
 use crate::domain::validation::validate_new_item;
 use crate::storage::repositories::{items, lists, members, users};
 use crate::telegram::views::{self};
@@ -118,53 +116,15 @@ async fn set_lead(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
 async fn set_time(ctx: &mut Ctx<'_>, field: TimeField, text: &str) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
     let actor = ctx.actor()?;
-    let value = text.trim().to_owned();
+    let value = text.trim();
 
-    let update = match field {
-        TimeField::Digest => NotificationSettingsUpdate {
-            digest_time: Some(value.clone()),
-            ..NotificationSettingsUpdate::default()
-        },
-        TimeField::AllDay => NotificationSettingsUpdate {
-            all_day_time: Some(value.clone()),
-            ..NotificationSettingsUpdate::default()
-        },
-        TimeField::QuietStart => NotificationSettingsUpdate {
-            quiet_start: Some(value.clone()),
-            ..NotificationSettingsUpdate::default()
-        },
-        TimeField::QuietEnd => NotificationSettingsUpdate {
-            quiet_end: Some(value.clone()),
-            ..NotificationSettingsUpdate::default()
-        },
-    };
-    // Правка границ тихих часов может сделать текущий момент не тихим:
-    // тогда отложенные уведомления выпускаются сразу.
-    let trigger = matches!(field, TimeField::QuietStart | TimeField::QuietEnd)
-        .then_some(ReleaseTrigger::Boundaries);
-    let current = NotificationSettings::from_settings(&ctx.user()?.settings);
-    if let Err(error) = update.clone().apply(current) {
-        // Домен уже проверил и формат, и несовпадение границ. Формат ввода
-        // отличаем от совпавших границ по разбору самого значения.
-        let banner = match (&error, field) {
-            (
-                crate::domain::error::DomainError::Validation(_),
-                TimeField::QuietStart | TimeField::QuietEnd,
-            ) if parse_hhmm(&value, "time").is_ok() => {
-                "Начало и конец тихих часов не должны совпадать."
-            }
-            _ => "Введите время в формате HH:MM, например 08:30.",
-        };
-        ctx.banner(banner);
-        return ctx.present(Screen::Form).await;
-    }
-
+    // Домен проверяет и формат, и несовпадение границ тихих часов.
     let updated = users::update_profile(
         &mut *ctx.conn,
         household_id,
         &actor,
         ProfileUpdate {
-            notifications: Some(update),
+            notifications: Some(field.update(value)),
             ..ProfileUpdate::default()
         },
         ctx.now,
@@ -173,13 +133,45 @@ async fn set_time(ctx: &mut Ctx<'_>, field: TimeField, text: &str) -> Result<(),
     match updated {
         Ok(user) => {
             clear(ctx).await?;
-            settings::finish_settings_change(ctx, user, Screen::Notifications, trigger).await
+            settings::finish_settings_change(ctx, user, Screen::Notifications, field.trigger())
+                .await
         }
         Err(crate::domain::error::DomainError::Validation(_)) => {
-            ctx.banner("Введите время в формате HH:MM, например 08:30.");
+            ctx.banner(time_error(field, value));
             ctx.present(Screen::Form).await
         }
         Err(error) => Err(error.into()),
+    }
+}
+
+impl TimeField {
+    /// Обновление настройки, меняющее только это поле.
+    fn update(self, value: &str) -> NotificationSettingsUpdate {
+        let mut update = NotificationSettingsUpdate::default();
+        let time = Some(value.to_owned());
+        match self {
+            Self::Digest => update.digest_time = time,
+            Self::AllDay => update.all_day_time = time,
+            Self::QuietStart => update.quiet_start = time,
+            Self::QuietEnd => update.quiet_end = time,
+        }
+        update
+    }
+
+    /// Правка границ тихих часов может сделать текущий момент не тихим: тогда
+    /// отложенные уведомления выпускаются сразу.
+    fn trigger(self) -> Option<ReleaseTrigger> {
+        matches!(self, Self::QuietStart | Self::QuietEnd).then_some(ReleaseTrigger::Boundaries)
+    }
+}
+
+/// Текст ошибки ввода времени.
+fn time_error(field: TimeField, value: &str) -> &'static str {
+    match field {
+        TimeField::QuietStart | TimeField::QuietEnd if parse_hhmm(value, "time").is_ok() => {
+            "Начало и конец тихих часов не должны совпадать."
+        }
+        _ => "Введите время в формате HH:MM, например 08:30.",
     }
 }
 

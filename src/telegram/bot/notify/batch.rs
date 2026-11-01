@@ -12,18 +12,22 @@ use crate::domain::error::DomainError;
 use crate::domain::models::ItemStatus;
 use crate::storage::repositories::items;
 use crate::storage::repositories::notifications::{
-    self, BatchDelivery, BatchState, NewDelivery, NotificationKind,
+    self, BatchDelivery, BatchState, NotificationKind,
 };
-use crate::telegram::bot::screens::clip;
-use crate::telegram::rich::{Span, button};
+use crate::telegram::rich::button;
 use crate::telegram::ru;
 
 use super::super::model::{Action, SnoozeUntil, Ui};
 use super::super::{Ctx, Fail};
-use super::{edit_notice, open, snooze_time, when_line};
+use super::{edit_notice, insert_snooze, open, snooze_time, title_spans, when_line};
 
 /// Сколько блоков сводного сообщения помещается на страницу.
 pub const BATCH_PAGE_SIZE: usize = 5;
+
+/// Число страниц сводного сообщения; пустое сообщение — одна страница.
+fn page_count(total: usize) -> usize {
+    total.div_ceil(BATCH_PAGE_SIZE).max(1)
+}
 
 /// Подпись вида уведомления в блоке.
 fn kind_label(kind: NotificationKind) -> &'static str {
@@ -84,7 +88,7 @@ pub fn batch_ui(
     summary: Option<(i32, i32)>,
     tz: Tz,
 ) -> Ui {
-    let pages = total.div_ceil(BATCH_PAGE_SIZE).max(1);
+    let pages = page_count(total);
     let count = i64::try_from(total).unwrap_or(i64::MAX);
     let mut ui = Ui::new().heading(format!(
         "🌙 Пока были тихие часы — {count} {}",
@@ -99,69 +103,49 @@ pub fn batch_ui(
             ui = ui.rule();
         }
         ui = ui.bold(kind_label(entry.kind));
-        match entry.state {
-            BatchEntryState::Missing => {
-                ui = ui.text("Задача удалена");
-                continue;
-            }
-            BatchEntryState::ListArchived => {
-                ui = ui.text("Список в архиве");
-                continue;
-            }
-            BatchEntryState::Done => {
-                ui = ui
-                    .spans(vec![Span::bold(clip(&entry.title, 120))])
-                    .text(&entry.when)
-                    .text("✅ Выполнено");
-                continue;
-            }
-            BatchEntryState::Snoozed(until) => {
-                ui = ui
-                    .spans(vec![Span::bold(clip(&entry.title, 120))])
-                    .text(&entry.when)
-                    .text(format!(
-                        "😴 Напомню в {}",
-                        until.with_timezone(&tz).format("%H:%M")
-                    ));
-                continue;
-            }
-            BatchEntryState::Open => {}
-        }
-
-        ui = ui
-            .spans(vec![Span::bold(clip(&entry.title, 120))])
-            .text(&entry.when);
-        let done = button(
-            "✓ Готово",
-            Action::BatchComplete {
-                batch_id,
-                item_id: entry.item_id,
-                version: entry.version,
-            },
-        );
-        let open = button(
-            "📋 Открыть",
-            Action::BatchOpen {
-                batch_id,
-                item_id: entry.item_id,
-            },
-        );
-        let buttons = if is_assignment(entry.kind) {
-            vec![open, done]
-        } else {
-            vec![
-                done,
-                button(
-                    "😴 На час",
-                    Action::BatchSnooze {
+        let head = |ui: Ui| ui.spans(title_spans(&entry.title)).text(&entry.when);
+        ui = match entry.state {
+            BatchEntryState::Missing => ui.text("Задача удалена"),
+            BatchEntryState::ListArchived => ui.text("Список в архиве"),
+            BatchEntryState::Done => head(ui).text("✅ Выполнено"),
+            BatchEntryState::Snoozed(until) => head(ui).text(format!(
+                "😴 Напомню в {}",
+                until.with_timezone(&tz).format("%H:%M")
+            )),
+            BatchEntryState::Open => {
+                let done = button(
+                    "✓ Готово",
+                    Action::BatchComplete {
+                        batch_id,
+                        item_id: entry.item_id,
+                        version: entry.version,
+                    },
+                );
+                let open = button(
+                    "📋 Открыть",
+                    Action::BatchOpen {
                         batch_id,
                         item_id: entry.item_id,
                     },
-                ),
-                open,
-            ]
+                );
+                let buttons = if is_assignment(entry.kind) {
+                    vec![open, done]
+                } else {
+                    vec![
+                        done,
+                        button(
+                            "😴 На час",
+                            Action::BatchSnooze {
+                                batch_id,
+                                item_id: entry.item_id,
+                            },
+                        ),
+                        open,
+                    ]
+                };
+                head(ui).row(buttons)
+            }
         };
-        ui = ui.row(buttons);
     }
 
     if pages > 1 {
@@ -214,8 +198,7 @@ pub async fn batch_page(
         return Ok(());
     }
     let rows = notifications::batch_deliveries(&mut *ctx.conn, batch_id).await?;
-    let pages = rows.len().div_ceil(BATCH_PAGE_SIZE).max(1);
-    let page = (page as usize).min(pages - 1);
+    let page = (page as usize).min(page_count(rows.len()) - 1);
     notifications::set_batch_page(
         &mut *ctx.conn,
         batch_id,
@@ -234,15 +217,8 @@ pub async fn batch_complete(
     item_id: Uuid,
     version: i32,
 ) -> Result<(), Fail> {
-    let Some(rows) = batch_rows(ctx, batch_id).await? else {
+    if !actionable(ctx, message_id, batch_id, item_id).await? {
         return Ok(());
-    };
-    let Some(row) = rows.iter().find(|row| row.item_id == Some(item_id)) else {
-        return render_batch(ctx, message_id, batch_id).await;
-    };
-    if let Some(toast) = blocked_toast(batch_entry(row, ctx.tz, ctx.now).state) {
-        ctx.toast(toast);
-        return render_batch(ctx, message_id, batch_id).await;
     }
 
     let household = ctx.household()?.clone();
@@ -291,20 +267,12 @@ pub async fn batch_snooze(
     batch_id: Uuid,
     item_id: Uuid,
 ) -> Result<(), Fail> {
-    let Some(rows) = batch_rows(ctx, batch_id).await? else {
+    if !actionable(ctx, message_id, batch_id, item_id).await? {
         return Ok(());
-    };
-    let Some(row) = rows.iter().find(|row| row.item_id == Some(item_id)) else {
-        return render_batch(ctx, message_id, batch_id).await;
-    };
-    if let Some(toast) = blocked_toast(batch_entry(row, ctx.tz, ctx.now).state) {
-        ctx.toast(toast);
-        return render_batch(ctx, message_id, batch_id).await;
     }
-    if !snooze_batch_item(ctx, batch_id, item_id, false).await? {
-        return render_batch(ctx, message_id, batch_id).await;
+    if snooze_batch_item(ctx, batch_id, item_id, false).await? {
+        ctx.toast("Отложено");
     }
-    ctx.toast("Отложено");
     render_batch(ctx, message_id, batch_id).await
 }
 
@@ -349,29 +317,19 @@ pub async fn batch_complete_all(
     }
 
     let rows = notifications::batch_deliveries(&mut *ctx.conn, batch_id).await?;
-    let mut items_to_complete: Vec<(Uuid, Option<i32>)> = Vec::new();
-    for row in &rows {
-        if let Some(item_id) = row.item_id
-            && !items_to_complete.iter().any(|(id, _)| *id == item_id)
-        {
-            items_to_complete.push((item_id, row.batch_version));
-        }
-    }
 
     let household = ctx.household()?.clone();
     let actor = ctx.actor()?;
     let mut completed = 0;
     let mut changed = 0;
-    for (item_id, release_version) in items_to_complete {
-        let Some(row) = rows.iter().find(|row| row.item_id == Some(item_id)) else {
-            continue;
-        };
+    for (item_id, row) in unique_items(&rows) {
         if !matches!(
             batch_entry(row, ctx.tz, ctx.now).state,
             BatchEntryState::Open | BatchEntryState::Snoozed(_)
         ) {
             continue;
         }
+        let release_version = row.batch_version;
 
         match items::get(&mut *ctx.conn, household.id, item_id).await {
             Err(DomainError::Database(error)) => return Err(Fail::Infra(error)),
@@ -433,24 +391,10 @@ pub async fn batch_snooze_all(
         return Ok(());
     }
     let rows = notifications::batch_deliveries(&mut *ctx.conn, batch_id).await?;
-    let mut items: Vec<Uuid> = Vec::new();
-    for row in &rows {
-        if let Some(item_id) = row.item_id
-            && !items.contains(&item_id)
-        {
-            items.push(item_id);
-        }
-    }
 
     let mut snoozed = 0;
-    for item_id in items {
-        let Some(row) = rows.iter().find(|row| row.item_id == Some(item_id)) else {
-            continue;
-        };
-        if !matches!(
-            batch_entry(row, ctx.tz, ctx.now).state,
-            BatchEntryState::Open
-        ) {
+    for (item_id, row) in unique_items(&rows) {
+        if batch_entry(row, ctx.tz, ctx.now).state != BatchEntryState::Open {
             continue;
         }
         if snooze_batch_item(ctx, batch_id, item_id, true).await? {
@@ -462,6 +406,50 @@ pub async fn batch_snooze_all(
         ctx.toast("Отложено");
     }
     render_batch(ctx, message_id, batch_id).await
+}
+
+/// Проверить сообщение и блок перед действием: `false` — сообщение устарело
+/// или действие уже невозможно. В последнем случае сообщение перерисовано, а
+/// пользователю показана подсказка.
+async fn actionable(
+    ctx: &mut Ctx<'_>,
+    message_id: i64,
+    batch_id: Uuid,
+    item_id: Uuid,
+) -> Result<bool, Fail> {
+    let Some(rows) = batch_rows(ctx, batch_id).await? else {
+        return Ok(false);
+    };
+    let Some(row) = rows.into_iter().find(|row| row.item_id == Some(item_id)) else {
+        render_batch(ctx, message_id, batch_id).await?;
+        return Ok(false);
+    };
+    if let Some(toast) = blocked_toast(batch_entry(&row, ctx.tz, ctx.now).state) {
+        ctx.toast(toast);
+        render_batch(ctx, message_id, batch_id).await?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Первые блоки каждой задачи в порядке выпуска.
+///
+/// Задача может попасть в сводное несколько раз: например, напоминание и
+/// назначение на один срок. Общие действия трогают её один раз.
+fn unique_items(rows: &[BatchDelivery]) -> Vec<(Uuid, &BatchDelivery)> {
+    let mut seen = Vec::new();
+    let mut unique = Vec::new();
+    for row in rows {
+        let Some(item_id) = row.item_id else {
+            continue;
+        };
+        if seen.contains(&item_id) {
+            continue;
+        }
+        seen.push(item_id);
+        unique.push((item_id, row));
+    }
+    unique
 }
 
 /// Подсказка для блока, по которому действие уже невозможно.
@@ -486,7 +474,6 @@ async fn snooze_batch_item(
     batched: bool,
 ) -> Result<bool, Fail> {
     let household_id = ctx.household()?.id;
-    let user_id = ctx.user()?.id;
     let item = match items::get(&mut *ctx.conn, household_id, item_id).await {
         Ok(item) => item,
         Err(DomainError::Database(error)) => return Err(Fail::Infra(error)),
@@ -503,20 +490,7 @@ async fn snooze_batch_item(
     }
 
     let deliver_at = snooze_time(SnoozeUntil::OneHour, ctx.tz, ctx.now)?;
-    let occurrence_key = notifications::snooze_key(deliver_at);
-    let delivery = NewDelivery {
-        household_id,
-        user_id,
-        item_id: Some(item_id),
-        kind: NotificationKind::Snooze,
-        occurrence_key: &occurrence_key,
-        scheduled_at: deliver_at,
-    };
-    if batched {
-        notifications::insert_batched(&mut *ctx.conn, &delivery, ctx.now).await?;
-    } else {
-        notifications::insert(&mut *ctx.conn, &delivery, ctx.now).await?;
-    }
+    insert_snooze(ctx, item_id, deliver_at, batched).await?;
     set_batch_snoozed(ctx, batch_id, item_id, deliver_at).await?;
     Ok(true)
 }
@@ -605,9 +579,9 @@ async fn render_batch(ctx: &mut Ctx<'_>, message_id: i64, batch_id: Uuid) -> Res
         .map(|row| batch_entry(row, ctx.tz, ctx.now))
         .collect();
     let total = entries.len();
-    let pages = total.div_ceil(BATCH_PAGE_SIZE).max(1);
-    let page = (batch.page.max(0) as usize).min(pages - 1);
-    if page != batch.page.max(0) as usize {
+    let stored = batch.page.max(0) as usize;
+    let page = stored.min(page_count(total) - 1);
+    if page != stored {
         notifications::set_batch_page(
             &mut *ctx.conn,
             batch_id,

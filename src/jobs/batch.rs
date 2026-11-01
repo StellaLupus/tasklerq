@@ -36,19 +36,10 @@ enum ReleaseMode {
     Manual,
 }
 
-impl ReleaseMode {
-    /// Ручной выпуск, а не тик.
-    fn is_manual(self) -> bool {
-        matches!(self, Self::Manual)
-    }
-}
-
 /// Отложенная доставка и её блок сводного сообщения.
 struct BatchCandidate {
     delivery_id: Uuid,
     scheduled_at: DateTime<Utc>,
-    /// Вид для построчной доставки; сводка в набор не попадает.
-    scope: DeliveryScope,
     entry: notify::BatchEntry,
 }
 
@@ -223,7 +214,7 @@ async fn prepare_deferred_batch(
         // впереди, а тихие часы успели перенести запись на их конец, возвращаем
         // записи собственный срок и снимаем признак отложенности. Дальше она
         // идёт общим путём и уходит не раньше своего срока.
-        if mode.is_manual()
+        if matches!(mode, ReleaseMode::Manual)
             && row.is_snooze()
             && let Some(at) = notifications::snooze_key_time(&row.occurrence_key)
             && at > now
@@ -231,10 +222,10 @@ async fn prepare_deferred_batch(
             restore_snooze_time(&mut *conn, row.id, at, now).await?;
             continue;
         }
-        let Some(scope) = DeliveryScope::of(row.kind) else {
+        if DeliveryScope::of(row.kind).is_none() {
             // Запрос не выбирает сводку: она доставляется своим путём.
             continue;
-        };
+        }
         let Some((chat_id, telegram_user_id)) = ready_target(&mut *conn, &row, now).await? else {
             continue;
         };
@@ -252,7 +243,6 @@ async fn prepare_deferred_batch(
         candidates.push(BatchCandidate {
             delivery_id: row.id,
             scheduled_at: row.scheduled_at,
-            scope,
             entry: notify::BatchEntry {
                 item_id: item.id,
                 kind: row.kind,
@@ -273,7 +263,7 @@ async fn prepare_deferred_batch(
     if candidates.len() < 2 {
         // Ручной выпуск одного уведомления: обычное сообщение сразу, а не в
         // зафиксированное время.
-        if mode.is_manual()
+        if matches!(mode, ReleaseMode::Manual)
             && let Some(candidate) = candidates.pop()
         {
             return Ok(PreparedBatch::Single { candidate });
@@ -343,7 +333,11 @@ async fn commit_prepared_batch(
     match prepared {
         PreparedBatch::None => Ok(()),
         PreparedBatch::Single { candidate } => {
-            deliver_single_deferred(conn, &candidate, user_id, now).await
+            let scope = DeliveryScope::of(candidate.entry.kind)
+                .expect("batch candidates are never digests");
+            delivery::deliver_one_in_conn(conn, scope, candidate.delivery_id, user_id, now, false)
+                .await?;
+            Ok(())
         }
         PreparedBatch::Message {
             identity,
@@ -377,25 +371,6 @@ async fn commit_prepared_batch(
             Ok(())
         }
     }
-}
-
-/// Доставить единственную отложенную запись обычным сообщением.
-async fn deliver_single_deferred(
-    conn: &mut PgConnection,
-    candidate: &BatchCandidate,
-    user_id: Uuid,
-    now: DateTime<Utc>,
-) -> Result<(), sqlx::Error> {
-    delivery::deliver_one_in_conn(
-        conn,
-        candidate.scope,
-        candidate.delivery_id,
-        user_id,
-        now,
-        false,
-    )
-    .await?;
-    Ok(())
 }
 
 /// Перенести отложенные тихими часами записи получателя на конец интервала.

@@ -40,15 +40,13 @@ fn release_banner(
     settings: &NotificationSettings,
     count: usize,
 ) -> String {
-    let reason = if !settings.quiet_hours_enabled {
-        "Тихие часы выключены.".to_owned()
-    } else if trigger == ReleaseTrigger::Timezone {
-        "Часовой пояс обновлён.".to_owned()
-    } else {
-        format!(
+    let reason = match (settings.quiet_hours_enabled, trigger) {
+        (false, _) => "Тихие часы выключены.".to_owned(),
+        (true, ReleaseTrigger::Timezone) => "Часовой пояс обновлён.".to_owned(),
+        (true, _) => format!(
             "Тихие часы: {}–{}.",
             settings.quiet_start, settings.quiet_end
-        )
+        ),
     };
     let count = i64::try_from(count).unwrap_or(i64::MAX);
     format!(
@@ -75,13 +73,13 @@ pub(super) async fn finish_settings_change(
         return ctx.present(screen).await;
     };
 
-    let user_id = ctx.user()?.id;
-    let settings = NotificationSettings::from_settings(&ctx.user()?.settings);
-    let timezone = ctx.tz;
+    let user = ctx.user()?;
+    let user_id = user.id;
+    let settings = NotificationSettings::from_settings(&user.settings);
 
     delivery::recipient_lock(&mut *ctx.conn, user_id).await?;
 
-    if let Some(end) = quiet::quiet_end_at(ctx.now, timezone, &settings) {
+    if let Some(end) = quiet::quiet_end_at(ctx.now, ctx.tz, &settings) {
         // По новым настройкам сейчас всё ещё тихо: не выпускаем, но переносим
         // отложенные на конец нового интервала; snooze — не раньше своего срока.
         batch::postpone_deferred_for_user(&mut *ctx.conn, user_id, end, ctx.now).await?;
