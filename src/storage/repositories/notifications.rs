@@ -61,17 +61,6 @@ pub enum BatchState {
     Missing,
 }
 
-impl BatchState {
-    /// Значение для записи в `batch_state`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Done => "done",
-            Self::Snoozed => "snoozed",
-            Self::Missing => "missing",
-        }
-    }
-}
-
 /// Время из ключа snooze-доставки.
 pub fn snooze_key_time(key: &str) -> Option<DateTime<Utc>> {
     let seconds = key.strip_prefix("snooze:")?.parse::<i64>().ok()?;
@@ -104,7 +93,7 @@ pub async fn insert(
     delivery: &NewDelivery<'_>,
     now: DateTime<Utc>,
 ) -> Result<u64, sqlx::Error> {
-    insert_with_flags(conn, delivery, false, false, now).await
+    insert_with_flags(conn, delivery, false, now).await
 }
 
 /// Вставить групповую snooze-доставку действия «Отложить все на час».
@@ -117,13 +106,14 @@ pub async fn insert_batched(
     delivery: &NewDelivery<'_>,
     now: DateTime<Utc>,
 ) -> Result<u64, sqlx::Error> {
-    insert_with_flags(conn, delivery, false, true, now).await
+    insert_with_flags(conn, delivery, true, now).await
 }
 
+/// Вставить доставку; `batched` отмечает групповой snooze. Признак `deferred`
+/// при вставке всегда снят: его выставляет только перенос тихими часами.
 async fn insert_with_flags(
     conn: &mut PgConnection,
     delivery: &NewDelivery<'_>,
-    deferred: bool,
     batched: bool,
     now: DateTime<Utc>,
 ) -> Result<u64, sqlx::Error> {
@@ -132,7 +122,7 @@ async fn insert_with_flags(
              id, household_id, user_id, item_id, occurrence_key, kind,
              status, scheduled_at, deferred, batched, created_at, updated_at
          )
-         SELECT $1, $2, $3, $4, $5, $6, 'pending', $7, $8, $9, $10, $10
+         SELECT $1, $2, $3, $4, $5, $6, 'pending', $7, false, $8, $9, $9
          WHERE NOT EXISTS (
              SELECT 1 FROM notification_deliveries d
              WHERE d.user_id = $3 AND d.item_id IS NOT DISTINCT FROM $4
@@ -156,7 +146,6 @@ async fn insert_with_flags(
     .bind(delivery.occurrence_key)
     .bind(delivery.kind)
     .bind(delivery.scheduled_at)
-    .bind(deferred)
     .bind(batched)
     .bind(now)
     .execute(conn)
@@ -333,7 +322,7 @@ pub async fn set_batch_state(
     )
     .bind(batch_id)
     .bind(item_id)
-    .bind(state.as_str())
+    .bind(state)
     .bind(snoozed_until)
     .bind(now)
     .execute(conn)

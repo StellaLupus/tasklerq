@@ -83,14 +83,14 @@ pub(super) async fn finish_settings_change(
 
     if let Some(end) = quiet::quiet_end_at(ctx.now, timezone, &settings) {
         // По новым настройкам сейчас всё ещё тихо: не выпускаем, но переносим
-        // отложенные на конец нового интервала.
+        // отложенные на конец нового интервала; snooze — не раньше своего срока.
         batch::postpone_deferred_for_user(&mut *ctx.conn, user_id, end, ctx.now).await?;
         return ctx.present(screen).await;
     }
 
     let release = batch::prepare_release(&mut *ctx.conn, user_id, ctx.now).await?;
     if !release.is_empty() {
-        ctx.banner(release_banner(trigger, &settings, release.notifications));
+        ctx.banner(release_banner(trigger, &settings, release.notifications()));
     }
     ctx.present(screen).await?;
     batch::commit_release(&mut *ctx.conn, release, ctx.now).await?;

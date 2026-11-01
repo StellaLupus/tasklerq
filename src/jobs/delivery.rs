@@ -35,12 +35,12 @@ pub(crate) enum DeliveryScope {
 }
 
 impl DeliveryScope {
-    /// Вид по типу доставки; snooze доставляется как напоминание.
-    pub(crate) fn of(kind: NotificationKind) -> Self {
+    /// Вид построчной доставки по типу; у сводки свой путь, поэтому `None`.
+    pub(crate) fn of(kind: NotificationKind) -> Option<Self> {
         match kind {
-            NotificationKind::Reminder | NotificationKind::Snooze => Self::Reminder,
-            NotificationKind::Assignment => Self::Assignment,
-            NotificationKind::Digest => Self::Digest,
+            NotificationKind::Reminder | NotificationKind::Snooze => Some(Self::Reminder),
+            NotificationKind::Assignment => Some(Self::Assignment),
+            NotificationKind::Digest => None,
         }
     }
 
@@ -249,23 +249,10 @@ pub(crate) async fn deliver_one_in_conn(
     let Some(row) = row else {
         return Ok(0);
     };
-    if row.is_stale(now) {
-        mark_cancelled(&mut *conn, row.id, now).await?;
+    if cancel_if_stale(&mut *conn, &row, now).await? {
         return Ok(0);
     }
-    // Проверка под блокировкой закрывает гонку с другим экземпляром
-    // планировщика: даже «сброшенная» запись не уйдёт внутри тихих часов.
-    if let Some(settings) = row.recipient_settings.as_ref()
-        && postpone_for_quiet(&mut *conn, row.id, settings, row.timezone(), now).await?
-    {
-        return Ok(0);
-    }
-
-    // `is_stale` уже проверил эти поля; явная проверка не даёт отправить
-    // сообщение в чат 0 при будущих изменениях схемы.
-    let (Some(chat_id), Some(telegram_user_id)) = (row.telegram_chat_id, row.telegram_user_id)
-    else {
-        mark_cancelled(&mut *conn, row.id, now).await?;
+    let Some((chat_id, telegram_user_id)) = ready_target(&mut *conn, &row, now).await? else {
         return Ok(0);
     };
     let Some(html) = render(&mut *conn, scope, &row, telegram_user_id, now).await? else {
@@ -276,6 +263,49 @@ pub(crate) async fn deliver_one_in_conn(
     let seq = enqueue_message(&mut *conn, chat_id, &dedupe_key, html, true, now).await?;
     mark_sent(&mut *conn, row.id, seq, now).await?;
     Ok(1)
+}
+
+/// Отменить запись, если её вхождение больше не актуально.
+///
+/// Возвращает `true`, если запись отменена и дальше её обрабатывать не нужно.
+pub(crate) async fn cancel_if_stale(
+    conn: &mut PgConnection,
+    row: &NoticeRow,
+    now: DateTime<Utc>,
+) -> Result<bool, sqlx::Error> {
+    if !row.is_stale(now) {
+        return Ok(false);
+    }
+    mark_cancelled(&mut *conn, row.id, now).await?;
+    Ok(true)
+}
+
+/// Проверить тихие часы и получателя перед сборкой сообщения.
+///
+/// Возвращает чат и Telegram-пользователя или `None`, если доставка отложена
+/// до конца тихих часов либо отменена из-за недоступного получателя. Проверки
+/// выполняются под `FOR UPDATE`: «сброшенная» запись не уйдёт внутри тихого
+/// интервала.
+pub(crate) async fn ready_target(
+    conn: &mut PgConnection,
+    row: &NoticeRow,
+    now: DateTime<Utc>,
+) -> Result<Option<(i64, i64)>, sqlx::Error> {
+    // Границы могли сдвинуть после переноса: в момент выпуска тихие часы
+    // проверяются ещё раз и доставка снова фиксируется на их конце.
+    if let Some(settings) = row.recipient_settings.as_ref()
+        && postpone_for_quiet(&mut *conn, row.id, settings, row.timezone(), now).await?
+    {
+        return Ok(None);
+    }
+    // `is_stale` уже проверил эти поля; явная проверка не даёт отправить
+    // сообщение в чат 0 при будущих изменениях схемы.
+    let (Some(chat_id), Some(telegram_user_id)) = (row.telegram_chat_id, row.telegram_user_id)
+    else {
+        mark_cancelled(&mut *conn, row.id, now).await?;
+        return Ok(None);
+    };
+    Ok(Some((chat_id, telegram_user_id)))
 }
 
 /// Собрать HTML сообщения по виду доставки; `None` — запись отменена.

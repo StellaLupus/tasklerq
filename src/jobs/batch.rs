@@ -18,27 +18,37 @@ use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::delivery::{
-    self, DELIVERY_BATCH, DeliveryScope, enqueue_message, load_item_and_list, mark_cancelled,
-    postpone_for_quiet, try_recipient_lock,
+    self, DELIVERY_BATCH, DeliveryScope, cancel_if_stale, enqueue_message, load_item_and_list,
+    ready_target, try_recipient_lock,
 };
 use super::digest;
 use super::notice::{NOTICE_ROW_COLUMNS, NOTICE_ROW_FROM, NoticeRow};
-use crate::storage::repositories::notifications::{self, NotificationKind};
+use crate::storage::repositories::notifications;
 use crate::telegram::bot::notify;
 
-/// Итог выпуска: сообщения в outbox и включённые в них уведомления.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct Delivered {
-    /// Поставлено в outbox сообщений.
-    pub messages: u64,
-    /// Уведомлений, включённых в эти сообщения.
-    pub notifications: usize,
+/// Режим выпуска отложенных доставок.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseMode {
+    /// Тик планировщика: выпускаются только доставки, срок которых наступил.
+    Tick,
+    /// Ручной выпуск из настроек: только отложенные тихими часами. Групповой
+    /// snooze и ещё не наступивший срок самого snooze не ускоряются.
+    Manual,
+}
+
+impl ReleaseMode {
+    /// Ручной выпуск, а не тик.
+    fn is_manual(self) -> bool {
+        matches!(self, Self::Manual)
+    }
 }
 
 /// Отложенная доставка и её блок сводного сообщения.
 struct BatchCandidate {
     delivery_id: Uuid,
     scheduled_at: DateTime<Utc>,
+    /// Вид для построчной доставки; сводка в набор не попадает.
+    scope: DeliveryScope,
     entry: notify::BatchEntry,
 }
 
@@ -68,7 +78,7 @@ pub(crate) async fn deliver_batches(pool: &PgPool, now: DateTime<Utc>) -> Result
     let mut delivered = 0;
     for user_id in users {
         match deliver_batch_for_user(pool, user_id, now).await {
-            Ok(rows) => delivered += rows.messages,
+            Ok(messages) => delivered += messages,
             Err(error) => tracing::error!(
                 %user_id,
                 %error,
@@ -81,20 +91,17 @@ pub(crate) async fn deliver_batches(pool: &PgPool, now: DateTime<Utc>) -> Result
 
 /// SQL отложенных доставок получателя для сборки сводного сообщения.
 ///
-/// `due_only` ограничивает выборку записями, срок которых уже наступил: так
-/// работает тик. `quiet_only` оставляет только отложенные тихими часами: так
-/// работает ручной выпуск, который не ускоряет групповой snooze и ещё не
-/// наступивший срок самого snooze.
-fn deferred_row_sql(due_only: bool, quiet_only: bool) -> String {
-    let due = if due_only {
-        "AND d.scheduled_at <= $2"
-    } else {
-        ""
+/// Тик ограничивает выборку записями, срок которых уже наступил. Ручной выпуск
+/// оставляет только отложенные тихими часами: он не ускоряет групповой snooze
+/// и ещё не наступивший срок самого snooze.
+fn deferred_row_sql(mode: ReleaseMode) -> String {
+    let due = match mode {
+        ReleaseMode::Tick => "AND d.scheduled_at <= $2",
+        ReleaseMode::Manual => "",
     };
-    let scope = if quiet_only {
-        "AND d.deferred"
-    } else {
-        "AND (d.deferred OR d.batched)"
+    let scope = match mode {
+        ReleaseMode::Tick => "AND (d.deferred OR d.batched)",
+        ReleaseMode::Manual => "AND d.deferred",
     };
     format!(
         "SELECT {NOTICE_ROW_COLUMNS}
@@ -108,13 +115,14 @@ fn deferred_row_sql(due_only: bool, quiet_only: bool) -> String {
     )
 }
 
+/// Собрать одно сводное сообщение на получателя.
 async fn deliver_batch_for_user(
     pool: &PgPool,
     user_id: Uuid,
     now: DateTime<Utc>,
-) -> Result<Delivered, sqlx::Error> {
+) -> Result<u64, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    let delivered = deliver_deferred_batch(&mut tx, user_id, now, true, false).await?;
+    let delivered = deliver_deferred_batch(&mut tx, user_id, now, ReleaseMode::Tick).await?;
     tx.commit().await?;
     Ok(delivered)
 }
@@ -124,10 +132,7 @@ enum PreparedBatch {
     /// Нечего выпускать.
     None,
     /// Одно уведомление обычным сообщением.
-    Single {
-        candidate: BatchCandidate,
-        user_id: Uuid,
-    },
+    Single { candidate: BatchCandidate },
     /// Сводное сообщение с готовым HTML.
     Message {
         identity: BatchIdentity,
@@ -155,38 +160,37 @@ impl PreparedBatch {
 pub(crate) struct PreparedRelease {
     user_id: Uuid,
     prepared: PreparedBatch,
-    /// Фактическое число уведомлений для баннера, без утренней сводки.
-    pub notifications: usize,
 }
 
 impl PreparedRelease {
+    /// Фактическое число уведомлений для баннера, без утренней сводки.
+    pub fn notifications(&self) -> usize {
+        self.prepared.notifications()
+    }
+
     /// Выпускать нечего.
     pub fn is_empty(&self) -> bool {
-        self.notifications == 0
+        self.notifications() == 0
     }
 }
 
 /// Собрать одно сводное сообщение на получателя из отложенных доставок.
 ///
-/// При `due_only` одна оставшаяся доставка не отправляется здесь: её доставит
-/// обычный путь. Ручной выпуск (`due_only = false`, `quiet_only = true`) доставляет
-/// единственную отложенную тихими часами запись сразу, не дожидаясь её
-/// зафиксированного времени; исключение — snooze, чей собственный срок ещё
-/// впереди: ему возвращается этот срок и снимается признак отложенности.
-pub(crate) async fn deliver_deferred_batch(
+/// По тику одна оставшаяся доставка не отправляется здесь: её доставит обычный
+/// путь. Ручной выпуск доставляет единственную отложенную тихими часами запись
+/// сразу, не дожидаясь её зафиксированного времени; исключение — snooze, чей
+/// собственный срок ещё впереди: ему возвращается этот срок и снимается признак
+/// отложенности.
+async fn deliver_deferred_batch(
     conn: &mut PgConnection,
     user_id: Uuid,
     now: DateTime<Utc>,
-    due_only: bool,
-    quiet_only: bool,
-) -> Result<Delivered, sqlx::Error> {
-    let prepared = prepare_deferred_batch(&mut *conn, user_id, now, due_only, quiet_only).await?;
+    mode: ReleaseMode,
+) -> Result<u64, sqlx::Error> {
+    let prepared = prepare_deferred_batch(&mut *conn, user_id, now, mode).await?;
     let messages = u64::from(prepared.has_message());
-    let notifications = commit_prepared_batch(conn, prepared, user_id, now).await?;
-    Ok(Delivered {
-        messages,
-        notifications,
-    })
+    commit_prepared_batch(conn, prepared, user_id, now).await?;
+    Ok(messages)
 }
 
 /// Отобрать отложенные доставки, проверить их и собрать сообщения.
@@ -198,13 +202,12 @@ async fn prepare_deferred_batch(
     conn: &mut PgConnection,
     user_id: Uuid,
     now: DateTime<Utc>,
-    due_only: bool,
-    quiet_only: bool,
+    mode: ReleaseMode,
 ) -> Result<PreparedBatch, sqlx::Error> {
     if !try_recipient_lock(&mut *conn, user_id).await? {
         return Ok(PreparedBatch::None);
     }
-    let rows: Vec<NoticeRow> = sqlx::query_as(&deferred_row_sql(due_only, quiet_only))
+    let rows: Vec<NoticeRow> = sqlx::query_as(&deferred_row_sql(mode))
         .bind(user_id)
         .bind(now)
         .fetch_all(&mut *conn)
@@ -213,15 +216,14 @@ async fn prepare_deferred_batch(
     let mut identity: Option<BatchIdentity> = None;
     let mut candidates = Vec::new();
     for row in rows {
-        if row.is_stale(now) {
-            mark_cancelled(&mut *conn, row.id, now).await?;
+        if cancel_if_stale(&mut *conn, &row, now).await? {
             continue;
         }
         // Ручной выпуск не ускоряет snooze: если его собственный срок ещё
         // впереди, а тихие часы успели перенести запись на их конец, возвращаем
         // записи собственный срок и снимаем признак отложенности. Дальше она
         // идёт общим путём и уходит не раньше своего срока.
-        if !due_only
+        if mode.is_manual()
             && row.is_snooze()
             && let Some(at) = notifications::snooze_key_time(&row.occurrence_key)
             && at > now
@@ -229,16 +231,11 @@ async fn prepare_deferred_batch(
             restore_snooze_time(&mut *conn, row.id, at, now).await?;
             continue;
         }
-        // Границы могли сдвинуть после переноса: в момент выпуска тихие часы
-        // проверяются ещё раз и доставка снова фиксируется на их конце.
-        if let Some(settings) = row.recipient_settings.as_ref()
-            && postpone_for_quiet(&mut *conn, row.id, settings, row.timezone(), now).await?
-        {
+        let Some(scope) = DeliveryScope::of(row.kind) else {
+            // Запрос не выбирает сводку: она доставляется своим путём.
             continue;
-        }
-        let (Some(chat_id), Some(telegram_user_id)) = (row.telegram_chat_id, row.telegram_user_id)
-        else {
-            mark_cancelled(&mut *conn, row.id, now).await?;
+        };
+        let Some((chat_id, telegram_user_id)) = ready_target(&mut *conn, &row, now).await? else {
             continue;
         };
         let Some((item, list)) = load_item_and_list(&mut *conn, &row, now).await? else {
@@ -255,6 +252,7 @@ async fn prepare_deferred_batch(
         candidates.push(BatchCandidate {
             delivery_id: row.id,
             scheduled_at: row.scheduled_at,
+            scope,
             entry: notify::BatchEntry {
                 item_id: item.id,
                 kind: row.kind,
@@ -275,11 +273,10 @@ async fn prepare_deferred_batch(
     if candidates.len() < 2 {
         // Ручной выпуск одного уведомления: обычное сообщение сразу, а не в
         // зафиксированное время.
-        if candidates.len() == 1 && !due_only {
-            return Ok(PreparedBatch::Single {
-                candidate: candidates.pop().expect("one candidate"),
-                user_id,
-            });
+        if mode.is_manual()
+            && let Some(candidate) = candidates.pop()
+        {
+            return Ok(PreparedBatch::Single { candidate });
         }
         return Ok(PreparedBatch::None);
     }
@@ -342,12 +339,11 @@ async fn commit_prepared_batch(
     prepared: PreparedBatch,
     user_id: Uuid,
     now: DateTime<Utc>,
-) -> Result<usize, sqlx::Error> {
+) -> Result<(), sqlx::Error> {
     match prepared {
-        PreparedBatch::None => Ok(0),
-        PreparedBatch::Single { candidate, user_id } => {
-            let delivered = deliver_single_deferred(conn, &candidate, user_id, now).await?;
-            Ok(usize::from(delivered > 0))
+        PreparedBatch::None => Ok(()),
+        PreparedBatch::Single { candidate } => {
+            deliver_single_deferred(conn, &candidate, user_id, now).await
         }
         PreparedBatch::Message {
             identity,
@@ -378,7 +374,7 @@ async fn commit_prepared_batch(
                 )
                 .await?;
             }
-            Ok(candidates.len())
+            Ok(())
         }
     }
 }
@@ -389,22 +385,17 @@ async fn deliver_single_deferred(
     candidate: &BatchCandidate,
     user_id: Uuid,
     now: DateTime<Utc>,
-) -> Result<u64, sqlx::Error> {
-    match candidate.entry.kind {
-        // Запрос сводного явно ограничен видами reminder/snooze/assignment.
-        NotificationKind::Digest => unreachable!("digest is delivered separately"),
-        kind => {
-            delivery::deliver_one_in_conn(
-                conn,
-                DeliveryScope::of(kind),
-                candidate.delivery_id,
-                user_id,
-                now,
-                false,
-            )
-            .await
-        }
-    }
+) -> Result<(), sqlx::Error> {
+    delivery::deliver_one_in_conn(
+        conn,
+        candidate.scope,
+        candidate.delivery_id,
+        user_id,
+        now,
+        false,
+    )
+    .await?;
+    Ok(())
 }
 
 /// Перенести отложенные тихими часами записи получателя на конец интервала.
@@ -433,34 +424,22 @@ pub(crate) async fn postpone_deferred_for_user(
     .fetch_all(&mut *conn)
     .await?;
     for (id, occurrence_key) in snoozes {
-        match notifications::snooze_key_time(&occurrence_key) {
-            // Свой срок вне нового интервала: вернуть его и снять признак
-            // отложенности, иначе запись ушла бы раньше срока.
-            Some(at) if at > end => {
-                restore_snooze_time(&mut *conn, id, at, now).await?;
-                postponed += 1;
-            }
-            _ => {
-                postponed += sqlx::query(
-                    "UPDATE notification_deliveries
-                     SET scheduled_at = $2, deferred = true, updated_at = $3
-                     WHERE id = $1 AND status = 'pending' AND scheduled_at <> $2",
-                )
-                .bind(id)
-                .bind(end)
-                .bind(now)
-                .execute(&mut *conn)
-                .await?
-                .rows_affected();
-            }
+        // Свой срок вне нового интервала: вернуть его и снять признак
+        // отложенности, иначе запись ушла бы раньше срока.
+        if let Some(at) = notifications::snooze_key_time(&occurrence_key)
+            && at > end
+        {
+            restore_snooze_time(&mut *conn, id, at, now).await?;
+            postponed += 1;
         }
     }
 
+    // Остальные отложенные записи, включая snooze внутри интервала, ждут его
+    // конца. Восстановленные выше уже не `deferred` и сюда не попадают.
     postponed += sqlx::query(
         "UPDATE notification_deliveries
          SET scheduled_at = $2, deferred = true, updated_at = $3
          WHERE user_id = $1 AND status = 'pending' AND deferred
-           AND kind <> 'snooze'
            AND scheduled_at <> $2",
     )
     .bind(user_id)
@@ -481,13 +460,8 @@ pub(crate) async fn prepare_release(
     user_id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<PreparedRelease, sqlx::Error> {
-    let prepared = prepare_deferred_batch(&mut *conn, user_id, now, false, true).await?;
-    let notifications = prepared.notifications();
-    Ok(PreparedRelease {
-        user_id,
-        prepared,
-        notifications,
-    })
+    let prepared = prepare_deferred_batch(&mut *conn, user_id, now, ReleaseMode::Manual).await?;
+    Ok(PreparedRelease { user_id, prepared })
 }
 
 /// Выпустить подготовленные уведомления, затем отложенную утреннюю сводку.
