@@ -2,23 +2,23 @@
 //!
 //! Одиночная доставка, отмена устаревших записей и сборка сводного сообщения
 //! используют один снимок `notification_deliveries` с текущим состоянием
-//! получателя, задачи и списка. Раньше у каждого пути была своя копия проверок,
-//! и назначение из архивного списка уходило одиночным сообщением, но терялось
-//! в сводном.
+//! получателя, задачи и списка. Здесь же живёт правило актуальности для всех
+//! видов уведомлений: у каждого вида свой [`is_stale`](NoticeRow::is_stale).
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use chrono_tz::Tz;
 use sqlx::FromRow;
 use uuid::Uuid;
 
-use super::scheduler::{all_day_occurrence_key, occurrence_key, resolved_timezone};
+use super::keys::{all_day_occurrence_key, digest_occurrence_key, occurrence_key};
+use super::quiet::resolved_timezone;
 use crate::domain::models::ItemStatus;
 use crate::domain::settings::NotificationSettings;
 use crate::storage::repositories::notifications::NotificationKind;
 
 /// Колонки записи доставки и связанных строк для [`NoticeRow`].
 pub(crate) const NOTICE_ROW_COLUMNS: &str = "d.id, d.household_id, d.user_id, d.kind,
-        d.occurrence_key, d.scheduled_at, d.deferred,
+        d.occurrence_key, d.scheduled_at, d.deferred, d.created_at,
         i.id AS item_id, i.title AS item_title, i.status AS item_status,
         i.deleted_at AS item_deleted_at, i.due_at AS item_due_at,
         i.due_date AS item_due_date,
@@ -49,6 +49,7 @@ pub(crate) struct NoticeRow {
     pub occurrence_key: String,
     pub scheduled_at: DateTime<Utc>,
     pub deferred: bool,
+    pub created_at: DateTime<Utc>,
     pub item_id: Option<Uuid>,
     pub item_title: Option<String>,
     pub item_status: Option<ItemStatus>,
@@ -179,7 +180,7 @@ impl NoticeRow {
         match self.kind {
             NotificationKind::Assignment => self.assignment_stale(),
             NotificationKind::Reminder | NotificationKind::Snooze => self.reminder_stale(now),
-            NotificationKind::Digest => true,
+            NotificationKind::Digest => self.digest_stale(now),
         }
     }
 
@@ -204,5 +205,24 @@ impl NoticeRow {
             || !self.recipient_selected()
             || self.current_key().as_deref() != Some(self.occurrence_key.as_str())
             || !self.in_window(now)
+    }
+
+    /// Сводка актуальна, пока пользователь и household живы, сводка включена,
+    /// а ключ соответствует текущему локальному дню получателя.
+    ///
+    /// Сводка, отложенная тихими часами через полночь (например, в 23:00 при
+    /// тихих часах до 08:00), остаётся актуальной до утра: иначе она была бы
+    /// отменена в 00:00 и потерялась, а следующая сводка пришла бы только через
+    /// сутки. Утром уходит ровно одна такая сводка, и следующая планируется на
+    /// новый день.
+    fn digest_stale(&self, now: DateTime<Utc>) -> bool {
+        if !self.settings().digest_enabled {
+            return true;
+        }
+        let today = now.with_timezone(&self.timezone()).date_naive();
+        let current = digest_occurrence_key(today);
+        self.occurrence_key != current
+            && !(self.deferred
+                && self.occurrence_key == digest_occurrence_key(today - Duration::days(1)))
     }
 }

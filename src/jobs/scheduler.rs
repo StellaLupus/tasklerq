@@ -1,9 +1,11 @@
-//! Планировщик уведомлений: тик, напоминания и общие части доставки.
+//! Планировщик напоминаний: тик и планирование.
 //!
-//! Сводка живёт в [`crate::jobs::digest`], сводное сообщение — в
-//! [`crate::jobs::batch`], уведомление о назначении — в
-//! [`crate::jobs::assignment`]. Здесь остаются цикл, тик, общие операции над
-//! `notification_deliveries`/`outbox` и напоминания.
+//! Общий каркас доставки живёт в [`crate::jobs::delivery`], правило
+//! актуальности — в [`crate::jobs::notice`], тихие часы и пояс получателя — в
+//! [`crate::jobs::quiet`]. Сводка живёт в [`crate::jobs::digest`], сводное
+//! сообщение — в [`crate::jobs::batch`], уведомление о назначении — в
+//! [`crate::jobs::assignment`]. Здесь остаются цикл, тик и планирование
+//! напоминаний.
 //!
 //! Один тик делает три шага:
 //!
@@ -30,44 +32,29 @@
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
-use chrono::{DateTime, Duration, NaiveDate, NaiveTime, SecondsFormat, Utc};
-use chrono_tz::Tz;
+use chrono::{DateTime, Duration, NaiveDate, NaiveTime, Utc};
 use sqlx::{FromRow, PgConnection, PgPool};
 use tokio::sync::{Notify, watch};
 use uuid::Uuid;
 
-use crate::domain::error::DomainError;
-use crate::domain::models::{Item, List};
-use crate::domain::recurrence::{parse_timezone, resolve_local};
+use super::delivery::{self, DeliveryScope};
+use super::notice::NoticeRow;
+use super::quiet::resolved_timezone;
+use super::{assignment, batch, digest};
+use crate::domain::recurrence::resolve_local;
 use crate::domain::settings::{MAX_LEAD_MINUTES, NotificationSettings, parse_hhmm};
-use crate::jobs::{assignment, batch, digest};
 use crate::storage::repositories::notifications::{
     self, NewDelivery, NotificationKind, snooze_key_time,
 };
-use crate::storage::repositories::{items, lists};
 use crate::telegram::bot::notify;
-use crate::telegram::outbox::{self, Outgoing};
 
-use super::notice::{NOTICE_ROW_COLUMNS, NOTICE_ROW_FROM, NoticeRow};
+pub use super::keys::{all_day_occurrence_key, occurrence_key};
 
 /// Интервал планировщика.
 pub const TICK_INTERVAL: StdDuration = StdDuration::from_secs(30);
 
-/// Сколько кандидатов на доставку рассматривается за один тик.
-pub(crate) const DELIVERY_BATCH: i64 = 100;
-
 /// Время вседневного напоминания по умолчанию.
 const DEFAULT_ALL_DAY_TIME: &str = "09:00";
-
-/// Ключ вхождения: срок в UTC с микросекундной точностью.
-pub fn occurrence_key(due_at: DateTime<Utc>) -> String {
-    due_at.to_rfc3339_opts(SecondsFormat::Micros, true)
-}
-
-/// Ключ вхождения вседневной задачи: локальная дата срока.
-pub fn all_day_occurrence_key(due_date: NaiveDate) -> String {
-    format!("date:{due_date}")
-}
 
 /// Итог одного тика.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -94,9 +81,9 @@ impl Scheduler {
 
     /// Один тик на момент `now`.
     pub async fn tick(&self, now: DateTime<Utc>) -> Result<TickStats, sqlx::Error> {
-        let cancelled = cancel_stale(&self.pool, now).await?
-            + digest::cancel_stale(&self.pool, now).await?
-            + assignment::cancel_stale(&self.pool, now).await?;
+        let cancelled = delivery::cancel_stale(&self.pool, now, DeliveryScope::Reminder).await?
+            + delivery::cancel_stale(&self.pool, now, DeliveryScope::Digest).await?
+            + delivery::cancel_stale(&self.pool, now, DeliveryScope::Assignment).await?;
         let planned =
             plan_reminders(&self.pool, now).await? + digest::plan(&self.pool, now).await?;
 
@@ -104,7 +91,8 @@ impl Scheduler {
         // пояс или границы тихих часов применяются без перезапуска. Время
         // считается идемпотентно, поэтому повторный тик не сбрасывает уже
         // отложенную запись обратно в прошлое.
-        reschedule_reminders(&self.pool, now).await?;
+        delivery::reschedule_pending(&self.pool, now, DeliveryScope::Reminder, reminder_intended)
+            .await?;
         digest::reschedule(&self.pool, now).await?;
         assignment::reschedule(&self.pool, now).await?;
 
@@ -112,9 +100,9 @@ impl Scheduler {
         // сообщение; одиночные и неотложенные записи затем уходят обычным
         // путём. Сводка в батч не входит и доставляется отдельно.
         let delivered = batch::deliver_batches(&self.pool, now).await?
-            + deliver_due(&self.pool, now).await?
-            + digest::deliver_due(&self.pool, now).await?
-            + assignment::deliver_due(&self.pool, now).await?;
+            + delivery::deliver_due(&self.pool, now, DeliveryScope::Reminder).await?
+            + delivery::deliver_due(&self.pool, now, DeliveryScope::Digest).await?
+            + delivery::deliver_due(&self.pool, now, DeliveryScope::Assignment).await?;
 
         if delivered > 0 {
             self.wake_outbox.notify_one();
@@ -148,214 +136,28 @@ impl Scheduler {
     }
 }
 
-/// Пояс получателя: личный, иначе household, иначе UTC.
-pub(crate) fn resolved_timezone(
-    user_timezone: Option<&str>,
-    household_timezone: Option<&str>,
-) -> Tz {
-    user_timezone
-        .and_then(|value| parse_timezone(value).ok())
-        .or_else(|| household_timezone.and_then(|value| parse_timezone(value).ok()))
-        .unwrap_or(chrono_tz::UTC)
-}
-
-/// Ближайший конец тихих часов, если `instant` попадает в интервал.
+/// Момент, в который напоминание должно уйти по текущим настройкам.
 ///
-/// Начало интервала включительно, конец исключительно. Интервал может
-/// переходить через полночь: 22:00–08:00 означает «с 22:00 до полуночи и с
-/// полуночи до 08:00». Время считается в поясе получателя.
-pub(crate) fn quiet_end_at(
-    instant: DateTime<Utc>,
-    timezone: Tz,
-    settings: &NotificationSettings,
-) -> Option<DateTime<Utc>> {
-    if !settings.quiet_hours_enabled {
+/// `None` — вхождение больше не планируется: устарело или ключ повреждён.
+fn reminder_intended(row: &NoticeRow) -> Option<DateTime<Utc>> {
+    if row.is_snooze() {
+        // Время snooze зафиксировано в ключе: повторный расчёт не должен
+        // сдвигать его из-за позднего тика.
+        return snooze_key_time(&row.occurrence_key);
+    }
+    if !row.item_valid() || row.current_key().as_deref() != Some(row.occurrence_key.as_str()) {
         return None;
     }
-    let start = match parse_hhmm(&settings.quiet_start, "quiet hours start") {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::warn!(%error, "invalid quiet hours start; delivering without quiet hours");
-            return None;
+    let settings = row.settings();
+    match (row.item_due_at, row.item_due_date) {
+        (Some(due_at), None) => Some(due_at - Duration::minutes(i64::from(settings.lead_minutes))),
+        (None, Some(due_date)) => {
+            let time = parse_hhmm(&settings.all_day_time, "all-day reminder time")
+                .unwrap_or_else(|_| default_all_day_time());
+            resolve_local(row.timezone(), due_date, time).ok()
         }
-    };
-    let end = match parse_hhmm(&settings.quiet_end, "quiet hours end") {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::warn!(%error, "invalid quiet hours end; delivering without quiet hours");
-            return None;
-        }
-    };
-    if start == end {
-        tracing::warn!("quiet hours start equals end; delivering without quiet hours");
-        return None;
+        _ => None,
     }
-
-    let local = instant.with_timezone(&timezone);
-    let time = local.time();
-    let date = local.date_naive();
-    let inside = if start < end {
-        time >= start && time < end
-    } else {
-        time >= start || time < end
-    };
-    if !inside {
-        return None;
-    }
-
-    // Конец в тот же день, кроме случая, когда мы уже после начала интервала,
-    // а конец — за полночь (22:00 → 08:00 следующего дня).
-    let end_date = if start < end || time < end {
-        date
-    } else {
-        date + Duration::days(1)
-    };
-    match resolve_local(timezone, end_date, end) {
-        Ok(end) => Some(end),
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                %timezone,
-                %end_date,
-                "failed to resolve quiet hours end; delivering without quiet hours"
-            );
-            None
-        }
-    }
-}
-
-/// Стабильное время доставки по базовому времени и текущим тихим часам.
-///
-/// `base` — время, когда уведомление должно было уйти по своей природе
-/// (срок минус lead time, время сводки, момент назначения). Если оно ещё
-/// впереди, тихие часы применяются к нему. Если уже прошло — к текущему
-/// моменту: сервис мог проснуться внутри тихих часов.
-///
-/// Функция идемпотентна: пока запись остаётся в том же тихом интервале,
-/// повторный расчёт возвращает то же время.
-pub(crate) fn desired_schedule(
-    base: DateTime<Utc>,
-    now: DateTime<Utc>,
-    timezone: Tz,
-    settings: &NotificationSettings,
-) -> DateTime<Utc> {
-    if base > now {
-        quiet_end_at(base, timezone, settings).unwrap_or(base)
-    } else {
-        quiet_end_at(now, timezone, settings).unwrap_or(base)
-    }
-}
-
-/// Обновить `scheduled_at`, только если время или флаг переноса изменились.
-pub(crate) async fn reschedule_if_changed(
-    conn: &mut PgConnection,
-    id: Uuid,
-    desired: DateTime<Utc>,
-    deferred: bool,
-    now: DateTime<Utc>,
-) -> Result<u64, sqlx::Error> {
-    Ok(sqlx::query(
-        "UPDATE notification_deliveries
-         SET scheduled_at = $2, deferred = deferred OR $3, updated_at = $4
-         WHERE id = $1 AND status = 'pending'
-           AND (scheduled_at <> $2 OR ($3 AND NOT deferred))",
-    )
-    .bind(id)
-    .bind(desired)
-    .bind(deferred)
-    .bind(now)
-    .execute(&mut *conn)
-    .await?
-    .rows_affected())
-}
-
-/// Перенести уже заблокированную запись, если её момент доставки в тихих часах.
-///
-/// Вызывается в `deliver_one` под `FOR UPDATE`: даже если другой экземпляр
-/// планировщика успел поставить `scheduled_at <= now`, доставка не произойдёт
-/// внутри тихого интервала.
-pub(crate) async fn postpone_for_quiet(
-    conn: &mut PgConnection,
-    id: Uuid,
-    settings: &serde_json::Value,
-    timezone: Tz,
-    now: DateTime<Utc>,
-) -> Result<bool, sqlx::Error> {
-    let settings = NotificationSettings::from_settings(settings);
-    let Some(end) = quiet_end_at(now, timezone, &settings) else {
-        return Ok(false);
-    };
-    sqlx::query(
-        "UPDATE notification_deliveries
-         SET scheduled_at = $2, deferred = true, updated_at = $3
-         WHERE id = $1 AND status = 'pending'",
-    )
-    .bind(id)
-    .bind(end)
-    .bind(now)
-    .execute(&mut *conn)
-    .await?;
-    Ok(true)
-}
-
-/// Пересчитать `pending`-напоминания по текущим настройкам получателя.
-///
-/// Время берётся из срока и настроек, а не из старой `scheduled_at`: смена
-/// lead time, времени вседневного напоминания или пояса сдвигает ещё не
-/// доставленную запись. Уже отложенная тихими часами запись не
-/// пересчитывается: её время зафиксировано до выпуска.
-async fn reschedule_reminders(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error> {
-    let sql = format!(
-        "SELECT {NOTICE_ROW_COLUMNS}
-         {NOTICE_ROW_FROM}
-         WHERE d.status = 'pending' AND d.kind IN ('reminder', 'snooze')"
-    );
-    let rows: Vec<NoticeRow> = sqlx::query_as(&sql).fetch_all(pool).await?;
-
-    let mut conn = pool.acquire().await?;
-    let mut rescheduled = 0;
-    for row in rows {
-        // Момент выпуска отложенного тихими часами уведомления фиксируется при
-        // переносе. Последующие тики не пересчитывают его: выключение или
-        // смена границ тихих часов не ускоряет уже отложенную доставку.
-        if row.deferred {
-            continue;
-        }
-        let settings = row.settings();
-        let timezone = row.timezone();
-        let intended = if row.is_snooze() {
-            // Время snooze зафиксировано в ключе: повторный расчёт не должен
-            // сдвигать его из-за позднего тика.
-            match snooze_key_time(&row.occurrence_key) {
-                Some(at) => at,
-                None => continue,
-            }
-        } else {
-            if !row.item_valid()
-                || row.current_key().as_deref() != Some(row.occurrence_key.as_str())
-            {
-                continue;
-            }
-            match (row.item_due_at, row.item_due_date) {
-                (Some(due_at), None) => {
-                    due_at - Duration::minutes(i64::from(settings.lead_minutes))
-                }
-                (None, Some(due_date)) => {
-                    let time = parse_hhmm(&settings.all_day_time, "all-day reminder time")
-                        .unwrap_or_else(|_| default_all_day_time());
-                    match resolve_local(timezone, due_date, time) {
-                        Ok(at) => at,
-                        Err(_) => continue,
-                    }
-                }
-                _ => continue,
-            }
-        };
-        let desired = desired_schedule(intended, now, timezone, &settings);
-        let deferred = desired != intended;
-        rescheduled += reschedule_if_changed(&mut conn, row.id, desired, deferred, now).await?;
-    }
-    Ok(rescheduled)
 }
 
 #[derive(FromRow)]
@@ -517,294 +319,16 @@ async fn insert_reminder(
     notifications::insert(conn, &delivery, now).await
 }
 
-/// Отменить `pending`-доставки, вхождение которых больше не актуально.
-async fn cancel_stale(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error> {
-    let sql = format!(
-        "SELECT {NOTICE_ROW_COLUMNS}
-         {NOTICE_ROW_FROM}
-         WHERE d.status = 'pending' AND d.kind IN ('reminder', 'snooze')"
-    );
-    let rows: Vec<NoticeRow> = sqlx::query_as(&sql).fetch_all(pool).await?;
-
-    let mut cancelled = 0;
-    for row in rows {
-        if !row.is_stale(now) {
-            continue;
-        }
-        match cancel_delivery(pool, row.id, now).await {
-            Ok(rows) => cancelled += rows,
-            Err(error) => tracing::error!(
-                delivery_id = %row.id,
-                %error,
-                "failed to cancel stale notification delivery"
-            ),
-        }
-    }
-
-    Ok(cancelled)
-}
-
-/// Пометить `pending`-доставку отменённой в текущей транзакции.
-pub(crate) async fn mark_cancelled(
-    conn: &mut PgConnection,
-    id: Uuid,
-    now: DateTime<Utc>,
-) -> Result<u64, sqlx::Error> {
-    Ok(sqlx::query(
-        "UPDATE notification_deliveries
-         SET status = 'cancelled', updated_at = $2
-         WHERE id = $1 AND status = 'pending'",
-    )
-    .bind(id)
-    .bind(now)
-    .execute(&mut *conn)
-    .await?
-    .rows_affected())
-}
-
-/// Пометить доставку переданной в outbox.
-pub(crate) async fn mark_sent(
-    conn: &mut PgConnection,
-    id: Uuid,
-    seq: i64,
-    now: DateTime<Utc>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE notification_deliveries
-         SET status = 'sent', outbox_seq = $2, updated_at = $3
-         WHERE id = $1 AND status = 'pending'",
-    )
-    .bind(id)
-    .bind(seq)
-    .bind(now)
-    .execute(&mut *conn)
-    .await?;
-    Ok(())
-}
-
-/// Поставить сообщение в outbox и вернуть его `seq`.
-///
-/// Повторная постановка после сбоя использует уже существующую запись по
-/// `dedupe_key`.
-pub(crate) async fn enqueue_message(
-    conn: &mut PgConnection,
-    chat_id: i64,
-    dedupe_key: &str,
-    html: String,
-    rich: bool,
-    now: DateTime<Utc>,
-) -> Result<i64, sqlx::Error> {
-    let outgoing = Outgoing::Message { html, rich };
-    match outbox::enqueue(conn, chat_id, &outgoing, Some(dedupe_key), now).await? {
-        Some(seq) => Ok(seq),
-        None => {
-            sqlx::query_scalar("SELECT seq FROM outbox WHERE dedupe_key = $1")
-                .bind(dedupe_key)
-                .fetch_one(&mut *conn)
-                .await
-        }
-    }
-}
-
-/// Отменить `pending`-доставку через пул.
-pub(crate) async fn cancel_delivery(
-    pool: &PgPool,
-    id: Uuid,
-    now: DateTime<Utc>,
-) -> Result<u64, sqlx::Error> {
-    let mut conn = pool.acquire().await?;
-    mark_cancelled(&mut conn, id, now).await
-}
-
-/// Ключ транзакционной блокировки получателя.
-///
-/// Последние восемь байт `user_id`: у UUIDv7 первые восемь байт заняты
-/// временным префиксом и у соседних записей совпадают. Коллизии двух UUID
-/// практически невозможны.
-fn recipient_lock_key(user_id: Uuid) -> i64 {
-    i64::from_be_bytes(
-        user_id.as_bytes()[8..]
-            .try_into()
-            .expect("uuid has at least sixteen bytes"),
-    )
-}
-
-/// Попробовать взять транзакционную блокировку получателя без ожидания.
-///
-/// Все пути доставки берут её до блокировки строк: тогда два экземпляра
-/// планировщика не соберут сводное сообщение из части отложенных строк
-/// (`SKIP LOCKED` пропустил бы строки, которые в этот момент доставляет
-/// одиночный путь). Занятого получателя тик пропускает.
-pub(crate) async fn try_recipient_lock(
-    conn: &mut PgConnection,
-    user_id: Uuid,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
-        .bind(recipient_lock_key(user_id))
-        .fetch_one(conn)
-        .await
-}
-
-/// Дождаться транзакционной блокировки получателя.
-///
-/// Планировщик держит её только на время одной транзакции тика, поэтому
-/// обработчик бота может подождать: после коммита тика записи уже `sent`, и
-/// ручной выпуск не создаст дубль.
-pub(crate) async fn recipient_lock(
-    conn: &mut PgConnection,
-    user_id: Uuid,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(recipient_lock_key(user_id))
-        .execute(conn)
-        .await?;
-    Ok(())
-}
-
-/// Загрузить задачу и список доставки или отменить её.
-///
-/// Общий путь одиночной доставки, сводного сообщения и уведомления о
-/// назначении: если задачу или список не удалось прочитать, запись переводится
-/// в `cancelled`, а не остаётся навсегда в `pending`.
-pub(crate) async fn load_item_and_list(
+/// Собрать сообщение напоминания; `None` — запись отменена.
+pub(crate) async fn reminder_message(
     conn: &mut PgConnection,
     row: &NoticeRow,
+    telegram_user_id: i64,
     now: DateTime<Utc>,
-) -> Result<Option<(Item, List)>, sqlx::Error> {
-    let Some(item_id) = row.item_id else {
-        mark_cancelled(conn, row.id, now).await?;
+) -> Result<Option<String>, sqlx::Error> {
+    let Some((item, list)) = delivery::load_item_and_list(conn, row, now).await? else {
         return Ok(None);
     };
-    let item = match items::get(conn, row.household_id, item_id).await {
-        Ok(item) => item,
-        Err(DomainError::Database(error)) => return Err(error),
-        Err(_) => {
-            mark_cancelled(conn, row.id, now).await?;
-            return Ok(None);
-        }
-    };
-    let list = match lists::get(conn, row.household_id, item.list_id).await {
-        Ok(list) => list,
-        Err(DomainError::Database(error)) => return Err(error),
-        Err(_) => {
-            mark_cancelled(conn, row.id, now).await?;
-            return Ok(None);
-        }
-    };
-    Ok(Some((item, list)))
-}
-
-/// Передать готовые напоминания в outbox.
-async fn deliver_due(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error> {
-    let ids: Vec<(Uuid, Uuid)> = sqlx::query_as(
-        "SELECT id, user_id FROM notification_deliveries
-         WHERE status = 'pending' AND kind IN ('reminder', 'snooze')
-           AND scheduled_at <= $1
-         ORDER BY scheduled_at, id
-         LIMIT $2",
-    )
-    .bind(now)
-    .bind(DELIVERY_BATCH)
-    .fetch_all(pool)
-    .await?;
-
-    let mut delivered = 0;
-    for (id, user_id) in ids {
-        match deliver_one(pool, id, user_id, now).await {
-            Ok(rows) => delivered += rows,
-            Err(error) => tracing::error!(
-                delivery_id = %id,
-                %error,
-                "failed to deliver notification reminder"
-            ),
-        }
-    }
-    Ok(delivered)
-}
-
-/// Доставить одно напоминание: outbox и `sent` в одной транзакции.
-///
-/// Запись блокируется `FOR UPDATE SKIP LOCKED`, поэтому два экземпляра
-/// планировщика не обработают её одновременно. `dedupe_key` выводится из
-/// идентификатора доставки, поэтому даже повторная постановка не создаст второе
-/// сообщение. Недоступный получатель или устаревшее вхождение переводят запись
-/// в `cancelled`, а не оставляют её навсегда в `pending`.
-async fn deliver_one(
-    pool: &PgPool,
-    id: Uuid,
-    user_id: Uuid,
-    now: DateTime<Utc>,
-) -> Result<u64, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    let delivered = deliver_one_in_conn(&mut tx, id, user_id, now, true).await?;
-    tx.commit().await?;
-    Ok(delivered)
-}
-
-/// Доставить одно напоминание в уже открытой транзакции.
-///
-/// `due_only = false` используется ручным выпуском: запись забирается сразу,
-/// не дожидаясь зафиксированного времени. Запись блокируется `FOR UPDATE SKIP
-/// LOCKED`, поэтому два экземпляра планировщика не обработают её одновременно.
-pub(crate) async fn deliver_one_in_conn(
-    conn: &mut PgConnection,
-    id: Uuid,
-    user_id: Uuid,
-    now: DateTime<Utc>,
-    due_only: bool,
-) -> Result<u64, sqlx::Error> {
-    // Тот же получатель не должен одновременно собираться в сводное другим
-    // экземпляром планировщика.
-    if !try_recipient_lock(&mut *conn, user_id).await? {
-        return Ok(0);
-    }
-    let due = if due_only {
-        "AND d.scheduled_at <= $2"
-    } else {
-        ""
-    };
-    let sql = format!(
-        "SELECT {NOTICE_ROW_COLUMNS}
-         {NOTICE_ROW_FROM}
-         WHERE d.id = $1 AND d.status = 'pending'
-           AND d.kind IN ('reminder', 'snooze')
-           {due}
-         FOR UPDATE OF d SKIP LOCKED"
-    );
-    let row: Option<NoticeRow> = sqlx::query_as(&sql)
-        .bind(id)
-        .bind(now)
-        .fetch_optional(&mut *conn)
-        .await?;
-
-    let Some(row) = row else {
-        return Ok(0);
-    };
-
-    if row.is_stale(now) {
-        mark_cancelled(&mut *conn, row.id, now).await?;
-        return Ok(0);
-    }
-    let timezone = row.timezone();
-    // Проверка под блокировкой закрывает гонку с другим экземпляром
-    // планировщика: даже «сброшенная» запись не уйдёт внутри тихих часов.
-    if let Some(settings) = row.recipient_settings.as_ref()
-        && postpone_for_quiet(&mut *conn, row.id, settings, timezone, now).await?
-    {
-        return Ok(0);
-    }
-
-    // `is_stale` уже проверил эти поля; явная проверка не даёт отправить
-    // сообщение в чат 0 или с пустым названием при будущих изменениях схемы.
-    let (Some(chat_id), Some(telegram_user_id)) = (row.telegram_chat_id, row.telegram_user_id)
-    else {
-        mark_cancelled(&mut *conn, row.id, now).await?;
-        return Ok(0);
-    };
-    let Some((item, list)) = load_item_and_list(&mut *conn, &row, now).await? else {
-        return Ok(0);
-    };
-
     // Snooze и вседневное напоминание показывают «Пора». Для timed-задачи
     // заголовок считает фактическое время до срока: тихие часы или поздний тик
     // уже могли сдвинуть доставку ближе к сроку.
@@ -816,17 +340,8 @@ pub(crate) async fn deliver_one_in_conn(
             (seconds > 0).then_some((seconds + 59) / 60)
         })
     };
-    let ui = notify::reminder_ui(&item, &list, timezone, now, lead_minutes);
-    let html =
-        notify::render_notice(&mut *conn, telegram_user_id, row.household_id, &ui, now).await?;
-    let dedupe_key = delivery_dedupe_key(row.id, row.kind);
-
-    let seq = enqueue_message(&mut *conn, chat_id, &dedupe_key, html, true, now).await?;
-    mark_sent(&mut *conn, row.id, seq, now).await?;
-
-    Ok(1)
-}
-
-fn delivery_dedupe_key(id: Uuid, kind: NotificationKind) -> String {
-    format!("notification:{}:{id}", kind.as_str())
+    let ui = notify::reminder_ui(&item, &list, row.timezone(), now, lead_minutes);
+    notify::render_notice(conn, telegram_user_id, row.household_id, &ui, now)
+        .await
+        .map(Some)
 }

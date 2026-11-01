@@ -10,7 +10,7 @@ use crate::domain::settings::{
     NotificationSettings, NotificationSettingsUpdate, ProfileUpdate, SUGGESTED_TIMEZONES,
     validate_timezone,
 };
-use crate::jobs::{batch, scheduler};
+use crate::jobs::{batch, delivery, quiet};
 use crate::storage::repositories::{audit, invites, members, users};
 use crate::telegram::rich::{Span, button};
 use crate::telegram::ru;
@@ -79,9 +79,9 @@ pub(super) async fn finish_settings_change(
     let settings = NotificationSettings::from_settings(&ctx.user()?.settings);
     let timezone = ctx.tz;
 
-    scheduler::recipient_lock(&mut *ctx.conn, user_id).await?;
+    delivery::recipient_lock(&mut *ctx.conn, user_id).await?;
 
-    if let Some(end) = scheduler::quiet_end_at(ctx.now, timezone, &settings) {
+    if let Some(end) = quiet::quiet_end_at(ctx.now, timezone, &settings) {
         // По новым настройкам сейчас всё ещё тихо: не выпускаем, но переносим
         // отложенные на конец нового интервала.
         batch::postpone_deferred_for_user(&mut *ctx.conn, user_id, end, ctx.now).await?;

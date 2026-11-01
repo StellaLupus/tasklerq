@@ -17,12 +17,12 @@ use chrono_tz::Tz;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use super::notice::{NOTICE_ROW_COLUMNS, NOTICE_ROW_FROM, NoticeRow};
-use super::scheduler::{
-    DELIVERY_BATCH, deliver_one_in_conn, enqueue_message, load_item_and_list, mark_cancelled,
+use super::delivery::{
+    self, DELIVERY_BATCH, DeliveryScope, enqueue_message, load_item_and_list, mark_cancelled,
     postpone_for_quiet, try_recipient_lock,
 };
-use super::{assignment, digest};
+use super::digest;
+use super::notice::{NOTICE_ROW_COLUMNS, NOTICE_ROW_FROM, NoticeRow};
 use crate::storage::repositories::notifications::{self, NotificationKind};
 use crate::telegram::bot::notify;
 
@@ -391,14 +391,19 @@ async fn deliver_single_deferred(
     now: DateTime<Utc>,
 ) -> Result<u64, sqlx::Error> {
     match candidate.entry.kind {
-        NotificationKind::Reminder | NotificationKind::Snooze => {
-            deliver_one_in_conn(conn, candidate.delivery_id, user_id, now, false).await
-        }
-        NotificationKind::Assignment => {
-            assignment::deliver_one_in_conn(conn, candidate.delivery_id, user_id, now, false).await
-        }
         // Запрос сводного явно ограничен видами reminder/snooze/assignment.
         NotificationKind::Digest => unreachable!("digest is delivered separately"),
+        kind => {
+            delivery::deliver_one_in_conn(
+                conn,
+                DeliveryScope::of(kind),
+                candidate.delivery_id,
+                user_id,
+                now,
+                false,
+            )
+            .await
+        }
     }
 }
 
