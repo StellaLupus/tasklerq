@@ -166,6 +166,10 @@ pub async fn enqueue(
         // Блокировка и вытеснение — один запрос: воркер не может доставить
         // строку между чтением `placement` и её вытеснением, иначе новый
         // экран унаследовал бы режим уже доставленного.
+        //
+        // Вытесняемая строка с неизвестным `placement` тоже уходит в
+        // `skipped`: в выборе режима она не участвует и в dead-letter не
+        // попадает.
         let pending: Vec<Value> = sqlx::query_scalar(
             "WITH evicted AS (
                  SELECT seq, payload FROM outbox
@@ -627,14 +631,13 @@ async fn deliver(
             let target = active.as_ref().and_then(|view| view.message_id);
             let buried = active.as_ref().is_some_and(|view| view.buried);
 
-            let replace = target.is_some()
-                && match placement {
-                    Placement::InPlace => false,
-                    Placement::Visible => buried,
-                    Placement::Fresh => true,
-                };
+            let old_id = match (target, placement) {
+                (Some(old_id), Placement::Fresh) => Some(old_id),
+                (Some(old_id), Placement::Visible) if buried => Some(old_id),
+                _ => None,
+            };
 
-            let (message_id, sent_new) = match target.filter(|_| replace) {
+            let (message_id, sent_new) = match old_id {
                 Some(old_id) => {
                     let message_id = api.send_rich_message(row.chat_id, &rich).await?;
                     // Новый экран уже отправлен: любая ошибка удаления старого

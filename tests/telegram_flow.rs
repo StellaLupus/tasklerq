@@ -2,11 +2,13 @@
 
 mod support;
 
-use support::telegram::{Call, Harness, buttons};
+use std::sync::Arc;
+
+use support::telegram::{Call, FakeTelegram, Harness, buttons};
 use support::{db, next_telegram_id};
 use tasklerq::telegram::api::TelegramError;
-use tasklerq::telegram::bot::issue_and_render;
 use tasklerq::telegram::bot::model::{Action, Screen, Ui};
+use tasklerq::telegram::bot::{Bot, issue_and_render};
 use tasklerq::telegram::callbacks::Scope;
 use tasklerq::telegram::outbox::{self, Outgoing};
 use tasklerq::telegram::rich::button;
@@ -126,6 +128,53 @@ fn has_send(calls: &[Call]) -> bool {
     calls
         .iter()
         .any(|call| matches!(call, Call::SendRich { .. } | Call::Send { .. }))
+}
+
+/// Строки outbox: `(seq, вид, message_id из payload)`.
+type OutboxRow = (i64, String, Option<i64>);
+
+async fn max_outbox_seq(bot: &Harness) -> i64 {
+    sqlx::query_scalar("SELECT coalesce(max(seq), 0) FROM outbox WHERE chat_id = $1")
+        .bind(bot.chat)
+        .fetch_one(&bot.pool)
+        .await
+        .expect("max outbox seq")
+}
+
+async fn outbox_since(bot: &Harness, seq: i64) -> Vec<OutboxRow> {
+    sqlx::query_as(
+        "SELECT seq, kind::text AS kind,
+                coalesce((payload->>'message_id')::bigint, message_id) AS message_id
+         FROM outbox
+         WHERE chat_id = $1 AND seq > $2
+         ORDER BY seq",
+    )
+    .bind(bot.chat)
+    .bind(seq)
+    .fetch_all(&bot.pool)
+    .await
+    .expect("outbox rows")
+}
+
+/// Отправить текст, зная `message_id` входящего сообщения, и вернуть строки
+/// outbox, появившиеся за это обновление.
+async fn send_text(bot: &mut Harness, text: &str) -> (i64, Vec<OutboxRow>) {
+    let name = bot.name.clone();
+    let update = bot.text_update(&name, text);
+    let message_id = update["message"]["message_id"]
+        .as_i64()
+        .expect("incoming message id");
+    let before = max_outbox_seq(bot).await;
+    bot.enqueue(update).await;
+    bot.pump().await;
+    (message_id, outbox_since(bot, before).await)
+}
+
+fn delete_seq(rows: &[OutboxRow], message_id: i64) -> i64 {
+    rows.iter()
+        .find(|(_, kind, id)| kind == "delete" && *id == Some(message_id))
+        .unwrap_or_else(|| panic!("no delete row for incoming message {message_id}: {rows:?}"))
+        .0
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -441,10 +490,18 @@ async fn start_sends_a_new_screen_when_edit_would_succeed() {
     let db = db().await;
     let mut bot = onboarded(&db.pool).await;
     let (anchor, _) = bot.active();
+    let buried: bool = sqlx::query_scalar("SELECT buried FROM telegram_views WHERE chat_id = $1")
+        .bind(bot.chat)
+        .fetch_one(&db.pool)
+        .await
+        .expect("view");
+    assert!(
+        !buried,
+        "the active screen must not be buried before /start"
+    );
 
     // Telegram принимает правку: бот не может узнать, что пользователь удалил
     // сообщение только у себя.
-    bot.fake.reject_edits(None);
     bot.fake.clear_calls();
 
     bot.text("/start").await;
@@ -529,4 +586,175 @@ async fn text_on_visible_screen_edits_it_in_place() {
     assert_eq!(bot.active().0, anchor);
     assert_eq!(bot.fake.messages(bot.chat).len(), 1);
     bot.assert_screen_contains("Проверьте и сохраните");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incoming_text_is_deleted_before_the_screen_is_edited() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let (anchor, _) = bot.active();
+    bot.fake.clear_calls();
+
+    let (message_id, rows) = send_text(&mut bot, "купить молоко").await;
+
+    let delete = delete_seq(&rows, message_id);
+    let screen = rows
+        .iter()
+        .find(|(_, kind, _)| kind == "screen")
+        .expect("the update must enqueue a screen")
+        .0;
+    assert!(
+        delete < screen,
+        "the incoming message must be deleted before the screen: {rows:?}"
+    );
+
+    let calls = bot.fake.calls();
+    let deleted_at = calls
+        .iter()
+        .position(|call| matches!(call, Call::Delete { id, .. } if *id == message_id))
+        .unwrap_or_else(|| panic!("the incoming message must be deleted: {calls:?}"));
+    let edited_at = calls
+        .iter()
+        .position(|call| matches!(call, Call::EditRich { id, .. } if *id == anchor))
+        .unwrap_or_else(|| panic!("the active screen must be edited: {calls:?}"));
+    assert!(
+        deleted_at < edited_at,
+        "the delete must be delivered before the edit: {calls:?}"
+    );
+    assert_eq!(bot.active().0, anchor);
+    bot.assert_screen_contains("Проверьте и сохраните");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_kind_of_incoming_text_is_deleted() {
+    let db = db().await;
+
+    // Команда у ещё не зарегистрированного пользователя.
+    let mut newcomer = Harness::new(&db.pool, next_telegram_id());
+    let (message_id, rows) = send_text(&mut newcomer, "/start").await;
+    delete_seq(&rows, message_id);
+    newcomer.assert_screen_contains("Как назовём ваше пространство");
+
+    let mut bot = onboarded(&db.pool).await;
+
+    // `/help` остаётся отдельным сообщением, но команда тоже удаляется.
+    let (message_id, rows) = send_text(&mut bot, "/help").await;
+    delete_seq(&rows, message_id);
+    assert!(
+        rows.iter().any(|(_, kind, _)| kind == "message"),
+        "/help must stay a separate message: {rows:?}"
+    );
+
+    // Ответ на шаг формы.
+    bot.press("Добавить").await;
+    bot.press("Задачу").await;
+    let (message_id, rows) = send_text(&mut bot, "Оплатить интернет").await;
+    delete_seq(&rows, message_id);
+    bot.assert_screen_contains("Когда сделать?");
+
+    // Текст на разбор.
+    let id = next_telegram_id();
+    let handler = Bot::new("tasklerqbot").with_llm_capture(true);
+    let mut parser = Harness::with_handler(&db.pool, id, Arc::new(handler), FakeTelegram::new());
+    parser.text("/start").await;
+    parser.text("Семья").await;
+    parser.press("Москва").await;
+    parser.press("меню").await;
+    let (message_id, rows) = send_text(&mut parser, "купить молоко").await;
+    delete_seq(&rows, message_id);
+    parser.assert_screen_contains("Разбираю сообщение");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_delete_keeps_the_result_and_sends_the_next_screen_below() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let (anchor, _) = bot.active();
+    bot.fake
+        .reject_deletes(Some(TelegramError::MessageUndeletable));
+
+    send_text(&mut bot, "купить молоко").await;
+
+    let status: String = sqlx::query_scalar(
+        "SELECT status::text FROM outbox
+         WHERE chat_id = $1 AND kind = 'delete'
+         ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("delete row");
+    assert_eq!(status, "skipped", "an undeletable message is not an error");
+
+    bot.assert_screen_contains("Проверьте и сохраните");
+    let (new_id, _) = bot.active();
+    assert_ne!(new_id, anchor, "a buried screen must be sent anew");
+    assert!(new_id > anchor, "the new screen must be below the old one");
+    assert!(is_alive(&bot, anchor), "the old anchor stays in the chat");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_command_is_a_banner_without_a_message() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let (anchor, _) = bot.active();
+    bot.fake.clear_calls();
+
+    let (message_id, rows) = send_text(&mut bot, "/nonsense").await;
+
+    delete_seq(&rows, message_id);
+    assert!(
+        !rows.iter().any(|(_, kind, _)| kind == "message"),
+        "an unknown command must not send a message: {rows:?}"
+    );
+    bot.assert_screen_contains("Не знаю такой команды");
+    assert_eq!(
+        bot.active().0,
+        anchor,
+        "the current screen must be redrawn in place"
+    );
+    assert!(!has_send(&bot.fake.calls()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn double_tap_on_a_buried_anchor_keeps_editing_it_in_place() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let (anchor, html) = bot.active();
+    let tasks = buttons(&html)
+        .into_iter()
+        .find(|(label, _)| label.contains("Задачи"))
+        .expect("tasks button")
+        .1;
+
+    deliver_message(&mut bot, "<p>напоминание</p>").await;
+    let buried: bool = sqlx::query_scalar("SELECT buried FROM telegram_views WHERE chat_id = $1")
+        .bind(bot.chat)
+        .fetch_one(&db.pool)
+        .await
+        .expect("view");
+    assert!(buried, "a notification must bury the anchor");
+    bot.fake.clear_calls();
+
+    bot.press_data(&tasks, anchor).await;
+    bot.press_data(&tasks, anchor).await;
+
+    let calls = bot.fake.calls();
+    let edits = calls
+        .iter()
+        .filter(|call| matches!(call, Call::EditRich { id, .. } if *id == anchor))
+        .count();
+    assert_eq!(
+        edits, 2,
+        "a repeated tap on the anchor must edit it in place: {calls:?}"
+    );
+    assert!(
+        !has_send(&calls),
+        "a repeated tap must not send a new screen: {calls:?}"
+    );
+    assert!(
+        !calls.iter().any(|call| matches!(call, Call::Delete { .. })),
+        "a repeated tap must not delete the anchor: {calls:?}"
+    );
+    assert_eq!(bot.active().0, anchor);
 }

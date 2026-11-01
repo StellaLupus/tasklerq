@@ -147,6 +147,30 @@ impl Stand {
             .expect("count jobs")
     }
 
+    /// Последний `seq` outbox этого чата.
+    async fn last_outbox_seq(&self) -> i64 {
+        sqlx::query_scalar("SELECT coalesce(max(seq), 0) FROM outbox WHERE chat_id = $1")
+            .bind(self.bot.chat)
+            .fetch_one(&self.bot.pool)
+            .await
+            .expect("max outbox seq")
+    }
+
+    /// Строки outbox, появившиеся после `seq`: `(вид, message_id)`.
+    async fn outbox_since(&self, seq: i64) -> Vec<(String, Option<i64>)> {
+        sqlx::query_as(
+            "SELECT kind::text AS kind, (payload->>'message_id')::bigint AS message_id
+             FROM outbox
+             WHERE chat_id = $1 AND seq > $2
+             ORDER BY seq",
+        )
+        .bind(self.bot.chat)
+        .bind(seq)
+        .fetch_all(&self.bot.pool)
+        .await
+        .expect("outbox rows")
+    }
+
     async fn household_items(&self) -> i64 {
         sqlx::query_scalar(
             "SELECT count(*) FROM items i JOIN users u ON u.household_id = i.household_id
@@ -403,9 +427,20 @@ async fn expired_draft_is_not_saved() {
 async fn too_long_text_is_not_queued() {
     let db = db().await;
     let mut stand = stand(&db.pool, vec![]).await;
+    let before = stand.last_outbox_seq().await;
+
     stand.bot.text(&"а".repeat(2_001)).await;
 
-    stand.bot.assert_latest_contains("слишком длинное");
+    stand.bot.assert_screen_contains("слишком длинное");
+    let rows = stand.outbox_since(before).await;
+    assert!(
+        rows.iter().any(|(kind, _)| kind == "delete"),
+        "the rejected text must be deleted: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|(kind, _)| kind == "message"),
+        "a rejection is a banner, not a separate message: {rows:?}"
+    );
     assert_eq!(stand.jobs().await, 0);
     assert_eq!(stand.ai.calls(), 0);
 }
@@ -815,8 +850,18 @@ async fn more_than_ten_parses_per_minute_are_rejected_without_llm() {
     }
     assert_eq!(stand.jobs().await, PARSES_PER_MINUTE);
 
+    let before = stand.last_outbox_seq().await;
     stand.bot.text("дело 11").await;
-    stand.bot.assert_latest_contains("Слишком много сообщений");
+    stand.bot.assert_screen_contains("Слишком много сообщений");
+    let rows = stand.outbox_since(before).await;
+    assert!(
+        rows.iter().any(|(kind, _)| kind == "delete"),
+        "the rejected text must be deleted: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|(kind, _)| kind == "message"),
+        "a rejection is a banner, not a separate message: {rows:?}"
+    );
     assert_eq!(stand.jobs().await, PARSES_PER_MINUTE);
     assert_eq!(stand.ai.calls(), 0);
 }

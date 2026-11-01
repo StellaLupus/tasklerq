@@ -41,12 +41,11 @@ pub async fn intake(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
     let user_id = ctx.user()?.id;
     let household_id = ctx.household()?.id;
     if text.chars().count() > MAX_TEXT {
-        return ctx
-            .say(&format!(
-                "Сообщение слишком длинное: не больше {MAX_TEXT} символов. \
-                 Сократите его или разделите на части."
-            ))
-            .await;
+        ctx.banner(format!(
+            "Сообщение слишком длинное: не больше {MAX_TEXT} символов. \
+             Сократите его или разделите на части."
+        ));
+        return ctx.refresh().await;
     }
 
     let recent = capture_jobs::count_recent_for_user(
@@ -57,12 +56,11 @@ pub async fn intake(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
     )
     .await?;
     if recent >= PARSES_PER_MINUTE {
-        return ctx
-            .say(&format!(
-                "Слишком много сообщений на разбор: не больше {PARSES_PER_MINUTE} в минуту. \
-                 Подождите немного и отправьте снова."
-            ))
-            .await;
+        ctx.banner(format!(
+            "Слишком много сообщений на разбор: не больше {PARSES_PER_MINUTE} в минуту. \
+             Подождите немного и отправьте снова."
+        ));
+        return ctx.refresh().await;
     }
 
     capture_jobs::enqueue(

@@ -12,8 +12,9 @@ use sqlx::PgConnection;
 use support::telegram::{FakeTelegram, Harness};
 use support::{db, next_telegram_id};
 use tasklerq::security_audit::Audit;
-use tasklerq::telegram::bot::Outcome;
+use tasklerq::telegram::bot::{Bot, Outcome};
 use tasklerq::telegram::queue::{self, Failure};
+use tasklerq::telegram::update::{self, Classified};
 use tasklerq::telegram::worker::{Pass, UPDATES_PER_MINUTE, UpdateHandler, UpdateWorker};
 use tokio::sync::Notify;
 
@@ -44,6 +45,36 @@ impl UpdateHandler for Flaky {
             return Err(sqlx::Error::PoolTimedOut);
         }
         Ok(Outcome::default())
+    }
+}
+
+/// Настоящий бот, который после обработки сообщает о сбое: проверяет, что
+/// откат транзакции убирает и строку удаления входящего сообщения.
+struct BotThenFail {
+    bot: Bot,
+    failures_left: AtomicU32,
+}
+
+#[async_trait]
+impl UpdateHandler for BotThenFail {
+    async fn handle(
+        &self,
+        conn: &mut PgConnection,
+        payload: &Value,
+        now: DateTime<Utc>,
+    ) -> Result<Outcome, sqlx::Error> {
+        let parsed = update::parse(payload).map_err(|error| {
+            sqlx::Error::Protocol(format!("stored update is malformed: {error}"))
+        })?;
+        let Classified::Handle(incoming) = update::classify(&parsed) else {
+            return Ok(Outcome::default());
+        };
+        let outcome = self.bot.handle(conn, incoming, now).await?;
+        if self.failures_left.load(Ordering::SeqCst) > 0 {
+            self.failures_left.fetch_sub(1, Ordering::SeqCst);
+            return Err(sqlx::Error::PoolTimedOut);
+        }
+        Ok(outcome)
     }
 }
 
@@ -191,6 +222,64 @@ async fn temporary_failure_is_retried_with_backoff_and_applied_once() {
         Pass::Idle
     );
     assert_eq!(marker_count(&db.pool, &marker).await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rolled_back_processing_leaves_no_delete_row_and_the_retry_adds_one() {
+    let db = db().await;
+    ensure_household(&db.pool).await;
+    let chat = next_telegram_id();
+    let handler = Arc::new(BotThenFail {
+        bot: Bot::new("tasklerqbot"),
+        failures_left: AtomicU32::new(1),
+    });
+    let worker = worker(&db.pool, chat, handler, 10);
+    let mut bot = Harness::new(&db.pool, chat);
+    let update = bot.text_update("Ann", "привет");
+    let id = update["update_id"].as_i64().expect("id");
+    let t0 = Utc::now().trunc_subsecs(6);
+    enqueue_at(&db.pool, &update, t0).await;
+
+    async fn delete_rows(pool: &sqlx::PgPool, chat: i64) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM outbox WHERE chat_id = $1 AND kind = 'delete'")
+            .bind(chat)
+            .fetch_one(pool)
+            .await
+            .expect("delete rows")
+    }
+
+    // Сбой после обработки: транзакция откатывается вместе со строкой удаления.
+    assert!(matches!(
+        worker.run_once(t0).await.expect("pass"),
+        Pass::Failed(Failure::Retry(_))
+    ));
+    assert_eq!(
+        delete_rows(&db.pool, chat).await,
+        0,
+        "a rolled back update must not leave a delete row"
+    );
+
+    // Успешный повтор ставит удаление ровно один раз.
+    let t1 = t0 + Duration::seconds(1);
+    assert_eq!(worker.run_once(t1).await.expect("pass"), Pass::Processed);
+    assert_eq!(
+        delete_rows(&db.pool, chat).await,
+        1,
+        "the successful retry must delete the message once"
+    );
+    assert_eq!(status_of(&db.pool, id).await.0, "processed");
+    let message_id = update["message"]["message_id"]
+        .as_i64()
+        .expect("message id");
+    let deleted: Option<i64> = sqlx::query_scalar(
+        "SELECT (payload->>'message_id')::bigint FROM outbox
+         WHERE chat_id = $1 AND kind = 'delete'",
+    )
+    .bind(chat)
+    .fetch_optional(&db.pool)
+    .await
+    .expect("deleted message");
+    assert_eq!(deleted, Some(message_id));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

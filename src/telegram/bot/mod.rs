@@ -466,6 +466,22 @@ impl Bot {
             } => (*chat_id, sender.clone()),
         };
 
+        // Входящий текст удаляется первой строкой обновления, до обработчика и
+        // вне savepoint шага: удаление доставляется раньше экрана, а отказ шага
+        // его не отменяет. Откат всей транзакции убирает и удаление.
+        if let Incoming::Text { message_id, .. } = &incoming {
+            outbox::enqueue(
+                conn,
+                chat_id,
+                &Outgoing::Delete {
+                    message_id: *message_id,
+                },
+                Some(&delete_dedupe_key(chat_id, *message_id)),
+                now,
+            )
+            .await?;
+        }
+
         let user = users::find_active_by_telegram(&mut *conn, sender.id)
             .await
             .map_err(into_sqlx)?;
@@ -665,6 +681,15 @@ impl<'a> Ctx<'a> {
     }
 }
 
+/// Ключ удаления входящего сообщения.
+///
+/// Одно сообщение удаляется не больше раза, даже если Telegram пришлёт его
+/// повторно другим обновлением. `message_id` уникален в чате и не переиспользуется,
+/// поэтому конфликт возможен только у настоящего повтора.
+fn delete_dedupe_key(chat_id: i64, message_id: i64) -> String {
+    format!("delete:{chat_id}:{message_id}")
+}
+
 fn parse_command(text: &str) -> Option<(String, &str)> {
     let rest = text.strip_prefix('/')?;
     let (command, argument) = match rest.split_once(char::is_whitespace) {
@@ -703,9 +728,8 @@ async fn on_command(ctx: &mut Ctx<'_>, command: &str, argument: &str) -> Result<
             Ok(())
         }
         _ => {
-            ctx.say("Не знаю такой команды. Отправьте /help, чтобы увидеть список.")
-                .await?;
-            Ok(())
+            ctx.banner("Не знаю такой команды. Отправьте /help, чтобы увидеть список.");
+            ctx.refresh().await
         }
     }
 }
@@ -718,6 +742,17 @@ const HELP: &str = "Я помогаю вести задачи и покупки 
 /help — эта справка";
 
 async fn on_callback(ctx: &mut Ctx<'_>, message_id: i64, data: &str) -> Result<(), Fail> {
+    let active_id = views::get(&mut *ctx.conn, ctx.chat_id)
+        .await?
+        .and_then(|view| view.message_id);
+    // Кнопка на самом якоре правит его на месте при любом исходе нажатия:
+    // повтор, устаревший токен или невалидный payload не должны прислать
+    // второй экран и удалить якорь, на который смотрит пользователь. Кнопки
+    // уведомлений с якорем не совпадают и остаются `visible`.
+    if active_id == Some(message_id) {
+        ctx.placement = Placement::InPlace;
+    }
+
     let consumed = callbacks::consume(&mut *ctx.conn, data, ctx.sender.id, ctx.now).await?;
     let token = match consumed {
         Consumed::Valid(token) => token,
@@ -749,17 +784,12 @@ async fn on_callback(ctx: &mut Ctx<'_>, message_id: i64, data: &str) -> Result<(
     // Кнопка заменённого сообщения экрана не выполняется: пользователь видит
     // актуальный экран в активном сообщении. Кнопка на самом якоре правит его
     // на месте, даже если якорь засыпан уведомлением.
-    if token.scope == Scope::Screen {
-        let active = views::get(&mut *ctx.conn, ctx.chat_id).await?;
-        if let Some(active) = active
-            && let Some(active_id) = active.message_id
-        {
-            if active_id != message_id {
-                ctx.toast("Это сообщение устарело. Показываю актуальный экран.");
-                return ctx.refresh().await;
-            }
-            ctx.placement = Placement::InPlace;
-        }
+    if token.scope == Scope::Screen
+        && let Some(active_id) = active_id
+        && active_id != message_id
+    {
+        ctx.toast("Это сообщение устарело. Показываю актуальный экран.");
+        return ctx.refresh().await;
     }
 
     let Ok(action) = serde_json::from_value::<Action>(token.payload) else {
