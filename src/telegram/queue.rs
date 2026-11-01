@@ -166,6 +166,23 @@ pub async fn record_failure(
     })
 }
 
+/// Время самого старого готового к обработке обновления.
+///
+/// `None` — готовых обновлений нет. Используется readiness и метрикой задержки
+/// очереди, чтобы запрос не дублировался.
+pub async fn oldest_ready(
+    conn: &mut PgConnection,
+    now: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT min(available_at) FROM telegram_updates
+         WHERE status = 'pending' AND available_at <= $1",
+    )
+    .bind(now)
+    .fetch_one(conn)
+    .await
+}
+
 /// Количество обновлений по статусам.
 pub async fn counts(conn: &mut PgConnection) -> Result<Counts, sqlx::Error> {
     let rows: Vec<(String, i64)> =

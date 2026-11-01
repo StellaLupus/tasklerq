@@ -13,9 +13,9 @@ pub const REDACTED: &str = "<redacted>";
 /// Переменные окружения, значения которых считаются секретами целиком.
 const SECRET_ENV: [&str; 3] = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET", "HA_TOKEN"];
 
-/// Слишком короткие значения не заменяются глобально: иначе секрет вроде
-/// `abc` испортил бы обычные слова. Это осознанный компромисс: короткий
-/// пароль может остаться в диагностическом тексте.
+/// Порог только для пароля из `DATABASE_URL`: слишком короткое значение
+/// заменило бы обычные слова. Значения `TELEGRAM_BOT_TOKEN`,
+/// `TELEGRAM_WEBHOOK_SECRET` и `HA_TOKEN` вырезаются при любой непустой длине.
 const MIN_SECRET_CHARS: usize = 6;
 
 /// Убрать учётные данные из одного URL, сохранив остальные части.
@@ -80,25 +80,24 @@ pub fn redact_url_credentials(text: &str) -> String {
     output
 }
 
-/// Вырезать всё между `://` и последним `@` до первого `/`, `?` или `#`.
+/// Вырезать всё между `://` и последним `@` во всём кандидате.
+///
+/// Кандидат уже обрезан по пробелу и угловым скобкам. Границей не служит
+/// первый `/`: в `http://user:pa/ss@host` пароль содержит `/`, и остановка на
+/// нём оставила бы `pa/ss` в тексте.
 fn strip_userinfo_lexically(url: &str) -> String {
     let Some(scheme_at) = url.find("://") else {
         return url.to_owned();
     };
     let authority_start = scheme_at + 3;
-    let authority_end = url[authority_start..]
-        .char_indices()
-        .find(|(_, ch)| matches!(ch, '/' | '?' | '#'))
-        .map_or(url.len(), |(offset, _)| authority_start + offset);
-    let authority = &url[authority_start..authority_end];
-    let Some(at) = authority.rfind('@') else {
+    let Some(relative_at) = url[authority_start..].rfind('@') else {
         return url.to_owned();
     };
+    let at = authority_start + relative_at;
 
     let mut output = String::with_capacity(url.len());
     output.push_str(&url[..authority_start]);
-    output.push_str(&authority[at + 1..]);
-    output.push_str(&url[authority_end..]);
+    output.push_str(&url[at + 1..]);
     output
 }
 
@@ -138,30 +137,65 @@ fn collect_secrets<'a>(vars: impl IntoIterator<Item = (&'a str, &'a str)>) -> Ve
         if name == "DATABASE_URL" {
             database_url = Some(value);
         } else if SECRET_ENV.contains(&name) {
+            // Токены и секреты вырезаются целиком при любой непустой длине.
             push_secret(&mut secrets, value);
         }
     }
 
-    if let Some(raw) = database_url
-        && let Ok(url) = Url::parse(raw)
-        && let Some(password) = url.password()
-    {
-        push_secret(&mut secrets, password);
-        // Пароль мог прийти percent-encoded; в тексте ошибки он может быть как
-        // закодированным, так и раскрытым.
-        if let Some(decoded) = percent_decode(password) {
-            push_secret(&mut secrets, &decoded);
+    if let Some(raw) = database_url {
+        match Url::parse(raw) {
+            Ok(url) => {
+                if let Some(password) = url.password() {
+                    push_database_password(&mut secrets, password);
+                }
+            }
+            Err(_) => {
+                // Строка подключения не разобралась: собираем пароль
+                // лексически, иначе он остался бы в тексте ошибки.
+                if let Some(password) = lexical_password(raw) {
+                    push_database_password(&mut secrets, password);
+                }
+            }
         }
     }
 
     secrets
 }
 
+/// Добавить секрет без порога длины (переменные окружения).
 fn push_secret(secrets: &mut Vec<String>, value: &str) {
-    if value.chars().count() < MIN_SECRET_CHARS || secrets.iter().any(|known| known == value) {
+    if value.is_empty() || secrets.iter().any(|known| known == value) {
         return;
     }
     secrets.push(value.to_owned());
+}
+
+/// Добавить пароль из `DATABASE_URL`: короткие значения пропускаются, чтобы не
+/// портить обычные слова в диагностическом тексте.
+fn push_database_password(secrets: &mut Vec<String>, password: &str) {
+    if password.chars().count() < MIN_SECRET_CHARS {
+        return;
+    }
+    push_secret(secrets, password);
+    // Пароль мог прийти percent-encoded; в тексте ошибки он может быть как
+    // закодированным, так и раскрытым.
+    if let Some(decoded) = percent_decode(password) {
+        push_secret(secrets, &decoded);
+    }
+}
+
+/// Пароль из нераспарсенной строки подключения: последний `@` до пробела,
+/// затем часть после первого `:` в userinfo.
+fn lexical_password(raw: &str) -> Option<&str> {
+    let scheme_at = raw.find("://")?;
+    let rest = &raw[scheme_at + 3..];
+    let end = rest
+        .find(|ch: char| ch.is_whitespace())
+        .unwrap_or(rest.len());
+    let authority = &rest[..end];
+    let at = authority.rfind('@')?;
+    let (_, password) = authority[..at].split_once(':')?;
+    (!password.is_empty()).then_some(password)
 }
 
 /// Декодировать `%XX` без внешнего крейта; `None`, если замен нет.
@@ -310,7 +344,17 @@ mod tests {
     }
 
     #[test]
-    fn environment_secrets_include_url_password_and_skip_short_values() {
+    fn lexical_redaction_uses_the_last_at_before_whitespace() {
+        // Первый `/` не граница userinfo: пароль `pa/ssword` содержит слэш.
+        assert_eq!(redact_url("http://user:pa/ssword@host"), "http://host");
+        assert_eq!(
+            redact_url_credentials("connect http://user:pa/ssword@host failed"),
+            "connect http://host failed"
+        );
+    }
+
+    #[test]
+    fn environment_secrets_replace_short_values_and_keep_the_database_threshold() {
         let secrets = collect_secrets([
             (
                 "DATABASE_URL",
@@ -318,7 +362,7 @@ mod tests {
             ),
             ("TELEGRAM_BOT_TOKEN", "123456:secret-token-value"),
             ("HA_TOKEN", "abc"),
-            ("TELEGRAM_WEBHOOK_SECRET", ""),
+            ("TELEGRAM_WEBHOOK_SECRET", "s3c"),
         ]);
 
         assert!(secrets.iter().any(|secret| secret == "p%40ssword"));
@@ -332,17 +376,45 @@ mod tests {
                 .any(|secret| secret == "123456:secret-token-value")
         );
         assert!(
-            !secrets.iter().any(|secret| secret == "abc"),
-            "short values must not be replaced globally"
+            secrets.iter().any(|secret| secret == "abc"),
+            "token values are replaced at any non-empty length: {secrets:?}"
+        );
+        assert!(
+            secrets.iter().any(|secret| secret == "s3c"),
+            "a short webhook secret must still be collected: {secrets:?}"
         );
 
-        let text = "db p%40ssword, decoded p@ssword, token 123456:secret-token-value";
+        let text =
+            "db p%40ssword, decoded p@ssword, token 123456:secret-token-value, ha abc, hook s3c";
         let redacted = replace_known_secrets(text, &secrets);
         assert!(!redacted.contains("p%40ssword"), "{redacted}");
         assert!(!redacted.contains("p@ssword"), "{redacted}");
         assert!(
             !redacted.contains("123456:secret-token-value"),
             "{redacted}"
+        );
+        assert!(!redacted.contains(" abc"), "{redacted}");
+        assert!(!redacted.contains(" s3c"), "{redacted}");
+    }
+
+    #[test]
+    fn short_database_password_is_still_skipped() {
+        let secrets =
+            collect_secrets([("DATABASE_URL", "postgres://tasklerq:abc@db:5432/tasklerq")]);
+        assert!(
+            !secrets.iter().any(|secret| secret == "abc"),
+            "the database password keeps the length threshold: {secrets:?}"
+        );
+    }
+
+    #[test]
+    fn password_from_an_unparsed_database_url_is_collected_lexically() {
+        // Порт `pa` делает строку невалидной для `Url::parse`, а пароль
+        // содержит `/`, который раньше обрывал лексический разбор.
+        let secrets = collect_secrets([("DATABASE_URL", "postgres://tasklerq:pa/ssword@[::1")]);
+        assert!(
+            secrets.iter().any(|secret| secret == "pa/ssword"),
+            "the password of a malformed URL must be collected: {secrets:?}"
         );
     }
 }

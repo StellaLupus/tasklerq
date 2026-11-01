@@ -6,9 +6,15 @@ use sqlx::PgPool;
 use sqlx::migrate::{MigrateError, Migrator};
 
 /// Миграции, встроенные в бинарник.
+///
+/// `sqlx::migrate!` строит [`Migrator`] с `locking = true`, поэтому
+/// [`run`] выполняет `pg_advisory_lock` на всё время применения (см.
+/// `sqlx-core::migrate::migrator`, `sqlx-postgres::migrate::lock`). Не
+/// отключаем блокировку и не добавляем свою: параллельные `serve` и
+/// `tasklerq migrate` сериализуются на одной базе.
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
-/// Применить все ожидающие миграции.
+/// Применить все ожидающие миграции под advisory lock.
 pub async fn run(pool: &PgPool) -> Result<(), MigrateError> {
     MIGRATOR.run(pool).await
 }

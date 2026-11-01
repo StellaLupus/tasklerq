@@ -564,17 +564,33 @@ sudo /usr/local/bin/docker compose exec tasklerq \
 
 ## 11. Резервное копирование
 
-Ежедневный дамп через контейнер `postgres`:
+Скрипты `scripts/backup.sh` и `scripts/restore.sh` работают так же, как
+ручные команды: через `docker exec`, потому что на проде `pg_dump` и
+`pg_restore` есть только внутри контейнера PostgreSQL. Установите их в
+`/usr/local/bin/`:
 
 ```bash
+sudo install -m 0755 scripts/backup.sh /usr/local/bin/tasklerq-backup.sh
+sudo install -m 0755 scripts/restore.sh /usr/local/bin/tasklerq-restore.sh
 mkdir -p /volume2/backups/tasklerq
-
-sudo /usr/local/bin/docker exec postgres \
-  pg_dump -U postgres -Fc tasklerq \
-  > "/volume2/backups/tasklerq/tasklerq-$(date +%F).dump"
-
-find /volume2/backups/tasklerq -type f -mtime +14 -delete
 ```
+
+Переменные окружения и умолчания прода:
+
+| Переменная | По умолчанию | Назначение |
+| --- | --- | --- |
+| `TASKLERQ_PG_CONTAINER` | `postgres` | Контейнер PostgreSQL. |
+| `TASKLERQ_PG_USER` | `postgres` | Пользователь PostgreSQL. |
+| `TASKLERQ_DB` | `tasklerq` | База для `backup.sh`. |
+| `TASKLERQ_BACKUP_DIR` | `/volume2/backups/tasklerq` | Каталог дампов. |
+| `TASKLERQ_BACKUP_KEEP_DAYS` | `14` | Сколько дней хранить дампы. |
+| `DOCKER` | `docker` | Путь к docker; на Synology — `/usr/local/bin/docker`. |
+
+`backup.sh` пишет `pg_dump -Fc` во временный файл в каталоге дампов и
+атомарно переименовывает его в `tasklerq-YYYY-MM-DDTHHMMSS.dump`. Если
+`pg_dump` упал, итоговый файл не появляется, а временный удаляется. После
+успешного дампа скрипт удаляет `tasklerq-*.dump` старше
+`TASKLERQ_BACKUP_KEEP_DAYS`.
 
 Cron:
 
@@ -582,14 +598,25 @@ Cron:
 15 3 * * * /usr/local/bin/tasklerq-backup.sh >> /var/log/tasklerq-backup.log 2>&1
 ```
 
-Восстановление:
+Сбой backup — это ненулевой код выхода и строка в stderr; при запуске из cron
+она попадает в лог. Отдельной метрики в сервисе нет: скрипт работает вне
+процесса Tasklerq. Включите уведомление планировщика Synology:
+**Панель управления → Планировщик заданий → Настройки → Уведомлять при
+ошибке** (или настройте алерт на ненулевой код возврата cron/строку в логе).
+
+Восстановление всегда выполняется в **новую** базу. `restore.sh` отказывается
+работать, если база с таким именем уже существует, и не передаёт
+`pg_restore --clean`, поэтому рабочую базу не затрагивает:
 
 ```bash
-sudo /usr/local/bin/docker exec -it postgres createdb -U postgres tasklerq_restore
-sudo /usr/local/bin/docker exec -i postgres \
-  pg_restore -U postgres -d tasklerq_restore --no-owner \
-  < /volume2/backups/tasklerq/tasklerq-2026-11-03.dump
+sudo /usr/local/bin/tasklerq-restore.sh \
+  /volume2/backups/tasklerq/tasklerq-2026-11-03T031500.dump \
+  tasklerq_restore
 ```
+
+Скрипт создаёт базу и выполняет
+`pg_restore --no-owner --exit-on-error`. При ошибке он завершается с
+ненулевым кодом и строкой в stderr.
 
 Затем:
 
@@ -671,7 +698,7 @@ curl -fsS http://127.0.0.1:18080/health/ready
 
 ```bash
 curl -fsS \
-  -H "Authorization: Bearer ${TASKERQ_METRICS_TOKEN}" \
+  -H "Authorization: Bearer ${TASKLERQ_METRICS_TOKEN}" \
   http://127.0.0.1:18080/metrics
 ```
 

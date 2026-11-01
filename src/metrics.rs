@@ -10,8 +10,10 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::sync::{Mutex, OnceLock};
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use sqlx::PgPool;
+
+use crate::telegram::queue;
 
 /// Корзины гистограммы латентности LLM в секундах.
 const LATENCY_BUCKETS: [(&str, f64); 9] = [
@@ -147,34 +149,70 @@ pub fn webhook_auth_failure() {
     add_counter("webhook_auth_failures_total", &[]);
 }
 
-/// Обновить gauges, которые считаются запросом к базе при скрейпе.
-pub async fn update_database_gauges(pool: &PgPool) -> Result<(), sqlx::Error> {
+/// Значения gauges, которые считаются запросом к базе при скрейпе.
+struct DatabaseGauges {
+    queue_lag: f64,
+    outbox_pending: i64,
+    pool_in_use: u32,
+}
+
+async fn database_gauges(pool: &PgPool) -> Result<DatabaseGauges, sqlx::Error> {
     let now = Utc::now();
-    let oldest: Option<DateTime<Utc>> = sqlx::query_scalar(
-        "SELECT min(available_at) FROM telegram_updates
-         WHERE status = 'pending' AND available_at <= $1",
-    )
-    .bind(now)
-    .fetch_one(pool)
-    .await?;
-    let lag = oldest.map_or(0.0, |oldest| {
+    let mut conn = pool.acquire().await?;
+    let oldest = queue::oldest_ready(&mut conn, now).await?;
+    let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM outbox WHERE status = 'pending'")
+        .fetch_one(&mut *conn)
+        .await?;
+    drop(conn);
+
+    let queue_lag = oldest.map_or(0.0, |oldest| {
         (now - oldest).num_milliseconds().max(0) as f64 / 1_000.0
     });
-    set_telegram_queue_lag(lag);
-
-    let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM outbox WHERE status = 'pending'")
-        .fetch_one(pool)
-        .await?;
-    set_outbox_pending(pending);
-
     let idle = u32::try_from(pool.num_idle()).unwrap_or(u32::MAX);
-    set_db_pool_in_use(pool.size().saturating_sub(idle));
+    Ok(DatabaseGauges {
+        queue_lag,
+        outbox_pending: pending,
+        pool_in_use: pool.size().saturating_sub(idle),
+    })
+}
+
+fn apply_database_gauges(registry: &mut Registry, gauges: DatabaseGauges) {
+    registry
+        .gauges
+        .insert(key("telegram_queue_lag_seconds", &[]), gauges.queue_lag);
+    registry.gauges.insert(
+        key("outbox_pending", &[]),
+        gauges.outbox_pending.max(0) as f64,
+    );
+    registry
+        .gauges
+        .insert(key("db_pool_in_use", &[]), f64::from(gauges.pool_in_use));
+}
+
+/// Обновить gauges, которые считаются запросом к базе при скрейпе.
+pub async fn update_database_gauges(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let gauges = database_gauges(pool).await?;
+    apply_database_gauges(&mut lock(), gauges);
     Ok(())
 }
 
 /// Текст в формате Prometheus exposition 0.0.4.
 pub fn render() -> String {
-    let registry = lock();
+    render_locked(&lock())
+}
+
+/// Обновить gauges из базы и сразу отрендерить всё под одним локом.
+///
+/// Два параллельных скрейпа не могут перезаписать gauges между подсчётом и
+/// рендером: соседний скрейп ждёт блокировку до конца формирования ответа.
+pub async fn render_with_database_gauges(pool: &PgPool) -> Result<String, sqlx::Error> {
+    let gauges = database_gauges(pool).await?;
+    let mut registry = lock();
+    apply_database_gauges(&mut registry, gauges);
+    Ok(render_locked(&registry))
+}
+
+fn render_locked(registry: &Registry) -> String {
     let mut output = String::new();
 
     render_simple(&mut output, "counter", &registry.counters);

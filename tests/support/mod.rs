@@ -104,9 +104,54 @@ pub async fn isolated_db() -> TestDb {
     TestDb { pool }
 }
 
+/// Свежая база без применённых миграций на том же сервере.
+///
+/// Нужна тестам самих миграций: они должны видеть пустую схему.
+pub async fn empty_db() -> TestDb {
+    let name = format!("empty_{}", Uuid::now_v7().simple());
+    create_database(&name).await;
+    let url = database_url_for(&name).await;
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&url)
+        .await
+        .expect("empty database should accept connections");
+    TestDb { pool }
+}
+
+/// Создать базу с уникальным именем на тестовом сервере.
+pub async fn create_database(name: &str) {
+    let shared = DATABASE.get_or_init(start_db).await;
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&shared.url)
+        .await
+        .expect("database should accept connections");
+    sqlx::query(&format!("CREATE DATABASE {name}"))
+        .execute(&admin)
+        .await
+        .expect("database should be created");
+    admin.close().await;
+}
+
+/// URL базы на тестовом сервере по имени.
+pub async fn database_url_for(name: &str) -> String {
+    let shared = DATABASE.get_or_init(start_db).await;
+    shared.url.replace("/tasklerq?", &format!("/{name}?"))
+}
+
 /// URL общей тестовой базы (для запуска бинарника `tasklerq`).
 pub async fn database_url() -> String {
     DATABASE.get_or_init(start_db).await.url.clone()
+}
+
+/// Идентификатор контейнера PostgreSQL (для `docker exec` в тестах скриптов).
+pub async fn container_id() -> String {
+    let _ = DATABASE.get_or_init(start_db).await;
+    CONTAINER_ID
+        .get()
+        .cloned()
+        .expect("the shared container should have an id")
 }
 
 /// Уникальный Telegram ID, не пересекающийся с household из `create_household`.

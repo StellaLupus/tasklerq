@@ -9,22 +9,15 @@ mod support;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::Request;
-use chrono::{DateTime, Utc};
 use http_body_util::BodyExt;
 use serde_json::Value;
-use sqlx::PgConnection;
 use tasklerq::http::router::{AppState, build_router};
-use tasklerq::telegram::bot::Outcome;
-use tasklerq::telegram::queue;
-use tasklerq::telegram::worker::{Pass, UpdateHandler, UpdateWorker};
-use tokio::sync::Notify;
 use tower::ServiceExt;
 
 use support::next_telegram_id;
-use support::telegram::FakeTelegram;
+use support::telegram::Harness;
 
 /// Писатель журнала в память.
 #[derive(Clone, Default)]
@@ -51,18 +44,18 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
     }
 }
 
-struct Noop;
+fn records(captured: &str) -> Vec<Value> {
+    captured
+        .lines()
+        .filter_map(|line| serde_json::from_str(line.trim()).ok())
+        .collect()
+}
 
-#[async_trait]
-impl UpdateHandler for Noop {
-    async fn handle(
-        &self,
-        _conn: &mut PgConnection,
-        _payload: &Value,
-        _now: DateTime<Utc>,
-    ) -> Result<Outcome, sqlx::Error> {
-        Ok(Outcome::default())
-    }
+fn record<'a>(records: &'a [Value], message: &str) -> &'a Value {
+    records
+        .iter()
+        .find(|record| record["fields"]["message"].as_str() == Some(message))
+        .unwrap_or_else(|| panic!("log record '{message}' is missing:\n{records:#?}"))
 }
 
 #[test]
@@ -73,8 +66,8 @@ fn logs_keep_identifiers_and_results_but_not_the_message_text() {
         .with_max_level(tracing::Level::TRACE)
         .with_writer(logs.clone())
         .finish();
-    let update_id: i64 = 6_000_999;
 
+    let mut update_id = 0;
     tracing::subscriber::with_default(subscriber, || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -83,34 +76,14 @@ fn logs_keep_identifiers_and_results_but_not_the_message_text() {
         runtime.block_on(async {
             let db = support::db().await;
             let chat = next_telegram_id();
-            let update = serde_json::json!({
-                "update_id": update_id,
-                "message": {
-                    "message_id": 1,
-                    "date": 1_700_000_000,
-                    "chat": {"id": chat, "type": "private", "first_name": "Ann"},
-                    "from": {"id": chat, "is_bot": false, "first_name": "Ann"},
-                    "text": "Купить лекарство"
-                }
-            });
-            let mut conn = db.pool.acquire().await.expect("connection");
-            queue::enqueue(&mut conn, update_id, &update, Utc::now())
-                .await
-                .expect("enqueue");
-            drop(conn);
-
-            let worker = UpdateWorker::new(
-                db.pool.clone(),
-                Arc::new(Noop),
-                FakeTelegram::new(),
-                10,
-                Arc::new(Notify::new()),
-            )
-            .only_chat(chat);
-            assert_eq!(
-                worker.run_once(Utc::now()).await.expect("worker"),
-                Pass::Processed
-            );
+            let mut bot = Harness::new(&db.pool, chat);
+            let update = bot.text_update("Ann", "Купить лекарство");
+            update_id = update["update_id"]
+                .as_i64()
+                .expect("the fake update has an id");
+            assert!(update_id > 0);
+            bot.enqueue(update).await;
+            bot.pump().await;
 
             let app = build_router(AppState::new(db.pool.clone()));
             let response = app
@@ -128,28 +101,47 @@ fn logs_keep_identifiers_and_results_but_not_the_message_text() {
     });
 
     let captured = String::from_utf8(logs.0.lock().expect("lock").clone()).expect("utf8");
-    assert!(
-        captured.contains("telegram update finished"),
-        "the update must be logged:\n{captured}"
+    let records = records(&captured);
+
+    let update = record(&records, "telegram update finished");
+    assert_eq!(
+        update["fields"]["update_id"].as_i64(),
+        Some(update_id),
+        "the update log must contain update_id:\n{captured}"
+    );
+    assert_eq!(
+        update["fields"]["status"].as_str(),
+        Some("processed"),
+        "the update log must contain the result:\n{captured}"
     );
     assert!(
-        captured.contains(&format!("\"update_id\":{update_id}")),
-        "the log must contain update_id:\n{captured}"
+        update["fields"]["duration_ms"].as_u64().is_some(),
+        "the update log must contain duration_ms:\n{captured}"
+    );
+
+    let http = record(&records, "request completed");
+    assert_eq!(
+        http["fields"]["request_id"].as_str(),
+        Some("req-observability"),
+        "the HTTP log must contain request_id:\n{captured}"
+    );
+    assert_eq!(
+        http["fields"]["route"].as_str(),
+        Some("/health/live"),
+        "the HTTP log must contain the matched route:\n{captured}"
+    );
+    assert_eq!(
+        http["fields"]["status"].as_u64(),
+        Some(200),
+        "the HTTP log must contain the status:\n{captured}"
     );
     assert!(
-        captured.contains("\"status\":\"processed\"") && captured.contains("\"duration_ms\":"),
-        "the log must contain the result and duration:\n{captured}"
+        http["fields"]["duration_ms"].as_u64().is_some(),
+        "the HTTP log must contain duration_ms:\n{captured}"
     );
-    assert!(
-        captured.contains("request completed")
-            && captured.contains("\"route\":\"/health/live\"")
-            && captured.contains("\"request_id\":")
-            && captured.contains("\"status\":200")
-            && captured.contains("\"duration_ms\":"),
-        "the HTTP log must contain route, request_id, status and duration:\n{captured}"
-    );
+
     assert!(
         !captured.contains("Купить лекарство"),
-        "the message text must not reach the logs:\n{captured}"
+        "the message text must not reach any log line:\n{captured}"
     );
 }

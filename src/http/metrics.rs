@@ -24,7 +24,7 @@ pub async fn scrape(
     auth.require_scope(SCOPE)
         .map_err(|_| ApiError::forbidden("Token is missing scope metrics:read"))?;
 
-    metrics::update_database_gauges(&state.pool)
+    let text = metrics::render_with_database_gauges(&state.pool)
         .await
         .map_err(|error| {
             tracing::warn!(error = %error, "metrics database check failed");
@@ -33,7 +33,7 @@ pub async fn scrape(
 
     Ok((
         [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
-        metrics::render(),
+        text,
     )
         .into_response())
 }

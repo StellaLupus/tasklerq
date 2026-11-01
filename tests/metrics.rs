@@ -21,7 +21,8 @@ use tasklerq::home_assistant::{AiTask, GenerateData, HaError};
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
 use tasklerq::telegram::api::TelegramError;
-use tasklerq::telegram::bot::Outcome;
+use tasklerq::telegram::bot::{Bot, Outcome};
+use tasklerq::telegram::capture_worker::{CaptureWorker, Pass as CapturePass};
 use tasklerq::telegram::outbox::{OutboxWorker, Outgoing};
 use tasklerq::telegram::queue;
 use tasklerq::telegram::webhook::{Ingress, SECRET_HEADER};
@@ -29,7 +30,7 @@ use tasklerq::telegram::worker::{Pass, UpdateHandler, UpdateWorker};
 use tokio::sync::Notify;
 use tower::ServiceExt;
 
-use support::telegram::FakeTelegram;
+use support::telegram::{FakeTelegram, Harness};
 use support::{db, issue_token, next_telegram_id};
 
 const SECRET: &str = "webhook-secret";
@@ -45,6 +46,13 @@ fn capture_config() -> CaptureConfig {
         voice_fallback_raw: false,
         rate_limit_per_min: 10,
         max_text_chars: 2_000,
+    }
+}
+
+fn fallback_capture_config() -> CaptureConfig {
+    CaptureConfig {
+        voice_fallback_raw: true,
+        ..capture_config()
     }
 }
 
@@ -93,6 +101,38 @@ impl UpdateHandler for Noop {
         _now: DateTime<Utc>,
     ) -> Result<Outcome, sqlx::Error> {
         Ok(Outcome::default())
+    }
+}
+
+struct Failing;
+
+#[async_trait]
+impl UpdateHandler for Failing {
+    async fn handle(
+        &self,
+        _conn: &mut PgConnection,
+        _payload: &Value,
+        _now: DateTime<Utc>,
+    ) -> Result<Outcome, sqlx::Error> {
+        Err(sqlx::Error::PoolTimedOut)
+    }
+}
+
+/// LLM недоступна: capture уходит в fallback из исходного текста.
+struct UnavailableAi;
+
+#[async_trait]
+impl AiTask for UnavailableAi {
+    async fn check_entity(&self) -> Result<(), HaError> {
+        Ok(())
+    }
+
+    async fn generate_data(
+        &self,
+        _request: &GenerateData<'_>,
+        _timeout: StdDuration,
+    ) -> Result<Value, HaError> {
+        Err(HaError::Unreachable)
     }
 }
 
@@ -241,6 +281,123 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
+    // Недоступная LLM с разрешённым fallback создаёт позицию из исходного текста.
+    let fallback_app = build_router(AppState::new(db.pool.clone()).with_capture(
+        CaptureState::new(
+            fallback_capture_config(),
+            Some(Arc::new(UnavailableAi)),
+            Arc::new(CircuitBreaker::default()),
+            200,
+        ),
+    ));
+    let (status, _, body) = send(
+        &fallback_app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&capture_token),
+        Some(json!({"text": "Купить хлеб", "source": "api", "mode": "auto"})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Обновления, исчерпавшие попытки: failed и dead.
+    let failed_chat = next_telegram_id();
+    let failed_update = text_update(6_000_010, failed_chat, "сбой");
+    let mut conn = db.pool.acquire().await.expect("connection");
+    queue::enqueue(&mut conn, 6_000_010, &failed_update, now)
+        .await
+        .expect("enqueue failed");
+    drop(conn);
+    let failed_worker = UpdateWorker::new(
+        db.pool.clone(),
+        Arc::new(Failing),
+        FakeTelegram::new(),
+        5,
+        Arc::new(Notify::new()),
+    )
+    .only_chat(failed_chat);
+    assert!(matches!(
+        failed_worker.run_once(now).await.expect("failed pass"),
+        Pass::Failed(_)
+    ));
+
+    let dead_chat = next_telegram_id();
+    let dead_update = text_update(6_000_011, dead_chat, "исчерпано");
+    let mut conn = db.pool.acquire().await.expect("connection");
+    queue::enqueue(&mut conn, 6_000_011, &dead_update, now)
+        .await
+        .expect("enqueue dead update");
+    drop(conn);
+    let dead_worker = UpdateWorker::new(
+        db.pool.clone(),
+        Arc::new(Failing),
+        FakeTelegram::new(),
+        1,
+        Arc::new(Notify::new()),
+    )
+    .only_chat(dead_chat);
+    assert!(matches!(
+        dead_worker.run_once(now).await.expect("dead pass"),
+        Pass::Failed(_)
+    ));
+
+    // Второе обновление сверх лимита помечается rate_limited.
+    let limited_chat = next_telegram_id();
+    for update_id in [6_000_020, 6_000_021] {
+        let update = text_update(update_id, limited_chat, "часто");
+        let mut conn = db.pool.acquire().await.expect("connection");
+        queue::enqueue(&mut conn, update_id, &update, now)
+            .await
+            .expect("enqueue limited");
+    }
+    let limited_worker = UpdateWorker::new(
+        db.pool.clone(),
+        Arc::new(Noop),
+        FakeTelegram::new(),
+        5,
+        Arc::new(Notify::new()),
+    )
+    .only_chat(limited_chat)
+    .with_rate_limit(1);
+    assert_eq!(
+        limited_worker.run_once(now).await.expect("first limited"),
+        Pass::Processed
+    );
+    assert_eq!(
+        limited_worker.run_once(now).await.expect("second limited"),
+        Pass::Processed
+    );
+
+    // Capture из Telegram: отдельный household с реальным ботом.
+    let capture_chat = next_telegram_id();
+    let handler = Bot::new("tasklerqbot").with_llm_capture(true);
+    let mut telegram = Harness::with_handler(
+        &db.pool,
+        capture_chat,
+        Arc::new(handler.clone()),
+        FakeTelegram::new(),
+    );
+    telegram.text("/start").await;
+    telegram.text("Семья").await;
+    telegram.press("Москва").await;
+    telegram.press("меню").await;
+    let capture_worker = CaptureWorker::new(
+        db.pool.clone(),
+        Arc::new(StubAi),
+        handler,
+        Arc::new(Notify::new()),
+    )
+    .only_chat(capture_chat);
+    telegram.text("Молоко").await;
+    assert_eq!(
+        capture_worker
+            .run_once(telegram.now)
+            .await
+            .expect("telegram capture"),
+        CapturePass::Drafted
+    );
+
     // HTTP-метрика использует шаблон маршрута, а не сырой путь.
     let item_id = uuid::Uuid::now_v7();
     let (status, _, _) = send(
@@ -334,12 +491,25 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
     );
 
     assert_metric_at_least(&text, "telegram_updates_total{status=\"processed\"}", 1.0);
+    assert_metric_at_least(&text, "telegram_updates_total{status=\"failed\"}", 1.0);
+    assert_metric_at_least(&text, "telegram_updates_total{status=\"dead\"}", 1.0);
+    assert_metric_at_least(
+        &text,
+        "telegram_updates_total{status=\"rate_limited\"}",
+        1.0,
+    );
     assert_metric_at_least(&text, "telegram_queue_lag_seconds", 590.0);
     assert_metric_at_least(&text, "outbox_pending", 1.0);
     assert_metric_at_least(&text, "outbox_dead_total", 1.0);
     assert_metric_at_least(
         &text,
         "capture_total{source=\"api\",status=\"applied\"}",
+        1.0,
+    );
+    assert_metric_at_least(&text, "capture_fallback_total{source=\"api\"}", 1.0);
+    assert_metric_at_least(
+        &text,
+        "capture_total{source=\"telegram\",status=\"drafted\"}",
         1.0,
     );
     assert_metric_at_least(&text, "llm_requests_total{status=\"success\"}", 1.0);
