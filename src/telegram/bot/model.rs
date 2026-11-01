@@ -377,6 +377,11 @@ pub enum Action {
     RenameStart,
     /// Открыть форму ввода времени напоминания.
     LeadStart,
+    /// Открыть форму ввода времени настройки уведомлений.
+    TimeStart {
+        /// Какое время редактируется.
+        field: TimeField,
+    },
     /// Выбрать часовой пояс пользователя.
     SetTimezone {
         /// IANA-идентификатор.
@@ -454,6 +459,52 @@ pub enum Action {
         /// Элемент.
         item_id: Uuid,
     },
+    /// Перелистнуть сводное сообщение после тихих часов.
+    BatchPage {
+        /// Сводное сообщение.
+        batch_id: Uuid,
+        /// Страница с нуля.
+        page: u32,
+    },
+    /// Завершить задачу из блока сводного сообщения.
+    BatchComplete {
+        /// Сводное сообщение.
+        batch_id: Uuid,
+        /// Элемент.
+        item_id: Uuid,
+        /// Версия на момент выпуска.
+        version: i32,
+    },
+    /// Отложить задачу из блока сводного сообщения на час.
+    BatchSnooze {
+        /// Сводное сообщение.
+        batch_id: Uuid,
+        /// Элемент.
+        item_id: Uuid,
+    },
+    /// Открыть задачу из блока сводного сообщения.
+    BatchOpen {
+        /// Сводное сообщение.
+        batch_id: Uuid,
+        /// Элемент.
+        item_id: Uuid,
+    },
+    /// Завершить все ещё открытые задачи сводного сообщения.
+    ///
+    /// Входят и блоки, уже отложенные кнопкой «На час»: задача выполнена, а её
+    /// snooze-доставка отменяется планировщиком как устаревшая. Блоки
+    /// «Выполнено», «Задача удалена» и «Список в архиве» не трогаются.
+    BatchCompleteAll {
+        /// Сводное сообщение.
+        batch_id: Uuid,
+    },
+    /// Отложить все ещё открытые задачи сводного сообщения на час.
+    ///
+    /// Блоки, у которых уже есть свой snooze, не откладываются повторно.
+    BatchSnoozeAll {
+        /// Сводное сообщение.
+        batch_id: Uuid,
+    },
     /// Обновить текущий экран.
     Refresh,
     /// Исправить элемент черновика в форме.
@@ -526,6 +577,20 @@ pub enum Setting {
     QuietHours,
 }
 
+/// Время настройки уведомлений, которое вводится текстом.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeField {
+    /// Время утренней сводки.
+    Digest,
+    /// Время вседневного напоминания.
+    AllDay,
+    /// Начало тихих часов.
+    QuietStart,
+    /// Конец тихих часов.
+    QuietEnd,
+}
+
 /// На сколько отложить напоминание.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -554,7 +619,8 @@ impl Action {
         match self {
             Self::Complete { version, .. }
             | Self::Reopen { version, .. }
-            | Self::NoticeComplete { version, .. } => Some(*version),
+            | Self::NoticeComplete { version, .. }
+            | Self::BatchComplete { version, .. } => Some(*version),
             Self::Form {
                 act: FormAct::Increase { version, .. },
             } => Some(*version),
@@ -789,6 +855,11 @@ pub enum Form {
     DeleteHousehold,
     /// Своё время напоминания в минутах.
     Lead,
+    /// Время настройки уведомлений в формате `HH:MM`.
+    Time {
+        /// Какое время редактируется.
+        field: TimeField,
+    },
 }
 
 /// Создание элемента.
@@ -862,6 +933,7 @@ impl Form {
             Self::Rename => "rename",
             Self::DeleteHousehold => "delete_household",
             Self::Lead => "lead",
+            Self::Time { .. } => "time",
         }
     }
 }

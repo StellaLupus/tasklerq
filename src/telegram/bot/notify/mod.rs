@@ -5,7 +5,7 @@
 //! сообщение. Сами уведомления ставит в очередь планировщик (фаза 7): он
 //! использует эти конструкторы экранов.
 
-use chrono::{DateTime, Duration, NaiveTime, Utc};
+use chrono::{DateTime, Duration, NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
 use sqlx::PgConnection;
 use uuid::Uuid;
@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::models::{Item, ItemStatus, List};
 use crate::domain::recurrence::resolve_local;
+use crate::storage::repositories::notifications::{self, NewDelivery, NotificationKind};
 use crate::storage::repositories::{items, lists};
 use crate::telegram::callbacks::Scope;
 use crate::telegram::outbox::{self, Outgoing};
@@ -23,14 +24,37 @@ use super::model::{Action, Screen, SnoozeUntil, Ui};
 use super::screens::{back_button, clip};
 use super::{Ctx, Fail, issue_and_render};
 
+mod batch;
+
+pub use batch::{
+    BATCH_PAGE_SIZE, BatchEntry, BatchEntryState, batch_complete, batch_complete_all, batch_open,
+    batch_page, batch_snooze, batch_snooze_all, batch_ui,
+};
+
 /// Час, на который переносится напоминание «до завтра».
 const MORNING: (u32, u32) = (9, 0);
 
-fn when_line(item: &Item, list: &List, tz: Tz, now: DateTime<Utc>) -> String {
-    match ru::due_label(item.due_at, item.due_date, tz, now) {
-        Some(due) => format!("{} · {}", ru::capitalize(&due), list.name),
-        None => list.name.clone(),
+/// Строка «срок · список» для уведомления или блока сводного сообщения.
+pub(crate) fn when_line(
+    due_at: Option<DateTime<Utc>>,
+    due_date: Option<NaiveDate>,
+    list_name: &str,
+    tz: Tz,
+    now: DateTime<Utc>,
+) -> String {
+    match ru::due_label(due_at, due_date, tz, now) {
+        Some(due) if !list_name.is_empty() => {
+            format!("{} · {}", ru::capitalize(&due), list_name)
+        }
+        Some(due) => ru::capitalize(&due),
+        None => list_name.to_owned(),
     }
+}
+
+/// Название задачи в уведомлении или блоке сводного сообщения: жирным и
+/// обрезанным до 120 символов.
+pub(super) fn title_spans(title: &str) -> Vec<Span> {
+    vec![Span::bold(clip(title, 120))]
 }
 
 /// Напоминание о сроке.
@@ -47,8 +71,8 @@ pub fn reminder_ui(
     };
     Ui::new()
         .heading(heading)
-        .spans(vec![Span::bold(clip(&item.title, 120))])
-        .text(when_line(item, list, tz, now))
+        .spans(title_spans(&item.title))
+        .text(when_line(item.due_at, item.due_date, &list.name, tz, now))
         .row(vec![
             button(
                 "✓ Готово",
@@ -81,8 +105,8 @@ pub fn reminder_ui(
 pub fn assignment_ui(item: &Item, list: &List, tz: Tz, now: DateTime<Utc>) -> Ui {
     Ui::new()
         .heading("👤 Вам назначили задачу")
-        .spans(vec![Span::bold(clip(&item.title, 120))])
-        .text(when_line(item, list, tz, now))
+        .spans(title_spans(&item.title))
+        .text(when_line(item.due_at, item.due_date, &list.name, tz, now))
         .row(vec![
             button("📋 Открыть", Action::NoticeOpen { item_id: item.id }),
             button(
@@ -112,6 +136,7 @@ pub fn digest_ui(
     shopping_list: Option<Uuid>,
 ) -> Ui {
     const MAX_LINES: usize = 20;
+    let total_tasks = today.len() + overdue.len();
     let mut ui = Ui::new().heading("☀️ Доброе утро!");
     let line = |entry: &DigestLine| format!("☐ {} · {}", clip(&entry.title, 60), entry.when);
     let mut budget = MAX_LINES;
@@ -131,7 +156,11 @@ pub fn digest_ui(
         ui = ui.bold(title).text(lines.join("\n"));
     }
     if today.is_empty() && overdue.is_empty() {
-        ui = ui.text("На сегодня задач нет.");
+        ui = if shopping_open == 0 {
+            ui.text("День свободен.")
+        } else {
+            ui.text("На сегодня задач нет.")
+        };
     }
     if shopping_open > 0 {
         ui = ui.text(format!("Покупки: {}", ru::positions(shopping_open)));
@@ -142,6 +171,14 @@ pub fn digest_ui(
     }
     if let Some(list_id) = shopping_list {
         row.push(back_button("🛒 Покупки", Screen::List { list_id, page: 0 }));
+    }
+    if total_tasks > MAX_LINES
+        && let Some(list_id) = tasks_list
+    {
+        row.push(back_button(
+            "Показать ещё",
+            Screen::List { list_id, page: 0 },
+        ));
     }
     ui.row(row)
 }
@@ -192,7 +229,7 @@ async fn load(ctx: &mut Ctx<'_>, item_id: Uuid) -> Result<Option<(Item, List)>, 
 }
 
 /// Заменить содержимое сообщения-уведомления.
-async fn edit_notice(ctx: &mut Ctx<'_>, message_id: i64, ui: &Ui) -> Result<(), Fail> {
+pub(super) async fn edit_notice(ctx: &mut Ctx<'_>, message_id: i64, ui: &Ui) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
     let html = render_notice(&mut *ctx.conn, ctx.sender.id, household_id, ui, ctx.now).await?;
     outbox::enqueue(
@@ -219,7 +256,7 @@ async fn show_current(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> Resu
         }
         None => {
             let ui = Ui::new()
-                .heading("Задача удалена")
+                .heading("Задача больше недоступна")
                 .row(vec![back_button("📋 В меню", Screen::Menu)]);
             edit_notice(ctx, message_id, &ui).await
         }
@@ -258,7 +295,12 @@ pub async fn complete(
         }
         Err(DomainError::Conflict { .. } | DomainError::NotFound) => {
             // Задачу успели изменить: кнопки обновляются, действие не повторяется.
-            ctx.toast("Задача уже изменилась");
+            let toast = match load(ctx, item_id).await? {
+                None => "Задача больше недоступна",
+                Some((item, _)) if item.status == ItemStatus::Done => "Задача уже выполнена",
+                Some(_) => "Задача уже изменилась",
+            };
+            ctx.toast(toast);
             show_current(ctx, message_id, item_id).await
         }
         Err(error) => Err(error.into()),
@@ -278,10 +320,10 @@ pub async fn undo(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> Result<(
 }
 
 /// «Открыть» из уведомления: карточка задачи в экране навигации.
-pub async fn open(ctx: &mut Ctx<'_>, item_id: Uuid) -> Result<(), Fail> {
+pub(super) async fn open(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> Result<(), Fail> {
     if load(ctx, item_id).await?.is_none() {
-        ctx.toast("Задача удалена");
-        return ctx.present(Screen::Menu).await;
+        ctx.toast("Задача больше недоступна");
+        return show_current(ctx, message_id, item_id).await;
     }
     ctx.present(Screen::Item {
         item_id,
@@ -290,32 +332,63 @@ pub async fn open(ctx: &mut Ctx<'_>, item_id: Uuid) -> Result<(), Fail> {
     .await
 }
 
-fn snooze_time(
+pub(super) fn snooze_time(
     until: SnoozeUntil,
     tz: Tz,
     now: DateTime<Utc>,
 ) -> Result<DateTime<Utc>, DomainError> {
-    match until {
-        SnoozeUntil::OneHour => Ok(now + Duration::hours(1)),
+    let at = match until {
+        SnoozeUntil::OneHour => now + Duration::hours(1),
         SnoozeUntil::TomorrowMorning => {
             let tomorrow = now.with_timezone(&tz).date_naive() + Duration::days(1);
             let morning =
                 NaiveTime::from_hms_opt(MORNING.0, MORNING.1, 0).unwrap_or(NaiveTime::MIN);
-            resolve_local(tz, tomorrow, morning)
+            resolve_local(tz, tomorrow, morning)?
         }
-    }
+    };
+    // Ключ snooze хранит время с точностью до секунды; усечём и `scheduled_at`,
+    // чтобы первому тику не пришлось перезаписывать его из-за долей секунды.
+    Ok(DateTime::<Utc>::from_timestamp(at.timestamp(), 0).unwrap_or(at))
 }
 
-/// «Отложить»: напоминание придёт позже новым сообщением.
+/// Поставить snooze-доставку задачи на `deliver_at`.
+///
+/// `batched` — групповой snooze: несколько таких задач приходят одним сводным
+/// сообщением. Ключ включает время snooze, поэтому повторное нажатие той же
+/// кнопки не создаёт вторую доставку, а планировщик не путает её с вхождением
+/// срока.
+pub(super) async fn insert_snooze(
+    ctx: &mut Ctx<'_>,
+    item_id: Uuid,
+    deliver_at: DateTime<Utc>,
+    batched: bool,
+) -> Result<(), Fail> {
+    let occurrence_key = notifications::snooze_key(deliver_at);
+    let delivery = NewDelivery {
+        household_id: ctx.household()?.id,
+        user_id: ctx.user()?.id,
+        item_id: Some(item_id),
+        kind: NotificationKind::Snooze,
+        occurrence_key: &occurrence_key,
+        scheduled_at: deliver_at,
+    };
+    if batched {
+        notifications::insert_batched(&mut *ctx.conn, &delivery, ctx.now).await?;
+    } else {
+        notifications::insert(&mut *ctx.conn, &delivery, ctx.now).await?;
+    }
+    Ok(())
+}
+
+/// «Отложить»: создаёт отдельную доставку, которую отправит планировщик.
 pub async fn snooze(
     ctx: &mut Ctx<'_>,
     message_id: i64,
     item_id: Uuid,
     until: SnoozeUntil,
 ) -> Result<(), Fail> {
-    let household_id = ctx.household()?.id;
-    let Some((item, list)) = load(ctx, item_id).await? else {
-        ctx.toast("Задача удалена");
+    let Some((item, _)) = load(ctx, item_id).await? else {
+        ctx.toast("Задача больше недоступна");
         return show_current(ctx, message_id, item_id).await;
     };
     if item.status == ItemStatus::Done {
@@ -324,29 +397,7 @@ pub async fn snooze(
     }
 
     let deliver_at = snooze_time(until, ctx.tz, ctx.now)?;
-    // Кнопки нового напоминания живут 24 часа от момента доставки.
-    let ui = reminder_ui(&item, &list, ctx.tz, deliver_at, None);
-    let html = render_notice(&mut *ctx.conn, ctx.sender.id, household_id, &ui, deliver_at).await?;
-    let key = format!(
-        "snooze:{}:{item_id}:{}",
-        ctx.sender.id,
-        deliver_at.timestamp()
-    );
-    if let Some(seq) = outbox::enqueue(
-        &mut *ctx.conn,
-        ctx.chat_id,
-        &Outgoing::Message { html, rich: true },
-        Some(&key),
-        ctx.now,
-    )
-    .await?
-    {
-        sqlx::query("UPDATE outbox SET next_attempt_at = $2 WHERE seq = $1")
-            .bind(seq)
-            .bind(deliver_at)
-            .execute(&mut *ctx.conn)
-            .await?;
-    }
+    insert_snooze(ctx, item_id, deliver_at, false).await?;
 
     let local = deliver_at.with_timezone(&ctx.tz);
     ctx.toast("Отложено");
@@ -391,6 +442,17 @@ mod tests {
     }
 
     #[test]
+    fn snooze_time_is_truncated_to_whole_seconds() {
+        let tz: Tz = "Europe/Moscow".parse().expect("tz");
+        let now =
+            Utc.with_ymd_and_hms(2026, 10, 30, 20, 30, 0).unwrap() + Duration::milliseconds(750);
+
+        let at = snooze_time(SnoozeUntil::OneHour, tz, now).expect("time");
+        assert_eq!(at.timestamp_subsec_nanos(), 0);
+        assert_eq!(at, Utc.with_ymd_and_hms(2026, 10, 30, 21, 30, 0).unwrap());
+    }
+
+    #[test]
     fn digest_is_limited_to_twenty_lines() {
         let lines: Vec<DigestLine> = (0..25)
             .map(|n| DigestLine {
@@ -398,18 +460,30 @@ mod tests {
                 when: "сегодня".into(),
             })
             .collect();
-        let ui = digest_ui(&lines, &[], 0, None, None);
-        let html = crate::telegram::rich::render(&ui, &[]).html;
+        let ui = digest_ui(&lines, &[], 0, Some(Uuid::now_v7()), None);
+        assert_eq!(ui.button_count(), 2);
+        let tokens = vec!["t:AAAAAAAAAAAAAAAA".to_owned(); 2];
+        let html = crate::telegram::rich::render(&ui, &tokens).html;
 
         assert_eq!(html.matches("☐ Задача").count(), 20);
         assert!(html.contains("…и ещё 5 задач"));
+        assert!(html.contains("Показать ещё"));
     }
 
     #[test]
-    fn empty_digest_says_so() {
+    fn empty_digest_says_the_day_is_free() {
+        let ui = digest_ui(&[], &[], 0, None, None);
+        let html = crate::telegram::rich::render(&ui, &[]).html;
+        assert!(html.contains("День свободен."));
+        assert!(!html.contains("Сегодня"));
+        assert!(!html.contains("Просрочено"));
+        assert!(!html.contains("Покупки"));
+    }
+
+    #[test]
+    fn digest_with_only_shopping_keeps_the_purchase_count() {
         let ui = digest_ui(&[], &[], 7, None, None);
         let html = crate::telegram::rich::render(&ui, &[]).html;
-        assert!(html.contains("На сегодня задач нет."));
         assert!(html.contains("Покупки: 7 позиций"));
     }
 }

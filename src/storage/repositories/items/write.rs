@@ -8,14 +8,16 @@ use uuid::Uuid;
 use super::row::{hydrate_one, load_item, row_by_id};
 use super::{local_today, recurrence_values, version_conflict};
 use crate::domain::error::DomainError;
-use crate::domain::models::{Actor, EventType, Field, Item, ItemPatch, ListKind, SubtaskInput};
+use crate::domain::models::{
+    Actor, EventType, Field, Item, ItemPatch, ItemStatus, ListKind, SubtaskInput,
+};
 use crate::domain::recurrence::parse_timezone;
 use crate::domain::validation::{
     MAX_NOTES, MAX_TITLE, ValidatedItem, normalize_due_for_recurrence, normalize_recurrence,
     normalize_subtasks, normalize_tags, normalize_text, normalize_text_allow_empty, normalize_unit,
     validate_quantity,
 };
-use crate::storage::repositories::{active_member, events, lists, subtasks, tags};
+use crate::storage::repositories::{active_member, events, lists, notifications, subtasks, tags};
 
 /// Создать элемент.
 pub async fn create(
@@ -106,7 +108,7 @@ pub async fn create(
     subtasks::replace(conn, item_id, &subtask_inputs, now).await?;
 
     let item = load_item(conn, household_id, item_id).await?;
-    events::insert(
+    let event = events::insert(
         conn,
         household_id,
         item_id,
@@ -114,6 +116,19 @@ pub async fn create(
         EventType::Created,
         json!({"before": Value::Null, "after": item}),
         None,
+        now,
+    )
+    .await?;
+    notifications::notify_assignment(
+        conn,
+        &notifications::AssignmentNotice {
+            household_id,
+            item_id,
+            actor,
+            previous_assignee: None,
+            assignee: item.assignee_user_id,
+            event_id: event.id,
+        },
         now,
     )
     .await?;
@@ -293,6 +308,39 @@ pub async fn update(
         recurrence_month_rule,
     ) = recurrence_values(recurrence.as_ref());
 
+    let tags_unchanged = tag_names
+        == current
+            .tags
+            .iter()
+            .map(|tag| tag.name.clone())
+            .collect::<Vec<_>>();
+    let subtasks_unchanged = subtask_inputs.len() == current.subtasks.len()
+        && subtask_inputs
+            .iter()
+            .zip(&current.subtasks)
+            .all(|(input, subtask)| {
+                input.title == subtask.title
+                    && input.status.unwrap_or(ItemStatus::Open) == subtask.status
+            });
+    let unchanged = target_list.id == current.list_id
+        && title == current.title
+        && notes == current.notes
+        && priority == current.priority
+        && due_at == current.due_at
+        && due_date == current.due_date
+        && assignee_user_id == current.assignee_user_id
+        && quantity == current.quantity
+        && unit == current.unit
+        && recurrence == current.recurrence
+        && tags_unchanged
+        && subtasks_unchanged;
+    if unchanged {
+        // Повторный PATCH без изменений не двигает версию и не пишет событие:
+        // «состояние задачи не меняется». Уведомление о назначении при этом
+        // тоже не создаётся.
+        return Ok(current);
+    }
+
     sqlx::query(
         "UPDATE items
          SET list_id = $3, title = $4, notes = $5, priority = $6,
@@ -343,7 +391,7 @@ pub async fn update(
         EventType::Updated
     };
 
-    events::insert(
+    let event = events::insert(
         conn,
         household_id,
         item_id,
@@ -351,6 +399,20 @@ pub async fn update(
         event_type,
         json!({"before": current, "after": updated}),
         None,
+        now,
+    )
+    .await?;
+
+    notifications::notify_assignment(
+        conn,
+        &notifications::AssignmentNotice {
+            household_id,
+            item_id,
+            actor,
+            previous_assignee: row.assignee_user_id,
+            assignee: updated.assignee_user_id,
+            event_id: event.id,
+        },
         now,
     )
     .await?;

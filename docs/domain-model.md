@@ -275,15 +275,28 @@ CHECK ((recurrence_freq = 'monthly') = (recurrence_month_rule IS NOT NULL))
 
 ### 3.12 Outbox и уведомления
 
-`outbox`: `id`, `household_id`, `chat_id`, `kind`, `payload jsonb`, `status`,
-`attempts`, `next_attempt_at`, `telegram_message_id`, `last_error`, `created_at`,
-`sent_at`.
+`outbox`: `seq`, `chat_id`, `kind`, `payload jsonb`, `dedupe_key`, `status`,
+`attempts`, `next_attempt_at`, `message_id`, `last_error`, `created_at`,
+`sent_at`, `dead_at`. `dead_at` заполняется при переводе в `dead` и пуст у
+остальных статусов.
 
 `notification_deliveries`: `id`, `household_id`, `user_id`, `item_id` (NULL для
-сводки), `occurrence_key`, `kind`, `status`, `scheduled_at`, `sent_at`,
-`created_at`; UNIQUE `(user_id, item_id, occurrence_key, kind)`. Для сводок
-`item_id` равен NULL, поэтому уникальность обеспечивается
-`UNIQUE NULLS NOT DISTINCT` (PostgreSQL 15+) или частичным индексом.
+сводки), `occurrence_key`, `kind`, `status`, `scheduled_at`, `deferred`,
+`outbox_seq`, `created_at`, `updated_at`; UNIQUE `(user_id, item_id,
+occurrence_key, kind)`. `kind` — `reminder`, `digest`, `assignment` или
+`snooze`; `status` — `pending`, `sent` или `cancelled`. `deferred` отмечает
+запись, хотя бы раз отложенную тихими часами: перенесённая через полночь
+сводка или вседневное напоминание не отменяются только из-за смены локальной
+даты. `snooze` — отдельная доставка отложенного напоминания, её ключ включает
+время snooze. Отложенное («😴») напоминание отменяется, если к моменту
+доставки у получателя выключены напоминания.
+Для сводок `item_id` равен NULL, поэтому уникальность обеспечивается
+`UNIQUE NULLS NOT DISTINCT` (PostgreSQL 15+). Составные внешние ключи
+`(user_id, household_id)` и `(item_id, household_id)` не дают записать
+получателя или элемент из чужого household. `outbox_seq` ссылается на
+поставленное сообщение; после retention outbox ссылка обнуляется, а запись
+доставки остаётся для аудита дедупликации. Завершённые доставки (`sent`,
+`cancelled`) хранятся 30 дней (`RETENTION_OUTBOX_DAYS`); `pending` не удаляются.
 
 ### 3.13 `audit_events`
 
@@ -559,8 +572,10 @@ CREATE INDEX telegram_updates_ready_idx
   ON telegram_updates (available_at) WHERE status = 'pending';
 CREATE INDEX outbox_ready_idx
   ON outbox (next_attempt_at) WHERE status = 'pending';
-CREATE UNIQUE INDEX notification_delivery_key_idx
-  ON notification_deliveries (user_id, item_id, occurrence_key, kind);
+CREATE INDEX notification_deliveries_pending_idx
+  ON notification_deliveries (scheduled_at) WHERE status = 'pending';
+-- UNIQUE NULLS NOT DISTINCT (user_id, item_id, occurrence_key, kind)
+-- объявлен в 0008 как ограничение таблицы, а не отдельный индекс.
 
 -- events
 CREATE INDEX item_events_item_created_idx

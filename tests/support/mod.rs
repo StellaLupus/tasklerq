@@ -2,6 +2,7 @@
 
 #![allow(dead_code)]
 
+pub mod notifications;
 pub mod telegram;
 
 use std::process::Command;

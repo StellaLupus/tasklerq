@@ -13,7 +13,7 @@ use super::{
 use crate::domain::error::DomainError;
 use crate::domain::models::{Actor, EventType, Item, ItemStatus};
 use crate::domain::recurrence::Due;
-use crate::storage::repositories::{events, lists, subtasks, tags};
+use crate::storage::repositories::{events, lists, notifications, subtasks, tags};
 
 /// Завершить элемент.
 pub async fn complete(
@@ -428,7 +428,8 @@ pub async fn undo_last(
 
     let updated = load_item_any(conn, household_id, item_id).await?;
     let event_type = undo_event_type(&current, &updated);
-    events::insert(
+    let previous_assignee = current.assignee_user_id;
+    let undo_event = events::insert(
         conn,
         household_id,
         item_id,
@@ -436,6 +437,19 @@ pub async fn undo_last(
         event_type,
         json!({"before": current, "after": updated}),
         Some(event.id),
+        now,
+    )
+    .await?;
+    notifications::notify_assignment(
+        conn,
+        &notifications::AssignmentNotice {
+            household_id,
+            item_id,
+            actor,
+            previous_assignee,
+            assignee: updated.assignee_user_id,
+            event_id: undo_event.id,
+        },
         now,
     )
     .await?;

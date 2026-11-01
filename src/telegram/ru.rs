@@ -83,6 +83,9 @@ pub fn weekday_short(iso: u32) -> &'static str {
         .unwrap_or("")
 }
 
+/// Подпись срока без времени.
+pub const ALL_DAY: &str = "весь день";
+
 /// Дата в человекочитаемом виде относительно `today`.
 pub fn date_label(date: NaiveDate, today: NaiveDate) -> String {
     match (date - today).num_days() {

@@ -350,7 +350,7 @@ src/
 | `GET` | `/api/v1/lists/{id}/items` | Позиции списка. |
 | `POST` | `/api/v1/lists/{id}/items` | Создать задачу/позицию. |
 | `GET` | `/api/v1/items/{id}` | Карточка. |
-| `PATCH` | `/api/v1/items/{id}` | Изменить (нужна `version`). |
+| `PATCH` | `/api/v1/items/{id}` | Изменить (нужна `version`; без изменений — `200` без роста `version`). |
 | `DELETE` | `/api/v1/items/{id}` | Мягко удалить. |
 | `POST` | `/api/v1/items/{id}/complete` | Завершить. |
 | `POST` | `/api/v1/items/{id}/reopen` | Открыть. |

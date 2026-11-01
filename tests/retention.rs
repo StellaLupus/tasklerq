@@ -6,11 +6,18 @@ mod support;
 // и в общей базе параллельный тест успевал удалить строки соседа раньше, чем
 // тот читал статистику.
 
-use chrono::{Duration, Utc};
-use tasklerq::config::RetentionConfig;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration as StdDuration;
+
+use chrono::{DateTime, Duration, Utc};
+use sqlx::PgPool;
+use tasklerq::app::build_application;
+use tasklerq::config::{Config, RetentionConfig};
 use tasklerq::domain::models::ListKind;
-use tasklerq::jobs::retention;
+use tasklerq::jobs::retention::{self, RetentionStats, RetentionWorker};
 use tasklerq::storage::repositories::{items, lists};
+use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
 fn config() -> RetentionConfig {
@@ -23,6 +30,40 @@ fn config() -> RetentionConfig {
         outbox_days: 30,
         audit_days: 180,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_delivery(
+    pool: &PgPool,
+    household_id: Uuid,
+    user_id: Uuid,
+    occurrence_key: &str,
+    status: &str,
+    updated_at: DateTime<Utc>,
+    deferred: bool,
+    outbox_seq: Option<i64>,
+) -> Uuid {
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO notification_deliveries (
+             id, household_id, user_id, item_id, occurrence_key, kind, status,
+             scheduled_at, deferred, outbox_seq, created_at, updated_at
+         )
+         VALUES ($1, $2, $3, NULL, $4, 'digest', $5::notification_status,
+                 $6, $7, $8, $6, $6)",
+    )
+    .bind(id)
+    .bind(household_id)
+    .bind(user_id)
+    .bind(occurrence_key)
+    .bind(status)
+    .bind(updated_at)
+    .bind(deferred)
+    .bind(outbox_seq)
+    .execute(pool)
+    .await
+    .expect("notification delivery");
+    id
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -492,4 +533,312 @@ async fn retention_purges_capture_request_reservations_with_the_drafts() {
             .await
             .expect("remaining reservations");
     assert_eq!(remaining, [("recent".to_owned(),)]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_purges_finished_notification_deliveries_but_keeps_pending() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let old = now - Duration::days(40);
+
+    let old_sent = insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        "old-sent",
+        "sent",
+        old,
+        false,
+        None,
+    )
+    .await;
+    let old_cancelled = insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        "old-cancelled",
+        "cancelled",
+        old,
+        false,
+        None,
+    )
+    .await;
+    let recent_sent = insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        "recent-sent",
+        "sent",
+        now - Duration::days(1),
+        false,
+        None,
+    )
+    .await;
+    let old_pending = insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        "old-pending",
+        "pending",
+        old,
+        false,
+        None,
+    )
+    .await;
+    let old_deferred = insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        "old-deferred",
+        "pending",
+        old,
+        true,
+        None,
+    )
+    .await;
+
+    let stats = retention::run(&db.pool, &config(), now)
+        .await
+        .expect("retention");
+
+    assert_eq!(stats.purged_notification_deliveries, 2);
+    let left: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM notification_deliveries ORDER BY id")
+        .fetch_all(&db.pool)
+        .await
+        .expect("deliveries");
+    assert_eq!(left.len(), 3);
+    assert!(!left.contains(&old_sent));
+    assert!(!left.contains(&old_cancelled));
+    assert!(left.contains(&recent_sent));
+    assert!(left.contains(&old_pending), "pending must never be purged");
+    assert!(
+        left.contains(&old_deferred),
+        "deferred pending must never be purged"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_purges_an_outbox_message_referenced_by_a_delivery() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let old = now - Duration::days(40);
+
+    let seq: i64 = sqlx::query_scalar(
+        "INSERT INTO outbox (chat_id, kind, payload, status, created_at, dedupe_key)
+         VALUES (1, 'message', '{}'::jsonb, 'sent', $1, $2)
+         RETURNING seq",
+    )
+    .bind(old)
+    .bind(format!("retention-fk:{}", Uuid::now_v7()))
+    .fetch_one(&db.pool)
+    .await
+    .expect("outbox message");
+    // Доставка моложе срока хранения, поэтому её удаляет не retention
+    // доставок; ссылка обнуляется `ON DELETE SET NULL` при очистке outbox.
+    let delivery = insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        "referenced-outbox",
+        "sent",
+        now,
+        false,
+        Some(seq),
+    )
+    .await;
+
+    let stats = retention::run(&db.pool, &config(), now)
+        .await
+        .expect("retention must not fail on the outbox foreign key");
+
+    assert!(stats.purged_outbox >= 1);
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM outbox WHERE seq = $1)")
+        .bind(seq)
+        .fetch_one(&db.pool)
+        .await
+        .expect("outbox exists");
+    assert!(!exists);
+    let outbox_seq: Option<i64> =
+        sqlx::query_scalar("SELECT outbox_seq FROM notification_deliveries WHERE id = $1")
+            .bind(delivery)
+            .fetch_one(&db.pool)
+            .await
+            .expect("delivery");
+    assert_eq!(outbox_seq, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_worker_skips_the_run_when_the_advisory_lock_is_held() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+
+    sqlx::query(
+        "INSERT INTO capture_drafts (
+             id, household_id, source, mode, raw_text, status, created_at, expires_at
+         )
+         VALUES ($1, $2, 'api', 'auto', 'старый черновик', 'pending', $3, $3)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(household.household_id)
+    .bind(now - Duration::days(40))
+    .execute(&db.pool)
+    .await
+    .expect("draft");
+
+    let mut holder = db.pool.acquire().await.expect("holder connection");
+    let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(retention::ADVISORY_LOCK_KEY)
+        .fetch_one(&mut *holder)
+        .await
+        .expect("lock");
+    assert!(locked, "the test must hold the retention lock");
+
+    let worker = RetentionWorker::new(db.pool.clone(), config());
+    let skipped = worker
+        .run_once(now)
+        .await
+        .expect("a held lock must not fail the run");
+    assert_eq!(skipped, None);
+
+    let drafts: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM capture_drafts WHERE household_id = $1")
+            .bind(household.household_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("drafts");
+    assert_eq!(drafts, 1, "a skipped run must not delete anything");
+
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(retention::ADVISORY_LOCK_KEY)
+        .execute(&mut *holder)
+        .await
+        .expect("unlock");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_application_starts_retention_without_telegram() {
+    let db = support::db().await;
+    let database_url = support::database_url().await;
+    let config = Config::from_map([
+        ("ENV", "development"),
+        ("PUBLIC_BASE_URL", "http://127.0.0.1:18080"),
+        ("DATABASE_URL", database_url.as_str()),
+        ("TELEGRAM_MODE", "disabled"),
+        ("LLM_CAPTURE_ENABLED", "false"),
+    ])
+    .expect("headless config without a bot token must load");
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let application = build_application(&config, db.pool.clone(), shutdown_rx)
+        .await
+        .expect("application should build in disabled mode");
+    assert_eq!(
+        application.workers.len(),
+        1,
+        "retention must run even without Telegram"
+    );
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    for worker in application.workers {
+        tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+            .await
+            .expect("retention must stop on shutdown")
+            .expect("retention task must join");
+    }
+}
+
+async fn insert_expired_draft(pool: &PgPool, household_id: Uuid) -> Uuid {
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO capture_drafts (
+             id, household_id, source, mode, raw_text, status, created_at, expires_at
+         )
+         VALUES ($1, $2, 'api', 'auto', 'просроченный черновик', 'pending', $3, $3)",
+    )
+    .bind(id)
+    .bind(household_id)
+    .bind(Utc::now() - Duration::hours(1))
+    .execute(pool)
+    .await
+    .expect("draft");
+    id
+}
+
+async fn wait_for_draft_status(pool: &PgPool, id: Uuid, wanted: &str) {
+    for _ in 0..200 {
+        let status: String =
+            sqlx::query_scalar("SELECT status::text FROM capture_drafts WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("draft status");
+        if status == wanted {
+            return;
+        }
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+    }
+    panic!("draft {id} did not become {wanted}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_worker_repeats_on_the_configured_interval() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let worker = RetentionWorker::new(db.pool.clone(), config())
+        .with_timing(StdDuration::ZERO, StdDuration::from_millis(50));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = tokio::spawn(worker.run(shutdown_rx));
+
+    let first = insert_expired_draft(&db.pool, household.household_id).await;
+    wait_for_draft_status(&db.pool, first, "expired").await;
+
+    // Второй прогон через настроенный интервал, без ожидания суток.
+    let second = insert_expired_draft(&db.pool, household.household_id).await;
+    wait_for_draft_status(&db.pool, second, "expired").await;
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    tokio::time::timeout(StdDuration::from_secs(5), handle)
+        .await
+        .expect("worker must stop on shutdown")
+        .expect("worker task must join");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_worker_survives_a_failed_and_a_panicked_run() {
+    let db = support::isolated_db().await;
+    let worker = RetentionWorker::new(db.pool.clone(), config())
+        .with_timing(StdDuration::ZERO, StdDuration::from_millis(20));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let runs = Arc::new(AtomicUsize::new(0));
+    let (done_tx, mut done_rx) = mpsc::channel(1);
+    let counter = runs.clone();
+    let handle = tokio::spawn(worker.run_with(shutdown_rx, move |_now| {
+        let run = counter.fetch_add(1, Ordering::SeqCst);
+        let done_tx = done_tx.clone();
+        async move {
+            match run {
+                0 => panic!("the first run panics"),
+                1 => Err(sqlx::Error::Protocol("the second run fails".into())),
+                _ => {
+                    let _ = done_tx.send(()).await;
+                    Ok(Some(RetentionStats::default()))
+                }
+            }
+        }
+    }));
+
+    tokio::time::timeout(StdDuration::from_secs(5), done_rx.recv())
+        .await
+        .expect("the cycle must survive an error and a panic")
+        .expect("the third run must signal");
+    assert!(runs.load(Ordering::SeqCst) >= 3);
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    tokio::time::timeout(StdDuration::from_secs(5), handle)
+        .await
+        .expect("worker must stop on shutdown")
+        .expect("worker task must join");
 }

@@ -11,7 +11,7 @@ use super::actions::load_item_draft;
 use super::{MAX_QUANTITY, lists_of_kind};
 use crate::telegram::bot::card::{describe_recurrence_draft, priority_label};
 use crate::telegram::bot::model::{
-    Action, Choice, EditForm, Form, FormAct, ItemDraft, ItemForm, Screen, Step, Ui,
+    Action, Choice, EditForm, Form, FormAct, ItemDraft, ItemForm, Screen, Step, TimeField, Ui,
 };
 use crate::telegram::bot::onboarding;
 use crate::telegram::bot::screens::{back_button, clip};
@@ -92,6 +92,19 @@ pub async fn view(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
             .heading("За сколько минут напоминать?")
             .text("Отправьте число от 5 до 1440.")
             .row(vec![cancel_button()])),
+        Form::Time { field } => Ok(Ui::new()
+            .heading(time_title(field))
+            .text("Отправьте время в формате HH:MM, например 08:30.")
+            .row(vec![cancel_button()])),
+    }
+}
+
+fn time_title(field: TimeField) -> &'static str {
+    match field {
+        TimeField::Digest => "Во сколько присылать сводку?",
+        TimeField::AllDay => "Во сколько напоминать о вседневных задачах?",
+        TimeField::QuietStart => "Когда начинаются тихие часы?",
+        TimeField::QuietEnd => "Когда заканчиваются тихие часы?",
     }
 }
 

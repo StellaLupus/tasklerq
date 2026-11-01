@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 use crate::capture::breaker::CircuitBreaker;
 use crate::config::{Config, LlmConfig, TelegramMode};
 use crate::home_assistant::{AiTask, HttpAiTask};
+use crate::jobs::scheduler::Scheduler;
 
 use super::api::{DEFAULT_BASE_URL, HttpTelegramApi, TelegramApi};
 use super::bot::Bot;
@@ -93,6 +94,9 @@ pub async fn start(
         wake_outbox.clone(),
     );
     tasks.push(tokio::spawn(updates.run(wake_updates, shutdown.clone())));
+
+    let scheduler = Scheduler::new(pool.clone(), wake_outbox.clone());
+    tasks.push(tokio::spawn(scheduler.run(shutdown.clone())));
 
     let outbox = OutboxWorker::new(pool.clone(), api);
     tasks.push(tokio::spawn(outbox.run(wake_outbox, shutdown)));
