@@ -209,6 +209,34 @@ async fn edit_errors_are_classified() {
 }
 
 #[tokio::test]
+async fn delete_errors_are_classified() {
+    let cases = [
+        (
+            400,
+            "Bad Request: message to delete not found",
+            TelegramError::MessageGone,
+        ),
+        (
+            400,
+            "Bad Request: message can't be deleted",
+            TelegramError::MessageUndeletable,
+        ),
+    ];
+    for (code, description, expected) in cases {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(code).set_body_json(json!({
+                "ok": false, "error_code": code, "description": description
+            })))
+            .mount(&server)
+            .await;
+
+        let error = client(&server).delete_message(1, 2).await.unwrap_err();
+        assert_eq!(error, expected, "{description}");
+    }
+}
+
+#[tokio::test]
 async fn forbidden_bad_request_and_server_errors_are_distinguished() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

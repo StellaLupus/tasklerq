@@ -37,9 +37,12 @@ pub enum TelegramError {
     /// Новое содержимое совпадает с текущим.
     #[error("message is not modified")]
     NotModified,
-    /// Сообщение удалено, слишком старое или не принадлежит боту.
+    /// Сообщение не найдено, слишком старое или не принадлежит боту.
     #[error("message cannot be edited or deleted")]
     MessageGone,
+    /// Удалить сообщение нельзя: оно старше 48 часов или у бота нет прав.
+    #[error("message cannot be deleted")]
+    MessageUndeletable,
     /// Бот заблокирован пользователем или чат недоступен.
     #[error("forbidden: {0}")]
     Forbidden(String),
@@ -63,6 +66,7 @@ impl TelegramError {
             Self::RetryAfter(_) => "retry_after",
             Self::NotModified => "not_modified",
             Self::MessageGone => "message_gone",
+            Self::MessageUndeletable => "message_undeletable",
             Self::Forbidden(_) => "forbidden",
             Self::BadRequest(_) => "bad_request",
             Self::Transient(_) => "transient",
@@ -247,10 +251,12 @@ pub fn parse_response<T: DeserializeOwned>(status: u16, body: &str) -> Result<T,
     if lowered.contains("message is not modified") {
         return Err(TelegramError::NotModified);
     }
+    if lowered.contains("message can't be deleted") {
+        return Err(TelegramError::MessageUndeletable);
+    }
     if lowered.contains("message to edit not found")
         || lowered.contains("message to delete not found")
         || lowered.contains("message can't be edited")
-        || lowered.contains("message can't be deleted")
         || lowered.contains("message_id_invalid")
     {
         return Err(TelegramError::MessageGone);

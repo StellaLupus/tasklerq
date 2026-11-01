@@ -65,6 +65,34 @@ impl Rig {
         .expect("enqueue")
     }
 
+    async fn delete(&self, message_id: i64) -> i64 {
+        let mut conn = self.pool.acquire().await.expect("conn");
+        outbox::enqueue(
+            &mut conn,
+            self.chat,
+            &Outgoing::Delete { message_id },
+            None,
+            self.now,
+        )
+        .await
+        .expect("enqueue")
+        .expect("seq")
+    }
+
+    /// Создать строку вида чата, чтобы проверить `buried`.
+    async fn put_view(&self) {
+        let mut conn = self.pool.acquire().await.expect("conn");
+        views::set(
+            &mut conn,
+            self.chat,
+            "menu",
+            &serde_json::json!({}),
+            self.now,
+        )
+        .await
+        .expect("view");
+    }
+
     async fn pass(&mut self) -> usize {
         self.worker
             .run_once(self.now, self.clock)
@@ -91,6 +119,23 @@ impl Rig {
 }
 
 const SECOND: StdDuration = StdDuration::from_secs(1);
+
+/// Сериализует тесты, которые могут увеличить `outbox_dead_total`: реестр
+/// метрик общий на процесс, и параллельный dead-letter соседнего теста сломал
+/// бы проверку «метрика не выросла».
+static DEAD_METRIC: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn counter(text: &str, series: &str) -> f64 {
+    text.lines()
+        .find_map(|line| {
+            let mut parts = line.split_whitespace();
+            if parts.next()? != series {
+                return None;
+            }
+            parts.next()?.parse().ok()
+        })
+        .unwrap_or(0.0)
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn screen_is_sent_once_then_edited_in_place() {
@@ -188,6 +233,7 @@ async fn too_many_requests_defers_by_retry_after_without_losing_the_message() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn temporary_failure_backs_off_keeps_order_and_then_dies() {
+    let _dead = DEAD_METRIC.lock().await;
     let db = db().await;
     let mut rig = Rig::new(&db.pool);
     let head = rig.message("<p>первое</p>", None).await.expect("seq");
@@ -227,6 +273,7 @@ async fn temporary_failure_backs_off_keeps_order_and_then_dies() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blocked_bot_is_dead_immediately_and_does_not_block_the_chat() {
+    let _dead = DEAD_METRIC.lock().await;
     let db = db().await;
     let mut rig = Rig::new(&db.pool);
     let first = rig.message("<p>a</p>", None).await.expect("seq");
@@ -325,6 +372,7 @@ async fn scheduled_message_waits_without_blocking_later_ones() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn skipped_and_dead_messages_do_not_keep_their_text() {
+    let _dead = DEAD_METRIC.lock().await;
     let db = db().await;
     let mut rig = Rig::new(&db.pool);
 
@@ -355,4 +403,108 @@ async fn skipped_and_dead_messages_do_not_keep_their_text() {
             "{secret} must be wiped from the outbox: {payload}"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn successful_delete_is_sent_and_removes_the_message() {
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    let seq = rig.delete(55).await;
+
+    assert_eq!(rig.pass().await, 1);
+
+    assert_eq!(rig.row(seq).await.0, "sent");
+    assert_eq!(
+        rig.fake.calls(),
+        vec![Call::Delete {
+            chat: rig.chat,
+            id: 55
+        }]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_not_found_counts_as_sent() {
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    rig.fake.reject_deletes(Some(TelegramError::MessageGone));
+    let seq = rig.delete(56).await;
+
+    assert_eq!(rig.pass().await, 1);
+    assert_eq!(rig.row(seq).await.0, "sent");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undeletable_message_is_skipped_and_buries_the_view_without_dead_metric() {
+    let _dead = DEAD_METRIC.lock().await;
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    rig.put_view().await;
+    rig.fake
+        .reject_deletes(Some(TelegramError::MessageUndeletable));
+    let before = counter(&tasklerq::metrics::render(), "outbox_dead_total");
+    let seq = rig.delete(57).await;
+
+    assert_eq!(rig.pass().await, 0);
+
+    assert_eq!(
+        rig.row(seq).await,
+        (
+            "skipped".into(),
+            0,
+            Some("message_undeletable".into()),
+            None
+        )
+    );
+    let buried: bool = sqlx::query_scalar("SELECT buried FROM telegram_views WHERE chat_id = $1")
+        .bind(rig.chat)
+        .fetch_one(&db.pool)
+        .await
+        .expect("buried");
+    assert!(buried, "an undeletable user message must bury the view");
+    let after = counter(&tasklerq::metrics::render(), "outbox_dead_total");
+    assert_eq!(
+        after, before,
+        "an undeletable message is skipped, not a dead-letter"
+    );
+    let payload: String = sqlx::query_scalar("SELECT payload::text FROM outbox WHERE seq = $1")
+        .bind(seq)
+        .fetch_one(&db.pool)
+        .await
+        .expect("payload");
+    assert!(
+        !payload.contains("57"),
+        "the skipped delete payload must be redacted: {payload}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn temporary_delete_failure_backs_off_and_keeps_the_row_pending() {
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    rig.fake
+        .reject_deletes(Some(TelegramError::Transient("503".into())));
+    let seq = rig.delete(58).await;
+
+    assert_eq!(rig.pass().await, 0);
+    let (status, attempts, error, _) = rig.row(seq).await;
+    assert_eq!(
+        (status.as_str(), attempts, error.as_deref()),
+        ("pending", 1, Some("transient"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_rate_limit_defers_without_spending_an_attempt() {
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    rig.fake.reject_deletes(Some(TelegramError::RetryAfter(5)));
+    let seq = rig.delete(59).await;
+
+    assert_eq!(rig.pass().await, 0);
+    let (status, attempts, error, _) = rig.row(seq).await;
+    assert_eq!(
+        (status.as_str(), attempts, error.as_deref()),
+        ("pending", 0, Some("retry_after"))
+    );
 }

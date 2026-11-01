@@ -2,9 +2,9 @@
 
 ## 1. Схема и outbox-вид `delete`
 
-- [ ] 1.1 Добавить миграцию `0011_screen_visibility.sql` (`0010` занята `0010_security_audit.sql`): `ALTER TYPE outbox_kind ADD VALUE 'delete'` и `ALTER TABLE telegram_views ADD COLUMN buried boolean NOT NULL DEFAULT false`. Проверить: `make test` применяет миграцию на чистой базе, `tests/database_constraints.rs` проходит, на базе с данными `pr-5` миграция идёт без ошибок.
-- [ ] 1.2 Добавить `Outgoing::Delete { message_id }` с round-trip через строку outbox и доставку через `delete_message`. «message to delete not found» → `sent`. «message can't be deleted» → `skipped` с кодом в `last_error`, `buried = true` у вида чата, лог `warn`, без `outbox_dead` в логе и без роста метрики `outbox_dead_total`. Временные ошибки и `429` → как у остальных строк. Проверить тестами в `tests/telegram_outbox.rs` на `FakeTelegram` все четыре исхода и юнит-тестом round-trip в `outbox.rs`.
-- [ ] 1.3 Исключить `delete` из поминутной квоты чата в лимитере, оставив его в общем лимите 30/с. Проверить юнит-тестом лимитера: удаление и правка экрана в одном чате выполняются в одном проходе без ожидания секунды, а общий лимит удаления учитывает.
+- [x] 1.1 Добавить миграцию `0011_screen_visibility.sql` (`0010` занята `0010_security_audit.sql`): `ALTER TYPE outbox_kind ADD VALUE 'delete'` и `ALTER TABLE telegram_views ADD COLUMN buried boolean NOT NULL DEFAULT false`. Проверить: `make test` применяет миграцию на чистой базе, `tests/database_constraints.rs` проходит, на базе с данными `pr-5` миграция идёт без ошибок.
+- [x] 1.2 Добавить `Outgoing::Delete { message_id }` с round-trip через строку outbox и доставку через `delete_message`. «message to delete not found» → `sent`. «message can't be deleted» → `skipped` с кодом в `last_error`, `buried = true` у вида чата, лог `warn`, без `outbox_dead` в логе и без роста метрики `outbox_dead_total`. Временные ошибки и `429` → как у остальных строк. Проверить тестами в `tests/telegram_outbox.rs` на `FakeTelegram` все четыре исхода и юнит-тестом round-trip в `outbox.rs`.
+- [x] 1.3 Исключить `delete` из поминутной квоты чата в лимитере, оставив его в общем лимите 30/с. Проверить юнит-тестом лимитера: удаление и правка экрана в одном чате выполняются в одном проходе без ожидания секунды, а общий лимит удаления учитывает.
 
 ## 2. Правило видимости якоря
 

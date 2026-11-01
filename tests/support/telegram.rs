@@ -34,6 +34,7 @@ struct State {
     calls: Vec<Call>,
     failures: VecDeque<TelegramError>,
     edit_error: Option<TelegramError>,
+    delete_error: Option<TelegramError>,
     answers: Vec<(String, Option<String>, bool)>,
 }
 
@@ -56,6 +57,11 @@ impl FakeTelegram {
     /// Все правки будут отклоняться этой ошибкой (`None` — снять).
     pub fn reject_edits(&self, error: Option<TelegramError>) {
         self.state.lock().expect("lock").edit_error = error;
+    }
+
+    /// Все удаления будут отклоняться этой ошибкой (`None` — снять).
+    pub fn reject_deletes(&self, error: Option<TelegramError>) {
+        self.state.lock().expect("lock").delete_error = error;
     }
 
     pub fn calls(&self) -> Vec<Call> {
@@ -201,6 +207,12 @@ impl TelegramApi for FakeTelegram {
 
     async fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<(), TelegramError> {
         let mut state = self.state.lock().expect("lock");
+        if let Some(error) = Self::take_failure(&mut state) {
+            return Err(error);
+        }
+        if let Some(error) = state.delete_error.clone() {
+            return Err(error);
+        }
         state.messages.remove(&(chat_id, message_id));
         state.calls.push(Call::Delete {
             chat: chat_id,

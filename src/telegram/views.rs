@@ -85,6 +85,19 @@ pub async fn set_message(
     Ok(())
 }
 
+/// Пометить экран чата засыпанным.
+///
+/// Строку не создаём: `buried` имеет смысл только вместе с активным экраном, а
+/// до первого экрана его нет. Для чата без вида обновление — no-op.
+pub async fn mark_buried(conn: &mut PgConnection, chat_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE telegram_views SET buried = true WHERE chat_id = $1")
+        .bind(chat_id)
+        .execute(conn)
+        .await?;
+
+    Ok(())
+}
+
 /// Форма чата.
 #[derive(Debug, Clone)]
 pub struct Conversation {

@@ -61,6 +61,11 @@ pub enum Outgoing {
         /// HTML RichMessage.
         html: String,
     },
+    /// Удаление сообщения (например, входящего текста пользователя).
+    Delete {
+        /// Сообщение.
+        message_id: i64,
+    },
 }
 
 impl Outgoing {
@@ -69,6 +74,7 @@ impl Outgoing {
             Self::Screen { .. } => "screen",
             Self::Message { .. } => "message",
             Self::Edit { .. } => "edit",
+            Self::Delete { .. } => "delete",
         }
     }
 
@@ -77,15 +83,17 @@ impl Outgoing {
             Self::Screen { html } => json!({"html": html}),
             Self::Message { html, rich } => json!({"html": html, "rich": rich}),
             Self::Edit { message_id, html } => json!({"html": html, "message_id": message_id}),
+            Self::Delete { message_id } => json!({"message_id": message_id}),
         }
     }
 
     fn from_row(kind: &str, payload: &Value) -> Option<Self> {
-        let html = payload.get("html")?.as_str()?.to_owned();
         match kind {
-            "screen" => Some(Self::Screen { html }),
+            "screen" => Some(Self::Screen {
+                html: payload.get("html")?.as_str()?.to_owned(),
+            }),
             "message" => Some(Self::Message {
-                html,
+                html: payload.get("html")?.as_str()?.to_owned(),
                 rich: payload
                     .get("rich")
                     .and_then(Value::as_bool)
@@ -93,7 +101,10 @@ impl Outgoing {
             }),
             "edit" => Some(Self::Edit {
                 message_id: payload.get("message_id")?.as_i64()?,
-                html,
+                html: payload.get("html")?.as_str()?.to_owned(),
+            }),
+            "delete" => Some(Self::Delete {
+                message_id: payload.get("message_id")?.as_i64()?,
             }),
             _ => None,
         }
@@ -195,6 +206,19 @@ pub struct RateLimiter {
 impl RateLimiter {
     /// Занять слот для отправки в чат; `false` — отправлять пока нельзя.
     pub fn try_acquire(&mut self, chat_id: i64, now: Instant) -> bool {
+        self.try_acquire_with(chat_id, now, true)
+    }
+
+    /// Занять слот для удаления сообщения.
+    ///
+    /// Удаление не расходует поминутную квоту чата: лимит Telegram «1
+    /// сообщение в секунду» относится к отправке, а не к удалению. Общий лимит
+    /// и пауза после `429` действуют и здесь.
+    pub fn try_acquire_delete(&mut self, chat_id: i64, now: Instant) -> bool {
+        self.try_acquire_with(chat_id, now, false)
+    }
+
+    fn try_acquire_with(&mut self, chat_id: i64, now: Instant, chat_quota: bool) -> bool {
         if self.paused_until.is_some_and(|until| now < until) {
             return false;
         }
@@ -208,15 +232,18 @@ impl RateLimiter {
         if self.global.len() >= GLOBAL_PER_SECOND {
             return false;
         }
-        if self
-            .per_chat
-            .get(&chat_id)
-            .is_some_and(|last| now.duration_since(*last) < CHAT_INTERVAL)
+        if chat_quota
+            && self
+                .per_chat
+                .get(&chat_id)
+                .is_some_and(|last| now.duration_since(*last) < CHAT_INTERVAL)
         {
             return false;
         }
 
-        self.per_chat.insert(chat_id, now);
+        if chat_quota {
+            self.per_chat.insert(chat_id, now);
+        }
         self.global.push_back(now);
         // Карта не растёт без границ: давно неактивные чаты забываются.
         if self.per_chat.len() > 4_096 {
@@ -240,6 +267,8 @@ impl RateLimiter {
 pub enum Delivery {
     /// Доставлено.
     Sent,
+    /// Пропущено: операция не имеет смысла (например, удаление невозможно).
+    Skipped,
     /// Отложено: `429` или временная ошибка.
     Deferred,
     /// Попытки исчерпаны или ошибка постоянная.
@@ -316,7 +345,7 @@ impl OutboxWorker {
         for seq in candidates {
             match self.deliver_one(seq, now, clock).await? {
                 Delivery::Sent => sent += 1,
-                Delivery::Deferred | Delivery::Dead | Delivery::Idle => {}
+                Delivery::Skipped | Delivery::Deferred | Delivery::Dead | Delivery::Idle => {}
             }
         }
         Ok(sent)
@@ -343,7 +372,12 @@ impl OutboxWorker {
         let Some(row) = row else {
             return Ok(Delivery::Idle);
         };
-        if !self.limiter.try_acquire(row.chat_id, clock) {
+        let acquired = if row.kind == "delete" {
+            self.limiter.try_acquire_delete(row.chat_id, clock)
+        } else {
+            self.limiter.try_acquire(row.chat_id, clock)
+        };
+        if !acquired {
             return Ok(Delivery::Idle);
         }
 
@@ -383,6 +417,31 @@ impl OutboxWorker {
                 self.limiter
                     .pause_until(clock + StdDuration::from_secs(wait.unsigned_abs()));
                 Delivery::Deferred
+            }
+            Err(TelegramError::MessageUndeletable)
+                if matches!(outgoing, Outgoing::Delete { .. }) =>
+            {
+                let code = TelegramError::MessageUndeletable.code();
+                sqlx::query(
+                    "UPDATE outbox
+                     SET status = 'skipped', last_error = $2,
+                         payload = jsonb_build_object('redacted', true)
+                     WHERE seq = $1",
+                )
+                .bind(row.seq)
+                .bind(code)
+                .execute(&mut *tx)
+                .await?;
+                // Сообщение пользователя осталось в чате: следующий экран
+                // должен прийти новым сообщением. Строку вида не создаём —
+                // без активного экрана `buried` не нужен (см. `views`).
+                views::mark_buried(&mut tx, row.chat_id).await?;
+                tracing::warn!(
+                    seq = row.seq,
+                    error = code,
+                    "outbox delete skipped: message cannot be deleted"
+                );
+                Delivery::Skipped
             }
             Err(error) if error.is_retryable() => {
                 let attempts = row.attempts + 1;
@@ -515,6 +574,13 @@ async fn deliver(
             let rich = RichMessage { html: html.clone() };
             replace_or_send(api, row.chat_id, Some(*message_id), &rich).await
         }
+        Outgoing::Delete { message_id } => {
+            match api.delete_message(row.chat_id, *message_id).await {
+                // «Удалять нечего» — тот же результат, что и успешное удаление.
+                Ok(()) | Err(TelegramError::MessageGone) => Ok(*message_id),
+                Err(error) => Err(error),
+            }
+        }
     }
 }
 
@@ -579,6 +645,43 @@ mod tests {
     }
 
     #[test]
+    fn limiter_delete_does_not_take_the_chat_quota() {
+        let mut limiter = RateLimiter::default();
+        let start = Instant::now();
+
+        assert!(limiter.try_acquire_delete(1, start));
+        assert!(
+            limiter.try_acquire(1, start),
+            "an edit after deleting a message in the same chat must not wait a second"
+        );
+    }
+
+    #[test]
+    fn limiter_delete_counts_towards_the_global_limit() {
+        let mut limiter = RateLimiter::default();
+        let start = Instant::now();
+
+        for chat in 0..GLOBAL_PER_SECOND {
+            assert!(limiter.try_acquire_delete(i64::try_from(chat).expect("chat"), start));
+        }
+        assert!(
+            !limiter.try_acquire(10_000, start + StdDuration::from_millis(500)),
+            "deletes must fill the global per-second limit"
+        );
+        assert!(limiter.try_acquire(10_000, start + StdDuration::from_secs(1)));
+    }
+
+    #[test]
+    fn limiter_pause_blocks_deletes_too() {
+        let mut limiter = RateLimiter::default();
+        let start = Instant::now();
+
+        limiter.pause_until(start + StdDuration::from_secs(5));
+        assert!(!limiter.try_acquire_delete(1, start + StdDuration::from_secs(4)));
+        assert!(limiter.try_acquire_delete(1, start + StdDuration::from_secs(5)));
+    }
+
+    #[test]
     fn outgoing_round_trips_through_rows() {
         for outgoing in [
             Outgoing::Screen { html: "a".into() },
@@ -590,6 +693,7 @@ mod tests {
                 message_id: 7,
                 html: "c".into(),
             },
+            Outgoing::Delete { message_id: 8 },
         ] {
             assert_eq!(
                 Outgoing::from_row(outgoing.kind(), &outgoing.payload()),
