@@ -5,11 +5,12 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::identity::{AuditEvent, AuditEventType};
-use crate::domain::models::{ActorType, UserRole};
+use crate::domain::models::{ActorType, User, UserRole};
 use crate::domain::settings::{
     NotificationSettings, NotificationSettingsUpdate, ProfileUpdate, SUGGESTED_TIMEZONES,
     validate_timezone,
 };
+use crate::jobs::scheduler;
 use crate::storage::repositories::{audit, invites, members, users};
 use crate::telegram::rich::{Span, button};
 use crate::telegram::ru;
@@ -20,6 +21,79 @@ use super::{Ctx, Fail, display_timezone};
 
 fn on_off(value: bool) -> &'static str {
     if value { "вкл" } else { "выкл" }
+}
+
+/// Какая правка тихих часов запускает ручной выпуск отложенных.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReleaseTrigger {
+    /// Тихие часы выключены.
+    Disabled,
+    /// Изменено начало или конец интервала.
+    Boundaries,
+    /// Изменён часовой пояс.
+    Timezone,
+}
+
+/// Баннер над экраном настроек после ручного выпуска.
+fn release_banner(trigger: ReleaseTrigger, settings: &NotificationSettings, count: u64) -> String {
+    let reason = if !settings.quiet_hours_enabled {
+        "Тихие часы выключены.".to_owned()
+    } else if trigger == ReleaseTrigger::Timezone {
+        "Часовой пояс обновлён.".to_owned()
+    } else {
+        format!(
+            "Тихие часы: {}–{}.",
+            settings.quiet_start, settings.quiet_end
+        )
+    };
+    let count = i64::try_from(count).unwrap_or(i64::MAX);
+    format!(
+        "{reason} Накопилось {count} {} — ниже",
+        ru::plural(count, "уведомление", "уведомления", "уведомлений")
+    )
+}
+
+/// Показать экран после правки настроек и, если сейчас уже не тихо, сразу
+/// выпустить отложенные уведомления.
+///
+/// Всё выполняется в транзакции обработчика: сохранение настройки, экран и
+/// выпуск фиксируются вместе. Записи забираются под advisory-блокировкой
+/// получателя, поэтому планировщик не отправит их второй раз.
+pub(super) async fn finish_settings_change(
+    ctx: &mut Ctx<'_>,
+    user: User,
+    screen: Screen,
+    trigger: Option<ReleaseTrigger>,
+) -> Result<(), Fail> {
+    ctx.user = Some(user);
+    let Some(trigger) = trigger else {
+        return ctx.present(screen).await;
+    };
+
+    let user_id = ctx.user()?.id;
+    let settings = NotificationSettings::from_settings(&ctx.user()?.settings);
+    let timezone = ctx.tz;
+
+    // Занятый получатель: планировщик уже выпускает его записи. Второго
+    // сообщения не будет, экран показываем без баннера.
+    if !scheduler::try_recipient_lock(&mut *ctx.conn, user_id).await? {
+        return ctx.present(screen).await;
+    }
+
+    if let Some(end) = scheduler::quiet_end_at(ctx.now, timezone, &settings) {
+        // По новым настройкам сейчас всё ещё тихо: не выпускаем, но переносим
+        // отложенные на конец нового интервала.
+        scheduler::postpone_deferred_for_user(&mut *ctx.conn, user_id, end, ctx.now).await?;
+        return ctx.present(screen).await;
+    }
+
+    let count = scheduler::deferred_notice_count(&mut *ctx.conn, user_id, ctx.now).await?;
+    if count > 0 {
+        ctx.banner(release_banner(trigger, &settings, count));
+    }
+    ctx.present(screen).await?;
+    scheduler::release_deferred_for_user(&mut *ctx.conn, user_id, ctx.now).await?;
+    Ok(())
 }
 
 /// Собрать экран раздела «Настройки».
@@ -461,14 +535,14 @@ pub async fn set_timezone(ctx: &mut Ctx<'_>, zone: &str) -> Result<(), Fail> {
     )
     .await?;
     ctx.tz = display_timezone(Some(&user), ctx.household.as_ref());
-    ctx.user = Some(user);
     ctx.toast("Часовой пояс обновлён");
-    ctx.present(Screen::Settings).await
+    finish_settings_change(ctx, user, Screen::Settings, Some(ReleaseTrigger::Timezone)).await
 }
 
 async fn update_notifications(
     ctx: &mut Ctx<'_>,
     update: NotificationSettingsUpdate,
+    trigger: Option<ReleaseTrigger>,
 ) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
     let actor = ctx.actor()?;
@@ -483,8 +557,7 @@ async fn update_notifications(
         ctx.now,
     )
     .await?;
-    ctx.user = Some(user);
-    ctx.present(Screen::Notifications).await
+    finish_settings_change(ctx, user, Screen::Notifications, trigger).await
 }
 
 /// Переключить настройку уведомлений.
@@ -508,7 +581,10 @@ pub async fn toggle(ctx: &mut Ctx<'_>, setting: Setting) -> Result<(), Fail> {
             ..Default::default()
         },
     };
-    update_notifications(ctx, update).await
+    // Выключение тихих часов — ручной выпуск. Включение ничего не ускоряет.
+    let trigger = (setting == Setting::QuietHours && current.quiet_hours_enabled)
+        .then_some(ReleaseTrigger::Disabled);
+    update_notifications(ctx, update, trigger).await
 }
 
 /// Выбрать время напоминания.
@@ -519,6 +595,7 @@ pub async fn set_lead(ctx: &mut Ctx<'_>, minutes: u16) -> Result<(), Fail> {
             lead_minutes: Some(minutes),
             ..Default::default()
         },
+        None,
     )
     .await
 }

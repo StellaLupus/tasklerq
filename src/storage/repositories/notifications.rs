@@ -11,7 +11,7 @@ use sqlx::{FromRow, PgConnection};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
-use crate::domain::models::Actor;
+use crate::domain::models::{Actor, ItemStatus};
 
 /// Тип уведомления; совпадает с PostgreSQL-типом `notification_kind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
@@ -260,7 +260,7 @@ pub struct BatchDelivery {
     /// Элемент; у сводки пусто, у батча всегда есть.
     pub item_id: Option<Uuid>,
     /// Тип уведомления.
-    pub kind: String,
+    pub kind: NotificationKind,
     /// Версия задачи на момент выпуска.
     pub batch_version: Option<i32>,
     /// Итог действия над блоком.
@@ -272,7 +272,7 @@ pub struct BatchDelivery {
     /// Название задачи.
     pub title: Option<String>,
     /// Статус задачи.
-    pub item_status: Option<String>,
+    pub item_status: Option<ItemStatus>,
     /// Задача удалена.
     pub item_deleted_at: Option<DateTime<Utc>>,
     /// Текущая версия задачи.
@@ -295,9 +295,9 @@ pub async fn batch_deliveries(
     batch_id: Uuid,
 ) -> Result<Vec<BatchDelivery>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT d.id, d.item_id, d.kind::text AS kind, d.batch_version,
+        "SELECT d.id, d.item_id, d.kind AS kind, d.batch_version,
                 d.batch_state, d.batch_snoozed_until, d.scheduled_at,
-                i.title, i.status::text AS item_status,
+                i.title, i.status AS item_status,
                 i.deleted_at AS item_deleted_at, i.version AS item_version,
                 i.due_at, i.due_date,
                 l.name AS list_name, l.deleted_at AS list_deleted_at,

@@ -477,28 +477,68 @@ async fn deliver_one(pool: &PgPool, id: Uuid, now: DateTime<Utc>) -> Result<u64,
         .fetch_optional(&mut *tx)
         .await?;
 
-    let Some(row) = row else {
-        return Ok(0);
+    let delivered = match row {
+        Some(row) => deliver_row(&mut tx, row, now).await?,
+        None => 0,
     };
+    tx.commit().await?;
+    Ok(delivered)
+}
+
+/// Немедленно выпустить отложенные сводки получателя.
+///
+/// Вызывается из обработчика настроек в его транзакции после сводного
+/// сообщения. Записи блокируются `FOR UPDATE SKIP LOCKED`, поэтому
+/// планировщик не отправит ту же сводку второй раз.
+pub(crate) async fn release_deferred(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
+    let sql = format!(
+        "SELECT {DIGEST_ROW_COLUMNS}
+         FROM notification_deliveries d
+         LEFT JOIN users u ON u.id = d.user_id
+         LEFT JOIN households h ON h.id = d.household_id
+         WHERE d.user_id = $1 AND d.status = 'pending' AND d.kind = 'digest'
+           AND d.deferred
+         ORDER BY d.scheduled_at, d.id
+         FOR UPDATE OF d SKIP LOCKED"
+    );
+    let rows: Vec<DigestDeliveryRow> = sqlx::query_as(&sql)
+        .bind(user_id)
+        .fetch_all(&mut *conn)
+        .await?;
+
+    let mut delivered = 0;
+    for row in rows {
+        delivered += deliver_row(conn, row, now).await?;
+    }
+    Ok(delivered)
+}
+
+/// Собрать и поставить в outbox одну сводку, если она ещё актуальна.
+async fn deliver_row(
+    conn: &mut PgConnection,
+    row: DigestDeliveryRow,
+    now: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
     if row.is_stale(now) {
-        mark_cancelled(&mut tx, row.id, now).await?;
-        tx.commit().await?;
+        mark_cancelled(&mut *conn, row.id, now).await?;
         return Ok(0);
     }
     if let Some(settings) = row.settings.as_ref()
-        && postpone_for_quiet(&mut tx, row.id, settings, row.timezone(), now).await?
+        && postpone_for_quiet(&mut *conn, row.id, settings, row.timezone(), now).await?
     {
-        tx.commit().await?;
         return Ok(0);
     }
     let (Some(chat_id), Some(telegram_user_id)) = (row.telegram_chat_id, row.telegram_user_id)
     else {
-        mark_cancelled(&mut tx, row.id, now).await?;
-        tx.commit().await?;
+        mark_cancelled(&mut *conn, row.id, now).await?;
         return Ok(0);
     };
 
-    let content = content(&mut tx, row.household_id, row.timezone(), now).await?;
+    let content = content(&mut *conn, row.household_id, row.timezone(), now).await?;
     let ui = notify::digest_ui(
         &content.today,
         &content.overdue,
@@ -506,11 +546,11 @@ async fn deliver_one(pool: &PgPool, id: Uuid, now: DateTime<Utc>) -> Result<u64,
         content.tasks_list,
         content.shopping_list,
     );
-    let html = notify::render_notice(&mut tx, telegram_user_id, row.household_id, &ui, now).await?;
+    let html =
+        notify::render_notice(&mut *conn, telegram_user_id, row.household_id, &ui, now).await?;
     let dedupe_key = format!("notification:digest:{}", row.id);
-    let seq = enqueue_message(&mut tx, chat_id, &dedupe_key, html, true, now).await?;
-    mark_sent(&mut tx, row.id, seq, now).await?;
+    let seq = enqueue_message(&mut *conn, chat_id, &dedupe_key, html, true, now).await?;
+    mark_sent(&mut *conn, row.id, seq, now).await?;
 
-    tx.commit().await?;
     Ok(1)
 }

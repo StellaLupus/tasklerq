@@ -1,5 +1,6 @@
 //! Retention и purge: сроки хранения и физическое удаление.
 
+use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::time::Duration as StdDuration;
 
@@ -208,6 +209,12 @@ async fn run_in_tx(
     // локального дня; назначение и snooze вставляются однократно. Поэтому
     // `sent`/`cancelled` старше `RETENTION_OUTBOX_DAYS` уже не участвуют в
     // проверке уникальности.
+    //
+    // Инвариант: `RETENTION_OUTBOX_DAYS` >= 1 (минимум в `config/mod.rs`), а
+    // `MAX_LEAD_MINUTES` = 1440 (`domain/settings.rs`) — напоминание о timed-сроке
+    // не создаётся раньше чем за сутки до него. Если изменить любое из этих
+    // значений, пересмотреть очистку: строка `sent`/`cancelled` должна
+    // пережить окно, в котором её вхождение ещё может быть перепланировано.
     let purged_notification_deliveries = sqlx::query(
         "DELETE FROM notification_deliveries
          WHERE status IN ('sent', 'cancelled') AND updated_at < $1",
@@ -260,12 +267,27 @@ async fn run_in_tx(
 pub struct RetentionWorker {
     pool: PgPool,
     config: RetentionConfig,
+    first_delay: StdDuration,
+    interval: StdDuration,
 }
 
 impl RetentionWorker {
     /// Создать задание.
     pub fn new(pool: PgPool, config: RetentionConfig) -> Self {
-        Self { pool, config }
+        Self {
+            pool,
+            config,
+            first_delay: FIRST_RUN_DELAY,
+            interval: RUN_INTERVAL,
+        }
+    }
+
+    /// Переопределить задержку первого прогона и интервал (для тестов).
+    #[must_use]
+    pub fn with_timing(mut self, first_delay: StdDuration, interval: StdDuration) -> Self {
+        self.first_delay = first_delay;
+        self.interval = interval;
+        self
     }
 
     /// Один прогон на момент `now`.
@@ -276,7 +298,15 @@ impl RetentionWorker {
         &self,
         now: DateTime<Utc>,
     ) -> Result<Option<RetentionStats>, sqlx::Error> {
-        let stats = run_locked(&self.pool, &self.config, now).await?;
+        Self::run_once_with(&self.pool, &self.config, now).await
+    }
+
+    async fn run_once_with(
+        pool: &PgPool,
+        config: &RetentionConfig,
+        now: DateTime<Utc>,
+    ) -> Result<Option<RetentionStats>, sqlx::Error> {
+        let stats = run_locked(pool, config, now).await?;
         if let Some(stats) = stats {
             tracing::info!(
                 expired_drafts = stats.expired_drafts,
@@ -303,26 +333,63 @@ impl RetentionWorker {
     }
 
     /// Цикл до сигнала остановки.
-    pub async fn run(self, mut shutdown: watch::Receiver<bool>) {
-        let mut next = tokio::time::Instant::now() + FIRST_RUN_DELAY;
-        loop {
-            if *shutdown.borrow() {
-                return;
-            }
-            tokio::select! {
-                _ = shutdown.changed() => return,
-                _ = tokio::time::sleep_until(next) => {
-                    // Ошибка или паника одного прогона не останавливает цикл.
-                    match AssertUnwindSafe(self.run_once(Utc::now())).catch_unwind().await {
-                        Ok(Ok(Some(_))) => {}
-                        Ok(Ok(None)) => {
-                            tracing::info!("retention skipped: another instance holds the lock");
-                        }
-                        Ok(Err(error)) => tracing::error!(%error, "retention run failed"),
-                        Err(_) => tracing::error!("retention run panicked"),
+    pub async fn run(self, shutdown: watch::Receiver<bool>) {
+        let RetentionWorker {
+            pool,
+            config,
+            first_delay,
+            interval,
+        } = self;
+        run_loop(
+            move |now| {
+                let pool = pool.clone();
+                async move { RetentionWorker::run_once_with(&pool, &config, now).await }
+            },
+            shutdown,
+            first_delay,
+            interval,
+        )
+        .await;
+    }
+
+    /// Цикл с подменённым прогоном. Нужен тестам, чтобы проверить, что ошибка
+    /// и паника одного прогона не останавливают следующие.
+    pub async fn run_with<F, Fut>(self, shutdown: watch::Receiver<bool>, run: F)
+    where
+        F: FnMut(DateTime<Utc>) -> Fut + Send,
+        Fut: Future<Output = Result<Option<RetentionStats>, sqlx::Error>> + Send,
+    {
+        run_loop(run, shutdown, self.first_delay, self.interval).await;
+    }
+}
+
+async fn run_loop<F, Fut>(
+    mut run: F,
+    mut shutdown: watch::Receiver<bool>,
+    first_delay: StdDuration,
+    interval: StdDuration,
+) where
+    F: FnMut(DateTime<Utc>) -> Fut + Send,
+    Fut: Future<Output = Result<Option<RetentionStats>, sqlx::Error>> + Send,
+{
+    let mut next = tokio::time::Instant::now() + first_delay;
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            _ = tokio::time::sleep_until(next) => {
+                // Ошибка или паника одного прогона не останавливает цикл.
+                match AssertUnwindSafe(run(Utc::now())).catch_unwind().await {
+                    Ok(Ok(Some(_))) => {}
+                    Ok(Ok(None)) => {
+                        tracing::info!("retention skipped: another instance holds the lock");
                     }
-                    next = tokio::time::Instant::now() + RUN_INTERVAL;
+                    Ok(Err(error)) => tracing::error!(%error, "retention run failed"),
+                    Err(_) => tracing::error!("retention run panicked"),
                 }
+                next = tokio::time::Instant::now() + interval;
             }
         }
     }

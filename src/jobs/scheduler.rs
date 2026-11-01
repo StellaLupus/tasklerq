@@ -45,7 +45,6 @@ use crate::storage::repositories::notifications::{
 use crate::storage::repositories::{items, lists};
 use crate::telegram::bot::notify;
 use crate::telegram::outbox::{self, Outgoing};
-use crate::telegram::ru;
 
 use super::notice::{NOTICE_ROW_COLUMNS, NOTICE_ROW_FROM, NoticeRow};
 
@@ -665,12 +664,20 @@ async fn deliver_batches(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx:
 }
 
 /// SQL отложенных доставок получателя для сборки сводного сообщения.
-fn batch_row_sql() -> String {
+///
+/// `due_only` ограничивает выборку записями, срок которых уже наступил: так
+/// работает тик. Ручной выпуск забирает все отложенные записи получателя.
+fn deferred_row_sql(due_only: bool) -> String {
+    let due = if due_only {
+        "AND d.scheduled_at <= $2"
+    } else {
+        ""
+    };
     format!(
         "SELECT {NOTICE_ROW_COLUMNS}
          {NOTICE_ROW_FROM}
          WHERE d.user_id = $1 AND d.status = 'pending' AND d.deferred
-           AND d.scheduled_at <= $2
+           {due}
            AND d.kind IN ('reminder', 'snooze', 'assignment')
          ORDER BY d.scheduled_at, d.id
          FOR UPDATE OF d SKIP LOCKED"
@@ -682,17 +689,18 @@ fn batch_row_sql() -> String {
 /// Все пути доставки берут её до блокировки строк: тогда два экземпляра
 /// планировщика не соберут сводное сообщение из части отложенных строк
 /// (`SKIP LOCKED` пропустил бы строки, которые в этот момент доставляет
-/// одиночный путь). Ключ — первые восемь байт `user_id`; коллизии двух UUID
-/// практически невозможны. Блокировка не ждёт: занятого получателя тик
-/// пропускает.
+/// одиночный путь). Ключ — последние восемь байт `user_id`: у UUIDv7 первые
+/// восемь байт заняты временным префиксом и у соседних записей совпадают.
+/// Коллизии двух UUID практически невозможны. Блокировка не ждёт: занятого
+/// получателя тик пропускает.
 pub(crate) async fn try_recipient_lock(
     conn: &mut PgConnection,
     user_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
     let key = i64::from_be_bytes(
-        user_id.as_bytes()[..8]
+        user_id.as_bytes()[8..]
             .try_into()
-            .expect("uuid has at least eight bytes"),
+            .expect("uuid has at least sixteen bytes"),
     );
     sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
         .bind(key)
@@ -706,54 +714,69 @@ async fn deliver_batch_for_user(
     now: DateTime<Utc>,
 ) -> Result<u64, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    if !try_recipient_lock(&mut tx, user_id).await? {
+    let delivered = deliver_deferred_batch(&mut tx, user_id, now, true).await?;
+    tx.commit().await?;
+    Ok(delivered)
+}
+
+/// Собрать одно сводное сообщение на получателя из отложенных доставок.
+///
+/// Сборка и смена статусов выполняются в одной транзакции, а строки
+/// блокируются `FOR UPDATE SKIP LOCKED`, поэтому два экземпляра планировщика не
+/// отправят батч дважды. При `due_only` одна оставшаяся доставка не
+/// отправляется здесь: её доставит обычный путь. Ручной выпуск (`due_only =
+/// false`) доставляет единственную запись сразу, не дожидаясь её
+/// зафиксированного времени.
+pub(crate) async fn deliver_deferred_batch(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+    now: DateTime<Utc>,
+    due_only: bool,
+) -> Result<u64, sqlx::Error> {
+    if !try_recipient_lock(&mut *conn, user_id).await? {
         return Ok(0);
     }
-    let rows: Vec<NoticeRow> = sqlx::query_as(&batch_row_sql())
+    let rows: Vec<NoticeRow> = sqlx::query_as(&deferred_row_sql(due_only))
         .bind(user_id)
         .bind(now)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *conn)
         .await?;
 
     let mut identity: Option<BatchIdentity> = None;
     let mut candidates = Vec::new();
     for row in rows {
         if row.is_stale(now) {
-            mark_cancelled(&mut tx, row.id, now).await?;
+            mark_cancelled(&mut *conn, row.id, now).await?;
             continue;
         }
         // Границы могли сдвинуть после переноса: в момент выпуска тихие часы
         // проверяются ещё раз и доставка снова фиксируется на их конце.
         if let Some(settings) = row.recipient_settings.as_ref()
-            && postpone_for_quiet(&mut tx, row.id, settings, row.timezone(), now).await?
+            && postpone_for_quiet(&mut *conn, row.id, settings, row.timezone(), now).await?
         {
             continue;
         }
         let (Some(item_id), Some(chat_id), Some(telegram_user_id)) =
             (row.item_id, row.telegram_chat_id, row.telegram_user_id)
         else {
-            mark_cancelled(&mut tx, row.id, now).await?;
+            mark_cancelled(&mut *conn, row.id, now).await?;
             continue;
         };
-        let item = match items::get(&mut tx, row.household_id, item_id).await {
+        let item = match items::get(&mut *conn, row.household_id, item_id).await {
             Ok(item) => item,
             Err(DomainError::Database(error)) => return Err(error),
             Err(_) => {
-                mark_cancelled(&mut tx, row.id, now).await?;
+                mark_cancelled(&mut *conn, row.id, now).await?;
                 continue;
             }
         };
-        let list = match lists::get(&mut tx, row.household_id, item.list_id).await {
+        let list = match lists::get(&mut *conn, row.household_id, item.list_id).await {
             Ok(list) => list,
             Err(DomainError::Database(error)) => return Err(error),
             Err(_) => {
-                mark_cancelled(&mut tx, row.id, now).await?;
+                mark_cancelled(&mut *conn, row.id, now).await?;
                 continue;
             }
-        };
-        let Some(kind) = notify::BatchKind::from_kind(row.kind) else {
-            mark_cancelled(&mut tx, row.id, now).await?;
-            continue;
         };
         if identity.is_none() {
             identity = Some(BatchIdentity {
@@ -768,9 +791,15 @@ async fn deliver_batch_for_user(
             scheduled_at: row.scheduled_at,
             entry: notify::BatchEntry {
                 item_id,
-                kind,
+                kind: row.kind,
                 title: item.title.clone(),
-                when: batch_when(&item, &list, row.timezone(), now),
+                when: notify::when_line(
+                    item.due_at,
+                    item.due_date,
+                    &list.name,
+                    row.timezone(),
+                    now,
+                ),
                 version: item.version,
                 state: notify::BatchEntryState::Open,
             },
@@ -778,11 +807,15 @@ async fn deliver_batch_for_user(
     }
 
     if candidates.len() < 2 {
-        tx.commit().await?;
+        // Ручной выпуск одного уведомления: обычное сообщение сразу, а не в
+        // зафиксированное время.
+        if candidates.len() == 1 && !due_only {
+            let candidate = candidates.pop().expect("one candidate");
+            return deliver_single_deferred(conn, &candidate, user_id, now).await;
+        }
         return Ok(0);
     }
     let Some(identity) = identity else {
-        tx.commit().await?;
         return Ok(0);
     };
     candidates.sort_by_key(|candidate| (candidate.scheduled_at, candidate.delivery_id));
@@ -793,7 +826,7 @@ async fn deliver_batch_for_user(
 
     let batch_id = Uuid::now_v7();
     notifications::create_batch(
-        &mut tx,
+        &mut *conn,
         batch_id,
         identity.household_id,
         user_id,
@@ -804,7 +837,7 @@ async fn deliver_batch_for_user(
     let page = &entries[..entries.len().min(notify::BATCH_PAGE_SIZE)];
     let ui = notify::batch_ui(batch_id, 0, page, entries.len(), None, identity.timezone);
     let html = notify::render_notice(
-        &mut tx,
+        &mut *conn,
         identity.telegram_user_id,
         identity.household_id,
         &ui,
@@ -812,10 +845,10 @@ async fn deliver_batch_for_user(
     )
     .await?;
     let dedupe_key = format!("notification:batch:{batch_id}");
-    let seq = enqueue_message(&mut tx, identity.chat_id, &dedupe_key, html, true, now).await?;
+    let seq = enqueue_message(&mut *conn, identity.chat_id, &dedupe_key, html, true, now).await?;
     for candidate in candidates {
         mark_batch_sent(
-            &mut tx,
+            &mut *conn,
             candidate.delivery_id,
             seq,
             batch_id,
@@ -825,20 +858,92 @@ async fn deliver_batch_for_user(
         .await?;
     }
 
-    tx.commit().await?;
     Ok(1)
 }
 
-fn batch_when(
-    item: &crate::domain::models::Item,
-    list: &crate::domain::models::List,
-    timezone: Tz,
+/// Доставить единственную отложенную запись обычным сообщением.
+async fn deliver_single_deferred(
+    conn: &mut PgConnection,
+    candidate: &BatchCandidate,
+    user_id: Uuid,
     now: DateTime<Utc>,
-) -> String {
-    match ru::due_label(item.due_at, item.due_date, timezone, now) {
-        Some(due) => format!("{} · {}", ru::capitalize(&due), list.name),
-        None => list.name.clone(),
+) -> Result<u64, sqlx::Error> {
+    match candidate.entry.kind {
+        NotificationKind::Reminder | NotificationKind::Snooze => {
+            deliver_one_in_conn(conn, candidate.delivery_id, user_id, now, false).await
+        }
+        NotificationKind::Assignment => {
+            assignment::deliver_one_in_conn(conn, candidate.delivery_id, user_id, now, false).await
+        }
+        NotificationKind::Digest => Ok(0),
     }
+}
+
+/// Число актуальных отложенных уведомлений получателя без утренней сводки.
+///
+/// Используется для баннера ручного выпуска; сводка приходит отдельным
+/// сообщением и в счётчик не входит.
+pub(crate) async fn deferred_notice_count(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
+    let sql = format!(
+        "SELECT {NOTICE_ROW_COLUMNS}
+         {NOTICE_ROW_FROM}
+         WHERE d.user_id = $1 AND d.status = 'pending' AND d.deferred
+           AND d.kind IN ('reminder', 'snooze', 'assignment')
+         ORDER BY d.scheduled_at, d.id"
+    );
+    let rows: Vec<NoticeRow> = sqlx::query_as(&sql)
+        .bind(user_id)
+        .fetch_all(&mut *conn)
+        .await?;
+    Ok(rows
+        .iter()
+        .filter(|row| !row.is_stale(now))
+        .count()
+        .try_into()
+        .unwrap_or(u64::MAX))
+}
+
+/// Перенести все отложенные записи получателя на конец нового интервала.
+///
+/// Вызывается после правки тихих часов, если сейчас по новым настройкам
+/// по-прежнему тихо: выпускать нечего, но старое зафиксированное время больше
+/// не соответствует новому интервалу.
+pub(crate) async fn postpone_deferred_for_user(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+    end: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query(
+        "UPDATE notification_deliveries
+         SET scheduled_at = $2, deferred = true, updated_at = $3
+         WHERE user_id = $1 AND status = 'pending' AND deferred
+           AND scheduled_at <> $2",
+    )
+    .bind(user_id)
+    .bind(end)
+    .bind(now)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected())
+}
+
+/// Немедленно выпустить все отложенные уведомления получателя.
+///
+/// Вызывается из обработчика настроек в его транзакции. Сводка уходит
+/// отдельным сообщением после сводного.
+pub(crate) async fn release_deferred_for_user(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
+    let mut delivered = deliver_deferred_batch(&mut *conn, user_id, now, false).await?;
+    delivered += digest::release_deferred(&mut *conn, user_id, now).await?;
+    Ok(delivered)
 }
 
 /// Пометить доставку переданной в outbox вместе со сводным сообщением.
@@ -908,23 +1013,45 @@ async fn deliver_one(
     now: DateTime<Utc>,
 ) -> Result<u64, sqlx::Error> {
     let mut tx = pool.begin().await?;
+    let delivered = deliver_one_in_conn(&mut tx, id, user_id, now, true).await?;
+    tx.commit().await?;
+    Ok(delivered)
+}
+
+/// Доставить одно напоминание в уже открытой транзакции.
+///
+/// `due_only = false` используется ручным выпуском: запись забирается сразу,
+/// не дожидаясь зафиксированного времени. Запись блокируется `FOR UPDATE SKIP
+/// LOCKED`, поэтому два экземпляра планировщика не обработают её одновременно.
+pub(crate) async fn deliver_one_in_conn(
+    conn: &mut PgConnection,
+    id: Uuid,
+    user_id: Uuid,
+    now: DateTime<Utc>,
+    due_only: bool,
+) -> Result<u64, sqlx::Error> {
     // Тот же получатель не должен одновременно собираться в сводное другим
     // экземпляром планировщика.
-    if !try_recipient_lock(&mut tx, user_id).await? {
+    if !try_recipient_lock(&mut *conn, user_id).await? {
         return Ok(0);
     }
+    let due = if due_only {
+        "AND d.scheduled_at <= $2"
+    } else {
+        ""
+    };
     let sql = format!(
         "SELECT {NOTICE_ROW_COLUMNS}
          {NOTICE_ROW_FROM}
          WHERE d.id = $1 AND d.status = 'pending'
            AND d.kind IN ('reminder', 'snooze')
-           AND d.scheduled_at <= $2
+           {due}
          FOR UPDATE OF d SKIP LOCKED"
     );
     let row: Option<NoticeRow> = sqlx::query_as(&sql)
         .bind(id)
         .bind(now)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut *conn)
         .await?;
 
     let Some(row) = row else {
@@ -932,17 +1059,15 @@ async fn deliver_one(
     };
 
     if row.is_stale(now) {
-        mark_cancelled(&mut tx, row.id, now).await?;
-        tx.commit().await?;
+        mark_cancelled(&mut *conn, row.id, now).await?;
         return Ok(0);
     }
     let timezone = row.timezone();
     // Проверка под блокировкой закрывает гонку с другим экземпляром
     // планировщика: даже «сброшенная» запись не уйдёт внутри тихих часов.
     if let Some(settings) = row.recipient_settings.as_ref()
-        && postpone_for_quiet(&mut tx, row.id, settings, timezone, now).await?
+        && postpone_for_quiet(&mut *conn, row.id, settings, timezone, now).await?
     {
-        tx.commit().await?;
         return Ok(0);
     }
 
@@ -951,25 +1076,22 @@ async fn deliver_one(
     let (Some(chat_id), Some(telegram_user_id), Some(item_id)) =
         (row.telegram_chat_id, row.telegram_user_id, row.item_id)
     else {
-        mark_cancelled(&mut tx, row.id, now).await?;
-        tx.commit().await?;
+        mark_cancelled(&mut *conn, row.id, now).await?;
         return Ok(0);
     };
-    let item = match items::get(&mut tx, row.household_id, item_id).await {
+    let item = match items::get(&mut *conn, row.household_id, item_id).await {
         Ok(item) => item,
         Err(DomainError::Database(error)) => return Err(error),
         Err(_) => {
-            mark_cancelled(&mut tx, row.id, now).await?;
-            tx.commit().await?;
+            mark_cancelled(&mut *conn, row.id, now).await?;
             return Ok(0);
         }
     };
-    let list = match lists::get(&mut tx, row.household_id, item.list_id).await {
+    let list = match lists::get(&mut *conn, row.household_id, item.list_id).await {
         Ok(list) => list,
         Err(DomainError::Database(error)) => return Err(error),
         Err(_) => {
-            mark_cancelled(&mut tx, row.id, now).await?;
-            tx.commit().await?;
+            mark_cancelled(&mut *conn, row.id, now).await?;
             return Ok(0);
         }
     };
@@ -986,13 +1108,13 @@ async fn deliver_one(
         })
     };
     let ui = notify::reminder_ui(&item, &list, timezone, now, lead_minutes);
-    let html = notify::render_notice(&mut tx, telegram_user_id, row.household_id, &ui, now).await?;
+    let html =
+        notify::render_notice(&mut *conn, telegram_user_id, row.household_id, &ui, now).await?;
     let dedupe_key = delivery_dedupe_key(row.id, row.kind);
 
-    let seq = enqueue_message(&mut tx, chat_id, &dedupe_key, html, true, now).await?;
-    mark_sent(&mut tx, row.id, seq, now).await?;
+    let seq = enqueue_message(&mut *conn, chat_id, &dedupe_key, html, true, now).await?;
+    mark_sent(&mut *conn, row.id, seq, now).await?;
 
-    tx.commit().await?;
     Ok(1)
 }
 

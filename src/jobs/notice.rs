@@ -12,13 +12,14 @@ use sqlx::FromRow;
 use uuid::Uuid;
 
 use super::scheduler::{all_day_occurrence_key, occurrence_key, resolved_timezone};
+use crate::domain::models::ItemStatus;
 use crate::domain::settings::NotificationSettings;
 use crate::storage::repositories::notifications::NotificationKind;
 
 /// Колонки записи доставки и связанных строк для [`NoticeRow`].
 pub(crate) const NOTICE_ROW_COLUMNS: &str = "d.id, d.household_id, d.user_id, d.kind,
         d.occurrence_key, d.scheduled_at, d.deferred,
-        i.id AS item_id, i.title AS item_title, i.status::text AS item_status,
+        i.id AS item_id, i.title AS item_title, i.status AS item_status,
         i.deleted_at AS item_deleted_at, i.due_at AS item_due_at,
         i.due_date AS item_due_date,
         i.assignee_user_id AS item_assignee_user_id,
@@ -50,7 +51,7 @@ pub(crate) struct NoticeRow {
     pub deferred: bool,
     pub item_id: Option<Uuid>,
     pub item_title: Option<String>,
-    pub item_status: Option<String>,
+    pub item_status: Option<ItemStatus>,
     pub item_deleted_at: Option<DateTime<Utc>>,
     pub item_due_at: Option<DateTime<Utc>>,
     pub item_due_date: Option<NaiveDate>,
@@ -107,7 +108,7 @@ impl NoticeRow {
     fn item_alive(&self) -> bool {
         self.item_id.is_some()
             && self.item_deleted_at.is_none()
-            && self.item_status.as_deref() == Some("open")
+            && self.item_status == Some(ItemStatus::Open)
             && self.item_title.is_some()
     }
 

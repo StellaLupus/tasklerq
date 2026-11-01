@@ -6,13 +6,18 @@ mod support;
 // и в общей базе параллельный тест успевал удалить строки соседа раньше, чем
 // тот читал статистику.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration as StdDuration;
+
 use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
 use tasklerq::app::build_application;
 use tasklerq::config::{Config, RetentionConfig};
 use tasklerq::domain::models::ListKind;
-use tasklerq::jobs::retention::{self, RetentionWorker};
+use tasklerq::jobs::retention::{self, RetentionStats, RetentionWorker};
 use tasklerq::storage::repositories::{items, lists};
+use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
 fn config() -> RetentionConfig {
@@ -743,4 +748,97 @@ async fn build_application_starts_retention_without_telegram() {
             .expect("retention must stop on shutdown")
             .expect("retention task must join");
     }
+}
+
+async fn insert_expired_draft(pool: &PgPool, household_id: Uuid) -> Uuid {
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO capture_drafts (
+             id, household_id, source, mode, raw_text, status, created_at, expires_at
+         )
+         VALUES ($1, $2, 'api', 'auto', 'просроченный черновик', 'pending', $3, $3)",
+    )
+    .bind(id)
+    .bind(household_id)
+    .bind(Utc::now() - Duration::hours(1))
+    .execute(pool)
+    .await
+    .expect("draft");
+    id
+}
+
+async fn wait_for_draft_status(pool: &PgPool, id: Uuid, wanted: &str) {
+    for _ in 0..200 {
+        let status: String =
+            sqlx::query_scalar("SELECT status::text FROM capture_drafts WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("draft status");
+        if status == wanted {
+            return;
+        }
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+    }
+    panic!("draft {id} did not become {wanted}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_worker_repeats_on_the_configured_interval() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let worker = RetentionWorker::new(db.pool.clone(), config())
+        .with_timing(StdDuration::ZERO, StdDuration::from_millis(50));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = tokio::spawn(worker.run(shutdown_rx));
+
+    let first = insert_expired_draft(&db.pool, household.household_id).await;
+    wait_for_draft_status(&db.pool, first, "expired").await;
+
+    // Второй прогон через настроенный интервал, без ожидания суток.
+    let second = insert_expired_draft(&db.pool, household.household_id).await;
+    wait_for_draft_status(&db.pool, second, "expired").await;
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    tokio::time::timeout(StdDuration::from_secs(5), handle)
+        .await
+        .expect("worker must stop on shutdown")
+        .expect("worker task must join");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_worker_survives_a_failed_and_a_panicked_run() {
+    let db = support::isolated_db().await;
+    let worker = RetentionWorker::new(db.pool.clone(), config())
+        .with_timing(StdDuration::ZERO, StdDuration::from_millis(20));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let runs = Arc::new(AtomicUsize::new(0));
+    let (done_tx, mut done_rx) = mpsc::channel(1);
+    let counter = runs.clone();
+    let handle = tokio::spawn(worker.run_with(shutdown_rx, move |_now| {
+        let run = counter.fetch_add(1, Ordering::SeqCst);
+        let done_tx = done_tx.clone();
+        async move {
+            match run {
+                0 => panic!("the first run panics"),
+                1 => Err(sqlx::Error::Protocol("the second run fails".into())),
+                _ => {
+                    let _ = done_tx.send(()).await;
+                    Ok(Some(RetentionStats::default()))
+                }
+            }
+        }
+    }));
+
+    tokio::time::timeout(StdDuration::from_secs(5), done_rx.recv())
+        .await
+        .expect("the cycle must survive an error and a panic")
+        .expect("the third run must signal");
+    assert!(runs.load(Ordering::SeqCst) >= 3);
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    tokio::time::timeout(StdDuration::from_secs(5), handle)
+        .await
+        .expect("worker must stop on shutdown")
+        .expect("worker task must join");
 }

@@ -13,6 +13,7 @@ use support::TestHousehold;
 use support::telegram::{Harness, buttons};
 use tasklerq::config::RetentionConfig;
 use tasklerq::domain::models::{Actor, Item, RecurrenceFreq, RecurrenceInput, UserRole};
+use tasklerq::jobs::digest::digest_occurrence_key;
 use tasklerq::jobs::retention;
 use tasklerq::jobs::scheduler::{Scheduler, TickStats};
 use tasklerq::storage::repositories::items;
@@ -161,6 +162,35 @@ async fn insert_delivery(
     id
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn insert_digest_delivery(
+    pool: &PgPool,
+    household_id: Uuid,
+    user_id: Uuid,
+    key: &str,
+    scheduled_at: DateTime<Utc>,
+    deferred: bool,
+) -> Uuid {
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO notification_deliveries (
+             id, household_id, user_id, item_id, occurrence_key, kind,
+             status, scheduled_at, deferred, created_at, updated_at
+         )
+         VALUES ($1, $2, $3, NULL, $4, 'digest', 'pending', $5, $6, $5, $5)",
+    )
+    .bind(id)
+    .bind(household_id)
+    .bind(user_id)
+    .bind(key)
+    .bind(scheduled_at)
+    .bind(deferred)
+    .execute(pool)
+    .await
+    .expect("digest delivery");
+    id
+}
+
 async fn deferred_reminder(
     pool: &PgPool,
     household: &TestHousehold,
@@ -183,11 +213,15 @@ async fn deferred_reminder(
 }
 
 async fn outbox_messages(pool: &PgPool, chat: i64) -> Vec<String> {
-    sqlx::query_scalar("SELECT payload->>'html' FROM outbox WHERE chat_id = $1 ORDER BY seq")
-        .bind(chat)
-        .fetch_all(pool)
-        .await
-        .expect("outbox")
+    sqlx::query_scalar(
+        "SELECT payload->>'html' FROM outbox
+         WHERE chat_id = $1 AND payload ? 'html'
+         ORDER BY seq",
+    )
+    .bind(chat)
+    .fetch_all(pool)
+    .await
+    .expect("outbox")
 }
 
 async fn tick_and_deliver(bot: &mut Harness, pool: &PgPool, at: DateTime<Utc>) -> TickStats {
@@ -804,7 +838,14 @@ async fn snooze_in_a_block_creates_one_delivery_and_an_ordinary_reminder_later()
 
     bot.press_data(&snooze, message_id).await;
     let (_, edited) = bot.latest();
-    assert!(edited.contains("😴 Напомню в "), "{edited}");
+    let expected = (pressed_at + Duration::hours(1))
+        .with_timezone(&moscow)
+        .format("%H:%M")
+        .to_string();
+    assert!(
+        edited.contains(&format!("😴 Напомню в {expected}")),
+        "{edited}"
+    );
     let rows = snooze_rows(&db.pool, first.id).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].0, "pending");
@@ -960,7 +1001,14 @@ async fn changed_task_block_is_redrawn_and_the_old_version_only_refreshes_it() {
     assert_eq!(due_at, Some(changed_due));
     let (_, edited) = bot.latest();
     assert!(edited.contains("Первая (новая)"), "{edited}");
-    assert!(!edited.contains("Задача уже изменилась"), "{edited}");
+    let toast = bot
+        .fake
+        .answers()
+        .last()
+        .expect("callback answer")
+        .1
+        .clone();
+    assert_eq!(toast.as_deref(), Some("Задача уже изменилась"));
     let done_buttons: Vec<String> = buttons(&edited)
         .into_iter()
         .filter(|(label, _)| label.contains("Готово"))
@@ -1161,4 +1209,513 @@ async fn retention_purges_old_batches_without_pending_deliveries() {
     assert!(!left.contains(&old_sent));
     assert!(left.contains(&old_pending));
     assert!(left.contains(&recent_sent));
+}
+
+async fn open_notifications(bot: &mut Harness) {
+    bot.press("Настройки").await;
+    bot.press("Уведомления").await;
+}
+
+async fn quiet_settings(pool: &PgPool, user_id: Uuid, digest: bool) {
+    set_notifications(
+        pool,
+        user_id,
+        json!({
+            "digest_enabled": digest,
+            "digest_time": "08:00",
+            "quiet_hours_enabled": true,
+            "quiet_start": "22:00",
+            "quiet_end": "08:00"
+        }),
+    )
+    .await;
+}
+
+fn local_today(bot: &Harness, timezone: Tz) -> NaiveDate {
+    bot.now.with_timezone(&timezone).date_naive()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recipient_advisory_lock_blocks_the_tick_until_released() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = day();
+    set_notifications(
+        &db.pool,
+        household.owner_id,
+        json!({"digest_enabled": false, "quiet_hours_enabled": false}),
+    )
+    .await;
+    let due = local_utc(moscow, day, 9, 0);
+    let release_at = local_utc(moscow, day, 8, 0);
+    for title in ["Первая", "Вторая"] {
+        let item = create_task(&db.pool, &household, title, due, None).await;
+        deferred_reminder(&db.pool, &household, item.id, due, release_at).await;
+    }
+    let chat = sqlx::query_scalar("SELECT telegram_chat_id FROM users WHERE id = $1")
+        .bind(household.owner_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("chat");
+
+    // Ключ совпадает с `scheduler::try_recipient_lock`: последние 8 байт UUID.
+    let key = i64::from_be_bytes(
+        household.owner_id.as_bytes()[8..]
+            .try_into()
+            .expect("eight bytes"),
+    );
+    let mut holder = db.pool.acquire().await.expect("holder connection");
+    let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(key)
+        .fetch_one(&mut *holder)
+        .await
+        .expect("lock");
+    assert!(locked);
+
+    assert_eq!(
+        scheduler(&db.pool)
+            .tick(release_at)
+            .await
+            .expect("locked tick")
+            .delivered,
+        0
+    );
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM notification_deliveries WHERE status = 'pending' AND deferred",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("pending");
+    assert_eq!(pending, 2);
+    assert!(outbox_messages(&db.pool, chat).await.is_empty());
+
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(key)
+        .execute(&mut *holder)
+        .await
+        .expect("unlock");
+    assert_eq!(
+        scheduler(&db.pool)
+            .tick(release_at)
+            .await
+            .expect("released tick")
+            .delivered,
+        1
+    );
+    let sent = outbox_messages(&db.pool, chat).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(sent[0].contains("Пока были тихие часы"), "{sent:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabling_quiet_hours_releases_three_notifications_and_the_digest() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    let at = local_utc(moscow, day, 6, 0);
+    bot.advance(at - bot.now);
+    quiet_settings(&db.pool, household.owner_id, true).await;
+
+    let due = local_utc(moscow, day, 9, 0);
+    let release_at = local_utc(moscow, day, 8, 0);
+    for title in ["Первая", "Вторая", "Третья"] {
+        let item = create_task(&db.pool, &household, title, due, None).await;
+        deferred_reminder(&db.pool, &household, item.id, due, release_at).await;
+    }
+    insert_digest_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        &digest_occurrence_key(day),
+        release_at,
+        true,
+    )
+    .await;
+
+    open_notifications(&mut bot).await;
+    bot.press("Тихие часы: вкл").await;
+
+    let screen = bot.screen();
+    assert!(screen.contains("Тихие часы выключены"), "{screen}");
+    assert!(screen.contains("Накопилось 3 уведомления"), "{screen}");
+
+    let messages = bot.fake.messages(bot.chat);
+    let (batch_id, batch) = messages
+        .iter()
+        .find(|(_, html)| html.contains("Пока были тихие часы"))
+        .expect("batch message");
+    assert_eq!(block_count(batch, "⏰ напоминание"), 3, "{batch}");
+    let (digest_id, _digest) = messages
+        .iter()
+        .find(|(_, html)| html.contains("Доброе утро"))
+        .expect("digest message");
+    assert!(*batch_id < *digest_id, "digest comes after the batch");
+
+    let sent_before = bot.fake.sent().len();
+    let stats = tick_and_deliver(&mut bot, &db.pool, release_at).await;
+    assert_eq!(stats.delivered, 0, "{stats:?}");
+    assert_eq!(
+        bot.fake.sent().len(),
+        sent_before,
+        "nothing else should be sent at the fixed release time"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_deferred_notification_is_released_as_an_ordinary_message() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    let at = local_utc(moscow, day, 6, 0);
+    bot.advance(at - bot.now);
+    quiet_settings(&db.pool, household.owner_id, false).await;
+
+    let due = local_utc(moscow, day, 9, 0);
+    let release_at = local_utc(moscow, day, 8, 0);
+    let item = create_task(&db.pool, &household, "Одно напоминание", due, None).await;
+    deferred_reminder(&db.pool, &household, item.id, due, release_at).await;
+
+    open_notifications(&mut bot).await;
+    bot.press("Тихие часы: вкл").await;
+
+    let screen = bot.screen();
+    assert!(screen.contains("Накопилось 1 уведомление"), "{screen}");
+    let (_, notice) = bot.latest();
+    assert!(notice.contains("Одно напоминание"), "{notice}");
+    assert!(!notice.contains("Пока были тихие часы"), "{notice}");
+    let labels: Vec<String> = buttons(&notice)
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect();
+    for label in ["Готово", "Отложить на час", "Открыть"] {
+        assert!(
+            labels.iter().any(|item| item.contains(label)),
+            "{label}: {labels:?}"
+        );
+    }
+
+    // Повторное включение и выключение не присылает ничего.
+    let sent_after_release = bot.fake.sent().len();
+    bot.press("Тихие часы: выкл").await;
+    bot.press("Тихие часы: вкл").await;
+    assert_eq!(bot.fake.sent().len(), sent_after_release);
+    assert!(!bot.screen().contains("Накопилось"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabling_quiet_hours_with_nothing_deferred_sends_no_notice() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    let at = local_utc(moscow, day, 6, 0);
+    bot.advance(at - bot.now);
+    quiet_settings(&db.pool, household.owner_id, false).await;
+
+    open_notifications(&mut bot).await;
+    let sent_before = bot.fake.sent().len();
+    bot.press("Тихие часы: вкл").await;
+
+    assert!(!bot.screen().contains("Накопилось"));
+    assert_eq!(bot.fake.sent().len(), sent_before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moving_quiet_end_earlier_releases_deferred_immediately() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    let at = local_utc(moscow, day, 6, 0);
+    bot.advance(at - bot.now);
+    quiet_settings(&db.pool, household.owner_id, false).await;
+
+    let due = local_utc(moscow, day, 9, 0);
+    let release_at = local_utc(moscow, day, 8, 0);
+    for title in ["Первая", "Вторая"] {
+        let item = create_task(&db.pool, &household, title, due, None).await;
+        deferred_reminder(&db.pool, &household, item.id, due, release_at).await;
+    }
+
+    open_notifications(&mut bot).await;
+    bot.press("Конец тихих").await;
+    bot.text("05:00").await;
+
+    let screen = bot.screen();
+    assert!(screen.contains("Тихие часы: 22:00–05:00"), "{screen}");
+    assert!(screen.contains("Накопилось 2 уведомления"), "{screen}");
+    let messages = bot.fake.messages(bot.chat);
+    let batch = messages
+        .iter()
+        .find(|(_, html)| html.contains("Пока были тихие часы"))
+        .expect("batch message");
+    assert_eq!(block_count(&batch.1, "⏰ напоминание"), 2, "{}", batch.1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moving_quiet_end_later_keeps_deferred_until_the_new_end() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    let at = local_utc(moscow, day, 6, 0);
+    bot.advance(at - bot.now);
+    quiet_settings(&db.pool, household.owner_id, false).await;
+
+    let due = local_utc(moscow, day, 10, 0);
+    let release_at = local_utc(moscow, day, 8, 0);
+    for title in ["Первая", "Вторая"] {
+        let item = create_task(&db.pool, &household, title, due, None).await;
+        deferred_reminder(&db.pool, &household, item.id, due, release_at).await;
+    }
+
+    open_notifications(&mut bot).await;
+    let sent_before = bot.fake.sent().len();
+    bot.press("Конец тихих").await;
+    bot.text("09:00").await;
+
+    assert!(!bot.screen().contains("Накопилось"));
+    assert_eq!(bot.fake.sent().len(), sent_before);
+    let scheduled: Vec<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT scheduled_at FROM notification_deliveries
+         WHERE status = 'pending' AND deferred ORDER BY scheduled_at",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("scheduled");
+    assert!(
+        scheduled
+            .iter()
+            .all(|at| *at == local_utc(moscow, day, 9, 0)),
+        "{scheduled:?}"
+    );
+
+    assert_eq!(
+        tick_and_deliver(&mut bot, &db.pool, local_utc(moscow, day, 8, 0))
+            .await
+            .delivered,
+        0
+    );
+    assert_eq!(
+        tick_and_deliver(&mut bot, &db.pool, local_utc(moscow, day, 9, 0))
+            .await
+            .delivered,
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timezone_change_that_leaves_quiet_hours_releases_deferred() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    let at = local_utc(moscow, day, 6, 0);
+    bot.advance(at - bot.now);
+    quiet_settings(&db.pool, household.owner_id, false).await;
+
+    let due = local_utc(moscow, day, 9, 0);
+    let release_at = local_utc(moscow, day, 8, 0);
+    for title in ["Первая", "Вторая"] {
+        let item = create_task(&db.pool, &household, title, due, None).await;
+        deferred_reminder(&db.pool, &household, item.id, due, release_at).await;
+    }
+
+    bot.press("Настройки").await;
+    bot.press("Время").await;
+    // 06:00 в Москве — 13:00 во Владивостоке: по новым настройкам уже не тихо.
+    bot.press("Asia/Vladivostok").await;
+
+    let screen = bot.screen();
+    assert!(screen.contains("Часовой пояс обновлён"), "{screen}");
+    assert!(screen.contains("Накопилось 2 уведомления"), "{screen}");
+    let messages = bot.fake.messages(bot.chat);
+    let batch = messages
+        .iter()
+        .find(|(_, html)| html.contains("Пока были тихие часы"))
+        .expect("batch message");
+    assert_eq!(block_count(&batch.1, "⏰ напоминание"), 2, "{}", batch.1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_release_does_not_touch_another_participant() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    let at = local_utc(moscow, day, 6, 0);
+    bot.advance(at - bot.now);
+    quiet_settings(&db.pool, household.owner_id, false).await;
+
+    let extra_id = Uuid::now_v7();
+    let extra_chat = support::next_telegram_id();
+    sqlx::query(
+        "INSERT INTO users (
+             id, household_id, telegram_user_id, telegram_chat_id, display_name,
+             role, settings, created_at, updated_at
+         )
+         VALUES ($1, $2, $3, $3, 'Второй', 'member', '{}'::jsonb, now(), now())",
+    )
+    .bind(extra_id)
+    .bind(household.household_id)
+    .bind(extra_chat)
+    .execute(&db.pool)
+    .await
+    .expect("extra member");
+
+    let due = local_utc(moscow, day, 9, 0);
+    let release_at = local_utc(moscow, day, 8, 0);
+    let owner_item = create_task(&db.pool, &household, "Владельца", due, None).await;
+    let extra_item = create_task(&db.pool, &household, "Второго", due, None).await;
+    deferred_reminder(&db.pool, &household, owner_item.id, due, release_at).await;
+    insert_delivery(
+        &db.pool,
+        household.household_id,
+        extra_id,
+        extra_item.id,
+        "reminder",
+        &tasklerq::jobs::scheduler::occurrence_key(due),
+        release_at,
+        true,
+    )
+    .await;
+
+    open_notifications(&mut bot).await;
+    bot.press("Тихие часы: вкл").await;
+
+    assert!(bot.screen().contains("Накопилось 1 уведомление"));
+    assert!(
+        outbox_messages(&db.pool, extra_chat).await.is_empty(),
+        "another participant must keep their deferred notification"
+    );
+    let extra_pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM notification_deliveries
+         WHERE user_id = $1 AND status = 'pending' AND deferred",
+    )
+    .bind(extra_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("extra pending");
+    assert_eq!(extra_pending, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_release_skips_while_the_scheduler_holds_the_recipient_lock() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    let at = local_utc(moscow, day, 6, 0);
+    bot.advance(at - bot.now);
+    quiet_settings(&db.pool, household.owner_id, false).await;
+
+    let due = local_utc(moscow, day, 9, 0);
+    let release_at = local_utc(moscow, day, 8, 0);
+    for title in ["Первая", "Вторая"] {
+        let item = create_task(&db.pool, &household, title, due, None).await;
+        deferred_reminder(&db.pool, &household, item.id, due, release_at).await;
+    }
+
+    let key = i64::from_be_bytes(
+        household.owner_id.as_bytes()[8..]
+            .try_into()
+            .expect("eight bytes"),
+    );
+    let mut holder = db.pool.acquire().await.expect("holder connection");
+    let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(key)
+        .fetch_one(&mut *holder)
+        .await
+        .expect("lock");
+    assert!(locked);
+
+    open_notifications(&mut bot).await;
+    let sent_before = bot.fake.sent().len();
+    bot.press("Тихие часы: вкл").await;
+    assert!(!bot.screen().contains("Накопилось"));
+    assert_eq!(bot.fake.sent().len(), sent_before);
+
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(key)
+        .execute(&mut *holder)
+        .await
+        .expect("unlock");
+    assert_eq!(
+        tick_and_deliver(&mut bot, &db.pool, release_at)
+            .await
+            .delivered,
+        1
+    );
+    let messages = bot.fake.messages(bot.chat);
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|(_, html)| html.contains("Пока были тихие часы"))
+            .count(),
+        1,
+        "the scheduler sends exactly one batch"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn assignment_from_an_archived_list_keeps_its_actions_in_a_block() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = bot.now.with_timezone(&moscow).date_naive();
+    let morning = local_utc(moscow, day, 8, 0);
+    let due = local_utc(moscow, day, 9, 0);
+    let first = create_task(&db.pool, &household, "Первая", due, None).await;
+    let second = create_task(&db.pool, &household, "Вторая", due, None).await;
+    for (index, item) in [&first, &second].into_iter().enumerate() {
+        insert_delivery(
+            &db.pool,
+            household.household_id,
+            household.owner_id,
+            item.id,
+            "assignment",
+            &format!("assignment:archived:{index}"),
+            morning,
+            true,
+        )
+        .await;
+    }
+    sqlx::query("UPDATE lists SET is_default = false, is_archived = true WHERE id = $1")
+        .bind(household.tasks_list_id)
+        .execute(&db.pool)
+        .await
+        .expect("archive list");
+
+    tick_and_deliver(&mut bot, &db.pool, morning).await;
+    let (message_id, html) = bot.latest();
+    assert!(html.contains("Пока были тихие часы"), "{html}");
+    assert!(!html.contains("Список в архиве"), "{html}");
+    assert_eq!(block_count(&html, "👤 назначение"), 2, "{html}");
+
+    let done = button_of(&html, "Готово");
+    bot.press_data(&done, message_id).await;
+    assert_eq!(item_status(&db.pool, first.id).await.0, "done");
+
+    let (_, edited) = bot.latest();
+    let opens: Vec<String> = buttons(&edited)
+        .into_iter()
+        .filter(|(label, _)| label.contains("Открыть"))
+        .map(|(_, data)| data)
+        .collect();
+    assert_eq!(opens.len(), 1, "{edited}");
+    bot.press_data(&opens[0], message_id).await;
+    bot.assert_screen_contains("Вторая");
 }

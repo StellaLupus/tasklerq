@@ -6,7 +6,7 @@
 //! только проверяет актуальность и передаёт сообщение в outbox.
 
 use chrono::{DateTime, Utc};
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::notice::{NOTICE_ROW_COLUMNS, NOTICE_ROW_FROM, NoticeRow};
@@ -126,74 +126,89 @@ async fn deliver_one(
     now: DateTime<Utc>,
 ) -> Result<u64, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    if !try_recipient_lock(&mut tx, user_id).await? {
+    let delivered = deliver_one_in_conn(&mut tx, id, user_id, now, true).await?;
+    tx.commit().await?;
+    Ok(delivered)
+}
+
+/// Доставить одно уведомление о назначении в уже открытой транзакции.
+///
+/// `due_only = false` используется ручным выпуском: запись забирается сразу,
+/// не дожидаясь зафиксированного времени.
+pub(crate) async fn deliver_one_in_conn(
+    conn: &mut PgConnection,
+    id: Uuid,
+    user_id: Uuid,
+    now: DateTime<Utc>,
+    due_only: bool,
+) -> Result<u64, sqlx::Error> {
+    if !try_recipient_lock(&mut *conn, user_id).await? {
         return Ok(0);
     }
+    let due = if due_only {
+        "AND d.scheduled_at <= $2"
+    } else {
+        ""
+    };
     let sql = format!(
         "SELECT {NOTICE_ROW_COLUMNS}
          {NOTICE_ROW_FROM}
          WHERE d.id = $1 AND d.status = 'pending' AND d.kind = 'assignment'
-           AND d.scheduled_at <= $2
+           {due}
          FOR UPDATE OF d SKIP LOCKED"
     );
     let row: Option<NoticeRow> = sqlx::query_as(&sql)
         .bind(id)
         .bind(now)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut *conn)
         .await?;
 
     let Some(row) = row else {
         return Ok(0);
     };
     if row.is_stale(now) {
-        mark_cancelled(&mut tx, row.id, now).await?;
-        tx.commit().await?;
+        mark_cancelled(&mut *conn, row.id, now).await?;
         return Ok(0);
     }
     if let Some(settings) = row.recipient_settings.as_ref()
-        && postpone_for_quiet(&mut tx, row.id, settings, row.timezone(), now).await?
+        && postpone_for_quiet(&mut *conn, row.id, settings, row.timezone(), now).await?
     {
-        tx.commit().await?;
         return Ok(0);
     }
     let (Some(chat_id), Some(telegram_user_id), Some(item_id)) =
         (row.telegram_chat_id, row.telegram_user_id, row.item_id)
     else {
-        mark_cancelled(&mut tx, row.id, now).await?;
-        tx.commit().await?;
+        mark_cancelled(&mut *conn, row.id, now).await?;
         return Ok(0);
     };
 
-    let item = match items::get(&mut tx, row.household_id, item_id).await {
+    let item = match items::get(&mut *conn, row.household_id, item_id).await {
         Ok(item) => item,
         Err(DomainError::Database(error)) => return Err(error),
         Err(_) => {
-            mark_cancelled(&mut tx, row.id, now).await?;
-            tx.commit().await?;
+            mark_cancelled(&mut *conn, row.id, now).await?;
             return Ok(0);
         }
     };
     if item.status != ItemStatus::Open || item.assignee_user_id != Some(row.user_id) {
-        mark_cancelled(&mut tx, row.id, now).await?;
-        tx.commit().await?;
+        mark_cancelled(&mut *conn, row.id, now).await?;
         return Ok(0);
     }
-    let list = match lists::get(&mut tx, row.household_id, item.list_id).await {
+    let list = match lists::get(&mut *conn, row.household_id, item.list_id).await {
         Ok(list) => list,
         Err(DomainError::Database(error)) => return Err(error),
         Err(_) => {
-            mark_cancelled(&mut tx, row.id, now).await?;
-            tx.commit().await?;
+            mark_cancelled(&mut *conn, row.id, now).await?;
             return Ok(0);
         }
     };
 
     let ui = notify::assignment_ui(&item, &list, row.timezone(), now);
-    let html = notify::render_notice(&mut tx, telegram_user_id, row.household_id, &ui, now).await?;
+    let html =
+        notify::render_notice(&mut *conn, telegram_user_id, row.household_id, &ui, now).await?;
     let dedupe_key = format!("notification:assignment:{}", row.id);
-    let seq = enqueue_message(&mut tx, chat_id, &dedupe_key, html, true, now).await?;
-    mark_sent(&mut tx, row.id, seq, now).await?;
+    let seq = enqueue_message(&mut *conn, chat_id, &dedupe_key, html, true, now).await?;
+    mark_sent(&mut *conn, row.id, seq, now).await?;
 
-    tx.commit().await?;
     Ok(1)
 }

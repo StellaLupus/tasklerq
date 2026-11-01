@@ -16,6 +16,7 @@ use crate::telegram::bot::model::{
     Choice, EditForm, Form, FormAct, ItemDraft, ItemForm, Screen, Step, TimeField,
 };
 use crate::telegram::bot::onboarding;
+use crate::telegram::bot::settings::{self, ReleaseTrigger};
 use crate::telegram::bot::{Ctx, Fail};
 
 // ---------------------------------------------------------------------
@@ -137,6 +138,10 @@ async fn set_time(ctx: &mut Ctx<'_>, field: TimeField, text: &str) -> Result<(),
             ..NotificationSettingsUpdate::default()
         },
     };
+    // Правка границ тихих часов может сделать текущий момент не тихим:
+    // тогда отложенные уведомления выпускаются сразу.
+    let trigger = matches!(field, TimeField::QuietStart | TimeField::QuietEnd)
+        .then_some(ReleaseTrigger::Boundaries);
     let current = NotificationSettings::from_settings(&ctx.user()?.settings);
     if let Err(error) = update.clone().apply(current) {
         // Домен уже проверил и формат, и несовпадение границ. Формат ввода
@@ -167,9 +172,8 @@ async fn set_time(ctx: &mut Ctx<'_>, field: TimeField, text: &str) -> Result<(),
     .await;
     match updated {
         Ok(user) => {
-            ctx.user = Some(user);
             clear(ctx).await?;
-            ctx.present(Screen::Notifications).await
+            settings::finish_settings_change(ctx, user, Screen::Notifications, trigger).await
         }
         Err(crate::domain::error::DomainError::Validation(_)) => {
             ctx.banner("Введите время в формате HH:MM, например 08:30.");

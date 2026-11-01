@@ -20,54 +20,25 @@ use crate::telegram::ru;
 
 use super::super::model::{Action, SnoozeUntil, Ui};
 use super::super::{Ctx, Fail};
-use super::{edit_notice, open, snooze_time};
+use super::{edit_notice, open, snooze_time, when_line};
 
 /// Сколько блоков сводного сообщения помещается на страницу.
 pub const BATCH_PAGE_SIZE: usize = 5;
 
-/// Вид уведомления в блоке сводного сообщения.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BatchKind {
-    /// Напоминание о сроке.
-    Reminder,
-    /// Отложенное напоминание.
-    Snooze,
-    /// Назначение исполнителя.
-    Assignment,
+/// Подпись вида уведомления в блоке.
+fn kind_label(kind: NotificationKind) -> &'static str {
+    match kind {
+        NotificationKind::Reminder => "⏰ напоминание",
+        NotificationKind::Snooze => "😴 отложенное",
+        NotificationKind::Assignment => "👤 назначение",
+        // Сводка в сводное сообщение не входит; подпись нужна только для
+        // исчерпывающего match.
+        NotificationKind::Digest => "☀️ сводка",
+    }
 }
 
-impl BatchKind {
-    /// Вид по значению `notification_deliveries.kind`.
-    pub fn parse(kind: &str) -> Option<Self> {
-        match kind {
-            "reminder" => Some(Self::Reminder),
-            "snooze" => Some(Self::Snooze),
-            "assignment" => Some(Self::Assignment),
-            _ => None,
-        }
-    }
-
-    /// Вид по типу уведомления.
-    pub fn from_kind(kind: NotificationKind) -> Option<Self> {
-        match kind {
-            NotificationKind::Reminder => Some(Self::Reminder),
-            NotificationKind::Snooze => Some(Self::Snooze),
-            NotificationKind::Assignment => Some(Self::Assignment),
-            NotificationKind::Digest => None,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Reminder => "⏰ напоминание",
-            Self::Snooze => "😴 отложенное",
-            Self::Assignment => "👤 назначение",
-        }
-    }
-
-    fn is_assignment(self) -> bool {
-        matches!(self, Self::Assignment)
-    }
+fn is_assignment(kind: NotificationKind) -> bool {
+    kind == NotificationKind::Assignment
 }
 
 /// Состояние блока сводного сообщения.
@@ -91,7 +62,7 @@ pub struct BatchEntry {
     /// Элемент.
     pub item_id: Uuid,
     /// Вид уведомления.
-    pub kind: BatchKind,
+    pub kind: NotificationKind,
     /// Название.
     pub title: String,
     /// Срок и список.
@@ -129,7 +100,7 @@ pub fn batch_ui(
         if index > 0 {
             ui = ui.rule();
         }
-        ui = ui.bold(entry.kind.label());
+        ui = ui.bold(kind_label(entry.kind));
         match entry.state {
             BatchEntryState::Missing => {
                 ui = ui.text("Задача удалена");
@@ -177,7 +148,7 @@ pub fn batch_ui(
                 item_id: entry.item_id,
             },
         );
-        let buttons = if entry.kind.is_assignment() {
+        let buttons = if is_assignment(entry.kind) {
             vec![open, done]
         } else {
             vec![
@@ -651,13 +622,16 @@ async fn render_batch(ctx: &mut Ctx<'_>, message_id: i64, batch_id: Uuid) -> Res
 }
 
 fn batch_entry(row: &BatchDelivery, tz: Tz, now: DateTime<Utc>) -> BatchEntry {
-    let kind = BatchKind::parse(&row.kind).unwrap_or(BatchKind::Reminder);
+    let kind = row.kind;
     let missing = row.item_id.is_none()
         || row.item_deleted_at.is_some()
         || row.title.is_none()
         || row.list_name.is_none()
         || row.list_deleted_at.is_some();
-    let list_archived = !kind.is_assignment() && row.list_archived == Some(true);
+    // Архивный список скрывает действия у напоминаний и snooze. Назначение —
+    // исключение: оно остаётся актуальным, поэтому блок показывает задачу и
+    // работает так же, как одиночное уведомление о назначении.
+    let list_archived = !is_assignment(kind) && row.list_archived == Some(true);
     let state = if missing {
         BatchEntryState::Missing
     } else if list_archived {
@@ -670,7 +644,7 @@ fn batch_entry(row: &BatchDelivery, tz: Tz, now: DateTime<Utc>) -> BatchEntry {
             }
             Some(BatchState::Missing) => BatchEntryState::Missing,
             None => {
-                if row.item_status.as_deref() != Some("open") {
+                if row.item_status != Some(ItemStatus::Open) {
                     BatchEntryState::Done
                 } else {
                     BatchEntryState::Open
@@ -679,11 +653,7 @@ fn batch_entry(row: &BatchDelivery, tz: Tz, now: DateTime<Utc>) -> BatchEntry {
         }
     };
     let list = row.list_name.clone().unwrap_or_default();
-    let when = match ru::due_label(row.due_at, row.due_date, tz, now) {
-        Some(due) if !list.is_empty() => format!("{} · {}", ru::capitalize(&due), list),
-        Some(due) => ru::capitalize(&due),
-        None => list,
-    };
+    let when = when_line(row.due_at, row.due_date, &list, tz, now);
     BatchEntry {
         item_id: row.item_id.unwrap_or_default(),
         kind,

@@ -5,7 +5,7 @@
 //! сообщение. Сами уведомления ставит в очередь планировщик (фаза 7): он
 //! использует эти конструкторы экранов.
 
-use chrono::{DateTime, Duration, NaiveTime, Utc};
+use chrono::{DateTime, Duration, NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
 use sqlx::PgConnection;
 use uuid::Uuid;
@@ -27,17 +27,27 @@ use super::{Ctx, Fail, issue_and_render};
 mod batch;
 
 pub use batch::{
-    BATCH_PAGE_SIZE, BatchEntry, BatchEntryState, BatchKind, batch_complete, batch_complete_all,
-    batch_open, batch_page, batch_snooze, batch_snooze_all, batch_ui,
+    BATCH_PAGE_SIZE, BatchEntry, BatchEntryState, batch_complete, batch_complete_all, batch_open,
+    batch_page, batch_snooze, batch_snooze_all, batch_ui,
 };
 
 /// Час, на который переносится напоминание «до завтра».
 const MORNING: (u32, u32) = (9, 0);
 
-fn when_line(item: &Item, list: &List, tz: Tz, now: DateTime<Utc>) -> String {
-    match ru::due_label(item.due_at, item.due_date, tz, now) {
-        Some(due) => format!("{} · {}", ru::capitalize(&due), list.name),
-        None => list.name.clone(),
+/// Строка «срок · список» для уведомления или блока сводного сообщения.
+pub(crate) fn when_line(
+    due_at: Option<DateTime<Utc>>,
+    due_date: Option<NaiveDate>,
+    list_name: &str,
+    tz: Tz,
+    now: DateTime<Utc>,
+) -> String {
+    match ru::due_label(due_at, due_date, tz, now) {
+        Some(due) if !list_name.is_empty() => {
+            format!("{} · {}", ru::capitalize(&due), list_name)
+        }
+        Some(due) => ru::capitalize(&due),
+        None => list_name.to_owned(),
     }
 }
 
@@ -56,7 +66,7 @@ pub fn reminder_ui(
     Ui::new()
         .heading(heading)
         .spans(vec![Span::bold(clip(&item.title, 120))])
-        .text(when_line(item, list, tz, now))
+        .text(when_line(item.due_at, item.due_date, &list.name, tz, now))
         .row(vec![
             button(
                 "✓ Готово",
@@ -90,7 +100,7 @@ pub fn assignment_ui(item: &Item, list: &List, tz: Tz, now: DateTime<Utc>) -> Ui
     Ui::new()
         .heading("👤 Вам назначили задачу")
         .spans(vec![Span::bold(clip(&item.title, 120))])
-        .text(when_line(item, list, tz, now))
+        .text(when_line(item.due_at, item.due_date, &list.name, tz, now))
         .row(vec![
             button("📋 Открыть", Action::NoticeOpen { item_id: item.id }),
             button(
