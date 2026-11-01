@@ -29,7 +29,7 @@ use crate::security_audit::Audit;
 use crate::storage::repositories::{households, users};
 
 use super::callbacks::{self, Consumed, NewToken, Scope};
-use super::outbox::{self, Outgoing};
+use super::outbox::{self, Outgoing, Placement};
 use super::rich::{self, Block, Span};
 use super::update::{Incoming, Sender};
 use super::views::{self, Lookup};
@@ -213,7 +213,10 @@ impl Ctx<'_> {
         outbox::enqueue(
             &mut *self.conn,
             self.chat_id,
-            &Outgoing::Screen { html },
+            &Outgoing::Screen {
+                html,
+                placement: Placement::Visible,
+            },
             None,
             self.now,
         )

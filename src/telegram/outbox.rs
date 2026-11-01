@@ -38,6 +38,28 @@ pub const MAX_ATTEMPTS: i32 = 5;
 /// Сколько кандидатов рассматривается за один проход.
 const BATCH: i64 = 50;
 
+/// Насколько новый экран должен быть виден в чате.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Placement {
+    /// Править активное сообщение: кнопка нажата на самом якоре.
+    InPlace,
+    /// Править, если экран ещё виден, иначе прислать заново.
+    #[default]
+    Visible,
+    /// Всегда присылать заново: `/start` и `/menu`.
+    Fresh,
+}
+
+impl Placement {
+    fn from_payload(payload: &Value) -> Self {
+        payload
+            .get("placement")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default()
+    }
+}
+
 /// Что отправить.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -46,6 +68,8 @@ pub enum Outgoing {
     Screen {
         /// HTML RichMessage.
         html: String,
+        /// Правило видимости активного сообщения.
+        placement: Placement,
     },
     /// Новое самостоятельное сообщение.
     Message {
@@ -80,7 +104,9 @@ impl Outgoing {
 
     fn payload(&self) -> Value {
         match self {
-            Self::Screen { html } => json!({"html": html}),
+            Self::Screen { html, placement } => {
+                json!({"html": html, "placement": placement})
+            }
             Self::Message { html, rich } => json!({"html": html, "rich": rich}),
             Self::Edit { message_id, html } => json!({"html": html, "message_id": message_id}),
             Self::Delete { message_id } => json!({"message_id": message_id}),
@@ -91,6 +117,7 @@ impl Outgoing {
         match kind {
             "screen" => Some(Self::Screen {
                 html: payload.get("html")?.as_str()?.to_owned(),
+                placement: Placement::from_payload(payload),
             }),
             "message" => Some(Self::Message {
                 html: payload.get("html")?.as_str()?.to_owned(),
@@ -115,7 +142,9 @@ impl Outgoing {
 /// таким `dedupe_key` уже есть.
 ///
 /// Экран заменяет все ещё не доставленные экраны того же чата: пользователю
-/// нужно только актуальное состояние.
+/// нужно только актуальное состояние. Он наследует самый сильный `placement`
+/// вытесненных экранов, чтобы `/start` (`fresh`) не потерялся, если до доставки
+/// пришёл другой экран.
 pub async fn enqueue(
     conn: &mut PgConnection,
     chat_id: i64,
@@ -123,7 +152,20 @@ pub async fn enqueue(
     dedupe_key: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<Option<i64>, sqlx::Error> {
-    if matches!(outgoing, Outgoing::Screen { .. }) {
+    let outgoing = if let Outgoing::Screen { html, placement } = outgoing {
+        let pending: Vec<Value> = sqlx::query_scalar(
+            "SELECT payload FROM outbox
+             WHERE chat_id = $1 AND status = 'pending' AND kind = 'screen'
+               AND message_id IS NULL",
+        )
+        .bind(chat_id)
+        .fetch_all(&mut *conn)
+        .await?;
+        let placement = pending
+            .iter()
+            .map(Placement::from_payload)
+            .fold(*placement, std::cmp::max);
+
         sqlx::query(
             "UPDATE outbox SET status = 'skipped', payload = jsonb_build_object('redacted', true)
              WHERE chat_id = $1 AND status = 'pending' AND kind = 'screen'
@@ -132,7 +174,14 @@ pub async fn enqueue(
         .bind(chat_id)
         .execute(&mut *conn)
         .await?;
-    }
+
+        Outgoing::Screen {
+            html: html.clone(),
+            placement,
+        }
+    } else {
+        outgoing.clone()
+    };
 
     let seq: Option<i64> = sqlx::query_scalar(
         "INSERT INTO outbox (chat_id, kind, payload, dedupe_key, next_attempt_at, created_at)
@@ -401,6 +450,12 @@ impl OutboxWorker {
                 .bind(now)
                 .execute(&mut *tx)
                 .await?;
+                // Новое самостоятельное сообщение встаёт ниже якоря: править
+                // экран на месте больше нельзя. Правка (`edit`) признак не
+                // меняет: сообщение уже было в чате.
+                if matches!(outgoing, Outgoing::Message { .. }) {
+                    views::mark_buried(&mut tx, row.chat_id).await?;
+                }
                 Delivery::Sent
             }
             Err(TelegramError::RetryAfter(seconds)) => {
@@ -552,12 +607,35 @@ async fn deliver(
     let db = |error: sqlx::Error| TelegramError::Transient(format!("database: {error}"));
 
     match outgoing {
-        Outgoing::Screen { html } => {
+        Outgoing::Screen { html, placement } => {
             let rich = RichMessage { html: html.clone() };
             let active = views::get(conn, row.chat_id).await.map_err(db)?;
-            let target = active.and_then(|view| view.message_id);
-            let message_id = replace_or_send(api, row.chat_id, target, &rich).await?;
-            views::set_message(conn, row.chat_id, message_id, now)
+            let target = active.as_ref().and_then(|view| view.message_id);
+            let buried = active.as_ref().is_some_and(|view| view.buried);
+
+            let replace = target.is_some()
+                && match placement {
+                    Placement::InPlace => false,
+                    Placement::Visible => buried,
+                    Placement::Fresh => true,
+                };
+
+            let message_id = if replace {
+                let old_id = target.expect("replace requires an active message");
+                let message_id = api.send_rich_message(row.chat_id, &rich).await?;
+                // Новый экран уже отправлен: любая ошибка удаления старого
+                // якоря (включая «нельзя удалить») не делает строку мёртвой.
+                let _ = api.delete_message(row.chat_id, old_id).await;
+                message_id
+            } else {
+                replace_or_send(api, row.chat_id, target, &rich).await?
+            };
+
+            // Новое сообщение снимает признак засыпанности; правка на месте
+            // оставляет его как было.
+            let sent_new = target != Some(message_id);
+            let buried = !sent_new && buried;
+            views::set_message(conn, row.chat_id, message_id, buried, now)
                 .await
                 .map_err(db)?;
             Ok(message_id)
@@ -684,7 +762,10 @@ mod tests {
     #[test]
     fn outgoing_round_trips_through_rows() {
         for outgoing in [
-            Outgoing::Screen { html: "a".into() },
+            Outgoing::Screen {
+                html: "a".into(),
+                placement: Placement::Visible,
+            },
             Outgoing::Message {
                 html: "b".into(),
                 rich: true,
@@ -700,5 +781,30 @@ mod tests {
                 Some(outgoing)
             );
         }
+    }
+
+    #[test]
+    fn screen_round_trips_every_placement() {
+        for placement in [Placement::InPlace, Placement::Visible, Placement::Fresh] {
+            let outgoing = Outgoing::Screen {
+                html: "a".into(),
+                placement,
+            };
+            assert_eq!(
+                Outgoing::from_row(outgoing.kind(), &outgoing.payload()),
+                Some(outgoing)
+            );
+        }
+    }
+
+    #[test]
+    fn screen_row_without_placement_reads_as_visible() {
+        assert_eq!(
+            Outgoing::from_row("screen", &json!({"html": "a"})),
+            Some(Outgoing::Screen {
+                html: "a".into(),
+                placement: Placement::Visible,
+            })
+        );
     }
 }

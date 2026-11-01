@@ -20,20 +20,24 @@ pub struct ActiveView {
     pub view_key: String,
     /// Состояние, достаточное для перерисовки экрана.
     pub state: Value,
+    /// После экрана в чате появилось другое сообщение: править его нельзя.
+    pub buried: bool,
 }
 
 /// Активный экран чата.
 pub async fn get(conn: &mut PgConnection, chat_id: i64) -> Result<Option<ActiveView>, sqlx::Error> {
-    let row: Option<(Option<i64>, String, Value)> =
-        sqlx::query_as("SELECT message_id, view_key, state FROM telegram_views WHERE chat_id = $1")
-            .bind(chat_id)
-            .fetch_optional(conn)
-            .await?;
+    let row: Option<(Option<i64>, String, Value, bool)> = sqlx::query_as(
+        "SELECT message_id, view_key, state, buried FROM telegram_views WHERE chat_id = $1",
+    )
+    .bind(chat_id)
+    .fetch_optional(conn)
+    .await?;
 
-    Ok(row.map(|(message_id, view_key, state)| ActiveView {
+    Ok(row.map(|(message_id, view_key, state, buried)| ActiveView {
         message_id,
         view_key,
         state,
+        buried,
     }))
 }
 
@@ -63,21 +67,25 @@ pub async fn set(
     Ok(())
 }
 
-/// Записать сообщение, в котором показан экран.
+/// Записать сообщение, в котором показан экран, и признак засыпанности.
 pub async fn set_message(
     conn: &mut PgConnection,
     chat_id: i64,
     message_id: i64,
+    buried: bool,
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO telegram_views (chat_id, message_id, view_key, updated_at)
-         VALUES ($1, $2, 'unknown', $3)
+        "INSERT INTO telegram_views (chat_id, message_id, view_key, buried, updated_at)
+         VALUES ($1, $2, 'unknown', $3, $4)
          ON CONFLICT (chat_id)
-         DO UPDATE SET message_id = EXCLUDED.message_id, updated_at = EXCLUDED.updated_at",
+         DO UPDATE SET message_id = EXCLUDED.message_id,
+                       buried = EXCLUDED.buried,
+                       updated_at = EXCLUDED.updated_at",
     )
     .bind(chat_id)
     .bind(message_id)
+    .bind(buried)
     .bind(now)
     .execute(conn)
     .await?;

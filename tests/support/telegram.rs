@@ -207,9 +207,9 @@ impl TelegramApi for FakeTelegram {
 
     async fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<(), TelegramError> {
         let mut state = self.state.lock().expect("lock");
-        if let Some(error) = Self::take_failure(&mut state) {
-            return Err(error);
-        }
+        // Удаление берёт только свою настройку: общая очередь `fail_next`
+        // относится к отправке и правке. Иначе сбой «на отправку» незаметно
+        // уходил бы в игнорируемую ошибку удаления старого якоря.
         if let Some(error) = state.delete_error.clone() {
             return Err(error);
         }

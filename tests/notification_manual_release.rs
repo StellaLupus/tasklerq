@@ -4,7 +4,7 @@ mod support;
 
 use chrono::{DateTime, Duration, Utc};
 use support::notifications::*;
-use support::telegram::buttons;
+use support::telegram::{Call, buttons};
 use tasklerq::jobs::digest::digest_occurrence_key;
 use uuid::Uuid;
 
@@ -129,11 +129,22 @@ async fn one_deferred_notification_is_released_as_an_ordinary_message() {
         );
     }
 
-    // Повторное включение и выключение не присылает ничего.
+    // Повторное включение и выключение не выпускает уведомление снова. Сам
+    // экран может прийти новым сообщением: после выпуска уведомления он
+    // засыпан (`buried`), а `placement` пока остаётся `visible` (пункт 2.3).
     let sent_after_release = bot.fake.sent().len();
     bot.press("Тихие часы: выкл").await;
     bot.press("Тихие часы: вкл").await;
-    assert_eq!(bot.fake.sent().len(), sent_after_release);
+    let repeated = &bot.fake.sent()[sent_after_release..];
+    assert!(
+        repeated.iter().all(|call| match call {
+            Call::SendRich { html, .. } | Call::Send { html, .. } => {
+                !html.contains("Пока были тихие часы") && !html.contains("Одно напоминание")
+            }
+            Call::EditRich { .. } | Call::EditText { .. } | Call::Delete { .. } => true,
+        }),
+        "repeated toggling must not release the deferred notification again: {repeated:?}"
+    );
     assert!(!bot.screen().contains("Накопилось"));
 }
 
