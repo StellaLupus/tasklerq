@@ -16,7 +16,7 @@ pub async fn get(
     State(state): State<AppState>,
     auth: AuthContext,
 ) -> Result<Json<HouseholdResponse>, ApiError> {
-    require_read(&auth)?;
+    require_read(&state, &auth).await?;
     let mut conn = connection(&state).await?;
 
     let household = households::get(&mut conn, auth.household_id).await?;

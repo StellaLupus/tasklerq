@@ -14,6 +14,7 @@ use std::time::Duration as StdDuration;
 use async_trait::async_trait;
 use serde_json::Value;
 use tasklerq::home_assistant::{AiTask, GenerateData, HaError};
+use tasklerq::security_audit::Audit;
 use tasklerq::telegram::bot::Bot;
 use tasklerq::telegram::capture_worker::{CaptureWorker, Pass};
 use tokio::sync::Notify;
@@ -100,6 +101,7 @@ fn llm_logs_do_not_contain_the_source_text() {
                 ai.clone(),
                 handler,
                 Arc::new(Notify::new()),
+                Audit::new(db.pool.clone()),
             )
             .only_chat(id);
             bot.text("секретная заметка про подарок").await;

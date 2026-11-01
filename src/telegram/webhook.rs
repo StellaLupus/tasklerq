@@ -4,10 +4,11 @@
 //! очередь. Всё остальное делает воркер, поэтому ответ `200` не зависит от
 //! LLM и Telegram API.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::body::{Body, to_bytes};
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
@@ -15,8 +16,12 @@ use subtle::ConstantTimeEq;
 use tokio::sync::Notify;
 
 use crate::config::SecretString;
+use crate::domain::models::{Actor, ActorType};
 use crate::http::error::ApiError;
 use crate::http::router::AppState;
+use crate::metrics;
+use crate::rate_limit::RateLimiter;
+use crate::security_audit::{self, LimitKey, RateLimitEvent};
 
 use super::queue;
 use super::update::{self, Classified};
@@ -27,18 +32,40 @@ pub const SECRET_HEADER: &str = "x-telegram-bot-api-secret-token";
 /// Максимальный размер тела обновления.
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 
+/// Не больше 120 webhook-запросов в секунду с одного IP.
+pub const WEBHOOKS_PER_SECOND: u32 = 120;
+/// Окно лимита webhook, секунды.
+const WEBHOOK_WINDOW_SECONDS: i64 = 1;
+/// Заголовок, который дописывает доверенный reverse proxy.
+const FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
+
 /// Настройки приёма webhook.
 #[derive(Clone)]
 pub struct Ingress {
     secret_digest: [u8; 32],
+    rate: Arc<RateLimiter<IpAddr>>,
     wake: Arc<Notify>,
 }
 
 impl Ingress {
     /// Создать приёмник. `wake` будит воркер обновлений после вставки.
     pub fn new(secret: &SecretString, wake: Arc<Notify>) -> Self {
+        Self::with_rate_limit(secret, wake, WEBHOOKS_PER_SECOND, WEBHOOK_WINDOW_SECONDS)
+    }
+
+    /// Создать приёмник с явным лимитом и окном в секундах.
+    ///
+    /// Окно вынесено в параметр, чтобы тест мог не зависеть от реального
+    /// времени; рабочий режим использует [`Self::new`].
+    pub fn with_rate_limit(
+        secret: &SecretString,
+        wake: Arc<Notify>,
+        limit: u32,
+        window_seconds: i64,
+    ) -> Self {
         Self {
             secret_digest: Sha256::digest(secret.expose().as_bytes()).into(),
+            rate: Arc::new(RateLimiter::with_window(limit, window_seconds)),
             wake,
         }
     }
@@ -54,6 +81,7 @@ impl Ingress {
 /// `POST /webhooks/telegram`.
 pub async fn receive(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Body,
 ) -> Result<StatusCode, ApiError> {
@@ -61,11 +89,64 @@ pub async fn receive(
         return Err(ApiError::not_found("Route not found"));
     };
 
+    // Проверка лимита — до разбора тела и секрета: всплеск запросов с одного
+    // IP не должен доходить до парсинга и базы.
+    let ip = client_ip(peer, forwarded_for(&headers).as_deref());
+    let now = Utc::now();
+    // IPv6-клиент почти всегда распоряжается целой /64: лимит должен считать
+    // префикс, иначе смена младших 64 бит обходит 120/с. Тот же префикс идёт в
+    // событие аудита, чтобы ротация адреса внутри /64 не давала новый ключ
+    // подавления на каждый запрос.
+    let key = crate::rate_limit::ip_key(ip);
+    let decision = ingress.rate.check(key, now);
+    if !decision.allowed {
+        // Метрика считает каждый отказ, включая подавленные в аудите.
+        metrics::webhook_rate_limited();
+        let retry_after = decision.retry_after.unwrap_or(1);
+        let recorded = state
+            .audit
+            .rate_limited(
+                RateLimitEvent {
+                    limit: security_audit::WEBHOOK_LIMIT,
+                    key: LimitKey::Ip(key),
+                    retry_after,
+                    household_id: None,
+                    actor: Actor::system(ActorType::System),
+                },
+                now,
+            )
+            .await;
+        // Предупреждение только на записанное событие: иначе флуд сверх
+        // подавления засорял бы журнал строкой на каждый отклонённый запрос.
+        if recorded {
+            tracing::warn!(
+                ip = %ip,
+                limit = ingress.rate.limit(),
+                "webhook requests from one IP are rate limited"
+            );
+        } else {
+            tracing::debug!(
+                ip = %ip,
+                limit = ingress.rate.limit(),
+                "webhook requests from one IP are rate limited"
+            );
+        }
+        return Err(
+            ApiError::rate_limited("Too many webhook requests").with_retry_after(retry_after)
+        );
+    }
+
     let provided = headers
         .get(SECRET_HEADER)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
     if !ingress.accepts(provided) {
+        let reason = if provided.is_empty() {
+            "missing_secret"
+        } else {
+            "bad_secret"
+        };
+        state.audit.webhook_auth_failed(reason, ip, now).await;
         return Err(ApiError::unauthorized("Invalid webhook secret"));
     }
 
@@ -108,4 +189,102 @@ pub async fn receive(
     }
 
     Ok(StatusCode::OK)
+}
+
+/// Последнее значение `X-Forwarded-For` из всех заголовков запроса.
+fn forwarded_for(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get_all(FORWARDED_FOR_HEADER)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .rfind(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// IP клиента по адресу пира и `X-Forwarded-For`.
+///
+/// Заголовок принимается только от доверенного прокси: loopback или приватной
+/// сети. В Docker reverse proxy на хосте подключается к контейнеру через
+/// bridge-шлюз (`172.x.0.1`), поэтому одного loopback недостаточно. Для
+/// остальных пиров заголовок игнорируется: клиент мог подделать его сам.
+fn client_ip(peer: SocketAddr, forwarded: Option<&str>) -> IpAddr {
+    // IPv4-mapped адрес (`::ffff:127.0.0.1`) — это тот же IPv4-клиент на
+    // dual-stack-сокете; без приведения loopback-пир не считался бы доверенным
+    // прокси и `X-Forwarded-For` игнорировался бы.
+    let peer_ip = peer.ip().to_canonical();
+    if is_trusted_proxy(peer_ip)
+        && let Some(forwarded) = forwarded
+        && let Ok(ip) = forwarded.trim().parse::<IpAddr>()
+    {
+        return ip;
+    }
+    peer_ip
+}
+
+/// Адрес доверенного reverse proxy: loopback, RFC1918 или IPv6 ULA.
+fn is_trusted_proxy(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
+        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use axum::http::{HeaderMap, HeaderValue};
+
+    use super::{client_ip, forwarded_for};
+
+    fn peer(octets: [u8; 4]) -> SocketAddr {
+        SocketAddr::from((octets, 4_040))
+    }
+
+    #[test]
+    fn the_last_forwarded_address_is_used() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.1, 198.51.100.7"),
+        );
+        assert_eq!(forwarded_for(&headers).as_deref(), Some("198.51.100.7"));
+    }
+
+    #[test]
+    fn a_trusted_peer_uses_the_forwarded_address() {
+        let ip: IpAddr = "198.51.100.7".parse().expect("ip");
+        assert_eq!(client_ip(peer([127, 0, 0, 1]), Some("198.51.100.7")), ip);
+        // Docker bridge: reverse proxy на хосте виден как шлюз 172.x.0.1.
+        assert_eq!(client_ip(peer([172, 18, 0, 1]), Some("198.51.100.7")), ip);
+        assert_eq!(
+            client_ip(peer([127, 0, 0, 1]), None),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(
+            client_ip(peer([127, 0, 0, 1]), Some("not-an-ip")),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+    }
+
+    #[test]
+    fn a_public_peer_ignores_the_forwarded_header() {
+        assert_eq!(
+            client_ip(peer([203, 0, 113, 9]), Some("198.51.100.7")),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))
+        );
+    }
+
+    #[test]
+    fn an_ipv4_mapped_loopback_peer_is_a_trusted_proxy() {
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:4040".parse().expect("mapped peer");
+        assert_eq!(
+            client_ip(mapped, Some("198.51.100.7")),
+            "198.51.100.7".parse::<IpAddr>().expect("ip")
+        );
+        // Без заголовка пир приводится к каноническому IPv4.
+        assert_eq!(client_ip(mapped, None), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
 }

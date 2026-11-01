@@ -25,6 +25,7 @@ use crate::domain::error::DomainError;
 use crate::domain::identity::{MembershipChange, MembershipNotice, NoticeKind};
 use crate::domain::models::{Actor, Household, User};
 use crate::domain::recurrence::parse_timezone;
+use crate::security_audit::Audit;
 use crate::storage::repositories::{households, users};
 
 use super::callbacks::{self, Consumed, NewToken, Scope};
@@ -73,6 +74,8 @@ pub struct Bot {
     pub username: String,
     /// Свободный текст уходит на разбор в LLM, а не в быстрое добавление.
     pub llm_capture: bool,
+    /// Журнал событий безопасности, которые откатываются вместе с шагом.
+    audit: Option<Audit>,
 }
 
 /// Сбой обработки: инфраструктурный (повторить) или объяснимый пользователю.
@@ -138,6 +141,8 @@ pub struct Ctx<'a> {
     pub banner: Option<String>,
     /// Свободный текст уходит на разбор в LLM.
     pub llm_capture: bool,
+    /// Журнал событий безопасности; `None` в тестах без пула.
+    pub audit: Option<&'a Audit>,
 }
 
 impl Ctx<'_> {
@@ -341,6 +346,7 @@ impl Bot {
         Self {
             username: username.into(),
             llm_capture: false,
+            audit: None,
         }
     }
 
@@ -417,6 +423,7 @@ impl Bot {
             toast: None,
             banner,
             llm_capture: self.llm_capture,
+            audit: self.audit.as_ref(),
         }
     }
 
@@ -424,6 +431,14 @@ impl Bot {
     #[must_use]
     pub fn with_llm_capture(mut self, enabled: bool) -> Self {
         self.llm_capture = enabled;
+        self
+    }
+
+    /// Записывать события безопасности, которые нельзя сохранить в
+    /// откатываемой транзакции (например, отказ по лимиту приглашений).
+    #[must_use]
+    pub fn with_audit(mut self, audit: Audit) -> Self {
+        self.audit = Some(audit);
         self
     }
 
@@ -469,6 +484,7 @@ impl Bot {
             toast: None,
             banner: None,
             llm_capture: self.llm_capture,
+            audit: self.audit.as_ref(),
         };
 
         let query_id = match &incoming {

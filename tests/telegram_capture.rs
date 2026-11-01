@@ -13,6 +13,7 @@ use chrono::{Duration, Utc};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tasklerq::home_assistant::{AiTask, GenerateData, HaError};
+use tasklerq::security_audit::Audit;
 use tasklerq::telegram::bot::Bot;
 use tasklerq::telegram::capture_worker::{CaptureWorker, DEFAULT_DAILY_QUOTA, MAX_ATTEMPTS, Pass};
 use tokio::sync::Notify;
@@ -116,9 +117,15 @@ async fn stand_with(
     bot.press("Москва").await;
     bot.press("меню").await;
 
-    let worker = CaptureWorker::new(pool.clone(), ai.clone(), handler, Arc::new(Notify::new()))
-        .only_chat(id)
-        .with_quota(quota);
+    let worker = CaptureWorker::new(
+        pool.clone(),
+        ai.clone(),
+        handler,
+        Arc::new(Notify::new()),
+        Audit::new(pool.clone()),
+    )
+    .only_chat(id)
+    .with_quota(quota);
     Stand { bot, worker, ai }
 }
 

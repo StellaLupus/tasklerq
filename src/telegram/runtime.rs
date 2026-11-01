@@ -5,18 +5,20 @@ use std::sync::Arc;
 use sqlx::PgPool;
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
+use url::Url;
 
 use crate::capture::breaker::CircuitBreaker;
 use crate::config::{Config, LlmConfig, TelegramMode};
 use crate::home_assistant::{AiTask, HttpAiTask};
 use crate::jobs::scheduler::Scheduler;
+use crate::security_audit::Audit;
 
 use super::api::{DEFAULT_BASE_URL, HttpTelegramApi, TelegramApi};
 use super::bot::Bot;
 use super::capture_worker::CaptureWorker;
 use super::outbox::OutboxWorker;
 use super::webhook::Ingress;
-use super::worker::{UpdateWorker, poll};
+use super::worker::{UPDATES_PER_MINUTE, UpdateWorker, poll};
 
 /// Запущенная Telegram-часть.
 pub struct Runtime {
@@ -42,6 +44,23 @@ pub async fn start(
     shutdown: watch::Receiver<bool>,
     ai: Option<Arc<dyn AiTask>>,
     breaker: Arc<CircuitBreaker>,
+    audit: Audit,
+) -> Result<Option<Runtime>, StartError> {
+    start_with_update_limit(config, pool, shutdown, ai, breaker, audit, None).await
+}
+
+/// Запустить Telegram-часть с явным лимитом обновлений на пользователя.
+///
+/// `update_limit = None` использует боевой [`UPDATES_PER_MINUTE`]. Переопределение
+/// нужно нагрузочному тесту, который проверяет обработчик, а не ветку лимита.
+pub async fn start_with_update_limit(
+    config: &Config,
+    pool: &PgPool,
+    shutdown: watch::Receiver<bool>,
+    ai: Option<Arc<dyn AiTask>>,
+    breaker: Arc<CircuitBreaker>,
+    audit: Audit,
+    update_limit: Option<u32>,
 ) -> Result<Option<Runtime>, StartError> {
     let telegram = &config.telegram;
     let Some(token) = telegram.bot_token.clone() else {
@@ -51,7 +70,13 @@ pub async fn start(
         return Ok(None);
     }
 
-    let api: Arc<dyn TelegramApi> = Arc::new(HttpTelegramApi::new(token, DEFAULT_BASE_URL)?);
+    let api: Arc<dyn TelegramApi> = Arc::new(HttpTelegramApi::new(
+        token,
+        telegram
+            .api_base_url
+            .as_ref()
+            .map_or(DEFAULT_BASE_URL, Url::as_str),
+    )?);
     let wake_updates = Arc::new(Notify::new());
     let wake_outbox = Arc::new(Notify::new());
     let mut tasks = Vec::new();
@@ -79,11 +104,19 @@ pub async fn start(
         TelegramMode::Disabled => {}
     }
 
-    let bot = Bot::new(telegram.bot_username.clone()).with_llm_capture(ai.is_some());
+    let bot = Bot::new(telegram.bot_username.clone())
+        .with_llm_capture(ai.is_some())
+        .with_audit(audit.clone());
     if let Some(ai) = ai {
-        let capture = CaptureWorker::new(pool.clone(), ai, bot.clone(), wake_outbox.clone())
-            .with_quota(config.llm.daily_quota)
-            .with_breaker(breaker);
+        let capture = CaptureWorker::new(
+            pool.clone(),
+            ai,
+            bot.clone(),
+            wake_outbox.clone(),
+            audit.clone(),
+        )
+        .with_quota(config.llm.daily_quota)
+        .with_breaker(breaker);
         tasks.push(tokio::spawn(capture.run(shutdown.clone())));
     }
     let updates = UpdateWorker::new(
@@ -92,7 +125,9 @@ pub async fn start(
         api.clone(),
         config.queue.max_attempts,
         wake_outbox.clone(),
-    );
+        audit,
+    )
+    .with_rate_limit(update_limit.unwrap_or(UPDATES_PER_MINUTE));
     tasks.push(tokio::spawn(updates.run(wake_updates, shutdown.clone())));
 
     let scheduler = Scheduler::new(pool.clone(), wake_outbox.clone());

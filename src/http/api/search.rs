@@ -47,7 +47,7 @@ pub async fn search(
     auth: AuthContext,
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<SearchResponse>, ApiError> {
-    require_read(&auth)?;
+    require_read(&state, &auth).await?;
 
     let (status, all_status) = match query.status.as_deref() {
         None | Some("open") => (Some(ItemStatus::Open), false),

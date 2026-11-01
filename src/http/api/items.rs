@@ -24,7 +24,7 @@ pub async fn list(
     auth: AuthContext,
     Path(list_id): Path<Uuid>,
 ) -> Result<Json<ItemsResponse>, ApiError> {
-    require_read(&auth)?;
+    require_read(&state, &auth).await?;
     let mut conn = connection(&state).await?;
     let items = items::list_by_list(&mut conn, auth.household_id, list_id).await?;
     Ok(Json(ItemsResponse {
@@ -39,7 +39,7 @@ pub async fn create(
     Path(list_id): Path<Uuid>,
     Json(request): Json<CreateItemRequest>,
 ) -> Result<(StatusCode, Json<ItemResponse>), ApiError> {
-    require_write(&auth)?;
+    require_write(&state, &auth).await?;
 
     let mut tx = transaction(&state).await?;
     let list = lists::get_visible(&mut tx, auth.household_id, list_id).await?;
@@ -87,7 +87,7 @@ pub async fn get(
     auth: AuthContext,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ItemResponse>, ApiError> {
-    require_read(&auth)?;
+    require_read(&state, &auth).await?;
     let mut conn = connection(&state).await?;
     let item = items::get(&mut conn, auth.household_id, id).await?;
     Ok(Json(ItemResponse::from(item)))
@@ -100,7 +100,7 @@ pub async fn update(
     Path(id): Path<Uuid>,
     Json(request): Json<UpdateItemRequest>,
 ) -> Result<Json<ItemResponse>, ApiError> {
-    require_write(&auth)?;
+    require_write(&state, &auth).await?;
 
     let mut tx = transaction(&state).await?;
     let household = households::get(&mut tx, auth.household_id).await?;
@@ -126,7 +126,7 @@ pub async fn delete(
     auth: AuthContext,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    require_write(&auth)?;
+    require_write(&state, &auth).await?;
 
     let mut tx = transaction(&state).await?;
     items::soft_delete(
@@ -149,7 +149,7 @@ pub async fn complete(
     Path(id): Path<Uuid>,
     body: Option<Json<VersionRequest>>,
 ) -> Result<Json<ItemResponse>, ApiError> {
-    require_write(&auth)?;
+    require_write(&state, &auth).await?;
 
     let mut tx = transaction(&state).await?;
     let household = households::get(&mut tx, auth.household_id).await?;
@@ -176,7 +176,7 @@ pub async fn reopen(
     Path(id): Path<Uuid>,
     body: Option<Json<VersionRequest>>,
 ) -> Result<Json<ItemResponse>, ApiError> {
-    require_write(&auth)?;
+    require_write(&state, &auth).await?;
 
     let mut tx = transaction(&state).await?;
     let version = body.and_then(|Json(body)| body.version);
@@ -200,7 +200,7 @@ pub async fn undo(
     auth: AuthContext,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ItemResponse>, ApiError> {
-    require_write(&auth)?;
+    require_write(&state, &auth).await?;
 
     let mut tx = transaction(&state).await?;
     let item = items::undo_last(

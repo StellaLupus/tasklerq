@@ -30,7 +30,7 @@ pub async fn snapshot(
     auth: AuthContext,
     Query(query): Query<SnapshotQuery>,
 ) -> Result<Json<SnapshotResponse>, ApiError> {
-    require_read(&auth)?;
+    require_read(&state, &auth).await?;
 
     let since = parse_since(query.since.as_deref())?;
     let server_time = Utc::now();

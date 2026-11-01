@@ -13,6 +13,7 @@ use super::context::CaptureContext;
 use super::prompt;
 use super::schema::{ParseError, ParsedResponse, parse_response};
 use crate::home_assistant::{AiTask, GenerateData, HaError};
+use crate::metrics;
 
 /// Успешный разбор.
 #[derive(Debug)]
@@ -103,6 +104,8 @@ pub async fn generate(
     match generated {
         Err(error) => {
             breaker.record_failure(finished_at);
+            metrics::llm_request("failure");
+            metrics::llm_latency(elapsed.as_secs_f64());
             Err(Failed {
                 failure: Failure::Ai(error),
                 latency_ms,
@@ -112,6 +115,8 @@ pub async fn generate(
         Ok(data) => match parse_response(&data) {
             Ok(parsed) => {
                 breaker.record_success(finished_at);
+                metrics::llm_request("success");
+                metrics::llm_latency(elapsed.as_secs_f64());
                 Ok(Generated {
                     parsed,
                     latency_ms,
@@ -126,6 +131,9 @@ pub async fn generate(
                 } else {
                     breaker.record_failure(finished_at);
                 }
+                metrics::llm_request("failure");
+                metrics::llm_latency(elapsed.as_secs_f64());
+                metrics::llm_validation_failure();
                 Err(Failed {
                     failure: Failure::Parse(error),
                     latency_ms,

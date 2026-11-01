@@ -2,11 +2,13 @@
 
 use std::time::Instant;
 
-use axum::extract::Request;
+use axum::extract::{MatchedPath, Request};
 use axum::http::{HeaderName, HeaderValue};
 use axum::middleware::Next;
 use axum::response::Response;
 use uuid::Uuid;
+
+use crate::metrics;
 
 /// Заголовок с идентификатором запроса.
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -32,7 +34,12 @@ pub async fn request_id(request: Request, next: Next) -> Response {
         .unwrap_or_else(|| Uuid::now_v7().to_string());
 
     let method = request.method().clone();
-    let path = request.uri().path().to_owned();
+    // Шаблон маршрута, а не сырой путь: идентификаторы не попадают ни в лог,
+    // ни в метку метрики.
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or_else(|| "unmatched".to_owned(), |path| path.as_str().to_owned());
     let started = Instant::now();
 
     let mut response = REQUEST_ID.scope(id.clone(), next.run(request)).await;
@@ -45,10 +52,11 @@ pub async fn request_id(request: Request, next: Next) -> Response {
 
     let status = response.status().as_u16();
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    metrics::http_request(&route, status);
     tracing::info!(
         request_id = %id,
         %method,
-        path = %path,
+        route = %route,
         status,
         duration_ms,
         "request completed"

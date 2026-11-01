@@ -25,6 +25,8 @@ use crate::capture::schema::{ParseError, ParsedResponse};
 use crate::domain::error::DomainError;
 use crate::domain::models::{CaptureMode, Household, User};
 use crate::home_assistant::{AiTask, MAX_GENERATE_TIMEOUT};
+use crate::metrics;
+use crate::security_audit::{Audit, LlmValidation};
 use crate::storage::repositories::capture_jobs::{self, Failure, Job};
 use crate::storage::repositories::llm_runs::{self, FAILURE, NewRun, SUCCESS};
 use crate::storage::repositories::{households, users};
@@ -70,6 +72,7 @@ pub struct CaptureWorker {
     only_chat: Option<i64>,
     quota: u32,
     breaker: Arc<CircuitBreaker>,
+    audit: Audit,
 }
 
 /// Данные, которые читаются до вызова LLM.
@@ -104,9 +107,17 @@ impl Prepared {
 }
 
 impl CaptureWorker {
-    /// Создать воркер. `wake_outbox` будит доставку после коммита.
-    pub fn new(pool: PgPool, ai: Arc<dyn AiTask>, bot: Bot, wake_outbox: Arc<Notify>) -> Self {
+    /// Создать воркер. `wake_outbox` будит доставку после коммита, `audit` —
+    /// общий журнал событий процесса.
+    pub fn new(
+        pool: PgPool,
+        ai: Arc<dyn AiTask>,
+        bot: Bot,
+        wake_outbox: Arc<Notify>,
+        audit: Audit,
+    ) -> Self {
         Self {
+            audit,
             pool,
             ai,
             bot,
@@ -247,6 +258,24 @@ impl CaptureWorker {
                     ),
                     LlmFailure::Parse(error) => {
                         tracing::warn!(error = error.code(), "llm capture response rejected");
+                        self.audit
+                            .llm_validation_failed(
+                                LlmValidation {
+                                    source: "telegram",
+                                    stage: "parse",
+                                    code: error.code(),
+                                    prompt_version: PROMPT_VERSION,
+                                    household_id: job.household_id,
+                                    actor: crate::domain::models::Actor::user(
+                                        prepared.user.id,
+                                        prepared.user.role,
+                                    ),
+                                    capture_id: None,
+                                    job_id: Some(job.id),
+                                },
+                                now,
+                            )
+                            .await;
                     }
                 }
                 let message =
@@ -387,6 +416,7 @@ impl CaptureWorker {
             .await?;
         tx.commit().await?;
         self.wake_outbox.notify_one();
+        metrics::capture("telegram", "drafted");
         Ok(Pass::Drafted)
     }
 
@@ -434,6 +464,7 @@ impl CaptureWorker {
                     .await?;
                 tx.commit().await?;
                 self.wake_outbox.notify_one();
+                metrics::capture("telegram", "failed");
                 Ok(Pass::Dead)
             }
         }
@@ -448,6 +479,7 @@ impl CaptureWorker {
     ) -> Result<Pass, sqlx::Error> {
         let mut conn = self.pool.acquire().await?;
         capture_jobs::record_failure(&mut conn, job, code, false, MAX_ATTEMPTS, now).await?;
+        metrics::capture("telegram", "failed");
         Ok(Pass::Dead)
     }
 

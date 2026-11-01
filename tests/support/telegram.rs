@@ -217,7 +217,10 @@ impl TelegramApi for FakeTelegram {
         Ok(WebhookInfo {
             url: String::new(),
             pending_update_count: 0,
+            last_error_date: None,
             last_error_message: None,
+            max_connections: None,
+            ip_address: None,
         })
     }
 
@@ -254,6 +257,11 @@ pub fn unescape(text: &str) -> String {
         .replace("&amp;", "&")
 }
 
+/// Бот стенда с журналом событий безопасности на пуле стенда.
+fn harness_bot(pool: &PgPool) -> Bot {
+    Bot::new("tasklerqbot").with_audit(tasklerq::security_audit::Audit::new(pool.clone()))
+}
+
 /// Сценарный стенд: один пользователь, настоящий бот и поддельный Telegram.
 pub struct Harness {
     pub pool: PgPool,
@@ -276,13 +284,13 @@ impl Harness {
         Self::with_handler(
             pool,
             telegram_id,
-            Arc::new(Bot::new("tasklerqbot")),
+            Arc::new(harness_bot(pool)),
             FakeTelegram::new(),
         )
     }
 
     pub fn sharing(pool: &PgPool, telegram_id: i64, fake: Arc<FakeTelegram>) -> Self {
-        Self::with_handler(pool, telegram_id, Arc::new(Bot::new("tasklerqbot")), fake)
+        Self::with_handler(pool, telegram_id, Arc::new(harness_bot(pool)), fake)
     }
 
     pub fn with_handler(
@@ -300,8 +308,15 @@ impl Harness {
             skew: Duration::zero(),
             name: "Alice".to_owned(),
             screen_id: None,
-            updates: UpdateWorker::new(pool.clone(), handler, fake.clone(), 10, wake)
-                .only_chat(telegram_id),
+            updates: UpdateWorker::new(
+                pool.clone(),
+                handler,
+                fake.clone(),
+                10,
+                wake,
+                tasklerq::security_audit::Audit::new(pool.clone()),
+            )
+            .only_chat(telegram_id),
             outbox: OutboxWorker::new(pool.clone(), fake).only_chat(telegram_id),
             clock: Instant::now(),
             next_update: NEXT_UPDATE.fetch_add(10_000, std::sync::atomic::Ordering::Relaxed),

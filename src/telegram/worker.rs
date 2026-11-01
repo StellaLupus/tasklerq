@@ -7,7 +7,7 @@
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -15,10 +15,21 @@ use futures_util::FutureExt;
 use sqlx::PgPool;
 use tokio::sync::{Notify, watch};
 
+use crate::metrics;
+use crate::rate_limit::RateLimiter;
+use crate::security_audit::{Audit, LimitKey, RateLimitEvent};
+
 use super::api::TelegramApi;
-use super::bot::{Bot, Outcome};
+use super::bot::{Answer, Bot, Outcome};
+use super::outbox::{self, Outgoing};
 use super::queue::{self, Failure};
-use super::update::{self, Classified};
+use super::rich;
+use super::update::{self, Classified, Incoming};
+
+/// Сколько обновлений пользователя обрабатывается за минуту.
+pub const UPDATES_PER_MINUTE: u32 = 20;
+/// Окно лимита обновлений, секунды.
+const UPDATE_WINDOW_SECONDS: i64 = 60;
 
 /// Итог одного прохода воркера.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +40,12 @@ pub enum Pass {
     Processed,
     /// Обработка не удалась; повтор или `dead` записаны в очередь.
     Failed(Failure),
+}
+
+/// Пропущенное обновление и событие о сработавшем лимите.
+struct Limited {
+    outcome: Outcome,
+    event: RateLimitEvent,
 }
 
 /// Обработчик обновления: граница, через которую тесты подменяют бота.
@@ -71,24 +88,32 @@ pub struct UpdateWorker {
     max_attempts: u32,
     wake_outbox: Arc<Notify>,
     only_chat: Option<i64>,
+    rate: Option<Arc<RateLimiter<i64>>>,
+    notices: Option<Arc<RateLimiter<i64>>>,
+    audit: Audit,
 }
 
 impl UpdateWorker {
-    /// Создать воркер. `wake_outbox` будит доставку после коммита.
+    /// Создать воркер. `wake_outbox` будит доставку после коммита, `audit` —
+    /// общий журнал событий процесса.
     pub fn new(
         pool: PgPool,
         handler: Arc<dyn UpdateHandler>,
         api: Arc<dyn TelegramApi>,
         max_attempts: u32,
         wake_outbox: Arc<Notify>,
+        audit: Audit,
     ) -> Self {
         Self {
+            audit,
             pool,
             handler,
             api,
             max_attempts,
             wake_outbox,
             only_chat: None,
+            rate: None,
+            notices: None,
         }
     }
 
@@ -99,12 +124,48 @@ impl UpdateWorker {
         self
     }
 
+    /// Ограничить обработку обновлений пользователя `per_minute` в минуту.
+    ///
+    /// Сообщение о превышении в чат отправляется не чаще раза за окно; ответ
+    /// на callback уходит на каждое превышение, чтобы убрать «часики».
+    #[must_use]
+    pub fn with_rate_limit(mut self, per_minute: u32) -> Self {
+        self.rate = Some(Arc::new(RateLimiter::with_window(
+            per_minute,
+            UPDATE_WINDOW_SECONDS,
+        )));
+        self.notices = Some(Arc::new(RateLimiter::with_window(1, UPDATE_WINDOW_SECONDS)));
+        self
+    }
+
     /// Обработать одно готовое обновление.
     pub async fn run_once(&self, now: DateTime<Utc>) -> Result<Pass, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         let Some(job) = queue::claim_next(&mut tx, now, self.only_chat).await? else {
             return Ok(Pass::Idle);
         };
+        let started = Instant::now();
+
+        // Лимит проверяется до обработчика: обновление сверх лимита не должно
+        // создавать или менять данные. Оно всё равно помечается обработанным,
+        // чтобы Telegram не повторял доставку.
+        //
+        // Слот расходуется только на первой попытке: повтор уже учтённого
+        // обновления не должен отнимать лимит у новых действий пользователя.
+        if job.attempts == 0
+            && let Some(limited) = self.rate_limited(&mut tx, &job, now).await?
+        {
+            queue::mark_processed(&mut tx, job.update_id, now).await?;
+            tx.commit().await?;
+            // Событие пишется после коммита отдельным соединением: отказ не
+            // должен исчезнуть вместе с транзакцией ответа.
+            self.audit.rate_limited(limited.event, now).await;
+            self.wake_outbox.notify_one();
+            self.answer(limited.outcome).await;
+            metrics::telegram_update("rate_limited");
+            log_update(job.update_id, "rate_limited", started);
+            return Ok(Pass::Processed);
+        }
 
         // Паника обработчика считается неудачной попыткой, как и ошибка базы:
         // иначе «ядовитое» обновление роняло бы воркер при каждом перезапуске
@@ -118,6 +179,8 @@ impl UpdateWorker {
                 tx.commit().await?;
                 self.wake_outbox.notify_one();
                 self.answer(outcome).await;
+                metrics::telegram_update("processed");
+                log_update(job.update_id, "processed", started);
                 return Ok(Pass::Processed);
             }
             Ok(Err(error)) => {
@@ -148,7 +211,91 @@ impl UpdateWorker {
                 "telegram update moved to the dead-letter queue"
             );
         }
+        let status = match failure {
+            Failure::Dead => "dead",
+            Failure::Retry(_) => "failed",
+        };
+        metrics::telegram_update(status);
+        log_update(job.update_id, status, started);
         Ok(Pass::Failed(failure))
+    }
+
+    /// Проверить лимит пользователя. `Some` — обновление пропущено, в нём
+    /// только ответ на callback; данные не изменены.
+    async fn rate_limited(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        job: &queue::Claimed,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Limited>, sqlx::Error> {
+        let Some(rate) = &self.rate else {
+            return Ok(None);
+        };
+        let Ok(parsed) = update::parse(&job.payload) else {
+            return Ok(None);
+        };
+        let Classified::Handle(incoming) = update::classify(&parsed) else {
+            return Ok(None);
+        };
+        let user_id = match &incoming {
+            Incoming::Text { sender, .. } | Incoming::Callback { sender, .. } => sender.id,
+        };
+        let decision = rate.check(user_id, now);
+        if decision.allowed {
+            return Ok(None);
+        }
+
+        let retry_after = decision
+            .retry_after
+            .unwrap_or_else(|| u64::try_from(rate.window_seconds()).unwrap_or(60));
+        tracing::warn!(
+            limit = rate.limit(),
+            user_id,
+            retry_after,
+            "telegram user is rate limited"
+        );
+
+        let answer = match incoming {
+            Incoming::Callback { query_id, .. } => Some(Answer {
+                query_id,
+                text: Some(rate_limited_text(retry_after)),
+                alert: false,
+            }),
+            Incoming::Text {
+                chat_id, sender, ..
+            } => {
+                let notify = self
+                    .notices
+                    .as_ref()
+                    .is_some_and(|gate| gate.check(sender.id, now).allowed);
+                if notify {
+                    outbox::enqueue(
+                        tx,
+                        chat_id,
+                        &Outgoing::Message {
+                            html: rich::escape(&rate_limited_text(retry_after)),
+                            rich: false,
+                        },
+                        None,
+                        now,
+                    )
+                    .await?;
+                }
+                None
+            }
+        };
+        Ok(Some(Limited {
+            outcome: Outcome { answer },
+            event: RateLimitEvent {
+                limit: crate::security_audit::TELEGRAM_LIMIT,
+                key: LimitKey::User(user_id),
+                retry_after,
+                household_id: None,
+                actor: crate::domain::models::Actor::system(
+                    crate::domain::models::ActorType::System,
+                ),
+            },
+        }))
     }
 
     async fn answer(&self, outcome: Outcome) {
@@ -189,6 +336,17 @@ impl UpdateWorker {
             }
         }
     }
+}
+
+/// Сообщение пользователю о превышении лимита; без пользовательского текста.
+fn rate_limited_text(retry_after: u64) -> String {
+    format!("Слишком часто. Попробуйте через {retry_after} с.")
+}
+
+/// Строка журнала об исходе обновления: только идентификатор, статус и время.
+fn log_update(update_id: i64, status: &'static str, started: Instant) {
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(update_id, status, duration_ms, "telegram update finished");
 }
 
 /// Long polling для локальной разработки: те же обновления попадают в ту же

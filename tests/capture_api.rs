@@ -21,6 +21,7 @@ use tasklerq::config::CaptureConfig;
 use tasklerq::home_assistant::{AiTask, GenerateData, HaError};
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
+use tasklerq::security_audit::Audit;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -94,7 +95,8 @@ fn app_with(
 ) -> Router {
     let ai: Option<Arc<dyn AiTask>> = ai.map(|ai| ai as Arc<dyn AiTask>);
     build_router(
-        AppState::new(pool.clone()).with_capture(CaptureState::new(config, ai, breaker, quota)),
+        AppState::new(pool.clone(), Audit::new(pool.clone()))
+            .with_capture(CaptureState::new(config, ai, breaker, quota)),
     )
 }
 
@@ -307,6 +309,131 @@ async fn a_token_in_a_query_parameter_is_not_accepted() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_token_in_a_query_parameter_is_not_accepted_on_any_route() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(
+        &db.pool,
+        household.household_id,
+        &["capture:write", "ha:read"],
+    )
+    .await;
+    let ai = StubAi::new(vec![Ok(two_purchases())]);
+    let app = app(&db.pool, ai.clone(), config());
+
+    for parameter in ["token", "access_token"] {
+        let (status, _, json) = call(
+            &app,
+            Method::POST,
+            &format!("/api/v1/capture?{parameter}={token}"),
+            None,
+            Some(body("купить молоко", "ha_voice", "auto")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{parameter}: {json}");
+        assert_error_envelope(&json, "unauthorized");
+
+        let uris = [
+            format!("/api/v1/lists?{parameter}={token}"),
+            format!(
+                "/api/v1/lists/{}/items?{parameter}={token}",
+                household.tasks_list_id
+            ),
+            format!("/api/v1/search?q=молоко&{parameter}={token}"),
+        ];
+        for uri in uris {
+            let (status, _, json) = call(&app, Method::GET, &uri, None, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}: {json}");
+            assert_error_envelope(&json, "unauthorized");
+        }
+    }
+
+    assert_eq!(ai.calls(), 0);
+    assert_eq!(item_count(&db.pool, household.household_id).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_query_token_is_not_accepted_on_capture_actions_and_writes() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(
+        &db.pool,
+        household.household_id,
+        &["capture:write", "ha:write"],
+    )
+    .await;
+    let ai = StubAi::new(vec![Ok(shopping("молоко"))]);
+    let app = app(&db.pool, ai.clone(), config());
+    let capture_id = auto_capture(&app, &token).await;
+    let item_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM items WHERE capture_id = $1 AND deleted_at IS NULL")
+            .bind(capture_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("capture item");
+    let lists_before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM lists WHERE household_id = $1")
+            .bind(household.household_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("list count");
+
+    for action in ["confirm", "cancel", "undo"] {
+        let uri = format!("{}?access_token={token}", action_uri(capture_id, action));
+        let (status, _, json) = call(&app, Method::POST, &uri, None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{action}: {json}");
+        assert_error_envelope(&json, "unauthorized");
+    }
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        &format!("/api/v1/captures/undo-last?token={token}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{json}");
+    assert_error_envelope(&json, "unauthorized");
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        &format!("/api/v1/lists?token={token}"),
+        None,
+        Some(json!({"kind": "checklist", "name": "Чужой список"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{json}");
+    assert_error_envelope(&json, "unauthorized");
+
+    let (status, _, json) = call(
+        &app,
+        Method::PATCH,
+        &format!("/api/v1/items/{item_id}?access_token={token}"),
+        None,
+        Some(json!({"version": 1, "title": "изменено"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{json}");
+    assert_error_envelope(&json, "unauthorized");
+
+    let title: String = sqlx::query_scalar("SELECT title FROM items WHERE id = $1")
+        .bind(item_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("item title");
+    assert_eq!(title, "молоко");
+    assert_eq!(live_items_in_capture(&db.pool, capture_id).await, 1);
+    let lists_after: i64 = sqlx::query_scalar("SELECT count(*) FROM lists WHERE household_id = $1")
+        .bind(household.household_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("list count");
+    assert_eq!(lists_after, lists_before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_body_over_sixteen_kilobytes_is_rejected_without_parsing() {
     let db = db().await;
     let household = support::create_household(&db.pool).await;
@@ -349,6 +476,41 @@ async fn text_over_the_configured_limit_is_rejected_before_the_llm() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_error_envelope(&json, "validation_error");
     assert_eq!(ai.calls(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exactly_the_text_limit_is_accepted_and_one_more_character_is_not() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(shopping("молоко"))]);
+    let app = app(&db.pool, ai.clone(), config());
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(body(&"a".repeat(2_000), "ha_voice", "auto")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["status"], "applied");
+    assert_eq!(ai.calls(), 1);
+    assert_eq!(item_count(&db.pool, household.household_id).await, 1);
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(body(&"a".repeat(2_001), "ha_voice", "auto")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{json}");
+    assert_error_envelope(&json, "validation_error");
+    assert_eq!(ai.calls(), 1);
+    assert_eq!(item_count(&db.pool, household.household_id).await, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -561,6 +723,46 @@ async fn auto_applies_two_purchases_and_returns_the_full_contract() {
         2,
         "each created item must have one created event"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_response_contains_only_the_items_created_by_this_capture() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let existing = support::create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &household.owner(),
+        support::new_item(household.shopping_list_id, "старое молоко"),
+    )
+    .await;
+    let ai = StubAi::new(vec![Ok(two_purchases())]);
+    let app = app(&db.pool, ai.clone(), config());
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(json!({"text": "купить молоко и хлеб", "source": "ha_voice",
+                    "mode": "auto", "hint": "shopping"})),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let items = json["items"].as_array().expect("items");
+    assert_eq!(items.len(), 2);
+    let ids: Vec<&str> = items
+        .iter()
+        .map(|item| item["id"].as_str().expect("item id"))
+        .collect();
+    let existing_id = existing.id.to_string();
+    assert!(!ids.contains(&existing_id.as_str()));
+    assert_eq!(items[0]["title"], "молоко");
+    assert_eq!(items[1]["title"], "хлеб");
+    assert_eq!(item_count(&db.pool, household.household_id).await, 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1312,6 +1514,45 @@ async fn a_capture_token_cannot_read_items() {
 
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_error_envelope(&json, "forbidden");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_characters_are_removed_from_the_stored_capture_text_and_items() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(json!({
+        "items": [{"target_kind": "shopping", "title": "молоко\u{7}"}]
+    }))]);
+    let app = app(&db.pool, ai.clone(), config());
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(body("купить\u{0} молоко\u{1}", "ha_voice", "auto")),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["items"][0]["title"], "молоко");
+    let capture_id =
+        Uuid::parse_str(json["capture_id"].as_str().expect("capture id")).expect("uuid");
+    let raw_text: String = sqlx::query_scalar("SELECT raw_text FROM capture_drafts WHERE id = $1")
+        .bind(capture_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("stored text");
+    assert_eq!(raw_text, "купить молоко");
+    let title: String = sqlx::query_scalar(
+        "SELECT title FROM items WHERE household_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(household.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("stored item");
+    assert_eq!(title, "молоко");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2429,6 +2670,83 @@ async fn capture_actions_require_the_scope_and_an_enabled_route() {
     }
 
     assert_eq!(item_count(&db.pool, household.household_id).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forbidden_capture_actions_leave_the_capture_and_its_items_untouched() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let weak = issue_token(&db.pool, household.household_id, &["ha:read"]).await;
+    let ai = StubAi::new(vec![
+        Ok(shopping("молоко")),
+        Ok(shopping("хлеб")),
+        Ok(shopping("сыр")),
+    ]);
+    let app = app(&db.pool, ai.clone(), config());
+
+    let confirm_id = draft_capture(&app, &token).await;
+    let (status, _, _) = call(
+        &app,
+        Method::POST,
+        &action_uri(confirm_id, "confirm"),
+        Some(&weak),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let status_text: String =
+        sqlx::query_scalar("SELECT status::text FROM capture_drafts WHERE id = $1")
+            .bind(confirm_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("draft status");
+    assert_eq!(status_text, "pending");
+    assert_eq!(item_count(&db.pool, household.household_id).await, 0);
+
+    // Черновик остался рабочим: тот же confirm с нужным scope применяется.
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        &action_uri(confirm_id, "confirm"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["status"], "applied");
+    assert_eq!(item_count(&db.pool, household.household_id).await, 1);
+
+    let cancel_id = draft_capture(&app, &token).await;
+    let (status, _, _) = call(
+        &app,
+        Method::POST,
+        &action_uri(cancel_id, "cancel"),
+        Some(&weak),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let status_text: String =
+        sqlx::query_scalar("SELECT status::text FROM capture_drafts WHERE id = $1")
+            .bind(cancel_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("draft status");
+    assert_eq!(status_text, "pending");
+
+    let applied_id = auto_capture(&app, &token).await;
+    let (status, _, _) = call(
+        &app,
+        Method::POST,
+        &action_uri(applied_id, "undo"),
+        Some(&weak),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(live_items_in_capture(&db.pool, applied_id).await, 1);
+    assert_eq!(ai.calls(), 3, "forbidden actions must not call the LLM");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

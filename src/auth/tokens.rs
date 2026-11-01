@@ -1,5 +1,7 @@
 //! API-токены: хеширование, проверка и контекст запроса.
 
+use std::fmt;
+
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -11,6 +13,7 @@ use crate::domain::error::DomainError;
 use crate::domain::identity::AuditEventType;
 use crate::domain::models::{Actor, ActorType, UserRole};
 use crate::domain::validation::normalize_text;
+use crate::redaction::REDACTED;
 use crate::storage::repositories::tokens::{self, ApiToken};
 use crate::storage::repositories::{audit, households};
 
@@ -21,17 +24,44 @@ pub const TOKEN_PREFIX: &str = "tlq_";
 /// Длина видимого префикса, по которому токен узнают в списках.
 const VISIBLE_PREFIX_LEN: usize = 12;
 /// Поддерживаемые scopes.
-pub const SCOPES: [&str; 3] = ["ha:read", "ha:write", "capture:write"];
+pub const SCOPES: [&str; 4] = ["ha:read", "ha:write", "capture:write", "metrics:read"];
 
-/// Ошибка аутентификации или авторизации.
+/// Ошибка авторизации: токену не хватает scope.
+///
+/// Ошибки проверки самого токена возвращает [`AuthenticateError`].
 #[derive(Debug, Error)]
 pub enum AuthError {
-    /// Токен отсутствует, неизвестен, отозван или истёк.
-    #[error("invalid or expired token")]
-    Unauthorized,
     /// Токену не хватает scope.
     #[error("token does not have the required scope: {0}")]
     Forbidden(String),
+}
+
+/// Ошибка проверки Bearer-токена.
+///
+/// Уже, чем [`AuthError`]: проверка токена не может вернуть `Forbidden`, эта
+/// ветка есть только у [`AuthContext::require_scope`]. Отдельный тип не даёт
+/// HTTP-слою обрабатывать невозможный случай.
+#[derive(Debug, Error)]
+pub enum AuthenticateError {
+    /// Токен отсутствует или неизвестен.
+    #[error("unknown token")]
+    Unknown,
+    /// Токен отозван.
+    #[error("revoked token")]
+    Revoked {
+        /// Идентификатор токена.
+        token_id: Uuid,
+        /// Household токена.
+        household_id: Uuid,
+    },
+    /// Срок токена истёк.
+    #[error("expired token")]
+    Expired {
+        /// Идентификатор токена.
+        token_id: Uuid,
+        /// Household токена.
+        household_id: Uuid,
+    },
     /// Ошибка базы данных.
     #[error("database error")]
     Database(#[from] sqlx::Error),
@@ -48,6 +78,9 @@ pub struct AuthContext {
     pub scopes: Vec<String>,
     /// Актор доменных операций.
     pub actor: Actor,
+    /// Шаблон маршрута запроса; заполняет HTTP-слой, нужен журналу безопасности
+    /// при нехватке scope.
+    pub route: Option<String>,
 }
 
 impl AuthContext {
@@ -62,12 +95,22 @@ impl AuthContext {
 }
 
 /// Выпущенный токен: открытое значение показывается один раз.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IssuedToken {
     /// Открытое значение токена.
     pub token: String,
     /// Запись без хеша.
     pub record: ApiToken,
+}
+
+impl fmt::Debug for IssuedToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IssuedToken")
+            .field("token", &REDACTED)
+            .field("record", &self.record)
+            .finish()
+    }
 }
 
 /// Сгенерировать токен: `tlq_` + 32 случайных байта в base64url.
@@ -193,33 +236,46 @@ pub fn hash_token(token: &str) -> String {
 }
 
 /// Проверить Bearer-токен и вернуть контекст.
-pub async fn authenticate(pool: &PgPool, token: &str) -> Result<Option<AuthContext>, AuthError> {
-    if !token.starts_with("tlq_") {
-        return Ok(None);
+///
+/// Отозванный и просроченный токены различаются в ошибке: HTTP-слой пишет
+/// причину отказа в журнал безопасности, не раскрывая её клиенту.
+pub async fn authenticate(pool: &PgPool, token: &str) -> Result<AuthContext, AuthenticateError> {
+    if !token.starts_with(TOKEN_PREFIX) {
+        return Err(AuthenticateError::Unknown);
     }
 
     let token_hash = hash_token(token);
     let now = chrono::Utc::now();
     let mut conn = pool.acquire().await?;
 
-    let Some(record) = tokens::find_valid(&mut conn, &token_hash, now)
+    let Some(record) = tokens::find_by_hash(&mut conn, &token_hash)
         .await
-        .map_err(|error| match error {
-            crate::domain::error::DomainError::Database(error) => AuthError::Database(error),
-            _ => AuthError::Unauthorized,
-        })?
+        .map_err(database_error)?
     else {
-        return Ok(None);
+        return Err(AuthenticateError::Unknown);
     };
+
+    if record.revoked_at.is_some() {
+        return Err(AuthenticateError::Revoked {
+            token_id: record.id,
+            household_id: record.household_id,
+        });
+    }
+    if record
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= now)
+    {
+        return Err(AuthenticateError::Expired {
+            token_id: record.id,
+            household_id: record.household_id,
+        });
+    }
 
     tokens::touch(&mut conn, record.id, now)
         .await
-        .map_err(|error| match error {
-            crate::domain::error::DomainError::Database(error) => AuthError::Database(error),
-            _ => AuthError::Unauthorized,
-        })?;
+        .map_err(database_error)?;
 
-    Ok(Some(AuthContext {
+    Ok(AuthContext {
         token_id: record.id,
         household_id: record.household_id,
         scopes: record.scopes,
@@ -228,5 +284,41 @@ pub async fn authenticate(pool: &PgPool, token: &str) -> Result<Option<AuthConte
             role: Some(UserRole::Owner),
             actor_type: ActorType::HomeAssistant,
         },
-    }))
+        route: None,
+    })
+}
+
+fn database_error(error: DomainError) -> AuthenticateError {
+    match error {
+        DomainError::Database(error) => AuthenticateError::Database(error),
+        _ => AuthenticateError::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn issued_token_debug_hides_the_raw_value() {
+        let now = Utc::now();
+        let issued = IssuedToken {
+            token: "tlq_SECRET-debug-token".into(),
+            record: ApiToken {
+                id: Uuid::now_v7(),
+                household_id: Uuid::now_v7(),
+                name: "test".into(),
+                prefix: "tlq_SECRET".into(),
+                scopes: vec!["ha:read".into()],
+                expires_at: None,
+                revoked_at: None,
+                last_used_at: None,
+                created_at: now,
+            },
+        };
+
+        let rendered = format!("{issued:?}");
+        assert!(!rendered.contains("tlq_SECRET-debug-token"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
 }

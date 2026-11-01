@@ -19,6 +19,7 @@ use tasklerq::config::CaptureConfig;
 use tasklerq::home_assistant::{AiTask, GenerateData, HaError};
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
+use tasklerq::security_audit::Audit;
 use tokio::sync::Notify;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -161,12 +162,14 @@ fn config() -> CaptureConfig {
 }
 
 fn app(pool: &PgPool, ai: Arc<dyn AiTask>) -> Router {
-    build_router(AppState::new(pool.clone()).with_capture(CaptureState::new(
-        config(),
-        Some(ai),
-        Arc::new(CircuitBreaker::default()),
-        200,
-    )))
+    build_router(
+        AppState::new(pool.clone(), Audit::new(pool.clone())).with_capture(CaptureState::new(
+            config(),
+            Some(ai),
+            Arc::new(CircuitBreaker::default()),
+            200,
+        )),
+    )
 }
 
 fn app_with(
@@ -177,7 +180,8 @@ fn app_with(
     quota: u32,
 ) -> Router {
     build_router(
-        AppState::new(pool.clone()).with_capture(CaptureState::new(config, ai, breaker, quota)),
+        AppState::new(pool.clone(), Audit::new(pool.clone()))
+            .with_capture(CaptureState::new(config, ai, breaker, quota)),
     )
 }
 

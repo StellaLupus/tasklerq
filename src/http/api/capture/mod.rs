@@ -36,6 +36,7 @@ use crate::domain::error::DomainError;
 use crate::domain::models::{CaptureMode, CaptureSource, Item, List, ListKind};
 use crate::domain::validation::{MAX_TITLE, sanitize};
 use crate::home_assistant::{AiTask, MAX_GENERATE_TIMEOUT};
+use crate::security_audit::{self, LimitKey, LlmValidation, RateLimitEvent};
 use crate::storage::repositories::capture_requests;
 use crate::storage::repositories::capture_requests::Reserved;
 use crate::storage::repositories::drafts::Draft;
@@ -94,7 +95,7 @@ impl FromRequestParts<AppState> for CaptureAuth {
     ) -> Result<Self, Self::Rejection> {
         let auth =
             <AuthContext as FromRequestParts<AppState>>::from_request_parts(parts, state).await?;
-        require_capture(&auth)?;
+        require_capture(state, &auth).await?;
         Ok(Self(auth))
     }
 }
@@ -287,9 +288,16 @@ async fn capture_inner(
         .as_ref()
         .ok_or_else(|| ApiError::not_found("Route not found"))?;
 
+    let source: CaptureSource = request.source.into();
+    // Идентификатор попытки для журнала и ответа `rejected`; у применённого
+    // capture в ответе и журнале будет идентификатор черновика. При повторе
+    // этот же идентификатор закрепляется за резервом ключа.
+    let capture_id = Uuid::now_v7();
+
     let text = request.text.trim().to_owned();
     let length = text.chars().count();
     if length == 0 || length > usize::try_from(capture.config.max_text_chars).unwrap_or(0) {
+        log_capture(source, "invalid", capture_id);
         return Err(ApiError::validation(format!(
             "text must be between 1 and {} characters",
             capture.config.max_text_chars
@@ -297,22 +305,49 @@ async fn capture_inner(
     }
 
     let now = Utc::now();
-    let source: CaptureSource = request.source.into();
-    // Идентификатор попытки для журнала и ответа `rejected`; у применённого
-    // capture в ответе и журнале будет идентификатор черновика. При повторе
-    // этот же идентификатор закрепляется за резервом ключа.
-    let capture_id = Uuid::now_v7();
 
     // Лимит частоты проверяется до разбора ключа: запрос с невалидным ключом —
     // такой же запрос и тоже расходует лимит.
     let decision = capture.rate.check(auth.token_id, now);
     if !decision.allowed {
+        tracing::warn!(
+            limit = capture.rate.limit(),
+            household_id = %auth.household_id,
+            "capture requests are rate limited"
+        );
+        state
+            .audit
+            .rate_limited(
+                RateLimitEvent {
+                    limit: crate::security_audit::CAPTURE_LIMIT,
+                    key: LimitKey::Token(auth.token_id),
+                    retry_after: decision.retry_after.unwrap_or(60),
+                    household_id: Some(auth.household_id),
+                    actor: auth.actor.clone(),
+                },
+                now,
+            )
+            .await;
+        log_capture(source, "rate_limited", capture_id);
         return Err(ApiError::rate_limited("Too many capture requests")
             .with_retry_after(decision.retry_after.unwrap_or(60)));
     }
 
-    let header = header_key(headers)?;
-    let idempotency_key = resolve_idempotency_key(header, request.idempotency_key.as_deref())?;
+    let header = match header_key(headers) {
+        Ok(header) => header,
+        Err(error) => {
+            log_capture(source, "invalid", capture_id);
+            return Err(error);
+        }
+    };
+    let idempotency_key = match resolve_idempotency_key(header, request.idempotency_key.as_deref())
+    {
+        Ok(key) => key,
+        Err(error) => {
+            log_capture(source, "invalid", capture_id);
+            return Err(error);
+        }
+    };
     let request_hash = idempotency_key
         .as_ref()
         .map(|_| request_hash(&text, source, request.mode, request.hint, request.list_id));
@@ -358,12 +393,14 @@ async fn capture_inner(
                 return Ok(Json(response));
             }
             Reserved::InProgress => {
+                log_capture(source, "conflict", capture_id);
                 return Err(ApiError::conflict(
                     "Capture with this Idempotency-Key is still in progress",
                 )
                 .with_retry_after(IN_PROGRESS_RETRY_AFTER));
             }
             Reserved::Mismatch => {
+                log_capture(source, "conflict", capture_id);
                 return Err(ApiError::validation(
                     "Idempotency-Key was already used with a different request",
                 ));
@@ -377,6 +414,7 @@ async fn capture_inner(
         Some(list_id) => match lists::get_visible(&mut conn, auth.household_id, list_id).await {
             Ok(list) => Some(list),
             Err(DomainError::NotFound) => {
+                log_capture(source, "invalid", capture_id);
                 return Err(ApiError::validation("Unknown list"));
             }
             Err(error) => return Err(error.into()),
@@ -529,6 +567,22 @@ async fn capture_inner(
                 }
                 Failure::Parse(error) => {
                     tracing::warn!(error = error.code(), "llm capture response rejected");
+                    state
+                        .audit
+                        .llm_validation_failed(
+                            LlmValidation {
+                                source: security_audit::capture_source_label(source),
+                                stage: "parse",
+                                code: error.code(),
+                                prompt_version: PROMPT_VERSION,
+                                household_id: auth.household_id,
+                                actor: integration_actor(draft::item_source(source)),
+                                capture_id: Some(capture_id),
+                                job_id: None,
+                            },
+                            last_finished_at,
+                        )
+                        .await;
                 }
             }
 
@@ -906,6 +960,7 @@ async fn apply_fallback(
         source = source_name(input.source),
         "capture fell back to the raw text"
     );
+    crate::metrics::capture_fallback(source_name(input.source));
     log_capture(input.source, "fallback", applied.capture_id);
     Ok(Json(fallback_response(&applied, kind)))
 }
@@ -1163,8 +1218,10 @@ fn source_name(source: CaptureSource) -> &'static str {
 
 /// Одна строка на capture; текст, `speech` и заголовки сюда не попадают.
 fn log_capture(source: CaptureSource, status: &str, capture_id: Uuid) {
+    let source = source_name(source);
+    crate::metrics::capture(source, status);
     tracing::info!(
-        source = source_name(source),
+        source,
         status,
         capture_id = %capture_id,
         "capture finished"

@@ -19,7 +19,7 @@ pub async fn list(
     State(state): State<AppState>,
     auth: AuthContext,
 ) -> Result<Json<Vec<List>>, ApiError> {
-    require_read(&auth)?;
+    require_read(&state, &auth).await?;
     let mut conn = connection(&state).await?;
     Ok(Json(lists::list(&mut conn, auth.household_id).await?))
 }
@@ -30,7 +30,7 @@ pub async fn create(
     auth: AuthContext,
     Json(request): Json<CreateListRequest>,
 ) -> Result<(StatusCode, Json<List>), ApiError> {
-    require_write(&auth)?;
+    require_write(&state, &auth).await?;
     if request.kind == ListKind::Tasks {
         return Err(ApiError::validation(
             "additional lists must have kind shopping or checklist",
@@ -58,7 +58,7 @@ pub async fn update(
     Path(id): Path<Uuid>,
     Json(request): Json<UpdateListRequest>,
 ) -> Result<Json<List>, ApiError> {
-    require_write(&auth)?;
+    require_write(&state, &auth).await?;
 
     let mut tx = transaction(&state).await?;
     let list = lists::update(
@@ -82,7 +82,7 @@ pub async fn delete(
     auth: AuthContext,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    require_write(&auth)?;
+    require_write(&state, &auth).await?;
 
     let mut tx = transaction(&state).await?;
     lists::delete(

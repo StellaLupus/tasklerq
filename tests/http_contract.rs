@@ -10,6 +10,7 @@ use http_body_util::BodyExt;
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use tasklerq::http::router::{AppState, build_router};
+use tasklerq::security_audit::Audit;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -19,7 +20,7 @@ fn test_app() -> Router {
         .acquire_timeout(Duration::from_millis(100))
         .connect_lazy("postgres://tasklerq:password@127.0.0.1:1/tasklerq")
         .expect("lazy pool should be valid");
-    build_router(AppState::new(pool))
+    build_router(AppState::new(pool.clone(), Audit::new(pool)))
 }
 
 async fn send(request: Request<Body>) -> (StatusCode, HeaderMap, Value) {

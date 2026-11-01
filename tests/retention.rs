@@ -842,3 +842,49 @@ async fn retention_worker_survives_a_failed_and_a_panicked_run() {
         .expect("worker must stop on shutdown")
         .expect("worker task must join");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_keeps_audit_events_for_the_configured_minimum() {
+    use tasklerq::domain::identity::AuditEventType;
+    use tasklerq::domain::models::{Actor, ActorType};
+    use tasklerq::storage::repositories::audit;
+
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let actor = Actor::system(ActorType::System);
+
+    // 89 дней — внутри обещанного минимума журнала; 91 — за настроенным сроком.
+    for (age_days, label) in [(89, "kept"), (91, "purged")] {
+        audit::record(
+            &mut conn,
+            Some(household.household_id),
+            &actor,
+            AuditEventType::AuthFailed,
+            serde_json::json!({"label": label}),
+            now - Duration::days(age_days),
+        )
+        .await
+        .expect("event");
+    }
+    drop(conn);
+
+    let config = RetentionConfig {
+        audit_days: 90,
+        ..config()
+    };
+    retention::run(&db.pool, &config, now)
+        .await
+        .expect("retention");
+
+    let labels: Vec<String> = sqlx::query_scalar(
+        "SELECT payload->>'label' FROM audit_events
+         WHERE household_id = $1 AND payload ? 'label'",
+    )
+    .bind(household.household_id)
+    .fetch_all(&db.pool)
+    .await
+    .expect("labels");
+    assert_eq!(labels, vec!["kept".to_owned()]);
+}

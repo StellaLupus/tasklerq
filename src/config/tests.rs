@@ -131,6 +131,24 @@ fn defaults_match_documented_values() {
 }
 
 #[test]
+fn database_url_preserves_sslmode() {
+    let mut vars = base_env();
+    vars.insert(
+        "DATABASE_URL".to_owned(),
+        "postgres://tasklerq:db-password@db.example:5432/tasklerq?sslmode=require".to_owned(),
+    );
+
+    let config = config(vars).expect("config with sslmode");
+
+    // Настройку TLS выбирает строка подключения; конфигурация не должна её
+    // терять или переписывать. Для внешней БД `sslmode=require` — 15.2.
+    assert!(
+        config.database.url.expose().contains("sslmode=require"),
+        "sslmode must survive config parsing"
+    );
+}
+
+#[test]
 fn environment_values_are_strict() {
     for (raw, expected) in [
         ("production", Some(Environment::Production)),
@@ -685,4 +703,43 @@ fn errors_do_not_echo_secret_values() {
     let message = error.to_string();
     assert_invalid(error, "DATABASE_URL");
     assert!(!message.contains("db-secret-password"));
+}
+
+#[test]
+fn telegram_api_base_url_allows_http_only_in_development() {
+    let mut vars = base_env();
+    vars.insert(
+        "TELEGRAM_API_BASE_URL".to_owned(),
+        "http://127.0.0.1:8080".to_owned(),
+    );
+    let loaded = config(vars).expect("http is allowed in development");
+    assert_eq!(loaded.telegram.api_base_url.expect("url").scheme(), "http");
+
+    let mut vars = base_env();
+    vars.insert("ENV".to_owned(), "production".to_owned());
+    vars.insert(
+        "PUBLIC_BASE_URL".to_owned(),
+        "https://tasklerq.example.com".to_owned(),
+    );
+    vars.insert(
+        "TELEGRAM_API_BASE_URL".to_owned(),
+        "http://127.0.0.1:8080".to_owned(),
+    );
+    assert_invalid(
+        config(vars).expect_err("http must be rejected outside development"),
+        "TELEGRAM_API_BASE_URL",
+    );
+
+    let mut vars = base_env();
+    vars.insert("ENV".to_owned(), "production".to_owned());
+    vars.insert(
+        "PUBLIC_BASE_URL".to_owned(),
+        "https://tasklerq.example.com".to_owned(),
+    );
+    vars.insert(
+        "TELEGRAM_API_BASE_URL".to_owned(),
+        "https://api.telegram.org".to_owned(),
+    );
+    let loaded = config(vars).expect("https is always allowed");
+    assert_eq!(loaded.telegram.api_base_url.expect("url").scheme(), "https");
 }

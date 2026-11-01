@@ -470,6 +470,7 @@ async fn mark_dead(
         // текста сообщения и токенов. Уровень `error` одинаков для всех
         // отказов, включая отказ Telegram: ручное разбирательство нужно в
         // каждом случае.
+        crate::metrics::outbox_dead();
         tracing::error!(
             seq,
             error = code,

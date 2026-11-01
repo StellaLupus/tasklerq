@@ -15,6 +15,7 @@ use crate::config::Config;
 use crate::http::api::capture::CaptureState;
 use crate::http::router::{AppState, build_router};
 use crate::jobs::retention::RetentionWorker;
+use crate::security_audit::Audit;
 use crate::telegram::runtime::{self, StartError};
 
 /// Собранное приложение и его фоновые задачи.
@@ -35,12 +36,37 @@ pub async fn build_application(
     pool: PgPool,
     shutdown: watch::Receiver<bool>,
 ) -> Result<Application, StartError> {
+    build_application_with_update_limit(config, pool, shutdown, None).await
+}
+
+/// Собрать приложение с явным лимитом обновлений Telegram на пользователя.
+///
+/// `None` — боевой лимит. Переопределение используется нагрузочным тестом,
+/// который должен провести все обновления через обработчик, а не через ветку
+/// `rate_limited`.
+pub async fn build_application_with_update_limit(
+    config: &Config,
+    pool: PgPool,
+    shutdown: watch::Receiver<bool>,
+    update_limit: Option<u32>,
+) -> Result<Application, StartError> {
     let ai = runtime::build_ai(&config.llm);
     let breaker = Arc::new(CircuitBreaker::default());
-    let telegram =
-        runtime::start(config, &pool, shutdown.clone(), ai.clone(), breaker.clone()).await?;
+    // Один журнал событий на процесс: вебхук, воркеры, бот и capture-воркер
+    // делят состояние подавления и счётчики отказов.
+    let audit = Audit::new(pool.clone());
+    let telegram = runtime::start_with_update_limit(
+        config,
+        &pool,
+        shutdown.clone(),
+        ai.clone(),
+        breaker.clone(),
+        audit.clone(),
+        update_limit,
+    )
+    .await?;
 
-    let mut state = AppState::new(pool.clone());
+    let mut state = AppState::new(pool.clone(), audit);
     let mut workers = Vec::new();
     if let Some(runtime) = telegram {
         if let Some(ingress) = runtime.ingress {

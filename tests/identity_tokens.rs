@@ -33,6 +33,10 @@ fn scopes_are_validated_and_deduplicated() {
     ]))
     .expect("known scopes");
     assert_eq!(valid, scopes(&["ha:read", "ha:write", "capture:write"]));
+    assert_eq!(
+        validate_scopes(&scopes(&["metrics:read"])).expect("metrics scope"),
+        scopes(&["metrics:read"])
+    );
     assert!(validate_scopes(&[]).is_err());
     assert!(validate_scopes(&scopes(&["admin"])).is_err());
 }
@@ -288,6 +292,18 @@ async fn cli_creates_lists_and_revokes_tokens() {
     let id = field("id");
     assert_eq!(field("scopes"), "ha:read,ha:write");
 
+    // CLI пишет событие создания токена без открытого значения.
+    let payload: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload FROM audit_events
+         WHERE event_type = 'token_created' AND payload->>'token_id' = $1",
+    )
+    .bind(&id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("token_created event");
+    assert_eq!(payload["name"], "cli token");
+    assert!(!payload.to_string().contains(&token));
+
     let (status, _) =
         support::request(&app, Method::GET, "/api/v1/lists", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
@@ -309,9 +325,23 @@ async fn cli_creates_lists_and_revokes_tokens() {
     assert!(listing.contains(&id) && listing.contains("active"));
     assert!(!listing.contains(&token), "list must not print secrets");
 
-    let revoke = bin()
+    // Без TTY подтверждение не получить: без --yes токен остаётся активным.
+    let unconfirmed = bin()
         .env("DATABASE_URL", &url)
         .args(["admin", "token", "revoke", &id])
+        .output()
+        .await
+        .expect("cli should run");
+    assert!(!unconfirmed.status.success(), "{unconfirmed:?}");
+    let stderr = String::from_utf8(unconfirmed.stderr).expect("utf8");
+    assert!(stderr.contains("нужно подтверждение (--yes)"), "{stderr}");
+    let (status, _) =
+        support::request(&app, Method::GET, "/api/v1/lists", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK, "the token must stay active");
+
+    let revoke = bin()
+        .env("DATABASE_URL", &url)
+        .args(["admin", "token", "revoke", &id, "--yes"])
         .output()
         .await
         .expect("cli should run");

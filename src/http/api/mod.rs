@@ -14,6 +14,7 @@ pub mod snapshot;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, patch, post};
+use chrono::Utc;
 use sqlx::Transaction;
 use sqlx::postgres::Postgres;
 
@@ -60,22 +61,46 @@ pub fn router(state: &AppState) -> Router<AppState> {
     router
 }
 
+/// Проверить scope и записать отказ в журнал безопасности.
+///
+/// Отказ не меняет ответ: клиент получает тот же `403`, запись идёт отдельной
+/// короткой операцией и её ошибка не влияет на запрос.
+pub async fn require_scope(
+    state: &AppState,
+    auth: &AuthContext,
+    scope: &'static str,
+) -> Result<(), ApiError> {
+    if auth.require_scope(scope).is_ok() {
+        return Ok(());
+    }
+
+    state
+        .audit
+        .api_auth_failed(
+            "missing_scope",
+            auth.route.as_deref().unwrap_or("unmatched"),
+            Some((auth.token_id, auth.household_id)),
+            Utc::now(),
+        )
+        .await;
+    Err(ApiError::forbidden(format!(
+        "Token is missing scope {scope}"
+    )))
+}
+
 /// Проверить scope на чтение.
-pub fn require_read(auth: &AuthContext) -> Result<(), ApiError> {
-    auth.require_scope("ha:read")
-        .map_err(|_| ApiError::forbidden("Token is missing scope ha:read"))
+pub async fn require_read(state: &AppState, auth: &AuthContext) -> Result<(), ApiError> {
+    require_scope(state, auth, "ha:read").await
 }
 
 /// Проверить scope на запись.
-pub fn require_write(auth: &AuthContext) -> Result<(), ApiError> {
-    auth.require_scope("ha:write")
-        .map_err(|_| ApiError::forbidden("Token is missing scope ha:write"))
+pub async fn require_write(state: &AppState, auth: &AuthContext) -> Result<(), ApiError> {
+    require_scope(state, auth, "ha:write").await
 }
 
 /// Проверить scope на внешний capture.
-pub fn require_capture(auth: &AuthContext) -> Result<(), ApiError> {
-    auth.require_scope("capture:write")
-        .map_err(|_| ApiError::forbidden("Token is missing scope capture:write"))
+pub async fn require_capture(state: &AppState, auth: &AuthContext) -> Result<(), ApiError> {
+    require_scope(state, auth, "capture:write").await
 }
 
 /// Получить соединение из пула.

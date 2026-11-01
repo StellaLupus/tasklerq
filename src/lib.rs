@@ -9,6 +9,10 @@ pub mod domain;
 pub mod home_assistant;
 pub mod http;
 pub mod jobs;
+pub mod metrics;
+pub mod rate_limit;
+pub mod redaction;
+pub mod security_audit;
 pub mod storage;
 pub mod telegram;
 

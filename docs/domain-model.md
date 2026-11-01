@@ -217,7 +217,7 @@ CHECK ((recurrence_freq = 'monthly') = (recurrence_month_rule IS NOT NULL))
 | `name` | `text` | 1..64. |
 | `token_hash` | `text` | UNIQUE, SHA-256. |
 | `prefix` | `text` | Первые символы для отображения. |
-| `scopes` | `text[]` | `ha:read`, `ha:write`. |
+| `scopes` | `text[]` | `ha:read`, `ha:write`, `capture:write`, `metrics:read`. |
 | `created_by_user_id` | `uuid` | NULL для CLI. |
 | `expires_at` | `timestamptz` | NULL. |
 | `last_used_at` | `timestamptz` | NULL. |

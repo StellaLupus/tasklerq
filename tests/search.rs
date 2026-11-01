@@ -454,3 +454,57 @@ async fn due_upper_bound_is_exclusive_at_local_midnight() {
         .expect("search");
     assert_eq!(hits.len(), 2, "both items due on 3 November are found");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_treats_sql_and_like_syntax_as_plain_text() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let actor = household.owner();
+    let mut created = Vec::new();
+    for title in [
+        "Скидка 100% сегодня",
+        "Файл a_b",
+        "Путь C:\\tmp",
+        "Обычная задача",
+    ] {
+        created.push(
+            support::create_item(
+                &db.pool,
+                &household,
+                household.tasks_list_id,
+                &actor,
+                support::new_item(household.tasks_list_id, title),
+            )
+            .await,
+        );
+    }
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    for query in ["'; DROP TABLE items; --", "%", "_", "\\"] {
+        let filters = SearchFilters {
+            q: Some(query.into()),
+            ..SearchFilters::default()
+        };
+        let result = items::search(&mut conn, household.household_id, "Europe/Moscow", &filters)
+            .await
+            .unwrap_or_else(|error| panic!("search `{query}` failed: {error}"));
+        let ids: HashSet<Uuid> = result.0.iter().map(|hit| hit.item.id).collect();
+        let expected = match query {
+            "%" => HashSet::from([created[0].id]),
+            "_" => HashSet::from([created[1].id]),
+            "\\" => HashSet::from([created[2].id]),
+            _ => HashSet::new(),
+        };
+        assert_eq!(ids, expected, "query `{query}` must be treated as text");
+    }
+
+    // Таблица не изменилась: все элементы на месте после «инъекции».
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM items WHERE household_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(household.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("items table must still exist");
+    assert_eq!(count, 4);
+}

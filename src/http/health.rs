@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::VERSION;
+use crate::telegram::queue;
 
 use super::error::ApiError;
 use super::router::AppState;
@@ -30,8 +31,8 @@ pub async fn live() -> Json<HealthResponse> {
     })
 }
 
-/// `GET /health/ready`: база доступна и принимает запросы, а очередь обновлений
-/// Telegram не застряла (если воркер запущен).
+/// `GET /health/ready`: база доступна и принимает запросы, миграции применены,
+/// а очередь обновлений Telegram не застряла (если воркер запущен).
 pub async fn ready(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
     sqlx::query("SELECT 1")
         .execute(&state.pool)
@@ -41,18 +42,28 @@ pub async fn ready(State(state): State<AppState>) -> Result<Json<HealthResponse>
             ApiError::service_unavailable("Database is unavailable")
         })?;
 
+    let migrations = crate::storage::migrations::all_applied(&state.pool)
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "readiness migration check failed");
+            ApiError::service_unavailable("Database migrations are not applied")
+        })?;
+    if !migrations {
+        tracing::warn!("not all embedded migrations are applied");
+        return Err(ApiError::service_unavailable(
+            "Database migrations are not applied",
+        ));
+    }
+
     let now = Utc::now();
     if let Some(limit) = state.queue_lag_limit {
         // Упавший или остановленный воркер заметен по самому старому обновлению,
         // которое давно могло быть обработано.
-        let oldest: Option<DateTime<Utc>> = sqlx::query_scalar(
-            "SELECT min(available_at) FROM telegram_updates
-             WHERE status = 'pending' AND available_at <= $1",
-        )
-        .bind(now)
-        .fetch_one(&state.pool)
-        .await
-        .map_err(|error| {
+        let mut conn = state.pool.acquire().await.map_err(|error| {
+            tracing::warn!(error = %error, "readiness check failed");
+            ApiError::service_unavailable("Database is unavailable")
+        })?;
+        let oldest = queue::oldest_ready(&mut conn, now).await.map_err(|error| {
             tracing::warn!(error = %error, "readiness check failed");
             ApiError::service_unavailable("Database is unavailable")
         })?;
