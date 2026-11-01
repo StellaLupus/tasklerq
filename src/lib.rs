@@ -10,6 +10,7 @@ pub mod home_assistant;
 pub mod http;
 pub mod jobs;
 pub mod rate_limit;
+pub mod redaction;
 pub mod storage;
 pub mod telegram;
 

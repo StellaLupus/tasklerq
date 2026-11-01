@@ -16,6 +16,7 @@ use tasklerq::domain::error::DomainError;
 use tasklerq::domain::models::UserRole;
 use tasklerq::home_assistant::{AiTask, GenerateData, HttpAiTask, MAX_GENERATE_TIMEOUT};
 use tasklerq::http::server;
+use tasklerq::redaction;
 use tasklerq::storage;
 use tokio::net::TcpListener;
 use tokio::signal;
@@ -182,7 +183,8 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("tasklerq: {error:#}");
+            let message = redaction::sanitize(&format!("{error:#}"));
+            eprintln!("tasklerq: {message}");
             ExitCode::FAILURE
         }
     }
@@ -539,11 +541,12 @@ async fn healthcheck(url: &str) -> Result<()> {
         .build()
         .context("failed to build HTTP client")?;
 
+    let safe_url = redaction::redact_url(url);
     let response = client
         .get(url)
         .send()
         .await
-        .with_context(|| format!("healthcheck request to {url} failed"))?;
+        .with_context(|| format!("healthcheck request to {safe_url} failed"))?;
 
     if !response.status().is_success() {
         bail!("healthcheck failed with status {}", response.status());

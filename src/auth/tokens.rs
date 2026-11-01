@@ -1,5 +1,7 @@
 //! API-токены: хеширование, проверка и контекст запроса.
 
+use std::fmt;
+
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -11,6 +13,7 @@ use crate::domain::error::DomainError;
 use crate::domain::identity::AuditEventType;
 use crate::domain::models::{Actor, ActorType, UserRole};
 use crate::domain::validation::normalize_text;
+use crate::redaction::REDACTED;
 use crate::storage::repositories::tokens::{self, ApiToken};
 use crate::storage::repositories::{audit, households};
 
@@ -62,12 +65,22 @@ impl AuthContext {
 }
 
 /// Выпущенный токен: открытое значение показывается один раз.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IssuedToken {
     /// Открытое значение токена.
     pub token: String,
     /// Запись без хеша.
     pub record: ApiToken,
+}
+
+impl fmt::Debug for IssuedToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IssuedToken")
+            .field("token", &REDACTED)
+            .field("record", &self.record)
+            .finish()
+    }
 }
 
 /// Сгенерировать токен: `tlq_` + 32 случайных байта в base64url.
@@ -229,4 +242,32 @@ pub async fn authenticate(pool: &PgPool, token: &str) -> Result<Option<AuthConte
             actor_type: ActorType::HomeAssistant,
         },
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn issued_token_debug_hides_the_raw_value() {
+        let now = Utc::now();
+        let issued = IssuedToken {
+            token: "tlq_SECRET-debug-token".into(),
+            record: ApiToken {
+                id: Uuid::now_v7(),
+                household_id: Uuid::now_v7(),
+                name: "test".into(),
+                prefix: "tlq_SECRET".into(),
+                scopes: vec!["ha:read".into()],
+                expires_at: None,
+                revoked_at: None,
+                last_used_at: None,
+                created_at: now,
+            },
+        };
+
+        let rendered = format!("{issued:?}");
+        assert!(!rendered.contains("tlq_SECRET-debug-token"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
 }
