@@ -9,7 +9,7 @@
 use uuid::Uuid;
 
 use crate::domain::models::{List, ListKind};
-use crate::domain::validation::MAX_TITLE;
+use crate::domain::validation::{MAX_TITLE, sanitize};
 use crate::storage::repositories::{items, lists};
 use crate::telegram::views::{self, Lookup};
 
@@ -116,6 +116,8 @@ pub async fn start_create(
 
 /// Свободный текст без формы: черновик с готовым названием.
 pub async fn quick_add(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
+    let cleaned = sanitize(text);
+    let text = cleaned.trim();
     let household_id = ctx.household()?.id;
     if text.chars().count() > MAX_TITLE {
         ctx.banner(format!(

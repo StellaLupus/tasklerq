@@ -11,7 +11,7 @@ use support::{TestHousehold, create_item, db, new_item, next_telegram_id};
 use tasklerq::domain::models::{Actor, UserRole};
 use tasklerq::domain::settings::NotificationSettings;
 use tasklerq::jobs::scheduler::Scheduler;
-use tasklerq::telegram::bot::model::Action;
+use tasklerq::telegram::bot::model::{Action, Form};
 use tasklerq::telegram::callbacks::{self, NewToken, Scope};
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -1120,5 +1120,89 @@ async fn member_cannot_open_owner_screens_even_with_a_valid_token() {
             Some("Это доступно только владельцу."),
             "target {target:?}"
         );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_html_is_escaped_on_list_and_card_screens() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let title = "<script>alert(1)</script> & <b>\"x\"</b>";
+    let item = create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, title),
+    )
+    .await;
+    assert_eq!(item.title, title, "the title must be stored as plain text");
+
+    bot.press("Задачи").await;
+    let list = bot.screen();
+    assert!(!list.contains("<script>"), "{list}");
+    assert!(
+        list.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+        "{list}"
+    );
+    assert!(list.contains("&amp;"), "{list}");
+    assert!(!list.contains("<b>\"x\"</b>"), "{list}");
+
+    bot.press("script").await;
+    let card = bot.screen();
+    assert!(!card.contains("<script>"), "{card}");
+    assert!(
+        card.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+        "{card}"
+    );
+    assert!(card.contains("&amp;"), "{card}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_characters_are_removed_from_bot_quick_add_and_form_input() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+
+    // Быстрый ввод: черновик формы и сохранённый элемент не содержат
+    // управляющих символов.
+    bot.text("Купить\u{7} молоко\u{6}").await;
+    let data: String =
+        sqlx::query_scalar("SELECT data::text FROM conversation_states WHERE chat_id = $1")
+            .bind(bot.chat)
+            .fetch_one(&db.pool)
+            .await
+            .expect("conversation");
+    let form: Form = serde_json::from_str(&data).expect("form data");
+    match form {
+        Form::Create(form) => assert_eq!(form.draft.title, "Купить молоко"),
+        other => panic!("expected a create form, got {other:?}"),
+    }
+    bot.press("Сохранить").await;
+    let title: String = sqlx::query_scalar(
+        "SELECT title FROM items WHERE household_id = (
+             SELECT household_id FROM users WHERE telegram_user_id = $1
+         ) AND deleted_at IS NULL",
+    )
+    .bind(bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("item");
+    assert_eq!(title, "Купить молоко");
+
+    // Пошаговая форма: ввод названия очищается до сохранения в черновике.
+    bot.press("Добавить").await;
+    bot.text("Форма\u{1} ввод\u{2}").await;
+    let data: String =
+        sqlx::query_scalar("SELECT data::text FROM conversation_states WHERE chat_id = $1")
+            .bind(bot.chat)
+            .fetch_one(&db.pool)
+            .await
+            .expect("conversation");
+    let form: Form = serde_json::from_str(&data).expect("form data");
+    match form {
+        Form::Create(form) => assert_eq!(form.draft.title, "Форма ввод"),
+        other => panic!("expected a create form, got {other:?}"),
     }
 }

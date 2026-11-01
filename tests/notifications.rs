@@ -3928,3 +3928,53 @@ async fn digest_time_is_independent_between_members() {
     assert_eq!(messages(&db.pool, owner_chat).await.len(), 1);
     assert_eq!(messages(&db.pool, member_chat).await.len(), 1);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reminder_and_digest_escape_a_script_title() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    enable_digest(&db.pool, household.owner_id).await;
+    let title = "<script>alert(1)</script> & <b>\"x\"</b>";
+    create_task(
+        &db,
+        &household,
+        title,
+        Some(local_utc(moscow, day, 10, 0)),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let scheduler = scheduler(&db.pool);
+
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day, 8, 30))
+            .await
+            .expect("digest tick")
+            .delivered,
+        1
+    );
+    assert_eq!(
+        scheduler
+            .tick(local_utc(moscow, day, 9, 45))
+            .await
+            .expect("reminder tick")
+            .delivered,
+        1
+    );
+
+    let sent = messages(&db.pool, chat).await;
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    for html in &sent {
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(
+            html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "{html}"
+        );
+        assert!(html.contains("&amp;"), "{html}");
+    }
+}

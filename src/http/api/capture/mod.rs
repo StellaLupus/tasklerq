@@ -287,9 +287,16 @@ async fn capture_inner(
         .as_ref()
         .ok_or_else(|| ApiError::not_found("Route not found"))?;
 
+    let source: CaptureSource = request.source.into();
+    // Идентификатор попытки для журнала и ответа `rejected`; у применённого
+    // capture в ответе и журнале будет идентификатор черновика. При повторе
+    // этот же идентификатор закрепляется за резервом ключа.
+    let capture_id = Uuid::now_v7();
+
     let text = request.text.trim().to_owned();
     let length = text.chars().count();
     if length == 0 || length > usize::try_from(capture.config.max_text_chars).unwrap_or(0) {
+        log_capture(source, "invalid", capture_id);
         return Err(ApiError::validation(format!(
             "text must be between 1 and {} characters",
             capture.config.max_text_chars
@@ -297,11 +304,6 @@ async fn capture_inner(
     }
 
     let now = Utc::now();
-    let source: CaptureSource = request.source.into();
-    // Идентификатор попытки для журнала и ответа `rejected`; у применённого
-    // capture в ответе и журнале будет идентификатор черновика. При повторе
-    // этот же идентификатор закрепляется за резервом ключа.
-    let capture_id = Uuid::now_v7();
 
     // Лимит частоты проверяется до разбора ключа: запрос с невалидным ключом —
     // такой же запрос и тоже расходует лимит.
@@ -312,12 +314,26 @@ async fn capture_inner(
             household_id = %auth.household_id,
             "capture requests are rate limited"
         );
+        log_capture(source, "rate_limited", capture_id);
         return Err(ApiError::rate_limited("Too many capture requests")
             .with_retry_after(decision.retry_after.unwrap_or(60)));
     }
 
-    let header = header_key(headers)?;
-    let idempotency_key = resolve_idempotency_key(header, request.idempotency_key.as_deref())?;
+    let header = match header_key(headers) {
+        Ok(header) => header,
+        Err(error) => {
+            log_capture(source, "invalid", capture_id);
+            return Err(error);
+        }
+    };
+    let idempotency_key = match resolve_idempotency_key(header, request.idempotency_key.as_deref())
+    {
+        Ok(key) => key,
+        Err(error) => {
+            log_capture(source, "invalid", capture_id);
+            return Err(error);
+        }
+    };
     let request_hash = idempotency_key
         .as_ref()
         .map(|_| request_hash(&text, source, request.mode, request.hint, request.list_id));
@@ -363,12 +379,14 @@ async fn capture_inner(
                 return Ok(Json(response));
             }
             Reserved::InProgress => {
+                log_capture(source, "conflict", capture_id);
                 return Err(ApiError::conflict(
                     "Capture with this Idempotency-Key is still in progress",
                 )
                 .with_retry_after(IN_PROGRESS_RETRY_AFTER));
             }
             Reserved::Mismatch => {
+                log_capture(source, "conflict", capture_id);
                 return Err(ApiError::validation(
                     "Idempotency-Key was already used with a different request",
                 ));
@@ -382,6 +400,7 @@ async fn capture_inner(
         Some(list_id) => match lists::get_visible(&mut conn, auth.household_id, list_id).await {
             Ok(list) => Some(list),
             Err(DomainError::NotFound) => {
+                log_capture(source, "invalid", capture_id);
                 return Err(ApiError::validation("Unknown list"));
             }
             Err(error) => return Err(error.into()),

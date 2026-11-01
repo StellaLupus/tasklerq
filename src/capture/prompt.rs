@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 
 use super::context::CaptureContext;
 use crate::domain::models::ListKind;
+use crate::domain::validation::sanitize;
 
 /// Версия промпта; пишется в `llm_runs` и `capture_drafts`.
 pub const PROMPT_VERSION: &str = "capture-v3";
@@ -119,11 +120,7 @@ fn quote(value: &str) -> String {
 /// Убрать управляющие символы и разделители, которыми текст мог бы закрыть
 /// собственный блок и «выйти» в инструкции.
 fn neutralize_text(text: &str) -> String {
-    let cleaned: String = text
-        .chars()
-        .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
-        .collect();
-    cleaned
+    sanitize(text)
         .replace(TEXT_CLOSE, "USER_TEXT> >>")
         .replace(TEXT_OPEN, "< <<USER_TEXT")
 }

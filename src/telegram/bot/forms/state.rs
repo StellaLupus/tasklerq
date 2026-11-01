@@ -3,7 +3,9 @@
 use chrono::{Datelike, NaiveDate};
 
 use crate::domain::models::{ListKind, RecurrenceFreq};
-use crate::domain::validation::{MAX_NOTES, MAX_SUBTASKS, MAX_TAG, MAX_TAGS, MAX_TITLE, MAX_UNIT};
+use crate::domain::validation::{
+    MAX_NOTES, MAX_SUBTASKS, MAX_TAG, MAX_TAGS, MAX_TITLE, MAX_UNIT, sanitize,
+};
 use crate::telegram::ru;
 
 use super::MAX_QUANTITY;
@@ -103,7 +105,8 @@ pub(super) fn apply_text(
     today: NaiveDate,
     now_time: chrono::NaiveTime,
 ) -> Result<(), String> {
-    let text = text.trim();
+    let cleaned = sanitize(text);
+    let text = cleaned.trim();
     match step {
         Step::Title => {
             if text.is_empty() {
