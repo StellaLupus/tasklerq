@@ -50,12 +50,8 @@ fn app_with_webhook(pool: &PgPool, audit: Audit, per_second: u32) -> Router {
         per_second,
         1,
     );
-    build_router(
-        AppState::new(pool.clone())
-            .with_audit(audit)
-            .with_telegram(ingress),
-    )
-    .layer(MockConnectInfo(peer()))
+    build_router(AppState::new(pool.clone(), audit).with_telegram(ingress))
+        .layer(MockConnectInfo(peer()))
 }
 
 fn capture_config() -> CaptureConfig {
@@ -283,12 +279,9 @@ async fn rate_limits_are_audited_for_webhook_and_capture() {
     let mut config = capture_config();
     config.rate_limit_per_min = 1;
     let app = build_router(
-        AppState::new(db.pool.clone()).with_capture(CaptureState::new(
-            config,
-            None,
-            Arc::new(CircuitBreaker::default()),
-            200,
-        )),
+        AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_capture(
+            CaptureState::new(config, None, Arc::new(CircuitBreaker::default()), 200),
+        ),
     );
     let body = json!({"text": "Купить лекарство", "source": "api", "mode": "draft"});
     let (first, _) = support::request(
@@ -352,6 +345,7 @@ async fn the_telegram_update_limit_is_audited() {
         fake,
         10,
         Arc::new(Notify::new()),
+        Audit::new(db.pool.clone()),
     )
     .only_chat(chat)
     .with_rate_limit(1);
@@ -461,12 +455,14 @@ async fn llm_validation_failures_are_audited_for_api_and_telegram() {
         answer: json!({"items": LLM_RESPONSE}),
     });
     let app = build_router(
-        AppState::new(db.pool.clone()).with_capture(CaptureState::new(
-            capture_config(),
-            Some(ai),
-            Arc::new(CircuitBreaker::default()),
-            200,
-        )),
+        AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_capture(
+            CaptureState::new(
+                capture_config(),
+                Some(ai),
+                Arc::new(CircuitBreaker::default()),
+                200,
+            ),
+        ),
     );
     let (status, _) = support::request(
         &app,
@@ -513,6 +509,7 @@ async fn llm_validation_failures_are_audited_for_api_and_telegram() {
         }),
         Bot::new("tasklerqbot"),
         Arc::new(Notify::new()),
+        Audit::new(db.pool.clone()),
     )
     .only_chat(owner_chat);
     assert_eq!(
@@ -640,12 +637,14 @@ async fn no_secret_or_user_content_reaches_audit_payloads() {
         answer: json!({"items": LLM_RESPONSE}),
     });
     let app = build_router(
-        AppState::new(db.pool.clone()).with_capture(CaptureState::new(
-            capture_config(),
-            Some(ai),
-            Arc::new(CircuitBreaker::default()),
-            200,
-        )),
+        AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_capture(
+            CaptureState::new(
+                capture_config(),
+                Some(ai),
+                Arc::new(CircuitBreaker::default()),
+                200,
+            ),
+        ),
     );
     let _ = support::request(
         &app,
@@ -703,14 +702,9 @@ async fn a_broken_audit_does_not_change_the_response() {
         .expect("lazy pool");
 
     let app = build_router(
-        AppState::new(db.pool.clone())
-            .with_audit(Audit::new(dead.clone()))
-            .with_telegram(Ingress::with_rate_limit(
-                &SecretString::new(SECRET),
-                Arc::new(Notify::new()),
-                120,
-                1,
-            )),
+        AppState::new(db.pool.clone(), Audit::new(dead.clone())).with_telegram(
+            Ingress::with_rate_limit(&SecretString::new(SECRET), Arc::new(Notify::new()), 120, 1),
+        ),
     )
     .layer(MockConnectInfo(peer()));
 
@@ -730,7 +724,7 @@ async fn a_broken_audit_does_not_change_the_response() {
     assert_eq!(body["error"]["code"], "unauthorized");
 
     // API с отказавшим журналом.
-    let app = build_router(AppState::new(db.pool.clone()).with_audit(Audit::new(dead)));
+    let app = build_router(AppState::new(db.pool.clone(), Audit::new(dead)));
     let (status, body) = support::request(&app, Method::GET, "/api/v1/household", None, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["error"]["code"], "unauthorized");

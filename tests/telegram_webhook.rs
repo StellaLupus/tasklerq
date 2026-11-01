@@ -15,6 +15,7 @@ use sqlx::PgPool;
 use support::db;
 use tasklerq::config::SecretString;
 use tasklerq::http::router::{AppState, build_router};
+use tasklerq::security_audit::Audit;
 use tasklerq::telegram::webhook::{Ingress, MAX_BODY_BYTES, SECRET_HEADER, WEBHOOKS_PER_SECOND};
 use tokio::sync::Notify;
 use tower::ServiceExt;
@@ -28,7 +29,8 @@ fn peer() -> SocketAddr {
 
 fn app_for(pool: &PgPool, peer: SocketAddr) -> Router {
     let ingress = Ingress::new(&SecretString::new(SECRET), Arc::new(Notify::new()));
-    build_router(AppState::new(pool.clone()).with_telegram(ingress)).layer(MockConnectInfo(peer))
+    build_router(AppState::new(pool.clone(), Audit::new(pool.clone())).with_telegram(ingress))
+        .layer(MockConnectInfo(peer))
 }
 
 fn app_with_window(pool: &PgPool, peer: SocketAddr, window_seconds: i64) -> Router {
@@ -38,7 +40,8 @@ fn app_with_window(pool: &PgPool, peer: SocketAddr, window_seconds: i64) -> Rout
         WEBHOOKS_PER_SECOND,
         window_seconds,
     );
-    build_router(AppState::new(pool.clone()).with_telegram(ingress)).layer(MockConnectInfo(peer))
+    build_router(AppState::new(pool.clone(), Audit::new(pool.clone())).with_telegram(ingress))
+        .layer(MockConnectInfo(peer))
 }
 
 fn app(pool: &PgPool) -> Router {
@@ -227,9 +230,29 @@ async fn malformed_and_oversized_bodies_are_rejected() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deeply_nested_json_is_rejected_by_the_parser_limit() {
+    let db = db().await;
+    let app = app(&db.pool);
+
+    // serde_json по умолчанию ограничивает вложенность 128 уровнями. Тело
+    // валидно по размеру, но не должно разбираться глубже безопасного предела.
+    let body = format!(
+        "{{\"update_id\":5000030,\"nested\":{}{}}}",
+        "[".repeat(200),
+        "]".repeat(200)
+    );
+    let (status, body) = post(&app, Some(SECRET), body.into_bytes()).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "validation_error");
+    assert_eq!(stored(&db.pool, 5_000_030).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn route_is_absent_when_webhook_mode_is_off() {
     let db = db().await;
-    let app = build_router(AppState::new(db.pool.clone())).layer(MockConnectInfo(peer()));
+    let app = build_router(AppState::new(db.pool.clone(), Audit::new(db.pool.clone())))
+        .layer(MockConnectInfo(peer()));
 
     let (status, _) = post(&app, Some(SECRET), update(5_000_020, "private", 42)).await;
 
@@ -259,7 +282,9 @@ async fn only_post_is_allowed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn readiness_fails_while_an_update_waits_longer_than_the_limit() {
     let db = db().await;
-    let app = build_router(AppState::new(db.pool.clone()).with_queue_lag_limit(60));
+    let app = build_router(
+        AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_queue_lag_limit(60),
+    );
     let ready = |app: Router| async move {
         app.oneshot(
             Request::builder()

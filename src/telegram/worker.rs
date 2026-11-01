@@ -94,16 +94,18 @@ pub struct UpdateWorker {
 }
 
 impl UpdateWorker {
-    /// Создать воркер. `wake_outbox` будит доставку после коммита.
+    /// Создать воркер. `wake_outbox` будит доставку после коммита, `audit` —
+    /// общий журнал событий процесса.
     pub fn new(
         pool: PgPool,
         handler: Arc<dyn UpdateHandler>,
         api: Arc<dyn TelegramApi>,
         max_attempts: u32,
         wake_outbox: Arc<Notify>,
+        audit: Audit,
     ) -> Self {
         Self {
-            audit: Audit::new(pool.clone()),
+            audit,
             pool,
             handler,
             api,
@@ -119,13 +121,6 @@ impl UpdateWorker {
     #[must_use]
     pub fn only_chat(mut self, chat_id: i64) -> Self {
         self.only_chat = Some(chat_id);
-        self
-    }
-
-    /// Использовать общий журнал событий безопасности процесса.
-    #[must_use]
-    pub fn with_audit(mut self, audit: Audit) -> Self {
-        self.audit = audit;
         self
     }
 

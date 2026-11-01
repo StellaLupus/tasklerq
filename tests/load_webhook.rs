@@ -36,11 +36,14 @@ const USERS: usize = 10;
 const ITEMS: i64 = 10_000;
 const REQUESTS_PER_SECOND: u64 = 50;
 const LOAD_SECONDS: u64 = 60;
-/// Допуск роста очереди между первой и последней третью: одна секунда
-/// поступления запросов (50 обновлений).
-const QUEUE_GROWTH_TOLERANCE: i64 = 50;
+/// Допуск роста очереди между первой и последней третью.
+const QUEUE_GROWTH_TOLERANCE: i64 = 10;
 /// Сколько ждём опустошения очереди после последнего запроса.
 const DRAIN_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+/// Сколько ждём, пока метрики догонят уже обработанные обновления: счётчик
+/// увеличивается после коммита и ответа, то есть может отставать от пустой
+/// очереди.
+const METRIC_SETTLE_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 /// p99 webhook-ответа без LLM.
 const P99_LIMIT: StdDuration = StdDuration::from_millis(100);
 
@@ -373,6 +376,29 @@ fn metric_counter(text: &str, status: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Сколько обновлений учтено метриками после `before` по всем исходам.
+fn handled_since(before: &str, after: &str) -> u64 {
+    ["processed", "rate_limited", "failed", "dead"]
+        .iter()
+        .map(|status| metric_counter(after, status).saturating_sub(metric_counter(before, status)))
+        .sum()
+}
+
+/// Дождаться, пока метрики насчитают все отправленные обновления.
+///
+/// Счётчик `telegram_updates_total` увеличивается после коммита и ответа,
+/// поэтому пустая очередь ещё не означает, что метрики готовы.
+async fn wait_for_metrics(before: &str, sent: u64) -> String {
+    let started = Instant::now();
+    loop {
+        let after = metrics::render();
+        if handled_since(before, &after) >= sent || started.elapsed() >= METRIC_SETTLE_TIMEOUT {
+            return after;
+        }
+        sleep(StdDuration::from_millis(50)).await;
+    }
+}
+
 fn percentile(sorted: &[StdDuration], fraction: f64) -> StdDuration {
     if sorted.is_empty() {
         return StdDuration::ZERO;
@@ -460,9 +486,25 @@ async fn webhook_keeps_latency_and_queue_under_load() {
     ticker.set_missed_tick_behavior(MissedTickBehavior::Burst);
     let mut tasks = JoinSet::new();
     let mut latencies = Vec::new();
-    let mut samples = Vec::new();
-    let mut next_sample = StdDuration::from_secs(5);
     let mut sent = 0_u64;
+
+    // Очередь сэмплируется отдельной задачей: запрос к базе не должен
+    // задерживать тикер, который отправляет webhook-запросы.
+    let sample_pool = pool.clone();
+    let (sample_stop_tx, mut sample_stop_rx) = watch::channel(false);
+    let sampling = tokio::spawn(async move {
+        let mut samples = Vec::new();
+        let mut interval = tokio::time::interval(StdDuration::from_secs(5));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = interval.tick() => samples.push(sample_queue(&sample_pool, started).await),
+                _ = sample_stop_rx.changed() => break,
+            }
+        }
+        samples
+    });
 
     while started.elapsed() < StdDuration::from_secs(LOAD_SECONDS) {
         ticker.tick().await;
@@ -487,11 +529,6 @@ async fn webhook_keeps_latency_and_queue_under_load() {
             (status, began.elapsed())
         });
         sent += 1;
-
-        while started.elapsed() >= next_sample {
-            samples.push(sample_queue(&pool, started).await);
-            next_sample += StdDuration::from_secs(5);
-        }
     }
 
     while let Some(result) = tasks.join_next().await {
@@ -499,7 +536,6 @@ async fn webhook_keeps_latency_and_queue_under_load() {
         assert_eq!(status.as_u16(), 200, "every webhook must return 200");
         latencies.push(latency);
     }
-    samples.push(sample_queue(&pool, started).await);
 
     let drain_started = Instant::now();
     let counts = loop {
@@ -513,7 +549,14 @@ async fn webhook_keeps_latency_and_queue_under_load() {
         sleep(StdDuration::from_millis(100)).await;
     };
 
-    let after = metrics::render();
+    let _ = sample_stop_tx.send(true);
+    let mut samples = tokio::time::timeout(StdDuration::from_secs(5), sampling)
+        .await
+        .expect("sampling task stops")
+        .expect("sampling task");
+    samples.push(sample_queue(&pool, started).await);
+
+    let after = wait_for_metrics(&before, sent).await;
     let processed = metric_counter(&after, "processed") - metric_counter(&before, "processed");
     let rate_limited =
         metric_counter(&after, "rate_limited") - metric_counter(&before, "rate_limited");

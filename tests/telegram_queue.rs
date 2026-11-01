@@ -11,6 +11,7 @@ use serde_json::Value;
 use sqlx::PgConnection;
 use support::telegram::{FakeTelegram, Harness};
 use support::{db, next_telegram_id};
+use tasklerq::security_audit::Audit;
 use tasklerq::telegram::bot::Outcome;
 use tasklerq::telegram::queue::{self, Failure};
 use tasklerq::telegram::worker::{Pass, UPDATES_PER_MINUTE, UpdateHandler, UpdateWorker};
@@ -62,6 +63,7 @@ fn worker(
         FakeTelegram::new(),
         max,
         Arc::new(Notify::new()),
+        Audit::new(pool.clone()),
     )
     .only_chat(chat)
 }
@@ -463,9 +465,16 @@ fn limited_worker(
     handler: Arc<dyn UpdateHandler>,
     fake: Arc<FakeTelegram>,
 ) -> UpdateWorker {
-    UpdateWorker::new(pool.clone(), handler, fake, 10, Arc::new(Notify::new()))
-        .only_chat(chat)
-        .with_rate_limit(UPDATES_PER_MINUTE)
+    UpdateWorker::new(
+        pool.clone(),
+        handler,
+        fake,
+        10,
+        Arc::new(Notify::new()),
+        Audit::new(pool.clone()),
+    )
+    .only_chat(chat)
+    .with_rate_limit(UPDATES_PER_MINUTE)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -549,6 +558,7 @@ async fn a_retried_update_does_not_consume_the_rate_limit_twice() {
         fake,
         10,
         Arc::new(Notify::new()),
+        Audit::new(db.pool.clone()),
     )
     .only_chat(chat)
     .with_rate_limit(2);

@@ -131,6 +131,24 @@ fn defaults_match_documented_values() {
 }
 
 #[test]
+fn database_url_preserves_sslmode() {
+    let mut vars = base_env();
+    vars.insert(
+        "DATABASE_URL".to_owned(),
+        "postgres://tasklerq:db-password@db.example:5432/tasklerq?sslmode=require".to_owned(),
+    );
+
+    let config = config(vars).expect("config with sslmode");
+
+    // Настройку TLS выбирает строка подключения; конфигурация не должна её
+    // терять или переписывать. Для внешней БД `sslmode=require` — 15.2.
+    assert!(
+        config.database.url.expose().contains("sslmode=require"),
+        "sslmode must survive config parsing"
+    );
+}
+
+#[test]
 fn environment_values_are_strict() {
     for (raw, expected) in [
         ("production", Some(Environment::Production)),

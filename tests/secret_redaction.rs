@@ -19,6 +19,7 @@ use serde_json::json;
 use tasklerq::config::{Config, SecretString};
 use tasklerq::home_assistant::{AiTask, GenerateData, HttpAiTask};
 use tasklerq::http::router::{AppState, build_router};
+use tasklerq::security_audit::Audit;
 use tasklerq::telegram::api::{HttpTelegramApi, TelegramApi};
 use tasklerq::telegram::webhook::{Ingress, SECRET_HEADER};
 use tokio::sync::Notify;
@@ -333,7 +334,7 @@ fn peer() -> SocketAddr {
 #[tokio::test]
 async fn an_invalid_bearer_token_is_not_reflected_in_the_body_or_log() {
     let db = support::db().await;
-    let app = build_router(AppState::new(db.pool.clone()));
+    let app = build_router(AppState::new(db.pool.clone(), Audit::new(db.pool.clone())));
     let logs = LogBuffer::default();
     let subscriber = tracing_subscriber::fmt()
         .json()
@@ -367,8 +368,10 @@ async fn an_invalid_bearer_token_is_not_reflected_in_the_body_or_log() {
 async fn a_wrong_webhook_secret_is_not_logged() {
     let db = support::db().await;
     let ingress = Ingress::new(&SecretString::new(WEBHOOK_SECRET), Arc::new(Notify::new()));
-    let app = build_router(AppState::new(db.pool.clone()).with_telegram(ingress))
-        .layer(MockConnectInfo(peer()));
+    let app = build_router(
+        AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_telegram(ingress),
+    )
+    .layer(MockConnectInfo(peer()));
     let logs = LogBuffer::default();
     let subscriber = tracing_subscriber::fmt()
         .json()

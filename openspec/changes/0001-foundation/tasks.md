@@ -136,7 +136,7 @@
 - [x] 8.6 Реализовать миграции под advisory lock, backup-скрипт и restore-скрипт; проверить на тестовой базе.
 - [x] 8.7 Реализовать `tasklerq admin token create/revoke`, `queue stats`, `webhook info`, `household create/list`, `user add`, `export`; проверить CLI-тестами и redaction вывода.
 - [x] 8.8 Провести нагрузочный тест: 10 пользователей, 10 000 задач, 50 webhook/с; проверить latency webhook <100 мс и отсутствие роста очереди.
-- [ ] 8.9 Пройти security-чек-лист (webhook, callback, IDOR, LLM, внешний capture, секреты, rate limits) и зафиксировать результаты в `docs/deployment.md`.
+- [x] 8.9 Пройти security-чек-лист (webhook, callback, IDOR, LLM, внешний capture, секреты, rate limits) и зафиксировать результаты в `docs/deployment.md`.
 - [x] 8.10 Реализовать запись событий безопасности в `audit_events` (отказы аутентификации, rate limit, токены, роли, ошибки LLM-валидации), retention не менее 90 дней и метрику порога отказов webhook; проверить тестами отсутствие секретов в payload.
 
 ## 9. Документация и релиз

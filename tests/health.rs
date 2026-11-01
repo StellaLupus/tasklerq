@@ -9,10 +9,11 @@ use http_body_util::BodyExt;
 use serde_json::Value;
 use sqlx::PgPool;
 use tasklerq::http::router::{AppState, build_router};
+use tasklerq::security_audit::Audit;
 use tower::ServiceExt;
 
 async fn ready(pool: &PgPool) -> (StatusCode, Value) {
-    let app = build_router(AppState::new(pool.clone()));
+    let app = build_router(AppState::new(pool.clone(), Audit::new(pool.clone())));
     let response = app
         .oneshot(
             Request::builder()

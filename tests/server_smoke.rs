@@ -11,6 +11,7 @@ use tokio::net::TcpListener;
 use tasklerq::config::{DatabaseConfig, SecretString};
 use tasklerq::http::router::{AppState, build_router};
 use tasklerq::http::server::serve_with_grace;
+use tasklerq::security_audit::Audit;
 use tasklerq::storage;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -58,7 +59,7 @@ async fn serves_readiness_and_shuts_down_only_after_signal() {
         .await
         .expect("test listener should bind");
     let address = listener.local_addr().expect("bound address");
-    let app = build_router(AppState::new(pool));
+    let app = build_router(AppState::new(pool.clone(), Audit::new(pool)));
 
     let grace = Duration::from_millis(200);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();

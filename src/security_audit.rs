@@ -73,6 +73,9 @@ struct Suppression {
     /// добавляются к `suppressed` следующего записанного события того же типа.
     over_limit: HashMap<SuppressKind, u64>,
     last_cleanup: Option<DateTime<Utc>>,
+    /// Когда последний раз выселяли ключи с истёкшим окном. Проход по полной
+    /// карте не должен повторяться на каждое событие с новым ключом.
+    last_eviction: Option<DateTime<Utc>>,
 }
 
 impl Suppression {
@@ -101,6 +104,13 @@ impl Suppression {
         }
 
         let known = self.entries.contains_key(&entry_key);
+        if !known && self.entries.len() >= MAX_SUPPRESSION_ENTRIES {
+            // Потолок карты не должен забиваться ключами, у которых окно
+            // подавления уже истекло: иначе легитимное новое событие уйдёт в
+            // `over_limit` и не попадёт в журнал. Подавленные повторы таких
+            // ключей добавляем к агрегатному счётчику своего типа.
+            self.evict_expired(now, window);
+        }
         if (!known && self.entries.len() >= MAX_SUPPRESSION_ENTRIES) || !self.record_available(kind)
         {
             *self.over_limit.entry(kind).or_default() += 1;
@@ -126,6 +136,32 @@ impl Suppression {
             },
         );
         Some(over_limit)
+    }
+
+    /// Выселить ключи с истёкшим окном подавления, сохранив их счётчики.
+    ///
+    /// Потолок карты проверяется до записи нового ключа, поэтому «мёртвые»
+    /// ключи нельзя ждать до плановой чистки по TTL: они заняли бы место,
+    /// которое нужно действующим событиям.
+    fn evict_expired(&mut self, now: DateTime<Utc>, window: Duration) {
+        if self.last_eviction.is_some_and(|last| now - last < window) {
+            return;
+        }
+        self.last_eviction = Some(now);
+
+        let mut evicted: HashMap<SuppressKind, u64> = HashMap::new();
+        self.entries.retain(|(kind, _), entry| {
+            if now - entry.last < window {
+                return true;
+            }
+            if entry.suppressed > 0 {
+                *evicted.entry(*kind).or_default() += entry.suppressed;
+            }
+            false
+        });
+        for (kind, suppressed) in evicted {
+            *self.over_limit.entry(kind).or_default() += suppressed;
+        }
     }
 
     /// Есть ли место для ещё одной записи этого типа в текущем окне.
@@ -630,6 +666,36 @@ mod tests {
         assert_eq!(
             written, MAX_RECORDS_PER_WINDOW,
             "at most one window's worth of records may be written per type"
+        );
+    }
+
+    #[test]
+    fn expired_keys_are_evicted_before_a_new_event_is_dropped() {
+        let mut suppression = Suppression::default();
+        let start = at(55_000);
+        let expired = start - Duration::seconds(SUPPRESSION_WINDOW_SECONDS + 1);
+        for index in 0..MAX_SUPPRESSION_ENTRIES {
+            suppression.entries.insert(
+                (SuppressKind::AuthFailed, format!("ip:10.1.{index}")),
+                Suppressed {
+                    last: expired,
+                    suppressed: if index == 0 { 5 } else { 0 },
+                },
+            );
+        }
+        assert_eq!(suppression.entries.len(), MAX_SUPPRESSION_ENTRIES);
+
+        assert_eq!(
+            suppression.allow(SuppressKind::AuthFailed, "ip:203.0.113.9", start),
+            Some(5),
+            "a live event must be written after dead keys are evicted, \
+             and their suppressed repeats count towards it"
+        );
+        assert!(suppression.tracks("ip:203.0.113.9"));
+        assert_eq!(
+            suppression.entries.len(),
+            1,
+            "only the new key stays in the map"
         );
     }
 

@@ -30,22 +30,19 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Создать состояние из пула.
-    pub fn new(pool: PgPool) -> Self {
+    /// Создать состояние из пула и общего журнала событий безопасности.
+    ///
+    /// Журнал передаётся аргументом, чтобы production-путь не мог случайно
+    /// создать отдельное состояние подавления: [`crate::app::build_application`]
+    /// собирает один `Audit` на процесс и передаёт его сюда, в воркеры и бота.
+    pub fn new(pool: PgPool, audit: Audit) -> Self {
         Self {
-            audit: Audit::new(pool.clone()),
+            audit,
             pool,
             telegram: None,
             queue_lag_limit: None,
             capture: None,
         }
-    }
-
-    /// Подменить журнал событий безопасности.
-    #[must_use]
-    pub fn with_audit(mut self, audit: Audit) -> Self {
-        self.audit = audit;
-        self
     }
 
     /// Включить `POST /api/v1/capture`.

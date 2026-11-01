@@ -19,6 +19,7 @@ use tasklerq::config::CaptureConfig;
 use tasklerq::home_assistant::{AiTask, GenerateData, HaError};
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
+use tasklerq::security_audit::Audit;
 use tower::ServiceExt;
 
 use support::{db, issue_token};
@@ -83,18 +84,20 @@ fn capture_logs_have_metadata_but_not_the_text() {
             let db = db().await;
             let household = support::create_household(&db.pool).await;
             let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
-            let state = AppState::new(db.pool.clone()).with_capture(CaptureState::new(
-                CaptureConfig {
-                    enabled: true,
-                    voice_timeout_ms: 8_000,
-                    voice_fallback_raw: false,
-                    rate_limit_per_min: 10,
-                    max_text_chars: 2_000,
-                },
-                Some(Arc::new(StubAi)),
-                Arc::new(CircuitBreaker::default()),
-                200,
-            ));
+            let state = AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_capture(
+                CaptureState::new(
+                    CaptureConfig {
+                        enabled: true,
+                        voice_timeout_ms: 8_000,
+                        voice_fallback_raw: false,
+                        rate_limit_per_min: 10,
+                        max_text_chars: 2_000,
+                    },
+                    Some(Arc::new(StubAi)),
+                    Arc::new(CircuitBreaker::default()),
+                    200,
+                ),
+            );
             let app = build_router(state);
             let body = serde_json::to_vec(&json!({
                 "text": "секретная заметка про подарок",
@@ -153,18 +156,20 @@ fn a_disabled_llm_logs_the_fallback_reason_without_the_text() {
             let db = db().await;
             let household = support::create_household(&db.pool).await;
             let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
-            let state = AppState::new(db.pool.clone()).with_capture(CaptureState::new(
-                CaptureConfig {
-                    enabled: true,
-                    voice_timeout_ms: 8_000,
-                    voice_fallback_raw: true,
-                    rate_limit_per_min: 10,
-                    max_text_chars: 2_000,
-                },
-                None,
-                Arc::new(CircuitBreaker::default()),
-                200,
-            ));
+            let state = AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_capture(
+                CaptureState::new(
+                    CaptureConfig {
+                        enabled: true,
+                        voice_timeout_ms: 8_000,
+                        voice_fallback_raw: true,
+                        rate_limit_per_min: 10,
+                        max_text_chars: 2_000,
+                    },
+                    None,
+                    Arc::new(CircuitBreaker::default()),
+                    200,
+                ),
+            );
             let app = build_router(state);
             let body = serde_json::to_vec(&json!({
                 "text": "секретная заметка про подарок",
@@ -237,18 +242,20 @@ fn capture_logs_for(
             let db = db().await;
             let household = support::create_household(&db.pool).await;
             let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
-            let state = AppState::new(db.pool.clone()).with_capture(CaptureState::new(
-                CaptureConfig {
-                    enabled: true,
-                    voice_timeout_ms: 8_000,
-                    voice_fallback_raw: false,
-                    rate_limit_per_min,
-                    max_text_chars: 2_000,
-                },
-                ai,
-                Arc::new(CircuitBreaker::default()),
-                200,
-            ));
+            let state = AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_capture(
+                CaptureState::new(
+                    CaptureConfig {
+                        enabled: true,
+                        voice_timeout_ms: 8_000,
+                        voice_fallback_raw: false,
+                        rate_limit_per_min,
+                        max_text_chars: 2_000,
+                    },
+                    ai,
+                    Arc::new(CircuitBreaker::default()),
+                    200,
+                ),
+            );
             let app = build_router(state);
             let mut status = StatusCode::OK;
             for (payload, extra_headers) in requests {

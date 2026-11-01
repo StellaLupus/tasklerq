@@ -39,12 +39,8 @@ fn app_with_webhook(pool: &PgPool, audit: Audit, per_second: u32) -> Router {
         per_second,
         1,
     );
-    build_router(
-        AppState::new(pool.clone())
-            .with_audit(audit)
-            .with_telegram(ingress),
-    )
-    .layer(MockConnectInfo(peer()))
+    build_router(AppState::new(pool.clone(), audit).with_telegram(ingress))
+        .layer(MockConnectInfo(peer()))
 }
 
 async fn post_webhook(app: &Router, secret: Option<&str>, body: &[u8]) -> StatusCode {

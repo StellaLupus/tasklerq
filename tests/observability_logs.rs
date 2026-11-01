@@ -14,6 +14,7 @@ use axum::http::Request;
 use http_body_util::BodyExt;
 use serde_json::Value;
 use tasklerq::http::router::{AppState, build_router};
+use tasklerq::security_audit::Audit;
 use tower::ServiceExt;
 
 use support::next_telegram_id;
@@ -85,7 +86,7 @@ fn logs_keep_identifiers_and_results_but_not_the_message_text() {
             bot.enqueue(update).await;
             bot.pump().await;
 
-            let app = build_router(AppState::new(db.pool.clone()));
+            let app = build_router(AppState::new(db.pool.clone(), Audit::new(db.pool.clone())));
             let response = app
                 .oneshot(
                     Request::builder()

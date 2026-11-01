@@ -21,6 +21,7 @@ use tasklerq::config::CaptureConfig;
 use tasklerq::home_assistant::{AiTask, GenerateData, HaError};
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
+use tasklerq::security_audit::Audit;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -94,7 +95,8 @@ fn app_with(
 ) -> Router {
     let ai: Option<Arc<dyn AiTask>> = ai.map(|ai| ai as Arc<dyn AiTask>);
     build_router(
-        AppState::new(pool.clone()).with_capture(CaptureState::new(config, ai, breaker, quota)),
+        AppState::new(pool.clone(), Audit::new(pool.clone()))
+            .with_capture(CaptureState::new(config, ai, breaker, quota)),
     )
 }
 

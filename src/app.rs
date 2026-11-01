@@ -51,7 +51,7 @@ pub async fn build_application(
     )
     .await?;
 
-    let mut state = AppState::new(pool.clone()).with_audit(audit);
+    let mut state = AppState::new(pool.clone(), audit);
     let mut workers = Vec::new();
     if let Some(runtime) = telegram {
         if let Some(ingress) = runtime.ingress {

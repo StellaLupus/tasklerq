@@ -308,8 +308,15 @@ impl Harness {
             skew: Duration::zero(),
             name: "Alice".to_owned(),
             screen_id: None,
-            updates: UpdateWorker::new(pool.clone(), handler, fake.clone(), 10, wake)
-                .only_chat(telegram_id),
+            updates: UpdateWorker::new(
+                pool.clone(),
+                handler,
+                fake.clone(),
+                10,
+                wake,
+                tasklerq::security_audit::Audit::new(pool.clone()),
+            )
+            .only_chat(telegram_id),
             outbox: OutboxWorker::new(pool.clone(), fake).only_chat(telegram_id),
             clock: Instant::now(),
             next_update: NEXT_UPDATE.fetch_add(10_000, std::sync::atomic::Ordering::Relaxed),

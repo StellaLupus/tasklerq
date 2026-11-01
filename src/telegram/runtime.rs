@@ -92,10 +92,15 @@ pub async fn start(
         .with_llm_capture(ai.is_some())
         .with_audit(audit.clone());
     if let Some(ai) = ai {
-        let capture = CaptureWorker::new(pool.clone(), ai, bot.clone(), wake_outbox.clone())
-            .with_quota(config.llm.daily_quota)
-            .with_breaker(breaker)
-            .with_audit(audit.clone());
+        let capture = CaptureWorker::new(
+            pool.clone(),
+            ai,
+            bot.clone(),
+            wake_outbox.clone(),
+            audit.clone(),
+        )
+        .with_quota(config.llm.daily_quota)
+        .with_breaker(breaker);
         tasks.push(tokio::spawn(capture.run(shutdown.clone())));
     }
     let updates = UpdateWorker::new(
@@ -104,9 +109,9 @@ pub async fn start(
         api.clone(),
         config.queue.max_attempts,
         wake_outbox.clone(),
+        audit,
     )
-    .with_rate_limit(UPDATES_PER_MINUTE)
-    .with_audit(audit);
+    .with_rate_limit(UPDATES_PER_MINUTE);
     tasks.push(tokio::spawn(updates.run(wake_updates, shutdown.clone())));
 
     let scheduler = Scheduler::new(pool.clone(), wake_outbox.clone());

@@ -20,6 +20,7 @@ use tasklerq::config::{CaptureConfig, SecretString};
 use tasklerq::home_assistant::{AiTask, GenerateData, HaError};
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
+use tasklerq::security_audit::Audit;
 use tasklerq::telegram::api::TelegramError;
 use tasklerq::telegram::bot::{Bot, Outcome};
 use tasklerq::telegram::capture_worker::{CaptureWorker, Pass as CapturePass};
@@ -219,7 +220,7 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
     let read_token = issue_token(&db.pool, household.household_id, &["ha:read"]).await;
 
     let ingress = Ingress::new(&SecretString::new(SECRET), Arc::new(Notify::new()));
-    let state = AppState::new(db.pool.clone())
+    let state = AppState::new(db.pool.clone(), Audit::new(db.pool.clone()))
         .with_capture(CaptureState::new(
             capture_config(),
             Some(Arc::new(StubAi)),
@@ -245,6 +246,7 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
         FakeTelegram::new(),
         10,
         Arc::new(Notify::new()),
+        Audit::new(db.pool.clone()),
     )
     .only_chat(chat);
     assert_eq!(worker.run_once(now).await.expect("worker"), Pass::Processed);
@@ -263,12 +265,14 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
 
     // Сбой валидации ответа LLM считается отдельной метрикой.
     let bad_app = build_router(
-        AppState::new(db.pool.clone()).with_capture(CaptureState::new(
-            capture_config(),
-            Some(Arc::new(BadAi)),
-            Arc::new(CircuitBreaker::default()),
-            200,
-        )),
+        AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_capture(
+            CaptureState::new(
+                capture_config(),
+                Some(Arc::new(BadAi)),
+                Arc::new(CircuitBreaker::default()),
+                200,
+            ),
+        ),
     );
     let (status, _, _) = send(
         &bad_app,
@@ -282,14 +286,16 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
     // Недоступная LLM с разрешённым fallback создаёт позицию из исходного текста.
-    let fallback_app = build_router(AppState::new(db.pool.clone()).with_capture(
-        CaptureState::new(
-            fallback_capture_config(),
-            Some(Arc::new(UnavailableAi)),
-            Arc::new(CircuitBreaker::default()),
-            200,
+    let fallback_app = build_router(
+        AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_capture(
+            CaptureState::new(
+                fallback_capture_config(),
+                Some(Arc::new(UnavailableAi)),
+                Arc::new(CircuitBreaker::default()),
+                200,
+            ),
         ),
-    ));
+    );
     let (status, _, body) = send(
         &fallback_app,
         Method::POST,
@@ -315,6 +321,7 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
         FakeTelegram::new(),
         5,
         Arc::new(Notify::new()),
+        Audit::new(db.pool.clone()),
     )
     .only_chat(failed_chat);
     assert!(matches!(
@@ -335,6 +342,7 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
         FakeTelegram::new(),
         1,
         Arc::new(Notify::new()),
+        Audit::new(db.pool.clone()),
     )
     .only_chat(dead_chat);
     assert!(matches!(
@@ -357,6 +365,7 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
         FakeTelegram::new(),
         5,
         Arc::new(Notify::new()),
+        Audit::new(db.pool.clone()),
     )
     .only_chat(limited_chat)
     .with_rate_limit(1);
@@ -387,6 +396,7 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
         Arc::new(StubAi),
         handler,
         Arc::new(Notify::new()),
+        Audit::new(db.pool.clone()),
     )
     .only_chat(capture_chat);
     telegram.text("Молоко").await;

@@ -25,6 +25,7 @@ use tasklerq::domain::models::{
 use tasklerq::domain::recurrence::parse_timezone;
 use tasklerq::domain::validation::validate_new_item;
 use tasklerq::http::router::{AppState, build_router};
+use tasklerq::security_audit::Audit;
 use tasklerq::storage;
 use tasklerq::storage::repositories::households::{self, NewOwner};
 use tasklerq::storage::repositories::{items, lists, tokens};
@@ -370,7 +371,7 @@ pub async fn issue_token(pool: &PgPool, household_id: Uuid, scopes: &[&str]) -> 
 
 /// Роутер с тестовым пулом.
 pub fn app(pool: &PgPool) -> Router {
-    build_router(AppState::new(pool.clone()))
+    build_router(AppState::new(pool.clone(), Audit::new(pool.clone())))
 }
 
 /// Выполнить HTTP-запрос и вернуть статус и JSON.
