@@ -135,8 +135,8 @@ async fn api_authentication_failures_are_audited_without_secrets() {
     assert_eq!(events[0]["route"], "/api/v1/household");
     assert!(events[0].get("token_id").is_none());
 
-    // Неизвестный токен: новый журнал подавления, чтобы событие записалось.
-    let app = support::app(&db.pool);
+    // Неизвестный токен: причина входит в ключ подавления, поэтому событие
+    // записывается тем же журналом, что и `missing_token`.
     let (status, _) = support::request(
         &app,
         Method::GET,
@@ -168,7 +168,6 @@ async fn api_authentication_failures_are_audited_without_secrets() {
     admin::revoke_token(&db.pool, revoked.record.id, now)
         .await
         .expect("revoke");
-    let app = support::app(&db.pool);
     let (status, _) = support::request(
         &app,
         Method::GET,
@@ -210,7 +209,6 @@ async fn api_authentication_failures_are_audited_without_secrets() {
         .execute(&db.pool)
         .await
         .expect("expire");
-    let app = support::app(&db.pool);
     let (status, _) = support::request(
         &app,
         Method::GET,
@@ -238,7 +236,6 @@ async fn api_authentication_failures_are_audited_without_secrets() {
     )
     .await
     .expect("token");
-    let app = support::app(&db.pool);
     let (status, _) = support::request(
         &app,
         Method::POST,
@@ -737,4 +734,63 @@ async fn a_broken_audit_does_not_change_the_response() {
     let (status, body) = support::request(&app, Method::GET, "/api/v1/household", None, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["error"]["code"], "unauthorized");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hung_audit_database_does_not_delay_auth_rejections() {
+    let db = isolated_db().await;
+    // Держим таблицу аудита под блокировкой: запись не сможет завершиться,
+    // пока тест не отпустит её. Ответ должен прийти по таймауту аудита.
+    let mut lock = db.pool.begin().await.expect("lock transaction");
+    sqlx::query("LOCK TABLE audit_events IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .expect("lock audit_events");
+
+    let app = app_with_webhook(&db.pool, Audit::new(db.pool.clone()), 10_000);
+
+    let started = std::time::Instant::now();
+    assert_eq!(
+        post_webhook(
+            &app,
+            Some("wrong-Bearer-SECRET-value"),
+            &update_payload(991).await
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+    let webhook_elapsed = started.elapsed();
+    assert!(
+        webhook_elapsed < StdDuration::from_secs(1),
+        "webhook 401 waited for audit: {webhook_elapsed:?}"
+    );
+
+    let started = std::time::Instant::now();
+    let (status, _) = support::request(&app, Method::GET, "/api/v1/household", None, None).await;
+    let api_elapsed = started.elapsed();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(
+        api_elapsed < StdDuration::from_secs(1),
+        "API 401 waited for audit: {api_elapsed:?}"
+    );
+
+    lock.rollback().await.expect("release lock");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_webhook_without_the_secret_header_is_audited_as_missing_secret() {
+    let db = isolated_db().await;
+    let app = app_with_webhook(&db.pool, Audit::new(db.pool.clone()), 10_000);
+
+    assert_eq!(
+        post_webhook(&app, None, &update_payload(992).await).await,
+        StatusCode::UNAUTHORIZED
+    );
+
+    let events = payloads(&db.pool, "auth_failed").await;
+    let event = events
+        .iter()
+        .find(|payload| payload["source"] == "webhook")
+        .expect("webhook auth failure event");
+    assert_eq!(event["reason"], "missing_secret", "{event}");
 }

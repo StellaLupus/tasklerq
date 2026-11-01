@@ -11,6 +11,7 @@ use crate::capture::breaker::CircuitBreaker;
 use crate::config::{Config, LlmConfig, TelegramMode};
 use crate::home_assistant::{AiTask, HttpAiTask};
 use crate::jobs::scheduler::Scheduler;
+use crate::security_audit::Audit;
 
 use super::api::{DEFAULT_BASE_URL, HttpTelegramApi, TelegramApi};
 use super::bot::Bot;
@@ -43,6 +44,7 @@ pub async fn start(
     shutdown: watch::Receiver<bool>,
     ai: Option<Arc<dyn AiTask>>,
     breaker: Arc<CircuitBreaker>,
+    audit: Audit,
 ) -> Result<Option<Runtime>, StartError> {
     let telegram = &config.telegram;
     let Some(token) = telegram.bot_token.clone() else {
@@ -88,11 +90,12 @@ pub async fn start(
 
     let bot = Bot::new(telegram.bot_username.clone())
         .with_llm_capture(ai.is_some())
-        .with_audit(crate::security_audit::Audit::new(pool.clone()));
+        .with_audit(audit.clone());
     if let Some(ai) = ai {
         let capture = CaptureWorker::new(pool.clone(), ai, bot.clone(), wake_outbox.clone())
             .with_quota(config.llm.daily_quota)
-            .with_breaker(breaker);
+            .with_breaker(breaker)
+            .with_audit(audit.clone());
         tasks.push(tokio::spawn(capture.run(shutdown.clone())));
     }
     let updates = UpdateWorker::new(
@@ -102,7 +105,8 @@ pub async fn start(
         config.queue.max_attempts,
         wake_outbox.clone(),
     )
-    .with_rate_limit(UPDATES_PER_MINUTE);
+    .with_rate_limit(UPDATES_PER_MINUTE)
+    .with_audit(audit);
     tasks.push(tokio::spawn(updates.run(wake_updates, shutdown.clone())));
 
     let scheduler = Scheduler::new(pool.clone(), wake_outbox.clone());

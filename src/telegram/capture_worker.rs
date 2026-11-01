@@ -121,6 +121,13 @@ impl CaptureWorker {
         }
     }
 
+    /// Использовать общий журнал событий безопасности процесса.
+    #[must_use]
+    pub fn with_audit(mut self, audit: Audit) -> Self {
+        self.audit = audit;
+        self
+    }
+
     /// Обрабатывать только задания одного чата (для тестов).
     #[must_use]
     pub fn only_chat(mut self, chat_id: i64) -> Self {

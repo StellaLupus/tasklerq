@@ -15,6 +15,7 @@ use crate::config::Config;
 use crate::http::api::capture::CaptureState;
 use crate::http::router::{AppState, build_router};
 use crate::jobs::retention::RetentionWorker;
+use crate::security_audit::Audit;
 use crate::telegram::runtime::{self, StartError};
 
 /// Собранное приложение и его фоновые задачи.
@@ -37,10 +38,20 @@ pub async fn build_application(
 ) -> Result<Application, StartError> {
     let ai = runtime::build_ai(&config.llm);
     let breaker = Arc::new(CircuitBreaker::default());
-    let telegram =
-        runtime::start(config, &pool, shutdown.clone(), ai.clone(), breaker.clone()).await?;
+    // Один журнал событий на процесс: вебхук, воркеры, бот и capture-воркер
+    // делят состояние подавления и счётчики отказов.
+    let audit = Audit::new(pool.clone());
+    let telegram = runtime::start(
+        config,
+        &pool,
+        shutdown.clone(),
+        ai.clone(),
+        breaker.clone(),
+        audit.clone(),
+    )
+    .await?;
 
-    let mut state = AppState::new(pool.clone());
+    let mut state = AppState::new(pool.clone()).with_audit(audit);
     let mut workers = Vec::new();
     if let Some(runtime) = telegram {
         if let Some(ingress) = runtime.ingress {

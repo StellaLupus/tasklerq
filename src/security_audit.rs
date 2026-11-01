@@ -29,6 +29,12 @@ use crate::storage::repositories::audit;
 pub const SUPPRESSION_WINDOW_SECONDS: i64 = 60;
 /// Ключ без событий дольше этого времени удаляется из памяти, секунды.
 pub const SUPPRESSION_KEY_TTL_SECONDS: i64 = 3_600;
+/// Жёсткий потолок числа ключей в карте подавления.
+pub const MAX_SUPPRESSION_ENTRIES: usize = 4_096;
+/// Сколько событий одного типа можно записать за окно подавления.
+pub const MAX_RECORDS_PER_WINDOW: usize = 50;
+/// Сколько ждём запись аудита, прежде чем ответить клиенту без неё.
+pub const RECORD_TIMEOUT_MS: u64 = 500;
 /// Окно подсчёта отказов webhook, секунды.
 pub const WEBHOOK_FAILURE_WINDOW_SECONDS: i64 = 300;
 /// Порог отказов webhook в окне: превышение создаёт событие и метрику.
@@ -61,38 +67,101 @@ struct Suppressed {
 #[derive(Debug, Default)]
 struct Suppression {
     entries: HashMap<(SuppressKind, String), Suppressed>,
+    /// Моменты записанных событий каждого типа для общего лимита в минуту.
+    records: HashMap<SuppressKind, VecDeque<DateTime<Utc>>>,
+    /// События, не записанные из-за потолка карты или лимита типа. Они
+    /// добавляются к `suppressed` следующего записанного события того же типа.
+    over_limit: HashMap<SuppressKind, u64>,
+    last_cleanup: Option<DateTime<Utc>>,
 }
 
 impl Suppression {
     /// Проверить, нужно ли писать событие. `Some(n)` — писать, `n` повторов
     /// подавлено; `None` — событие подавлено.
+    ///
+    /// Чистка устаревших ключей выполняется не чаще раза в окно. Сверх
+    /// [`MAX_RECORDS_PER_WINDOW`] записей одного типа за окно и сверх
+    /// [`MAX_SUPPRESSION_ENTRIES`] ключей события только считаются: их число
+    /// попадёт в `suppressed` следующей разрешённой записи.
     fn allow(&mut self, kind: SuppressKind, key: &str, now: DateTime<Utc>) -> Option<u64> {
-        let ttl = Duration::seconds(SUPPRESSION_KEY_TTL_SECONDS);
-        self.entries.retain(|_, entry| now - entry.last < ttl);
+        self.cleanup(now);
+        self.prune_records(kind, now);
 
+        let entry_key = (kind, key.to_owned());
         let window = Duration::seconds(SUPPRESSION_WINDOW_SECONDS);
-        match self.entries.get_mut(&(kind, key.to_owned())) {
-            Some(entry) if now - entry.last < window => {
+        if self
+            .entries
+            .get(&entry_key)
+            .is_some_and(|entry| now - entry.last < window)
+        {
+            if let Some(entry) = self.entries.get_mut(&entry_key) {
                 entry.suppressed += 1;
-                None
             }
-            Some(entry) => {
-                let suppressed = entry.suppressed;
-                entry.last = now;
-                entry.suppressed = 0;
-                Some(suppressed)
-            }
-            None => {
-                self.entries.insert(
-                    (kind, key.to_owned()),
-                    Suppressed {
-                        last: now,
-                        suppressed: 0,
-                    },
-                );
-                Some(0)
+            return None;
+        }
+
+        let known = self.entries.contains_key(&entry_key);
+        if (!known && self.entries.len() >= MAX_SUPPRESSION_ENTRIES) || !self.record_available(kind)
+        {
+            *self.over_limit.entry(kind).or_default() += 1;
+            return None;
+        }
+
+        let over_limit = self.over_limit.remove(&kind).unwrap_or(0);
+        // Запись ключа, у которого истекло окно, тоже расходует лимит типа:
+        // иначе истёкшие ключи писались бы сверх потолка в новом окне.
+        self.records.entry(kind).or_default().push_back(now);
+        if let Some(entry) = self.entries.get_mut(&entry_key) {
+            let suppressed = entry.suppressed + over_limit;
+            entry.last = now;
+            entry.suppressed = 0;
+            return Some(suppressed);
+        }
+
+        self.entries.insert(
+            entry_key,
+            Suppressed {
+                last: now,
+                suppressed: 0,
+            },
+        );
+        Some(over_limit)
+    }
+
+    /// Есть ли место для ещё одной записи этого типа в текущем окне.
+    fn record_available(&self, kind: SuppressKind) -> bool {
+        self.records
+            .get(&kind)
+            .is_none_or(|hits| hits.len() < MAX_RECORDS_PER_WINDOW)
+    }
+
+    /// Удалить отметки типа старше окна.
+    fn prune_records(&mut self, kind: SuppressKind, now: DateTime<Utc>) {
+        let cutoff = now - Duration::seconds(SUPPRESSION_WINDOW_SECONDS);
+        if let Some(hits) = self.records.get_mut(&kind) {
+            while hits.front().is_some_and(|at| *at <= cutoff) {
+                hits.pop_front();
             }
         }
+    }
+
+    /// Удалить ключи без событий дольше TTL, но не чаще раза в окно.
+    fn cleanup(&mut self, now: DateTime<Utc>) {
+        let window = Duration::seconds(SUPPRESSION_WINDOW_SECONDS);
+        if self.last_cleanup.is_some_and(|last| now - last < window) {
+            return;
+        }
+
+        let ttl = Duration::seconds(SUPPRESSION_KEY_TTL_SECONDS);
+        self.entries.retain(|_, entry| now - entry.last < ttl);
+        let cutoff = now - window;
+        self.records.retain(|_, hits| {
+            while hits.front().is_some_and(|at| *at <= cutoff) {
+                hits.pop_front();
+            }
+            !hits.is_empty()
+        });
+        self.last_cleanup = Some(now);
     }
 
     /// Хранится ли ключ; только для тестов.
@@ -264,23 +333,30 @@ impl Audit {
         payload: Value,
         now: DateTime<Utc>,
     ) {
-        let written = async {
-            let mut conn = self.inner.pool.acquire().await?;
-            audit::record(&mut conn, household_id, actor, event_type, payload, now)
-                .await
-                .map_err(|error| match error {
-                    crate::domain::error::DomainError::Database(error) => error,
-                    other => sqlx::Error::Protocol(format!("audit record failed: {other}")),
-                })
-        }
-        .await;
+        let written =
+            tokio::time::timeout(std::time::Duration::from_millis(RECORD_TIMEOUT_MS), async {
+                let mut conn = self.inner.pool.acquire().await?;
+                audit::record(&mut conn, household_id, actor, event_type, payload, now)
+                    .await
+                    .map_err(|error| match error {
+                        crate::domain::error::DomainError::Database(error) => error,
+                        other => sqlx::Error::Protocol(format!("audit record failed: {other}")),
+                    })
+            })
+            .await;
 
-        if let Err(error) = written {
-            tracing::warn!(
+        match written {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::warn!(
                 %error,
                 event_type = event_type.as_str(),
                 "security audit event was not recorded"
-            );
+            ),
+            Err(_) => tracing::warn!(
+                timeout_ms = RECORD_TIMEOUT_MS,
+                event_type = event_type.as_str(),
+                "security audit event timed out"
+            ),
         }
     }
 
@@ -337,9 +413,11 @@ impl Audit {
         token: Option<(Uuid, Uuid)>,
         now: DateTime<Utc>,
     ) {
+        // Причина входит в ключ: `missing_token` не должен глушить
+        // `unknown_token` или отказ по отозванному токену.
         let key = token.map_or_else(
-            || "api:unknown".to_owned(),
-            |(token_id, _)| format!("api:token:{token_id}"),
+            || format!("api:{reason}"),
+            |(token_id, _)| format!("api:token:{token_id}:{reason}"),
         );
         let Some(suppressed) = self.check(SuppressKind::AuthFailed, &key, now) else {
             return;
@@ -524,6 +602,35 @@ mod tests {
             "a key without recent events must not stay in the map"
         );
         assert!(suppression.tracks("ip:2.2.2.2"));
+    }
+
+    #[test]
+    fn expired_keys_still_count_against_the_per_type_record_limit() {
+        let mut suppression = Suppression::default();
+        let start = at(60_000);
+        let keys: Vec<String> = (0..1_000)
+            .map(|index| format!("ip:10.0.{}.{}", index / 256, index % 256))
+            .collect();
+
+        for key in &keys {
+            suppression.allow(SuppressKind::AuthFailed, key, start);
+        }
+
+        let later = start + Duration::seconds(SUPPRESSION_WINDOW_SECONDS + 1);
+        let mut written = 0;
+        for key in &keys {
+            if suppression
+                .allow(SuppressKind::AuthFailed, key, later)
+                .is_some()
+            {
+                written += 1;
+            }
+        }
+
+        assert_eq!(
+            written, MAX_RECORDS_PER_WINDOW,
+            "at most one window's worth of records may be written per type"
+        );
     }
 
     #[test]

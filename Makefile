@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
-.PHONY: help dev test lint fmt check migrate seed build deps clean
+.PHONY: help dev test lint fmt check migrate seed build load deps clean
 
 help: ## Показать список команд
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -30,6 +30,9 @@ seed: ## Заполнить базу seed-данными (идемпотентн
 
 build: ## Собрать release-бинарник
 	cargo build --release --locked
+
+load: ## Нагрузочный тест webhook (10 пользователей, 10 000 задач, 50/с)
+	cargo test --release --locked --test load_webhook -- --ignored --nocapture
 
 deps: ## Показать дубли критичных зависимостей
 	cargo tree --duplicates
