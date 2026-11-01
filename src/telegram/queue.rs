@@ -13,6 +13,16 @@ use sqlx::PgConnection;
 /// Верхняя граница задержки между попытками, секунды.
 pub const MAX_BACKOFF_SECONDS: i64 = 300;
 
+/// Выражение `chat_id` из payload обновления.
+///
+/// У сообщения чат лежит в `message`, у нажатия кнопки — в
+/// `callback_query.message`. Одно выражение на фильтр [`claim_next`] и подсчёт
+/// отложенных, чтобы запросы не разошлись.
+const CHAT_ID_EXPR: &str = "COALESCE(
+    payload #>> '{message,chat,id}',
+    payload #>> '{callback_query,message,chat,id}'
+)";
+
 /// Задание из очереди.
 #[derive(Debug, Clone)]
 pub struct Claimed {
@@ -22,6 +32,8 @@ pub struct Claimed {
     pub payload: Value,
     /// Сколько раз обработка уже завершалась ошибкой.
     pub attempts: i32,
+    /// Обновление уже откладывалось: `available_at` сдвинуто после постановки.
+    pub deferred: bool,
 }
 
 /// Исход неудачной попытки.
@@ -81,28 +93,49 @@ pub async fn claim_next(
     now: DateTime<Utc>,
     only_chat: Option<i64>,
 ) -> Result<Option<Claimed>, sqlx::Error> {
-    let row: Option<(i64, Value, i32)> = sqlx::query_as(
-        "SELECT update_id, payload, attempts
+    let sql = format!(
+        "SELECT update_id, payload, attempts, available_at > received_at AS deferred
          FROM telegram_updates
          WHERE status = 'pending' AND available_at <= $1
-           AND ($2::bigint IS NULL OR COALESCE(
-                   payload #>> '{message,chat,id}',
-                   payload #>> '{callback_query,message,chat,id}'
-               )::bigint = $2)
+           AND ($2::bigint IS NULL OR ({CHAT_ID_EXPR})::bigint = $2)
          ORDER BY available_at, update_id
          LIMIT 1
-         FOR UPDATE SKIP LOCKED",
-    )
-    .bind(now)
-    .bind(only_chat)
-    .fetch_optional(conn)
-    .await?;
+         FOR UPDATE SKIP LOCKED"
+    );
+    let row: Option<(i64, Value, i32, bool)> = sqlx::query_as(&sql)
+        .bind(now)
+        .bind(only_chat)
+        .fetch_optional(conn)
+        .await?;
 
-    Ok(row.map(|(update_id, payload, attempts)| Claimed {
+    Ok(row.map(|(update_id, payload, attempts, deferred)| Claimed {
         update_id,
         payload,
         attempts,
+        deferred,
     }))
+}
+
+/// Сколько обновлений чата отложено на будущее (`available_at > now`).
+///
+/// Считается по тому же выражению `chat_id`, что и фильтр [`claim_next`]. В
+/// приватном чате `chat.id` равен `user.id`.
+pub async fn deferred_count(
+    conn: &mut PgConnection,
+    chat_id: i64,
+    now: DateTime<Utc>,
+) -> Result<i64, sqlx::Error> {
+    let sql = format!(
+        "SELECT count(*)
+         FROM telegram_updates
+         WHERE status = 'pending' AND available_at > $1
+           AND ({CHAT_ID_EXPR})::bigint = $2"
+    );
+    sqlx::query_scalar(&sql)
+        .bind(now)
+        .bind(chat_id)
+        .fetch_one(conn)
+        .await
 }
 
 /// Отложить обновление до `available_at`, не увеличивая счётчик попыток.

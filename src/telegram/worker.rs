@@ -16,16 +16,19 @@ use sqlx::PgPool;
 use tokio::sync::{Notify, watch};
 
 use crate::metrics;
-use crate::rate_limit::RateLimiter;
+use crate::rate_limit::{RateLimiter, retry_after_seconds};
 use crate::security_audit::{Audit, LimitKey, RateLimitEvent};
 
 use super::api::TelegramApi;
 use super::bot::{Answer, Bot, Outcome};
 use super::queue::{self, Failure};
 use super::update::{self, Classified, Incoming};
+use super::views;
 
 /// Сколько обновлений пользователя обрабатывается за минуту.
 pub const UPDATES_PER_MINUTE: u32 = 20;
+/// Сколько обновлений пользователя может ждать освобождения слота.
+pub const DEFERRED_QUEUE_LIMIT: i64 = 20;
 /// Окно лимита обновлений, секунды.
 const UPDATE_WINDOW_SECONDS: i64 = 60;
 
@@ -38,6 +41,8 @@ pub enum Pass {
     Processed,
     /// Обновление отложено до освобождения слота лимитера.
     Deferred,
+    /// Отложенная очередь переполнена: обновление отброшено без выполнения.
+    Dropped,
     /// Обработка не удалась; повтор или `dead` записаны в очередь.
     Failed(Failure),
 }
@@ -47,6 +52,10 @@ struct Limited {
     retry_at: DateTime<Utc>,
     outcome: Outcome,
     event: RateLimitEvent,
+    /// Чат, в котором откладывается обновление.
+    chat_id: i64,
+    /// Это текст: при отбрасывании его сообщение остаётся в чате.
+    text: bool,
 }
 
 /// Обработчик обновления: граница, через которую тесты подменяют бота.
@@ -155,6 +164,29 @@ impl UpdateWorker {
         if job.attempts == 0
             && let Some(limited) = self.rate_limited(&job, now).await?
         {
+            // Без предела флудящий пользователь заставлял бы единственный воркер
+            // заново проверять все отложенные обновления на каждом слоте.
+            if queue::deferred_count(&mut tx, limited.chat_id, now).await? >= DEFERRED_QUEUE_LIMIT {
+                queue::mark_processed(&mut tx, job.update_id, now).await?;
+                if limited.text {
+                    // Обработчик не увидит текст, поэтому сообщение остаётся в
+                    // чате; следующий экран придёт новым сообщением ниже.
+                    views::mark_buried(&mut tx, limited.chat_id).await?;
+                }
+                tx.commit().await?;
+                tracing::warn!(
+                    update_id = job.update_id,
+                    chat_id = limited.chat_id,
+                    limit = DEFERRED_QUEUE_LIMIT,
+                    "deferred telegram queue is full; dropping update"
+                );
+                // Событие пишется после коммита отдельным соединением: отказ не
+                // должен исчезнуть вместе с транзакцией ответа.
+                self.audit.rate_limited(limited.event, now).await;
+                metrics::telegram_update("dropped");
+                log_update(job.update_id, "dropped", started);
+                return Ok(Pass::Dropped);
+            }
             queue::defer(&mut tx, job.update_id, limited.retry_at).await?;
             tx.commit().await?;
             // Событие пишется после коммита отдельным соединением: отказ не
@@ -235,20 +267,25 @@ impl UpdateWorker {
         let Classified::Handle(incoming) = update::classify(&parsed) else {
             return Ok(None);
         };
-        let user_id = match &incoming {
-            Incoming::Text { sender, .. } | Incoming::Callback { sender, .. } => sender.id,
+        let (user_id, chat_id, text) = match &incoming {
+            Incoming::Text {
+                chat_id, sender, ..
+            } => (sender.id, *chat_id, true),
+            Incoming::Callback {
+                chat_id, sender, ..
+            } => (sender.id, *chat_id, false),
         };
         let decision = rate.check(user_id, now);
         if decision.allowed {
             return Ok(None);
         }
-        let Some(retry_at) = decision.retry_at else {
-            return Ok(None);
-        };
-
-        let retry_after = decision
-            .retry_after
-            .unwrap_or_else(|| u64::try_from(rate.window_seconds()).unwrap_or(60));
+        // Отказ всегда имеет момент освобождения слота. Если лимитер его не
+        // вернул, считаем ожиданием полного окна: обновление не должно тихо
+        // пройти лимит.
+        let retry_at = decision
+            .retry_at
+            .unwrap_or_else(|| now + chrono::Duration::seconds(rate.window_seconds()));
+        let retry_after = retry_after_seconds(retry_at - now);
         tracing::warn!(
             limit = rate.limit(),
             user_id,
@@ -257,15 +294,16 @@ impl UpdateWorker {
         );
 
         // Ответ на callback нужен сразу, чтобы убрать «часики»: после задержки
-        // Telegram его уже не примет. Действие выполнится позже, когда слот
+        // Telegram его уже не примет. Повторное откладывание того же нажатия
+        // второй раз не отвечает. Действие выполнится позже, когда слот
         // освободится.
         let answer = match incoming {
-            Incoming::Callback { query_id, .. } => Some(Answer {
+            Incoming::Callback { query_id, .. } if !job.deferred => Some(Answer {
                 query_id,
                 text: None,
                 alert: false,
             }),
-            Incoming::Text { .. } => None,
+            Incoming::Callback { .. } | Incoming::Text { .. } => None,
         };
         Ok(Some(Limited {
             retry_at,
@@ -279,6 +317,8 @@ impl UpdateWorker {
                     crate::domain::models::ActorType::System,
                 ),
             },
+            chat_id,
+            text,
         }))
     }
 
@@ -308,7 +348,7 @@ impl UpdateWorker {
                 .catch_unwind()
                 .await
             {
-                Ok(Ok(Pass::Processed | Pass::Deferred)) => continue,
+                Ok(Ok(Pass::Processed | Pass::Deferred | Pass::Dropped)) => continue,
                 Ok(Ok(Pass::Idle | Pass::Failed(_))) => {}
                 Ok(Err(error)) => tracing::error!(%error, "telegram update pass failed"),
                 Err(_) => tracing::error!("telegram update pass panicked"),

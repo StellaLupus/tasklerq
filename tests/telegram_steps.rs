@@ -5,6 +5,7 @@ mod support;
 use chrono::Utc;
 use serde_json::json;
 use sqlx::PgConnection;
+use support::telegram::Harness;
 use support::{create_household, db, next_telegram_id};
 use tasklerq::storage::repositories::{households, users};
 use tasklerq::telegram::bot::{Ctx, Fail};
@@ -148,6 +149,42 @@ async fn transaction_stays_usable_after_a_database_error_inside_a_user_failure()
     // Показ объяснения и экрана после сбоя возможен: транзакция жива.
     write_effects(&mut ctx).await;
     assert_eq!(effects(&mut tx, chat).await, (1, 1));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_form_step_answer_is_deleted_and_the_next_step_is_shown() {
+    let db = db().await;
+    let mut bot = Harness::new(&db.pool, next_telegram_id()).named("Ann");
+    bot.text("/start").await;
+    bot.text("Семья").await;
+    bot.press("Москва").await;
+    bot.press("меню").await;
+    bot.press("Добавить").await;
+    bot.press("Задачу").await;
+    bot.assert_screen_contains("Как назвать задачу?");
+
+    let update = bot.text_update("Ann", "Позвонить маме");
+    let message_id = update["message"]["message_id"]
+        .as_i64()
+        .expect("incoming message id");
+    bot.enqueue(update).await;
+    bot.pump().await;
+
+    let deleted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox
+         WHERE chat_id = $1 AND kind = 'delete'
+           AND coalesce((payload->>'message_id')::bigint, message_id) = $2",
+    )
+    .bind(bot.chat)
+    .bind(message_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("delete row");
+    assert_eq!(deleted, 1, "the form answer must be deleted");
+    bot.assert_screen_contains("Когда сделать?");
+    // Спека требует, чтобы принятое значение было видно на экране формы.
+    // Сейчас следующий шаг показывает только подсказку, поэтому 3.5 не
+    // закрыт: нужно решение, показывать ли черновик на каждом шаге.
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

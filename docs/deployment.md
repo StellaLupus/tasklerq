@@ -896,14 +896,14 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 | Секреты | Секреты читаются из окружения при старте, ротация не требует пересборки образа | `src/config/mod.rs::Config::from_env`; `src/telegram/runtime.rs::start` (читает токен и регистрирует webhook при старте) | пройдено (код); операционная ротация — 15.2 |
 | Секреты | Ротация `TELEGRAM_BOT_TOKEN`: после перезапуска используется новый токен, webhook регистрируется заново | `src/telegram/runtime.rs::start`, `src/telegram/api.rs::set_webhook`; runbook 16.5 | проверяется на живой системе (15.2) |
 | Секреты | Backup-файлы защищены правами доступа и, где возможно, шифрованием | runbook 11; проверка на NAS — 15.2 | проверяется на живой системе (15.2) |
-| Rate limits | 21-е обновление пользователя за минуту не выполняется; бот отвечает временем повтора, webhook остаётся `200` | `tests/telegram_queue.rs::the_twenty_first_message_in_a_minute_is_skipped_with_one_retry_notice`; `src/telegram/webhook.rs::receive` (ответ после постановки в очередь) | пройдено |
+| Rate limits | 21-е обновление пользователя за минуту откладывается и выполняется после освобождения слота, без сообщения в чат; отложенных не больше 20, следующее отбрасывается; webhook остаётся `200` | `tests/telegram_queue.rs::the_twenty_first_message_is_deferred_until_the_slot_frees`, `the_forty_first_message_is_dropped_when_the_deferred_queue_is_full`; `src/telegram/webhook.rs::receive` (ответ после постановки в очередь) | пройдено |
 | Rate limits | Не больше 10 LLM-разборов в минуту на пользователя | `tests/telegram_capture.rs::more_than_ten_parses_per_minute_are_rejected_without_llm` | пройдено |
 | Rate limits | Не больше 10 внешних capture в минуту на токен, `429` + `Retry-After` | `tests/capture_api.rs::the_eleventh_capture_in_a_minute_is_rate_limited_per_token` | пройдено |
 | Rate limits | Не больше 5 приглашений в час на household, с временем повтора | `tests/identity_households.rs::at_most_five_invites_per_hour_including_revoked_ones`; `tests/telegram_screens.rs::sixth_invite_within_an_hour_is_refused_with_retry_time` | пройдено |
 | Rate limits | Не больше 120 webhook-запросов в секунду на IP; лишние → `429` с `Retry-After`, остальные обрабатываются | `tests/telegram_webhook.rs::the_121st_request_from_one_ip_is_rejected_and_not_queued` | пройдено |
 | Rate limits | `429` API всегда содержит `Retry-After` | `src/http/error.rs` (`with_retry_after`); `tests/capture_api.rs::the_eleventh_capture_in_a_minute_is_rate_limited_per_token` | пройдено |
 | Rate limits | Суточная квота LLM по умолчанию 200 и настраивается | `src/config/mod.rs::LLM_DAILY_QUOTA` (200), `src/telegram/capture_worker.rs::DEFAULT_DAILY_QUOTA`; `src/config/tests.rs::defaults_match_documented_values`; `tests/telegram_capture.rs::daily_quota_stops_parsing_and_opens_the_manual_form` | пройдено |
-| Rate limits | Действия по callback ограничены лимитом пользователя | `tests/telegram_queue.rs::the_twenty_first_callback_is_not_run_and_is_answered_with_retry_time` | пройдено |
+| Rate limits | Действия по callback ограничены лимитом пользователя: сверх лимита нажатие сразу получает пустой ответ и выполняется после освобождения слота; сверх очереди отложенных отбрасывается без ответа | `tests/telegram_queue.rs::the_twenty_first_callback_is_answered_immediately_and_runs_after_the_slot_frees`, `a_callback_over_the_deferred_queue_limit_is_dropped_without_an_answer`, `a_repeatedly_deferred_callback_is_answered_once` | пройдено |
 | Rate limits | Превышения лимитов пишутся в аудит | `tests/security_audit.rs::rate_limits_are_audited_for_webhook_and_capture`, `the_telegram_update_limit_is_audited`, `the_invite_limit_is_audited` | пройдено |
 
 Проверки rate limits подтверждены тестами. Нагрузочная проверка (раздел 18) в
@@ -1141,11 +1141,14 @@ household. Заливка — батчами SQL. 60 секунд открыто
 секунду (3 000 запросов) с правильным секретом: сообщения (`/menu`, быстрое
 добавление) и callback-нажатия на списки, «Мои задачи», поиск и карточки
 задач. Два сценария идут подряд на одной базе и одном потоке запросов;
-второй продолжает данные, созданные первым:
+второй продолжает данные, созданные первым. Цифры ниже — исторический прогон до
+изменений 3.3–3.4: тогда сверхлимитные обновления помечались `rate_limited` и
+сразу уходили из очереди. Сейчас они откладываются (`deferred`), а сверх 20
+отложенных отбрасываются (`dropped`); актуальное поведение — в разделе 15.1.
 
 1. **production limit** — боевой лимит 20 обновлений/мин на пользователя
    включён. После первых 20 действий каждого пользователя обновления
-   обрабатываются как `rate_limited` и всё равно уходят из очереди.
+   обрабатывались как `rate_limited` и сразу уходили из очереди.
 2. **raised update limit** — лимит пользователя поднят только внутри теста
    (`build_application_with_update_limit`, 100 000), чтобы все обновления
    прошли через обработчик. В боевых настройках лимит не меняется.

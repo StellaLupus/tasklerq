@@ -666,6 +666,8 @@ async fn each_kind_of_incoming_text_is_deleted() {
         rows.iter().any(|(_, kind, _)| kind == "message"),
         "/help must stay a separate message: {rows:?}"
     );
+    bot.assert_latest_contains("удаляю из чата после обработки");
+    bot.assert_latest_contains("/start или /menu возвращают меню вниз чата");
 
     // Ответ на шаг формы.
     bot.press("Добавить").await;
