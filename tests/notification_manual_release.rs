@@ -2,7 +2,7 @@
 
 mod support;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use support::notifications::*;
 use support::telegram::buttons;
 use tasklerq::jobs::digest::digest_occurrence_key;
@@ -455,6 +455,99 @@ async fn manual_release_waits_for_the_scheduler_recipient_lock() {
         1,
         "the scheduler must not send the batch a second time"
     );
+}
+
+/// Snooze из блока сводного, срок которого ещё не наступил, не выпускается
+/// раньше этого срока, даже если выключение тихих часов освобождает отложенные.
+async fn snooze_not_released_before_its_own_time(move_quiet_start: bool) {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    let at = local_utc(moscow, day, 21, 30);
+    bot.advance(at - bot.now);
+    quiet_settings(&db.pool, household.owner_id, false).await;
+
+    let due = local_utc(moscow, day, 23, 0);
+    for title in ["Первая", "Вторая"] {
+        let item = create_task(&db.pool, &household, title, due, None).await;
+        deferred_reminder(&db.pool, &household, item.id, due, at).await;
+    }
+
+    tick_and_deliver(&mut bot, &db.pool, at).await;
+    let (message_id, html) = bot.latest();
+    let snooze = button_of(&html, "На час");
+    bot.press_data(&snooze, message_id).await;
+    let snoozed_at = local_utc(moscow, day, 22, 30);
+    let delivery_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM notification_deliveries
+         WHERE kind = 'snooze' AND status = 'pending'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("snooze delivery");
+
+    // 21:40: срок snooze (22:30) попал в тихие часы — общее правило переносит
+    // его на 08:00 и помечает отложенным тихими часами.
+    let morning = local_utc(moscow, day + Duration::days(1), 8, 0);
+    tick_and_deliver(&mut bot, &db.pool, at + Duration::minutes(10)).await;
+    let (scheduled_at, deferred): (DateTime<Utc>, bool) =
+        sqlx::query_as("SELECT scheduled_at, deferred FROM notification_deliveries WHERE id = $1")
+            .bind(delivery_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("deferred snooze");
+    assert_eq!(scheduled_at, morning);
+    assert!(deferred);
+
+    // 21:50: тихие часы больше не действуют, но собственный срок snooze ещё
+    // впереди — ручной выпуск не должен его ускорять.
+    bot.advance(local_utc(moscow, day, 21, 50) - bot.now);
+    open_notifications(&mut bot).await;
+    let sent_before = bot.fake.sent().len();
+    if move_quiet_start {
+        bot.press("Начало тихих").await;
+        bot.text("23:00").await;
+    } else {
+        bot.press("Тихие часы: вкл").await;
+    }
+
+    assert!(!bot.screen().contains("Накопилось"), "{}", bot.screen());
+    assert_eq!(
+        bot.fake.sent().len(),
+        sent_before,
+        "snooze must not be released before its own time"
+    );
+    let (scheduled_at, deferred): (DateTime<Utc>, bool) =
+        sqlx::query_as("SELECT scheduled_at, deferred FROM notification_deliveries WHERE id = $1")
+            .bind(delivery_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("restored snooze");
+    assert_eq!(scheduled_at, snoozed_at);
+    assert!(!deferred);
+
+    // 22:30: срок наступил — snooze приходит обычным сообщением.
+    assert_eq!(
+        tick_and_deliver(&mut bot, &db.pool, snoozed_at)
+            .await
+            .delivered,
+        1
+    );
+    let (_, next) = bot.latest();
+    assert!(!next.contains("Пока были тихие часы"), "{next}");
+    assert!(next.contains("Пора"), "{next}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabling_quiet_hours_does_not_release_a_snooze_early() {
+    snooze_not_released_before_its_own_time(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moving_quiet_start_later_does_not_release_a_snooze_early() {
+    snooze_not_released_before_its_own_time(true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

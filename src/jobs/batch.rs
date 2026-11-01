@@ -3,7 +3,9 @@
 //! Отложенные тихими часами доставки (`deferred`) и групповой snooze действия
 //! «Отложить все на час» (`batched`) в свой срок собираются в одно сообщение.
 //! Ручной выпуск, баннер и перенос при всё ещё тихом интервале трогают только
-//! `deferred`: групповой snooze ждёт своего срока.
+//! `deferred`: групповой snooze ждёт своего срока. Snooze, собственный срок
+//! которого ещё впереди, ручной выпуск не ускоряет: возвращает ему срок и
+//! снимает признак отложенности.
 //!
 //! Сборка и смена статусов выполняются в одной транзакции, строки блокируются
 //! `FOR UPDATE SKIP LOCKED`, а получатель — транзакционной advisory-блокировкой.
@@ -81,7 +83,8 @@ pub(crate) async fn deliver_batches(pool: &PgPool, now: DateTime<Utc>) -> Result
 ///
 /// `due_only` ограничивает выборку записями, срок которых уже наступил: так
 /// работает тик. `quiet_only` оставляет только отложенные тихими часами: так
-/// работает ручной выпуск, который не ускоряет групповой snooze.
+/// работает ручной выпуск, который не ускоряет групповой snooze и ещё не
+/// наступивший срок самого snooze.
 fn deferred_row_sql(due_only: bool, quiet_only: bool) -> String {
     let due = if due_only {
         "AND d.scheduled_at <= $2"
@@ -168,7 +171,8 @@ impl PreparedRelease {
 /// При `due_only` одна оставшаяся доставка не отправляется здесь: её доставит
 /// обычный путь. Ручной выпуск (`due_only = false`, `quiet_only = true`) доставляет
 /// единственную отложенную тихими часами запись сразу, не дожидаясь её
-/// зафиксированного времени.
+/// зафиксированного времени; исключение — snooze, чей собственный срок ещё
+/// впереди: ему возвращается этот срок и снимается признак отложенности.
 pub(crate) async fn deliver_deferred_batch(
     conn: &mut PgConnection,
     user_id: Uuid,
@@ -211,6 +215,18 @@ async fn prepare_deferred_batch(
     for row in rows {
         if row.is_stale(now) {
             mark_cancelled(&mut *conn, row.id, now).await?;
+            continue;
+        }
+        // Ручной выпуск не ускоряет snooze: если его собственный срок ещё
+        // впереди, а тихие часы успели перенести запись на их конец, возвращаем
+        // записи собственный срок и снимаем признак отложенности. Дальше она
+        // идёт общим путём и уходит не раньше своего срока.
+        if !due_only
+            && row.is_snooze()
+            && let Some(at) = notifications::snooze_key_time(&row.occurrence_key)
+            && at > now
+        {
+            restore_snooze_time(&mut *conn, row.id, at, now).await?;
             continue;
         }
         // Границы могли сдвинуть после переноса: в момент выпуска тихие часы
@@ -294,6 +310,30 @@ async fn prepare_deferred_batch(
         html,
         candidates,
     })
+}
+
+/// Вернуть отложенный тихими часами snooze его собственному сроку.
+///
+/// Ручной выпуск выполняется, когда сейчас уже не тихо, но срок snooze может
+/// быть ещё впереди: выпускать запись раньше нельзя. Она остаётся `pending`, и
+/// обычный путь доставит её в срок или снова отложит, если тогда тихо.
+async fn restore_snooze_time(
+    conn: &mut PgConnection,
+    id: Uuid,
+    scheduled_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE notification_deliveries
+         SET scheduled_at = $2, deferred = false, updated_at = $3
+         WHERE id = $1 AND status = 'pending'",
+    )
+    .bind(id)
+    .bind(scheduled_at)
+    .bind(now)
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 /// Поставить подготовленный выпуск в outbox и отметить доставки.

@@ -254,6 +254,59 @@ async fn grouped_snooze_that_falls_into_quiet_hours_becomes_quiet_deferred() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn complete_all_finishes_a_snoozed_block_and_cancels_its_snooze() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = bot.now.with_timezone(&moscow).date_naive();
+    let morning = local_utc(moscow, day, 8, 0);
+    let due = local_utc(moscow, day, 9, 0);
+    let first = create_task(&db.pool, &household, "Первая", due, None).await;
+    let second = create_task(&db.pool, &household, "Вторая", due, None).await;
+    deferred_reminder(&db.pool, &household, first.id, due, morning).await;
+    deferred_reminder(&db.pool, &household, second.id, due, morning).await;
+
+    tick_and_deliver(&mut bot, &db.pool, morning).await;
+    let (message_id, html) = bot.latest();
+    let snooze = button_of(&html, "На час");
+    bot.press_data(&snooze, message_id).await;
+    let (_, edited) = bot.latest();
+    assert!(edited.contains("😴 Напомню в"), "{edited}");
+    // Отложена одна из двух задач; «Завершить все» должен взять и её блок.
+    let (snoozed_item, snoozed_at): (Uuid, DateTime<Utc>) = sqlx::query_as(
+        "SELECT item_id, scheduled_at FROM notification_deliveries
+         WHERE kind = 'snooze' AND status = 'pending'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("snooze delivery");
+
+    let complete_all = button_of(&edited, "Завершить все");
+    bot.press_data(&complete_all, message_id).await;
+
+    assert_eq!(item_status(&db.pool, first.id).await.0, "done");
+    assert_eq!(item_status(&db.pool, second.id).await.0, "done");
+    assert_eq!(item_status(&db.pool, snoozed_item).await.0, "done");
+    let (_, result) = bot.latest();
+    assert!(result.contains("Выполнено 2"), "{result}");
+
+    // Отложенная доставка выполнена вместе с задачей: тик отменяет её как
+    // устаревшую и ничего не присылает через час.
+    let sent_before = bot.fake.sent().len();
+    let stats = tick_and_deliver(&mut bot, &db.pool, snoozed_at).await;
+    assert_eq!(stats.delivered, 0, "{stats:?}");
+    assert_eq!(stats.cancelled, 1, "{stats:?}");
+    assert_eq!(
+        bot.fake.sent().len(),
+        sent_before,
+        "a completed task must not arrive in an hour"
+    );
+    assert_eq!(snooze_rows(&db.pool, snoozed_item).await[0].0, "cancelled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snooze_all_with_one_remaining_task_sends_an_ordinary_message() {
     let db = support::isolated_db().await;
     let mut bot = onboarded(&db.pool).await;
