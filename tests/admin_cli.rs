@@ -334,6 +334,10 @@ async fn webhook_info_reports_state_without_the_bot_token() {
         "{text}"
     );
     assert!(!text.contains("user:password"), "{text}");
+    assert!(
+        !text.contains("token=1"),
+        "the webhook URL query must not be printed:\n{text}"
+    );
     assert_eq!(field(&text, "pending_update_count"), "7");
     assert!(text.contains("last_error_date: 2023-11-14"), "{text}");
     assert_eq!(field(&text, "max_connections"), "40");
@@ -373,6 +377,9 @@ async fn webhook_info_network_error_hides_the_bot_token_and_database_password() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn export_contains_own_data_only_and_no_secrets() {
+    use tasklerq::domain::models::{ListKind, RecurrenceFreq};
+    use tasklerq::storage::repositories::{items, lists};
+
     let db = cli_database().await;
     let ours = support::create_household(&db.pool).await;
     let other = support::create_household(&db.pool).await;
@@ -382,6 +389,64 @@ async fn export_contains_own_data_only_and_no_secrets() {
     item.subtasks = vec![support::subtask("Взять сумку")];
     let item = support::create_item(&db.pool, &ours, ours.tasks_list_id, &ours.owner(), item).await;
     assert_eq!(item.tags.len(), 1);
+
+    // Архивный список остаётся в выгрузке.
+    let now = Utc::now();
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let archived_list = lists::create(
+        &mut conn,
+        ours.household_id,
+        ListKind::Checklist,
+        "Архивный список",
+        now,
+    )
+    .await
+    .expect("list");
+    lists::update(
+        &mut conn,
+        ours.household_id,
+        archived_list.id,
+        None,
+        Some(true),
+        true,
+        now,
+    )
+    .await
+    .expect("archive");
+
+    // Выполненная задача.
+    let completed = support::create_item(
+        &db.pool,
+        &ours,
+        ours.tasks_list_id,
+        &ours.owner(),
+        support::new_item(ours.tasks_list_id, "Выполненная задача"),
+    )
+    .await;
+    items::complete(
+        &mut conn,
+        ours.household_id,
+        &ours.owner(),
+        completed.id,
+        None,
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("complete");
+
+    // Задача с назначением и повторением.
+    let mut recurring = support::new_item(ours.tasks_list_id, "Полить цветы");
+    recurring.assignee_user_id = Some(ours.member_id);
+    recurring.recurrence = Some(support::recurrence(RecurrenceFreq::Daily, Vec::new()));
+    let recurring = support::create_item(
+        &db.pool,
+        &ours,
+        ours.tasks_list_id,
+        &ours.owner(),
+        recurring,
+    )
+    .await;
 
     let foreign = support::create_item(
         &db.pool,
@@ -402,9 +467,27 @@ async fn export_contains_own_data_only_and_no_secrets() {
     .await;
     sqlx::query("UPDATE items SET deleted_at = now() WHERE id = $1")
         .bind(deleted.id)
-        .execute(&db.pool)
+        .execute(&mut *conn)
         .await
         .expect("soft delete");
+
+    // Напоминание по задаче попадает в блок `reminders`.
+    sqlx::query(
+        "INSERT INTO notification_deliveries
+             (id, household_id, user_id, item_id, occurrence_key, kind, status,
+              scheduled_at, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'export-occurrence', 'reminder'::notification_kind,
+                 'pending'::notification_status, $5, $5, $5)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(ours.household_id)
+    .bind(ours.owner_id)
+    .bind(recurring.id)
+    .bind(now)
+    .execute(&mut *conn)
+    .await
+    .expect("delivery");
+    drop(conn);
 
     // Токены, callback-токены и llm_runs не должны попасть в выгрузку.
     let token = support::issue_token(&db.pool, ours.household_id, &["ha:read"]).await;
@@ -447,6 +530,43 @@ async fn export_contains_own_data_only_and_no_secrets() {
     assert_eq!(exported["tags"][0]["name"], "молоко");
     assert_eq!(exported["subtasks"][0]["title"], "Взять сумку");
 
+    // Архивный список остаётся в выгрузке.
+    let lists = export["lists"].as_array().expect("lists array");
+    let archived = lists
+        .iter()
+        .find(|list| list["name"] == "Архивный список")
+        .expect("the archived list is exported");
+    assert_eq!(archived["is_archived"], true);
+
+    // Выполненная задача с назначением, повторением и напоминанием.
+    let completed_export = items
+        .iter()
+        .find(|item| item["title"] == "Выполненная задача")
+        .expect("the completed item is exported");
+    assert_eq!(completed_export["status"], "done");
+
+    let recurring_export = items
+        .iter()
+        .find(|item| item["title"] == "Полить цветы")
+        .expect("the recurring item is exported");
+    assert_eq!(
+        recurring_export["assignee_user_id"],
+        ours.member_id.to_string()
+    );
+    assert!(
+        recurring_export["recurrence"].is_object(),
+        "the recurrence rule is exported: {recurring_export}"
+    );
+    let reminders = recurring_export["reminders"]
+        .as_array()
+        .expect("reminders array");
+    let reminder = reminders
+        .iter()
+        .find(|reminder| reminder["occurrence_key"] == "export-occurrence")
+        .expect("the reminder attached to the item is exported");
+    assert_eq!(reminder["kind"], "reminder");
+    assert_eq!(reminder["status"], "pending");
+
     assert!(
         items.iter().all(|item| item["title"] != "ЧУЖАЯ ЗАДАЧА"),
         "another household must not be exported:\n{text}"
@@ -486,10 +606,18 @@ async fn export_contains_own_data_only_and_no_secrets() {
     }
     assert!(!text.contains(&foreign.id.to_string()));
 
-    // Файл выгрузки создаётся с правами 0600.
+    // Файл выгрузки создаётся с правами 0600, в том числе поверх файла с
+    // чужими правами.
     let dir = std::env::temp_dir().join(format!("tasklerq-export-{}", Uuid::now_v7().simple()));
     std::fs::create_dir_all(&dir).expect("temporary directory");
     let path = dir.join("export.json");
+    std::fs::write(&path, "прежнее содержимое").expect("pre-existing export file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("pre-existing permissions");
+    }
     let to_file = run(
         &db.url,
         &[
@@ -519,4 +647,19 @@ async fn export_contains_own_data_only_and_no_secrets() {
     }
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn export_uses_the_only_household_when_not_specified() {
+    let db = cli_database().await;
+    let household = support::create_household(&db.pool).await;
+
+    let output = run(&db.url, &["admin", "export"]).await;
+    assert!(output.status.success(), "{output:?}");
+    let export: Value = serde_json::from_str(&stdout(&output)).expect("stdout is JSON");
+    assert_eq!(
+        export["household"]["id"],
+        household.household_id.to_string(),
+        "the single household is used without --household"
+    );
 }

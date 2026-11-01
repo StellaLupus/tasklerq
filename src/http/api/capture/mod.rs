@@ -36,6 +36,7 @@ use crate::domain::error::DomainError;
 use crate::domain::models::{CaptureMode, CaptureSource, Item, List, ListKind};
 use crate::domain::validation::{MAX_TITLE, sanitize};
 use crate::home_assistant::{AiTask, MAX_GENERATE_TIMEOUT};
+use crate::security_audit::{self, LimitKey, LlmValidation, RateLimitEvent};
 use crate::storage::repositories::capture_requests;
 use crate::storage::repositories::capture_requests::Reserved;
 use crate::storage::repositories::drafts::Draft;
@@ -94,7 +95,7 @@ impl FromRequestParts<AppState> for CaptureAuth {
     ) -> Result<Self, Self::Rejection> {
         let auth =
             <AuthContext as FromRequestParts<AppState>>::from_request_parts(parts, state).await?;
-        require_capture(&auth)?;
+        require_capture(state, &auth).await?;
         Ok(Self(auth))
     }
 }
@@ -314,6 +315,19 @@ async fn capture_inner(
             household_id = %auth.household_id,
             "capture requests are rate limited"
         );
+        state
+            .audit
+            .rate_limited(
+                RateLimitEvent {
+                    limit: crate::security_audit::CAPTURE_LIMIT,
+                    key: LimitKey::Token(auth.token_id),
+                    retry_after: decision.retry_after.unwrap_or(60),
+                    household_id: Some(auth.household_id),
+                    actor: auth.actor.clone(),
+                },
+                now,
+            )
+            .await;
         log_capture(source, "rate_limited", capture_id);
         return Err(ApiError::rate_limited("Too many capture requests")
             .with_retry_after(decision.retry_after.unwrap_or(60)));
@@ -553,6 +567,22 @@ async fn capture_inner(
                 }
                 Failure::Parse(error) => {
                     tracing::warn!(error = error.code(), "llm capture response rejected");
+                    state
+                        .audit
+                        .llm_validation_failed(
+                            LlmValidation {
+                                source: security_audit::capture_source_label(source),
+                                stage: "parse",
+                                code: error.code(),
+                                prompt_version: PROMPT_VERSION,
+                                household_id: auth.household_id,
+                                actor: integration_actor(draft::item_source(source)),
+                                capture_id: Some(capture_id),
+                                job_id: None,
+                            },
+                            last_finished_at,
+                        )
+                        .await;
                 }
             }
 

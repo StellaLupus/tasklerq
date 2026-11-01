@@ -36,6 +36,10 @@ pub enum AuditEventType {
     AuthFailed,
     /// Сработал rate limit.
     RateLimited,
+    /// Ответ LLM не прошёл валидацию.
+    LlmValidationFailed,
+    /// За окно накопилось больше отказов аутентификации webhook, чем порог.
+    AuthFailureThresholdExceeded,
     /// Household удалён.
     HouseholdDeleted,
 }
@@ -56,6 +60,8 @@ impl AuditEventType {
             Self::TokenRevoked => "token_revoked",
             Self::AuthFailed => "auth_failed",
             Self::RateLimited => "rate_limited",
+            Self::LlmValidationFailed => "llm_validation_failed",
+            Self::AuthFailureThresholdExceeded => "auth_failure_threshold_exceeded",
             Self::HouseholdDeleted => "household_deleted",
         }
     }

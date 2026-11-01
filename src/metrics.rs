@@ -130,6 +130,11 @@ pub fn webhook_auth_failure() {
     add_counter("webhook_auth_failures_total", &[]);
 }
 
+/// Отказов аутентификации webhook в окне больше порога.
+pub fn webhook_auth_failure_threshold_exceeded() {
+    add_counter("webhook_auth_failure_threshold_exceeded_total", &[]);
+}
+
 /// Значения gauges, которые считаются запросом к базе при скрейпе.
 struct DatabaseGauges {
     queue_lag: f64,
@@ -268,6 +273,9 @@ fn help(name: &str) -> &'static str {
         "http_requests_total" => "HTTP requests by matched route template and status.",
         "db_pool_in_use" => "Database pool connections currently checked out.",
         "webhook_auth_failures_total" => "Telegram webhook requests rejected by the secret.",
+        "webhook_auth_failure_threshold_exceeded_total" => {
+            "Webhook auth failures per 5-minute window above the alerting threshold."
+        }
         _ => "Tasklerq metric.",
     }
 }

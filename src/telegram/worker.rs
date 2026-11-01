@@ -17,6 +17,7 @@ use tokio::sync::{Notify, watch};
 
 use crate::metrics;
 use crate::rate_limit::RateLimiter;
+use crate::security_audit::{Audit, LimitKey, RateLimitEvent};
 
 use super::api::TelegramApi;
 use super::bot::{Answer, Bot, Outcome};
@@ -39,6 +40,12 @@ pub enum Pass {
     Processed,
     /// Обработка не удалась; повтор или `dead` записаны в очередь.
     Failed(Failure),
+}
+
+/// Пропущенное обновление и событие о сработавшем лимите.
+struct Limited {
+    outcome: Outcome,
+    event: RateLimitEvent,
 }
 
 /// Обработчик обновления: граница, через которую тесты подменяют бота.
@@ -83,6 +90,7 @@ pub struct UpdateWorker {
     only_chat: Option<i64>,
     rate: Option<Arc<RateLimiter<i64>>>,
     notices: Option<Arc<RateLimiter<i64>>>,
+    audit: Audit,
 }
 
 impl UpdateWorker {
@@ -95,6 +103,7 @@ impl UpdateWorker {
         wake_outbox: Arc<Notify>,
     ) -> Self {
         Self {
+            audit: Audit::new(pool.clone()),
             pool,
             handler,
             api,
@@ -142,12 +151,15 @@ impl UpdateWorker {
         // Слот расходуется только на первой попытке: повтор уже учтённого
         // обновления не должен отнимать лимит у новых действий пользователя.
         if job.attempts == 0
-            && let Some(outcome) = self.rate_limited(&mut tx, &job, now).await?
+            && let Some(limited) = self.rate_limited(&mut tx, &job, now).await?
         {
             queue::mark_processed(&mut tx, job.update_id, now).await?;
             tx.commit().await?;
+            // Событие пишется после коммита отдельным соединением: отказ не
+            // должен исчезнуть вместе с транзакцией ответа.
+            self.audit.rate_limited(limited.event, now).await;
             self.wake_outbox.notify_one();
-            self.answer(outcome).await;
+            self.answer(limited.outcome).await;
             metrics::telegram_update("rate_limited");
             log_update(job.update_id, "rate_limited", started);
             return Ok(Pass::Processed);
@@ -213,7 +225,7 @@ impl UpdateWorker {
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         job: &queue::Claimed,
         now: DateTime<Utc>,
-    ) -> Result<Option<Outcome>, sqlx::Error> {
+    ) -> Result<Option<Limited>, sqlx::Error> {
         let Some(rate) = &self.rate else {
             return Ok(None);
         };
@@ -270,7 +282,18 @@ impl UpdateWorker {
                 None
             }
         };
-        Ok(Some(Outcome { answer }))
+        Ok(Some(Limited {
+            outcome: Outcome { answer },
+            event: RateLimitEvent {
+                limit: crate::security_audit::TELEGRAM_LIMIT,
+                key: LimitKey::User(user_id),
+                retry_after,
+                household_id: None,
+                actor: crate::domain::models::Actor::system(
+                    crate::domain::models::ActorType::System,
+                ),
+            },
+        }))
     }
 
     async fn answer(&self, outcome: Outcome) {

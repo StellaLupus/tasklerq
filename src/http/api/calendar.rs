@@ -30,7 +30,7 @@ pub async fn calendar(
     auth: AuthContext,
     Query(query): Query<CalendarQuery>,
 ) -> Result<Json<CalendarResponse>, ApiError> {
-    require_read(&auth)?;
+    require_read(&state, &auth).await?;
 
     let start = parse_date(query.start.as_deref(), "start")?;
     let end = parse_date(query.end.as_deref(), "end")?;

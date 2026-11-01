@@ -66,22 +66,18 @@ pub async fn create(
     Ok(token)
 }
 
-/// Найти действующий токен по хешу.
-pub async fn find_valid(
+/// Найти токен по хешу независимо от срока и отзыва.
+///
+/// Нужно аутентификации, чтобы отличить неизвестный токен от отозванного и
+/// просроченного: причина отказа попадает в журнал безопасности.
+pub async fn find_by_hash(
     conn: &mut PgConnection,
     token_hash: &str,
-    now: DateTime<Utc>,
 ) -> Result<Option<ApiToken>, DomainError> {
-    let token = sqlx::query_as::<_, ApiToken>(
-        "SELECT id, household_id, name, prefix, scopes, expires_at, revoked_at,
-                last_used_at, created_at
-         FROM api_tokens
-         WHERE token_hash = $1
-           AND revoked_at IS NULL
-           AND (expires_at IS NULL OR expires_at > $2)",
-    )
+    let token = sqlx::query_as::<_, ApiToken>(&format!(
+        "SELECT {COLUMNS} FROM api_tokens WHERE token_hash = $1"
+    ))
     .bind(token_hash)
-    .bind(now)
     .fetch_optional(conn)
     .await?;
 

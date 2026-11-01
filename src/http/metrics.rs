@@ -10,6 +10,7 @@ use axum::response::{IntoResponse, Response};
 use crate::auth::tokens::AuthContext;
 use crate::metrics;
 
+use super::api;
 use super::error::ApiError;
 use super::router::AppState;
 
@@ -21,9 +22,7 @@ pub async fn scrape(
     State(state): State<AppState>,
     auth: AuthContext,
 ) -> Result<Response, ApiError> {
-    auth.require_scope(SCOPE)
-        .map_err(|_| ApiError::forbidden("Token is missing scope metrics:read"))?;
-
+    api::require_scope(&state, &auth, SCOPE).await?;
     let text = metrics::render_with_database_gauges(&state.pool)
         .await
         .map_err(|error| {

@@ -457,7 +457,9 @@ impl Config {
             ));
         }
 
-        let api_base_url = source.url("TELEGRAM_API_BASE_URL", false)?;
+        // Служебный адрес Bot API: вне development разрешён только HTTPS,
+        // чтобы токен бота не уходил по открытому каналу.
+        let api_base_url = source.url("TELEGRAM_API_BASE_URL", environment.is_production())?;
 
         Ok(TelegramConfig {
             mode,

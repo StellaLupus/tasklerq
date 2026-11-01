@@ -353,7 +353,7 @@ async fn run_admin(command: AdminCommand) -> Result<()> {
     match command {
         // Webhook не требует базы: команда работает даже при недоступном
         // PostgreSQL и использует ту же конфигурацию Telegram, что сервис.
-        AdminCommand::Webhook { command } => webhook_info(command).await,
+        AdminCommand::Webhook { .. } => webhook_info().await,
         command => run_admin_database(command).await,
     }
 }
@@ -557,11 +557,26 @@ fn print_status_counts(name: &str, counts: &[(String, i64)], known: &[&str]) {
     }
 }
 
-async fn webhook_info(command: WebhookCommand) -> Result<()> {
-    match command {
-        WebhookCommand::Info => {}
-    }
+fn webhook_display_url(raw: &str) -> String {
+    let clean = |value: &str| {
+        let end = value.find(['?', '#']).unwrap_or(value.len());
+        redaction::sanitize(&redaction::redact_url(&value[..end]))
+    };
 
+    let Ok(url) = url::Url::parse(raw) else {
+        return clean(raw);
+    };
+
+    let mut shown = format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default());
+    if let Some(port) = url.port() {
+        shown.push(':');
+        shown.push_str(&port.to_string());
+    }
+    shown.push_str(url.path());
+    clean(&shown)
+}
+
+async fn webhook_info() -> Result<()> {
     let config = Config::from_env().context("invalid configuration")?;
     let token = config
         .telegram
@@ -581,10 +596,7 @@ async fn webhook_info(command: WebhookCommand) -> Result<()> {
         .await
         .context("getWebhookInfo failed")?;
 
-    println!(
-        "url: {}",
-        redaction::sanitize(&redaction::redact_url(&info.url))
-    );
+    println!("url: {}", webhook_display_url(&info.url));
     println!("pending_update_count: {}", info.pending_update_count);
     match info.last_error_date {
         Some(timestamp) => println!(
@@ -628,17 +640,20 @@ fn write_export_file(path: &Path, contents: &str) -> Result<()> {
     let mut file = options
         .open(path)
         .with_context(|| format!("failed to create {}", path.display()))?;
-    file.write_all(contents.as_bytes())
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    drop(file);
 
-    // Режим при создании не меняет уже существующий файл: выставляем явно.
+    // Режим при создании не меняет уже существующий файл: выставляем права на
+    // открытом дескрипторе до записи, чтобы данные не оказались в файле с
+    // чужими правами даже на мгновение.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .with_context(|| format!("failed to set permissions on {}", path.display()))?;
     }
+
+    file.write_all(contents.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    drop(file);
 
     Ok(())
 }

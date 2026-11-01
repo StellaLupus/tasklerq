@@ -26,6 +26,7 @@ use crate::domain::error::DomainError;
 use crate::domain::models::{CaptureMode, Household, User};
 use crate::home_assistant::{AiTask, MAX_GENERATE_TIMEOUT};
 use crate::metrics;
+use crate::security_audit::{Audit, LlmValidation};
 use crate::storage::repositories::capture_jobs::{self, Failure, Job};
 use crate::storage::repositories::llm_runs::{self, FAILURE, NewRun, SUCCESS};
 use crate::storage::repositories::{households, users};
@@ -71,6 +72,7 @@ pub struct CaptureWorker {
     only_chat: Option<i64>,
     quota: u32,
     breaker: Arc<CircuitBreaker>,
+    audit: Audit,
 }
 
 /// Данные, которые читаются до вызова LLM.
@@ -108,6 +110,7 @@ impl CaptureWorker {
     /// Создать воркер. `wake_outbox` будит доставку после коммита.
     pub fn new(pool: PgPool, ai: Arc<dyn AiTask>, bot: Bot, wake_outbox: Arc<Notify>) -> Self {
         Self {
+            audit: Audit::new(pool.clone()),
             pool,
             ai,
             bot,
@@ -248,6 +251,24 @@ impl CaptureWorker {
                     ),
                     LlmFailure::Parse(error) => {
                         tracing::warn!(error = error.code(), "llm capture response rejected");
+                        self.audit
+                            .llm_validation_failed(
+                                LlmValidation {
+                                    source: "telegram",
+                                    stage: "parse",
+                                    code: error.code(),
+                                    prompt_version: PROMPT_VERSION,
+                                    household_id: job.household_id,
+                                    actor: crate::domain::models::Actor::user(
+                                        prepared.user.id,
+                                        prepared.user.role,
+                                    ),
+                                    capture_id: None,
+                                    job_id: Some(job.id),
+                                },
+                                now,
+                            )
+                            .await;
                     }
                 }
                 let message =

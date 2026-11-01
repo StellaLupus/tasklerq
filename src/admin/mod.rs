@@ -348,18 +348,26 @@ struct ReminderRow {
 
 /// Сформировать выгрузку household.
 ///
+/// Все чтения идут в одной транзакции `REPEATABLE READ READ ONLY`: участники,
+/// списки, задачи и напоминания видны на один момент, а случайная запись из
+/// выгрузки невозможна.
+///
 /// Мягко удалённые участники, списки и задачи не включаются.
 pub async fn export(
     pool: &PgPool,
     household_id: Option<Uuid>,
     now: DateTime<Utc>,
 ) -> Result<Export, DomainError> {
-    let mut conn = pool.acquire().await?;
-    let household = resolve_household(&mut conn, household_id).await?;
-    let members = users::list_active(&mut conn, household.id).await?;
-    let lists = lists::list(&mut conn, household.id).await?;
-    let items = items::all_for_export(&mut conn, household.id).await?;
-    let reminders = reminders_for(&mut conn, household.id).await?;
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let household = resolve_household(&mut tx, household_id).await?;
+    let members = users::list_active(&mut tx, household.id).await?;
+    let lists = lists::list(&mut tx, household.id).await?;
+    let items = items::all_for_export(&mut tx, household.id).await?;
+    let reminders = reminders_for(&mut tx, household.id).await?;
+    tx.commit().await?;
 
     let mut by_item: HashMap<Uuid, Vec<Reminder>> = HashMap::new();
     for row in reminders {

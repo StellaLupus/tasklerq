@@ -292,6 +292,18 @@ async fn cli_creates_lists_and_revokes_tokens() {
     let id = field("id");
     assert_eq!(field("scopes"), "ha:read,ha:write");
 
+    // CLI пишет событие создания токена без открытого значения.
+    let payload: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload FROM audit_events
+         WHERE event_type = 'token_created' AND payload->>'token_id' = $1",
+    )
+    .bind(&id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("token_created event");
+    assert_eq!(payload["name"], "cli token");
+    assert!(!payload.to_string().contains(&token));
+
     let (status, _) =
         support::request(&app, Method::GET, "/api/v1/lists", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);

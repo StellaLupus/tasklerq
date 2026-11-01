@@ -29,6 +29,7 @@ fn ctx(conn: &mut PgConnection, chat: i64) -> Ctx<'_> {
         toast: None,
         banner: None,
         llm_capture: false,
+        audit: None,
     }
 }
 

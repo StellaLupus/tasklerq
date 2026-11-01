@@ -444,7 +444,9 @@ pub fn journal_line(event: &AuditEvent, tz: chrono_tz::Tz) -> String {
         AuditEventType::TokenCreated
         | AuditEventType::TokenRevoked
         | AuditEventType::AuthFailed
-        | AuditEventType::RateLimited => "Служебное событие".to_owned(),
+        | AuditEventType::RateLimited
+        | AuditEventType::LlmValidationFailed
+        | AuditEventType::AuthFailureThresholdExceeded => "Служебное событие".to_owned(),
     };
     match source_label(event.actor_type) {
         Some(source) => format!("{stamp} · {what} · источник: {source}"),
@@ -612,6 +614,20 @@ pub async fn invite_create(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
                     .get("retry_after")
                     .and_then(Value::as_u64)
                     .unwrap_or(3_600);
+                if let Some(audit) = ctx.audit {
+                    audit
+                        .rate_limited(
+                            crate::security_audit::RateLimitEvent {
+                                limit: crate::security_audit::INVITES_LIMIT,
+                                key: crate::security_audit::LimitKey::Household(household_id),
+                                retry_after: seconds,
+                                household_id: Some(household_id),
+                                actor: actor.clone(),
+                            },
+                            ctx.now,
+                        )
+                        .await;
+                }
                 let minutes = i64::try_from(seconds.div_ceil(60).max(1)).unwrap_or(60);
                 return Err(Fail::User(format!(
                     "Не больше {} приглашений в час. Попробуйте через {}.",

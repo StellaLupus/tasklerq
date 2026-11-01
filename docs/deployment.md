@@ -273,7 +273,7 @@ curl -sS -X POST \
 | `TELEGRAM_WEBHOOK_SECRET` | при `webhook` | `hex` | Секрет webhook. |
 | `TELEGRAM_WEBHOOK_URL` | при `webhook` | `https://tasklerq.stellalupus.ru/webhooks/telegram` | Регистрация webhook. |
 | `TELEGRAM_BOT_USERNAME` | нет | `tasklerqbot` | Имя бота без `@` для ссылок-приглашений. |
-| `TELEGRAM_API_BASE_URL` | нет | `https://api.telegram.org` | Базовый адрес Bot API; подменяется на mock-сервер в тестах. |
+| `TELEGRAM_API_BASE_URL` | нет | `https://api.telegram.org` | Служебный базовый адрес Bot API; вне `ENV=development` допускается только `https`. Подменяется на mock-сервер в тестах. |
 | `TELEGRAM_MODE` | нет | `webhook` | `webhook`/`polling` (dev)/`disabled` (headless). |
 | `CAPTURE_API_ENABLED` | нет | `true` | Включить `POST /api/v1/capture`. |
 | `CAPTURE_VOICE_TIMEOUT_MS` | нет | `8000` | Таймаут LLM для `source=ha_voice`. |
@@ -752,7 +752,12 @@ curl -fsS \
 - `http_requests_total{route,status}` — `route` — шаблон маршрута, а не сырой
   путь;
 - `db_pool_in_use`;
-- `webhook_auth_failures_total`.
+- `webhook_auth_failures_total` — каждый отказ аутентификации webhook;
+- `webhook_auth_failure_threshold_exceeded_total` — отказов аутентификации
+  webhook в скользящем окне 5 минут стало больше 50. Метрика увеличивается на
+  единицу при первом превышении; пока окно снова не опустится до порога,
+  повторно она не растёт. Параллельно пишется событие
+  `auth_failure_threshold_exceeded` в `audit_events`.
 
 Алерты:
 
@@ -764,6 +769,27 @@ curl -fsS \
 | webhook 401 > 50 за 5 мин | Проверить секрет и источник запросов. |
 | backup failed | Проверить диск, права, PostgreSQL. |
 | disk > 80% | Очистить старые backup/логи. |
+
+Уведомление администратора о всплеске отказов webhook настраивается снаружи:
+по метрике `webhook_auth_failure_threshold_exceeded_total`. Пример правила
+Prometheus:
+
+```yaml
+groups:
+  - name: tasklerq
+    rules:
+      - alert: TasklerqWebhookAuthFailureThresholdExceeded
+        expr: increase(webhook_auth_failure_threshold_exceeded_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Больше 50 отказов аутентификации webhook за 5 минут"
+          description: "Проверьте TELEGRAM_WEBHOOK_SECRET и источник запросов; подробности — в audit_events (auth_failure_threshold_exceeded)."
+```
+
+Alertmanager доставляет срабатывание администратору; сам сервис уведомления
+не отправляет.
 
 ## 14. Retention
 

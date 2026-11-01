@@ -16,9 +16,11 @@ use subtle::ConstantTimeEq;
 use tokio::sync::Notify;
 
 use crate::config::SecretString;
+use crate::domain::models::{Actor, ActorType};
 use crate::http::error::ApiError;
 use crate::http::router::AppState;
 use crate::rate_limit::RateLimiter;
+use crate::security_audit::{self, LimitKey, RateLimitEvent};
 
 use super::queue;
 use super::update::{self, Classified};
@@ -89,15 +91,31 @@ pub async fn receive(
     // Проверка лимита — до разбора тела и секрета: всплеск запросов с одного
     // IP не должен доходить до парсинга и базы.
     let ip = client_ip(peer, forwarded_for(&headers).as_deref());
-    let decision = ingress.rate.check(ip, Utc::now());
+    let now = Utc::now();
+    let decision = ingress.rate.check(ip, now);
     if !decision.allowed {
         tracing::warn!(
             ip = %ip,
             limit = ingress.rate.limit(),
             "webhook requests from one IP are rate limited"
         );
-        return Err(ApiError::rate_limited("Too many webhook requests")
-            .with_retry_after(decision.retry_after.unwrap_or(1)));
+        let retry_after = decision.retry_after.unwrap_or(1);
+        state
+            .audit
+            .rate_limited(
+                RateLimitEvent {
+                    limit: security_audit::WEBHOOK_LIMIT,
+                    key: LimitKey::Ip(ip),
+                    retry_after,
+                    household_id: None,
+                    actor: Actor::system(ActorType::System),
+                },
+                now,
+            )
+            .await;
+        return Err(
+            ApiError::rate_limited("Too many webhook requests").with_retry_after(retry_after)
+        );
     }
 
     let provided = headers
@@ -105,7 +123,12 @@ pub async fn receive(
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
     if !ingress.accepts(provided) {
-        crate::metrics::webhook_auth_failure();
+        let reason = if provided.is_empty() {
+            "missing_secret"
+        } else {
+            "bad_secret"
+        };
+        state.audit.webhook_auth_failed(reason, ip, now).await;
         return Err(ApiError::unauthorized("Invalid webhook secret"));
     }
 

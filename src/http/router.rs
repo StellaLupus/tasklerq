@@ -10,6 +10,7 @@ use super::error::ApiError;
 use super::health;
 use super::metrics;
 use super::middleware::request_id;
+use crate::security_audit::Audit;
 use crate::telegram::webhook::{self, Ingress};
 
 /// Состояние приложения, доступное обработчикам.
@@ -17,6 +18,8 @@ use crate::telegram::webhook::{self, Ingress};
 pub struct AppState {
     /// Пул соединений PostgreSQL.
     pub pool: PgPool,
+    /// Журнал событий безопасности.
+    pub audit: Audit,
     /// Приём Telegram webhook; `None`, если webhook выключен.
     pub telegram: Option<Ingress>,
     /// Допустимый возраст необработанного обновления Telegram; `None`, если
@@ -30,11 +33,19 @@ impl AppState {
     /// Создать состояние из пула.
     pub fn new(pool: PgPool) -> Self {
         Self {
+            audit: Audit::new(pool.clone()),
             pool,
             telegram: None,
             queue_lag_limit: None,
             capture: None,
         }
+    }
+
+    /// Подменить журнал событий безопасности.
+    #[must_use]
+    pub fn with_audit(mut self, audit: Audit) -> Self {
+        self.audit = audit;
+        self
     }
 
     /// Включить `POST /api/v1/capture`.

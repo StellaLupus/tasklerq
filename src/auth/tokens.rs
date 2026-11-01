@@ -29,9 +29,25 @@ pub const SCOPES: [&str; 4] = ["ha:read", "ha:write", "capture:write", "metrics:
 /// Ошибка аутентификации или авторизации.
 #[derive(Debug, Error)]
 pub enum AuthError {
-    /// Токен отсутствует, неизвестен, отозван или истёк.
-    #[error("invalid or expired token")]
-    Unauthorized,
+    /// Токен отсутствует или неизвестен.
+    #[error("unknown token")]
+    Unknown,
+    /// Токен отозван.
+    #[error("revoked token")]
+    Revoked {
+        /// Идентификатор токена.
+        token_id: Uuid,
+        /// Household токена.
+        household_id: Uuid,
+    },
+    /// Срок токена истёк.
+    #[error("expired token")]
+    Expired {
+        /// Идентификатор токена.
+        token_id: Uuid,
+        /// Household токена.
+        household_id: Uuid,
+    },
     /// Токену не хватает scope.
     #[error("token does not have the required scope: {0}")]
     Forbidden(String),
@@ -51,6 +67,9 @@ pub struct AuthContext {
     pub scopes: Vec<String>,
     /// Актор доменных операций.
     pub actor: Actor,
+    /// Шаблон маршрута запроса; заполняет HTTP-слой, нужен журналу безопасности
+    /// при нехватке scope.
+    pub route: Option<String>,
 }
 
 impl AuthContext {
@@ -206,33 +225,46 @@ pub fn hash_token(token: &str) -> String {
 }
 
 /// Проверить Bearer-токен и вернуть контекст.
-pub async fn authenticate(pool: &PgPool, token: &str) -> Result<Option<AuthContext>, AuthError> {
-    if !token.starts_with("tlq_") {
-        return Ok(None);
+///
+/// Отозванный и просроченный токены различаются в ошибке: HTTP-слой пишет
+/// причину отказа в журнал безопасности, не раскрывая её клиенту.
+pub async fn authenticate(pool: &PgPool, token: &str) -> Result<AuthContext, AuthError> {
+    if !token.starts_with(TOKEN_PREFIX) {
+        return Err(AuthError::Unknown);
     }
 
     let token_hash = hash_token(token);
     let now = chrono::Utc::now();
     let mut conn = pool.acquire().await?;
 
-    let Some(record) = tokens::find_valid(&mut conn, &token_hash, now)
+    let Some(record) = tokens::find_by_hash(&mut conn, &token_hash)
         .await
-        .map_err(|error| match error {
-            crate::domain::error::DomainError::Database(error) => AuthError::Database(error),
-            _ => AuthError::Unauthorized,
-        })?
+        .map_err(database_error)?
     else {
-        return Ok(None);
+        return Err(AuthError::Unknown);
     };
+
+    if record.revoked_at.is_some() {
+        return Err(AuthError::Revoked {
+            token_id: record.id,
+            household_id: record.household_id,
+        });
+    }
+    if record
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= now)
+    {
+        return Err(AuthError::Expired {
+            token_id: record.id,
+            household_id: record.household_id,
+        });
+    }
 
     tokens::touch(&mut conn, record.id, now)
         .await
-        .map_err(|error| match error {
-            crate::domain::error::DomainError::Database(error) => AuthError::Database(error),
-            _ => AuthError::Unauthorized,
-        })?;
+        .map_err(database_error)?;
 
-    Ok(Some(AuthContext {
+    Ok(AuthContext {
         token_id: record.id,
         household_id: record.household_id,
         scopes: record.scopes,
@@ -241,7 +273,15 @@ pub async fn authenticate(pool: &PgPool, token: &str) -> Result<Option<AuthConte
             role: Some(UserRole::Owner),
             actor_type: ActorType::HomeAssistant,
         },
-    }))
+        route: None,
+    })
+}
+
+fn database_error(error: DomainError) -> AuthError {
+    match error {
+        DomainError::Database(error) => AuthError::Database(error),
+        _ => AuthError::Unknown,
+    }
 }
 
 #[cfg(test)]

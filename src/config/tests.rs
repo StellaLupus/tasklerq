@@ -686,3 +686,42 @@ fn errors_do_not_echo_secret_values() {
     assert_invalid(error, "DATABASE_URL");
     assert!(!message.contains("db-secret-password"));
 }
+
+#[test]
+fn telegram_api_base_url_allows_http_only_in_development() {
+    let mut vars = base_env();
+    vars.insert(
+        "TELEGRAM_API_BASE_URL".to_owned(),
+        "http://127.0.0.1:8080".to_owned(),
+    );
+    let loaded = config(vars).expect("http is allowed in development");
+    assert_eq!(loaded.telegram.api_base_url.expect("url").scheme(), "http");
+
+    let mut vars = base_env();
+    vars.insert("ENV".to_owned(), "production".to_owned());
+    vars.insert(
+        "PUBLIC_BASE_URL".to_owned(),
+        "https://tasklerq.example.com".to_owned(),
+    );
+    vars.insert(
+        "TELEGRAM_API_BASE_URL".to_owned(),
+        "http://127.0.0.1:8080".to_owned(),
+    );
+    assert_invalid(
+        config(vars).expect_err("http must be rejected outside development"),
+        "TELEGRAM_API_BASE_URL",
+    );
+
+    let mut vars = base_env();
+    vars.insert("ENV".to_owned(), "production".to_owned());
+    vars.insert(
+        "PUBLIC_BASE_URL".to_owned(),
+        "https://tasklerq.example.com".to_owned(),
+    );
+    vars.insert(
+        "TELEGRAM_API_BASE_URL".to_owned(),
+        "https://api.telegram.org".to_owned(),
+    );
+    let loaded = config(vars).expect("https is always allowed");
+    assert_eq!(loaded.telegram.api_base_url.expect("url").scheme(), "https");
+}

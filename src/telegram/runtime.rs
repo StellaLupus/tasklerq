@@ -86,7 +86,9 @@ pub async fn start(
         TelegramMode::Disabled => {}
     }
 
-    let bot = Bot::new(telegram.bot_username.clone()).with_llm_capture(ai.is_some());
+    let bot = Bot::new(telegram.bot_username.clone())
+        .with_llm_capture(ai.is_some())
+        .with_audit(crate::security_audit::Audit::new(pool.clone()));
     if let Some(ai) = ai {
         let capture = CaptureWorker::new(pool.clone(), ai, bot.clone(), wake_outbox.clone())
             .with_quota(config.llm.daily_quota)

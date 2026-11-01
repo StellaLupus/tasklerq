@@ -257,6 +257,11 @@ pub fn unescape(text: &str) -> String {
         .replace("&amp;", "&")
 }
 
+/// Бот стенда с журналом событий безопасности на пуле стенда.
+fn harness_bot(pool: &PgPool) -> Bot {
+    Bot::new("tasklerqbot").with_audit(tasklerq::security_audit::Audit::new(pool.clone()))
+}
+
 /// Сценарный стенд: один пользователь, настоящий бот и поддельный Telegram.
 pub struct Harness {
     pub pool: PgPool,
@@ -279,13 +284,13 @@ impl Harness {
         Self::with_handler(
             pool,
             telegram_id,
-            Arc::new(Bot::new("tasklerqbot")),
+            Arc::new(harness_bot(pool)),
             FakeTelegram::new(),
         )
     }
 
     pub fn sharing(pool: &PgPool, telegram_id: i64, fake: Arc<FakeTelegram>) -> Self {
-        Self::with_handler(pool, telegram_id, Arc::new(Bot::new("tasklerqbot")), fake)
+        Self::with_handler(pool, telegram_id, Arc::new(harness_bot(pool)), fake)
     }
 
     pub fn with_handler(
