@@ -10,6 +10,12 @@ use super::api::RichMessage;
 /// Максимум кнопок в одном ряду: длинные подписи иначе обрезаются.
 pub const MAX_BUTTONS_PER_ROW: usize = 3;
 
+/// Сколько строк цитаты видно до сворачивания.
+pub const QUOTE_MAX_LINES: usize = 3;
+
+/// Сколько символов цитаты видно до сворачивания.
+pub const QUOTE_MAX_CHARS: usize = 200;
+
 /// Фрагмент строки с форматированием.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Span {
@@ -60,6 +66,8 @@ pub enum Block<A> {
         /// Текст.
         body: String,
     },
+    /// Цитата пользовательского текста.
+    Quote(String),
     /// Ряд кнопок.
     Buttons(Vec<Button<A>>),
 }
@@ -121,6 +129,12 @@ impl<A> View<A> {
             summary: summary.into(),
             body: body.into(),
         });
+        self
+    }
+
+    /// Добавить цитату пользовательского текста.
+    pub fn quote(mut self, text: impl Into<String>) -> Self {
+        self.blocks.push(Block::Quote(text.into()));
         self
     }
 
@@ -188,6 +202,10 @@ fn render_span(span: &Span) -> String {
     }
 }
 
+fn quote_is_long(text: &str) -> bool {
+    text.split('\n').count() > QUOTE_MAX_LINES || text.chars().count() > QUOTE_MAX_CHARS
+}
+
 /// Собрать HTML экрана. `tokens` — по одному на кнопку в порядке
 /// [`View::actions`].
 ///
@@ -217,6 +235,14 @@ pub fn render<A>(view: &View<A>, tokens: &[String]) -> RichMessage {
                 escape_inline(summary),
                 escape_inline(body)
             )),
+            Block::Quote(text) => {
+                let open = if quote_is_long(text) {
+                    "<blockquote expandable>"
+                } else {
+                    "<blockquote>"
+                };
+                lines.push(format!("{open}{}</blockquote>", escape_inline(text)));
+            }
             Block::Buttons(buttons) => {
                 for chunk in buttons.chunks(MAX_BUTTONS_PER_ROW) {
                     let mut row = String::from("<tg-button-row>");
@@ -307,5 +333,57 @@ mod tests {
     fn empty_rows_are_skipped() {
         let view: View<()> = View::new().row(Vec::new()).text("x");
         assert_eq!(view.blocks.len(), 1);
+    }
+
+    #[test]
+    fn a_short_quote_is_not_collapsed_and_is_escaped() {
+        let view = View::<()>::new().quote("a < b & c > d");
+        let html = render(&view, &[]).html;
+
+        assert_eq!(html, "<blockquote>a &lt; b &amp; c &gt; d</blockquote>");
+    }
+
+    #[test]
+    fn quote_line_breaks_are_preserved() {
+        let view = View::<()>::new().quote("первая\nвторая");
+        let html = render(&view, &[]).html;
+
+        assert_eq!(html, "<blockquote>первая<br/>вторая</blockquote>");
+    }
+
+    #[test]
+    fn three_lines_or_two_hundred_characters_are_not_collapsed() {
+        let lines = View::<()>::new().quote("один\nдва\nтри");
+        assert_eq!(
+            render(&lines, &[]).html,
+            "<blockquote>один<br/>два<br/>три</blockquote>"
+        );
+
+        let chars = View::<()>::new().quote("я".repeat(200));
+        assert_eq!(
+            render(&chars, &[]).html,
+            format!("<blockquote>{}</blockquote>", "я".repeat(200))
+        );
+    }
+
+    #[test]
+    fn four_lines_or_two_hundred_one_characters_are_collapsed() {
+        let lines = View::<()>::new().quote("один\nдва\nтри\nчетыре");
+        assert!(
+            render(&lines, &[])
+                .html
+                .starts_with("<blockquote expandable>"),
+            "{}",
+            render(&lines, &[]).html
+        );
+
+        let chars = View::<()>::new().quote("я".repeat(201));
+        assert!(
+            render(&chars, &[])
+                .html
+                .starts_with("<blockquote expandable>"),
+            "{}",
+            render(&chars, &[]).html
+        );
     }
 }

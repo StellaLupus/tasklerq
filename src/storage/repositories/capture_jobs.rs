@@ -146,6 +146,27 @@ pub async fn count_recent_for_user(
     .await
 }
 
+/// Текст задания для своего пользователя и household. `None`, если задания
+/// нет, оно текстовое не от него, или текст уже затёрт.
+pub async fn text_for_user(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    user_id: Uuid,
+    job_id: Uuid,
+) -> Result<Option<String>, sqlx::Error> {
+    let text = sqlx::query_scalar(
+        "SELECT payload->>'text' FROM capture_jobs
+         WHERE id = $1 AND household_id = $2 AND user_id = $3 AND input_kind = $4",
+    )
+    .bind(job_id)
+    .bind(household_id)
+    .bind(user_id)
+    .bind(INPUT_TEXT)
+    .fetch_optional(conn)
+    .await?;
+    Ok(text.flatten())
+}
+
 /// Захватить следующее готовое задание на время [`LEASE`].
 ///
 /// Готово то, что ждёт и чьё время подошло, а также то, чья аренда истекла

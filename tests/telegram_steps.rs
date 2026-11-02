@@ -249,3 +249,111 @@ async fn user_failure_restores_member_and_timezone_in_the_context() {
     );
     assert_eq!(ctx.tz, chrono_tz::Europe::Moscow);
 }
+
+/// Onboarding до главного меню.
+async fn onboarded(pool: &sqlx::PgPool) -> Harness {
+    let mut bot = Harness::new(pool, next_telegram_id()).named("Ann");
+    bot.text("/start").await;
+    bot.text("Семья").await;
+    bot.press("Москва").await;
+    bot.press("меню").await;
+    bot
+}
+
+/// Household стенда с идентификаторами списков по умолчанию.
+async fn stand_household(pool: &sqlx::PgPool, chat: i64) -> support::TestHousehold {
+    let (household_id, owner_id): (uuid::Uuid, uuid::Uuid) =
+        sqlx::query_as("SELECT household_id, id FROM users WHERE telegram_user_id = $1")
+            .bind(chat)
+            .fetch_one(pool)
+            .await
+            .expect("household");
+    let list = |kind: &'static str| {
+        sqlx::query_scalar(
+            "SELECT id FROM lists WHERE household_id = $1 AND kind::text = $2
+             ORDER BY is_default DESC, created_at LIMIT 1",
+        )
+        .bind(household_id)
+        .bind(kind)
+        .fetch_one(pool)
+    };
+    support::TestHousehold {
+        household_id,
+        owner_id,
+        member_id: owner_id,
+        tasks_list_id: list("tasks").await.expect("default tasks list"),
+        shopping_list_id: list("shopping").await.expect("default shopping list"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_form_summary_shows_the_shopping_quantity() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = stand_household(&db.pool, bot.chat).await;
+    let mut item = support::new_item(household.shopping_list_id, "Молоко");
+    item.quantity = Some(2.0);
+    item.unit = Some("л".into());
+    support::create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &household.owner(),
+        item,
+    )
+    .await;
+
+    bot.press("Покупки").await;
+    bot.press("⋯").await;
+    bot.press("Количество").await;
+
+    bot.assert_screen_contains("Сколько?");
+    bot.assert_screen_contains("Название: Молоко");
+    bot.assert_screen_contains("Количество: 2 л");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_form_summary_shows_a_unit_without_quantity() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = stand_household(&db.pool, bot.chat).await;
+    let mut item = support::new_item(household.shopping_list_id, "Хлеб");
+    item.unit = Some("уп".into());
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &household.owner(),
+        item,
+    )
+    .await;
+    // Старая или внешняя позиция без количества: сводка должна показать единицу.
+    sqlx::query("UPDATE items SET quantity = NULL WHERE id = $1")
+        .bind(created.id)
+        .execute(&db.pool)
+        .await
+        .expect("quantity without number");
+
+    bot.press("Покупки").await;
+    bot.press("⋯").await;
+    bot.press("Единица").await;
+
+    bot.assert_screen_contains("В чём измерять?");
+    bot.assert_screen_contains("Название: Хлеб");
+    bot.assert_screen_contains("Единица: уп");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_shopping_summary_keeps_the_chosen_quantity_and_unit() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+
+    bot.press("Добавить").await;
+    bot.press("Покупку").await;
+    bot.text("Молоко").await;
+    bot.press("2").await;
+    bot.assert_screen_contains("Количество: 2");
+    bot.press("л").await;
+
+    bot.assert_screen_contains("Количество: 2 л");
+}

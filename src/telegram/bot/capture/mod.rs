@@ -63,21 +63,39 @@ pub async fn intake(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
         return ctx.refresh().await;
     }
 
-    capture_jobs::enqueue(
+    let job_id = capture_jobs::enqueue(
         &mut *ctx.conn,
         NewJob::telegram_text(household_id, user_id, ctx.chat_id, text),
         ctx.now,
     )
     .await?;
-    ctx.present(Screen::Processing).await
+    ctx.present(Screen::Processing {
+        job_id: Some(job_id),
+    })
+    .await
 }
 
 /// Экран ожидания разбора.
-pub fn processing() -> Ui {
-    Ui::new()
+pub async fn processing(ctx: &mut Ctx<'_>, job_id: Option<Uuid>) -> Result<Ui, Fail> {
+    let text = match (
+        job_id,
+        ctx.user.as_ref().map(|user| user.id),
+        ctx.household.as_ref().map(|household| household.id),
+    ) {
+        (Some(job_id), Some(user_id), Some(household_id)) => {
+            capture_jobs::text_for_user(&mut *ctx.conn, household_id, user_id, job_id).await?
+        }
+        _ => None,
+    };
+
+    let mut ui = Ui::new();
+    if let Some(text) = text.as_deref().filter(|text| !text.is_empty()) {
+        ui = ui.quote(text);
+    }
+    Ok(ui
         .heading("⏳ Разбираю сообщение…")
         .text("Это займёт несколько секунд. Задачи появятся после вашего подтверждения.")
-        .row(vec![back_button("🏠 Меню", Screen::Menu)])
+        .row(vec![back_button("🏠 Меню", Screen::Menu)]))
 }
 
 fn kind_icon(kind: ListKind) -> &'static str {
@@ -134,7 +152,11 @@ fn card(ctx: &Ctx<'_>, view: &DraftView) -> Ui {
     let items = &view.validated.items;
     let total = items.len();
 
-    let mut ui = Ui::new().heading(if total == 0 {
+    let mut ui = Ui::new();
+    if !view.draft.raw_text.is_empty() {
+        ui = ui.quote(&view.draft.raw_text);
+    }
+    ui = ui.heading(if total == 0 {
         "Черновик пуст".to_owned()
     } else {
         format!(
