@@ -103,14 +103,59 @@ pub async fn create_household(
     timezone: &str,
     now: DateTime<Utc>,
 ) -> Result<Household, DomainError> {
+    let (household, _) = create_household_inner(pool, mode, name, timezone, None, now).await?;
+    Ok(household)
+}
+
+/// Создать household вместе с владельцем одной транзакцией.
+///
+/// Telegram ID владельца уже занят другим активным пользователем — конфликт,
+/// как у `admin user add`. Без имени используется [`DEFAULT_MEMBER_NAME`].
+pub async fn create_household_with_owner(
+    pool: &PgPool,
+    mode: TenancyMode,
+    name: &str,
+    timezone: &str,
+    telegram_user_id: i64,
+    display_name: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<(Household, User), DomainError> {
+    let owner = households::NewOwner {
+        member: NewMember {
+            telegram_user_id,
+            // В приватном чате chat_id равен Telegram ID, как в `user add`.
+            telegram_chat_id: telegram_user_id,
+            display_name: display_name.unwrap_or(DEFAULT_MEMBER_NAME).to_owned(),
+            username: None,
+        },
+        timezone: None,
+    };
+
+    let (household, owner) =
+        create_household_inner(pool, mode, name, timezone, Some(owner), now).await?;
+    let owner = owner.ok_or_else(|| {
+        DomainError::Validation("a household created with an owner has no owner".into())
+    })?;
+
+    Ok((household, owner))
+}
+
+async fn create_household_inner(
+    pool: &PgPool,
+    mode: TenancyMode,
+    name: &str,
+    timezone: &str,
+    owner: Option<households::NewOwner>,
+    now: DateTime<Utc>,
+) -> Result<(Household, Option<User>), DomainError> {
     let mut tx = pool.begin().await?;
-    let (household, _) = households::create(
+    let result = households::create(
         &mut tx,
         mode,
         households::NewHousehold {
             name: name.to_owned(),
             timezone: timezone.to_owned(),
-            owner: None,
+            owner,
         },
         &admin_actor(),
         now,
@@ -118,7 +163,7 @@ pub async fn create_household(
     .await?;
     tx.commit().await?;
 
-    Ok(household)
+    Ok(result)
 }
 
 /// Добавить участника. Без `household_id` используется единственный
@@ -163,37 +208,81 @@ pub struct HouseholdSummary {
     pub name: String,
     /// Часовой пояс IANA.
     pub timezone: String,
+    /// Telegram ID активного владельца.
+    pub owner_telegram_id: Option<i64>,
     /// Число активных участников.
     pub members: i64,
+    /// Число открытых задач.
+    pub open_tasks: i64,
+    /// Число активных (не отозванных и не истёкших) токенов.
+    pub active_tokens: i64,
     /// Время создания.
     pub created_at: DateTime<Utc>,
 }
 
-/// Все неудалённые household с числом участников.
-pub async fn list_households(pool: &PgPool) -> Result<Vec<HouseholdSummary>, DomainError> {
-    let rows: Vec<(Uuid, String, String, DateTime<Utc>, i64)> = sqlx::query_as(
-        "SELECT h.id, h.name, h.timezone, h.created_at, count(u.id)
+/// Все неудалённые household с агрегатами одним запросом.
+///
+/// Открытая задача — та же, что в [`items::stats`]: неудалённая, в
+/// неудалённом неархивном списке `tasks` со статусом `open`. Активный токен
+/// не отозван и не истёк на момент `now`.
+pub async fn list_households(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+) -> Result<Vec<HouseholdSummary>, DomainError> {
+    let rows = sqlx::query_as::<_, HouseholdSummaryRow>(
+        "SELECT h.id, h.name, h.timezone, o.telegram_user_id AS owner_telegram_id,
+                h.created_at,
+                (SELECT count(*) FROM users u
+                  WHERE u.household_id = h.id AND u.deleted_at IS NULL) AS members,
+                (SELECT count(*) FROM items i
+                   JOIN lists l ON l.id = i.list_id
+                  WHERE i.household_id = h.id
+                    AND i.deleted_at IS NULL
+                    AND l.deleted_at IS NULL
+                    AND NOT l.is_archived
+                    AND l.kind = 'tasks'
+                    AND i.status = 'open') AS open_tasks,
+                (SELECT count(*) FROM api_tokens t
+                  WHERE t.household_id = h.id
+                    AND t.revoked_at IS NULL
+                    AND (t.expires_at IS NULL OR t.expires_at > $1)) AS active_tokens
          FROM households h
-         LEFT JOIN users u ON u.household_id = h.id AND u.deleted_at IS NULL
+         LEFT JOIN users o
+                ON o.household_id = h.id
+               AND o.role = 'owner'
+               AND o.deleted_at IS NULL
          WHERE h.deleted_at IS NULL
-         GROUP BY h.id, h.name, h.timezone, h.created_at
          ORDER BY h.created_at, h.id",
     )
+    .bind(now)
     .fetch_all(pool)
     .await?;
 
     Ok(rows
         .into_iter()
-        .map(
-            |(id, name, timezone, created_at, members)| HouseholdSummary {
-                id,
-                name,
-                timezone,
-                members,
-                created_at,
-            },
-        )
+        .map(|row| HouseholdSummary {
+            id: row.id,
+            name: row.name,
+            timezone: row.timezone,
+            owner_telegram_id: row.owner_telegram_id,
+            members: row.members,
+            open_tasks: row.open_tasks,
+            active_tokens: row.active_tokens,
+            created_at: row.created_at,
+        })
         .collect())
+}
+
+#[derive(sqlx::FromRow)]
+struct HouseholdSummaryRow {
+    id: Uuid,
+    name: String,
+    timezone: String,
+    owner_telegram_id: Option<i64>,
+    created_at: DateTime<Utc>,
+    members: i64,
+    open_tasks: i64,
+    active_tokens: i64,
 }
 
 /// Количество заданий каждой очереди по статусам.

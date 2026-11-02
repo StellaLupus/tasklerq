@@ -185,7 +185,11 @@ struct TokenCreate {
 
 #[derive(Debug, Subcommand)]
 enum HouseholdCommand {
-    /// Создать household без владельца.
+    /// Создать household и списки «Задачи» и «Покупки».
+    ///
+    /// В режиме `single` второй активный household отклоняется с `409`. С
+    /// `--owner-telegram-id` владелец создаётся в той же транзакции; без него
+    /// печатается подсказка, как добавить владельца через `admin user add`.
     Create {
         /// Название household.
         #[arg(long)]
@@ -193,8 +197,14 @@ enum HouseholdCommand {
         /// Часовой пояс IANA.
         #[arg(long, default_value = "Europe/Moscow")]
         timezone: String,
+        /// Telegram ID владельца (положительное целое).
+        #[arg(long, value_name = "ID", value_parser = clap::value_parser!(i64).range(1..))]
+        owner_telegram_id: Option<i64>,
+        /// Отображаемое имя владельца; требует --owner-telegram-id.
+        #[arg(long, requires = "owner_telegram_id")]
+        owner_name: Option<String>,
     },
-    /// Показать household без секретов.
+    /// Показать активные household без секретов.
     List,
 }
 
@@ -477,23 +487,60 @@ async fn run_admin_database(command: DatabaseCommand) -> Result<()> {
             }
         },
         DatabaseCommand::Household(command) => match command {
-            HouseholdCommand::Create { name, timezone } => {
+            HouseholdCommand::Create {
+                name,
+                timezone,
+                owner_telegram_id,
+                owner_name,
+            } => {
                 let tenancy = TenancyConfig::from_env().context("invalid tenancy configuration")?;
-                let household = admin::create_household(&pool, tenancy.mode, &name, &timezone, now)
-                    .await
-                    .map_err(explain)?;
-                println!("id: {}", household.id);
-                println!("name: {}", household.name);
-                println!("timezone: {}", household.timezone);
+                match owner_telegram_id {
+                    Some(telegram_user_id) => {
+                        let (household, owner) = admin::create_household_with_owner(
+                            &pool,
+                            tenancy.mode,
+                            &name,
+                            &timezone,
+                            telegram_user_id,
+                            owner_name.as_deref(),
+                            now,
+                        )
+                        .await
+                        .map_err(explain)?;
+                        println!("id: {}", household.id);
+                        println!("name: {}", household.name);
+                        println!("timezone: {}", household.timezone);
+                        println!("owner: {}", owner.telegram_user_id);
+                    }
+                    None => {
+                        let household =
+                            admin::create_household(&pool, tenancy.mode, &name, &timezone, now)
+                                .await
+                                .map_err(explain)?;
+                        println!("id: {}", household.id);
+                        println!("name: {}", household.name);
+                        println!("timezone: {}", household.timezone);
+                        println!(
+                            "tasklerq admin user add --telegram-id <id> --role owner --household {}",
+                            household.id
+                        );
+                    }
+                }
             }
             HouseholdCommand::List => {
-                for household in admin::list_households(&pool).await.map_err(explain)? {
+                for household in admin::list_households(&pool, now).await.map_err(explain)? {
+                    let owner = household
+                        .owner_telegram_id
+                        .map_or_else(|| "-".to_owned(), |id| id.to_string());
                     println!(
-                        "{}\t{}\t{}\t{}\t{}",
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                         household.id,
                         household.name,
                         household.timezone,
+                        owner,
                         household.members,
+                        household.open_tasks,
+                        household.active_tokens,
                         household.created_at.to_rfc3339()
                     );
                 }

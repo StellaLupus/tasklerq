@@ -572,8 +572,8 @@ curl -fsS -X POST http://127.0.0.1:18080/api/v1/capture \
 | `tasklerq admin token create --name "Home Assistant" --scopes ha:read,ha:write` | Выпустить токен. Значение показывается один раз, в базе хранится только хеш. `--scopes`: `ha:read`, `ha:write`, `capture:write`, `metrics:read`. `--expires-in-days N` задаёт срок. |
 | `tasklerq admin token list [--household <id>]` | id, префикс, состояние, scopes и название без секретов. |
 | `tasklerq admin token revoke <id> [--yes]` | Отозвать токен. Опасная команда: без `--yes` спрашивает `y/N` в терминале; без TTY завершается ошибкой и токен не меняет. |
-| `tasklerq admin household create --name "Семья" --timezone Europe/Moscow` | Создать household и списки «Задачи»/«Покупки». |
-| `tasklerq admin household list` | id, название, часовой пояс, число участников и дата создания. |
+| `tasklerq admin household create --name "Семья" --timezone Europe/Moscow [--owner-telegram-id <id> [--owner-name "Имя"]]` | Создать household, списки «Задачи»/«Покупки» и, если указан `--owner-telegram-id`, владельца одной транзакцией. Без владельца печатает подсказку `admin user add`. В режиме `single` второй активный household отклоняется с `409`. |
+| `tasklerq admin household list` | id, название, часовой пояс, Telegram ID владельца или `-`, число участников, открытых задач, активных токенов и дата создания. |
 | `tasklerq admin user add --telegram-id <id> --role owner\|member [--name "Имя"] [--household <id>]` | Добавить участника, записать `member_joined`, отклонить занятый Telegram ID и второго `owner`. |
 | `tasklerq admin queue stats` | Количество заданий `telegram_updates`, `outbox`, `capture_jobs` и `notification_deliveries` по статусам, возраст самого старого готового обновления. Содержимое сообщений не печатается. |
 | `tasklerq admin webhook info` | `getWebhookInfo`: URL без учётных данных, `pending_update_count`, последняя ошибка, `max_connections`, `ip_address`. Токен бота не выводится. |
