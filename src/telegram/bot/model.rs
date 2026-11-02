@@ -132,6 +132,11 @@ pub enum Screen {
         /// Новый владелец.
         user_id: Uuid,
     },
+    /// Подтверждение отзыва API-токена.
+    ConfirmRevokeToken {
+        /// Токен.
+        token_id: Uuid,
+    },
     /// Подтверждение выхода.
     ConfirmLeave,
     /// Ссылка на только что созданное приглашение.
@@ -163,6 +168,8 @@ pub enum Screen {
     Timezones,
     /// Участники household.
     Family,
+    /// Активные API-токены household.
+    Integrations,
     /// Карточка участника.
     Member {
         /// Участник.
@@ -441,6 +448,11 @@ pub enum Action {
     InviteRevoke {
         /// Приглашение.
         invite_id: Uuid,
+    },
+    /// Отозвать API-токен.
+    RevokeToken {
+        /// Токен.
+        token_id: Uuid,
     },
     /// Подтвердить удаление участника.
     MemberRemoveAsk {

@@ -158,6 +158,49 @@ pub fn owner_command(telegram_id: i64) -> String {
     format!("tasklerq admin user add --telegram-id {telegram_id} --role owner")
 }
 
+/// Заголовок экрана «Интеграции».
+pub const INTEGRATIONS_TITLE: &str = "Интеграции";
+/// Экран «Интеграции» без активных токенов.
+pub const INTEGRATIONS_EMPTY: &str = "Активных токенов нет.";
+/// Токен ещё не использовался.
+pub const TOKEN_NEVER_USED: &str = "не использовался";
+/// Пояснение на экране подтверждения отзыва токена.
+pub const TOKEN_STOPS_WORKING: &str = "Интеграция, которая им пользуется, перестанет работать.";
+/// Баннер после успешного отзыва токена.
+pub const TOKEN_REVOKED: &str = "Токен отозван.";
+/// Баннер, если токен уже был отозван раньше.
+pub const TOKEN_ALREADY_REVOKED: &str = "Токен уже отозван.";
+
+/// Строка «последнее использование» для списка токенов.
+pub fn token_last_used(
+    last_used_at: Option<DateTime<Utc>>,
+    timezone: Tz,
+    now: DateTime<Utc>,
+) -> String {
+    match last_used_at {
+        Some(at) => {
+            let local = at.with_timezone(&timezone);
+            let today = now.with_timezone(&timezone).date_naive();
+            format!(
+                "Последнее использование: {}, {}",
+                date_label(local.date_naive(), today),
+                local.format("%H:%M")
+            )
+        }
+        None => TOKEN_NEVER_USED.to_owned(),
+    }
+}
+
+/// Кнопка отзыва токена в списке.
+pub fn token_revoke_button(name: &str, prefix: &str) -> String {
+    format!("🚫 Отозвать «{name} {prefix}»")
+}
+
+/// Заголовок подтверждения отзыва токена.
+pub fn confirm_revoke_token(name: &str, prefix: &str) -> String {
+    format!("Отозвать токен «{name}» ({prefix})?")
+}
+
 /// Количество с единицей: «2 л», «1,5 кг».
 pub fn quantity_label(quantity: f64, unit: Option<&str>) -> String {
     let mut number = format!("{quantity:.3}");

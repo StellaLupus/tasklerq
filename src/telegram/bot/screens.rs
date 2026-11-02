@@ -44,11 +44,13 @@ pub async fn build(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
         | Screen::Notifications
         | Screen::Timezones
         | Screen::Family
+        | Screen::Integrations
         | Screen::Member { .. }
         | Screen::Invites
         | Screen::Journal { .. }
         | Screen::ConfirmRemove { .. }
         | Screen::ConfirmTransfer { .. }
+        | Screen::ConfirmRevokeToken { .. }
         | Screen::ConfirmLeave
         | Screen::InviteCreated { .. } => settings::view(ctx, screen).await,
     }

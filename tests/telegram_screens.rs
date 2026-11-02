@@ -4,14 +4,17 @@ mod support;
 
 use std::sync::Arc;
 
+use axum::http::{Method, StatusCode};
 use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc};
 use sqlx::PgPool;
 use support::telegram::{Call, Harness};
 use support::{TestHousehold, create_item, db, new_item, next_telegram_id};
+use tasklerq::admin;
+use tasklerq::config::TenancyMode;
 use tasklerq::domain::models::{Actor, UserRole};
 use tasklerq::domain::settings::NotificationSettings;
 use tasklerq::jobs::scheduler::Scheduler;
-use tasklerq::telegram::bot::model::{Action, Form};
+use tasklerq::telegram::bot::model::{Action, Form, Screen};
 use tasklerq::telegram::callbacks::{self, NewToken, Scope};
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -112,6 +115,51 @@ async fn invite(owner: &mut Harness, pool: &PgPool, name: &str) -> Harness {
     owner.press("Назад").await;
     owner.deliver().await;
     member
+}
+
+/// Выпустить токен путём CLI (административный слой) в household теста.
+async fn cli_token(
+    pool: &PgPool,
+    household_id: Uuid,
+    name: &str,
+) -> tasklerq::auth::tokens::IssuedToken {
+    admin::create_token(
+        pool,
+        TenancyMode::Single,
+        Some(household_id),
+        name,
+        &["ha:read".to_owned(), "ha:write".to_owned()],
+        None,
+        Utc::now(),
+    )
+    .await
+    .expect("token should be issued")
+}
+
+/// Callback-токен на произвольное действие: так проверяются устаревшие и
+/// подделанные кнопки, которых на экране уже нет.
+async fn action_callback(
+    pool: &PgPool,
+    telegram_id: i64,
+    household_id: Uuid,
+    action: Action,
+) -> String {
+    let mut conn = pool.acquire().await.expect("connection");
+    callbacks::issue_many(
+        &mut conn,
+        &[NewToken {
+            telegram_user_id: telegram_id,
+            household_id: Some(household_id),
+            scope: Scope::Screen,
+            action: action.name(),
+            payload: serde_json::to_value(&action).expect("action payload"),
+            version: None,
+        }],
+        Utc::now(),
+    )
+    .await
+    .expect("callback should be issued")
+    .remove(0)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -571,11 +619,14 @@ async fn owner_manages_family_and_journal_hides_secrets() {
     for hash in invite_codes {
         assert!(!screen.contains(&hash));
     }
-    let payloads: Vec<String> =
-        sqlx::query_scalar("SELECT payload::text FROM audit_events WHERE household_id IS NOT NULL")
-            .fetch_all(&db.pool)
-            .await
-            .expect("payloads");
+    let payloads: Vec<String> = sqlx::query_scalar(
+        "SELECT payload::text FROM audit_events
+         WHERE household_id = $1",
+    )
+    .bind(household_for(&db.pool, owner.chat).await.household_id)
+    .fetch_all(&db.pool)
+    .await
+    .expect("payloads");
     assert!(
         payloads
             .iter()
@@ -1076,38 +1127,35 @@ async fn button_of_a_removed_member_is_stale_even_for_a_valid_token() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn member_cannot_open_owner_screens_even_with_a_valid_token() {
-    use tasklerq::telegram::bot::model::{Action, Screen};
-    use tasklerq::telegram::callbacks::{self, NewToken, Scope};
-
     let db = db().await;
     let mut owner = onboarded_named(&db.pool, "Алексей").await;
     let mut maria = invite(&mut owner, &db.pool, "Мария").await;
-    let household_id = household_for(&db.pool, owner.chat).await.household_id;
+    let household = household_for(&db.pool, owner.chat).await;
+    let household_id = household.household_id;
+    let token = cli_token(&db.pool, household_id, "Home Assistant").await;
     maria.press("Настройки").await;
     let (message_id, _) = maria.active();
+    assert!(maria.find_button("Интеграции").is_none());
 
     // Кнопок на эти экраны участнику не выдают, поэтому токены выпускаем вручную.
-    for target in [Screen::Family, Screen::Journal { page: 0 }, Screen::Invites] {
-        let payload = serde_json::to_value(Action::Go { to: target.clone() }).expect("payload");
-        let mut conn = db.pool.acquire().await.expect("conn");
-        let token = callbacks::issue_many(
-            &mut conn,
-            &[NewToken {
-                telegram_user_id: maria.chat,
-                household_id: Some(household_id),
-                scope: Scope::Screen,
-                action: "go".into(),
-                payload,
-                version: None,
-            }],
-            Utc::now(),
+    for target in [
+        Screen::Family,
+        Screen::Journal { page: 0 },
+        Screen::Invites,
+        Screen::Integrations,
+        Screen::ConfirmRevokeToken {
+            token_id: token.record.id,
+        },
+    ] {
+        let data = action_callback(
+            &db.pool,
+            maria.chat,
+            household_id,
+            Action::Go { to: target.clone() },
         )
-        .await
-        .expect("issue")
-        .remove(0);
-        drop(conn);
+        .await;
 
-        maria.press_data(&token, message_id).await;
+        maria.press_data(&data, message_id).await;
 
         let toast = maria
             .fake
@@ -1121,6 +1169,18 @@ async fn member_cannot_open_owner_screens_even_with_a_valid_token() {
             "target {target:?}"
         );
     }
+
+    // Токены участнику не показываются и не меняются.
+    maria.assert_screen_contains("Настройки");
+    assert!(!maria.screen().contains("Home Assistant"));
+    assert!(!maria.screen().contains(&token.record.prefix));
+    let revoked_at: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT revoked_at FROM api_tokens WHERE id = $1")
+            .bind(token.record.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("token");
+    assert!(revoked_at.is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1205,4 +1265,258 @@ async fn control_characters_are_removed_from_bot_quick_add_and_form_input() {
         Form::Create(form) => assert_eq!(form.draft.title, "Форма ввод"),
         other => panic!("expected a create form, got {other:?}"),
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn integrations_show_only_active_tokens_for_owner() {
+    let db = db().await;
+    let mut owner = onboarded_named(&db.pool, "Алексей").await;
+    let household = household_for(&db.pool, owner.chat).await;
+
+    let active = cli_token(&db.pool, household.household_id, "Home Assistant").await;
+    let revoked = cli_token(&db.pool, household.household_id, "Отозванный").await;
+    admin::revoke_token(&db.pool, revoked.record.id, Utc::now())
+        .await
+        .expect("revoke");
+    let expired = cli_token(&db.pool, household.household_id, "Истёкший").await;
+    sqlx::query("UPDATE api_tokens SET expires_at = now() - interval '1 hour' WHERE id = $1")
+        .bind(expired.record.id)
+        .execute(&db.pool)
+        .await
+        .expect("expire");
+
+    // Запрос с токеном отмечает последнее использование.
+    let app = support::app(&db.pool);
+    let (status, _) = support::request(
+        &app,
+        Method::GET,
+        "/api/v1/household",
+        Some(&active.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    owner.press("Настройки").await;
+    owner.assert_has_button("Интеграции");
+    owner.press("Интеграции").await;
+
+    owner.assert_screen_contains("Интеграции");
+    owner.assert_screen_contains("Home Assistant");
+    owner.assert_screen_contains(&active.record.prefix);
+    owner.assert_screen_contains("ha:read");
+    owner.assert_screen_contains("ha:write");
+    owner.assert_screen_contains("Последнее использование");
+    assert!(!owner.screen().contains("не использовался"));
+    assert!(!owner.screen().contains("Отозванный"));
+    assert!(!owner.screen().contains("Истёкший"));
+    assert!(!owner.screen().contains(&active.token));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_revokes_token_and_api_rejects_it() {
+    let db = db().await;
+    let mut owner = onboarded_named(&db.pool, "Алексей").await;
+    let household = household_for(&db.pool, owner.chat).await;
+    let token = cli_token(&db.pool, household.household_id, "Home Assistant").await;
+
+    owner.press("Настройки").await;
+    owner.press("Интеграции").await;
+    owner.press("Отозвать").await;
+    owner.assert_screen_contains("Отозвать токен");
+    owner.assert_screen_contains("перестанет работать");
+    owner.press("Отозвать").await;
+
+    owner.assert_screen_contains("Токен отозван.");
+    owner.assert_screen_contains("Активных токенов нет.");
+    let revoked_at: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT revoked_at FROM api_tokens WHERE id = $1")
+            .bind(token.record.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("token");
+    assert!(revoked_at.is_some());
+
+    let (actor_id, payload): (Option<Uuid>, serde_json::Value) = sqlx::query_as(
+        "SELECT actor_user_id, payload FROM audit_events
+         WHERE household_id = $1 AND event_type = 'token_revoked'
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1",
+    )
+    .bind(household.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("audit event");
+    assert_eq!(actor_id, Some(household.owner_id));
+    assert_eq!(payload["token_id"], serde_json::json!(token.record.id));
+
+    // Повторная устаревшая кнопка не пишет второй аудит.
+    let data = action_callback(
+        &db.pool,
+        owner.chat,
+        household.household_id,
+        Action::RevokeToken {
+            token_id: token.record.id,
+        },
+    )
+    .await;
+    let (message_id, _) = owner.active();
+    owner.press_data(&data, message_id).await;
+    owner.assert_screen_contains("Токен уже отозван.");
+    let events: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events
+         WHERE household_id = $1 AND event_type = 'token_revoked'",
+    )
+    .bind(household.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("audit count");
+    assert_eq!(events, 1);
+
+    let app = support::app(&db.pool);
+    let (status, _) = support::request(
+        &app,
+        Method::GET,
+        "/api/v1/household",
+        Some(&token.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreign_token_revoke_is_not_found_and_does_not_change_it() {
+    let db = db().await;
+    let mut owner = onboarded_named(&db.pool, "Алексей").await;
+    let household = household_for(&db.pool, owner.chat).await;
+    let other = support::create_household(&db.pool).await;
+    let foreign = cli_token(&db.pool, other.household_id, "Чужой").await;
+
+    owner.press("Настройки").await;
+    owner.press("Интеграции").await;
+
+    // Подделанный экран подтверждения: имя чужого токена не раскрывается.
+    let data = action_callback(
+        &db.pool,
+        owner.chat,
+        household.household_id,
+        Action::Go {
+            to: Screen::ConfirmRevokeToken {
+                token_id: foreign.record.id,
+            },
+        },
+    )
+    .await;
+    let (message_id, _) = owner.active();
+    owner.press_data(&data, message_id).await;
+    let toast = owner
+        .fake
+        .answers()
+        .into_iter()
+        .next_back()
+        .and_then(|(_, text, _)| text);
+    assert_eq!(
+        toast.as_deref(),
+        Some("Не нашёл это — возможно, оно уже удалено.")
+    );
+    owner.assert_screen_contains("Интеграции");
+    assert!(!owner.screen().contains("Чужой"));
+    assert!(!owner.screen().contains(&foreign.record.prefix));
+
+    // Подделанное действие отзыва в обход экрана подтверждения.
+    let data = action_callback(
+        &db.pool,
+        owner.chat,
+        household.household_id,
+        Action::RevokeToken {
+            token_id: foreign.record.id,
+        },
+    )
+    .await;
+    let (message_id, _) = owner.active();
+    owner.press_data(&data, message_id).await;
+    let toast = owner
+        .fake
+        .answers()
+        .into_iter()
+        .next_back()
+        .and_then(|(_, text, _)| text);
+    assert_eq!(
+        toast.as_deref(),
+        Some("Не нашёл это — возможно, оно уже удалено.")
+    );
+    owner.assert_screen_contains("Интеграции");
+
+    let revoked_at: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT revoked_at FROM api_tokens WHERE id = $1")
+            .bind(foreign.record.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("token");
+    assert!(revoked_at.is_none());
+    let events: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events
+         WHERE household_id = $1 AND event_type = 'token_revoked'",
+    )
+    .bind(other.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("audit count");
+    assert_eq!(events, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn former_owner_cannot_revoke_token_with_stale_button() {
+    let db = db().await;
+    let mut owner = onboarded_named(&db.pool, "Алексей").await;
+    let _member = invite(&mut owner, &db.pool, "Мария").await;
+    let household = household_for(&db.pool, owner.chat).await;
+    let token = cli_token(&db.pool, household.household_id, "Home Assistant").await;
+    let data = action_callback(
+        &db.pool,
+        owner.chat,
+        household.household_id,
+        Action::RevokeToken {
+            token_id: token.record.id,
+        },
+    )
+    .await;
+
+    owner.press("Настройки").await;
+    owner.press("Семья").await;
+    owner.press("Мария").await;
+    owner.press("Передать владение").await;
+    owner.press("Да, передать").await;
+    owner.assert_screen_contains("Настройки");
+
+    let (message_id, _) = owner.active();
+    owner.press_data(&data, message_id).await;
+
+    let toast = owner
+        .fake
+        .answers()
+        .into_iter()
+        .next_back()
+        .and_then(|(_, text, _)| text);
+    assert_eq!(
+        toast.as_deref(),
+        Some("Недостаточно прав для этого действия.")
+    );
+    let revoked_at: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT revoked_at FROM api_tokens WHERE id = $1")
+            .bind(token.record.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("token");
+    assert!(revoked_at.is_none());
+    let events: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events
+         WHERE household_id = $1 AND event_type = 'token_revoked'",
+    )
+    .bind(household.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("audit count");
+    assert_eq!(events, 0);
 }

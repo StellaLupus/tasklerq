@@ -11,7 +11,7 @@ use crate::domain::settings::{
     validate_timezone,
 };
 use crate::jobs::{batch, delivery, quiet};
-use crate::storage::repositories::{audit, invites, members, users};
+use crate::storage::repositories::{audit, invites, members, tokens, users};
 use crate::telegram::rich::{Span, button};
 use crate::telegram::ru;
 
@@ -102,6 +102,8 @@ pub async fn view(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
         Screen::Notifications => notifications(ctx),
         Screen::Timezones => Ok(timezones()),
         Screen::Family => family(ctx).await,
+        Screen::Integrations => integrations(ctx).await,
+        Screen::ConfirmRevokeToken { token_id } => confirm_revoke(ctx, *token_id).await,
         Screen::Member { user_id } => member(ctx, *user_id).await,
         Screen::Invites => invites_screen(ctx).await,
         Screen::InviteCreated { code, .. } => {
@@ -173,6 +175,7 @@ fn settings(ctx: &Ctx<'_>) -> Result<Ui, Fail> {
             .row(vec![
                 back_button("👥 Семья", Screen::Family),
                 back_button("📜 Журнал", Screen::Journal { page: 0 }),
+                back_button("🔌 Интеграции", Screen::Integrations),
             ])
             .row(vec![button(
                 "🗑 Удалить пространство",
@@ -309,6 +312,50 @@ async fn family(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
         )]);
     }
     Ok(ui.row(vec![back_button("⬅️ Назад", Screen::Settings)]))
+}
+
+async fn integrations(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
+    ctx.require_owner()?;
+    let household_id = ctx.household()?.id;
+    let active = tokens::list_active(&mut *ctx.conn, household_id, ctx.now).await?;
+
+    let mut ui = Ui::new().heading(ru::INTEGRATIONS_TITLE);
+    if active.is_empty() {
+        ui = ui.text(ru::INTEGRATIONS_EMPTY);
+    } else {
+        for token in &active {
+            ui = ui
+                .text(format!("🔑 {} · {}", token.name, token.prefix))
+                .text(format!("Области: {}", token.scopes.join(", ")))
+                .text(ru::token_last_used(token.last_used_at, ctx.tz, ctx.now))
+                .row(vec![button(
+                    ru::token_revoke_button(&clip(&token.name, 30), &token.prefix),
+                    Action::Go {
+                        to: Screen::ConfirmRevokeToken { token_id: token.id },
+                    },
+                )]);
+        }
+    }
+    Ok(ui.row(vec![back_button("⬅️ Назад", Screen::Settings)]))
+}
+
+async fn confirm_revoke(ctx: &mut Ctx<'_>, token_id: Uuid) -> Result<Ui, Fail> {
+    ctx.require_owner()?;
+    let household_id = ctx.household()?.id;
+    let token = tokens::find_by_id(&mut *ctx.conn, token_id)
+        .await?
+        .filter(|token| token.household_id == household_id)
+        .ok_or(DomainError::NotFound)?;
+    Ok(Ui::new()
+        .heading(ru::confirm_revoke_token(
+            &clip(&token.name, 40),
+            &token.prefix,
+        ))
+        .text(ru::TOKEN_STOPS_WORKING)
+        .row(vec![
+            button("Отозвать", Action::RevokeToken { token_id }),
+            back_button("Отмена", Screen::Integrations),
+        ]))
 }
 
 async fn member(ctx: &mut Ctx<'_>, user_id: Uuid) -> Result<Ui, Fail> {
@@ -657,6 +704,28 @@ pub async fn invite_revoke(ctx: &mut Ctx<'_>, invite_id: Uuid) -> Result<(), Fai
     invites::revoke(&mut *ctx.conn, household_id, &actor, invite_id, ctx.now).await?;
     ctx.toast("Приглашение отозвано");
     ctx.present(Screen::Invites).await
+}
+
+/// Отозвать API-токен. Владелец и принадлежность токена проверяются по базе
+/// до отзыва: устаревшая кнопка и чужой household получают отказ.
+pub async fn revoke_token(ctx: &mut Ctx<'_>, token_id: Uuid) -> Result<(), Fail> {
+    let household_id = ctx.household()?.id;
+    let actor = ctx.actor()?;
+    users::require_current_owner(&mut *ctx.conn, household_id, &actor).await?;
+
+    let token = tokens::find_by_id(&mut *ctx.conn, token_id)
+        .await?
+        .filter(|token| token.household_id == household_id)
+        .ok_or(DomainError::NotFound)?;
+
+    let (_, revoked_now) =
+        crate::auth::tokens::revoke(&mut *ctx.conn, token.id, &actor, ctx.now).await?;
+    ctx.banner(if revoked_now {
+        ru::TOKEN_REVOKED
+    } else {
+        ru::TOKEN_ALREADY_REVOKED
+    });
+    ctx.present(Screen::Integrations).await
 }
 
 /// Запросить подтверждение удаления участника.
