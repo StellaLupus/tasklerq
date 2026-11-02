@@ -182,9 +182,36 @@ async fn a_form_step_answer_is_deleted_and_the_next_step_is_shown() {
     .expect("delete row");
     assert_eq!(deleted, 1, "the form answer must be deleted");
     bot.assert_screen_contains("Когда сделать?");
-    // Спека требует, чтобы принятое значение было видно на экране формы.
-    // Сейчас следующий шаг показывает только подсказку, поэтому 3.5 не
-    // закрыт: нужно решение, показывать ли черновик на каждом шаге.
+    bot.assert_screen_contains("Название: Позвонить маме");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_second_text_step_value_is_visible_and_escaped_on_the_next_step() {
+    let db = db().await;
+    let mut bot = Harness::new(&db.pool, next_telegram_id()).named("Ann");
+    bot.text("/start").await;
+    bot.text("Семья").await;
+    bot.press("Москва").await;
+    bot.press("меню").await;
+    bot.press("Добавить").await;
+    bot.press("Задачу").await;
+    bot.assert_screen_contains("Как назвать задачу?");
+    // На первом шаге ничего не принято: сводки нет.
+    assert!(
+        !bot.screen().contains("Название:"),
+        "the first step should not show a summary:\n{}",
+        bot.screen()
+    );
+
+    bot.text("Позвонить <маме> & папе").await;
+    bot.assert_screen_contains("Когда сделать?");
+    bot.assert_screen_contains("Название: Позвонить &lt;маме&gt; &amp; папе");
+
+    bot.press("Дата и время").await;
+    bot.text("завтра 18:30").await;
+    bot.assert_screen_contains("Какой приоритет?");
+    bot.assert_screen_contains("Срок: Завтра, 18:30");
+    bot.assert_screen_contains("Название: Позвонить &lt;маме&gt; &amp; папе");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
