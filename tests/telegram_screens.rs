@@ -1182,6 +1182,45 @@ async fn member_cannot_open_owner_screens_even_with_a_valid_token() {
     maria.assert_screen_contains("Настройки");
     assert!(!maria.screen().contains("Home Assistant"));
     assert!(!maria.screen().contains(&token.record.prefix));
+    let tokens_before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM api_tokens WHERE household_id = $1")
+            .bind(household_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("token count");
+
+    // Действия с токенами отклоняются и члену household.
+    for action in [
+        Action::IssueHaToken,
+        Action::RevokeToken {
+            token_id: token.record.id,
+        },
+    ] {
+        let data = action_callback(&db.pool, maria.chat, household_id, action).await;
+        maria.press_data(&data, message_id).await;
+        let toast = maria
+            .fake
+            .answers()
+            .into_iter()
+            .next_back()
+            .and_then(|(_, text, _)| text);
+        assert_eq!(
+            toast.as_deref(),
+            Some("Недостаточно прав для этого действия."),
+            "a member must not issue or revoke tokens"
+        );
+    }
+    maria.assert_screen_contains("Настройки");
+    let tokens_after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM api_tokens WHERE household_id = $1")
+            .bind(household_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("token count");
+    assert_eq!(
+        tokens_after, tokens_before,
+        "a rejected issue must not create a token"
+    );
     let revoked_at: Option<DateTime<Utc>> =
         sqlx::query_scalar("SELECT revoked_at FROM api_tokens WHERE id = $1")
             .bind(token.record.id)
@@ -1527,4 +1566,389 @@ async fn former_owner_cannot_revoke_token_with_stale_button() {
     .await
     .expect("audit count");
     assert_eq!(events, 0);
+}
+
+/// Текстовое представление строк таблицы для поиска утечки секрета.
+async fn row_texts(pool: &PgPool, query: &str, id: i64) -> Vec<String> {
+    sqlx::query_scalar(query)
+        .bind(id)
+        .fetch_all(pool)
+        .await
+        .expect("rows")
+}
+
+fn assert_no_token_in(rows: &[String], token: &str, secret: &str, table: &str) {
+    for row in rows {
+        assert!(!row.contains(token), "{table} leaked the full token: {row}");
+        assert!(
+            !row.contains(secret),
+            "{table} leaked the token after its prefix: {row}"
+        );
+    }
+}
+
+async fn issue_ha_from_integrations(owner: &mut Harness) {
+    owner.press("Настройки").await;
+    owner.press("Интеграции").await;
+    owner.press("Выпустить токен").await;
+}
+
+fn secret_token(html: &str) -> String {
+    let marker = "<tg-spoiler>";
+    let start = html
+        .find(marker)
+        .expect("the token must be spoiler-wrapped")
+        + marker.len();
+    let end = html[start..]
+        .find("</tg-spoiler>")
+        .expect("the spoiler must be closed");
+    html[start..start + end].to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_issues_ha_token_once_and_no_secret_is_stored() {
+    let db = db().await;
+    let mut owner = onboarded_named(&db.pool, "Алексей").await;
+    let household = household_for(&db.pool, owner.chat).await;
+
+    owner.press("Настройки").await;
+    owner.press("Интеграции").await;
+    let (anchor_id, _) = owner.active();
+    owner.press("Выпустить токен").await;
+
+    // Новый токен: имя, области и отсутствие срока.
+    let (token_id, name, prefix, scopes, expires_at): (
+        Uuid,
+        String,
+        String,
+        Vec<String>,
+        Option<DateTime<Utc>>,
+    ) = sqlx::query_as(
+        "SELECT id, name, prefix, scopes, expires_at FROM api_tokens
+         WHERE household_id = $1 ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(household.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("issued token");
+    assert_eq!(name, "Home Assistant");
+    assert_eq!(
+        scopes,
+        ["ha:read", "ha:write", "capture:write"]
+            .map(str::to_owned)
+            .to_vec()
+    );
+    assert!(expires_at.is_none(), "the HA token must not expire");
+
+    // Сообщение с открытым значением — отдельное, под спойлером, с кнопкой.
+    let (secret_id, secret_html) = owner.latest();
+    assert_ne!(
+        secret_id, anchor_id,
+        "the token message must be sent as a new message"
+    );
+    let token = secret_token(&secret_html);
+    assert!(token.starts_with("tlq_"), "{token}");
+    assert_eq!(
+        prefix,
+        token.chars().take(12).collect::<String>(),
+        "the visible prefix must match the stored one"
+    );
+    assert!(
+        secret_html.contains("Сообщение удалится через час"),
+        "{secret_html}"
+    );
+    assert!(secret_html.contains("Я сохранил"), "{secret_html}");
+
+    // Якорь отредактирован на месте и уже показывает новый токен по префиксу.
+    assert!(owner.screen().contains(&prefix), "{}", owner.screen());
+    let calls = owner.fake.calls();
+    let edit = calls
+        .iter()
+        .rposition(|call| {
+            matches!(call, Call::EditRich { id, html, .. } if *id == anchor_id && html.contains(&prefix))
+        })
+        .expect("the integrations anchor must be edited in place");
+    let send = calls
+        .iter()
+        .rposition(|call| {
+            matches!(call, Call::SendRich { id, html, .. } if *id == secret_id && html.contains("<tg-spoiler>"))
+        })
+        .expect("the secret message must be sent");
+    assert!(
+        edit < send,
+        "the anchor must be updated before the secret message arrives below it"
+    );
+
+    // Аудит: имя, области и актор-владелец, без открытого значения.
+    let (actor_id, payload): (Option<Uuid>, serde_json::Value) = sqlx::query_as(
+        "SELECT actor_user_id, payload FROM audit_events
+         WHERE household_id = $1 AND event_type = 'token_created'
+         ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(household.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("token audit");
+    assert_eq!(actor_id, Some(household.owner_id));
+    assert_eq!(payload["name"], serde_json::json!("Home Assistant"));
+    assert_eq!(
+        payload["scopes"],
+        serde_json::json!(["ha:read", "ha:write", "capture:write"])
+    );
+    assert_eq!(payload["prefix"], serde_json::json!(prefix));
+
+    // Автоудаление запланировано от доставки ровно через час.
+    let (secret_message_id, sent_at): (Option<i64>, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT message_id, sent_at FROM outbox
+         WHERE chat_id = $1 AND kind = 'message' ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(owner.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("secret outbox row");
+    assert_eq!(secret_message_id, Some(secret_id));
+    let sent_at = sent_at.expect("the secret message must be delivered");
+    let (delete_target, delete_at, key): (i64, DateTime<Utc>, Option<String>) = sqlx::query_as(
+        "SELECT (payload->>'message_id')::bigint, next_attempt_at, dedupe_key FROM outbox
+         WHERE chat_id = $1 AND kind = 'delete' AND dedupe_key LIKE 'expire:%'",
+    )
+    .bind(owner.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("scheduled delete");
+    assert_eq!(delete_target, secret_id);
+    assert_eq!((delete_at - sent_at).num_seconds(), 3_600);
+    let expected_key = format!("expire:{}:{secret_id}", owner.chat);
+    assert_eq!(key.as_deref(), Some(expected_key.as_str()));
+
+    // После доставки открытого значения нет ни в одной таблице.
+    let secret = &token[prefix.len()..];
+    let outbox = row_texts(
+        &db.pool,
+        "SELECT row_to_json(t)::text FROM outbox t WHERE chat_id = $1",
+        owner.chat,
+    )
+    .await;
+    let views = row_texts(
+        &db.pool,
+        "SELECT row_to_json(t)::text FROM telegram_views t WHERE chat_id = $1",
+        owner.chat,
+    )
+    .await;
+    let callbacks = row_texts(
+        &db.pool,
+        "SELECT row_to_json(t)::text FROM callback_tokens t WHERE telegram_user_id = $1",
+        owner.chat,
+    )
+    .await;
+    let conversations = row_texts(
+        &db.pool,
+        "SELECT row_to_json(t)::text FROM conversation_states t WHERE chat_id = $1",
+        owner.chat,
+    )
+    .await;
+    let audits: Vec<String> = sqlx::query_scalar(
+        "SELECT row_to_json(t)::text FROM audit_events t WHERE household_id = $1",
+    )
+    .bind(household.household_id)
+    .fetch_all(&db.pool)
+    .await
+    .expect("audit rows");
+    for (table, rows) in [
+        ("outbox", &outbox),
+        ("telegram_views", &views),
+        ("callback_tokens", &callbacks),
+        ("conversation_states", &conversations),
+        ("audit_events", &audits),
+    ] {
+        assert_no_token_in(rows, &token, secret, table);
+    }
+    assert!(
+        sqlx::query_scalar::<_, Option<String>>("SELECT prefix FROM api_tokens WHERE id = $1")
+            .bind(token_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("stored token")
+            .is_some(),
+        "the prefix is deliberately stored for identification"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saved_secret_button_deletes_the_message_and_does_not_redraw() {
+    let db = db().await;
+    let mut owner = onboarded_named(&db.pool, "Алексей").await;
+    issue_ha_from_integrations(&mut owner).await;
+    let (secret_id, secret_html) = owner.latest();
+    let data = support::telegram::buttons(&secret_html)
+        .into_iter()
+        .find(|(label, _)| label.contains("Я сохранил"))
+        .expect("saved button")
+        .1;
+    let screens_before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM outbox WHERE chat_id = $1 AND kind = 'screen'")
+            .bind(owner.chat)
+            .fetch_one(&db.pool)
+            .await
+            .expect("screen count");
+
+    owner.fake.clear_calls();
+    owner.press_data(&data, secret_id).await;
+
+    assert_eq!(
+        owner.fake.calls(),
+        vec![Call::Delete {
+            chat: owner.chat,
+            id: secret_id,
+        }],
+        "the saved button must only delete its own message"
+    );
+    let key = format!("delete:{}:{secret_id}", owner.chat);
+    let (target, stored_key, status): (i64, Option<String>, String) = sqlx::query_as(
+        "SELECT message_id, dedupe_key, status::text FROM outbox
+         WHERE chat_id = $1 AND kind = 'delete' AND dedupe_key = $2",
+    )
+    .bind(owner.chat)
+    .bind(&key)
+    .fetch_one(&db.pool)
+    .await
+    .expect("button delete row");
+    assert_eq!(target, secret_id);
+    assert_eq!(stored_key.as_deref(), Some(key.as_str()));
+    assert_eq!(status, "sent");
+
+    let screens_after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM outbox WHERE chat_id = $1 AND kind = 'screen'")
+            .bind(owner.chat)
+            .fetch_one(&db.pool)
+            .await
+            .expect("screen count");
+    assert_eq!(
+        screens_after, screens_before,
+        "dismissing the secret must not enqueue a screen"
+    );
+
+    // Запланированное автоудаление никуда не делось.
+    let expire_status: String = sqlx::query_scalar(
+        "SELECT status::text FROM outbox WHERE chat_id = $1 AND kind = 'delete'
+           AND dedupe_key LIKE 'expire:%'",
+    )
+    .bind(owner.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("expire row");
+    assert_eq!(expire_status, "pending");
+
+    let toast = owner
+        .fake
+        .answers()
+        .into_iter()
+        .next_back()
+        .and_then(|(_, text, _)| text);
+    assert_eq!(toast.as_deref(), Some("Сообщение удалено."));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn former_owner_can_dismiss_the_secret_message() {
+    let db = db().await;
+    let mut owner = onboarded_named(&db.pool, "Алексей").await;
+    let _maria = invite(&mut owner, &db.pool, "Мария").await;
+    issue_ha_from_integrations(&mut owner).await;
+    let (secret_id, secret_html) = owner.latest();
+    let data = support::telegram::buttons(&secret_html)
+        .into_iter()
+        .find(|(label, _)| label.contains("Я сохранил"))
+        .expect("saved button")
+        .1;
+
+    owner.press("Назад").await;
+    owner.press("Семья").await;
+    owner.press("Мария").await;
+    owner.press("Передать владение").await;
+    owner.press("Да, передать").await;
+
+    owner.fake.clear_calls();
+    owner.press_data(&data, secret_id).await;
+
+    assert!(
+        owner.fake.calls().iter().any(
+            |call| matches!(call, Call::Delete { chat, id } if *chat == owner.chat && *id == secret_id)
+        ),
+        "a former owner must still be able to remove the secret: {:?}",
+        owner.fake.calls()
+    );
+    assert!(
+        owner
+            .fake
+            .messages(owner.chat)
+            .iter()
+            .all(|(id, _)| *id != secret_id),
+        "the secret message must be gone from the chat"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_saved_button_is_rejected_but_the_expire_row_survives() {
+    let db = db().await;
+    let mut owner = onboarded_named(&db.pool, "Алексей").await;
+    let _maria = invite(&mut owner, &db.pool, "Мария").await;
+    issue_ha_from_integrations(&mut owner).await;
+    let (secret_id, secret_html) = owner.latest();
+    let data = support::telegram::buttons(&secret_html)
+        .into_iter()
+        .find(|(label, _)| label.contains("Я сохранил"))
+        .expect("saved button")
+        .1;
+
+    // Владелец передаёт владение и выходит: его текущий household меняется.
+    owner.press("Назад").await;
+    owner.press("Семья").await;
+    owner.press("Мария").await;
+    owner.press("Передать владение").await;
+    owner.press("Да, передать").await;
+    owner.press("Выйти").await;
+    owner.press("Да, выйти").await;
+
+    owner.fake.clear_calls();
+    owner.press_data(&data, secret_id).await;
+
+    let toast = owner
+        .fake
+        .answers()
+        .into_iter()
+        .next_back()
+        .and_then(|(_, text, _)| text);
+    assert_eq!(toast.as_deref(), Some("Это действие уже неактуально."));
+    assert!(
+        !owner
+            .fake
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::Delete { id, .. } if *id == secret_id)),
+        "a button from another household must not delete the message: {:?}",
+        owner.fake.calls()
+    );
+    let button_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox WHERE chat_id = $1 AND kind = 'delete'
+           AND dedupe_key = $2",
+    )
+    .bind(owner.chat)
+    .bind(format!("delete:{}:{secret_id}", owner.chat))
+    .fetch_one(&db.pool)
+    .await
+    .expect("button deletes");
+    assert_eq!(button_rows, 0);
+
+    let expire_status: String = sqlx::query_scalar(
+        "SELECT status::text FROM outbox WHERE chat_id = $1 AND kind = 'delete'
+           AND dedupe_key LIKE 'expire:%'",
+    )
+    .bind(owner.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("expire row");
+    assert_eq!(
+        expire_status, "pending",
+        "the scheduled auto-delete must survive a rejected button"
+    );
 }

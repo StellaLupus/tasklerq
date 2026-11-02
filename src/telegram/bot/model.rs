@@ -454,6 +454,10 @@ pub enum Action {
         /// Токен.
         token_id: Uuid,
     },
+    /// Выпустить токен для Home Assistant.
+    IssueHaToken,
+    /// Удалить сообщение с одноразовым секретом.
+    DismissSecret,
     /// Подтвердить удаление участника.
     MemberRemoveAsk {
         /// Участник.

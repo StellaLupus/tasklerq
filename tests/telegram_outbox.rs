@@ -72,6 +72,22 @@ impl Rig {
         .expect("raw screen")
     }
 
+    /// Поставить строку `message` с произвольным payload (для испорченных
+    /// записей).
+    async fn raw_message(&self, payload: serde_json::Value) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO outbox (chat_id, kind, payload, next_attempt_at, created_at)
+             VALUES ($1, 'message', $2, $3, $3)
+             RETURNING seq",
+        )
+        .bind(self.chat)
+        .bind(payload)
+        .bind(self.now)
+        .fetch_one(&self.pool)
+        .await
+        .expect("raw message")
+    }
+
     /// `placement` последней ожидающей строки экрана.
     async fn pending_placement(&self) -> String {
         sqlx::query_scalar(
@@ -616,6 +632,31 @@ async fn screen_with_unknown_placement_is_dead_as_invalid_payload() {
     assert_eq!(
         rig.row(seq).await,
         ("dead".into(), 0, Some("invalid_payload".into()), None)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn message_with_invalid_delete_after_is_dead_as_invalid_payload() {
+    let _dead = DEAD_METRIC.lock().await;
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    let seq = rig
+        .raw_message(serde_json::json!({
+            "html": "<p>секрет</p>",
+            "rich": true,
+            "delete_after": -1
+        }))
+        .await;
+
+    assert_eq!(rig.pass().await, 0);
+    assert_eq!(
+        rig.row(seq).await,
+        ("dead".into(), 0, Some("invalid_payload".into()), None)
+    );
+    assert!(
+        rig.fake.sent().is_empty(),
+        "an invalid delete_after must not send the message: {:?}",
+        rig.fake.calls()
     );
 }
 

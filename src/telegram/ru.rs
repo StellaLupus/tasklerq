@@ -162,6 +162,16 @@ pub fn owner_command(telegram_id: i64) -> String {
 pub const INTEGRATIONS_TITLE: &str = "Интеграции";
 /// Экран «Интеграции» без активных токенов.
 pub const INTEGRATIONS_EMPTY: &str = "Активных токенов нет.";
+/// Кнопка выпуска токена для Home Assistant.
+pub const ISSUE_HA_TOKEN_BUTTON: &str = "➕ Выпустить токен для HA";
+/// Имя токена, выпускаемого в боте.
+pub const HA_TOKEN_NAME: &str = "Home Assistant";
+/// Предупреждение о сроке жизни сообщения с токеном.
+pub const SECRET_MESSAGE_EXPIRES: &str = "Сообщение удалится через час";
+/// Кнопка подтверждения, что токен сохранён.
+pub const SECRET_SAVED_BUTTON: &str = "Я сохранил";
+/// Ответ на кнопку «Я сохранил».
+pub const SECRET_MESSAGE_DELETED: &str = "Сообщение удалено.";
 /// Токен ещё не использовался.
 pub const TOKEN_NEVER_USED: &str = "не использовался";
 /// Пояснение на экране подтверждения отзыва токена.

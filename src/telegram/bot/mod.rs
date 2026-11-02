@@ -905,6 +905,8 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
         Action::InviteCreate => settings::invite_create(ctx).await,
         Action::InviteRevoke { invite_id } => settings::invite_revoke(ctx, invite_id).await,
         Action::RevokeToken { token_id } => settings::revoke_token(ctx, token_id).await,
+        Action::IssueHaToken => settings::issue_ha_token(ctx).await,
+        Action::DismissSecret => settings::dismiss_secret(ctx, message_id).await,
         Action::MemberRemoveAsk { user_id } => settings::member_remove_ask(ctx, user_id).await,
         Action::MemberRemove { user_id } => settings::member_remove(ctx, user_id).await,
         Action::TransferAsk { user_id } => settings::transfer_ask(ctx, user_id).await,

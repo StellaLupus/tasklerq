@@ -70,6 +70,18 @@ impl Placement {
     }
 }
 
+/// Разобрать `delete_after` из payload строки `message`.
+///
+/// Отсутствующее поле — `Some(None)` («без автоудаления»). Испорченное
+/// значение (отрицательное, дробное, строка, больше `u32::MAX`) даёт `None`,
+/// и вся строка уходит в `invalid_payload`.
+fn delete_after_from_payload(payload: &Value) -> Option<Option<u32>> {
+    match payload.get("delete_after") {
+        None => Some(None),
+        Some(seconds) => u32::try_from(seconds.as_u64()?).ok().map(Some),
+    }
+}
+
 /// Что отправить.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -150,12 +162,11 @@ impl Outgoing {
                     .get("rich")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
-                // Отсутствующее или неразбираемое поле — «без автоудаления»:
-                // старые строки и все обычные сообщения.
-                delete_after: payload
-                    .get("delete_after")
-                    .and_then(Value::as_u64)
-                    .and_then(|seconds| u32::try_from(seconds).ok()),
+                // Отсутствующее поле — «без автоудаления»: старые строки и все
+                // обычные сообщения. Испорченное значение не подменяется
+                // умолчанием: строка уходит в `invalid_payload`, иначе
+                // сообщение с секретом осталось бы в чате без таймера.
+                delete_after: delete_after_from_payload(payload)?,
             }),
             "edit" => Some(Self::Edit {
                 message_id: payload.get("message_id")?.as_i64()?,
@@ -930,6 +941,25 @@ mod tests {
                 delete_after: None,
             })
         );
+    }
+
+    #[test]
+    fn message_row_with_invalid_delete_after_is_not_parsed() {
+        for delete_after in [
+            json!(-1),
+            json!("abc"),
+            json!(1.5),
+            json!(u64::from(u32::MAX) + 1),
+        ] {
+            assert_eq!(
+                Outgoing::from_row(
+                    "message",
+                    &json!({"html": "a", "rich": true, "delete_after": delete_after})
+                ),
+                None,
+                "delete_after {delete_after} must become invalid_payload, not no auto delete"
+            );
+        }
     }
 
     #[test]
