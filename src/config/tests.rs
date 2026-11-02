@@ -131,6 +131,80 @@ fn defaults_match_documented_values() {
 }
 
 #[test]
+fn tenancy_defaults_to_single_without_bootstrap_owner() {
+    let config = config(base_env()).expect("config should be valid");
+
+    assert_eq!(config.tenancy.mode, TenancyMode::Single);
+    assert_eq!(config.tenancy.bootstrap_owner, None);
+}
+
+#[test]
+fn blank_bootstrap_owner_is_treated_as_missing() {
+    // `.env.example` поставляется с пустым `BOOTSTRAP_OWNER_TELEGRAM_ID=`, а
+    // окружение может содержать одно пробельное значение.
+    for value in ["", "   "] {
+        let mut vars = base_env();
+        vars.insert("BOOTSTRAP_OWNER_TELEGRAM_ID".to_owned(), value.to_owned());
+
+        let config = config(vars).expect("blank optional value should be ignored");
+        assert_eq!(config.tenancy.bootstrap_owner, None, "value: {value:?}");
+    }
+}
+
+#[test]
+fn tenancy_mode_accepts_multi() {
+    let mut vars = base_env();
+    vars.insert("TENANCY_MODE".to_owned(), "multi".to_owned());
+
+    let config = config(vars).expect("multi is a valid tenancy mode");
+    assert_eq!(config.tenancy.mode, TenancyMode::Multi);
+}
+
+#[test]
+fn invalid_tenancy_mode_lists_allowed_values() {
+    let mut vars = base_env();
+    vars.insert("TENANCY_MODE".to_owned(), "saas".to_owned());
+
+    let error = config(vars).expect_err("unknown tenancy mode should be rejected");
+    let message = error.to_string();
+    assert_invalid(error, "TENANCY_MODE");
+    assert!(
+        message.contains("single"),
+        "message lists single: {message}"
+    );
+    assert!(message.contains("multi"), "message lists multi: {message}");
+}
+
+#[test]
+fn bootstrap_owner_telegram_id_must_be_positive() {
+    for value in ["abc", "0", "-5"] {
+        let mut vars = base_env();
+        vars.insert("BOOTSTRAP_OWNER_TELEGRAM_ID".to_owned(), value.to_owned());
+
+        let error = config(vars).expect_err("invalid Telegram id should be rejected");
+        let message = error.to_string();
+        assert_invalid(error, "BOOTSTRAP_OWNER_TELEGRAM_ID");
+        assert!(
+            message.contains("BOOTSTRAP_OWNER_TELEGRAM_ID"),
+            "message names the parameter: {message}"
+        );
+        assert!(
+            message.contains("positive integer"),
+            "message describes the expected format: {message}"
+        );
+    }
+}
+
+#[test]
+fn bootstrap_owner_telegram_id_is_loaded() {
+    let mut vars = base_env();
+    vars.insert("BOOTSTRAP_OWNER_TELEGRAM_ID".to_owned(), "111".to_owned());
+
+    let config = config(vars).expect("positive Telegram id should be accepted");
+    assert_eq!(config.tenancy.bootstrap_owner, Some(111));
+}
+
+#[test]
 fn database_url_preserves_sslmode() {
     let mut vars = base_env();
     vars.insert(

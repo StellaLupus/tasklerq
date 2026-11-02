@@ -300,6 +300,8 @@ curl -sS -X POST \
 | `TELEGRAM_BOT_USERNAME` | нет | `tasklerqbot` | Имя бота без `@` для ссылок-приглашений. |
 | `TELEGRAM_API_BASE_URL` | нет | `https://api.telegram.org` | Служебный базовый адрес Bot API; вне `ENV=development` допускается только `https`. Подменяется на mock-сервер в тестах. |
 | `TELEGRAM_MODE` | нет | `webhook` | `webhook`/`polling` (dev)/`disabled` (headless). |
+| `TENANCY_MODE` | нет | `single` | `single` (по умолчанию) — один household на инсталляцию; `multi` — несколько. |
+| `BOOTSTRAP_OWNER_TELEGRAM_ID` | нет | не задано | Положительный Telegram ID первого владельца. При включённом Telegram рекомендуется задать: иначе первым владельцем станет первый написавший боту. |
 | `CAPTURE_API_ENABLED` | нет | `true` | Включить `POST /api/v1/capture`. |
 | `CAPTURE_VOICE_TIMEOUT_MS` | нет | `8000` | Таймаут LLM для `source=ha_voice`. |
 | `CAPTURE_VOICE_FALLBACK_RAW` | нет | `true` | Создавать позицию из текста при сбое LLM, таймауте, исчерпанной квоте или открытом предохранителе. Действует на весь внешний `auto`, не только на `ha_voice`; в `draft` fallback не применяется. |

@@ -2,8 +2,8 @@
 
 ## 1. Конфигурация режима размещения
 
-- [ ] 1.1 Добавить в `Config` блок `TenancyConfig { mode: TenancyMode, bootstrap_owner: Option<i64> }`, который читает `TENANCY_MODE` (значения `single` и `multi`, по умолчанию `single`) и `BOOTSTRAP_OWNER_TELEGRAM_ID` (положительное целое). Проверить тестами в `src/config/tests.rs`: значение по умолчанию; отказ на `TENANCY_MODE=saas` с перечислением допустимых значений; отказ на `BOOTSTRAP_OWNER_TELEGRAM_ID=abc` и `0`.
-- [ ] 1.2 Добавить предупреждение при старте в `app.rs`, если Telegram включён, а `BOOTSTRAP_OWNER_TELEGRAM_ID` не задан. Добавить обе переменные в `.env.example` и таблицу переменных в `docs/deployment.md`. Проверить тестом, что предупреждение пишется и в нём нет секретов.
+- [x] 1.1 Добавить в `Config` блок `TenancyConfig { mode: TenancyMode, bootstrap_owner: Option<i64> }`, который читает `TENANCY_MODE` (значения `single` и `multi`, по умолчанию `single`) и `BOOTSTRAP_OWNER_TELEGRAM_ID` (положительное целое). Проверить тестами в `src/config/tests.rs`: значение по умолчанию; отказ на `TENANCY_MODE=saas` с перечислением допустимых значений; отказ на `BOOTSTRAP_OWNER_TELEGRAM_ID=abc` и `0`.
+- [x] 1.2 Добавить предупреждение при старте в `app.rs`, если Telegram включён, а `BOOTSTRAP_OWNER_TELEGRAM_ID` не задан. Добавить обе переменные в `.env.example` и таблицу переменных в `docs/deployment.md`. Проверить тестом, что предупреждение пишется и в нём нет секретов.
 
 ## 2. Единая точка создания household
 
