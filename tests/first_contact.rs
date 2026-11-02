@@ -451,6 +451,53 @@ async fn refresh_after_an_owner_is_appointed_shows_the_menu() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_owner_set_after_the_form_opened_blocks_onboarding() {
+    let db = isolated_db().await;
+    let sender = next_telegram_id();
+    let bootstrap = next_telegram_id();
+    let mut bot = single_harness(&db.pool, sender, None);
+
+    bot.text("/start").await;
+    bot.text("Семья").await;
+    bot.assert_screen_contains("выберите часовой пояс");
+    let data = bot.find_button("Москва").expect("zone button");
+    let (message_id, _) = bot.active();
+
+    // Администратор задал BOOTSTRAP_OWNER_TELEGRAM_ID уже после открытия формы.
+    let mut reconfigured = single_harness(&db.pool, sender, Some(bootstrap));
+    reconfigured.press_data(&data, message_id).await;
+
+    reconfigured.assert_screen_contains("Обратитесь к администратору");
+    let screen = reconfigured.screen();
+    assert!(
+        !screen.contains(&bootstrap.to_string()),
+        "the expected owner id must not be disclosed:\n{screen}"
+    );
+    assert_eq!(household_count(&db.pool).await, 0);
+    assert_eq!(form_count(&db.pool, sender).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_owner_matching_sender_completes_onboarding_after_the_form_opened() {
+    let db = isolated_db().await;
+    let sender = next_telegram_id();
+    let mut bot = single_harness(&db.pool, sender, None);
+
+    bot.text("/start").await;
+    bot.text("Семья").await;
+    let data = bot.find_button("Москва").expect("zone button");
+    let (message_id, _) = bot.active();
+
+    // Тот же пользователь становится ожидаемым владельцем: онбординг разрешён.
+    let mut reconfigured = single_harness(&db.pool, sender, Some(sender));
+    reconfigured.press_data(&data, message_id).await;
+
+    reconfigured.assert_screen_contains("Готово");
+    assert_eq!(household_count(&db.pool).await, 1);
+    assert_eq!(form_count(&db.pool, sender).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invalid_invite_code_shows_its_banner_over_the_first_contact_screen() {
     let db = isolated_db().await;
     let _household = create_household(&db.pool).await;

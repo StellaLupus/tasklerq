@@ -84,6 +84,22 @@ async fn onboarding_creates_household_owner_and_default_lists() {
     .await
     .expect("count");
     assert_eq!(created, 1);
+
+    let (actor_type, actor_id, payload): (String, Option<Uuid>, serde_json::Value) =
+        sqlx::query_as(
+            "SELECT actor_type::text, actor_user_id, payload FROM audit_events
+         WHERE household_id = $1 AND event_type = 'household_created'",
+        )
+        .bind(onboarded.household.id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("household_created event");
+    assert_eq!(
+        actor_type, "user",
+        "the bot onboarding acts as the new owner"
+    );
+    assert_eq!(actor_id, Some(onboarded.user.id));
+    assert_eq!(payload["actor_name"], "Алексей");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -44,7 +44,7 @@ pub async fn build(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
         | Screen::Notifications
         | Screen::Timezones
         | Screen::Family
-        | Screen::Integrations
+        | Screen::Integrations { .. }
         | Screen::Member { .. }
         | Screen::Invites
         | Screen::Journal { .. }
@@ -282,14 +282,14 @@ fn due_key(item: &Item) -> (u8, Option<DateTime<Utc>>, Option<chrono::NaiveDate>
 
 /// Страница `page` из `total` элементов; номер ограничивается последней
 /// страницей, чтобы после действия не открывалась пустая.
-fn page_bounds(total: usize, page: u32) -> (usize, usize, usize, usize) {
+pub(super) fn page_bounds(total: usize, page: u32) -> (usize, usize, usize, usize) {
     let pages = total.div_ceil(PAGE_SIZE).max(1);
     let page = usize::try_from(page).unwrap_or(0).min(pages - 1);
     let start = page * PAGE_SIZE;
     (start, (start + PAGE_SIZE).min(total), page, pages)
 }
 
-fn pager(ui: Ui, page: usize, pages: usize, make: impl Fn(usize) -> Screen) -> Ui {
+pub(super) fn pager(ui: Ui, page: usize, pages: usize, make: impl Fn(usize) -> Screen) -> Ui {
     if pages <= 1 {
         return ui;
     }

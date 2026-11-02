@@ -148,11 +148,24 @@ pub async fn create_household_with_owner(
     };
 
     let mut tx = pool.begin().await?;
-    let (household, owner) =
-        households::create_with_owner(&mut tx, mode, name, timezone, owner, now).await?;
+    let (household, owner) = households::create(
+        &mut tx,
+        mode,
+        households::NewHousehold {
+            name: name.to_owned(),
+            timezone: timezone.to_owned(),
+            owner: Some(owner),
+        },
+        &admin_actor(),
+        now,
+    )
+    .await?;
     tx.commit().await?;
 
-    Ok((household, owner))
+    Ok((
+        household,
+        owner.expect("a household created with an owner returns it"),
+    ))
 }
 
 /// Название активного household: нужно для подтверждения удаления.

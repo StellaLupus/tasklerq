@@ -18,7 +18,7 @@ use crate::telegram::rich::{Span, button, escape};
 use crate::telegram::ru;
 
 use super::model::{Action, PAGE_SIZE, Screen, Setting, TimeField, Ui};
-use super::screens::{back_button, clip};
+use super::screens::{back_button, clip, page_bounds, pager};
 use super::{Ctx, Fail, delete_dedupe_key, display_timezone, issue_and_render};
 
 /// Сколько живёт сообщение с открытым токеном: час после доставки.
@@ -107,7 +107,7 @@ pub async fn view(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
         Screen::Notifications => notifications(ctx),
         Screen::Timezones => Ok(timezones()),
         Screen::Family => family(ctx).await,
-        Screen::Integrations => integrations(ctx).await,
+        Screen::Integrations { page } => integrations(ctx, *page).await,
         Screen::ConfirmRevokeToken { token_id } => confirm_revoke(ctx, *token_id).await,
         Screen::Member { user_id } => member(ctx, *user_id).await,
         Screen::Invites => invites_screen(ctx).await,
@@ -180,7 +180,7 @@ fn settings(ctx: &Ctx<'_>) -> Result<Ui, Fail> {
             .row(vec![
                 back_button("👥 Семья", Screen::Family),
                 back_button("📜 Журнал", Screen::Journal { page: 0 }),
-                back_button("🔌 Интеграции", Screen::Integrations),
+                back_button("🔌 Интеграции", Screen::Integrations { page: 0 }),
             ])
             .row(vec![button(
                 "🗑 Удалить пространство",
@@ -319,16 +319,20 @@ async fn family(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
     Ok(ui.row(vec![back_button("⬅️ Назад", Screen::Settings)]))
 }
 
-async fn integrations(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
+async fn integrations(ctx: &mut Ctx<'_>, page: u32) -> Result<Ui, Fail> {
     ctx.require_owner()?;
     let household_id = ctx.household()?.id;
     let active = tokens::list_active(&mut *ctx.conn, household_id, ctx.now).await?;
+    let (start, end, page, pages) = page_bounds(active.len(), page);
+    let here = |page: usize| Screen::Integrations {
+        page: u32::try_from(page).unwrap_or(0),
+    };
 
     let mut ui = Ui::new().heading(ru::INTEGRATIONS_TITLE);
     if active.is_empty() {
         ui = ui.text(ru::INTEGRATIONS_EMPTY);
     } else {
-        for token in &active {
+        for token in &active[start..end] {
             ui = ui
                 .text(format!("🔑 {} · {}", token.name, token.prefix))
                 .text(format!("Области: {}", token.scopes.join(", ")))
@@ -341,12 +345,11 @@ async fn integrations(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
                 )]);
         }
     }
-    Ok(ui
-        .row(vec![button(
-            ru::ISSUE_HA_TOKEN_BUTTON,
-            Action::IssueHaToken,
-        )])
-        .row(vec![back_button("⬅️ Назад", Screen::Settings)]))
+    let ui = pager(ui, page, pages, here);
+    Ok(ui.row(vec![
+        button(ru::ISSUE_HA_TOKEN_BUTTON, Action::IssueHaToken),
+        back_button("⬅️ Назад", Screen::Settings),
+    ]))
 }
 
 async fn confirm_revoke(ctx: &mut Ctx<'_>, token_id: Uuid) -> Result<Ui, Fail> {
@@ -364,7 +367,7 @@ async fn confirm_revoke(ctx: &mut Ctx<'_>, token_id: Uuid) -> Result<Ui, Fail> {
         .text(ru::TOKEN_STOPS_WORKING)
         .row(vec![
             button("Отозвать", Action::RevokeToken { token_id }),
-            back_button("Отмена", Screen::Integrations),
+            back_button("Отмена", Screen::Integrations { page: 0 }),
         ]))
 }
 
@@ -737,7 +740,7 @@ pub async fn revoke_token(ctx: &mut Ctx<'_>, token_id: Uuid) -> Result<(), Fail>
     } else {
         ru::TOKEN_ALREADY_REVOKED
     });
-    ctx.present(Screen::Integrations).await
+    ctx.present(Screen::Integrations { page: 0 }).await
 }
 
 /// Выпустить токен для Home Assistant и показать его один раз.
@@ -763,7 +766,7 @@ pub async fn issue_ha_token(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
 
     // Сначала экран: кнопка нажата на якоре, правка на месте уже показывает
     // новый префикс. Сообщение с секретом идёт следом и засыпает якорь (D6).
-    ctx.present(Screen::Integrations).await?;
+    ctx.present(Screen::Integrations { page: 0 }).await?;
     enqueue_secret_message(ctx, household_id, &issued.token).await
 }
 

@@ -14,7 +14,7 @@ use tasklerq::config::TenancyMode;
 use tasklerq::domain::models::{Actor, UserRole};
 use tasklerq::domain::settings::NotificationSettings;
 use tasklerq::jobs::scheduler::Scheduler;
-use tasklerq::telegram::bot::model::{Action, Form, Screen};
+use tasklerq::telegram::bot::model::{Action, Form, PAGE_SIZE, Screen};
 use tasklerq::telegram::callbacks::{self, NewToken, Scope};
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -1150,7 +1150,7 @@ async fn member_cannot_open_owner_screens_even_with_a_valid_token() {
         Screen::Family,
         Screen::Journal { page: 0 },
         Screen::Invites,
-        Screen::Integrations,
+        Screen::Integrations { page: 0 },
         Screen::ConfirmRevokeToken {
             token_id: token.record.id,
         },
@@ -1358,6 +1358,90 @@ async fn integrations_show_only_active_tokens_for_owner() {
     assert!(!owner.screen().contains("Отозванный"));
     assert!(!owner.screen().contains("Истёкший"));
     assert!(!owner.screen().contains(&active.token));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn integrations_paginate_tokens_and_clamp_the_page() {
+    let db = db().await;
+    let mut owner = onboarded_named(&db.pool, "Алексей").await;
+    let household = household_for(&db.pool, owner.chat).await;
+    for index in 0..25 {
+        cli_token(
+            &db.pool,
+            household.household_id,
+            &format!("Токен {index:02}"),
+        )
+        .await;
+    }
+
+    owner.press("Настройки").await;
+    owner.press("Интеграции").await;
+
+    let pages = 25usize.div_ceil(PAGE_SIZE);
+    let first = owner.screen();
+    assert_eq!(
+        first.matches("🔑 ").count(),
+        PAGE_SIZE,
+        "the first page holds exactly PAGE_SIZE tokens"
+    );
+    assert!(
+        first.len() < 4096,
+        "the page must fit into a Telegram message: {} chars",
+        first.len()
+    );
+    assert!(first.contains(&format!("Страница 1 из {pages}")));
+    assert!(first.contains("Выпустить токен"));
+    assert!(first.contains("Назад"));
+    assert!(owner.find_button("→").is_some(), "there is a next page");
+    assert!(
+        owner.find_button("←").is_none(),
+        "the first page has no previous page"
+    );
+    let rows = first.matches("<tg-button-row>").count();
+    assert!(
+        rows <= PAGE_SIZE + 2,
+        "pagination must not exceed other list screens: {rows} rows"
+    );
+
+    owner.press("→").await;
+    assert_eq!(owner.screen().matches("🔑 ").count(), PAGE_SIZE);
+    assert!(owner.screen().contains(&format!("Страница 2 из {pages}")));
+
+    owner.press("→").await;
+    owner.press("→").await;
+    let last = owner.screen();
+    assert_eq!(
+        last.matches("🔑 ").count(),
+        25 - PAGE_SIZE * (pages - 1),
+        "the last page contains the remainder"
+    );
+    assert!(last.contains(&format!("Страница {pages} из {pages}")));
+    assert!(
+        owner.find_button("→").is_none(),
+        "the last page has no next page"
+    );
+
+    // Страница за пределами открывает последнюю существующую.
+    let data = action_callback(
+        &db.pool,
+        owner.chat,
+        household.household_id,
+        Action::Go {
+            to: Screen::Integrations { page: 999 },
+        },
+    )
+    .await;
+    let (message_id, _) = owner.active();
+    owner.press_data(&data, message_id).await;
+    assert_eq!(
+        owner.screen().matches("🔑 ").count(),
+        25 - PAGE_SIZE * (pages - 1)
+    );
+    assert!(
+        owner
+            .screen()
+            .contains(&format!("Страница {pages} из {pages}"))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

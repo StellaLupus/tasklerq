@@ -302,6 +302,54 @@ async fn household_create_with_owner_creates_owner_and_default_lists() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_create_with_owner_audits_as_a_system_action() {
+    let db = cli_database().await;
+
+    let output = run(
+        &db.url,
+        &[
+            "admin",
+            "household",
+            "create",
+            "--name",
+            "Семья с владельцем",
+            "--timezone",
+            "Asia/Yekaterinburg",
+            "--owner-telegram-id",
+            "123456789",
+            "--owner-name",
+            "Алексей",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{output:?}");
+    let household_id = Uuid::parse_str(&field(&stdout(&output), "id")).expect("household id");
+
+    let (actor_type, actor_user_id, payload): (String, Option<Uuid>, Value) = sqlx::query_as(
+        "SELECT actor_type::text, actor_user_id, payload FROM audit_events
+         WHERE household_id = $1 AND event_type = 'household_created'",
+    )
+    .bind(household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("household_created event");
+    assert_eq!(
+        actor_type, "system",
+        "the CLI initiator is the administrator"
+    );
+    assert_eq!(actor_user_id, None);
+    assert_eq!(payload["household_name"], "Семья с владельцем");
+    assert_eq!(payload["timezone"], "Asia/Yekaterinburg");
+    assert_eq!(payload["display_name"], "Алексей");
+    assert_eq!(payload["role"], "owner");
+    assert!(payload["user_id"].is_string(), "the owner id is recorded");
+    assert!(
+        payload.get("actor_name").is_none(),
+        "a system action must not pose as the owner"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn household_create_with_owner_requires_a_telegram_id() {
     let output = bin()
         .args([

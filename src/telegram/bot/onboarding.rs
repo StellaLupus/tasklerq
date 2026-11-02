@@ -3,6 +3,7 @@
 use sqlx::Acquire;
 
 use crate::domain::error::DomainError;
+use crate::domain::first_contact::{FirstContact, classify};
 use crate::domain::identity::NewMember;
 use crate::domain::settings::validate_timezone;
 use crate::storage::repositories::households::{self, NewOwner};
@@ -177,6 +178,23 @@ pub async fn choose_zone(ctx: &mut Ctx<'_>, zone: &str) -> Result<(), Fail> {
 }
 
 async fn create(ctx: &mut Ctx<'_>, name: &str, zone: &str) -> Result<(), Fail> {
+    // Форма могла быть открыта до того, как администратор задал
+    // `BOOTSTRAP_OWNER_TELEGRAM_ID` или появился household. Перед вставкой
+    // классификатор перепроверяется целиком: не-`Onboard` закрывает форму и
+    // показывает экран нового состояния, household не создаётся.
+    let installation = households::installation(&mut *ctx.conn).await?;
+    let contact = classify(
+        ctx.tenancy.mode,
+        ctx.tenancy.bootstrap_owner,
+        ctx.sender.id,
+        installation,
+    );
+    if contact != FirstContact::Onboard {
+        // Тот же путь, что при `household_exists`: `start_onboarding` закроет
+        // форму онбординга и покажет экран по классификатору.
+        return forms::start_onboarding(ctx).await;
+    }
+
     let member = new_member(ctx);
     // Последний шаг может проиграть гонку: household успели создать извне.
     // Вложенный savepoint (как в `accept_invite`) гасит конфликт, не трогая

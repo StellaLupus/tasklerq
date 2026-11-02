@@ -169,7 +169,10 @@ pub enum Screen {
     /// Участники household.
     Family,
     /// Активные API-токены household.
-    Integrations,
+    Integrations {
+        /// Страница с нуля.
+        page: u32,
+    },
     /// Карточка участника.
     Member {
         /// Участник.

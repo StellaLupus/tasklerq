@@ -10,7 +10,7 @@ use crate::config::TenancyMode;
 use crate::domain::error::DomainError;
 use crate::domain::first_contact::Installation;
 use crate::domain::identity::{AuditEventType, NewMember, Onboarded};
-use crate::domain::models::{Actor, Household, List, ListKind, User, UserRole};
+use crate::domain::models::{Actor, ActorType, Household, List, ListKind, User, UserRole};
 use crate::domain::settings::validate_timezone;
 use crate::domain::validation::normalize_text;
 
@@ -48,10 +48,14 @@ pub struct NewHousehold {
 
 /// Создать household, два списка по умолчанию и (если указан) владельца.
 ///
-/// Единственная публичная точка создания вместе с [`onboard`]. Порядок
-/// блокировок: сначала Telegram ID владельца, затем installation. В режиме
-/// [`TenancyMode::Single`] активный household может быть только один; проверка
-/// под advisory-блокировкой не даёт двум одновременным запросам создать два.
+/// Единственная точка создания для всех боевых путей: CLI без владельца, CLI с
+/// владельцем и [`onboard`]. `actor` — инициатор: администратор из CLI или
+/// системный актор. В ветви с владельцем актор типа [`ActorType::User`]
+/// означает онбординг: событие пишется от имени только что созданного
+/// владельца. Порядок блокировок: сначала Telegram ID владельца, затем
+/// installation. В режиме [`TenancyMode::Single`] активный household может быть
+/// только один; проверка под advisory-блокировкой не даёт двум одновременным
+/// запросам создать два.
 pub async fn create(
     conn: &mut PgConnection,
     mode: TenancyMode,
@@ -62,7 +66,7 @@ pub async fn create(
     match new.owner {
         Some(owner) => {
             let (household, user) =
-                create_with_owner(conn, mode, &new.name, &new.timezone, owner, now).await?;
+                create_with_owner(conn, mode, &new.name, &new.timezone, owner, actor, now).await?;
             Ok((household, Some(user)))
         }
         None => {
@@ -77,13 +81,15 @@ pub async fn create(
 ///
 /// Порядок блокировок: Telegram ID, затем installation. Занятый Telegram ID
 /// отклоняется до вставки, чтобы вызывающий получил понятный `Conflict`, а не
-/// ошибку уникального индекса.
-pub(crate) async fn create_with_owner(
+/// ошибку уникального индекса. `actor` типа [`ActorType::User`] привязывается к
+/// созданному владельцу; остальные акторы пишут событие от своего имени.
+async fn create_with_owner(
     conn: &mut PgConnection,
     mode: TenancyMode,
     name: &str,
     timezone: &str,
     owner: NewOwner,
+    actor: &Actor,
     now: DateTime<Utc>,
 ) -> Result<(Household, User), DomainError> {
     users::lock_telegram_user(conn, owner.member.telegram_user_id).await?;
@@ -113,16 +119,29 @@ pub(crate) async fn create_with_owner(
     )
     .await?;
 
+    let audit_actor = match actor.actor_type {
+        ActorType::User => Actor::user(user.id, user.role),
+        _ => actor.clone(),
+    };
+    let mut payload = json!({
+        "household_name": household.name,
+        "timezone": household.timezone,
+    });
+    if audit_actor.actor_type == ActorType::User {
+        payload["actor_name"] = json!(user.display_name);
+    } else {
+        // Владелец создан администратором: в payload — те же данные, что у
+        // `member_joined`, без Telegram ID и прочих лишних полей.
+        payload["user_id"] = json!(user.id);
+        payload["display_name"] = json!(user.display_name);
+        payload["role"] = json!(user.role);
+    }
     audit::record(
         conn,
         Some(household.id),
-        &Actor::user(user.id, UserRole::Owner),
+        &audit_actor,
         AuditEventType::HouseholdCreated,
-        json!({
-            "household_name": household.name,
-            "timezone": household.timezone,
-            "actor_name": user.display_name,
-        }),
+        payload,
         now,
     )
     .await?;
@@ -212,7 +231,9 @@ async fn insert_household(
 ///
 /// Идемпотентность по Telegram ID важнее режима: повторный шаг возвращает
 /// существующий household даже в [`TenancyMode::Single`], когда household уже
-/// есть. Для нового ID создание идёт через [`create`].
+/// есть. Для нового ID создание идёт через [`create`] с актором-владельцем:
+/// `user_id` появится только после вставки, поэтому репозиторий привязывает
+/// актора к созданной строке.
 pub async fn onboard(
     conn: &mut PgConnection,
     mode: TenancyMode,
@@ -232,13 +253,29 @@ pub async fn onboard(
         });
     }
 
-    // `create_with_owner` повторно берёт блокировку того же Telegram ID.
+    // `create` повторно берёт блокировку того же Telegram ID.
     // Повторный `pg_advisory_xact_lock` в той же транзакции безопасен:
     // блокировка реентерабельна и освобождается только с концом транзакции.
     // Порядок «Telegram ID → installation» при этом сохраняется,
-    // взаимоблокировки с `user add` нет. Актор для аудита здесь не важен: при
-    // наличии владельца событие пишется от его имени.
-    let (household, user) = create_with_owner(conn, mode, name, timezone, owner, now).await?;
+    // взаимоблокировки с `user add` нет.
+    let actor = Actor {
+        user_id: None,
+        role: Some(UserRole::Owner),
+        actor_type: ActorType::User,
+    };
+    let (household, user) = create(
+        conn,
+        mode,
+        NewHousehold {
+            name: name.to_owned(),
+            timezone: timezone.to_owned(),
+            owner: Some(owner),
+        },
+        &actor,
+        now,
+    )
+    .await?;
+    let user = user.expect("onboarding always creates an owner");
 
     Ok(Onboarded {
         household,
