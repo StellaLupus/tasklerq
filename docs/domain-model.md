@@ -9,9 +9,12 @@
 - **Единая таблица `items`.** Задачи, покупки и чек-листы имеют общий жизненный
   цикл; различия — в `lists.kind` и nullable-полях.
 - **UUIDv7.** Сортировка по времени, безопасные идентификаторы в URL.
-- **Мягкое удаление.** Данные скрываются, но восстанавливаются 30 дней.
-- **Версии.** Каждое изменение элемента увеличивает `version`; API требует
-  версию для записи.
+- **Мягкое удаление.** Элементы скрываются и могут быть восстановлены в
+  течение 30 дней; списки и household после мягкого удаления физически
+  удаляются retention через 30 дней.
+- **Версии.** Каждое изменение элемента увеличивает `version`; `PATCH` требует
+  `version`, `complete`/`reopen` принимают её опционально, устаревшая версия
+  отклоняется (`409`).
 - **Аудит.** Значимые изменения пишутся в `item_events`; членство и
   безопасность — в `audit_events`.
 
@@ -29,9 +32,12 @@ erDiagram
     HOUSEHOLDS ||--o{ INVITES : issues
     HOUSEHOLDS ||--o{ API_TOKENS : owns
     HOUSEHOLDS ||--o{ CAPTURE_DRAFTS : creates
-    CAPTURE_DRAFTS ||--o{ LLM_RUNS : observes
-    HOUSEHOLDS ||--o{ OUTBOX : sends
+    HOUSEHOLDS ||--o{ CAPTURE_REQUESTS : reserves
+    HOUSEHOLDS ||--o{ CAPTURE_JOBS : queues
+    HOUSEHOLDS ||--o{ LLM_RUNS : records
+    HOUSEHOLDS ||--o{ NOTIFICATION_BATCHES : groups
     USERS ||--o{ NOTIFICATION_DELIVERIES : receives
+    NOTIFICATION_BATCHES ||--o{ NOTIFICATION_DELIVERIES : contains
     HOUSEHOLDS ||--o{ AUDIT_EVENTS : records
 ```
 
@@ -102,7 +108,7 @@ erDiagram
 | `priority` | `item_priority` | По умолчанию `normal`. |
 | `due_at` | `timestamptz` | NULL; взаимоисключающе с `due_date`. |
 | `due_date` | `date` | NULL; all-day. |
-| `assignee_user_id` | `uuid` | NULL, FK → users того же household. |
+| `assignee_user_id` | `uuid` | NULL, FK → users; приложение проверяет тот же household. |
 | `created_by_user_id` | `uuid` | NULL для системных источников; FK → users. |
 | `source` | `item_source` | `telegram`/`ha_todo`/`ha_voice`/`ha_automation`/`api`/`import`. |
 | `capture_id` | `uuid` | NULL, FK → `capture_drafts`; для внешнего capture. |
@@ -138,9 +144,16 @@ CHECK (
 )
 CHECK (
   recurrence_freq IS DISTINCT FROM 'weekly'
-  OR (recurrence_byweekday IS NOT NULL AND array_length(recurrence_byweekday, 1) > 0)
+  OR (recurrence_byweekday IS NOT NULL AND cardinality(recurrence_byweekday) > 0)
 )
-CHECK ((recurrence_freq = 'monthly') = (recurrence_month_rule IS NOT NULL))
+CHECK (recurrence_byweekday IS NULL
+       OR recurrence_byweekday <@ ARRAY[1, 2, 3, 4, 5, 6, 7]::smallint[])
+CHECK (recurrence_freq IS DISTINCT FROM 'monthly'
+       OR recurrence_month_rule IS NOT NULL)
+CHECK (recurrence_freq = 'monthly' OR recurrence_month_rule IS NULL)
+CHECK (recurrence_until IS NULL
+       OR (recurrence_until >= recurrence_anchor_date
+           AND recurrence_until <= (recurrence_anchor_date + INTERVAL '5 years')::date))
 ```
 
 Дополнительно приложение проверяет, что повторение допустимо только для
@@ -206,7 +219,8 @@ CHECK ((recurrence_freq = 'monthly') = (recurrence_month_rule IS NOT NULL))
 | `revoked_at` | `timestamptz` | NULL. |
 | `created_at` | `timestamptz` | NOT NULL. |
 
-Не более 5 активных приглашений на household.
+Не более 5 активных приглашений на household и не более 5 созданий в час на
+household.
 
 ### 3.9 `api_tokens`
 
@@ -230,24 +244,24 @@ CHECK ((recurrence_freq = 'monthly') = (recurrence_month_rule IS NOT NULL))
 
 | Поле | Тип | Назначение |
 | --- | --- | --- |
-| `update_id` | `bigint` | PK. |
-| `chat_id` | `bigint` | Чат. |
-| `user_id` | `bigint` | Пользователь. |
+| `update_id` | `bigint` | PK, `update_id` из Telegram. |
 | `payload` | `jsonb` | Полный Update. |
-| `status` | `update_status` | `pending`/`processed`/`dead`. Обработка идёт под `FOR UPDATE SKIP LOCKED`, поэтому отдельных `processing` и `failed` нет. После обработки `payload` затирается. |
+| `status` | `update_status` | `pending`/`processed`/`dead`. Обработка идёт под `FOR UPDATE SKIP LOCKED`, поэтому отдельных `processing` и `failed` нет. После обработки `payload` заменяется на `{"redacted": true}`. |
 | `attempts` | `integer` | По умолчанию 0. |
 | `available_at` | `timestamptz` | Время следующей попытки. |
 | `last_error` | `text` | Код/краткое описание. |
 | `received_at`, `processed_at` | `timestamptz` | Время. |
 
-`telegram_views`: `id`, `chat_id`, `message_id`, `view_key`, `state jsonb`,
-`updated_at`; UNIQUE `(chat_id, message_id)`.
+`telegram_views`: `chat_id` PK, `message_id`, `view_key`, `state jsonb`,
+`buried boolean` (якорь засыпан другим сообщением), `updated_at`.
 
-`conversation_states`: `id`, `user_id`, `chat_id`, `state`, `payload jsonb`,
-`expires_at`, `updated_at`; UNIQUE `(user_id, chat_id)`.
+`conversation_states`: `chat_id` PK, `telegram_user_id`, `kind`, `data jsonb`,
+`expires_at`, `created_at`, `updated_at`; одна активная форма на чат, TTL
+15 минут.
 
-`callback_tokens`: `token_hash` PK, `household_id`, `user_id`, `action`,
-`payload jsonb`, `resource_version`, `expires_at`, `consumed_at`.
+`callback_tokens`: `token_hash` PK, `telegram_user_id`, `household_id` (NULL
+для онбординга), `scope` (`screen`/`notice`), `action`, `payload jsonb`,
+`version`, `expires_at`, `consumed_at`, `created_at`; TTL не больше 24 часов.
 
 ### 3.11 Capture и LLM
 
@@ -259,37 +273,57 @@ CHECK ((recurrence_freq = 'monthly') = (recurrence_month_rule IS NOT NULL))
 | `household_id`, `user_id`, `chat_id` | | Владелец; `user_id`/`chat_id` NULL для внешнего capture. |
 | `source` | `capture_source` | `telegram`/`ha_voice`/`ha_automation`/`api`/`shortcut`. |
 | `mode` | `capture_mode` | `auto`/`draft`. |
-| `idempotency_key` | `text` | NULL; UNIQUE `(household_id, source, idempotency_key)`. Резервируется до вызова LLM: параллельный повтор получает `409`. |
-| `request_hash` | `text` | SHA-256 тела запроса; тот же ключ с другим хешем — `422`. |
+| `idempotency_key` | `text` | NULL; повтор ключа в `capture_requests` уникален по `(household_id, source, idempotency_key)`. Резервируется до вызова LLM: параллельный повтор получает `409`. |
+| `request_hash` | `text` | SHA-256 канонического тела запроса; тот же ключ с другим хешем — `422`. |
 | `raw_text` | `text` | Исходный текст, до 2000. |
-| `parsed` | `jsonb` | Валидированная структура. |
+| `parsed` | `jsonb` | Разобранная структура, включая невалидные элементы до подтверждения. |
 | `status` | `draft_status` | `pending`/`applied`/`cancelled`/`expired`/`rejected`. |
 | `fallback` | `boolean` | TRUE, если создано из исходного текста без LLM. |
-| `prompt_version` | `text` | Например, `capture-v1`. |
+| `prompt_version` | `text` | Например, `capture-v3`. |
 | `telegram_message_id` | `bigint` | NULL. |
-| `created_at`, `expires_at`, `applied_at` | `timestamptz` | `expires_at` — TTL подтверждения 15 минут; retention `raw_text` — 30 дней. |
+| `created_at`, `expires_at`, `applied_at` | `timestamptz` | `expires_at` — TTL подтверждения 15 минут; строка хранится вместе с `raw_text` 30 дней. |
 
-`llm_runs`: `id`, `household_id`, `user_id`, `draft_id`, `provider`, `model`,
-`prompt_version`, `status`, `latency_ms`, `input_tokens`, `output_tokens`,
-`error_code`, `created_at`. Исходный текст не хранится.
+`capture_requests`: `household_id`, `source`, `idempotency_key`, `request_hash`,
+`capture_id`, `response jsonb` (NULL, пока запрос обрабатывается), `created_at`,
+`completed_at`; UNIQUE `(household_id, source, idempotency_key)`. Завершённый
+повтор возвращает сохранённый `response` без нового разбора; зависший резерв
+перехватывается через 60 секунд.
+
+`capture_jobs`: `id`, `household_id`, `user_id`, `chat_id`, `source`,
+`input_kind`, `payload jsonb`, `status` (`capture_job_status`), `attempts`,
+`available_at`, `locked_until`, `last_error`, `draft_id`, `created_at`,
+`finished_at`. Задание захватывается арендой `locked_until`, поэтому упавший
+воркер не теряет разбор; у `done` и `dead` текст `payload` заменяется на
+`{"redacted": true}`.
+
+`llm_runs`: `id`, `household_id`, `user_id`, `source`, `mode`,
+`prompt_version`, `status` (`success`/`failure`), `error_code`, `latency_ms`,
+`input_tokens`, `output_tokens`, `created_at`. Исходный текст и ответ модели не
+хранятся.
 
 ### 3.12 Outbox и уведомления
 
-`outbox`: `seq`, `chat_id`, `kind`, `payload jsonb`, `dedupe_key`, `status`,
-`attempts`, `next_attempt_at`, `message_id`, `last_error`, `created_at`,
-`sent_at`, `dead_at`. `dead_at` заполняется при переводе в `dead` и пуст у
-остальных статусов.
+`outbox`: `seq`, `chat_id`, `kind` (`outbox_kind`), `payload jsonb`,
+`dedupe_key`, `status` (`pending`/`sent`/`dead`/`skipped`), `attempts`,
+`next_attempt_at`, `message_id`, `last_error`, `created_at`, `sent_at`,
+`dead_at`. `dead_at` заполняется при переводе в `dead` и пуст у остальных
+статусов. В `sent`, `skipped` и `dead` текст `payload` заменяется на
+`{"redacted": true}`.
 
 `notification_deliveries`: `id`, `household_id`, `user_id`, `item_id` (NULL для
 сводки), `occurrence_key`, `kind`, `status`, `scheduled_at`, `deferred`,
-`outbox_seq`, `created_at`, `updated_at`; UNIQUE `(user_id, item_id,
+`outbox_seq`, `batch_id`, `batch_version`, `batch_state`, `batch_snoozed_until`,
+`batched`, `created_at`, `updated_at`; UNIQUE `(user_id, item_id,
 occurrence_key, kind)`. `kind` — `reminder`, `digest`, `assignment` или
 `snooze`; `status` — `pending`, `sent` или `cancelled`. `deferred` отмечает
 запись, хотя бы раз отложенную тихими часами: перенесённая через полночь
 сводка или вседневное напоминание не отменяются только из-за смены локальной
 даты. `snooze` — отдельная доставка отложенного напоминания, её ключ включает
 время snooze. Отложенное («😴») напоминание отменяется, если к моменту
-доставки у получателя выключены напоминания.
+доставки у получателя выключены напоминания. `batch_id` связывает доставку со
+сводным сообщением, `batch_version` хранит версию задачи на момент выпуска,
+`batch_state` — итог действия над блоком (`done`/`snoozed`/`missing`),
+`batched` отмечает групповой snooze.
 Для сводок `item_id` равен NULL, поэтому уникальность обеспечивается
 `UNIQUE NULLS NOT DISTINCT` (PostgreSQL 15+). Составные внешние ключи
 `(user_id, household_id)` и `(item_id, household_id)` не дают записать
@@ -298,6 +332,11 @@ occurrence_key, kind)`. `kind` — `reminder`, `digest`, `assignment` или
 доставки остаётся для аудита дедупликации. Завершённые доставки (`sent`,
 `cancelled`) хранятся 30 дней (`RETENTION_OUTBOX_DAYS`); `pending` не удаляются.
 
+`notification_batches`: `id`, `household_id`, `user_id`, `chat_id`, `page`
+(текущая страница сводного), `result_completed`, `result_changed`,
+`created_at`, `updated_at`. Хранит одно выпущенное сводное сообщение; батч
+удаляется retention, когда на него больше не ссылается ни одна доставка.
+
 ### 3.13 `audit_events`
 
 `id`, `household_id` (NULL для системных), `actor_user_id`, `actor_type`
@@ -305,7 +344,8 @@ occurrence_key, kind)`. `kind` — `reminder`, `digest`, `assignment` или
 jsonb`, `created_at`. Типы: `household_created`, `member_joined`,
 `member_left`, `member_removed`, `role_changed`, `invite_created`,
 `invite_used`, `invite_revoked`, `token_created`, `token_revoked`,
-`auth_failed`, `rate_limited`, `household_deleted`.
+`auth_failed`, `rate_limited`, `llm_validation_failed`,
+`auth_failure_threshold_exceeded`, `household_deleted`.
 
 Раздел «Журнал» владельца показывает события членства
 (`household_created`, `member_*`, `role_changed`, `invite_*`,
@@ -333,7 +373,11 @@ household, созданные через `tasklerq admin`, попадают в �
 | `capture_mode` | `auto`, `draft` |
 | `item_source` | `telegram`, `ha_todo`, `ha_voice`, `ha_automation`, `api`, `import` |
 | `outbox_status` | `pending`, `sent`, `dead`, `skipped` |
+| `outbox_kind` | `screen`, `message`, `edit`, `delete` |
 | `notification_kind` | `reminder`, `digest`, `assignment`, `snooze` |
+| `notification_status` | `pending`, `sent`, `cancelled` |
+| `capture_job_status` | `pending`, `running`, `done`, `dead` |
+| `audit_event_type` | `household_created`, `member_joined`, `member_left`, `member_removed`, `role_changed`, `invite_created`, `invite_used`, `invite_revoked`, `token_created`, `token_revoked`, `auth_failed`, `rate_limited`, `llm_validation_failed`, `auth_failure_threshold_exceeded`, `household_deleted` |
 
 ## 5. Инварианты
 
@@ -347,7 +391,8 @@ household, созданные через `tasklerq admin`, попадают в �
    тоже участник. Для системного источника `created_by_user_id` может быть NULL.
 7. В household ровно один default-список `tasks` и один default-список
    `shopping`; их нельзя удалить/архивировать.
-8. `done` требует `completed_at` и `completed_by_user_id`; `open` не требует.
+8. `done` требует `completed_at`; `completed_by_user_id` заполняется, если
+   действие совершил пользователь, и остаётся NULL у системных источников.
 9. `version` монотонно растёт; конфликт версий не применяется.
 10. Удалённые элементы не видны в API, поиске, календаре и HA.
 11. Пользователь состоит не более чем в одном household.
@@ -355,7 +400,7 @@ household, созданные через `tasklerq admin`, попадают в �
 13. Приглашение одноразовое; код хранится только как хеш.
 14. API-токен хранится только как хеш; scopes обязательны.
 15. Ключ уведомления уникален; повтор не создаёт дубль.
-16. Внешний capture с `idempotency_key` уникален в рамках
+16. Ключ `idempotency_key` внешнего capture уникален в рамках
     `(household_id, source)`; повтор возвращает исходный результат.
 17. Все элементы одного capture создаются и отменяются вместе; частичного
     применения нет.
@@ -389,27 +434,29 @@ household, созданные через `tasklerq admin`, попадают в �
 pending ──confirm──▶ applied
    │
    ├──cancel──▶ cancelled
-   └──ttl─────▶ expired
+   ├──ttl─────▶ expired
+   └──reject──▶ rejected
 ```
 
-`applied`, `cancelled`, `expired` — терминальные.
+`applied`, `cancelled`, `expired`, `rejected` — терминальные.
 
 ### Очередь обновлений
 
 ```text
-pending ──claim──▶ processing ──ok──▶ processed
-   ▲                   │
-   └──retry────────────┘
-                       └──max attempts──▶ dead
+pending ──ok──▶ processed
+   │
+   ├──retry (attempts+1, available_at)──▶ pending
+   └──max attempts──▶ dead
 ```
 
 ### Outbox
 
 ```text
-pending ──claim──▶ sending ──ok──▶ sent
-   ▲                   │
-   └──retry────────────┘
-                       └──max attempts──▶ dead
+pending ──ok──▶ sent
+   │
+   ├──retry (attempts+1, next_attempt_at)──▶ pending
+   ├──удалено/недоступно──▶ skipped
+   └──max attempts──▶ dead
 ```
 
 ### Приглашение
@@ -499,17 +546,18 @@ anchor:    date — исходная дата серии
 
 - `search_vector` — генерируемая колонка из `title` и `notes` с конфигурацией
   `simple`.
-- GIN-индекс по `search_vector`; `pg_trgm` GIN по `title` для подстрок.
+- GIN-индекс по `search_vector`; `pg_trgm` GIN по `title` создаётся при
+  наличии расширения.
 - Теги и подзадачи участвуют в поиске через join.
 - Фильтры: `status`, `list_id`, `assignee_user_id`, `tag`, `due_from`,
   `due_to`. Срок фильтруется полуоткрытым интервалом `[due_from, due_to)`.
   Дата `YYYY-MM-DD` берётся в часовом поясе household (`due_to` — полночь
   следующего дня), значение RFC 3339 — точный момент.
-- Сортировка: релевантность, затем срок, затем `created_at`.
+- Сортировка: релевантность, затем срок, затем `id`.
 - Курсор: `(rank, due_at, id)` в base64; стабилен при вставках.
 - Удалённые, архивные и (по умолчанию) выполненные исключаются.
-- Русская морфология: `simple` не делает стемминг; `pg_trgm` компенсирует
-  подстроки. При недоступности расширения — `ILIKE`.
+- Русская морфология: `simple` не делает стемминг; подстроки ищутся через
+  `strpos(lower(...))`, поэтому поиск работает и без `pg_trgm`.
 
 ## 10. Мягкое удаление и retention
 
@@ -519,10 +567,15 @@ anchor:    date — исходная дата серии
 | `lists.deleted_at` | 30 дней | purge job + каскад. |
 | `households.deleted_at` | 30 дней | purge job. |
 | `telegram_updates` (processed, dead) | 7 дней | retention job. |
+| `capture_jobs` (finished) | 7 дней | retention job. |
 | `capture_drafts` | 30 дней | retention job. |
+| `capture_requests` | 30 дней | retention job вместе с черновиками. |
 | `llm_runs` | 90 дней | retention job. |
 | `item_events` | 365 дней | retention job. |
 | `outbox` sent, skipped, dead | 30 дней | retention job. |
+| `notification_deliveries` (sent, cancelled) | 30 дней | retention job. |
+| `notification_batches` без доставок | 30 дней | retention job. |
+| `invites` (used, revoked, expired) | 365 дней | retention job. |
 | `audit_events` | 365 дней | retention job. |
 
 Purge удаляет связанные подзадачи, теги, события и черновики. Восстановление
@@ -562,6 +615,8 @@ CREATE UNIQUE INDEX capture_idempotency_idx
   WHERE idempotency_key IS NOT NULL;
 CREATE INDEX capture_source_applied_idx
   ON capture_drafts (household_id, source, applied_at DESC);
+-- UNIQUE (household_id, source, idempotency_key) объявлен ограничением
+-- таблицы capture_requests.
 
 -- tags
 CREATE UNIQUE INDEX tags_household_lower_name_idx
@@ -569,9 +624,9 @@ CREATE UNIQUE INDEX tags_household_lower_name_idx
 
 -- queues
 CREATE INDEX telegram_updates_ready_idx
-  ON telegram_updates (available_at) WHERE status = 'pending';
-CREATE INDEX outbox_ready_idx
-  ON outbox (next_attempt_at) WHERE status = 'pending';
+  ON telegram_updates (available_at, update_id) WHERE status = 'pending';
+CREATE INDEX outbox_pending_idx
+  ON outbox (chat_id, seq) WHERE status = 'pending';
 CREATE INDEX notification_deliveries_pending_idx
   ON notification_deliveries (scheduled_at) WHERE status = 'pending';
 -- UNIQUE NULLS NOT DISTINCT (user_id, item_id, occurrence_key, kind)
@@ -585,7 +640,8 @@ CREATE INDEX item_events_item_created_idx
 ## 13. Миграции
 
 - Инструмент: `sqlx migrate`.
-- Имена: `0001_init.sql`, `0002_add_...sql`.
+- Имена: `0001_init.sql`, `0002_indexes.sql`, `0003_identity.sql` и далее по
+  номеру.
 - Применяются при старте под `pg_advisory_lock` или командой `tasklerq migrate`.
 - Схема expand/contract: добавление → двойная запись/чтение → удаление в
   следующем релизе.
@@ -596,7 +652,11 @@ CREATE INDEX item_events_item_created_idx
 
 ## 14. Открытые вопросы
 
-- Нужен ли `pg_trgm` на сервере пользователя; если нет — fallback `ILIKE`.
-- Версия PostgreSQL (минимум 15) и доступность расширений.
-- Нужно ли хранить `raw_text` черновика 30 дней или сократить до 7.
-- Нужен ли экспорт данных в JSON уже в MVP (CLI предусмотрен).
+Открытых вопросов по модели данных нет:
+
+- `pg_trgm` создаётся при наличии расширения; подстроки ищутся через
+  `strpos`, поэтому поиск работает и без него;
+- развёртывание использует PostgreSQL 18, минимум — 15 из-за
+  `UNIQUE NULLS NOT DISTINCT`;
+- `raw_text` хранится вместе с черновиком 30 дней (`RETENTION_DRAFTS_DAYS`);
+- экспорт JSON реализован командой `tasklerq admin export`.

@@ -9,8 +9,8 @@ Tasklerq — self-hosted сервис на Rust, который объединя
 Assistant. Бот при этом не обязателен: задачи можно создавать автоматизацией
 или прямым HTTP-запросом.
 
-> **Статус:** в разработке. Группа 1 (инфраструктура репозитория)
-> реализована; актуальный прогресс — в
+> **Статус:** MVP реализован; идёт синхронизация документации и подготовка
+> релиза `v0.1.0`. Актуальный прогресс — в
 > [`openspec/changes/0001-foundation/tasks.md`](openspec/changes/0001-foundation/tasks.md).
 
 ## Возможности MVP
@@ -24,16 +24,17 @@ Assistant. Бот при этом не обязателен: задачи мож
   несколько списков и чек-листов.
 - **Календарь.** Задачи со сроком, вседневные и со временем, повторяющиеся
   вхождения.
-- **Home Assistant.** Тонкий custom component: `todo`-сущность на каждый список
-  и read-only `calendar` для задач со сроком.
+- **Home Assistant.** Тонкий custom component: `todo`-сущность на каждый
+  неархивированный список и read-only `calendar` для задач со сроком.
 - **LLM-capture.** Свободный текст → структурированный черновик через
   `ai_task.generate_data` Home Assistant (Claude Haiku 5.5 через OpenRouter). LLM только разбирает;
   в Telegram данные применяются после подтверждения.
 - **Capture без бота.** Голос через HA Assist, автоматизации и HTTP API:
   `POST /api/v1/capture`, сервис `tasklerq.capture`, режим `auto` с
   идемпотентностью, fallback и отменой. Telegram не требуется.
-- **Семья.** Один household, роли owner/member, приглашения по deep link, общие
-  списки, назначение задач.
+- **Семья.** Один household на инсталляцию по умолчанию (`TENANCY_MODE=single`;
+  `multi` допускает несколько), роли owner/member, приглашения по deep link,
+  общие списки, назначение задач.
 - **Напоминания.** Сроки, утренняя сводка, назначения, тихие часы, snooze.
 - **Надёжность.** Webhook-очередь в PostgreSQL, идемпотентность, outbox,
   мягкое удаление, backup/restore.
@@ -47,7 +48,7 @@ flowchart LR
     TG -->|webhook HTTPS| RP[Reverse proxy]
     RP --> APP[Tasklerq<br/>Rust + axum]
     VA -->|tasklerq.capture| APP
-    SC[HTTP API / внешний клиент] -->|POST /capture| APP
+    SC[HTTP API / внешний клиент] -->|POST /api/v1/capture| APP
     APP -->|очередь| DB[(PostgreSQL)]
     APP -->|RichMessage| TG
     APP -->|REST + Bearer| HA[Home Assistant<br/>custom component]
@@ -72,26 +73,30 @@ flowchart LR
 | Развёртывание | Docker Compose на Synology NAS, PostgreSQL 18 в сети `shared-db`, Synology Reverse Proxy |
 | Наблюдаемость | `tracing` JSON, health/readiness, метрики |
 
-## Планируемая структура репозитория
+## Структура репозитория
 
 ```text
 tasklerq/
 ├── Cargo.toml
 ├── src/
-│   ├── main.rs
+│   ├── main.rs          # CLI: serve, migrate, seed, admin, healthcheck, capture-eval
+│   ├── lib.rs
+│   ├── app.rs           # сборка приложения и фоновых задач
 │   ├── config/
-│   │   ├── mod.rs
-│   │   ├── env_source.rs
-│   │   └── tests.rs
-│   ├── http/
+│   ├── http/            # router, server, middleware, error, health, metrics
+│   │   └── api/         # household, lists, items, capture, search, calendar, snapshot
 │   ├── auth/
-│   ├── telegram/
+│   ├── telegram/        # webhook, worker, queue, outbox, callbacks, rich, bot/
 │   ├── domain/
 │   ├── capture/
 │   ├── home_assistant/
-│   ├── storage/
-│   ├── jobs/
-│   └── admin/
+│   ├── storage/         # db, migrations, seed, repositories/
+│   ├── jobs/            # scheduler, delivery, digest, batch, retention
+│   ├── admin/
+│   ├── metrics.rs
+│   ├── rate_limit.rs
+│   ├── redaction.rs
+│   └── security_audit.rs
 ├── migrations/
 ├── tests/
 ├── docs/
@@ -121,7 +126,7 @@ Rust-сервером. Контракт API для клиента — [`docs/ha-
 Спецификации поведения: [`openspec/changes/0001-foundation/specs/`](openspec/changes/0001-foundation/specs/).
 Контекст проекта: [`openspec/project.md`](openspec/project.md).
 
-## Быстрый старт (после реализации)
+## Быстрый старт
 
 ```bash
 # 1. Скопировать пример конфигурации
@@ -138,6 +143,7 @@ make migrate
 TELEGRAM_MODE=polling make dev
 
 # 5. Открыть @tasklerqbot в Telegram и отправить /start
+#    Владелец — BOOTSTRAP_OWNER_TELEGRAM_ID, иначе первый написавший боту
 
 # 6. Создать токен для внешнего capture
 tasklerq admin token create --name "Dev capture" --scopes capture:write
