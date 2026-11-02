@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::capture::draft::DueChoice;
 use crate::domain::error::DomainError;
+use crate::domain::first_contact::FirstContact;
 use crate::domain::models::{
     Field, Item, ItemPatch, ItemPriority, ItemStatus, ListKind, MonthRule, NewItem, Recurrence,
     RecurrenceFreq, RecurrenceInput, SubtaskInput,
@@ -44,6 +45,8 @@ pub enum Screen {
     Menu,
     /// Приветствие после создания пространства.
     Welcome,
+    /// Информационный экран первого контакта без формы онбординга.
+    FirstContact(FirstContact),
     /// Выбор: добавить задачу или покупку.
     Add,
     /// Все списки.

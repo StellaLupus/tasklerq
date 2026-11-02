@@ -106,7 +106,7 @@ pub async fn start_with_update_limit(
 
     let bot = Bot::new(telegram.bot_username.clone())
         .with_llm_capture(ai.is_some())
-        .with_tenancy(config.tenancy.mode)
+        .with_tenancy_config(config.tenancy)
         .with_audit(audit.clone());
     if let Some(ai) = ai {
         let capture = CaptureWorker::new(

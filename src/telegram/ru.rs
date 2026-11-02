@@ -136,6 +136,21 @@ pub fn capitalize(text: &str) -> String {
     }
 }
 
+/// Экран первого контакта: у пространства уже есть владелец.
+pub const ASK_INVITE: &str = "Это частное пространство. Попросите приглашение у владельца.";
+/// Экран первого контакта: пространство без владельца.
+pub const ADMIN_COMMAND_INTRO: &str =
+    "Пространство ещё не настроено. Владельца назначает администратор командой:";
+/// Экран первого контакта: инсталляция ещё не настроена.
+pub const NOT_CONFIGURED: &str = "Пространство ещё не настроено. Обратитесь к администратору.";
+/// Экран первого контакта: в `single` больше одного household.
+pub const NEEDS_ADMIN: &str = "Инсталляция требует вмешательства администратора.";
+
+/// Команда CLI для назначения владельца с подставленным Telegram ID.
+pub fn owner_command(telegram_id: i64) -> String {
+    format!("tasklerq admin user add --telegram-id {telegram_id} --role owner")
+}
+
 /// Количество с единицей: «2 л», «1,5 кг».
 pub fn quantity_label(quantity: f64, unit: Option<&str>) -> String {
     let mut number = format!("{quantity:.3}");

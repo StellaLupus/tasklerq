@@ -21,7 +21,7 @@ use chrono_tz::Tz;
 use futures_util::future::BoxFuture;
 use sqlx::PgConnection;
 
-use crate::config::TenancyMode;
+use crate::config::{TenancyConfig, TenancyMode};
 use crate::domain::error::DomainError;
 use crate::domain::identity::{MembershipChange, MembershipNotice, NoticeKind};
 use crate::domain::models::{Actor, Household, User};
@@ -75,8 +75,8 @@ pub struct Bot {
     pub username: String,
     /// Свободный текст уходит на разбор в LLM, а не в быстрое добавление.
     pub llm_capture: bool,
-    /// Режим размещения инсталляции; влияет на онбординг.
-    pub tenancy: TenancyMode,
+    /// Политика размещения инсталляции; влияет на первый контакт.
+    pub tenancy: TenancyConfig,
     /// Журнал событий безопасности, которые откатываются вместе с шагом.
     audit: Option<Audit>,
 }
@@ -147,8 +147,8 @@ pub struct Ctx<'a> {
     pub placement: Placement,
     /// Свободный текст уходит на разбор в LLM.
     pub llm_capture: bool,
-    /// Режим размещения инсталляции.
-    pub tenancy: TenancyMode,
+    /// Политика размещения инсталляции.
+    pub tenancy: TenancyConfig,
     /// Журнал событий безопасности; `None` в тестах без пула.
     pub audit: Option<&'a Audit>,
 }
@@ -354,12 +354,15 @@ pub async fn issue_and_render(
 impl Bot {
     /// Создать бота. По умолчанию используется боевой режим `single`;
     /// сервис выставляет его явно из конфигурации, тесты — через
-    /// [`Bot::with_tenancy`].
+    /// [`Bot::with_tenancy`] или [`Bot::with_tenancy_config`].
     pub fn new(username: impl Into<String>) -> Self {
         Self {
             username: username.into(),
             llm_capture: false,
-            tenancy: TenancyMode::Single,
+            tenancy: TenancyConfig {
+                mode: TenancyMode::Single,
+                bootstrap_owner: None,
+            },
             audit: None,
         }
     }
@@ -450,10 +453,17 @@ impl Bot {
         self
     }
 
-    /// Задать режим размещения инсталляции.
+    /// Задать режим размещения инсталляции, сохранив `bootstrap_owner`.
     #[must_use]
     pub fn with_tenancy(mut self, mode: TenancyMode) -> Self {
-        self.tenancy = mode;
+        self.tenancy.mode = mode;
+        self
+    }
+
+    /// Задать полную политику размещения из конфигурации.
+    #[must_use]
+    pub fn with_tenancy_config(mut self, config: TenancyConfig) -> Self {
+        self.tenancy = config;
         self
     }
 

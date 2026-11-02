@@ -8,6 +8,7 @@ use serde_json::json;
 
 use crate::config::TenancyMode;
 use crate::domain::error::DomainError;
+use crate::domain::first_contact::Installation;
 use crate::domain::identity::{AuditEventType, NewMember, Onboarded};
 use crate::domain::models::{Actor, Household, List, ListKind, User, UserRole};
 use crate::domain::settings::validate_timezone;
@@ -289,6 +290,30 @@ pub async fn get(conn: &mut PgConnection, household_id: Uuid) -> Result<Househol
     .fetch_optional(conn)
     .await?
     .ok_or(DomainError::NotFound)
+}
+
+/// Состояние инсталляции одним запросом: число активных household и наличие
+/// активного владельца, если household один.
+pub async fn installation(conn: &mut PgConnection) -> Result<Installation, DomainError> {
+    let (active, has_owner): (i64, bool) = sqlx::query_as(
+        "SELECT count(*)::bigint,
+                coalesce(bool_or(EXISTS (
+                    SELECT 1 FROM users u
+                    WHERE u.household_id = h.id
+                      AND u.role = 'owner'
+                      AND u.deleted_at IS NULL
+                )), false)
+         FROM households h
+         WHERE h.deleted_at IS NULL",
+    )
+    .fetch_one(conn)
+    .await?;
+
+    Ok(match active {
+        0 => Installation::Empty,
+        1 => Installation::Single { has_owner },
+        _ => Installation::Multiple,
+    })
 }
 
 /// Все неудалённые household (для административных команд).

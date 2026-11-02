@@ -8,9 +8,10 @@
 
 use uuid::Uuid;
 
+use crate::domain::first_contact::{FirstContact, classify};
 use crate::domain::models::{List, ListKind};
 use crate::domain::validation::{MAX_TITLE, sanitize};
-use crate::storage::repositories::{items, lists};
+use crate::storage::repositories::{households, items, lists};
 use crate::telegram::views::{self, Lookup};
 
 use super::model::{EditForm, Form, ItemDraft, ItemForm, Screen, Step, TimeField};
@@ -207,9 +208,28 @@ pub async fn start_time(ctx: &mut Ctx<'_>, field: TimeField) -> Result<(), Fail>
     open(ctx, Form::Time { field }).await
 }
 
-/// Начать онбординг: шаг с названием.
+/// Начать первый контакт: онбординг или информационный экран.
+///
+/// Классификатор решает по состоянию инсталляции, режиму размещения и
+/// `bootstrap_owner`. В неонбординговых исходах незавершённая форма
+/// онбординга закрывается, а форма не открывается.
 pub async fn start_onboarding(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
-    open(ctx, Form::Onboarding { name: None }).await
+    let installation = households::installation(&mut *ctx.conn).await?;
+    let contact = classify(
+        ctx.tenancy.mode,
+        ctx.tenancy.bootstrap_owner,
+        ctx.sender.id,
+        installation,
+    );
+    match contact {
+        FirstContact::Onboard => open(ctx, Form::Onboarding { name: None }).await,
+        other => {
+            if matches!(load(ctx).await?, Some(Form::Onboarding { .. })) {
+                clear(ctx).await?;
+            }
+            ctx.present(Screen::FirstContact(other)).await
+        }
+    }
 }
 
 /// Сохранить состояние онбординга.

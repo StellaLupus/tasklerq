@@ -23,6 +23,7 @@ pub async fn build(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
         Screen::Draft { draft_id } => super::capture::view(ctx, *draft_id).await,
         Screen::Menu => menu(ctx).await,
         Screen::Welcome => Ok(welcome()),
+        Screen::FirstContact(contact) => Ok(super::onboarding::first_contact(contact)),
         Screen::Add => Ok(add_choice()),
         Screen::Lists => lists_screen(ctx).await,
         Screen::List { list_id, page } => list(ctx, *list_id, *page).await,
