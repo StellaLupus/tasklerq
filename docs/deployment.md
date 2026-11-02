@@ -541,17 +541,26 @@ sudo /usr/local/bin/docker compose up -d tasklerq
    Без `--owner-telegram-id` household создаётся без владельца. Добавить
    участников позже можно командой
    `tasklerq admin user add --telegram-id <id> --role member --name "Имя"`.
-6. Создайте API-токен для HA:
+6. Выпустите API-токен для HA. Основной путь — в боте:
+   **Настройки → 🔌 Интеграции → ➕ Выпустить токен для HA**. Токен придёт
+   отдельным сообщением под спойлером: скопируйте его в HA и нажмите
+   **Я сохранил**; если кнопку не нажимали, сообщение удалится само через час.
+
+   Для headless-режима (`TELEGRAM_MODE=disabled`) и автоматизации токен
+   выпускается через CLI:
 
 ```bash
 sudo /usr/local/bin/docker compose exec tasklerq \
   tasklerq admin token create \
   --name "Home Assistant" \
   --scopes ha:read,ha:write,capture:write
+# в режиме multi добавьте: --household <id>
 ```
 
-`capture:write` нужен сервису `tasklerq.capture` и голосовому сценарию Assist.
-Сохраните выданный токен в переменную `TASKLERQ_TOKEN` — он понадобится ниже.
+В режиме `multi` `--household` обязателен; в `single` его можно опустить, если
+household единственный. `capture:write` нужен сервису `tasklerq.capture` и
+голосовому сценарию Assist. Сохраните выданный токен в переменную
+`TASKLERQ_TOKEN` — он понадобится ниже.
 
 7. Установите custom component в HA (см. [`home-assistant.md`](home-assistant.md)).
 8. Настройте интеграцию: URL `http://127.0.0.1:18080`, токен.
@@ -1066,10 +1075,12 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 
 **API-токен HA:**
 
-1. Создайте новый токен.
+1. Выпустите новый токен в **Настройки → 🔌 Интеграции → ➕ Выпустить токен
+   для HA** (или `tasklerq admin token create`).
 2. Обновите токен в интеграции HA (reauth).
 3. Убедитесь, что сущности доступны.
-4. Отзовите старый токен.
+4. Отзовите старый токен в **Настройки → 🔌 Интеграции** (кнопка
+   **🚫 Отозвать «…»**) или командой `tasklerq admin token revoke <id> --yes`.
 
 **Токен бота:**
 
@@ -1147,7 +1158,9 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 
 1. `tasklerq admin household list` — найдите household с владельцем и
    задачами; лишний обычно остался без владельца или пустым.
-2. Выпустите токен для нужного household:
+2. Выпустите токен для нужного household — в боте через
+   **Настройки → 🔌 Интеграции → ➕ Выпустить токен для HA** (если вы владелец
+   этого household) или через CLI:
 
    ```bash
    tasklerq admin token create --household <id> \
