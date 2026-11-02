@@ -3,6 +3,7 @@
 mod support;
 
 use chrono::Utc;
+use tasklerq::config::TenancyMode;
 use tasklerq::domain::error::DomainError;
 use tasklerq::domain::identity::NewMember;
 use tasklerq::domain::models::{ItemPriority, ItemStatus, ListKind, SubtaskInput};
@@ -43,14 +44,16 @@ async fn transaction_rollback_leaves_no_household() {
     let name = format!("Rollback {}", Uuid::now_v7());
     let mut tx = db.pool.begin().await.expect("transaction");
 
+    let telegram_id = 7_000_000_001;
     let onboarded = households::onboard(
         &mut tx,
+        TenancyMode::Multi,
         &name,
         "Europe/Moscow",
         NewOwner {
             member: NewMember {
-                telegram_user_id: 7_000_000_001,
-                telegram_chat_id: 7_000_000_001,
+                telegram_user_id: telegram_id,
+                telegram_chat_id: telegram_id,
                 display_name: "Rollback Owner".into(),
                 username: None,
             },
@@ -60,16 +63,23 @@ async fn transaction_rollback_leaves_no_household() {
     )
     .await
     .expect("household in transaction");
-    let household = onboarded.household;
     tx.rollback().await.expect("rollback");
 
     let mut conn = db.pool.acquire().await.expect("connection");
     let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM households WHERE id = $1)")
-        .bind(household.id)
+        .bind(onboarded.household.id)
         .fetch_one(&mut *conn)
         .await
         .expect("query");
     assert!(!exists, "rolled back household must not be visible");
+
+    let owner_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE telegram_user_id = $1)")
+            .bind(telegram_id)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("query");
+    assert!(!owner_exists, "rolled back owner must not be visible");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

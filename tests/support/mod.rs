@@ -240,6 +240,7 @@ pub async fn create_household(pool: &PgPool) -> TestHousehold {
 
     let onboarded = households::onboard(
         &mut conn,
+        tasklerq::config::TenancyMode::Multi,
         &format!("Test household {sequence}"),
         "Europe/Moscow",
         NewOwner {

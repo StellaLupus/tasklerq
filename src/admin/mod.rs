@@ -12,6 +12,7 @@ use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use crate::auth::tokens::{self, IssuedToken};
+use crate::config::TenancyMode;
 use crate::domain::error::DomainError;
 use crate::domain::identity::NewMember;
 use crate::domain::models::{Actor, ActorType, Household, Item, ListKind, User, UserRole};
@@ -97,12 +98,24 @@ pub async fn list_tokens(
 /// Создать household без владельца.
 pub async fn create_household(
     pool: &PgPool,
+    mode: TenancyMode,
     name: &str,
     timezone: &str,
     now: DateTime<Utc>,
 ) -> Result<Household, DomainError> {
     let mut tx = pool.begin().await?;
-    let household = households::create_empty(&mut tx, name, timezone, &admin_actor(), now).await?;
+    let (household, _) = households::create(
+        &mut tx,
+        mode,
+        households::NewHousehold {
+            name: name.to_owned(),
+            timezone: timezone.to_owned(),
+            owner: None,
+        },
+        &admin_actor(),
+        now,
+    )
+    .await?;
     tx.commit().await?;
 
     Ok(household)

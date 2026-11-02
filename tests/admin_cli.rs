@@ -52,6 +52,18 @@ async fn run(url: &str, args: &[&str]) -> Output {
         .expect("the CLI should run")
 }
 
+async fn run_with_tenancy(url: &str, mode: &str, args: &[&str]) -> Output {
+    bin()
+        .env("DATABASE_URL", url)
+        .env("TENANCY_MODE", mode)
+        .env("RUST_LOG", "error")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .expect("the CLI should run")
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8(output.stdout.clone()).expect("utf8")
 }
@@ -145,6 +157,59 @@ async fn household_list_shows_members_timezone_and_no_secrets() {
             "household list must not contain {forbidden}:\n{text}"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_create_in_single_mode_rejects_a_second_household() {
+    let db = cli_database().await;
+
+    let first = run_with_tenancy(
+        &db.url,
+        "single",
+        &["admin", "household", "create", "--name", "Первая"],
+    )
+    .await;
+    assert!(first.status.success(), "{first:?}");
+
+    let second = run_with_tenancy(
+        &db.url,
+        "single",
+        &["admin", "household", "create", "--name", "Вторая"],
+    )
+    .await;
+    assert!(!second.status.success(), "{second:?}");
+    let combined = format!("{}{}", stdout(&second), stderr(&second));
+    assert!(
+        combined.contains("409"),
+        "the CLI should report a 409 conflict:\n{combined}"
+    );
+
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM households")
+        .fetch_one(&db.pool)
+        .await
+        .expect("count");
+    assert_eq!(count, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_create_in_multi_mode_allows_a_second_household() {
+    let db = cli_database().await;
+
+    for name in ["Первая", "Вторая"] {
+        let output = run_with_tenancy(
+            &db.url,
+            "multi",
+            &["admin", "household", "create", "--name", name],
+        )
+        .await;
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM households")
+        .fetch_one(&db.pool)
+        .await
+        .expect("count");
+    assert_eq!(count, 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

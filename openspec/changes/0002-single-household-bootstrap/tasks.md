@@ -7,8 +7,8 @@
 
 ## 2. Единая точка создания household
 
-- [ ] 2.1 Реализовать `households::create(conn, mode, NewHousehold { name, timezone, owner: Option<NewOwner> }, actor, now)`. Функция берёт блокировку Telegram ID владельца (если владелец указан), затем `pg_advisory_xact_lock` installation, считает активные household и в `single` при наличии хотя бы одного возвращает `Conflict(reason = "household_exists")`. `create_empty` и `create_with_owner` перевести на неё. Проверить интеграционными тестами: второе создание в `single` возвращает `409`; в `multi` создание разрешено; после мягкого удаления создание снова разрешено.
-- [ ] 2.2 Перевести `households::onboard` на `create` с передачей режима, сохранив идемпотентность по Telegram ID. Проверить интеграционным тестом: два параллельных `onboard` с разными Telegram ID на пустой базе в `single` создают ровно один household, второй получает `household_exists`. Повторный `onboard` того же ID возвращает существующий household.
+- [x] 2.1 Реализовать `households::create(conn, mode, NewHousehold { name, timezone, owner: Option<NewOwner> }, actor, now)`. Функция берёт блокировку Telegram ID владельца (если владелец указан), затем `pg_advisory_xact_lock` installation, считает активные household и в `single` при наличии хотя бы одного возвращает `Conflict(reason = "household_exists")`. `create_empty` и `create_with_owner` перевести на неё. Проверить интеграционными тестами: второе создание в `single` возвращает `409`; в `multi` создание разрешено; после мягкого удаления создание снова разрешено.
+- [x] 2.2 Перевести `households::onboard` на `create` с передачей режима, сохранив идемпотентность по Telegram ID. Проверить интеграционным тестом: два параллельных `onboard` с разными Telegram ID на пустой базе в `single` создают ровно один household, второй получает `household_exists`. Повторный `onboard` того же ID возвращает существующий household.
 
 ## 3. CLI: bootstrap, list, delete, `--household` в multi
 

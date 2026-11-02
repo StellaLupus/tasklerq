@@ -159,6 +159,7 @@ async fn create(ctx: &mut Ctx<'_>, name: &str, zone: &str) -> Result<(), Fail> {
     let member = new_member(ctx);
     let onboarded = households::onboard(
         &mut *ctx.conn,
+        ctx.tenancy,
         name,
         zone,
         NewOwner {

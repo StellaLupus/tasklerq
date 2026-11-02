@@ -11,7 +11,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use tasklerq::admin;
 use tasklerq::app::build_application;
 use tasklerq::capture::{eval, prompt};
-use tasklerq::config::{self, Config, DatabaseConfig, LlmConfig};
+use tasklerq::config::{self, Config, DatabaseConfig, LlmConfig, TenancyConfig};
 use tasklerq::domain::error::DomainError;
 use tasklerq::domain::models::UserRole;
 use tasklerq::home_assistant::{AiTask, GenerateData, HttpAiTask, MAX_GENERATE_TIMEOUT};
@@ -478,7 +478,8 @@ async fn run_admin_database(command: DatabaseCommand) -> Result<()> {
         },
         DatabaseCommand::Household(command) => match command {
             HouseholdCommand::Create { name, timezone } => {
-                let household = admin::create_household(&pool, &name, &timezone, now)
+                let tenancy = TenancyConfig::from_env().context("invalid tenancy configuration")?;
+                let household = admin::create_household(&pool, tenancy.mode, &name, &timezone, now)
                     .await
                     .map_err(explain)?;
                 println!("id: {}", household.id);

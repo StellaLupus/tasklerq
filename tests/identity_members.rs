@@ -717,6 +717,7 @@ async fn household_deletion_requires_confirmation_and_revokes_access() {
         .expect("telegram id");
     let onboarded = households::onboard(
         &mut conn,
+        tasklerq::config::TenancyMode::Multi,
         "Новая семья",
         "Europe/Moscow",
         households::NewOwner {

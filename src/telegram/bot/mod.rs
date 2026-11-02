@@ -21,6 +21,7 @@ use chrono_tz::Tz;
 use futures_util::future::BoxFuture;
 use sqlx::PgConnection;
 
+use crate::config::TenancyMode;
 use crate::domain::error::DomainError;
 use crate::domain::identity::{MembershipChange, MembershipNotice, NoticeKind};
 use crate::domain::models::{Actor, Household, User};
@@ -74,6 +75,8 @@ pub struct Bot {
     pub username: String,
     /// Свободный текст уходит на разбор в LLM, а не в быстрое добавление.
     pub llm_capture: bool,
+    /// Режим размещения инсталляции; влияет на онбординг.
+    pub tenancy: TenancyMode,
     /// Журнал событий безопасности, которые откатываются вместе с шагом.
     audit: Option<Audit>,
 }
@@ -144,6 +147,8 @@ pub struct Ctx<'a> {
     pub placement: Placement,
     /// Свободный текст уходит на разбор в LLM.
     pub llm_capture: bool,
+    /// Режим размещения инсталляции.
+    pub tenancy: TenancyMode,
     /// Журнал событий безопасности; `None` в тестах без пула.
     pub audit: Option<&'a Audit>,
 }
@@ -347,11 +352,14 @@ pub async fn issue_and_render(
 }
 
 impl Bot {
-    /// Создать бота.
+    /// Создать бота. По умолчанию используется боевой режим `single`;
+    /// сервис выставляет его явно из конфигурации, тесты — через
+    /// [`Bot::with_tenancy`].
     pub fn new(username: impl Into<String>) -> Self {
         Self {
             username: username.into(),
             llm_capture: false,
+            tenancy: TenancyMode::Single,
             audit: None,
         }
     }
@@ -430,6 +438,7 @@ impl Bot {
             banner,
             placement: Placement::Visible,
             llm_capture: self.llm_capture,
+            tenancy: self.tenancy,
             audit: self.audit.as_ref(),
         }
     }
@@ -438,6 +447,13 @@ impl Bot {
     #[must_use]
     pub fn with_llm_capture(mut self, enabled: bool) -> Self {
         self.llm_capture = enabled;
+        self
+    }
+
+    /// Задать режим размещения инсталляции.
+    #[must_use]
+    pub fn with_tenancy(mut self, mode: TenancyMode) -> Self {
+        self.tenancy = mode;
         self
     }
 
@@ -508,6 +524,7 @@ impl Bot {
             banner: None,
             placement: Placement::Visible,
             llm_capture: self.llm_capture,
+            tenancy: self.tenancy,
             audit: self.audit.as_ref(),
         };
 

@@ -85,7 +85,9 @@ fn llm_logs_do_not_contain_the_source_text() {
         runtime.block_on(async {
             let db = db().await;
             let id = next_telegram_id();
-            let handler = Bot::new("tasklerqbot").with_llm_capture(true);
+            let handler = Bot::new("tasklerqbot")
+                .with_llm_capture(true)
+                .with_tenancy(tasklerq::config::TenancyMode::Multi);
             let ai = Arc::new(FailingAi {
                 calls: AtomicUsize::new(0),
             });

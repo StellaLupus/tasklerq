@@ -6,13 +6,23 @@ use uuid::Uuid;
 
 use serde_json::json;
 
+use crate::config::TenancyMode;
 use crate::domain::error::DomainError;
 use crate::domain::identity::{AuditEventType, NewMember, Onboarded};
-use crate::domain::models::{Actor, Household, List, ListKind, User, UserRole};
+use crate::domain::models::{Actor, ActorType, Household, List, ListKind, User, UserRole};
 use crate::domain::settings::validate_timezone;
 use crate::domain::validation::normalize_text;
 
 use super::{audit, users};
+
+/// Класс блокировки инсталляции в двухкомпонентном пространстве ключей.
+///
+/// Двухкомпонентная форма `pg_advisory_xact_lock(int4, int4)` не пересекается
+/// с однокомпонентными bigint-ключами: `lock_telegram_user` берёт ключ, равный
+/// Telegram ID, а доставка — свой ключ получателя.
+const INSTALLATION_LOCK_CLASS: i32 = 0x544C_5251; // "TLRQ"
+/// Объект блокировки: создание household на инсталляции.
+const INSTALLATION_LOCK_OBJECT: i32 = 0x494E_5354; // "INST"
 
 /// Данные владельца при создании household.
 #[derive(Debug, Clone)]
@@ -23,47 +33,74 @@ pub struct NewOwner {
     pub timezone: Option<String>,
 }
 
-/// Создать household без владельца: два списка по умолчанию.
-///
-/// Владельца добавляет администратор (`tasklerq admin user add --role owner`).
-pub async fn create_empty(
-    conn: &mut PgConnection,
-    name: &str,
-    timezone: &str,
-    actor: &Actor,
-    now: DateTime<Utc>,
-) -> Result<Household, DomainError> {
-    let household = insert_household(conn, name, timezone, now).await?;
-
-    audit::record(
-        conn,
-        Some(household.id),
-        actor,
-        AuditEventType::HouseholdCreated,
-        json!({"household_name": household.name, "timezone": household.timezone}),
-        now,
-    )
-    .await?;
-
-    Ok(household)
+/// Данные нового household.
+#[derive(Debug, Clone)]
+pub struct NewHousehold {
+    /// Название.
+    pub name: String,
+    /// Часовой пояс IANA.
+    pub timezone: String,
+    /// Владелец; без него household создаёт администратор и добавляет владельца
+    /// отдельной командой.
+    pub owner: Option<NewOwner>,
 }
 
-/// Создать household, владельца и два списка по умолчанию.
+/// Создать household, два списка по умолчанию и (если указан) владельца.
 ///
-/// Единственная точка входа снаружи — [`onboard`]: она держит блокировку
-/// Telegram ID и не создаёт второй household для того же человека.
-async fn create_with_owner(
+/// Единственная публичная точка создания вместе с [`onboard`]. Порядок
+/// блокировок: сначала Telegram ID владельца, затем installation. В режиме
+/// [`TenancyMode::Single`] активный household может быть только один; проверка
+/// под advisory-блокировкой не даёт двум одновременным запросам создать два.
+pub async fn create(
     conn: &mut PgConnection,
-    name: &str,
-    timezone: &str,
-    owner: NewOwner,
+    mode: TenancyMode,
+    new: NewHousehold,
+    actor: &Actor,
     now: DateTime<Utc>,
-) -> Result<(Household, User), DomainError> {
-    if let Some(user_timezone) = owner.timezone.as_deref() {
+) -> Result<(Household, Option<User>), DomainError> {
+    if let Some(owner) = &new.owner {
+        users::lock_telegram_user(conn, owner.member.telegram_user_id).await?;
+    }
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        .bind(INSTALLATION_LOCK_CLASS)
+        .bind(INSTALLATION_LOCK_OBJECT)
+        .execute(&mut *conn)
+        .await?;
+
+    if mode == TenancyMode::Single {
+        let active: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM households WHERE deleted_at IS NULL")
+                .fetch_one(&mut *conn)
+                .await?;
+        if active >= 1 {
+            return Err(DomainError::conflict_with(
+                "a household already exists; only one is allowed in single mode",
+                json!({"reason": "household_exists"}),
+            ));
+        }
+    }
+
+    if let Some(owner) = &new.owner
+        && let Some(user_timezone) = owner.timezone.as_deref()
+    {
         validate_timezone(user_timezone)?;
     }
 
-    let household = insert_household(conn, name, timezone, now).await?;
+    let household = insert_household(conn, &new.name, &new.timezone, now).await?;
+
+    let Some(owner) = new.owner else {
+        audit::record(
+            conn,
+            Some(household.id),
+            actor,
+            AuditEventType::HouseholdCreated,
+            json!({"household_name": household.name, "timezone": household.timezone}),
+            now,
+        )
+        .await?;
+        return Ok((household, None));
+    };
+
     let user = users::insert(
         conn,
         household.id,
@@ -88,7 +125,7 @@ async fn create_with_owner(
     )
     .await?;
 
-    Ok((household, user))
+    Ok((household, Some(user)))
 }
 
 /// Вставить household и два списка по умолчанию.
@@ -124,8 +161,13 @@ async fn insert_household(
 /// Шаг идемпотентен: если у Telegram ID уже есть активная запись (повтор
 /// подтверждения или владелец, добавленный администратором), возвращается
 /// существующий household и второй не создаётся. Вызывать внутри транзакции.
+///
+/// Идемпотентность по Telegram ID важнее режима: повторный шаг возвращает
+/// существующий household даже в [`TenancyMode::Single`], когда household уже
+/// есть. Для нового ID создание идёт через [`create`].
 pub async fn onboard(
     conn: &mut PgConnection,
+    mode: TenancyMode,
     name: &str,
     timezone: &str,
     owner: NewOwner,
@@ -142,10 +184,28 @@ pub async fn onboard(
         });
     }
 
-    let (household, user) = create_with_owner(conn, name, timezone, owner, now).await?;
+    // `create` повторно берёт блокировку того же Telegram ID. Повторный
+    // `pg_advisory_xact_lock` в той же транзакции безопасен: блокировка
+    // реентерабельна и освобождается только с концом транзакции. Порядок
+    // «Telegram ID → installation» при этом сохраняется, взаимоблокировки с
+    // `user add` нет. Актор для аудита здесь не важен: при наличии владельца
+    // `create` пишет событие от его имени.
+    let (household, user) = create(
+        conn,
+        mode,
+        NewHousehold {
+            name: name.to_owned(),
+            timezone: timezone.to_owned(),
+            owner: Some(owner),
+        },
+        &Actor::system(ActorType::System),
+        now,
+    )
+    .await?;
+
     Ok(Onboarded {
         household,
-        user,
+        user: user.expect("a household created with an owner contains the owner"),
         created: true,
     })
 }

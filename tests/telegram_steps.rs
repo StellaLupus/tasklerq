@@ -7,6 +7,7 @@ use serde_json::json;
 use sqlx::PgConnection;
 use support::telegram::Harness;
 use support::{create_household, db, next_telegram_id};
+use tasklerq::config::TenancyMode;
 use tasklerq::storage::repositories::{households, users};
 use tasklerq::telegram::bot::{Ctx, Fail};
 use tasklerq::telegram::outbox::{self, Outgoing, Placement};
@@ -31,6 +32,7 @@ fn ctx(conn: &mut PgConnection, chat: i64) -> Ctx<'_> {
         banner: None,
         placement: Placement::Visible,
         llm_capture: false,
+        tenancy: TenancyMode::Multi,
         audit: None,
     }
 }

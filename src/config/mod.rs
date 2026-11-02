@@ -255,6 +255,16 @@ pub struct TenancyConfig {
     pub bootstrap_owner: Option<i64>,
 }
 
+impl TenancyConfig {
+    /// Загрузить только режим размещения из окружения.
+    ///
+    /// Нужно административным командам, которым не требуются Telegram, LLM и
+    /// остальные параметры сервиса.
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Config::tenancy_config(&EnvSource::from_process())
+    }
+}
+
 /// Параметры внешнего capture.
 #[derive(Clone, Copy, Debug)]
 pub struct CaptureConfig {
