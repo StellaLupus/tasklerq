@@ -9,9 +9,9 @@
 - **Единая таблица `items`.** Задачи, покупки и чек-листы имеют общий жизненный
   цикл; различия — в `lists.kind` и nullable-полях.
 - **UUIDv7.** Сортировка по времени, безопасные идентификаторы в URL.
-- **Мягкое удаление.** Элементы скрываются и могут быть восстановлены в
-  течение 30 дней; списки и household после мягкого удаления физически
-  удаляются retention через 30 дней.
+- **Мягкое удаление.** Элементы скрываются; вернуть удалённое можно только
+  отменой (undo) в течение 10 минут, отдельного восстановления нет. Через
+  30 дней retention удаляет данные физически; списки и household — так же.
 - **Версии.** Каждое изменение элемента увеличивает `version`; `PATCH` требует
   `version`, `complete`/`reopen` принимают её опционально, устаревшая версия
   отклоняется (`409`).
@@ -277,7 +277,7 @@ household.
 | `request_hash` | `text` | SHA-256 канонического тела запроса; тот же ключ с другим хешем — `422`. |
 | `raw_text` | `text` | Исходный текст, до 2000. |
 | `parsed` | `jsonb` | Разобранная структура, включая невалидные элементы до подтверждения. |
-| `status` | `draft_status` | `pending`/`applied`/`cancelled`/`expired`/`rejected`. |
+| `status` | `draft_status` | `pending`/`applied`/`cancelled`/`expired`; `rejected` зарезервирован в enum и пока не выставляется. |
 | `fallback` | `boolean` | TRUE, если создано из исходного текста без LLM. |
 | `prompt_version` | `text` | Например, `capture-v3`. |
 | `telegram_message_id` | `bigint` | NULL. |
@@ -368,7 +368,7 @@ household, созданные через `tasklerq admin`, попадают в �
 | `actor_type` | `user`, `system`, `home_assistant`, `voice` |
 | `event_type` | `created`, `updated`, `completed`, `reopened`, `deleted`, `restored`, `assigned`, `unassigned`, `recurrence_changed`, `subtask_completed`, `subtask_reopened` |
 | `update_status` | `pending`, `processed`, `dead` |
-| `draft_status` | `pending`, `applied`, `cancelled`, `expired`, `rejected` |
+| `draft_status` | `pending`, `applied`, `cancelled`, `expired`; `rejected` зарезервирован |
 | `capture_source` | `telegram`, `ha_voice`, `ha_automation`, `api`, `shortcut` |
 | `capture_mode` | `auto`, `draft` |
 | `item_source` | `telegram`, `ha_todo`, `ha_voice`, `ha_automation`, `api`, `import` |
@@ -420,11 +420,13 @@ household, созданные через `tasklerq admin`, попадают в �
     │ delete              │ delete
     ▼                     ▼
  deleted ◀────────────── deleted
-    │ restore             │ restore
+    │ undo (10 мин)       │ undo (10 мин)
     └────────▶ open       └────────▶ done
 ```
 
-Мягкое удаление сохраняет прежний статус; восстановление возвращает его.
+Мягкое удаление сохраняет прежний статус; отмена удаления возвращает его.
+Отдельного восстановления нет: удаление отменяется только через undo в
+течение 10 минут, после 30 дней retention удаляет запись физически.
 Повторяющаяся задача после завершения остаётся `open` с новым сроком, если
 следующее вхождение существует; иначе становится `done`.
 
@@ -434,11 +436,12 @@ household, созданные через `tasklerq admin`, попадают в �
 pending ──confirm──▶ applied
    │
    ├──cancel──▶ cancelled
-   ├──ttl─────▶ expired
-   └──reject──▶ rejected
+   └──ttl─────▶ expired
 ```
 
-`applied`, `cancelled`, `expired`, `rejected` — терминальные.
+`applied`, `cancelled`, `expired` — терминальные. Значение `rejected` в enum
+`draft_status` зарезервировано и пока нигде не выставляется: отказ разбора
+(`status=rejected` в ответе capture) не создаёт черновик.
 
 ### Очередь обновлений
 
@@ -578,8 +581,8 @@ anchor:    date — исходная дата серии
 | `invites` (used, revoked, expired) | 365 дней | retention job. |
 | `audit_events` | 365 дней | retention job. |
 
-Purge удаляет связанные подзадачи, теги, события и черновики. Восстановление
-после истечения срока невозможно.
+Purge удаляет связанные подзадачи, теги, события и черновики. Отменить
+удаление после истечения срока нельзя: данные удалены физически.
 
 ## 11. Транзакции
 
