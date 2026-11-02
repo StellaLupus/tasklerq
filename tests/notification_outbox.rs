@@ -322,6 +322,7 @@ async fn repeated_processing_after_success_keeps_one_message_and_the_same_id() {
         &Outgoing::Message {
             html: "<p>дубликат</p>".into(),
             rich: true,
+            delete_after: None,
         },
         Some(&key),
         rig.now,

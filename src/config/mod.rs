@@ -100,6 +100,29 @@ impl TelegramMode {
     }
 }
 
+/// Режим размещения инсталляции.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TenancyMode {
+    /// Один household на инсталляцию.
+    Single,
+    /// Несколько household; онбординг в боте доступен каждому.
+    Multi,
+}
+
+impl TenancyMode {
+    fn parse(raw: &str) -> Result<Self, ConfigError> {
+        match raw {
+            "single" => Ok(Self::Single),
+            "multi" => Ok(Self::Multi),
+            _ => Err(ConfigError::invalid(
+                "TENANCY_MODE",
+                "expected `single` or `multi`",
+            )),
+        }
+    }
+}
+
 /// Секретное значение: `Debug` и `Display` всегда скрывают содержимое.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SecretString(String);
@@ -223,6 +246,25 @@ pub struct TelegramConfig {
     pub bot_username: String,
 }
 
+/// Параметры режима размещения.
+#[derive(Clone, Copy, Debug)]
+pub struct TenancyConfig {
+    /// Режим: `single` или `multi`.
+    pub mode: TenancyMode,
+    /// Telegram ID явно заданного первого владельца.
+    pub bootstrap_owner: Option<i64>,
+}
+
+impl TenancyConfig {
+    /// Загрузить только режим размещения из окружения.
+    ///
+    /// Нужно административным командам, которым не требуются Telegram, LLM и
+    /// остальные параметры сервиса.
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Config::tenancy_config(&EnvSource::from_process())
+    }
+}
+
 /// Параметры внешнего capture.
 #[derive(Clone, Copy, Debug)]
 pub struct CaptureConfig {
@@ -304,6 +346,8 @@ pub struct Config {
     pub database: DatabaseConfig,
     /// Telegram.
     pub telegram: TelegramConfig,
+    /// Режим размещения.
+    pub tenancy: TenancyConfig,
     /// Внешний capture.
     pub capture: CaptureConfig,
     /// LLM-capture.
@@ -354,6 +398,8 @@ impl Config {
         let telegram_mode = TelegramMode::parse(source.get("TELEGRAM_MODE").unwrap_or("webhook"))?;
         let telegram = Self::telegram_config(source, telegram_mode, environment)?;
 
+        let tenancy = Self::tenancy_config(source)?;
+
         let capture = CaptureConfig {
             enabled: source.bool("CAPTURE_API_ENABLED", true)?,
             voice_timeout_ms: source.u32("CAPTURE_VOICE_TIMEOUT_MS", 8_000, 1_000, 60_000)?,
@@ -388,6 +434,7 @@ impl Config {
             public_base_url,
             database,
             telegram,
+            tenancy,
             capture,
             llm,
             queue,
@@ -468,6 +515,31 @@ impl Config {
             webhook_url,
             api_base_url,
             bot_username,
+        })
+    }
+
+    fn tenancy_config(source: &EnvSource) -> Result<TenancyConfig, ConfigError> {
+        let mode = TenancyMode::parse(source.get("TENANCY_MODE").unwrap_or("single"))?;
+        let bootstrap_owner = match source.get("BOOTSTRAP_OWNER_TELEGRAM_ID") {
+            None => None,
+            Some(raw) => {
+                let value = raw
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| {
+                        ConfigError::invalid(
+                            "BOOTSTRAP_OWNER_TELEGRAM_ID",
+                            "expected a positive integer",
+                        )
+                    })?;
+                Some(value)
+            }
+        };
+
+        Ok(TenancyConfig {
+            mode,
+            bootstrap_owner,
         })
     }
 

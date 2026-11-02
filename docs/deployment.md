@@ -300,6 +300,8 @@ curl -sS -X POST \
 | `TELEGRAM_BOT_USERNAME` | нет | `tasklerqbot` | Имя бота без `@` для ссылок-приглашений. |
 | `TELEGRAM_API_BASE_URL` | нет | `https://api.telegram.org` | Служебный базовый адрес Bot API; вне `ENV=development` допускается только `https`. Подменяется на mock-сервер в тестах. |
 | `TELEGRAM_MODE` | нет | `webhook` | `webhook`/`polling` (dev)/`disabled` (headless). |
+| `TENANCY_MODE` | нет | `single` | `single` (по умолчанию) — один household на инсталляцию; `multi` — несколько. |
+| `BOOTSTRAP_OWNER_TELEGRAM_ID` | нет | не задано | Положительный Telegram ID первого владельца. При включённом Telegram рекомендуется задать: иначе первым владельцем станет первый написавший боту. |
 | `CAPTURE_API_ENABLED` | нет | `true` | Включить `POST /api/v1/capture`. |
 | `CAPTURE_VOICE_TIMEOUT_MS` | нет | `8000` | Таймаут LLM для `source=ha_voice`. |
 | `CAPTURE_VOICE_FALLBACK_RAW` | нет | `true` | Создавать позицию из текста при сбое LLM, таймауте, исчерпанной квоте или открытом предохранителе. Действует на весь внешний `auto`, не только на `ha_voice`; в `draft` fallback не применяется. |
@@ -518,25 +520,47 @@ sudo /usr/local/bin/docker compose up -d tasklerq
 2. Заполните `.env`.
 3. Запустите Tasklerq.
 4. Проверьте `/health/ready` на `http://127.0.0.1:18080`.
-5. Откройте бота, отправьте `/start`, создайте household: токены API
-   принадлежат household, поэтому он должен существовать до выдачи токена. Без
-   Telegram (`TELEGRAM_MODE=disabled`) или чтобы не проходить онбординг,
-   создайте его командой
-   `tasklerq admin household create --name "Семья" --timezone Europe/Moscow` и
-   добавьте владельца по Telegram ID:
-   `tasklerq admin user add --telegram-id <ваш_id> --role owner --name "Имя"`.
-   Пока вы не нажали `/start`, бот не сможет написать вам первым.
-6. Создайте API-токен для HA:
+5. Откройте бота, отправьте `/start` и создайте household: токены API
+   принадлежат household, поэтому он должен существовать до выдачи токена.
+   Рекомендуется заранее задать в `.env` `BOOTSTRAP_OWNER_TELEGRAM_ID` — ваш
+   Telegram ID: тогда онбординг доступен только вам. Без этой переменной
+   первым владельцем станет первый написавший боту. Пока вы не нажали
+   `/start`, бот не сможет написать вам первым.
+
+   Для headless-режима (`TELEGRAM_MODE=disabled`) или bootstrap без бота
+   создайте household и владельца одной командой:
+
+   ```bash
+   tasklerq admin household create \
+     --name "Семья" \
+     --timezone Europe/Moscow \
+     --owner-telegram-id <ваш_id> \
+     --owner-name "Имя"
+   ```
+
+   Без `--owner-telegram-id` household создаётся без владельца. Добавить
+   участников позже можно командой
+   `tasklerq admin user add --telegram-id <id> --role member --name "Имя"`.
+6. Выпустите API-токен для HA. Основной путь — в боте:
+   **Настройки → 🔌 Интеграции → ➕ Выпустить токен для HA**. Токен придёт
+   отдельным сообщением под спойлером: скопируйте его в HA и нажмите
+   **Я сохранил**; если кнопку не нажимали, сообщение удалится само через час.
+
+   Для headless-режима (`TELEGRAM_MODE=disabled`) и автоматизации токен
+   выпускается через CLI:
 
 ```bash
 sudo /usr/local/bin/docker compose exec tasklerq \
   tasklerq admin token create \
   --name "Home Assistant" \
   --scopes ha:read,ha:write,capture:write
+# в режиме multi добавьте: --household <id>
 ```
 
-`capture:write` нужен сервису `tasklerq.capture` и голосовому сценарию Assist.
-Сохраните выданный токен в переменную `TASKLERQ_TOKEN` — он понадобится ниже.
+В режиме `multi` `--household` обязателен; в `single` его можно опустить, если
+household единственный. `capture:write` нужен сервису `tasklerq.capture` и
+голосовому сценарию Assist. Сохраните выданный токен в переменную
+`TASKLERQ_TOKEN` — он понадобится ниже.
 
 7. Установите custom component в HA (см. [`home-assistant.md`](home-assistant.md)).
 8. Настройте интеграцию: URL `http://127.0.0.1:18080`, токен.
@@ -563,15 +587,19 @@ curl -fsS -X POST http://127.0.0.1:18080/api/v1/capture \
 ### 9.1. Административный CLI
 
 Команды `tasklerq admin` читают то же окружение, что сервис, и выводят ошибки
-без секретов. `--household` можно опустить, если household единственный.
+без секретов. В режиме `single` `--household` можно опустить, если household
+единственный. В режиме `multi` `--household` обязателен для всех команд,
+которые выбирают household (`token create`, `token list`, `user add`,
+`export`), даже если household один.
 
 | Команда | Назначение |
 | --- | --- |
-| `tasklerq admin token create --name "Home Assistant" --scopes ha:read,ha:write` | Выпустить токен. Значение показывается один раз, в базе хранится только хеш. `--scopes`: `ha:read`, `ha:write`, `capture:write`, `metrics:read`. `--expires-in-days N` задаёт срок. |
+| `tasklerq admin token create [--household <id>] --name "Home Assistant" --scopes ha:read,ha:write [--expires-in-days N]` | Выпустить токен. Значение показывается один раз, в базе хранится только хеш. `--scopes`: `ha:read`, `ha:write`, `capture:write`, `metrics:read`. `--expires-in-days N` задаёт срок. |
 | `tasklerq admin token list [--household <id>]` | id, префикс, состояние, scopes и название без секретов. |
 | `tasklerq admin token revoke <id> [--yes]` | Отозвать токен. Опасная команда: без `--yes` спрашивает `y/N` в терминале; без TTY завершается ошибкой и токен не меняет. |
-| `tasklerq admin household create --name "Семья" --timezone Europe/Moscow` | Создать household и списки «Задачи»/«Покупки». |
-| `tasklerq admin household list` | id, название, часовой пояс, число участников и дата создания. |
+| `tasklerq admin household create --name "Семья" --timezone Europe/Moscow [--owner-telegram-id <id> [--owner-name "Имя"]]` | Создать household, списки «Задачи»/«Покупки» и, если указан `--owner-telegram-id`, владельца одной транзакцией. Без владельца печатает подсказку `admin user add`. В режиме `single` второй активный household отклоняется с `409`. |
+| `tasklerq admin household list` | id, название, часовой пояс, Telegram ID владельца или `-`, число участников, открытых задач, активных токенов и дата создания. |
+| `tasklerq admin household delete --household <id> [--yes]` | Мягко удалить household: household и активные участники помечаются удалёнными, токены и приглашения отзываются. Без `--yes` просит ввести название household; без TTY завершается ошибкой и ничего не меняет. Уведомления участникам не отправляются. |
 | `tasklerq admin user add --telegram-id <id> --role owner\|member [--name "Имя"] [--household <id>]` | Добавить участника, записать `member_joined`, отклонить занятый Telegram ID и второго `owner`. |
 | `tasklerq admin queue stats` | Количество заданий `telegram_updates`, `outbox`, `capture_jobs` и `notification_deliveries` по статусам, возраст самого старого готового обновления. Содержимое сообщений не печатается. |
 | `tasklerq admin webhook info` | `getWebhookInfo`: URL без учётных данных, `pending_update_count`, последняя ошибка, `max_connections`, `ip_address`. Токен бота не выводится. |
@@ -753,6 +781,13 @@ curl -fsS http://127.0.0.1:18080/health/ready
 - `route`, `status`, `duration_ms`;
 - `error_code`;
 - `version`.
+
+При деградации (в режиме `single` активных household больше одного)
+`/health/ready` продолжает отвечать `200`, но в ответе появляется поле
+`"warnings": ["multiple_households"]`. Когда предупреждений нет, поле
+`warnings` отсутствует; `/health/live` его не выдаёт. В том же состоянии при
+старте сервис пишет в лог `error` с числом активных household — без названий и
+идентификаторов.
 
 Метрики — `GET /metrics` в формате Prometheus exposition 0.0.4. Эндпоинт не
 публичный: нужен Bearer-токен со scope `metrics:read` (токен в query не
@@ -1040,10 +1075,12 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 
 **API-токен HA:**
 
-1. Создайте новый токен.
+1. Выпустите новый токен в **Настройки → 🔌 Интеграции → ➕ Выпустить токен
+   для HA** (или `tasklerq admin token create`).
 2. Обновите токен в интеграции HA (reauth).
 3. Убедитесь, что сущности доступны.
-4. Отзовите старый токен.
+4. Отзовите старый токен в **Настройки → 🔌 Интеграции** (кнопка
+   **🚫 Отозвать «…»**) или командой `tasklerq admin token revoke <id> --yes`.
 
 **Токен бота:**
 
@@ -1103,6 +1140,46 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 4. `sudo /usr/local/bin/docker compose up -d tasklerq`.
 5. Проверить `/health/ready`, логи, задачи и HA.
 6. Если схема несовместима — restore backup.
+
+### 16.11. Два household после обновления
+
+Возникает после обновления инсталляции, где в режиме `single` уже было два
+активных household, либо после переключения `single → multi → single`. Сервис
+продолжает работать.
+
+Симптомы:
+
+- при старте в логе есть `error` с числом активных household (без названий и
+  идентификаторов);
+- `/health/ready` отвечает `200`, но содержит
+  `"warnings": ["multiple_households"]`;
+- новые пользователи в боте видят «Инсталляция требует вмешательства
+  администратора».
+
+1. `tasklerq admin household list` — найдите household с владельцем и
+   задачами; лишний обычно остался без владельца или пустым.
+2. Выпустите токен для нужного household — в боте через
+   **Настройки → 🔌 Интеграции → ➕ Выпустить токен для HA** (если вы владелец
+   этого household) или через CLI:
+
+   ```bash
+   tasklerq admin token create --household <id> \
+     --name "Home Assistant" --scopes ha:read,ha:write,capture:write
+   ```
+
+3. Переподключите HA с новым токеном (reauth).
+4. Удалите лишний household:
+   `tasklerq admin household delete --household <лишний> --yes`. Без `--yes`
+   команда попросит ввести название household.
+5. Удаление мягкое: household и участники помечаются удалёнными, токены и
+   приглашения отзываются сразу. Физически данные удалит retention.
+   Восстановление — вручную до истечения retention
+   (`UPDATE households SET deleted_at = NULL`, то же для участников).
+   Отозванные токены не восстанавливаются, выпустите новые.
+
+После `household delete` предупреждение в `/health/ready` исчезает без
+перезапуска: число активных household читается при каждом запросе. Error-лог
+относится только к запуску — при следующем перезапуске его уже не будет.
 
 ## 17. Локальная разработка
 

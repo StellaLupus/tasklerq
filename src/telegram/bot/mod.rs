@@ -21,6 +21,7 @@ use chrono_tz::Tz;
 use futures_util::future::BoxFuture;
 use sqlx::PgConnection;
 
+use crate::config::{TenancyConfig, TenancyMode};
 use crate::domain::error::DomainError;
 use crate::domain::identity::{MembershipChange, MembershipNotice, NoticeKind};
 use crate::domain::models::{Actor, Household, User};
@@ -74,6 +75,8 @@ pub struct Bot {
     pub username: String,
     /// Свободный текст уходит на разбор в LLM, а не в быстрое добавление.
     pub llm_capture: bool,
+    /// Политика размещения инсталляции; влияет на первый контакт.
+    pub tenancy: TenancyConfig,
     /// Журнал событий безопасности, которые откатываются вместе с шагом.
     audit: Option<Audit>,
 }
@@ -144,6 +147,8 @@ pub struct Ctx<'a> {
     pub placement: Placement,
     /// Свободный текст уходит на разбор в LLM.
     pub llm_capture: bool,
+    /// Политика размещения инсталляции.
+    pub tenancy: TenancyConfig,
     /// Журнал событий безопасности; `None` в тестах без пула.
     pub audit: Option<&'a Audit>,
 }
@@ -254,6 +259,7 @@ impl Ctx<'_> {
             &Outgoing::Message {
                 html: rich::escape(text),
                 rich: false,
+                delete_after: None,
             },
             None,
             self.now,
@@ -269,6 +275,16 @@ impl Ctx<'_> {
             None => Screen::Menu,
         };
         if self.user.is_none() {
+            return forms::start_onboarding(self).await;
+        }
+        // Пользователь, которого администратор только что назначил владельцем,
+        // не должен видеть сохранённый экран первого контакта.
+        if matches!(screen, Screen::FirstContact(_)) {
+            return self.present(Screen::Menu).await;
+        }
+        // Онбординг мог остаться открытым, когда отправитель уже стал
+        // участником: `start_onboarding` закроет форму и покажет меню.
+        if matches!(screen, Screen::Form) && forms::onboarding_is_open(self).await? {
             return forms::start_onboarding(self).await;
         }
         self.present(screen).await
@@ -306,6 +322,7 @@ impl Ctx<'_> {
                 &Outgoing::Message {
                     html: rich::escape(&text),
                     rich: false,
+                    delete_after: None,
                 },
                 None,
                 self.now,
@@ -347,11 +364,17 @@ pub async fn issue_and_render(
 }
 
 impl Bot {
-    /// Создать бота.
+    /// Создать бота. По умолчанию используется боевой режим `single`;
+    /// сервис выставляет его явно из конфигурации, тесты — через
+    /// [`Bot::with_tenancy`] или [`Bot::with_tenancy_config`].
     pub fn new(username: impl Into<String>) -> Self {
         Self {
             username: username.into(),
             llm_capture: false,
+            tenancy: TenancyConfig {
+                mode: TenancyMode::Single,
+                bootstrap_owner: None,
+            },
             audit: None,
         }
     }
@@ -430,6 +453,7 @@ impl Bot {
             banner,
             placement: Placement::Visible,
             llm_capture: self.llm_capture,
+            tenancy: self.tenancy,
             audit: self.audit.as_ref(),
         }
     }
@@ -438,6 +462,20 @@ impl Bot {
     #[must_use]
     pub fn with_llm_capture(mut self, enabled: bool) -> Self {
         self.llm_capture = enabled;
+        self
+    }
+
+    /// Задать режим размещения инсталляции, сохранив `bootstrap_owner`.
+    #[must_use]
+    pub fn with_tenancy(mut self, mode: TenancyMode) -> Self {
+        self.tenancy.mode = mode;
+        self
+    }
+
+    /// Задать полную политику размещения из конфигурации.
+    #[must_use]
+    pub fn with_tenancy_config(mut self, config: TenancyConfig) -> Self {
+        self.tenancy = config;
         self
     }
 
@@ -508,6 +546,7 @@ impl Bot {
             banner: None,
             placement: Placement::Visible,
             llm_capture: self.llm_capture,
+            tenancy: self.tenancy,
             audit: self.audit.as_ref(),
         };
 
@@ -870,6 +909,9 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
         Action::SetLead { minutes } => settings::set_lead(ctx, minutes).await,
         Action::InviteCreate => settings::invite_create(ctx).await,
         Action::InviteRevoke { invite_id } => settings::invite_revoke(ctx, invite_id).await,
+        Action::RevokeToken { token_id } => settings::revoke_token(ctx, token_id).await,
+        Action::IssueHaToken => settings::issue_ha_token(ctx).await,
+        Action::DismissSecret => settings::dismiss_secret(ctx, message_id).await,
         Action::MemberRemoveAsk { user_id } => settings::member_remove_ask(ctx, user_id).await,
         Action::MemberRemove { user_id } => settings::member_remove(ctx, user_id).await,
         Action::TransferAsk { user_id } => settings::transfer_ask(ctx, user_id).await,

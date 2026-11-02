@@ -78,6 +78,7 @@ async fn deliver_message(bot: &mut Harness, html: &str) {
         &Outgoing::Message {
             html: html.to_owned(),
             rich: true,
+            delete_after: None,
         },
         None,
         bot.now,
@@ -718,7 +719,9 @@ async fn each_kind_of_incoming_text_is_deleted() {
 
     // Текст на разбор.
     let id = next_telegram_id();
-    let handler = Bot::new("tasklerqbot").with_llm_capture(true);
+    let handler = Bot::new("tasklerqbot")
+        .with_llm_capture(true)
+        .with_tenancy(tasklerq::config::TenancyMode::Multi);
     let mut parser = Harness::with_handler(&db.pool, id, Arc::new(handler), FakeTelegram::new());
     parser.text("/start").await;
     parser.text("Семья").await;

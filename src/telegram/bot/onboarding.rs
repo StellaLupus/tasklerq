@@ -3,13 +3,15 @@
 use sqlx::Acquire;
 
 use crate::domain::error::DomainError;
+use crate::domain::first_contact::{FirstContact, classify};
 use crate::domain::identity::NewMember;
 use crate::domain::settings::validate_timezone;
 use crate::storage::repositories::households::{self, NewOwner};
 use crate::storage::repositories::invites;
-use crate::telegram::rich::button;
+use crate::telegram::rich::{Span, button};
+use crate::telegram::ru;
 
-use super::model::{Action, FormAct, Screen, Ui};
+use super::model::{Action, FirstContactScreen, FormAct, Screen, Ui};
 use super::{Ctx, Fail, display_timezone, forms};
 
 const MAX_NAME: usize = 100;
@@ -108,6 +110,26 @@ pub fn view(name: Option<&str>) -> Ui {
     }
 }
 
+/// Информационный экран первого контакта без формы онбординга.
+pub fn first_contact(contact: &FirstContactScreen) -> Ui {
+    match contact {
+        FirstContactScreen::AskInvite => Ui::new()
+            .heading(ru::PRIVATE_SPACE_TITLE)
+            .text(ru::ASK_INVITE),
+        FirstContactScreen::AdminCommand(telegram_id) => Ui::new()
+            .heading(ru::NOT_CONFIGURED_TITLE)
+            .text(ru::ADMIN_COMMAND_INTRO)
+            .spans(vec![Span::Code(ru::owner_command(*telegram_id))])
+            .text(ru::OWNER_NOT_ASSIGNED),
+        FirstContactScreen::NotConfigured => Ui::new()
+            .heading(ru::NOT_CONFIGURED_TITLE)
+            .text(ru::NOT_CONFIGURED),
+        FirstContactScreen::NeedsAdmin => Ui::new()
+            .heading(ru::NEEDS_ADMIN_TITLE)
+            .text(ru::NEEDS_ADMIN),
+    }
+}
+
 fn zone(label: &str, zone: &str) -> crate::telegram::rich::Button<Action> {
     button(
         label,
@@ -119,6 +141,9 @@ fn zone(label: &str, zone: &str) -> crate::telegram::rich::Button<Action> {
 
 /// Текст при активном онбординге.
 pub async fn on_text(ctx: &mut Ctx<'_>, name: Option<String>, text: &str) -> Result<(), Fail> {
+    if ctx.user.is_some() {
+        return forms::start_onboarding(ctx).await;
+    }
     match name {
         None => {
             let trimmed = text.trim();
@@ -141,6 +166,9 @@ pub async fn on_text(ctx: &mut Ctx<'_>, name: Option<String>, text: &str) -> Res
 
 /// Выбор часового пояса кнопкой.
 pub async fn choose_zone(ctx: &mut Ctx<'_>, zone: &str) -> Result<(), Fail> {
+    if ctx.user.is_some() {
+        return forms::start_onboarding(ctx).await;
+    }
     let name =
         match crate::telegram::views::conversation(&mut *ctx.conn, ctx.chat_id, ctx.now).await? {
             crate::telegram::views::Lookup::Active(conversation) => {
@@ -156,9 +184,37 @@ pub async fn choose_zone(ctx: &mut Ctx<'_>, zone: &str) -> Result<(), Fail> {
 }
 
 async fn create(ctx: &mut Ctx<'_>, name: &str, zone: &str) -> Result<(), Fail> {
+    // Пока форма была открыта, отправителя могли добавить в household.
+    // Онбординг больше не нужен: форма закрывается, показывается меню.
+    if ctx.user.is_some() {
+        return forms::start_onboarding(ctx).await;
+    }
+
+    // Форма могла быть открыта до того, как администратор задал
+    // `BOOTSTRAP_OWNER_TELEGRAM_ID` или появился household. Перед вставкой
+    // классификатор перепроверяется целиком: не-`Onboard` закрывает форму и
+    // показывает экран нового состояния, household не создаётся.
+    let installation = households::installation(&mut *ctx.conn).await?;
+    let contact = classify(
+        ctx.tenancy.mode,
+        ctx.tenancy.bootstrap_owner,
+        ctx.sender.id,
+        installation,
+    );
+    if contact != FirstContact::Onboard {
+        // Тот же путь, что при `household_exists`: `start_onboarding` закроет
+        // форму онбординга и покажет экран по классификатору.
+        return forms::start_onboarding(ctx).await;
+    }
+
     let member = new_member(ctx);
-    let onboarded = households::onboard(
-        &mut *ctx.conn,
+    // Последний шаг может проиграть гонку: household успели создать извне.
+    // Вложенный savepoint (как в `accept_invite`) гасит конфликт, не трогая
+    // savepoint шага `Ctx::in_step`. Состояние перечитывается классификатором.
+    let mut savepoint = ctx.conn.begin().await?;
+    let result = households::onboard(
+        &mut savepoint,
+        ctx.tenancy.mode,
         name,
         zone,
         NewOwner {
@@ -167,7 +223,27 @@ async fn create(ctx: &mut Ctx<'_>, name: &str, zone: &str) -> Result<(), Fail> {
         },
         ctx.now,
     )
-    .await?;
+    .await;
+    let onboarded = match result {
+        Ok(onboarded) => {
+            savepoint.commit().await?;
+            onboarded
+        }
+        Err(error) => {
+            savepoint.rollback().await?;
+            if matches!(
+                &error,
+                DomainError::Conflict { details, .. }
+                    if details.get("reason").and_then(|reason| reason.as_str())
+                        == Some("household_exists")
+            ) {
+                // Форму закроет `start_onboarding`; баннер не нужен: экран сам
+                // объясняет новое состояние инсталляции.
+                return forms::start_onboarding(ctx).await;
+            }
+            return Err(error.into());
+        }
+    };
     forms::finish(ctx).await?;
     ctx.tz = display_timezone(Some(&onboarded.user), Some(&onboarded.household));
     ctx.user = Some(onboarded.user);

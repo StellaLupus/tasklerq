@@ -72,6 +72,22 @@ impl Rig {
         .expect("raw screen")
     }
 
+    /// Поставить строку `message` с произвольным payload (для испорченных
+    /// записей).
+    async fn raw_message(&self, payload: serde_json::Value) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO outbox (chat_id, kind, payload, next_attempt_at, created_at)
+             VALUES ($1, 'message', $2, $3, $3)
+             RETURNING seq",
+        )
+        .bind(self.chat)
+        .bind(payload)
+        .bind(self.now)
+        .fetch_one(&self.pool)
+        .await
+        .expect("raw message")
+    }
+
     /// `placement` последней ожидающей строки экрана.
     async fn pending_placement(&self) -> String {
         sqlx::query_scalar(
@@ -110,6 +126,29 @@ impl Rig {
             &Outgoing::Message {
                 html: html.into(),
                 rich: true,
+                delete_after: None,
+            },
+            key,
+            self.now,
+        )
+        .await
+        .expect("enqueue")
+    }
+
+    async fn message_expiring(
+        &self,
+        html: &str,
+        delete_after: u32,
+        key: Option<&str>,
+    ) -> Option<i64> {
+        let mut conn = self.pool.acquire().await.expect("conn");
+        outbox::enqueue(
+            &mut conn,
+            self.chat,
+            &Outgoing::Message {
+                html: html.into(),
+                rich: true,
+                delete_after: Some(delete_after),
             },
             key,
             self.now,
@@ -119,12 +158,16 @@ impl Rig {
     }
 
     async fn delete(&self, message_id: i64) -> i64 {
+        self.delete_keyed(message_id, None).await
+    }
+
+    async fn delete_keyed(&self, message_id: i64, key: Option<&str>) -> i64 {
         let mut conn = self.pool.acquire().await.expect("conn");
         outbox::enqueue(
             &mut conn,
             self.chat,
             &Outgoing::Delete { message_id },
-            None,
+            key,
             self.now,
         )
         .await
@@ -195,6 +238,33 @@ impl Rig {
         .fetch_one(&self.pool)
         .await
         .expect("row")
+    }
+
+    async fn payload_text(&self, seq: i64) -> String {
+        sqlx::query_scalar("SELECT payload::text FROM outbox WHERE seq = $1")
+            .bind(seq)
+            .fetch_one(&self.pool)
+            .await
+            .expect("payload")
+    }
+
+    /// Строки удаления чата: `(seq, payload, next_attempt_at, dedupe_key)`.
+    async fn delete_rows(&self) -> Vec<(i64, String, DateTime<Utc>, Option<String>)> {
+        sqlx::query_as(
+            "SELECT seq, payload::text, next_attempt_at, dedupe_key FROM outbox
+             WHERE chat_id = $1 AND kind = 'delete'
+             ORDER BY seq",
+        )
+        .bind(self.chat)
+        .fetch_all(&self.pool)
+        .await
+        .expect("delete rows")
+    }
+
+    /// Подвинуть время стенда без прохода воркера.
+    fn advance(&mut self, by: StdDuration) {
+        self.clock += by;
+        self.now += Duration::from_std(by).expect("duration");
     }
 }
 
@@ -562,6 +632,31 @@ async fn screen_with_unknown_placement_is_dead_as_invalid_payload() {
     assert_eq!(
         rig.row(seq).await,
         ("dead".into(), 0, Some("invalid_payload".into()), None)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn message_with_invalid_delete_after_is_dead_as_invalid_payload() {
+    let _dead = DEAD_METRIC.lock().await;
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    let seq = rig
+        .raw_message(serde_json::json!({
+            "html": "<p>секрет</p>",
+            "rich": true,
+            "delete_after": -1
+        }))
+        .await;
+
+    assert_eq!(rig.pass().await, 0);
+    assert_eq!(
+        rig.row(seq).await,
+        ("dead".into(), 0, Some("invalid_payload".into()), None)
+    );
+    assert!(
+        rig.fake.sent().is_empty(),
+        "an invalid delete_after must not send the message: {:?}",
+        rig.fake.calls()
     );
 }
 
@@ -946,5 +1041,238 @@ async fn delete_then_screen_are_delivered_in_two_passes_at_the_same_clock() {
     assert!(
         matches!(&calls[1], Call::SendRich { html, .. } if html == "<p>экран</p>"),
         "{calls:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivered_message_schedules_delete_from_the_delivery_time() {
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    let seq = rig
+        .message_expiring("<p>секрет</p>", 3_600, None)
+        .await
+        .expect("seq");
+
+    // Доставили через 10 минут после постановки: отсчёт идёт от доставки.
+    assert_eq!(rig.pass_after(StdDuration::from_secs(600)).await, 1);
+    let delivered_at = rig.now;
+
+    let (status, _, _, message_id) = rig.row(seq).await;
+    let message_id = message_id.expect("message id");
+    assert_eq!(status, "sent");
+    assert_eq!(
+        rig.payload_text(seq).await,
+        r#"{"redacted": true}"#,
+        "the delivered message payload must be wiped"
+    );
+
+    let deletes = rig.delete_rows().await;
+    assert_eq!(deletes.len(), 1, "{deletes:?}");
+    let (delete_seq, payload, next_attempt_at, key) = &deletes[0];
+    assert_eq!(
+        *payload,
+        format!(r#"{{"message_id": {message_id}}}"#),
+        "the delete row must carry only the message id"
+    );
+    assert_eq!(
+        (*next_attempt_at - (delivered_at + Duration::seconds(3_600)))
+            .num_milliseconds()
+            .abs(),
+        0,
+        "the delete must be scheduled from delivery, not from enqueue"
+    );
+    let expected_key = format!("expire:{}:{message_id}", rig.chat);
+    assert_eq!(key.as_deref(), Some(expected_key.as_str()));
+    assert_eq!(rig.row(*delete_seq).await.0, "pending");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scheduled_delete_does_not_hold_the_chat_and_fires_on_time() {
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    rig.message_expiring("<p>секрет</p>", 3_600, None)
+        .await
+        .expect("seq");
+    assert_eq!(rig.pass_after(StdDuration::from_secs(600)).await, 1);
+    let message_id = rig.fake.messages(rig.chat)[0].0;
+    let delete_seq = rig.delete_rows().await[0].0;
+
+    // Следующее сообщение того же чата уходит сразу: отложенная строка
+    // удаления очередь не держит.
+    let next = rig.message("<p>следующее</p>", None).await.expect("seq");
+    assert_eq!(rig.pass_after(SECOND).await, 1);
+    assert_eq!(rig.row(next).await.0, "sent");
+    assert_eq!(rig.row(delete_seq).await.0, "pending");
+
+    // За секунду до срока удаления нет.
+    assert_eq!(rig.pass_after(StdDuration::from_secs(3_598)).await, 0);
+    assert!(
+        !rig.fake
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::Delete { id, .. } if *id == message_id)),
+        "the message must not be deleted before its hour is up"
+    );
+
+    // Ровно через час после доставки — удаление.
+    assert_eq!(rig.pass_after(SECOND).await, 1);
+    assert_eq!(rig.row(delete_seq).await.0, "sent");
+    assert!(
+        rig.fake.calls().iter().any(
+            |call| matches!(call, Call::Delete { chat, id } if *chat == rig.chat && *id == message_id)
+        ),
+        "{:?}",
+        rig.fake.calls()
+    );
+    assert!(
+        rig.fake
+            .messages(rig.chat)
+            .iter()
+            .all(|(id, _)| *id != message_id)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn button_delete_is_not_swallowed_by_expire_and_the_timer_is_message_gone() {
+    let _dead = DEAD_METRIC.lock().await;
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    rig.message_expiring("<p>секрет</p>", 3_600, None)
+        .await
+        .expect("seq");
+    assert_eq!(rig.pass_after(StdDuration::from_secs(600)).await, 1);
+    let message_id = rig.fake.messages(rig.chat)[0].0;
+    let timer = rig.delete_rows().await[0].0;
+
+    // Кнопка «Я сохранил» через минуту: свой ключ, своя строка.
+    rig.advance(StdDuration::from_secs(60));
+    let button = rig
+        .delete_keyed(
+            message_id,
+            Some(&format!("delete:{}:{message_id}", rig.chat)),
+        )
+        .await;
+    assert!(
+        rig.delete_rows().await.len() == 2,
+        "the button delete must not be collapsed into the expire row"
+    );
+    assert_eq!(rig.pass().await, 1);
+    assert_eq!(rig.row(button).await.0, "sent");
+    assert!(rig.fake.messages(rig.chat).is_empty());
+    assert_eq!(rig.row(timer).await.0, "pending");
+
+    // В срок таймер получает от Telegram «сообщения нет» — это успех.
+    rig.fake.reject_deletes(Some(TelegramError::MessageGone));
+    let before = counter(&tasklerq::metrics::render(), "outbox_dead_total");
+    assert_eq!(rig.pass_after(StdDuration::from_secs(3_540)).await, 1);
+    assert_eq!(
+        rig.row(timer).await,
+        ("sent".into(), 0, None, Some(message_id))
+    );
+    let after = counter(&tasklerq::metrics::render(), "outbox_dead_total");
+    assert_eq!(
+        after, before,
+        "MessageGone on the timer delete is a success, not a dead-letter"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn message_rows_without_delete_after_never_schedule_deletion() {
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+
+    // Старая строка, вставленная SQL-ом без поля.
+    let legacy = sqlx::query_scalar(
+        "INSERT INTO outbox (chat_id, kind, payload, next_attempt_at, created_at)
+         VALUES ($1, 'message', $2, $3, $3)
+         RETURNING seq",
+    )
+    .bind(rig.chat)
+    .bind(serde_json::json!({"html": "<p>старое</p>", "rich": true}))
+    .bind(rig.now)
+    .fetch_one(&db.pool)
+    .await
+    .expect("legacy");
+    let plain = rig.message("<p>обычное</p>", None).await.expect("seq");
+
+    assert_eq!(rig.pass().await, 1);
+    assert_eq!(rig.pass_after(SECOND).await, 1);
+
+    assert_eq!(rig.row(legacy).await.0, "sent");
+    assert_eq!(rig.row(plain).await.0, "sent");
+    assert!(
+        rig.delete_rows().await.is_empty(),
+        "a message without delete_after must not schedule a delete"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn existing_expire_row_is_not_duplicated() {
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    // Первая же отправка подделки получает id 1.
+    let key = format!("expire:{}:1", rig.chat);
+    let run_at = rig.now + Duration::hours(1);
+    let mut conn = rig.pool.acquire().await.expect("conn");
+    let existing = outbox::enqueue_at(
+        &mut conn,
+        rig.chat,
+        &Outgoing::Delete { message_id: 1 },
+        Some(&key),
+        rig.now,
+        run_at,
+    )
+    .await
+    .expect("enqueue")
+    .expect("seq");
+    drop(conn);
+
+    let message = rig
+        .message_expiring("<p>секрет</p>", 3_600, None)
+        .await
+        .expect("seq");
+    assert_eq!(rig.pass().await, 1);
+    assert_eq!(rig.row(message).await.3, Some(1));
+
+    let rows: Vec<(i64, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT seq, next_attempt_at FROM outbox
+         WHERE chat_id = $1 AND kind = 'delete'
+         ORDER BY seq",
+    )
+    .bind(rig.chat)
+    .fetch_all(&db.pool)
+    .await
+    .expect("rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "a conflicting expire key must not add a second row"
+    );
+    assert_eq!(rows[0].0, existing);
+    assert_eq!(
+        (rows[0].1 - run_at).num_milliseconds().abs(),
+        0,
+        "the pre-existing row keeps its schedule"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_delivery_does_not_schedule_deletion() {
+    let _dead = DEAD_METRIC.lock().await;
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    let seq = rig
+        .message_expiring("<p>секрет</p>", 3_600, None)
+        .await
+        .expect("seq");
+    rig.fake
+        .fail_next(TelegramError::Forbidden("blocked".into()));
+
+    assert_eq!(rig.pass().await, 0);
+
+    assert_eq!(rig.row(seq).await.0, "dead");
+    assert!(
+        rig.delete_rows().await.is_empty(),
+        "an undelivered message has no id to delete"
     );
 }

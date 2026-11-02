@@ -109,7 +109,9 @@ async fn stand_with(
     llm_capture: bool,
 ) -> Stand {
     let id = next_telegram_id();
-    let handler = Bot::new("tasklerqbot").with_llm_capture(llm_capture);
+    let handler = Bot::new("tasklerqbot")
+        .with_llm_capture(llm_capture)
+        .with_tenancy(tasklerq::config::TenancyMode::Multi);
     let ai = StubAi::new(answers);
     let mut bot = Harness::with_handler(pool, id, Arc::new(handler.clone()), FakeTelegram::new());
     bot.text("/start").await;

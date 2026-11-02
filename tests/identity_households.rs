@@ -2,15 +2,19 @@
 
 mod support;
 
+use std::sync::Arc;
+
 use chrono::{Duration, Utc};
 use serde_json::json;
 use tasklerq::admin;
 use tasklerq::auth::tokens::hash_token;
+use tasklerq::config::TenancyMode;
 use tasklerq::domain::error::DomainError;
 use tasklerq::domain::identity::{AuditEventType, NewMember, NoticeKind};
 use tasklerq::domain::models::{Actor, ActorType, ListKind, UserRole};
 use tasklerq::storage::repositories::households::{self, NewOwner};
 use tasklerq::storage::repositories::{invites, lists, members};
+use tokio::sync::Barrier;
 use uuid::Uuid;
 
 fn owner(name: &str) -> NewOwner {
@@ -43,9 +47,16 @@ async fn onboarding_creates_household_owner_and_default_lists() {
     let new_owner = owner("Алексей");
     let telegram_id = new_owner.member.telegram_user_id;
 
-    let onboarded = households::onboard(&mut tx, "Семья", "Europe/Moscow", new_owner, Utc::now())
-        .await
-        .expect("onboarding");
+    let onboarded = households::onboard(
+        &mut tx,
+        TenancyMode::Multi,
+        "Семья",
+        "Europe/Moscow",
+        new_owner,
+        Utc::now(),
+    )
+    .await
+    .expect("onboarding");
     assert!(onboarded.created);
     assert_eq!(onboarded.user.role, UserRole::Owner);
     assert_eq!(onboarded.user.telegram_user_id, telegram_id);
@@ -73,6 +84,22 @@ async fn onboarding_creates_household_owner_and_default_lists() {
     .await
     .expect("count");
     assert_eq!(created, 1);
+
+    let (actor_type, actor_id, payload): (String, Option<Uuid>, serde_json::Value) =
+        sqlx::query_as(
+            "SELECT actor_type::text, actor_user_id, payload FROM audit_events
+         WHERE household_id = $1 AND event_type = 'household_created'",
+        )
+        .bind(onboarded.household.id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("household_created event");
+    assert_eq!(
+        actor_type, "user",
+        "the bot onboarding acts as the new owner"
+    );
+    assert_eq!(actor_id, Some(onboarded.user.id));
+    assert_eq!(payload["actor_name"], "Алексей");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -84,6 +111,7 @@ async fn repeated_onboarding_step_returns_the_same_household() {
     let mut tx = db.pool.begin().await.expect("tx");
     let first = households::onboard(
         &mut tx,
+        TenancyMode::Multi,
         "Первая",
         "Europe/Moscow",
         new_owner.clone(),
@@ -94,9 +122,16 @@ async fn repeated_onboarding_step_returns_the_same_household() {
     tx.commit().await.expect("commit");
 
     let mut tx = db.pool.begin().await.expect("tx");
-    let second = households::onboard(&mut tx, "Вторая", "Asia/Omsk", new_owner, Utc::now())
-        .await
-        .expect("second");
+    let second = households::onboard(
+        &mut tx,
+        TenancyMode::Multi,
+        "Вторая",
+        "Asia/Omsk",
+        new_owner,
+        Utc::now(),
+    )
+    .await
+    .expect("second");
     tx.commit().await.expect("commit");
 
     assert!(first.created);
@@ -126,10 +161,16 @@ async fn concurrent_onboarding_creates_one_household() {
         let new_owner = new_owner.clone();
         handles.push(tokio::spawn(async move {
             let mut tx = pool.begin().await.expect("tx");
-            let result =
-                households::onboard(&mut tx, "Гонка", "Europe/Moscow", new_owner, Utc::now())
-                    .await
-                    .expect("onboarding");
+            let result = households::onboard(
+                &mut tx,
+                TenancyMode::Multi,
+                "Гонка",
+                "Europe/Moscow",
+                new_owner,
+                Utc::now(),
+            )
+            .await
+            .expect("onboarding");
             tx.commit().await.expect("commit");
             result
         }));
@@ -156,6 +197,227 @@ async fn concurrent_onboarding_creates_one_household() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn single_mode_allows_only_one_active_household() {
+    let db = support::isolated_db().await;
+    let now = Utc::now();
+    let mut tx = db.pool.begin().await.expect("tx");
+    households::create_empty(
+        &mut tx,
+        TenancyMode::Single,
+        "Единственная",
+        "Europe/Moscow",
+        &admin::admin_actor(),
+        now,
+    )
+    .await
+    .expect("first household");
+    tx.commit().await.expect("commit");
+
+    let mut tx = db.pool.begin().await.expect("tx");
+    let error = households::create_empty(
+        &mut tx,
+        TenancyMode::Single,
+        "Вторая",
+        "Europe/Moscow",
+        &admin::admin_actor(),
+        now,
+    )
+    .await
+    .expect_err("second household");
+    tx.rollback().await.expect("rollback");
+    assert_eq!(reason(&error).as_deref(), Some("household_exists"));
+    assert!(admin::describe(&error).contains("409"));
+
+    // Тот же отказ через административный путь.
+    let admin_error = admin::create_household(
+        &db.pool,
+        TenancyMode::Single,
+        "Третья",
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect_err("admin create");
+    assert_eq!(reason(&admin_error).as_deref(), Some("household_exists"));
+    assert!(admin::describe(&admin_error).contains("409"));
+
+    let active: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM households WHERE deleted_at IS NULL")
+            .fetch_one(&db.pool)
+            .await
+            .expect("count");
+    assert_eq!(active, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_mode_allows_more_households() {
+    let db = support::isolated_db().await;
+    let now = Utc::now();
+    for name in ["Первая", "Вторая"] {
+        let mut tx = db.pool.begin().await.expect("tx");
+        households::create_empty(
+            &mut tx,
+            TenancyMode::Multi,
+            name,
+            "Europe/Moscow",
+            &admin::admin_actor(),
+            now,
+        )
+        .await
+        .expect("household");
+        tx.commit().await.expect("commit");
+    }
+
+    let active: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM households WHERE deleted_at IS NULL")
+            .fetch_one(&db.pool)
+            .await
+            .expect("count");
+    assert_eq!(active, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn soft_deleted_household_frees_the_single_slot() {
+    let db = support::isolated_db().await;
+    let now = Utc::now();
+    let mut tx = db.pool.begin().await.expect("tx");
+    let first = households::create_empty(
+        &mut tx,
+        TenancyMode::Single,
+        "Первая",
+        "Europe/Moscow",
+        &admin::admin_actor(),
+        now,
+    )
+    .await
+    .expect("first household");
+    tx.commit().await.expect("commit");
+
+    sqlx::query("UPDATE households SET deleted_at = $2 WHERE id = $1")
+        .bind(first.id)
+        .bind(now)
+        .execute(&db.pool)
+        .await
+        .expect("soft delete");
+
+    let mut tx = db.pool.begin().await.expect("tx");
+    let second = households::create_empty(
+        &mut tx,
+        TenancyMode::Single,
+        "Вторая",
+        "Europe/Moscow",
+        &admin::admin_actor(),
+        now,
+    )
+    .await
+    .expect("second household after deletion");
+    tx.commit().await.expect("commit");
+
+    assert_ne!(first.id, second.id);
+    let active: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM households WHERE deleted_at IS NULL")
+            .fetch_one(&db.pool)
+            .await
+            .expect("count");
+    assert_eq!(active, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_onboarding_with_different_ids_creates_one_household_in_single() {
+    let db = support::isolated_db().await;
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for index in 0..2 {
+        let pool = db.pool.clone();
+        let barrier = barrier.clone();
+        let new_owner = owner(&format!("Гость {index}"));
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let mut tx = pool.begin().await.expect("tx");
+            let result = households::onboard(
+                &mut tx,
+                TenancyMode::Single,
+                "Общая",
+                "Europe/Moscow",
+                new_owner,
+                Utc::now(),
+            )
+            .await;
+            match &result {
+                Ok(_) => tx.commit().await.expect("commit"),
+                Err(_) => tx.rollback().await.expect("rollback"),
+            }
+            result
+        }));
+    }
+
+    let mut created = 0;
+    let mut conflicts = 0;
+    for handle in handles {
+        match handle.await.expect("task") {
+            Ok(onboarded) => {
+                assert!(onboarded.created);
+                created += 1;
+            }
+            Err(error) => {
+                assert_eq!(reason(&error).as_deref(), Some("household_exists"));
+                conflicts += 1;
+            }
+        }
+    }
+    assert_eq!((created, conflicts), (1, 1));
+
+    let active: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM households WHERE deleted_at IS NULL")
+            .fetch_one(&db.pool)
+            .await
+            .expect("count");
+    assert_eq!(active, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_onboarding_in_single_returns_the_existing_household() {
+    let db = support::isolated_db().await;
+    let new_owner = owner("Повтор Single");
+    let mut tx = db.pool.begin().await.expect("tx");
+    let first = households::onboard(
+        &mut tx,
+        TenancyMode::Single,
+        "Первая",
+        "Europe/Moscow",
+        new_owner.clone(),
+        Utc::now(),
+    )
+    .await
+    .expect("first");
+    tx.commit().await.expect("commit");
+
+    let mut tx = db.pool.begin().await.expect("tx");
+    let second = households::onboard(
+        &mut tx,
+        TenancyMode::Single,
+        "Вторая",
+        "Asia/Omsk",
+        new_owner,
+        Utc::now(),
+    )
+    .await
+    .expect("second");
+    tx.commit().await.expect("commit");
+
+    assert!(first.created);
+    assert!(!second.created);
+    assert_eq!(first.household.id, second.household.id);
+
+    let active: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM households WHERE deleted_at IS NULL")
+            .fetch_one(&db.pool)
+            .await
+            .expect("count");
+    assert_eq!(active, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invalid_timezone_does_not_create_household() {
     let db = support::db().await;
     let new_owner = owner("Часы");
@@ -163,7 +425,15 @@ async fn invalid_timezone_does_not_create_household() {
     let name = format!("Без пояса {}", Uuid::now_v7());
 
     let mut tx = db.pool.begin().await.expect("tx");
-    let result = households::onboard(&mut tx, &name, "Mars/Olympus", new_owner, Utc::now()).await;
+    let result = households::onboard(
+        &mut tx,
+        TenancyMode::Multi,
+        &name,
+        "Mars/Olympus",
+        new_owner,
+        Utc::now(),
+    )
+    .await;
     assert!(
         matches!(result, Err(DomainError::Validation(_))),
         "{result:?}"
@@ -188,13 +458,20 @@ async fn invalid_timezone_does_not_create_household() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_added_owner_skips_onboarding_and_second_owner_is_rejected() {
     let db = support::db().await;
-    let household = admin::create_household(&db.pool, "Админская", "Europe/Moscow", Utc::now())
-        .await
-        .expect("household");
+    let household = admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Админская",
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("household");
     let telegram_id = support::next_telegram_id();
 
     let (_, user) = admin::add_user(
         &db.pool,
+        TenancyMode::Multi,
         Some(household.id),
         UserRole::Owner,
         telegram_id,
@@ -213,6 +490,7 @@ async fn admin_added_owner_skips_onboarding_and_second_owner_is_rejected() {
     let mut tx = db.pool.begin().await.expect("tx");
     let onboarded = households::onboard(
         &mut tx,
+        TenancyMode::Multi,
         "Новая",
         "Europe/Moscow",
         NewOwner {
@@ -234,6 +512,7 @@ async fn admin_added_owner_skips_onboarding_and_second_owner_is_rejected() {
 
     let second = admin::add_user(
         &db.pool,
+        TenancyMode::Multi,
         Some(household.id),
         UserRole::Owner,
         support::next_telegram_id(),
@@ -249,6 +528,7 @@ async fn admin_added_owner_skips_onboarding_and_second_owner_is_rejected() {
     // Участник добавляется без ограничений владельца.
     let (_, member) = admin::add_user(
         &db.pool,
+        TenancyMode::Multi,
         Some(household.id),
         UserRole::Member,
         support::next_telegram_id(),
@@ -262,6 +542,7 @@ async fn admin_added_owner_skips_onboarding_and_second_owner_is_rejected() {
     // Пользователь не может состоять в двух household.
     let duplicate = admin::add_user(
         &db.pool,
+        TenancyMode::Multi,
         Some(household.id),
         UserRole::Member,
         telegram_id,

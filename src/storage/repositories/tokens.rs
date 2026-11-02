@@ -133,6 +133,30 @@ pub async fn list(
     Ok(tokens)
 }
 
+/// Активные токены household, новые первыми.
+///
+/// Активный токен не отозван и не истёк на момент `now`; правило совпадает с
+/// подсчётом в `admin household list`.
+pub async fn list_active(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<Vec<ApiToken>, DomainError> {
+    let tokens = sqlx::query_as::<_, ApiToken>(&format!(
+        "SELECT {COLUMNS} FROM api_tokens
+         WHERE household_id = $1
+           AND revoked_at IS NULL
+           AND (expires_at IS NULL OR expires_at > $2)
+         ORDER BY created_at DESC, id DESC"
+    ))
+    .bind(household_id)
+    .bind(now)
+    .fetch_all(conn)
+    .await?;
+
+    Ok(tokens)
+}
+
 /// Отозвать токен. Возвращает запись, если токен был отозван сейчас, и `None`,
 /// если он уже отозван или не существует.
 pub async fn revoke(

@@ -11,7 +11,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use tasklerq::admin;
 use tasklerq::app::build_application;
 use tasklerq::capture::{eval, prompt};
-use tasklerq::config::{self, Config, DatabaseConfig, LlmConfig};
+use tasklerq::config::{self, Config, DatabaseConfig, LlmConfig, TenancyConfig};
 use tasklerq::domain::error::DomainError;
 use tasklerq::domain::models::UserRole;
 use tasklerq::home_assistant::{AiTask, GenerateData, HttpAiTask, MAX_GENERATE_TIMEOUT};
@@ -133,7 +133,8 @@ enum WebhookCommand {
 
 #[derive(Debug, Args)]
 struct ExportArgs {
-    /// Household; без значения используется единственный существующий.
+    /// Household; в `single` можно опустить, если household единственный;
+    /// в `multi` обязателен.
     #[arg(long)]
     household: Option<Uuid>,
     /// Файл выгрузки; без значения JSON печатается в stdout.
@@ -155,7 +156,8 @@ enum TokenCommand {
     },
     /// Показать токены household без секретов.
     List {
-        /// Household; без значения используется единственный существующий.
+        /// Household; в `single` можно опустить, если household единственный;
+        /// в `multi` обязателен.
         #[arg(long)]
         household: Option<Uuid>,
     },
@@ -163,7 +165,8 @@ enum TokenCommand {
 
 #[derive(Debug, Args)]
 struct TokenCreate {
-    /// Household; без значения используется единственный существующий.
+    /// Household; в `single` можно опустить, если household единственный;
+    /// в `multi` обязателен.
     #[arg(long)]
     household: Option<Uuid>,
     /// Название токена.
@@ -185,7 +188,11 @@ struct TokenCreate {
 
 #[derive(Debug, Subcommand)]
 enum HouseholdCommand {
-    /// Создать household без владельца.
+    /// Создать household и списки «Задачи» и «Покупки».
+    ///
+    /// В режиме `single` второй активный household отклоняется с `409`. С
+    /// `--owner-telegram-id` владелец создаётся в той же транзакции; без него
+    /// печатается подсказка, как добавить владельца через `admin user add`.
     Create {
         /// Название household.
         #[arg(long)]
@@ -193,9 +200,30 @@ enum HouseholdCommand {
         /// Часовой пояс IANA.
         #[arg(long, default_value = "Europe/Moscow")]
         timezone: String,
+        /// Telegram ID владельца (положительное целое).
+        #[arg(long, value_name = "ID", value_parser = clap::value_parser!(i64).range(1..))]
+        owner_telegram_id: Option<i64>,
+        /// Отображаемое имя владельца; требует --owner-telegram-id.
+        #[arg(long, requires = "owner_telegram_id")]
+        owner_name: Option<String>,
     },
-    /// Показать household без секретов.
+    /// Показать активные household без секретов.
     List,
+    /// Мягко удалить household и отозвать его токены и приглашения.
+    ///
+    /// Household и все активные участники помечаются удалёнными; токены и
+    /// приглашения отзываются сразу. Данные физически удалит retention.
+    /// Без `--yes` команда просит ввести название household; в
+    /// неинтерактивном режиме без `--yes` завершается ошибкой и ничего не
+    /// меняет. Уведомления участникам не отправляются.
+    Delete {
+        /// Идентификатор household.
+        #[arg(long)]
+        household: Uuid,
+        /// Не спрашивать подтверждение названием.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -208,7 +236,8 @@ enum UserCommand {
         /// Роль. Второй владелец в household не создаётся.
         #[arg(long, value_enum)]
         role: RoleArg,
-        /// Household; без значения используется единственный существующий.
+        /// Household; в `single` можно опустить, если household единственный;
+        /// в `multi` обязателен.
         #[arg(long)]
         household: Option<Uuid>,
         /// Отображаемое имя.
@@ -387,12 +416,14 @@ async fn run_admin_database(command: DatabaseCommand) -> Result<()> {
         .await
         .context("database connection failed")?;
     let now = Utc::now();
+    let tenancy = TenancyConfig::from_env().context("invalid tenancy configuration")?;
 
     match command {
         DatabaseCommand::Token(command) => match command {
             TokenCommand::Create(args) => {
                 let issued = admin::create_token(
                     &pool,
+                    tenancy.mode,
                     args.household,
                     &args.name,
                     &args.scopes,
@@ -424,7 +455,7 @@ async fn run_admin_database(command: DatabaseCommand) -> Result<()> {
                 }
             }
             TokenCommand::List { household } => {
-                for token in admin::list_tokens(&pool, household)
+                for token in admin::list_tokens(&pool, tenancy.mode, household)
                     .await
                     .map_err(explain)?
                 {
@@ -477,25 +508,75 @@ async fn run_admin_database(command: DatabaseCommand) -> Result<()> {
             }
         },
         DatabaseCommand::Household(command) => match command {
-            HouseholdCommand::Create { name, timezone } => {
-                let household = admin::create_household(&pool, &name, &timezone, now)
+            HouseholdCommand::Create {
+                name,
+                timezone,
+                owner_telegram_id,
+                owner_name,
+            } => match owner_telegram_id {
+                Some(telegram_user_id) => {
+                    let (household, owner) = admin::create_household_with_owner(
+                        &pool,
+                        tenancy.mode,
+                        &name,
+                        &timezone,
+                        telegram_user_id,
+                        owner_name.as_deref(),
+                        now,
+                    )
                     .await
                     .map_err(explain)?;
-                println!("id: {}", household.id);
-                println!("name: {}", household.name);
-                println!("timezone: {}", household.timezone);
-            }
-            HouseholdCommand::List => {
-                for household in admin::list_households(&pool).await.map_err(explain)? {
+                    println!("id: {}", household.id);
+                    println!("name: {}", household.name);
+                    println!("timezone: {}", household.timezone);
+                    println!("owner: {}", owner.telegram_user_id);
+                }
+                None => {
+                    let household =
+                        admin::create_household(&pool, tenancy.mode, &name, &timezone, now)
+                            .await
+                            .map_err(explain)?;
+                    println!("id: {}", household.id);
+                    println!("name: {}", household.name);
+                    println!("timezone: {}", household.timezone);
                     println!(
-                        "{}\t{}\t{}\t{}\t{}",
+                        "tasklerq admin user add --telegram-id <id> --role owner --household {}",
+                        household.id
+                    );
+                }
+            },
+            HouseholdCommand::List => {
+                for household in admin::list_households(&pool, now).await.map_err(explain)? {
+                    let owner = household
+                        .owner_telegram_id
+                        .map_or_else(|| "-".to_owned(), |id| id.to_string());
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                         household.id,
                         household.name,
                         household.timezone,
+                        owner,
                         household.members,
+                        household.open_tasks,
+                        household.active_tokens,
                         household.created_at.to_rfc3339()
                     );
                 }
+            }
+            HouseholdCommand::Delete { household, yes } => {
+                if !yes {
+                    let name = admin::household_name(&pool, household)
+                        .await
+                        .map_err(explain)?;
+                    require_name_confirmation(&name)?;
+                }
+                let deleted = admin::delete_household(&pool, household, now)
+                    .await
+                    .map_err(explain)?;
+                println!("id: {}", household);
+                println!("members: {}", deleted.members.len());
+                println!("revoked_tokens: {}", deleted.revoked_tokens);
+                println!("revoked_invites: {}", deleted.revoked_invites);
             }
         },
         DatabaseCommand::User(command) => match command {
@@ -507,6 +588,7 @@ async fn run_admin_database(command: DatabaseCommand) -> Result<()> {
             } => {
                 let (household, user) = admin::add_user(
                     &pool,
+                    tenancy.mode,
                     household,
                     role.into(),
                     telegram_id,
@@ -521,7 +603,7 @@ async fn run_admin_database(command: DatabaseCommand) -> Result<()> {
             }
         },
         DatabaseCommand::Export(args) => {
-            let export = admin::export(&pool, args.household, now)
+            let export = admin::export(&pool, tenancy.mode, args.household, now)
                 .await
                 .map_err(explain)?;
             let mut json =
@@ -557,6 +639,29 @@ fn require_confirmation(prompt: &str) -> Result<()> {
         answer.trim().to_ascii_lowercase().as_str(),
         "y" | "yes" | "д" | "да"
     ) {
+        Ok(())
+    } else {
+        bail!("отмена; ничего не изменено");
+    }
+}
+
+/// Спросить подтверждение названием household. Без TTY опасная команда
+/// выполняется только с `--yes`.
+fn require_name_confirmation(expected: &str) -> Result<()> {
+    use std::io::{IsTerminal, Write};
+
+    if !std::io::stdin().is_terminal() {
+        bail!("нужно подтверждение (--yes); ничего не изменено");
+    }
+    eprint!("Введите название household для подтверждения: ");
+    std::io::stderr()
+        .flush()
+        .context("failed to write the confirmation prompt")?;
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("failed to read the confirmation")?;
+    if tasklerq::domain::identity::confirmation_matches(expected, &answer) {
         Ok(())
     } else {
         bail!("отмена; ничего не изменено");

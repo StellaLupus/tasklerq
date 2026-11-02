@@ -413,7 +413,9 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
 
     // Capture из Telegram: отдельный household с реальным ботом.
     let capture_chat = next_telegram_id();
-    let handler = Bot::new("tasklerqbot").with_llm_capture(true);
+    let handler = Bot::new("tasklerqbot")
+        .with_llm_capture(true)
+        .with_tenancy(tasklerq::config::TenancyMode::Multi);
     let mut telegram = Harness::with_handler(
         &db.pool,
         capture_chat,
@@ -476,6 +478,7 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
     let dead_payload = Outgoing::Message {
         html: "dead".into(),
         rich: false,
+        delete_after: None,
     };
     tasklerq::telegram::outbox::enqueue(&mut conn, dead_chat, &dead_payload, None, now)
         .await
@@ -497,6 +500,7 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
     let pending = Outgoing::Message {
         html: "pending".into(),
         rich: false,
+        delete_after: None,
     };
     tasklerq::telegram::outbox::enqueue(&mut conn, pending_chat, &pending, None, now)
         .await

@@ -11,11 +11,12 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::capture::breaker::CircuitBreaker;
-use crate::config::Config;
+use crate::config::{Config, TelegramMode, TenancyMode};
 use crate::http::api::capture::CaptureState;
 use crate::http::router::{AppState, build_router};
 use crate::jobs::retention::RetentionWorker;
 use crate::security_audit::Audit;
+use crate::storage::repositories::households;
 use crate::telegram::runtime::{self, StartError};
 
 /// Собранное приложение и его фоновые задачи.
@@ -50,6 +51,9 @@ pub async fn build_application_with_update_limit(
     shutdown: watch::Receiver<bool>,
     update_limit: Option<u32>,
 ) -> Result<Application, StartError> {
+    warn_if_bootstrap_owner_missing(config);
+    warn_if_multiple_households(config, &pool).await;
+
     let ai = runtime::build_ai(&config.llm);
     let breaker = Arc::new(CircuitBreaker::default());
     // Один журнал событий на процесс: вебхук, воркеры, бот и capture-воркер
@@ -66,7 +70,7 @@ pub async fn build_application_with_update_limit(
     )
     .await?;
 
-    let mut state = AppState::new(pool.clone(), audit);
+    let mut state = AppState::new(pool.clone(), audit).with_tenancy_mode(config.tenancy.mode);
     let mut workers = Vec::new();
     if let Some(runtime) = telegram {
         if let Some(ingress) = runtime.ingress {
@@ -93,4 +97,180 @@ pub async fn build_application_with_update_limit(
         router: build_router(state),
         workers,
     })
+}
+
+/// Предупредить, что без явного первого владельца им станет первый написавший
+/// боту. Текст не содержит секретов: в нём только имя переменной.
+fn warn_if_bootstrap_owner_missing(config: &Config) {
+    if config.telegram.mode != TelegramMode::Disabled && config.tenancy.bootstrap_owner.is_none() {
+        tracing::warn!(
+            "BOOTSTRAP_OWNER_TELEGRAM_ID is not set: the first person to write to the bot \
+             will become the owner; set BOOTSTRAP_OWNER_TELEGRAM_ID to choose the owner explicitly"
+        );
+    }
+}
+
+/// Сообщить о деградации: в режиме `single` активных household больше одного.
+///
+/// Деградация — вычисляемое состояние (design D4), поэтому лог пишется один раз
+/// при старте и содержит только число: названия и идентификаторы не нужны и
+/// могут быть чувствительными. Сбой подсчёта не мешает запуску: недоступность
+/// базы уже обработают readiness и рабочие задачи, а падение сервиса из-за
+/// диагностической проверки недопустимо.
+async fn warn_if_multiple_households(config: &Config, pool: &PgPool) {
+    if config.tenancy.mode != TenancyMode::Single {
+        return;
+    }
+
+    let counted = async {
+        let mut conn = pool.acquire().await?;
+        households::count_active(&mut conn).await
+    }
+    .await;
+
+    match counted {
+        Ok(active) if active > 1 => {
+            tracing::error!(
+                households = active,
+                "single tenancy mode with multiple active households: creating new households \
+                 is disabled; see the runbook for cleanup"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "could not count active households at startup"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    const BOT_TOKEN: &str = "123456:SECRET-bot-token";
+    const WEBHOOK_SECRET: &str = "SECRET-webhook-secret";
+
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl LogBuffer {
+        fn contents(&self) -> String {
+            let bytes = self.0.lock().expect("log buffer lock").clone();
+            String::from_utf8(bytes).expect("logs are UTF-8")
+        }
+    }
+
+    impl Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer lock")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for LogBuffer {
+        type Writer = Self;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn config(mode: &str, bootstrap_owner: Option<&str>) -> Config {
+        let mut vars = BTreeMap::from([
+            ("ENV".to_owned(), "development".to_owned()),
+            (
+                "PUBLIC_BASE_URL".to_owned(),
+                "http://127.0.0.1:8080".to_owned(),
+            ),
+            (
+                "DATABASE_URL".to_owned(),
+                "postgres://tasklerq:db-password@127.0.0.1:5432/tasklerq".to_owned(),
+            ),
+            ("TELEGRAM_MODE".to_owned(), mode.to_owned()),
+            ("TELEGRAM_BOT_TOKEN".to_owned(), BOT_TOKEN.to_owned()),
+            (
+                "TELEGRAM_WEBHOOK_SECRET".to_owned(),
+                WEBHOOK_SECRET.to_owned(),
+            ),
+            (
+                "TELEGRAM_WEBHOOK_URL".to_owned(),
+                "http://127.0.0.1:8080/webhooks/telegram".to_owned(),
+            ),
+            ("LLM_CAPTURE_ENABLED".to_owned(), "false".to_owned()),
+        ]);
+        if let Some(owner) = bootstrap_owner {
+            vars.insert("BOOTSTRAP_OWNER_TELEGRAM_ID".to_owned(), owner.to_owned());
+        }
+        Config::from_map(vars).expect("test config should be valid")
+    }
+
+    fn captured_warning(config: &Config) -> String {
+        let buffer = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(buffer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            warn_if_bootstrap_owner_missing(config);
+        });
+        buffer.contents()
+    }
+
+    #[test]
+    fn warns_when_telegram_is_enabled_without_bootstrap_owner() {
+        for mode in ["webhook", "polling"] {
+            let logs = captured_warning(&config(mode, None));
+
+            assert!(
+                logs.contains("BOOTSTRAP_OWNER_TELEGRAM_ID"),
+                "{mode}: warning should name the parameter:\n{logs}"
+            );
+            assert!(
+                logs.contains("first person"),
+                "{mode}: warning should explain who becomes the owner:\n{logs}"
+            );
+            assert!(
+                !logs.contains(BOT_TOKEN),
+                "{mode}: warning leaked the token"
+            );
+            assert!(
+                !logs.contains(WEBHOOK_SECRET),
+                "{mode}: warning leaked the webhook secret"
+            );
+        }
+    }
+
+    #[test]
+    fn no_warning_when_bootstrap_owner_is_set() {
+        for mode in ["webhook", "polling"] {
+            let logs = captured_warning(&config(mode, Some("111")));
+            assert!(
+                !logs.contains("BOOTSTRAP_OWNER_TELEGRAM_ID"),
+                "{mode}: explicit owner should suppress the warning:\n{logs}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_warning_when_telegram_is_disabled() {
+        let logs = captured_warning(&config("disabled", None));
+        assert!(
+            !logs.contains("BOOTSTRAP_OWNER_TELEGRAM_ID"),
+            "disabled Telegram should not warn:\n{logs}"
+        );
+    }
 }

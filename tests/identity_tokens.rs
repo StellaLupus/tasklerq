@@ -6,6 +6,7 @@ use axum::http::{Method, StatusCode};
 use chrono::{Duration, Utc};
 use tasklerq::admin;
 use tasklerq::auth::tokens::{generate_token, hash_token, validate_scopes};
+use tasklerq::config::TenancyMode;
 use tasklerq::domain::error::DomainError;
 use tasklerq::domain::identity::AuditEventType;
 use tokio::process::Command;
@@ -49,6 +50,7 @@ async fn issued_token_is_stored_hashed_and_authenticates() {
 
     let issued = admin::create_token(
         &db.pool,
+        TenancyMode::Single,
         Some(household.household_id),
         "Home Assistant",
         &scopes(&["ha:read"]),
@@ -110,6 +112,7 @@ async fn revoked_and_expired_tokens_are_rejected() {
 
     let issued = admin::create_token(
         &db.pool,
+        TenancyMode::Single,
         Some(household.household_id),
         "Temporary",
         &scopes(&["ha:read"]),
@@ -153,6 +156,7 @@ async fn revoked_and_expired_tokens_are_rejected() {
     // Истёкший токен: срок задаётся в прошлом напрямую в базе.
     let expiring = admin::create_token(
         &db.pool,
+        TenancyMode::Single,
         Some(household.household_id),
         "Expiring",
         &scopes(&["ha:read"]),
@@ -200,6 +204,7 @@ async fn token_input_is_validated_and_audited_without_secret() {
     ] {
         let result = admin::create_token(
             &db.pool,
+            TenancyMode::Single,
             Some(household.household_id),
             name,
             &token_scopes,
@@ -215,6 +220,7 @@ async fn token_input_is_validated_and_audited_without_secret() {
 
     let missing = admin::create_token(
         &db.pool,
+        TenancyMode::Single,
         Some(Uuid::now_v7()),
         "Orphan",
         &scopes(&["ha:read"]),
@@ -226,6 +232,7 @@ async fn token_input_is_validated_and_audited_without_secret() {
 
     let issued = admin::create_token(
         &db.pool,
+        TenancyMode::Single,
         Some(household.household_id),
         "Audited",
         &scopes(&["ha:read", "capture:write"]),

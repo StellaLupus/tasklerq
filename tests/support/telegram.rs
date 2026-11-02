@@ -271,7 +271,11 @@ pub fn unescape(text: &str) -> String {
 
 /// Бот стенда с журналом событий безопасности на пуле стенда.
 fn harness_bot(pool: &PgPool) -> Bot {
-    Bot::new("tasklerqbot").with_audit(tasklerq::security_audit::Audit::new(pool.clone()))
+    Bot::new("tasklerqbot")
+        // Общая тестовая база содержит много household: онбординг в ней
+        // возможен только в режиме `multi`.
+        .with_tenancy(tasklerq::config::TenancyMode::Multi)
+        .with_audit(tasklerq::security_audit::Audit::new(pool.clone()))
 }
 
 /// Сценарный стенд: один пользователь, настоящий бот и поддельный Telegram.

@@ -5,19 +5,24 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::identity::{AuditEvent, AuditEventType};
-use crate::domain::models::{ActorType, User, UserRole};
+use crate::domain::models::{Actor, ActorType, User, UserRole};
 use crate::domain::settings::{
     NotificationSettings, NotificationSettingsUpdate, ProfileUpdate, SUGGESTED_TIMEZONES,
     validate_timezone,
 };
 use crate::jobs::{batch, delivery, quiet};
-use crate::storage::repositories::{audit, invites, members, users};
-use crate::telegram::rich::{Span, button};
+use crate::storage::repositories::{audit, invites, members, tokens, users};
+use crate::telegram::callbacks::Scope;
+use crate::telegram::outbox::{self, Outgoing};
+use crate::telegram::rich::{Span, button, escape};
 use crate::telegram::ru;
 
 use super::model::{Action, PAGE_SIZE, Screen, Setting, TimeField, Ui};
-use super::screens::{back_button, clip};
-use super::{Ctx, Fail, display_timezone};
+use super::screens::{back_button, clip, page_bounds, pager};
+use super::{Ctx, Fail, delete_dedupe_key, display_timezone, issue_and_render};
+
+/// Сколько живёт сообщение с открытым токеном: час после доставки.
+const SECRET_MESSAGE_TTL: u32 = 60 * 60;
 
 fn on_off(value: bool) -> &'static str {
     if value { "вкл" } else { "выкл" }
@@ -102,6 +107,8 @@ pub async fn view(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
         Screen::Notifications => notifications(ctx),
         Screen::Timezones => Ok(timezones()),
         Screen::Family => family(ctx).await,
+        Screen::Integrations { page } => integrations(ctx, *page).await,
+        Screen::ConfirmRevokeToken { token_id } => confirm_revoke(ctx, *token_id).await,
         Screen::Member { user_id } => member(ctx, *user_id).await,
         Screen::Invites => invites_screen(ctx).await,
         Screen::InviteCreated { code, .. } => {
@@ -173,6 +180,7 @@ fn settings(ctx: &Ctx<'_>) -> Result<Ui, Fail> {
             .row(vec![
                 back_button("👥 Семья", Screen::Family),
                 back_button("📜 Журнал", Screen::Journal { page: 0 }),
+                back_button("🔌 Интеграции", Screen::Integrations { page: 0 }),
             ])
             .row(vec![button(
                 "🗑 Удалить пространство",
@@ -309,6 +317,58 @@ async fn family(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
         )]);
     }
     Ok(ui.row(vec![back_button("⬅️ Назад", Screen::Settings)]))
+}
+
+async fn integrations(ctx: &mut Ctx<'_>, page: u32) -> Result<Ui, Fail> {
+    ctx.require_owner()?;
+    let household_id = ctx.household()?.id;
+    let active = tokens::list_active(&mut *ctx.conn, household_id, ctx.now).await?;
+    let (start, end, page, pages) = page_bounds(active.len(), page);
+    let here = |page: usize| Screen::Integrations {
+        page: u32::try_from(page).unwrap_or(0),
+    };
+
+    let mut ui = Ui::new().heading(ru::INTEGRATIONS_TITLE);
+    if active.is_empty() {
+        ui = ui.text(ru::INTEGRATIONS_EMPTY);
+    } else {
+        for token in &active[start..end] {
+            ui = ui
+                .text(format!("🔑 {} · {}", token.name, token.prefix))
+                .text(format!("Области: {}", token.scopes.join(", ")))
+                .text(ru::token_last_used(token.last_used_at, ctx.tz, ctx.now))
+                .row(vec![button(
+                    ru::token_revoke_button(&clip(&token.name, 30), &token.prefix),
+                    Action::Go {
+                        to: Screen::ConfirmRevokeToken { token_id: token.id },
+                    },
+                )]);
+        }
+    }
+    let ui = pager(ui, page, pages, here);
+    Ok(ui.row(vec![
+        button(ru::ISSUE_HA_TOKEN_BUTTON, Action::IssueHaToken),
+        back_button("⬅️ Назад", Screen::Settings),
+    ]))
+}
+
+async fn confirm_revoke(ctx: &mut Ctx<'_>, token_id: Uuid) -> Result<Ui, Fail> {
+    ctx.require_owner()?;
+    let household_id = ctx.household()?.id;
+    let token = tokens::find_by_id(&mut *ctx.conn, token_id)
+        .await?
+        .filter(|token| token.household_id == household_id)
+        .ok_or(DomainError::NotFound)?;
+    Ok(Ui::new()
+        .heading(ru::confirm_revoke_token(
+            &clip(&token.name, 40),
+            &token.prefix,
+        ))
+        .text(ru::TOKEN_STOPS_WORKING)
+        .row(vec![
+            button("Отозвать", Action::RevokeToken { token_id }),
+            back_button("Отмена", Screen::Integrations { page: 0 }),
+        ]))
 }
 
 async fn member(ctx: &mut Ctx<'_>, user_id: Uuid) -> Result<Ui, Fail> {
@@ -657,6 +717,111 @@ pub async fn invite_revoke(ctx: &mut Ctx<'_>, invite_id: Uuid) -> Result<(), Fai
     invites::revoke(&mut *ctx.conn, household_id, &actor, invite_id, ctx.now).await?;
     ctx.toast("Приглашение отозвано");
     ctx.present(Screen::Invites).await
+}
+
+/// Отозвать API-токен. Владелец и принадлежность токена проверяются по базе
+/// под блокировкой household до отзыва: устаревшая кнопка и чужой household
+/// получают отказ.
+pub async fn revoke_token(ctx: &mut Ctx<'_>, token_id: Uuid) -> Result<(), Fail> {
+    let household_id = ctx.household()?.id;
+    let actor = ctx.actor()?;
+    let owner = users::lock_and_require_owner(&mut *ctx.conn, household_id, &actor).await?;
+    let actor = Actor::user(owner.id, owner.role);
+
+    let token = tokens::find_by_id(&mut *ctx.conn, token_id)
+        .await?
+        .filter(|token| token.household_id == household_id)
+        .ok_or(DomainError::NotFound)?;
+
+    let (_, revoked_now) =
+        crate::auth::tokens::revoke(&mut *ctx.conn, token.id, &actor, ctx.now).await?;
+    ctx.banner(if revoked_now {
+        ru::TOKEN_REVOKED
+    } else {
+        ru::TOKEN_ALREADY_REVOKED
+    });
+    ctx.present(Screen::Integrations { page: 0 }).await
+}
+
+/// Выпустить токен для Home Assistant и показать его один раз.
+pub async fn issue_ha_token(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
+    let household_id = ctx.household()?.id;
+    let actor = ctx.actor()?;
+    let owner = users::lock_and_require_owner(&mut *ctx.conn, household_id, &actor).await?;
+    let actor = Actor::user(owner.id, owner.role);
+
+    let scopes: Vec<String> = ["ha:read", "ha:write", "capture:write"]
+        .map(str::to_owned)
+        .to_vec();
+    let issued = crate::auth::tokens::issue(
+        &mut *ctx.conn,
+        household_id,
+        ru::HA_TOKEN_NAME,
+        &scopes,
+        None,
+        &actor,
+        ctx.now,
+    )
+    .await?;
+
+    // Сначала экран: кнопка нажата на якоре, правка на месте уже показывает
+    // новый префикс. Сообщение с секретом идёт следом и засыпает якорь (D6).
+    ctx.present(Screen::Integrations { page: 0 }).await?;
+    enqueue_secret_message(ctx, household_id, &issued.token).await
+}
+
+/// Поставить отдельное сообщение с открытым токеном под спойлером.
+async fn enqueue_secret_message(
+    ctx: &mut Ctx<'_>,
+    household_id: Uuid,
+    token: &str,
+) -> Result<(), Fail> {
+    let ui = Ui::new().row(vec![button(ru::SECRET_SAVED_BUTTON, Action::DismissSecret)]);
+    let buttons = issue_and_render(
+        &mut *ctx.conn,
+        ctx.sender.id,
+        Some(household_id),
+        &ui,
+        Scope::Notice,
+        ctx.now,
+    )
+    .await?;
+    let html = format!(
+        "<p><tg-spoiler>{}</tg-spoiler></p>\n<p>{}</p>\n{buttons}",
+        escape(token),
+        escape(ru::SECRET_MESSAGE_EXPIRES),
+    );
+    outbox::enqueue(
+        &mut *ctx.conn,
+        ctx.chat_id,
+        &Outgoing::Message {
+            html,
+            rich: true,
+            delete_after: Some(SECRET_MESSAGE_TTL),
+        },
+        None,
+        ctx.now,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Удалить сообщение с одноразовым секретом через outbox.
+///
+/// Роль владельца не проверяется: убрать сообщение может любой его получатель,
+/// в том числе бывший владелец. Экран не перерисовывается — сообщение с
+/// секретом не является экраном навигации.
+pub async fn dismiss_secret(ctx: &mut Ctx<'_>, message_id: i64) -> Result<(), Fail> {
+    outbox::enqueue(
+        &mut *ctx.conn,
+        ctx.chat_id,
+        &Outgoing::Delete { message_id },
+        Some(&delete_dedupe_key(ctx.chat_id, message_id)),
+        ctx.now,
+    )
+    .await?;
+    ctx.toast(ru::SECRET_MESSAGE_DELETED);
+    Ok(())
 }
 
 /// Запросить подтверждение удаления участника.

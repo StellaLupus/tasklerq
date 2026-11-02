@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::capture::draft::DueChoice;
 use crate::domain::error::DomainError;
+use crate::domain::first_contact::FirstContact;
 use crate::domain::models::{
     Field, Item, ItemPatch, ItemPriority, ItemStatus, ListKind, MonthRule, NewItem, Recurrence,
     RecurrenceFreq, RecurrenceInput, SubtaskInput,
@@ -23,6 +24,37 @@ pub type Ui = View<Action>;
 
 /// Размер страницы списков и результатов.
 pub const PAGE_SIZE: usize = 8;
+
+/// Информационный экран первого контакта без формы онбординга.
+///
+/// `FirstContact::Onboard` сюда не входит: он открывает форму, а не экран.
+/// Старое или битое состояние с `onboard` не десериализуется, и `refresh`
+/// заменяет его меню.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum FirstContactScreen {
+    /// Это частное пространство: попросить приглашение у владельца.
+    AskInvite,
+    /// Нужно назначить владельца командой CLI с этим Telegram ID.
+    AdminCommand(i64),
+    /// Инсталляция ещё не настроена, подробностей нет.
+    NotConfigured,
+    /// В `single` больше одного household: вмешательство администратора.
+    NeedsAdmin,
+}
+
+impl FirstContactScreen {
+    /// Экран для исхода классификатора; `None` — это онбординг.
+    pub fn from_contact(contact: FirstContact) -> Option<Self> {
+        match contact {
+            FirstContact::Onboard => None,
+            FirstContact::AskInvite => Some(Self::AskInvite),
+            FirstContact::AdminCommand(telegram_id) => Some(Self::AdminCommand(telegram_id)),
+            FirstContact::NotConfigured => Some(Self::NotConfigured),
+            FirstContact::NeedsAdmin => Some(Self::NeedsAdmin),
+        }
+    }
+}
 
 /// Фильтр статуса в поиске.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +76,8 @@ pub enum Screen {
     Menu,
     /// Приветствие после создания пространства.
     Welcome,
+    /// Информационный экран первого контакта без формы онбординга.
+    FirstContact(FirstContactScreen),
     /// Выбор: добавить задачу или покупку.
     Add,
     /// Все списки.
@@ -98,6 +132,11 @@ pub enum Screen {
         /// Новый владелец.
         user_id: Uuid,
     },
+    /// Подтверждение отзыва API-токена.
+    ConfirmRevokeToken {
+        /// Токен.
+        token_id: Uuid,
+    },
     /// Подтверждение выхода.
     ConfirmLeave,
     /// Ссылка на только что созданное приглашение.
@@ -129,6 +168,11 @@ pub enum Screen {
     Timezones,
     /// Участники household.
     Family,
+    /// Активные API-токены household.
+    Integrations {
+        /// Страница с нуля.
+        page: u32,
+    },
     /// Карточка участника.
     Member {
         /// Участник.
@@ -408,6 +452,15 @@ pub enum Action {
         /// Приглашение.
         invite_id: Uuid,
     },
+    /// Отозвать API-токен.
+    RevokeToken {
+        /// Токен.
+        token_id: Uuid,
+    },
+    /// Выпустить токен для Home Assistant.
+    IssueHaToken,
+    /// Удалить сообщение с одноразовым секретом.
+    DismissSecret,
     /// Подтвердить удаление участника.
     MemberRemoveAsk {
         /// Участник.
@@ -939,5 +992,26 @@ impl Form {
             Self::Lead => "lead",
             Self::Time { .. } => "time",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn first_contact_screen_cannot_represent_onboarding() {
+        assert!(
+            serde_json::from_value::<Screen>(json!({"t": "first_contact", "kind": "onboard"}))
+                .is_err(),
+            "an old onboarding screen must fall back instead of being rendered"
+        );
+        assert_eq!(
+            serde_json::from_value::<Screen>(json!({"t": "first_contact", "kind": "ask_invite"}))
+                .expect("ask invite screen"),
+            Screen::FirstContact(FirstContactScreen::AskInvite)
+        );
     }
 }

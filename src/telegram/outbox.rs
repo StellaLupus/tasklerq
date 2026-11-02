@@ -70,6 +70,18 @@ impl Placement {
     }
 }
 
+/// Разобрать `delete_after` из payload строки `message`.
+///
+/// Отсутствующее поле — `Some(None)` («без автоудаления»). Испорченное
+/// значение (отрицательное, дробное, строка, больше `u32::MAX`) даёт `None`,
+/// и вся строка уходит в `invalid_payload`.
+fn delete_after_from_payload(payload: &Value) -> Option<Option<u32>> {
+    match payload.get("delete_after") {
+        None => Some(None),
+        Some(seconds) => u32::try_from(seconds.as_u64()?).ok().map(Some),
+    }
+}
+
 /// Что отправить.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -87,6 +99,11 @@ pub enum Outgoing {
         html: String,
         /// RichMessage с кнопками (иначе обычное HTML-сообщение).
         rich: bool,
+        /// Удалить сообщение через столько секунд после доставки.
+        ///
+        /// `None` — без автоудаления; так читаются старые строки без поля.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delete_after: Option<u32>,
     },
     /// Редактирование конкретного сообщения (например, уведомления).
     Edit {
@@ -117,7 +134,17 @@ impl Outgoing {
             Self::Screen { html, placement } => {
                 json!({"html": html, "placement": placement})
             }
-            Self::Message { html, rich } => json!({"html": html, "rich": rich}),
+            Self::Message {
+                html,
+                rich,
+                delete_after,
+            } => {
+                let mut payload = json!({"html": html, "rich": rich});
+                if let Some(seconds) = delete_after {
+                    payload["delete_after"] = json!(seconds);
+                }
+                payload
+            }
             Self::Edit { message_id, html } => json!({"html": html, "message_id": message_id}),
             Self::Delete { message_id } => json!({"message_id": message_id}),
         }
@@ -135,6 +162,11 @@ impl Outgoing {
                     .get("rich")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                // Отсутствующее поле — «без автоудаления»: старые строки и все
+                // обычные сообщения. Испорченное значение не подменяется
+                // умолчанием: строка уходит в `invalid_payload`, иначе
+                // сообщение с секретом осталось бы в чате без таймера.
+                delete_after: delete_after_from_payload(payload)?,
             }),
             "edit" => Some(Self::Edit {
                 message_id: payload.get("message_id")?.as_i64()?,
@@ -161,6 +193,24 @@ pub async fn enqueue(
     outgoing: &Outgoing,
     dedupe_key: Option<&str>,
     now: DateTime<Utc>,
+) -> Result<Option<i64>, sqlx::Error> {
+    enqueue_at(conn, chat_id, outgoing, dedupe_key, now, now).await
+}
+
+/// Поставить сообщение в очередь с временем выполнения `run_at`.
+///
+/// `now` — время постановки (`created_at`), `run_at` — когда строку можно
+/// доставлять (`next_attempt_at`). Строка, изначально запланированная на
+/// будущее, не блокирует очередь чата: `run_once` отличает её по
+/// `next_attempt_at > now` и пустому `last_error`. Во всём остальном —
+/// как [`enqueue`].
+pub async fn enqueue_at(
+    conn: &mut PgConnection,
+    chat_id: i64,
+    outgoing: &Outgoing,
+    dedupe_key: Option<&str>,
+    now: DateTime<Utc>,
+    run_at: DateTime<Utc>,
 ) -> Result<Option<i64>, sqlx::Error> {
     let outgoing = if let Outgoing::Screen { html, placement } = outgoing {
         // Блокировка и вытеснение — один запрос: воркер не может доставить
@@ -203,7 +253,7 @@ pub async fn enqueue(
 
     let seq: Option<i64> = sqlx::query_scalar(
         "INSERT INTO outbox (chat_id, kind, payload, dedupe_key, next_attempt_at, created_at)
-         VALUES ($1, $2::outbox_kind, $3, $4, $5, $5)
+         VALUES ($1, $2::outbox_kind, $3, $4, $5, $6)
          ON CONFLICT (dedupe_key) DO NOTHING
          RETURNING seq",
     )
@@ -211,6 +261,7 @@ pub async fn enqueue(
     .bind(outgoing.kind())
     .bind(outgoing.payload())
     .bind(dedupe_key)
+    .bind(run_at)
     .bind(now)
     .fetch_optional(conn)
     .await?;
@@ -474,6 +525,24 @@ impl OutboxWorker {
                 if matches!(outgoing, Outgoing::Message { .. }) {
                     views::mark_buried(&mut tx, row.chat_id).await?;
                 }
+                // Автоудаление отсчитывается от фактической доставки, поэтому
+                // строка ставится здесь же, в транзакции отметки `sent`.
+                if let Outgoing::Message {
+                    delete_after: Some(seconds),
+                    ..
+                } = &outgoing
+                {
+                    let key = format!("expire:{}:{message_id}", row.chat_id);
+                    enqueue_at(
+                        &mut tx,
+                        row.chat_id,
+                        &Outgoing::Delete { message_id },
+                        Some(&key),
+                        now,
+                        now + Duration::seconds(i64::from(*seconds)),
+                    )
+                    .await?;
+                }
                 Delivery::Sent
             }
             Err(TelegramError::RetryAfter(seconds)) => {
@@ -666,7 +735,7 @@ async fn deliver(
                 .map_err(db)?;
             Ok(message_id)
         }
-        Outgoing::Message { html, rich } => {
+        Outgoing::Message { html, rich, .. } => {
             if *rich {
                 api.send_rich_message(row.chat_id, &RichMessage { html: html.clone() })
                     .await
@@ -802,6 +871,12 @@ mod tests {
             Outgoing::Message {
                 html: "b".into(),
                 rich: true,
+                delete_after: None,
+            },
+            Outgoing::Message {
+                html: "b".into(),
+                rich: false,
+                delete_after: Some(3_600),
             },
             Outgoing::Edit {
                 message_id: 7,
@@ -854,5 +929,56 @@ mod tests {
     fn placement_order_reflects_visibility_strength() {
         assert!(Placement::InPlace < Placement::Visible);
         assert!(Placement::Visible < Placement::Fresh);
+    }
+
+    #[test]
+    fn message_row_without_delete_after_reads_as_no_auto_delete() {
+        assert_eq!(
+            Outgoing::from_row("message", &json!({"html": "a", "rich": true})),
+            Some(Outgoing::Message {
+                html: "a".into(),
+                rich: true,
+                delete_after: None,
+            })
+        );
+    }
+
+    #[test]
+    fn message_row_with_invalid_delete_after_is_not_parsed() {
+        for delete_after in [
+            json!(-1),
+            json!("abc"),
+            json!(1.5),
+            json!(u64::from(u32::MAX) + 1),
+        ] {
+            assert_eq!(
+                Outgoing::from_row(
+                    "message",
+                    &json!({"html": "a", "rich": true, "delete_after": delete_after})
+                ),
+                None,
+                "delete_after {delete_after} must become invalid_payload, not no auto delete"
+            );
+        }
+    }
+
+    #[test]
+    fn message_payload_has_delete_after_only_when_set() {
+        let plain = Outgoing::Message {
+            html: "a".into(),
+            rich: false,
+            delete_after: None,
+        };
+        assert_eq!(plain.payload(), json!({"html": "a", "rich": false}));
+
+        let expiring = Outgoing::Message {
+            html: "a".into(),
+            rich: false,
+            delete_after: Some(3_600),
+        };
+        assert_eq!(
+            expiring.payload(),
+            json!({"html": "a", "rich": false, "delete_after": 3_600})
+        );
     }
 }

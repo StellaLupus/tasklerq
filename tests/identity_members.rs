@@ -642,6 +642,10 @@ async fn household_deletion_requires_confirmation_and_revokes_access() {
         .await
         .expect("household")
         .name;
+    let owner_name = users::get(&mut conn, household.household_id, household.owner_id)
+        .await
+        .expect("owner")
+        .display_name;
     drop(conn);
 
     // Подтверждение должно совпадать с названием; участник удалять не может.
@@ -693,6 +697,23 @@ async fn household_deletion_requires_confirmation_and_revokes_access() {
             .expect("row");
     assert!(deleted_at.is_some());
 
+    let (actor_type, actor_user_id, payload): (String, Option<Uuid>, serde_json::Value) =
+        sqlx::query_as(
+            "SELECT actor_type::text, actor_user_id, payload
+             FROM audit_events
+             WHERE household_id = $1 AND event_type::text = 'household_deleted'
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+        )
+        .bind(household.household_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("household_deleted audit");
+    assert_eq!(actor_type, "user");
+    assert_eq!(actor_user_id, Some(household.owner_id));
+    assert_eq!(payload["actor_name"], owner_name);
+    assert_eq!(payload["members"], 2);
+
     // Токены отозваны, приглашения не работают, участники потеряли доступ.
     let (status, _) =
         support::request(&app, Method::GET, "/api/v1/household", Some(&token), None).await;
@@ -717,6 +738,7 @@ async fn household_deletion_requires_confirmation_and_revokes_access() {
         .expect("telegram id");
     let onboarded = households::onboard(
         &mut conn,
+        tasklerq::config::TenancyMode::Multi,
         "Новая семья",
         "Europe/Moscow",
         households::NewOwner {
@@ -813,6 +835,7 @@ async fn journal_is_owner_only_paged_and_free_of_secrets() {
     tx.commit().await.expect("commit");
     let issued = admin::create_token(
         &db.pool,
+        tasklerq::config::TenancyMode::Single,
         Some(household.household_id),
         "Журнал",
         &["ha:read".to_owned()],

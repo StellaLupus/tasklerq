@@ -7,11 +7,13 @@ mod support;
 
 use std::process::{Output, Stdio};
 
+use axum::http::{Method, StatusCode};
 use chrono::Utc;
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use tasklerq::auth::tokens::{SCOPES, hash_token};
 use tasklerq::storage::migrations;
+use tasklerq::storage::repositories::invites;
 use tokio::process::Command;
 use uuid::Uuid;
 use wiremock::matchers::{method, path};
@@ -44,6 +46,18 @@ fn bin() -> Command {
 async fn run(url: &str, args: &[&str]) -> Output {
     bin()
         .env("DATABASE_URL", url)
+        .env("RUST_LOG", "error")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .expect("the CLI should run")
+}
+
+async fn run_with_tenancy(url: &str, mode: &str, args: &[&str]) -> Output {
+    bin()
+        .env("DATABASE_URL", url)
+        .env("TENANCY_MODE", mode)
         .env("RUST_LOG", "error")
         .args(args)
         .stdin(Stdio::null())
@@ -133,15 +147,770 @@ async fn household_list_shows_members_timezone_and_no_secrets() {
         .find(|line| line.starts_with(&household_id))
         .unwrap_or_else(|| panic!("household {household_id} missing:\n{text}"));
     let columns: Vec<&str> = line.split('\t').collect();
-    assert_eq!(columns.len(), 5, "id, name, timezone, members, created_at");
+    assert_eq!(
+        columns.len(),
+        8,
+        "id, name, timezone, owner, members, open tasks, active tokens, created_at"
+    );
     assert_eq!(columns[1], "Семья CLI");
     assert_eq!(columns[2], "Asia/Yekaterinburg");
-    assert_eq!(columns[3], "1", "one active member");
-    assert!(!columns[4].is_empty(), "creation date is printed");
+    assert_eq!(columns[3], "123456789", "owner Telegram id");
+    assert_eq!(columns[4], "1", "one active member");
+    assert_eq!(columns[5], "0", "no open tasks");
+    assert_eq!(columns[6], "0", "no active tokens");
+    assert!(!columns[7].is_empty(), "creation date is printed");
 
     for forbidden in ["token_hash", "tlq_", "secret", "password"] {
         assert!(
             !text.to_lowercase().contains(forbidden),
+            "household list must not contain {forbidden}:\n{text}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_create_in_single_mode_rejects_a_second_household() {
+    let db = cli_database().await;
+
+    let first = run_with_tenancy(
+        &db.url,
+        "single",
+        &["admin", "household", "create", "--name", "Первая"],
+    )
+    .await;
+    assert!(first.status.success(), "{first:?}");
+
+    let second = run_with_tenancy(
+        &db.url,
+        "single",
+        &[
+            "admin",
+            "household",
+            "create",
+            "--name",
+            "Вторая",
+            "--owner-telegram-id",
+            "222222222",
+            "--owner-name",
+            "Второй",
+        ],
+    )
+    .await;
+    assert!(!second.status.success(), "{second:?}");
+    let combined = format!("{}{}", stdout(&second), stderr(&second));
+    assert!(
+        combined.contains("409"),
+        "the CLI should report a 409 conflict:\n{combined}"
+    );
+
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM households")
+        .fetch_one(&db.pool)
+        .await
+        .expect("count");
+    assert_eq!(count, 1);
+    let owners: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM users WHERE telegram_user_id = 222222222")
+            .fetch_one(&db.pool)
+            .await
+            .expect("owner count");
+    assert_eq!(owners, 0, "the rejected owner must not be created");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_create_in_multi_mode_allows_a_second_household() {
+    let db = cli_database().await;
+
+    for name in ["Первая", "Вторая"] {
+        let output = run_with_tenancy(
+            &db.url,
+            "multi",
+            &["admin", "household", "create", "--name", name],
+        )
+        .await;
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM households")
+        .fetch_one(&db.pool)
+        .await
+        .expect("count");
+    assert_eq!(count, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_create_with_owner_creates_owner_and_default_lists() {
+    let db = cli_database().await;
+
+    let output = run(
+        &db.url,
+        &[
+            "admin",
+            "household",
+            "create",
+            "--name",
+            "Семья с владельцем",
+            "--timezone",
+            "Asia/Yekaterinburg",
+            "--owner-telegram-id",
+            "123456789",
+            "--owner-name",
+            "Алексей",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    let household_id = field(&text, "id");
+    let household_id = Uuid::parse_str(&household_id).expect("household id");
+    assert_eq!(field(&text, "name"), "Семья с владельцем");
+    assert_eq!(field(&text, "timezone"), "Asia/Yekaterinburg");
+    assert_eq!(field(&text, "owner"), "123456789");
+
+    let lists: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM lists WHERE household_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("lists");
+    assert_eq!(lists, 2, "both default lists are created");
+
+    let users: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT telegram_user_id, role::text, display_name FROM users
+         WHERE household_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(household_id)
+    .fetch_all(&db.pool)
+    .await
+    .expect("users");
+    assert_eq!(users.len(), 1, "exactly one owner is created");
+    assert_eq!(users[0].0, 123456789);
+    assert_eq!(users[0].1, "owner");
+    assert_eq!(users[0].2, "Алексей");
+
+    let chat_ids: Vec<i64> =
+        sqlx::query_scalar("SELECT telegram_chat_id FROM users WHERE household_id = $1")
+            .bind(household_id)
+            .fetch_all(&db.pool)
+            .await
+            .expect("chat ids");
+    assert_eq!(
+        chat_ids,
+        vec![123456789],
+        "the private chat id equals the Telegram id"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_create_with_owner_audits_as_a_system_action() {
+    let db = cli_database().await;
+
+    let output = run(
+        &db.url,
+        &[
+            "admin",
+            "household",
+            "create",
+            "--name",
+            "Семья с владельцем",
+            "--timezone",
+            "Asia/Yekaterinburg",
+            "--owner-telegram-id",
+            "123456789",
+            "--owner-name",
+            "Алексей",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{output:?}");
+    let household_id = Uuid::parse_str(&field(&stdout(&output), "id")).expect("household id");
+
+    let (actor_type, actor_user_id, payload): (String, Option<Uuid>, Value) = sqlx::query_as(
+        "SELECT actor_type::text, actor_user_id, payload FROM audit_events
+         WHERE household_id = $1 AND event_type = 'household_created'",
+    )
+    .bind(household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("household_created event");
+    assert_eq!(
+        actor_type, "system",
+        "the CLI initiator is the administrator"
+    );
+    assert_eq!(actor_user_id, None);
+    assert_eq!(payload["household_name"], "Семья с владельцем");
+    assert_eq!(payload["timezone"], "Asia/Yekaterinburg");
+    assert_eq!(payload["display_name"], "Алексей");
+    assert_eq!(payload["role"], "owner");
+    assert!(payload["user_id"].is_string(), "the owner id is recorded");
+    assert!(
+        payload.get("actor_name").is_none(),
+        "a system action must not pose as the owner"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_create_with_owner_requires_a_telegram_id() {
+    let output = bin()
+        .args([
+            "admin",
+            "household",
+            "create",
+            "--name",
+            "Без ID",
+            "--owner-name",
+            "Алексей",
+        ])
+        .output()
+        .await
+        .expect("the CLI should run");
+
+    assert!(!output.status.success(), "{output:?}");
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        combined.contains("--owner-telegram-id"),
+        "the owner name requires an owner Telegram id:\n{combined}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_create_rejects_a_non_positive_owner_telegram_id() {
+    let output = bin()
+        .args([
+            "admin",
+            "household",
+            "create",
+            "--name",
+            "Нулевой ID",
+            "--owner-telegram-id",
+            "0",
+        ])
+        .output()
+        .await
+        .expect("the CLI should run");
+
+    assert!(!output.status.success(), "{output:?}");
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        combined.contains("--owner-telegram-id"),
+        "the Telegram id must be positive:\n{combined}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_create_with_owner_rejects_a_telegram_id_from_another_household() {
+    let db = cli_database().await;
+    let telegram_id = "555555555";
+
+    let first = run_with_tenancy(
+        &db.url,
+        "multi",
+        &[
+            "admin",
+            "household",
+            "create",
+            "--name",
+            "Первая",
+            "--owner-telegram-id",
+            telegram_id,
+            "--owner-name",
+            "Первый",
+        ],
+    )
+    .await;
+    assert!(first.status.success(), "{first:?}");
+
+    let second = run_with_tenancy(
+        &db.url,
+        "multi",
+        &[
+            "admin",
+            "household",
+            "create",
+            "--name",
+            "Вторая",
+            "--owner-telegram-id",
+            telegram_id,
+            "--owner-name",
+            "Второй",
+        ],
+    )
+    .await;
+    assert!(!second.status.success(), "{second:?}");
+    let combined = format!("{}{}", stdout(&second), stderr(&second));
+    assert!(
+        combined.contains("409"),
+        "an occupied Telegram id is a conflict:\n{combined}"
+    );
+
+    let households: i64 = sqlx::query_scalar("SELECT count(*) FROM households")
+        .fetch_one(&db.pool)
+        .await
+        .expect("households");
+    assert_eq!(households, 1, "the failed command creates nothing");
+    let users: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE telegram_user_id = $1")
+        .bind(telegram_id.parse::<i64>().expect("id"))
+        .fetch_one(&db.pool)
+        .await
+        .expect("users");
+    assert_eq!(users, 1, "the existing owner is unchanged");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_create_with_owner_rolls_back_when_the_owner_is_invalid() {
+    let db = cli_database().await;
+    let long_name = "я".repeat(65);
+
+    let output = run(
+        &db.url,
+        &[
+            "admin",
+            "household",
+            "create",
+            "--name",
+            "Откат",
+            "--owner-telegram-id",
+            "777777777",
+            "--owner-name",
+            &long_name,
+        ],
+    )
+    .await;
+    assert!(!output.status.success(), "{output:?}");
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        combined.contains("422"),
+        "an invalid owner name is a validation error:\n{combined}"
+    );
+
+    let households: i64 = sqlx::query_scalar("SELECT count(*) FROM households")
+        .fetch_one(&db.pool)
+        .await
+        .expect("households");
+    assert_eq!(
+        households, 0,
+        "the household inserted before the owner is rolled back"
+    );
+    let users: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
+        .fetch_one(&db.pool)
+        .await
+        .expect("users");
+    assert_eq!(users, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_create_without_owner_prints_the_add_user_hint() {
+    let db = cli_database().await;
+
+    let output = run(
+        &db.url,
+        &["admin", "household", "create", "--name", "Без владельца"],
+    )
+    .await;
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    let household_id = field(&text, "id");
+    let expected = format!(
+        "tasklerq admin user add --telegram-id <id> --role owner --household {household_id}"
+    );
+    assert!(
+        text.lines().any(|line| line == expected),
+        "the CLI should print the owner hint:\n{text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_delete_revokes_access_and_records_a_system_audit() {
+    let db = cli_database().await;
+    let household = support::create_household(&db.pool).await;
+    let app = support::app(&db.pool);
+    let token = support::issue_token(&db.pool, household.household_id, &["ha:read"]).await;
+    let now = Utc::now();
+    let mut tx = db.pool.begin().await.expect("tx");
+    let invite = invites::create(&mut tx, household.household_id, &household.owner(), now)
+        .await
+        .expect("invite");
+    tx.commit().await.expect("commit");
+
+    let household_id = household.household_id.to_string();
+    let output = run(
+        &db.url,
+        &[
+            "admin",
+            "household",
+            "delete",
+            "--household",
+            &household_id,
+            "--yes",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert_eq!(field(&text, "id"), household_id);
+    assert_eq!(field(&text, "members"), "2");
+    assert_eq!(field(&text, "revoked_tokens"), "1");
+    assert_eq!(field(&text, "revoked_invites"), "1");
+    assert!(!text.contains(&token), "the token value is not printed");
+
+    let (deleted_at,): (Option<chrono::DateTime<Utc>>,) =
+        sqlx::query_as("SELECT deleted_at FROM households WHERE id = $1")
+            .bind(household.household_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("household row");
+    assert!(deleted_at.is_some());
+    let active_members: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM users WHERE household_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(household.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("active members");
+    assert_eq!(active_members, 0, "all members are marked deleted");
+    let members: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE household_id = $1")
+        .bind(household.household_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("members");
+    assert_eq!(members, 2, "the rows stay until retention");
+    let (token_revoked,): (Option<chrono::DateTime<Utc>>,) =
+        sqlx::query_as("SELECT revoked_at FROM api_tokens WHERE household_id = $1")
+            .bind(household.household_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("token");
+    assert!(token_revoked.is_some());
+    let (invite_revoked,): (Option<chrono::DateTime<Utc>>,) =
+        sqlx::query_as("SELECT revoked_at FROM invites WHERE id = $1")
+            .bind(invite.invite.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("invite");
+    assert!(invite_revoked.is_some());
+
+    let (actor_type, actor_user_id, payload): (String, Option<Uuid>, Value) = sqlx::query_as(
+        "SELECT actor_type::text, actor_user_id, payload
+         FROM audit_events
+         WHERE household_id = $1 AND event_type::text = 'household_deleted'
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1",
+    )
+    .bind(household.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("household_deleted audit");
+    assert_eq!(actor_type, "system");
+    assert_eq!(actor_user_id, None);
+    assert_eq!(payload["members"].as_u64(), Some(2));
+    assert_eq!(payload["revoked_tokens"].as_u64(), Some(1));
+    assert_eq!(payload["revoked_invites"].as_u64(), Some(1));
+    assert!(
+        payload.get("actor_name").is_none(),
+        "a system actor has no display name"
+    );
+
+    let (status, _) =
+        support::request(&app, Method::GET, "/api/v1/household", Some(&token), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_delete_without_yes_in_non_interactive_mode_changes_nothing() {
+    let db = cli_database().await;
+    let household = support::create_household(&db.pool).await;
+    let _token = support::issue_token(&db.pool, household.household_id, &["ha:read"]).await;
+    let now = Utc::now();
+    let mut tx = db.pool.begin().await.expect("tx");
+    let invite = invites::create(&mut tx, household.household_id, &household.owner(), now)
+        .await
+        .expect("invite");
+    tx.commit().await.expect("commit");
+
+    let household_id = household.household_id.to_string();
+    let output = run(
+        &db.url,
+        &["admin", "household", "delete", "--household", &household_id],
+    )
+    .await;
+    assert!(!output.status.success(), "{output:?}");
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        combined.contains("--yes"),
+        "the CLI asks for --yes without a terminal:\n{combined}"
+    );
+
+    let (deleted_at,): (Option<chrono::DateTime<Utc>>,) =
+        sqlx::query_as("SELECT deleted_at FROM households WHERE id = $1")
+            .bind(household.household_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("household row");
+    assert!(deleted_at.is_none());
+    let active_members: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM users WHERE household_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(household.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("active members");
+    assert_eq!(active_members, 2);
+    let (token_revoked,): (Option<chrono::DateTime<Utc>>,) =
+        sqlx::query_as("SELECT revoked_at FROM api_tokens WHERE household_id = $1")
+            .bind(household.household_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("token");
+    assert!(token_revoked.is_none());
+    let (invite_revoked,): (Option<chrono::DateTime<Utc>>,) =
+        sqlx::query_as("SELECT revoked_at FROM invites WHERE id = $1")
+            .bind(invite.invite.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("invite");
+    assert!(invite_revoked.is_none());
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events
+         WHERE household_id = $1 AND event_type::text = 'household_deleted'",
+    )
+    .bind(household.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("audit count");
+    assert_eq!(audits, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_delete_reports_not_found_for_deleted_and_unknown_households() {
+    let db = cli_database().await;
+    let household = support::create_household(&db.pool).await;
+    let household_id = household.household_id.to_string();
+
+    let first = run(
+        &db.url,
+        &[
+            "admin",
+            "household",
+            "delete",
+            "--household",
+            &household_id,
+            "--yes",
+        ],
+    )
+    .await;
+    assert!(first.status.success(), "{first:?}");
+
+    let again = run(
+        &db.url,
+        &[
+            "admin",
+            "household",
+            "delete",
+            "--household",
+            &household_id,
+            "--yes",
+        ],
+    )
+    .await;
+    assert!(!again.status.success(), "{again:?}");
+    let combined = format!("{}{}", stdout(&again), stderr(&again));
+    assert!(
+        combined.contains("404"),
+        "a second delete reports not found:\n{combined}"
+    );
+
+    let unknown = Uuid::now_v7().to_string();
+    let missing = run(
+        &db.url,
+        &[
+            "admin",
+            "household",
+            "delete",
+            "--household",
+            &unknown,
+            "--yes",
+        ],
+    )
+    .await;
+    assert!(!missing.status.success(), "{missing:?}");
+    let combined = format!("{}{}", stdout(&missing), stderr(&missing));
+    assert!(
+        combined.contains("404"),
+        "an unknown household reports not found:\n{combined}"
+    );
+
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events WHERE event_type::text = 'household_deleted'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("audit count");
+    assert_eq!(audits, 1, "failed deletions write no audit");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_list_shows_owner_open_tasks_and_active_tokens_without_secrets() {
+    let db = cli_database().await;
+    let ours = support::create_household(&db.pool).await;
+    let owner_telegram_id: i64 =
+        sqlx::query_scalar("SELECT telegram_user_id FROM users WHERE id = $1")
+            .bind(ours.owner_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("owner telegram id");
+
+    let other = run_with_tenancy(
+        &db.url,
+        "multi",
+        &[
+            "admin",
+            "household",
+            "create",
+            "--name",
+            "Без владельца",
+            "--timezone",
+            "Asia/Yekaterinburg",
+        ],
+    )
+    .await;
+    assert!(other.status.success(), "{other:?}");
+    let other_id = Uuid::parse_str(&field(&stdout(&other), "id")).expect("other id");
+    let other_tasks: Uuid = sqlx::query_scalar(
+        "SELECT id FROM lists WHERE household_id = $1 AND kind = 'tasks' AND deleted_at IS NULL",
+    )
+    .bind(other_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("other tasks list");
+
+    let now = Utc::now();
+    let insert_item = |list_id: Uuid, title: &'static str, status: &'static str, deleted: bool| {
+        let pool = db.pool.clone();
+        let household_id = if list_id == other_tasks {
+            other_id
+        } else {
+            ours.household_id
+        };
+        async move {
+            sqlx::query(
+                "INSERT INTO items (id, household_id, list_id, title, status, completed_at,
+                                    deleted_at, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5::item_status,
+                         CASE WHEN $5 = 'done' THEN now() ELSE NULL END,
+                         CASE WHEN $6 THEN now() ELSE NULL END, $7, $7)",
+            )
+            .bind(Uuid::now_v7())
+            .bind(household_id)
+            .bind(list_id)
+            .bind(title)
+            .bind(status)
+            .bind(deleted)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .expect("item");
+        }
+    };
+
+    // Открытая задача, выполненная и удалённая задачи, открытая покупка.
+    insert_item(
+        ours.tasks_list_id,
+        "СЕКРЕТНАЯ ЗАДАЧА ОТКРЫТАЯ",
+        "open",
+        false,
+    )
+    .await;
+    insert_item(
+        ours.tasks_list_id,
+        "СЕКРЕТНАЯ ЗАДАЧА ВЫПОЛНЕННАЯ",
+        "done",
+        false,
+    )
+    .await;
+    insert_item(
+        ours.tasks_list_id,
+        "СЕКРЕТНАЯ ЗАДАЧА УДАЛЁННАЯ",
+        "open",
+        true,
+    )
+    .await;
+    insert_item(ours.shopping_list_id, "СЕКРЕТНАЯ ПОКУПКА", "open", false).await;
+    insert_item(other_tasks, "ЧУЖАЯ ОТКРЫТАЯ 1", "open", false).await;
+    insert_item(other_tasks, "ЧУЖАЯ ОТКРЫТАЯ 2", "open", false).await;
+    insert_item(other_tasks, "ЧУЖАЯ ВЫПОЛНЕННАЯ", "done", false).await;
+
+    let active = support::issue_token(&db.pool, ours.household_id, &["ha:read"]).await;
+    let revoked = support::issue_token(&db.pool, ours.household_id, &["ha:read"]).await;
+    sqlx::query("UPDATE api_tokens SET revoked_at = now() WHERE token_hash = $1")
+        .bind(hash_token(&revoked))
+        .execute(&db.pool)
+        .await
+        .expect("revoke token");
+    let expired = support::issue_token(&db.pool, ours.household_id, &["ha:read"]).await;
+    sqlx::query(
+        "UPDATE api_tokens SET expires_at = now() - interval '1 day' WHERE token_hash = $1",
+    )
+    .bind(hash_token(&expired))
+    .execute(&db.pool)
+    .await
+    .expect("expire token");
+    let other_active = support::issue_token(&db.pool, other_id, &["ha:read"]).await;
+
+    let listed = run(&db.url, &["admin", "household", "list"]).await;
+    assert!(listed.status.success(), "{listed:?}");
+    let text = stdout(&listed);
+
+    let line = |id: Uuid| -> Vec<String> {
+        let id = id.to_string();
+        text.lines()
+            .find(|line| line.starts_with(&id))
+            .unwrap_or_else(|| panic!("household {id} missing:\n{text}"))
+            .split('\t')
+            .map(str::to_owned)
+            .collect()
+    };
+
+    let ours_columns = line(ours.household_id);
+    assert_eq!(
+        ours_columns.len(),
+        8,
+        "id, name, timezone, owner, members, open tasks, active tokens, created_at"
+    );
+    assert_eq!(ours_columns[0], ours.household_id.to_string());
+    assert_eq!(ours_columns[2], "Europe/Moscow");
+    assert_eq!(ours_columns[3], owner_telegram_id.to_string());
+    assert_eq!(ours_columns[4], "2", "the owner and the member");
+    assert_eq!(ours_columns[5], "1", "only the open task is counted");
+    assert_eq!(
+        ours_columns[6], "1",
+        "revoked and expired tokens are not counted"
+    );
+    assert!(!ours_columns[7].is_empty(), "creation date is printed");
+
+    let other_columns = line(other_id);
+    assert_eq!(other_columns.len(), 8);
+    assert_eq!(other_columns[1], "Без владельца");
+    assert_eq!(other_columns[2], "Asia/Yekaterinburg");
+    assert_eq!(other_columns[3], "-", "a household without owner shows -");
+    assert_eq!(other_columns[4], "0");
+    assert_eq!(other_columns[5], "2", "the completed task is not counted");
+    assert_eq!(other_columns[6], "1");
+    assert!(!other_columns[7].is_empty());
+
+    for forbidden in [
+        "СЕКРЕТНАЯ ЗАДАЧА",
+        "СЕКРЕТНАЯ ПОКУПКА",
+        "ЧУЖАЯ ОТКРЫТАЯ",
+        "ЧУЖАЯ ВЫПОЛНЕННАЯ",
+        "test token",
+        "tlq_",
+        active.as_str(),
+        revoked.as_str(),
+        expired.as_str(),
+        other_active.as_str(),
+    ] {
+        assert!(
+            !text.contains(forbidden),
             "household list must not contain {forbidden}:\n{text}"
         );
     }
@@ -662,4 +1431,100 @@ async fn export_uses_the_only_household_when_not_specified() {
         household.household_id.to_string(),
         "the single household is used without --household"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_token_create_requires_household_even_when_unique() {
+    let db = cli_database().await;
+    let household = support::create_household(&db.pool).await;
+
+    let without = run_with_tenancy(
+        &db.url,
+        "multi",
+        &[
+            "admin", "token", "create", "--name", "HA", "--scopes", "ha:read",
+        ],
+    )
+    .await;
+    assert!(!without.status.success(), "{without:?}");
+    let combined = format!("{}{}", stdout(&without), stderr(&without));
+    assert!(
+        combined.contains("--household"),
+        "multi must ask for --household:\n{combined}"
+    );
+    let tokens: i64 = sqlx::query_scalar("SELECT count(*) FROM api_tokens WHERE household_id = $1")
+        .bind(household.household_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("token count");
+    assert_eq!(tokens, 0, "no token is created without --household");
+
+    let household_id = household.household_id.to_string();
+    let with = run_with_tenancy(
+        &db.url,
+        "multi",
+        &[
+            "admin",
+            "token",
+            "create",
+            "--household",
+            &household_id,
+            "--name",
+            "HA",
+            "--scopes",
+            "ha:read",
+        ],
+    )
+    .await;
+    assert!(with.status.success(), "{with:?}");
+    let token = field(&stdout(&with), "token");
+    assert!(token.starts_with("tlq_"), "the token is printed once");
+    let tokens: i64 = sqlx::query_scalar("SELECT count(*) FROM api_tokens WHERE household_id = $1")
+        .bind(household.household_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("token count");
+    assert_eq!(tokens, 1, "the explicit household gets the token");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_export_requires_household_even_when_unique() {
+    let db = cli_database().await;
+    let household = support::create_household(&db.pool).await;
+    let dir = std::env::temp_dir().join(format!("tasklerq-export-{}", Uuid::now_v7().simple()));
+    std::fs::create_dir_all(&dir).expect("temporary directory");
+    let path = dir.join("export.json");
+    let path_str = path.to_str().expect("path");
+
+    let without =
+        run_with_tenancy(&db.url, "multi", &["admin", "export", "--output", path_str]).await;
+    assert!(!without.status.success(), "{without:?}");
+    let combined = format!("{}{}", stdout(&without), stderr(&without));
+    assert!(
+        combined.contains("--household"),
+        "multi must ask for --household:\n{combined}"
+    );
+    assert!(stdout(&without).is_empty(), "no JSON is written to stdout");
+    assert!(!path.exists(), "no export file is created");
+
+    let household_id = household.household_id.to_string();
+    let with = run_with_tenancy(
+        &db.url,
+        "multi",
+        &[
+            "admin",
+            "export",
+            "--household",
+            &household_id,
+            "--output",
+            path_str,
+        ],
+    )
+    .await;
+    assert!(with.status.success(), "{with:?}");
+    let written = std::fs::read_to_string(&path).expect("export file");
+    let export: Value = serde_json::from_str(&written).expect("file is JSON");
+    assert_eq!(export["household"]["id"], household_id);
+
+    std::fs::remove_dir_all(&dir).ok();
 }
