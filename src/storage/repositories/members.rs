@@ -13,9 +13,29 @@ use uuid::Uuid;
 use crate::auth::access::require_user;
 use crate::domain::error::DomainError;
 use crate::domain::identity::{AuditEventType, MembershipChange, MembershipNotice, NoticeKind};
-use crate::domain::models::{Actor, EventType, User, UserRole};
+use crate::domain::models::{Actor, EventType, Household, User, UserRole};
 
 use super::{audit, events, invites, tokens, users};
+
+/// Результат мягкого удаления household.
+#[derive(Debug)]
+pub struct DeletedHousehold {
+    /// Название на момент удаления.
+    pub name: String,
+    /// Активные участники на момент удаления.
+    pub members: Vec<User>,
+    /// Сколько токенов отозвано.
+    pub revoked_tokens: u64,
+    /// Сколько приглашений отозвано.
+    pub revoked_invites: u64,
+}
+
+/// Совпадает ли подтверждение с названием household.
+///
+/// Пробелы по краям ввода не учитываются; регистр и остальные символы важны.
+pub fn confirmation_matches(name: &str, confirmation: &str) -> bool {
+    confirmation.trim() == name
+}
 
 /// Удалить участника из household. Только владелец.
 ///
@@ -201,13 +221,62 @@ pub async fn delete_household(
         .bind(household_id)
         .fetch_one(&mut *conn)
         .await?;
-    if confirmation.trim() != name {
+    if !confirmation_matches(&name, confirmation) {
         return Err(DomainError::Validation(
             "confirmation must match the household name".into(),
         ));
     }
 
+    let deleted = delete_household_unchecked(conn, household_id, actor, now).await?;
+
+    let notices = deleted
+        .members
+        .into_iter()
+        .filter(|member| member.id != owner.id)
+        .map(|member| MembershipNotice {
+            recipient_user_id: member.id,
+            chat_id: member.telegram_chat_id,
+            kind: NoticeKind::HouseholdDeleted {
+                household_name: deleted.name.clone(),
+            },
+        })
+        .collect();
+
+    Ok(MembershipChange {
+        notices,
+        unassigned_items: 0,
+    })
+}
+
+/// Мягко удалить household без проверки владельца.
+///
+/// Блокирует активную строку household (`FOR UPDATE`); уже удалённый или
+/// несуществующий household даёт [`DomainError::NotFound`]. Помечает удалёнными
+/// household и всех активных участников, отзывает токены и приглашения и пишет
+/// аудит `HouseholdDeleted` от переданного актора. Уведомления участникам
+/// отправляет только владельческий путь через бота.
+pub async fn delete_household_unchecked(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    actor: &Actor,
+    now: DateTime<Utc>,
+) -> Result<DeletedHousehold, DomainError> {
+    let household = sqlx::query_as::<_, Household>(
+        "SELECT id, name, timezone, created_at, updated_at, deleted_at
+         FROM households
+         WHERE id = $1 AND deleted_at IS NULL
+         FOR UPDATE",
+    )
+    .bind(household_id)
+    .fetch_optional(&mut *conn)
+    .await?
+    .ok_or(DomainError::NotFound)?;
+
     let members = users::list_active(conn, household_id).await?;
+    let actor_name = actor
+        .user_id
+        .and_then(|user_id| members.iter().find(|member| member.id == user_id))
+        .map(|member| member.display_name.clone());
 
     sqlx::query("UPDATE households SET deleted_at = $2, updated_at = $2 WHERE id = $1")
         .bind(household_id)
@@ -225,37 +294,30 @@ pub async fn delete_household(
     let revoked_tokens = tokens::revoke_all(conn, household_id, now).await?;
     let revoked_invites = invites::revoke_all(conn, household_id, now).await?;
 
+    let mut payload = json!({
+        "household_name": household.name.clone(),
+        "members": members.len(),
+        "revoked_tokens": revoked_tokens,
+        "revoked_invites": revoked_invites,
+    });
+    if let Some(actor_name) = actor_name {
+        payload["actor_name"] = json!(actor_name);
+    }
     audit::record(
         conn,
         Some(household_id),
         actor,
         AuditEventType::HouseholdDeleted,
-        json!({
-            "household_name": name,
-            "members": members.len(),
-            "revoked_tokens": revoked_tokens,
-            "revoked_invites": revoked_invites,
-            "actor_name": owner.display_name,
-        }),
+        payload,
         now,
     )
     .await?;
 
-    let notices = members
-        .into_iter()
-        .filter(|member| member.id != owner.id)
-        .map(|member| MembershipNotice {
-            recipient_user_id: member.id,
-            chat_id: member.telegram_chat_id,
-            kind: NoticeKind::HouseholdDeleted {
-                household_name: name.clone(),
-            },
-        })
-        .collect();
-
-    Ok(MembershipChange {
-        notices,
-        unassigned_items: 0,
+    Ok(DeletedHousehold {
+        name: household.name,
+        members,
+        revoked_tokens,
+        revoked_invites,
     })
 }
 
@@ -316,4 +378,17 @@ async fn detach(
     }
 
     Ok(unassigned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::confirmation_matches;
+
+    #[test]
+    fn household_name_confirmation_trims_surrounding_spaces_only() {
+        assert!(confirmation_matches("Семья", "  Семья \n"));
+        assert!(!confirmation_matches("Семья", "Семья 2"));
+        assert!(!confirmation_matches("Семья", "семья"));
+        assert!(!confirmation_matches("Семья", ""));
+    }
 }

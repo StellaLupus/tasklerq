@@ -642,6 +642,10 @@ async fn household_deletion_requires_confirmation_and_revokes_access() {
         .await
         .expect("household")
         .name;
+    let owner_name = users::get(&mut conn, household.household_id, household.owner_id)
+        .await
+        .expect("owner")
+        .display_name;
     drop(conn);
 
     // Подтверждение должно совпадать с названием; участник удалять не может.
@@ -692,6 +696,23 @@ async fn household_deletion_requires_confirmation_and_revokes_access() {
             .await
             .expect("row");
     assert!(deleted_at.is_some());
+
+    let (actor_type, actor_user_id, payload): (String, Option<Uuid>, serde_json::Value) =
+        sqlx::query_as(
+            "SELECT actor_type::text, actor_user_id, payload
+             FROM audit_events
+             WHERE household_id = $1 AND event_type::text = 'household_deleted'
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+        )
+        .bind(household.household_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("household_deleted audit");
+    assert_eq!(actor_type, "user");
+    assert_eq!(actor_user_id, Some(household.owner_id));
+    assert_eq!(payload["actor_name"], owner_name);
+    assert_eq!(payload["members"], 2);
 
     // Токены отозваны, приглашения не работают, участники потеряли доступ.
     let (status, _) =

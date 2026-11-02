@@ -206,6 +206,21 @@ enum HouseholdCommand {
     },
     /// Показать активные household без секретов.
     List,
+    /// Мягко удалить household и отозвать его токены и приглашения.
+    ///
+    /// Household и все активные участники помечаются удалёнными; токены и
+    /// приглашения отзываются сразу. Данные физически удалит retention.
+    /// Без `--yes` команда просит ввести название household; в
+    /// неинтерактивном режиме без `--yes` завершается ошибкой и ничего не
+    /// меняет. Уведомления участникам не отправляются.
+    Delete {
+        /// Идентификатор household.
+        #[arg(long)]
+        household: Uuid,
+        /// Не спрашивать подтверждение названием.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -545,6 +560,21 @@ async fn run_admin_database(command: DatabaseCommand) -> Result<()> {
                     );
                 }
             }
+            HouseholdCommand::Delete { household, yes } => {
+                if !yes {
+                    let name = admin::household_name(&pool, household)
+                        .await
+                        .map_err(explain)?;
+                    require_name_confirmation(&name)?;
+                }
+                let deleted = admin::delete_household(&pool, household, now)
+                    .await
+                    .map_err(explain)?;
+                println!("id: {}", household);
+                println!("members: {}", deleted.members.len());
+                println!("revoked_tokens: {}", deleted.revoked_tokens);
+                println!("revoked_invites: {}", deleted.revoked_invites);
+            }
         },
         DatabaseCommand::User(command) => match command {
             UserCommand::Add {
@@ -605,6 +635,29 @@ fn require_confirmation(prompt: &str) -> Result<()> {
         answer.trim().to_ascii_lowercase().as_str(),
         "y" | "yes" | "д" | "да"
     ) {
+        Ok(())
+    } else {
+        bail!("отмена; ничего не изменено");
+    }
+}
+
+/// Спросить подтверждение названием household. Без TTY опасная команда
+/// выполняется только с `--yes`.
+fn require_name_confirmation(expected: &str) -> Result<()> {
+    use std::io::{IsTerminal, Write};
+
+    if !std::io::stdin().is_terminal() {
+        bail!("нужно подтверждение (--yes); ничего не изменено");
+    }
+    eprint!("Введите название household для подтверждения: ");
+    std::io::stderr()
+        .flush()
+        .context("failed to write the confirmation prompt")?;
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("failed to read the confirmation")?;
+    if tasklerq::storage::repositories::members::confirmation_matches(expected, &answer) {
         Ok(())
     } else {
         bail!("отмена; ничего не изменено");

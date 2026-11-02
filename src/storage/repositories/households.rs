@@ -77,7 +77,7 @@ pub async fn create(
 /// Порядок блокировок: Telegram ID, затем installation. Занятый Telegram ID
 /// отклоняется до вставки, чтобы вызывающий получил понятный `Conflict`, а не
 /// ошибку уникального индекса.
-async fn create_with_owner(
+pub(crate) async fn create_with_owner(
     conn: &mut PgConnection,
     mode: TenancyMode,
     name: &str,

@@ -7,11 +7,13 @@ mod support;
 
 use std::process::{Output, Stdio};
 
+use axum::http::{Method, StatusCode};
 use chrono::Utc;
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use tasklerq::auth::tokens::{SCOPES, hash_token};
 use tasklerq::storage::migrations;
+use tasklerq::storage::repositories::invites;
 use tokio::process::Command;
 use uuid::Uuid;
 use wiremock::matchers::{method, path};
@@ -407,6 +409,48 @@ async fn household_create_with_owner_rejects_a_telegram_id_from_another_househol
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_create_with_owner_rolls_back_when_the_owner_is_invalid() {
+    let db = cli_database().await;
+    let long_name = "я".repeat(65);
+
+    let output = run(
+        &db.url,
+        &[
+            "admin",
+            "household",
+            "create",
+            "--name",
+            "Откат",
+            "--owner-telegram-id",
+            "777777777",
+            "--owner-name",
+            &long_name,
+        ],
+    )
+    .await;
+    assert!(!output.status.success(), "{output:?}");
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        combined.contains("422"),
+        "an invalid owner name is a validation error:\n{combined}"
+    );
+
+    let households: i64 = sqlx::query_scalar("SELECT count(*) FROM households")
+        .fetch_one(&db.pool)
+        .await
+        .expect("households");
+    assert_eq!(
+        households, 0,
+        "the household inserted before the owner is rolled back"
+    );
+    let users: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
+        .fetch_one(&db.pool)
+        .await
+        .expect("users");
+    assert_eq!(users, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn household_create_without_owner_prints_the_add_user_hint() {
     let db = cli_database().await;
 
@@ -425,6 +469,241 @@ async fn household_create_without_owner_prints_the_add_user_hint() {
         text.lines().any(|line| line == expected),
         "the CLI should print the owner hint:\n{text}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_delete_revokes_access_and_records_a_system_audit() {
+    let db = cli_database().await;
+    let household = support::create_household(&db.pool).await;
+    let app = support::app(&db.pool);
+    let token = support::issue_token(&db.pool, household.household_id, &["ha:read"]).await;
+    let now = Utc::now();
+    let mut tx = db.pool.begin().await.expect("tx");
+    let invite = invites::create(&mut tx, household.household_id, &household.owner(), now)
+        .await
+        .expect("invite");
+    tx.commit().await.expect("commit");
+
+    let household_id = household.household_id.to_string();
+    let output = run(
+        &db.url,
+        &[
+            "admin",
+            "household",
+            "delete",
+            "--household",
+            &household_id,
+            "--yes",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert_eq!(field(&text, "id"), household_id);
+    assert_eq!(field(&text, "members"), "2");
+    assert_eq!(field(&text, "revoked_tokens"), "1");
+    assert_eq!(field(&text, "revoked_invites"), "1");
+    assert!(!text.contains(&token), "the token value is not printed");
+
+    let (deleted_at,): (Option<chrono::DateTime<Utc>>,) =
+        sqlx::query_as("SELECT deleted_at FROM households WHERE id = $1")
+            .bind(household.household_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("household row");
+    assert!(deleted_at.is_some());
+    let active_members: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM users WHERE household_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(household.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("active members");
+    assert_eq!(active_members, 0, "all members are marked deleted");
+    let members: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE household_id = $1")
+        .bind(household.household_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("members");
+    assert_eq!(members, 2, "the rows stay until retention");
+    let (token_revoked,): (Option<chrono::DateTime<Utc>>,) =
+        sqlx::query_as("SELECT revoked_at FROM api_tokens WHERE household_id = $1")
+            .bind(household.household_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("token");
+    assert!(token_revoked.is_some());
+    let (invite_revoked,): (Option<chrono::DateTime<Utc>>,) =
+        sqlx::query_as("SELECT revoked_at FROM invites WHERE id = $1")
+            .bind(invite.invite.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("invite");
+    assert!(invite_revoked.is_some());
+
+    let (actor_type, actor_user_id, payload): (String, Option<Uuid>, Value) = sqlx::query_as(
+        "SELECT actor_type::text, actor_user_id, payload
+         FROM audit_events
+         WHERE household_id = $1 AND event_type::text = 'household_deleted'
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1",
+    )
+    .bind(household.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("household_deleted audit");
+    assert_eq!(actor_type, "system");
+    assert_eq!(actor_user_id, None);
+    assert_eq!(payload["members"].as_u64(), Some(2));
+    assert_eq!(payload["revoked_tokens"].as_u64(), Some(1));
+    assert_eq!(payload["revoked_invites"].as_u64(), Some(1));
+    assert!(
+        payload.get("actor_name").is_none(),
+        "a system actor has no display name"
+    );
+
+    let outbox: i64 = sqlx::query_scalar("SELECT count(*) FROM outbox")
+        .fetch_one(&db.pool)
+        .await
+        .expect("outbox");
+    assert_eq!(outbox, 0, "the CLI does not notify members");
+
+    let (status, _) =
+        support::request(&app, Method::GET, "/api/v1/household", Some(&token), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_delete_without_yes_in_non_interactive_mode_changes_nothing() {
+    let db = cli_database().await;
+    let household = support::create_household(&db.pool).await;
+    let _token = support::issue_token(&db.pool, household.household_id, &["ha:read"]).await;
+    let now = Utc::now();
+    let mut tx = db.pool.begin().await.expect("tx");
+    let invite = invites::create(&mut tx, household.household_id, &household.owner(), now)
+        .await
+        .expect("invite");
+    tx.commit().await.expect("commit");
+
+    let household_id = household.household_id.to_string();
+    let output = run(
+        &db.url,
+        &["admin", "household", "delete", "--household", &household_id],
+    )
+    .await;
+    assert!(!output.status.success(), "{output:?}");
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        combined.contains("--yes"),
+        "the CLI asks for --yes without a terminal:\n{combined}"
+    );
+
+    let (deleted_at,): (Option<chrono::DateTime<Utc>>,) =
+        sqlx::query_as("SELECT deleted_at FROM households WHERE id = $1")
+            .bind(household.household_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("household row");
+    assert!(deleted_at.is_none());
+    let active_members: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM users WHERE household_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(household.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("active members");
+    assert_eq!(active_members, 2);
+    let (token_revoked,): (Option<chrono::DateTime<Utc>>,) =
+        sqlx::query_as("SELECT revoked_at FROM api_tokens WHERE household_id = $1")
+            .bind(household.household_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("token");
+    assert!(token_revoked.is_none());
+    let (invite_revoked,): (Option<chrono::DateTime<Utc>>,) =
+        sqlx::query_as("SELECT revoked_at FROM invites WHERE id = $1")
+            .bind(invite.invite.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("invite");
+    assert!(invite_revoked.is_none());
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events
+         WHERE household_id = $1 AND event_type::text = 'household_deleted'",
+    )
+    .bind(household.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("audit count");
+    assert_eq!(audits, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_delete_reports_not_found_for_deleted_and_unknown_households() {
+    let db = cli_database().await;
+    let household = support::create_household(&db.pool).await;
+    let household_id = household.household_id.to_string();
+
+    let first = run(
+        &db.url,
+        &[
+            "admin",
+            "household",
+            "delete",
+            "--household",
+            &household_id,
+            "--yes",
+        ],
+    )
+    .await;
+    assert!(first.status.success(), "{first:?}");
+
+    let again = run(
+        &db.url,
+        &[
+            "admin",
+            "household",
+            "delete",
+            "--household",
+            &household_id,
+            "--yes",
+        ],
+    )
+    .await;
+    assert!(!again.status.success(), "{again:?}");
+    let combined = format!("{}{}", stdout(&again), stderr(&again));
+    assert!(
+        combined.contains("404"),
+        "a second delete reports not found:\n{combined}"
+    );
+
+    let unknown = Uuid::now_v7().to_string();
+    let missing = run(
+        &db.url,
+        &[
+            "admin",
+            "household",
+            "delete",
+            "--household",
+            &unknown,
+            "--yes",
+        ],
+    )
+    .await;
+    assert!(!missing.status.success(), "{missing:?}");
+    let combined = format!("{}{}", stdout(&missing), stderr(&missing));
+    assert!(
+        combined.contains("404"),
+        "an unknown household reports not found:\n{combined}"
+    );
+
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events WHERE event_type::text = 'household_deleted'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("audit count");
+    assert_eq!(audits, 1, "failed deletions write no audit");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

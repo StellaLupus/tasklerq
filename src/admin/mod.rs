@@ -18,7 +18,7 @@ use crate::domain::identity::NewMember;
 use crate::domain::models::{Actor, ActorType, Household, Item, ListKind, User, UserRole};
 use crate::storage::repositories::items;
 use crate::storage::repositories::tokens::ApiToken;
-use crate::storage::repositories::{households, lists, users};
+use crate::storage::repositories::{households, lists, members, users};
 use crate::telegram::queue;
 
 /// Имя участника, если администратор его не указал.
@@ -103,7 +103,21 @@ pub async fn create_household(
     timezone: &str,
     now: DateTime<Utc>,
 ) -> Result<Household, DomainError> {
-    let (household, _) = create_household_inner(pool, mode, name, timezone, None, now).await?;
+    let mut tx = pool.begin().await?;
+    let (household, _) = households::create(
+        &mut tx,
+        mode,
+        households::NewHousehold {
+            name: name.to_owned(),
+            timezone: timezone.to_owned(),
+            owner: None,
+        },
+        &admin_actor(),
+        now,
+    )
+    .await?;
+    tx.commit().await?;
+
     Ok(household)
 }
 
@@ -131,39 +145,35 @@ pub async fn create_household_with_owner(
         timezone: None,
     };
 
+    let mut tx = pool.begin().await?;
     let (household, owner) =
-        create_household_inner(pool, mode, name, timezone, Some(owner), now).await?;
-    let owner = owner.ok_or_else(|| {
-        DomainError::Validation("a household created with an owner has no owner".into())
-    })?;
+        households::create_with_owner(&mut tx, mode, name, timezone, owner, now).await?;
+    tx.commit().await?;
 
     Ok((household, owner))
 }
 
-async fn create_household_inner(
+/// Название активного household: нужно для подтверждения удаления.
+pub async fn household_name(pool: &PgPool, household_id: Uuid) -> Result<String, DomainError> {
+    let mut conn = pool.acquire().await?;
+    Ok(households::get(&mut conn, household_id).await?.name)
+}
+
+/// Мягко удалить household от системного актора.
+///
+/// Уведомления участникам не отправляются: у CLI нет контекста бота, а при
+/// починке инсталляции уведомлять некого.
+pub async fn delete_household(
     pool: &PgPool,
-    mode: TenancyMode,
-    name: &str,
-    timezone: &str,
-    owner: Option<households::NewOwner>,
+    household_id: Uuid,
     now: DateTime<Utc>,
-) -> Result<(Household, Option<User>), DomainError> {
+) -> Result<members::DeletedHousehold, DomainError> {
     let mut tx = pool.begin().await?;
-    let result = households::create(
-        &mut tx,
-        mode,
-        households::NewHousehold {
-            name: name.to_owned(),
-            timezone: timezone.to_owned(),
-            owner,
-        },
-        &admin_actor(),
-        now,
-    )
-    .await?;
+    let deleted =
+        members::delete_household_unchecked(&mut tx, household_id, &admin_actor(), now).await?;
     tx.commit().await?;
 
-    Ok(result)
+    Ok(deleted)
 }
 
 /// Добавить участника. Без `household_id` используется единственный
