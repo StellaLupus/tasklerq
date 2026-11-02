@@ -1,5 +1,6 @@
 //! Экраны форм.
 
+use crate::domain::error::DomainError;
 use crate::domain::models::{Item, ItemPriority, ListKind, MonthRule, RecurrenceFreq};
 use crate::domain::validation::{MAX_SUBTASKS, MAX_TAGS};
 use crate::storage::repositories::{lists, tags, users};
@@ -15,7 +16,7 @@ use crate::telegram::bot::model::{
 };
 use crate::telegram::bot::onboarding;
 use crate::telegram::bot::screens::{back_button, clip};
-use crate::telegram::bot::{Ctx, Fail};
+use crate::telegram::bot::{Ctx, Fail, into_sqlx};
 
 // ---------------------------------------------------------------------
 // Экраны
@@ -108,11 +109,80 @@ fn time_title(field: TimeField) -> &'static str {
     }
 }
 
+/// Принятые значения черновика компактными строками «Поле: значение».
+///
+/// Показываются над вопросом шага, чтобы после удаления ответа пользователя
+/// введённое значение оставалось видимым. На первом шаге черновик пуст и
+/// сводки нет; предпросмотр показывает карточку целиком и сводку не получает.
+async fn draft_summary(
+    ctx: &mut Ctx<'_>,
+    draft: &ItemDraft,
+    shopping: bool,
+) -> Result<Vec<String>, Fail> {
+    let mut lines = Vec::new();
+    if !draft.title.trim().is_empty() {
+        lines.push(format!("Название: {}", clip(&draft.title, 80)));
+    }
+    // Сводка не должна ломать экран шага: неразрешимый локальный срок
+    // покажет предпросмотр, а здесь строка просто пропускается.
+    if let Ok((due_at, due_date)) = draft.due(ctx.tz)
+        && let Some(due) = ru::due_label(due_at, due_date, ctx.tz, ctx.now)
+    {
+        lines.push(format!("Срок: {}", ru::capitalize(&due)));
+    }
+    if !shopping && draft.priority != ItemPriority::Normal {
+        lines.push(format!("Приоритет: {}", priority_label(draft.priority)));
+    }
+    if let Some(assignee) = draft.assignee {
+        let household_id = ctx.household()?.id;
+        let name = match users::get(&mut *ctx.conn, household_id, assignee).await {
+            Ok(user) => user.display_name,
+            // Исполнителя могли удалить: показываем прочерк, а не сбой.
+            Err(DomainError::NotFound) => "—".to_owned(),
+            Err(error) => return Err(Fail::Infra(into_sqlx(error))),
+        };
+        lines.push(format!("Исполнитель: {}", clip(&name, 40)));
+    }
+    if !draft.tags.is_empty() {
+        lines.push(format!("Теги: {}", clip(&draft.tags.join(", "), 80)));
+    }
+    if !draft.subtasks.is_empty() {
+        let titles: Vec<&str> = draft
+            .subtasks
+            .iter()
+            .map(|subtask| subtask.title.as_str())
+            .collect();
+        lines.push(format!("Подзадачи: {}", clip(&titles.join(", "), 80)));
+    }
+    if let Some(rule) = &draft.recurrence {
+        lines.push(format!("Повторение: {}", describe_recurrence_draft(rule)));
+    }
+    if shopping {
+        if let Some(quantity) = draft.quantity {
+            lines.push(format!(
+                "Количество: {}",
+                ru::quantity_label(quantity, draft.unit.as_deref())
+            ));
+        } else if let Some(unit) = &draft.unit {
+            lines.push(format!("Единица: {}", clip(unit, 16)));
+        }
+    }
+    if let Some(notes) = &draft.notes {
+        lines.push(format!("Описание: {}", clip(notes, 60)));
+    }
+    Ok(lines)
+}
+
 async fn create_view(ctx: &mut Ctx<'_>, form: ItemForm) -> Result<Ui, Fail> {
     let shopping = form.kind != ListKind::Tasks;
     let mut ui = Ui::new();
     if let Some(error) = &form.error {
         ui = ui.bold(format!("⚠️ {error}"));
+    }
+    if form.step != Step::Preview {
+        for line in draft_summary(ctx, &form.draft, shopping).await? {
+            ui = ui.text(line);
+        }
     }
     let optional_footer = |ui: Ui| {
         ui.row(vec![
@@ -190,10 +260,11 @@ async fn edit_view(ctx: &mut Ctx<'_>, form: EditForm) -> Result<Ui, Fail> {
     if let Some(error) = &form.error {
         ui = ui.bold(format!("⚠️ {error}"));
     }
+    for line in draft_summary(ctx, &draft, shopping).await? {
+        ui = ui.text(line);
+    }
     let step = form.step;
-    ui = ui
-        .heading(prompt_title(step, shopping))
-        .text(clip(&item.title, 80));
+    ui = ui.heading(prompt_title(step, shopping));
     if step.expects_text() && step != Step::Subtasks {
         ui = ui.text(prompt_hint(step, &draft));
         ui = match step {
@@ -295,11 +366,6 @@ async fn choice_buttons(
     let household_id = ctx.household()?.id;
     match step {
         Step::Due => {
-            let current =
-                ru::due_label(draft.due(ctx.tz)?.0, draft.due(ctx.tz)?.1, ctx.tz, ctx.now);
-            if let Some(current) = current {
-                ui = ui.text(format!("Сейчас: {current}"));
-            }
             ui = ui
                 .row(vec![
                     choose("Сегодня", Choice::DueToday),
@@ -391,9 +457,6 @@ async fn choice_buttons(
             ui = ui.text(prompt_hint(Step::Subtasks, draft));
         }
         Step::Recurrence => {
-            if let Some(rule) = &draft.recurrence {
-                ui = ui.text(format!("Сейчас: {}", describe_recurrence_draft(rule)));
-            }
             ui = ui
                 .row(vec![choose("Не повторять", Choice::Freq(None))])
                 .row(vec![

@@ -376,9 +376,12 @@ fn metric_counter(text: &str, status: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Сколько обновлений учтено метриками после `before` по всем исходам.
+/// Сколько обновлений учтено метриками после `before` по терминальным исходам.
+///
+/// `deferred` — не терминальный исход: отложенное обновление позже станет
+/// `processed` или `dropped`, поэтому ожидание дренажа его не считает.
 fn handled_since(before: &str, after: &str) -> u64 {
-    ["processed", "rate_limited", "failed", "dead"]
+    ["processed", "dropped", "failed", "dead"]
         .iter()
         .map(|status| metric_counter(after, status).saturating_sub(metric_counter(before, status)))
         .sum()
@@ -422,7 +425,8 @@ struct Scenario {
 struct ScenarioResult {
     name: &'static str,
     processed: u64,
-    rate_limited: u64,
+    deferred: u64,
+    dropped: u64,
     p50: StdDuration,
     p95: StdDuration,
     p99: StdDuration,
@@ -614,8 +618,8 @@ async fn run_scenario(
 
     let after = wait_for_metrics(&before, sent).await;
     let processed = metric_counter(&after, "processed") - metric_counter(&before, "processed");
-    let rate_limited =
-        metric_counter(&after, "rate_limited") - metric_counter(&before, "rate_limited");
+    let deferred = metric_counter(&after, "deferred") - metric_counter(&before, "deferred");
+    let dropped = metric_counter(&after, "dropped") - metric_counter(&before, "dropped");
     let failed = metric_counter(&after, "failed") - metric_counter(&before, "failed");
     let dead = metric_counter(&after, "dead") - metric_counter(&before, "dead");
 
@@ -653,7 +657,8 @@ async fn run_scenario(
         millis(max)
     );
     println!(
-        "requests={sent} processed={processed} rate_limited={rate_limited} failed={failed} dead={dead}"
+        "requests={sent} processed={processed} deferred={deferred} dropped={dropped} \
+         failed={failed} dead={dead}"
     );
     println!(
         "worker: rows={processed_rows} elapsed={:.3}s processed_rate={:.1}/s drain={:.3}s",
@@ -687,14 +692,22 @@ async fn run_scenario(
             "every update must go through the handler when the user limit is raised"
         );
         assert_eq!(
-            rate_limited, 0,
-            "no update may be rate_limited when the user limit is raised"
+            deferred, 0,
+            "no update may be deferred when the user limit is raised"
+        );
+        assert_eq!(
+            dropped, 0,
+            "no update may be dropped when the user limit is raised"
         );
     } else {
         assert_eq!(
-            processed + rate_limited,
+            processed + dropped,
             sent,
-            "every update is processed or rate_limited"
+            "every update ends as processed or dropped"
+        );
+        assert!(
+            dropped > 0,
+            "the deferred queue limit must be exercised under load"
         );
     }
     assert_eq!(failed, 0, "no update may fail under load");
@@ -737,7 +750,8 @@ async fn run_scenario(
     ScenarioResult {
         name: scenario.name,
         processed,
-        rate_limited,
+        deferred,
+        dropped,
         p50,
         p95,
         p99,
@@ -783,8 +797,8 @@ async fn webhook_keeps_latency_and_queue_under_load() {
         .mount(&telegram)
         .await;
 
-    // Первый прогон — боевой лимит 20 обновлений/мин на пользователя: большая
-    // часть обновлений завершается как `rate_limited`.
+    // Первый прогон — боевой лимит 20 обновлений/мин на пользователя: часть
+    // обновлений откладывается, а сверх очереди отложенных отбрасывается.
     let limited = run_scenario(
         Scenario {
             name: "production limit",
@@ -818,9 +832,9 @@ async fn webhook_keeps_latency_and_queue_under_load() {
     .await;
 
     println!(
-        "summary: '{}' p50={:.3} p95={:.3} p99={:.3} max={:.3} processed={} rate_limited={} \
+        "summary: '{}' p50={:.3} p95={:.3} p99={:.3} max={:.3} processed={} deferred={} dropped={} \
          drain={:.3}s processed_rate={:.1}/s | \
-         '{}' p50={:.3} p95={:.3} p99={:.3} max={:.3} processed={} rate_limited={} \
+         '{}' p50={:.3} p95={:.3} p99={:.3} max={:.3} processed={} deferred={} dropped={} \
          drain={:.3}s processed_rate={:.1}/s",
         limited.name,
         millis(limited.p50),
@@ -828,7 +842,8 @@ async fn webhook_keeps_latency_and_queue_under_load() {
         millis(limited.p99),
         millis(limited.max),
         limited.processed,
-        limited.rate_limited,
+        limited.deferred,
+        limited.dropped,
         limited.drain.as_secs_f64(),
         limited.processed_rate,
         processed.name,
@@ -837,7 +852,8 @@ async fn webhook_keeps_latency_and_queue_under_load() {
         millis(processed.p99),
         millis(processed.max),
         processed.processed,
-        processed.rate_limited,
+        processed.deferred,
+        processed.dropped,
         processed.drain.as_secs_f64(),
         processed.processed_rate
     );

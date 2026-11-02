@@ -5,10 +5,11 @@ mod support;
 use chrono::Utc;
 use serde_json::json;
 use sqlx::PgConnection;
+use support::telegram::Harness;
 use support::{create_household, db, next_telegram_id};
 use tasklerq::storage::repositories::{households, users};
 use tasklerq::telegram::bot::{Ctx, Fail};
-use tasklerq::telegram::outbox::{self, Outgoing};
+use tasklerq::telegram::outbox::{self, Outgoing, Placement};
 use tasklerq::telegram::update::Sender;
 use tasklerq::telegram::views;
 
@@ -28,6 +29,7 @@ fn ctx(conn: &mut PgConnection, chat: i64) -> Ctx<'_> {
         tz: chrono_tz::UTC,
         toast: None,
         banner: None,
+        placement: Placement::Visible,
         llm_capture: false,
         audit: None,
     }
@@ -150,6 +152,69 @@ async fn transaction_stays_usable_after_a_database_error_inside_a_user_failure()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_form_step_answer_is_deleted_and_the_next_step_is_shown() {
+    let db = db().await;
+    let mut bot = Harness::new(&db.pool, next_telegram_id()).named("Ann");
+    bot.text("/start").await;
+    bot.text("Семья").await;
+    bot.press("Москва").await;
+    bot.press("меню").await;
+    bot.press("Добавить").await;
+    bot.press("Задачу").await;
+    bot.assert_screen_contains("Как назвать задачу?");
+
+    let update = bot.text_update("Ann", "Позвонить маме");
+    let message_id = update["message"]["message_id"]
+        .as_i64()
+        .expect("incoming message id");
+    bot.enqueue(update).await;
+    bot.pump().await;
+
+    let deleted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox
+         WHERE chat_id = $1 AND kind = 'delete'
+           AND coalesce((payload->>'message_id')::bigint, message_id) = $2",
+    )
+    .bind(bot.chat)
+    .bind(message_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("delete row");
+    assert_eq!(deleted, 1, "the form answer must be deleted");
+    bot.assert_screen_contains("Когда сделать?");
+    bot.assert_screen_contains("Название: Позвонить маме");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_second_text_step_value_is_visible_and_escaped_on_the_next_step() {
+    let db = db().await;
+    let mut bot = Harness::new(&db.pool, next_telegram_id()).named("Ann");
+    bot.text("/start").await;
+    bot.text("Семья").await;
+    bot.press("Москва").await;
+    bot.press("меню").await;
+    bot.press("Добавить").await;
+    bot.press("Задачу").await;
+    bot.assert_screen_contains("Как назвать задачу?");
+    // На первом шаге ничего не принято: сводки нет.
+    assert!(
+        !bot.screen().contains("Название:"),
+        "the first step should not show a summary:\n{}",
+        bot.screen()
+    );
+
+    bot.text("Позвонить <маме> & папе").await;
+    bot.assert_screen_contains("Когда сделать?");
+    bot.assert_screen_contains("Название: Позвонить &lt;маме&gt; &amp; папе");
+
+    bot.press("Дата и время").await;
+    bot.text("завтра 18:30").await;
+    bot.assert_screen_contains("Какой приоритет?");
+    bot.assert_screen_contains("Срок: Завтра, 18:30");
+    bot.assert_screen_contains("Название: Позвонить &lt;маме&gt; &amp; папе");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_failure_restores_member_and_timezone_in_the_context() {
     let db = db().await;
     let home = create_household(&db.pool).await;
@@ -183,4 +248,115 @@ async fn user_failure_restores_member_and_timezone_in_the_context() {
         Some(home.household_id)
     );
     assert_eq!(ctx.tz, chrono_tz::Europe::Moscow);
+}
+
+/// Onboarding до главного меню.
+async fn onboarded(pool: &sqlx::PgPool) -> Harness {
+    let mut bot = Harness::new(pool, next_telegram_id()).named("Ann");
+    bot.text("/start").await;
+    bot.text("Семья").await;
+    bot.press("Москва").await;
+    bot.press("меню").await;
+    bot
+}
+
+/// Household стенда с идентификаторами списков по умолчанию.
+async fn stand_household(pool: &sqlx::PgPool, chat: i64) -> support::TestHousehold {
+    let (household_id, owner_id): (uuid::Uuid, uuid::Uuid) =
+        sqlx::query_as("SELECT household_id, id FROM users WHERE telegram_user_id = $1")
+            .bind(chat)
+            .fetch_one(pool)
+            .await
+            .expect("household");
+    let list = |kind: &'static str| {
+        sqlx::query_scalar(
+            "SELECT id FROM lists WHERE household_id = $1 AND kind::text = $2
+             ORDER BY is_default DESC, created_at LIMIT 1",
+        )
+        .bind(household_id)
+        .bind(kind)
+        .fetch_one(pool)
+    };
+    support::TestHousehold {
+        household_id,
+        owner_id,
+        member_id: owner_id,
+        tasks_list_id: list("tasks").await.expect("default tasks list"),
+        shopping_list_id: list("shopping").await.expect("default shopping list"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_form_summary_shows_the_shopping_quantity() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = stand_household(&db.pool, bot.chat).await;
+    let mut item = support::new_item(household.shopping_list_id, "Молоко");
+    item.quantity = Some(2.0);
+    item.unit = Some("л".into());
+    support::create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &household.owner(),
+        item,
+    )
+    .await;
+
+    bot.press("Покупки").await;
+    bot.press("⋯").await;
+    bot.press("Количество").await;
+
+    bot.assert_screen_contains("Сколько?");
+    bot.assert_screen_contains("Название: Молоко");
+    bot.assert_screen_contains("Количество: 2 л");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_form_summary_shows_a_unit_without_quantity() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = stand_household(&db.pool, bot.chat).await;
+    let mut item = support::new_item(household.shopping_list_id, "Хлеб");
+    item.unit = Some("уп".into());
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &household.owner(),
+        item,
+    )
+    .await;
+    // Старая или внешняя позиция без количества: сводка должна показать единицу.
+    sqlx::query("UPDATE items SET quantity = NULL WHERE id = $1")
+        .bind(created.id)
+        .execute(&db.pool)
+        .await
+        .expect("quantity without number");
+
+    bot.press("Покупки").await;
+    bot.press("⋯").await;
+    bot.press("Единица").await;
+
+    bot.assert_screen_contains("В чём измерять?");
+    bot.assert_screen_contains("Название: Хлеб");
+    bot.assert_screen_contains("Единица: уп");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_shopping_preview_keeps_the_chosen_quantity_and_unit() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+
+    bot.press("Добавить").await;
+    bot.press("Покупку").await;
+    bot.text("Молоко").await;
+    bot.press("2").await;
+    bot.assert_screen_contains("Количество: 2");
+    bot.press("л").await;
+
+    // Выбор единицы сразу открывает предпросмотр: проверяется он, а не
+    // сводка шага.
+    bot.assert_screen_contains("Проверьте и сохраните");
+    bot.assert_screen_contains("Количество: 2 л");
 }

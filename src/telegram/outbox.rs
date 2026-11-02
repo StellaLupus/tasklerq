@@ -38,6 +38,38 @@ pub const MAX_ATTEMPTS: i32 = 5;
 /// Сколько кандидатов рассматривается за один проход.
 const BATCH: i64 = 50;
 
+/// Насколько новый экран должен быть виден в чате.
+///
+/// Порядок вариантов значим: `derive(Ord)` использует его, когда
+/// вытесняемые экраны наследуют самый сильный `placement`
+/// (`InPlace < Visible < Fresh`). Более сильный режим должен побеждать при
+/// любом порядке постановки в очередь.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Placement {
+    /// Править активное сообщение: кнопка нажата на самом якоре.
+    InPlace,
+    /// Править, если экран ещё виден, иначе прислать заново.
+    #[default]
+    Visible,
+    /// Всегда присылать заново: `/start` и `/menu`.
+    Fresh,
+}
+
+impl Placement {
+    /// Разобрать `placement` из payload строки `screen`.
+    ///
+    /// Отсутствующее поле — старые строки — читается как [`Self::Visible`].
+    /// Неизвестное значение не подменяется умолчанием: строка не разбирается
+    /// и уходит в dead-letter как `invalid_payload`.
+    fn from_payload(payload: &Value) -> Option<Self> {
+        match payload.get("placement") {
+            None => Some(Self::Visible),
+            Some(value) => serde_json::from_value(value.clone()).ok(),
+        }
+    }
+}
+
 /// Что отправить.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -46,6 +78,8 @@ pub enum Outgoing {
     Screen {
         /// HTML RichMessage.
         html: String,
+        /// Правило видимости активного сообщения.
+        placement: Placement,
     },
     /// Новое самостоятельное сообщение.
     Message {
@@ -61,6 +95,11 @@ pub enum Outgoing {
         /// HTML RichMessage.
         html: String,
     },
+    /// Удаление сообщения (например, входящего текста пользователя).
+    Delete {
+        /// Сообщение.
+        message_id: i64,
+    },
 }
 
 impl Outgoing {
@@ -69,23 +108,29 @@ impl Outgoing {
             Self::Screen { .. } => "screen",
             Self::Message { .. } => "message",
             Self::Edit { .. } => "edit",
+            Self::Delete { .. } => "delete",
         }
     }
 
     fn payload(&self) -> Value {
         match self {
-            Self::Screen { html } => json!({"html": html}),
+            Self::Screen { html, placement } => {
+                json!({"html": html, "placement": placement})
+            }
             Self::Message { html, rich } => json!({"html": html, "rich": rich}),
             Self::Edit { message_id, html } => json!({"html": html, "message_id": message_id}),
+            Self::Delete { message_id } => json!({"message_id": message_id}),
         }
     }
 
     fn from_row(kind: &str, payload: &Value) -> Option<Self> {
-        let html = payload.get("html")?.as_str()?.to_owned();
         match kind {
-            "screen" => Some(Self::Screen { html }),
+            "screen" => Some(Self::Screen {
+                html: payload.get("html")?.as_str()?.to_owned(),
+                placement: Placement::from_payload(payload)?,
+            }),
             "message" => Some(Self::Message {
-                html,
+                html: payload.get("html")?.as_str()?.to_owned(),
                 rich: payload
                     .get("rich")
                     .and_then(Value::as_bool)
@@ -93,7 +138,10 @@ impl Outgoing {
             }),
             "edit" => Some(Self::Edit {
                 message_id: payload.get("message_id")?.as_i64()?,
-                html,
+                html: payload.get("html")?.as_str()?.to_owned(),
+            }),
+            "delete" => Some(Self::Delete {
+                message_id: payload.get("message_id")?.as_i64()?,
             }),
             _ => None,
         }
@@ -104,7 +152,9 @@ impl Outgoing {
 /// таким `dedupe_key` уже есть.
 ///
 /// Экран заменяет все ещё не доставленные экраны того же чата: пользователю
-/// нужно только актуальное состояние.
+/// нужно только актуальное состояние. Он наследует самый сильный `placement`
+/// вытесненных экранов, чтобы `/start` (`fresh`) не потерялся, если до доставки
+/// пришёл другой экран.
 pub async fn enqueue(
     conn: &mut PgConnection,
     chat_id: i64,
@@ -112,16 +162,44 @@ pub async fn enqueue(
     dedupe_key: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<Option<i64>, sqlx::Error> {
-    if matches!(outgoing, Outgoing::Screen { .. }) {
-        sqlx::query(
-            "UPDATE outbox SET status = 'skipped', payload = jsonb_build_object('redacted', true)
-             WHERE chat_id = $1 AND status = 'pending' AND kind = 'screen'
-               AND message_id IS NULL",
+    let outgoing = if let Outgoing::Screen { html, placement } = outgoing {
+        // Блокировка и вытеснение — один запрос: воркер не может доставить
+        // строку между чтением `placement` и её вытеснением, иначе новый
+        // экран унаследовал бы режим уже доставленного.
+        //
+        // Вытесняемая строка с неизвестным `placement` тоже уходит в
+        // `skipped`: в выборе режима она не участвует и в dead-letter не
+        // попадает.
+        let pending: Vec<Value> = sqlx::query_scalar(
+            "WITH evicted AS (
+                 SELECT seq, payload FROM outbox
+                 WHERE chat_id = $1 AND status = 'pending' AND kind = 'screen'
+                   AND message_id IS NULL
+                 FOR UPDATE
+             ),
+             skipped AS (
+                 UPDATE outbox o
+                 SET status = 'skipped', payload = jsonb_build_object('redacted', true)
+                 FROM evicted e
+                 WHERE o.seq = e.seq
+             )
+             SELECT payload FROM evicted",
         )
         .bind(chat_id)
-        .execute(&mut *conn)
+        .fetch_all(&mut *conn)
         .await?;
-    }
+        let placement = pending
+            .iter()
+            .filter_map(Placement::from_payload)
+            .fold(*placement, std::cmp::max);
+
+        Outgoing::Screen {
+            html: html.clone(),
+            placement,
+        }
+    } else {
+        outgoing.clone()
+    };
 
     let seq: Option<i64> = sqlx::query_scalar(
         "INSERT INTO outbox (chat_id, kind, payload, dedupe_key, next_attempt_at, created_at)
@@ -195,6 +273,19 @@ pub struct RateLimiter {
 impl RateLimiter {
     /// Занять слот для отправки в чат; `false` — отправлять пока нельзя.
     pub fn try_acquire(&mut self, chat_id: i64, now: Instant) -> bool {
+        self.try_acquire_with(chat_id, now, true)
+    }
+
+    /// Занять слот для удаления сообщения.
+    ///
+    /// Удаление не расходует поминутную квоту чата: лимит Telegram «1
+    /// сообщение в секунду» относится к отправке, а не к удалению. Общий лимит
+    /// и пауза после `429` действуют и здесь.
+    pub fn try_acquire_delete(&mut self, chat_id: i64, now: Instant) -> bool {
+        self.try_acquire_with(chat_id, now, false)
+    }
+
+    fn try_acquire_with(&mut self, chat_id: i64, now: Instant, chat_quota: bool) -> bool {
         if self.paused_until.is_some_and(|until| now < until) {
             return false;
         }
@@ -208,15 +299,18 @@ impl RateLimiter {
         if self.global.len() >= GLOBAL_PER_SECOND {
             return false;
         }
-        if self
-            .per_chat
-            .get(&chat_id)
-            .is_some_and(|last| now.duration_since(*last) < CHAT_INTERVAL)
+        if chat_quota
+            && self
+                .per_chat
+                .get(&chat_id)
+                .is_some_and(|last| now.duration_since(*last) < CHAT_INTERVAL)
         {
             return false;
         }
 
-        self.per_chat.insert(chat_id, now);
+        if chat_quota {
+            self.per_chat.insert(chat_id, now);
+        }
         self.global.push_back(now);
         // Карта не растёт без границ: давно неактивные чаты забываются.
         if self.per_chat.len() > 4_096 {
@@ -240,6 +334,8 @@ impl RateLimiter {
 pub enum Delivery {
     /// Доставлено.
     Sent,
+    /// Пропущено: операция не имеет смысла (например, удаление невозможно).
+    Skipped,
     /// Отложено: `429` или временная ошибка.
     Deferred,
     /// Попытки исчерпаны или ошибка постоянная.
@@ -316,7 +412,7 @@ impl OutboxWorker {
         for seq in candidates {
             match self.deliver_one(seq, now, clock).await? {
                 Delivery::Sent => sent += 1,
-                Delivery::Deferred | Delivery::Dead | Delivery::Idle => {}
+                Delivery::Skipped | Delivery::Deferred | Delivery::Dead | Delivery::Idle => {}
             }
         }
         Ok(sent)
@@ -343,7 +439,12 @@ impl OutboxWorker {
         let Some(row) = row else {
             return Ok(Delivery::Idle);
         };
-        if !self.limiter.try_acquire(row.chat_id, clock) {
+        let acquired = if row.kind == "delete" {
+            self.limiter.try_acquire_delete(row.chat_id, clock)
+        } else {
+            self.limiter.try_acquire(row.chat_id, clock)
+        };
+        if !acquired {
             return Ok(Delivery::Idle);
         }
 
@@ -367,6 +468,12 @@ impl OutboxWorker {
                 .bind(now)
                 .execute(&mut *tx)
                 .await?;
+                // Новое самостоятельное сообщение встаёт ниже якоря: править
+                // экран на месте больше нельзя. Правка (`edit`) признак не
+                // меняет: сообщение уже было в чате.
+                if matches!(outgoing, Outgoing::Message { .. }) {
+                    views::mark_buried(&mut tx, row.chat_id).await?;
+                }
                 Delivery::Sent
             }
             Err(TelegramError::RetryAfter(seconds)) => {
@@ -384,9 +491,39 @@ impl OutboxWorker {
                     .pause_until(clock + StdDuration::from_secs(wait.unsigned_abs()));
                 Delivery::Deferred
             }
+            Err(TelegramError::MessageUndeletable)
+                if matches!(outgoing, Outgoing::Delete { .. }) =>
+            {
+                let code = TelegramError::MessageUndeletable.code();
+                sqlx::query(
+                    "UPDATE outbox
+                     SET status = 'skipped', last_error = $2,
+                         payload = jsonb_build_object('redacted', true)
+                     WHERE seq = $1",
+                )
+                .bind(row.seq)
+                .bind(code)
+                .execute(&mut *tx)
+                .await?;
+                // Сообщение пользователя осталось в чате: следующий экран
+                // должен прийти новым сообщением. Строку вида не создаём —
+                // без активного экрана `buried` не нужен (см. `views`).
+                views::mark_buried(&mut tx, row.chat_id).await?;
+                tracing::warn!(
+                    seq = row.seq,
+                    error = code,
+                    "outbox delete skipped: message cannot be deleted"
+                );
+                Delivery::Skipped
+            }
             Err(error) if error.is_retryable() => {
                 let attempts = row.attempts + 1;
                 if attempts >= MAX_ATTEMPTS {
+                    // Сообщение пользователя осталось в чате: следующий
+                    // экран должен прийти новым сообщением.
+                    if matches!(outgoing, Outgoing::Delete { .. }) {
+                        views::mark_buried(&mut tx, row.chat_id).await?;
+                    }
                     mark_dead(&mut tx, row.seq, error.code(), now).await?;
                     Delivery::Dead
                 } else {
@@ -405,6 +542,11 @@ impl OutboxWorker {
                 }
             }
             Err(error) => {
+                // Любой окончательный отказ удаления, кроме «сообщения нет»,
+                // оставляет сообщение пользователя в чате.
+                if matches!(outgoing, Outgoing::Delete { .. }) {
+                    views::mark_buried(&mut tx, row.chat_id).await?;
+                }
                 mark_dead(&mut tx, row.seq, error.code(), now).await?;
                 Delivery::Dead
             }
@@ -493,12 +635,33 @@ async fn deliver(
     let db = |error: sqlx::Error| TelegramError::Transient(format!("database: {error}"));
 
     match outgoing {
-        Outgoing::Screen { html } => {
+        Outgoing::Screen { html, placement } => {
             let rich = RichMessage { html: html.clone() };
             let active = views::get(conn, row.chat_id).await.map_err(db)?;
-            let target = active.and_then(|view| view.message_id);
-            let message_id = replace_or_send(api, row.chat_id, target, &rich).await?;
-            views::set_message(conn, row.chat_id, message_id, now)
+            let target = active.as_ref().and_then(|view| view.message_id);
+            let buried = active.as_ref().is_some_and(|view| view.buried);
+
+            let old_id = match (target, placement) {
+                (Some(old_id), Placement::Fresh) => Some(old_id),
+                (Some(old_id), Placement::Visible) if buried => Some(old_id),
+                _ => None,
+            };
+
+            let (message_id, sent_new) = match old_id {
+                Some(old_id) => {
+                    let message_id = api.send_rich_message(row.chat_id, &rich).await?;
+                    // Новый экран уже отправлен: любая ошибка удаления старого
+                    // якоря (включая «нельзя удалить») не делает строку мёртвой.
+                    let _ = api.delete_message(row.chat_id, old_id).await;
+                    (message_id, true)
+                }
+                None => replace_or_send(api, row.chat_id, target, &rich).await?,
+            };
+
+            // Новое сообщение снимает признак засыпанности; правка на месте
+            // оставляет его как было.
+            let buried = !sent_new && buried;
+            views::set_message(conn, row.chat_id, message_id, buried, now)
                 .await
                 .map_err(db)?;
             Ok(message_id)
@@ -513,29 +676,43 @@ async fn deliver(
         }
         Outgoing::Edit { message_id, html } => {
             let rich = RichMessage { html: html.clone() };
-            replace_or_send(api, row.chat_id, Some(*message_id), &rich).await
+            let (message_id, sent_new) =
+                replace_or_send(api, row.chat_id, Some(*message_id), &rich).await?;
+            // Запасной путь отправил новое сообщение ниже якоря: как и при
+            // доставке `message`, активный экран больше нельзя править на месте.
+            if sent_new {
+                views::mark_buried(conn, row.chat_id).await.map_err(db)?;
+            }
+            Ok(message_id)
+        }
+        Outgoing::Delete { message_id } => {
+            match api.delete_message(row.chat_id, *message_id).await {
+                // «Удалять нечего» — тот же результат, что и успешное удаление.
+                Ok(()) | Err(TelegramError::MessageGone) => Ok(*message_id),
+                Err(error) => Err(error),
+            }
         }
     }
 }
 
 /// Отредактировать сообщение; если это невозможно — удалить старое и отправить
-/// новое.
+/// новое. Флаг в результате говорит, что было отправлено новое сообщение.
 async fn replace_or_send(
     api: &dyn TelegramApi,
     chat_id: i64,
     target: Option<i64>,
     message: &RichMessage,
-) -> Result<i64, TelegramError> {
+) -> Result<(i64, bool), TelegramError> {
     let Some(message_id) = target else {
-        return api.send_rich_message(chat_id, message).await;
+        return Ok((api.send_rich_message(chat_id, message).await?, true));
     };
 
     match api.edit_rich_message(chat_id, message_id, message).await {
-        Ok(()) | Err(TelegramError::NotModified) => Ok(message_id),
+        Ok(()) | Err(TelegramError::NotModified) => Ok((message_id, false)),
         Err(TelegramError::MessageGone) => {
             // Старое сообщение уже могло исчезнуть; ошибка удаления не мешает.
             let _ = api.delete_message(chat_id, message_id).await;
-            api.send_rich_message(chat_id, message).await
+            Ok((api.send_rich_message(chat_id, message).await?, true))
         }
         Err(error) => Err(error),
     }
@@ -579,9 +756,49 @@ mod tests {
     }
 
     #[test]
+    fn limiter_delete_does_not_take_the_chat_quota() {
+        let mut limiter = RateLimiter::default();
+        let start = Instant::now();
+
+        assert!(limiter.try_acquire_delete(1, start));
+        assert!(
+            limiter.try_acquire(1, start),
+            "an edit after deleting a message in the same chat must not wait a second"
+        );
+    }
+
+    #[test]
+    fn limiter_delete_counts_towards_the_global_limit() {
+        let mut limiter = RateLimiter::default();
+        let start = Instant::now();
+
+        for chat in 0..GLOBAL_PER_SECOND {
+            assert!(limiter.try_acquire_delete(i64::try_from(chat).expect("chat"), start));
+        }
+        assert!(
+            !limiter.try_acquire(10_000, start + StdDuration::from_millis(500)),
+            "deletes must fill the global per-second limit"
+        );
+        assert!(limiter.try_acquire(10_000, start + StdDuration::from_secs(1)));
+    }
+
+    #[test]
+    fn limiter_pause_blocks_deletes_too() {
+        let mut limiter = RateLimiter::default();
+        let start = Instant::now();
+
+        limiter.pause_until(start + StdDuration::from_secs(5));
+        assert!(!limiter.try_acquire_delete(1, start + StdDuration::from_secs(4)));
+        assert!(limiter.try_acquire_delete(1, start + StdDuration::from_secs(5)));
+    }
+
+    #[test]
     fn outgoing_round_trips_through_rows() {
         for outgoing in [
-            Outgoing::Screen { html: "a".into() },
+            Outgoing::Screen {
+                html: "a".into(),
+                placement: Placement::Visible,
+            },
             Outgoing::Message {
                 html: "b".into(),
                 rich: true,
@@ -590,11 +807,52 @@ mod tests {
                 message_id: 7,
                 html: "c".into(),
             },
+            Outgoing::Delete { message_id: 8 },
         ] {
             assert_eq!(
                 Outgoing::from_row(outgoing.kind(), &outgoing.payload()),
                 Some(outgoing)
             );
         }
+    }
+
+    #[test]
+    fn screen_round_trips_every_placement() {
+        for placement in [Placement::InPlace, Placement::Visible, Placement::Fresh] {
+            let outgoing = Outgoing::Screen {
+                html: "a".into(),
+                placement,
+            };
+            assert_eq!(
+                Outgoing::from_row(outgoing.kind(), &outgoing.payload()),
+                Some(outgoing)
+            );
+        }
+    }
+
+    #[test]
+    fn screen_row_without_placement_reads_as_visible() {
+        assert_eq!(
+            Outgoing::from_row("screen", &json!({"html": "a"})),
+            Some(Outgoing::Screen {
+                html: "a".into(),
+                placement: Placement::Visible,
+            })
+        );
+    }
+
+    #[test]
+    fn screen_row_with_unknown_placement_is_not_parsed() {
+        assert_eq!(
+            Outgoing::from_row("screen", &json!({"html": "a", "placement": "sometimes"})),
+            None,
+            "an unknown placement must become invalid_payload, not visible"
+        );
+    }
+
+    #[test]
+    fn placement_order_reflects_visibility_strength() {
+        assert!(Placement::InPlace < Placement::Visible);
+        assert!(Placement::Visible < Placement::Fresh);
     }
 }

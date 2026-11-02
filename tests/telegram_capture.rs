@@ -147,6 +147,30 @@ impl Stand {
             .expect("count jobs")
     }
 
+    /// Последний `seq` outbox этого чата.
+    async fn last_outbox_seq(&self) -> i64 {
+        sqlx::query_scalar("SELECT coalesce(max(seq), 0) FROM outbox WHERE chat_id = $1")
+            .bind(self.bot.chat)
+            .fetch_one(&self.bot.pool)
+            .await
+            .expect("max outbox seq")
+    }
+
+    /// Строки outbox, появившиеся после `seq`: `(вид, message_id)`.
+    async fn outbox_since(&self, seq: i64) -> Vec<(String, Option<i64>)> {
+        sqlx::query_as(
+            "SELECT kind::text AS kind, (payload->>'message_id')::bigint AS message_id
+             FROM outbox
+             WHERE chat_id = $1 AND seq > $2
+             ORDER BY seq",
+        )
+        .bind(self.bot.chat)
+        .bind(seq)
+        .fetch_all(&self.bot.pool)
+        .await
+        .expect("outbox rows")
+    }
+
     async fn household_items(&self) -> i64 {
         sqlx::query_scalar(
             "SELECT count(*) FROM items i JOIN users u ON u.household_id = i.household_id
@@ -173,6 +197,15 @@ impl Stand {
     async fn capture(&mut self, text: &str) {
         self.bot.text(text).await;
         assert_eq!(self.work().await, Pass::Drafted);
+    }
+
+    /// Состояние активного экрана чата.
+    async fn view_state(&self) -> String {
+        sqlx::query_scalar("SELECT state::text FROM telegram_views WHERE chat_id = $1")
+            .bind(self.bot.chat)
+            .fetch_one(&self.bot.pool)
+            .await
+            .expect("view state")
     }
 }
 
@@ -403,9 +436,20 @@ async fn expired_draft_is_not_saved() {
 async fn too_long_text_is_not_queued() {
     let db = db().await;
     let mut stand = stand(&db.pool, vec![]).await;
+    let before = stand.last_outbox_seq().await;
+
     stand.bot.text(&"а".repeat(2_001)).await;
 
-    stand.bot.assert_latest_contains("слишком длинное");
+    stand.bot.assert_screen_contains("слишком длинное");
+    let rows = stand.outbox_since(before).await;
+    assert!(
+        rows.iter().any(|(kind, _)| kind == "delete"),
+        "the rejected text must be deleted: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|(kind, _)| kind == "message"),
+        "a rejection is a banner, not a separate message: {rows:?}"
+    );
     assert_eq!(stand.jobs().await, 0);
     assert_eq!(stand.ai.calls(), 0);
 }
@@ -815,8 +859,18 @@ async fn more_than_ten_parses_per_minute_are_rejected_without_llm() {
     }
     assert_eq!(stand.jobs().await, PARSES_PER_MINUTE);
 
+    let before = stand.last_outbox_seq().await;
     stand.bot.text("дело 11").await;
-    stand.bot.assert_latest_contains("Слишком много сообщений");
+    stand.bot.assert_screen_contains("Слишком много сообщений");
+    let rows = stand.outbox_since(before).await;
+    assert!(
+        rows.iter().any(|(kind, _)| kind == "delete"),
+        "the rejected text must be deleted: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|(kind, _)| kind == "message"),
+        "a rejection is a banner, not a separate message: {rows:?}"
+    );
     assert_eq!(stand.jobs().await, PARSES_PER_MINUTE);
     assert_eq!(stand.ai.calls(), 0);
 }
@@ -904,4 +958,180 @@ async fn time_that_passes_while_the_draft_waits_is_shown_as_an_error() {
     stand.bot.assert_has_button("Сохранить всё");
     stand.bot.press("Сохранить всё").await;
     assert_eq!(stand.household_items().await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_processing_screen_quotes_the_source_text_without_storing_it_in_the_view() {
+    let db = db().await;
+    let mut stand = stand(&db.pool, vec![Ok(two_items())]).await;
+    let text = "завтра купить молоко и хлеб";
+
+    stand.bot.text(text).await;
+
+    let html = stand.bot.screen();
+    let quote = html.find("<blockquote>").expect("quote block");
+    let status = html.find("Разбираю сообщение").expect("processing status");
+    assert!(quote < status, "the quote must come first:\n{html}");
+    assert!(
+        html.contains(text),
+        "the quote must contain the text:\n{html}"
+    );
+
+    let state = stand.view_state().await;
+    assert!(
+        !state.contains(text) && !state.contains("молоко") && !state.contains("купить"),
+        "the source text must not be stored in telegram_views.state: {state}"
+    );
+    assert!(
+        state.contains("job_id"),
+        "the view keeps the job id: {state}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_draft_card_quotes_the_source_text_without_storing_it_in_the_view() {
+    let db = db().await;
+    let mut stand = stand(&db.pool, vec![Ok(two_items())]).await;
+    let text = "позвонить маме и купить молоко";
+
+    stand.capture(text).await;
+
+    let html = stand.bot.screen();
+    let quote = html.find("<blockquote>").expect("quote block");
+    let heading = html.find("Разобрал: 2 позиции").expect("card heading");
+    assert!(quote < heading, "the quote must come first:\n{html}");
+    assert!(
+        html.contains(text),
+        "the quote must contain the text:\n{html}"
+    );
+
+    let state = stand.view_state().await;
+    assert!(
+        !state.contains(text) && !state.contains("молоко") && !state.contains("позвонить"),
+        "the source text must not be stored in telegram_views.state: {state}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_quote_survives_removing_and_editing_draft_items() {
+    let db = db().await;
+    let mut stand = stand(&db.pool, vec![Ok(two_items())]).await;
+    let text = "позвонить маме и купить молоко";
+    stand.capture(text).await;
+
+    stand.bot.press("Удалить 1").await;
+    let html = stand.bot.screen();
+    assert!(html.contains("<blockquote>"), "after removal:\n{html}");
+    assert!(html.contains(text), "after removal:\n{html}");
+
+    stand.bot.press("Изменить 1").await;
+    stand.bot.press("Сохранить").await;
+    let html = stand.bot.screen();
+    assert!(html.contains("<blockquote>"), "after editing:\n{html}");
+    assert!(html.contains(text), "after editing:\n{html}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_long_source_text_is_collapsed_in_the_quote() {
+    let db = db().await;
+    let mut stand = stand(&db.pool, vec![Ok(two_items())]).await;
+    let text = "строка один\nстрока два\nстрока три\nстрока четыре";
+
+    stand.bot.text(text).await;
+
+    let html = stand.bot.screen();
+    assert!(
+        html.contains("<blockquote expandable>"),
+        "four lines must collapse:\n{html}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_quote_escapes_markup_on_the_processing_screen_and_in_the_card() {
+    let db = db().await;
+    let mut stand = stand(&db.pool, vec![Ok(two_items())]).await;
+    let text = "<b>x</b> & y";
+    let escaped = "&lt;b&gt;x&lt;/b&gt; &amp; y";
+
+    stand.bot.text(text).await;
+    let processing = stand.bot.screen();
+    assert!(
+        processing.contains(escaped),
+        "the processing quote must be escaped:\n{processing}"
+    );
+    assert!(
+        !processing.contains("<b>x</b>"),
+        "the processing quote must not contain raw markup:\n{processing}"
+    );
+
+    assert_eq!(stand.work().await, Pass::Drafted);
+    let card = stand.bot.screen();
+    assert!(
+        card.contains(escaped),
+        "the draft card quote must be escaped:\n{card}"
+    );
+    assert!(
+        !card.contains("<b>x</b>"),
+        "the draft card quote must not contain raw markup:\n{card}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_long_source_text_is_collapsed_in_the_draft_card_quote() {
+    let db = db().await;
+    let mut stand = stand(&db.pool, vec![Ok(two_items())]).await;
+    let text = "строка один\nстрока два\nстрока три\nстрока четыре";
+
+    stand.capture(text).await;
+
+    let html = stand.bot.screen();
+    assert!(
+        html.contains("<blockquote expandable>"),
+        "four lines must collapse in the draft card too:\n{html}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closed_drafts_do_not_quote_the_source_text() {
+    let db = db().await;
+    let text = "позвонить маме и купить молоко";
+
+    let mut saved = stand(&db.pool, vec![Ok(two_items())]).await;
+    saved.capture(text).await;
+    saved.bot.press("Сохранить всё").await;
+    saved.bot.assert_screen_contains("Сохранено: 2 позиции");
+    assert!(!saved.bot.screen().contains("<blockquote>"));
+
+    let mut cancelled = stand(&db.pool, vec![Ok(two_items())]).await;
+    cancelled.capture(text).await;
+    cancelled.bot.press("Отмена").await;
+    assert!(!cancelled.bot.screen().contains("<blockquote>"));
+
+    let mut expired = stand(&db.pool, vec![Ok(two_items())]).await;
+    expired.capture(text).await;
+    expired.bot.advance(Duration::minutes(16));
+    expired.bot.press("Сохранить всё").await;
+    expired.bot.assert_screen_contains("Черновик устарел");
+    assert!(!expired.bot.screen().contains("<blockquote>"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_old_processing_view_without_a_job_is_shown_without_a_quote() {
+    let db = db().await;
+    let mut stand = stand(&db.pool, vec![Ok(two_items())]).await;
+
+    // Состояние, сохранённое до выкатки: без `job_id`.
+    sqlx::query(
+        "UPDATE telegram_views SET state = '{\"t\": \"processing\"}'::jsonb WHERE chat_id = $1",
+    )
+    .bind(stand.bot.chat)
+    .execute(&db.pool)
+    .await
+    .expect("old view state");
+
+    stand.bot.text("/nonsense").await;
+
+    let html = stand.bot.screen();
+    assert!(html.contains("Разбираю сообщение"), "{html}");
+    assert!(!html.contains("<blockquote>"), "{html}");
 }

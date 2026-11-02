@@ -4,6 +4,7 @@ mod support;
 
 use anyhow::Context;
 use axum::http::{Method, StatusCode};
+use serde_json::json;
 use sqlx::migrate::Migrator;
 use sqlx::postgres::PgPoolOptions;
 use tasklerq::storage::migrations::{self, MIGRATOR};
@@ -64,6 +65,113 @@ async fn parallel_runs_apply_each_migration_exactly_once() {
             .expect("applied check"),
         "all embedded migrations should be applied"
     );
+}
+
+/// Скопировать встроенные миграции до версии `version` включительно.
+fn copy_migrations_through(version: i64, target: &std::path::Path) {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in std::fs::read_dir(source).expect("migrations directory") {
+        let entry = entry.expect("migration entry");
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(prefix) = name.get(..4) else {
+            continue;
+        };
+        let Ok(number) = prefix.parse::<i64>() else {
+            continue;
+        };
+        if number <= version {
+            std::fs::copy(entry.path(), target.join(name.as_ref())).expect("copy migration");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn screen_visibility_migration_applies_over_existing_rows() {
+    let db = support::empty_db().await;
+    let dir = std::env::temp_dir().join(format!(
+        "tasklerq-migrations-0010-{}",
+        Uuid::now_v7().simple()
+    ));
+    std::fs::create_dir_all(&dir).expect("temporary migration directory");
+    copy_migrations_through(10, &dir);
+
+    let before = Migrator::new(dir.as_path())
+        .await
+        .expect("a migrator through 0010 should resolve");
+    before
+        .run(&db.pool)
+        .await
+        .context("migrations through 0010 should apply")
+        .expect("migrations through 0010");
+
+    // Реалистичные строки до появления `delete` и `buried`: все виды и
+    // статусы outbox, а также существующие экраны чатов.
+    for (chat, kind, payload, status) in [
+        (101, "screen", json!({"html": "<p>экран</p>"}), "pending"),
+        (
+            101,
+            "message",
+            json!({"html": "<p>текст</p>", "rich": true}),
+            "sent",
+        ),
+        (
+            101,
+            "edit",
+            json!({"html": "<p>правка</p>", "message_id": 7}),
+            "skipped",
+        ),
+        (102, "screen", json!({"redacted": true}), "dead"),
+    ] {
+        sqlx::query(
+            "INSERT INTO outbox (chat_id, kind, payload, status)
+             VALUES ($1, $2::outbox_kind, $3, $4::outbox_status)",
+        )
+        .bind(chat)
+        .bind(kind)
+        .bind(payload)
+        .bind(status)
+        .execute(&db.pool)
+        .await
+        .expect("existing outbox row");
+    }
+    sqlx::query(
+        "INSERT INTO telegram_views (chat_id, message_id, view_key, state)
+         VALUES (101, 7, 'menu', $1), (102, NULL, 'empty', '{}'::jsonb)",
+    )
+    .bind(json!({"tab": "tasks"}))
+    .execute(&db.pool)
+    .await
+    .expect("existing view");
+
+    MIGRATOR
+        .run(&db.pool)
+        .await
+        .expect("0011 must apply over existing data");
+
+    let buried: Vec<(i64, bool)> =
+        sqlx::query_as("SELECT chat_id, buried FROM telegram_views ORDER BY chat_id")
+            .fetch_all(&db.pool)
+            .await
+            .expect("views after migration");
+    assert_eq!(
+        buried,
+        vec![(101, false), (102, false)],
+        "existing views must be visible after the migration"
+    );
+
+    let seq: i64 = sqlx::query_scalar(
+        "INSERT INTO outbox (chat_id, kind, payload)
+         VALUES (103, 'delete', $1)
+         RETURNING seq",
+    )
+    .bind(json!({"message_id": 5}))
+    .fetch_one(&db.pool)
+    .await
+    .expect("the new outbox kind must accept a delete row");
+    assert!(seq > 0);
+
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

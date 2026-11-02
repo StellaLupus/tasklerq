@@ -29,7 +29,7 @@ use crate::security_audit::Audit;
 use crate::storage::repositories::{households, users};
 
 use super::callbacks::{self, Consumed, NewToken, Scope};
-use super::outbox::{self, Outgoing};
+use super::outbox::{self, Outgoing, Placement};
 use super::rich::{self, Block, Span};
 use super::update::{Incoming, Sender};
 use super::views::{self, Lookup};
@@ -139,6 +139,9 @@ pub struct Ctx<'a> {
     pub toast: Option<(String, bool)>,
     /// Сообщение над следующим экраном.
     pub banner: Option<String>,
+    /// Правило видимости для следующего экрана. Обработчик выставляет его до
+    /// вызова [`Ctx::present`]/[`Ctx::show`]; по умолчанию — [`Placement::Visible`].
+    pub placement: Placement,
     /// Свободный текст уходит на разбор в LLM.
     pub llm_capture: bool,
     /// Журнал событий безопасности; `None` в тестах без пула.
@@ -213,7 +216,10 @@ impl Ctx<'_> {
         outbox::enqueue(
             &mut *self.conn,
             self.chat_id,
-            &Outgoing::Screen { html },
+            &Outgoing::Screen {
+                html,
+                placement: self.placement,
+            },
             None,
             self.now,
         )
@@ -422,6 +428,7 @@ impl Bot {
             tz: display_timezone(Some(user), Some(household)),
             toast: None,
             banner,
+            placement: Placement::Visible,
             llm_capture: self.llm_capture,
             audit: self.audit.as_ref(),
         }
@@ -459,6 +466,22 @@ impl Bot {
             } => (*chat_id, sender.clone()),
         };
 
+        // Входящий текст удаляется первой строкой обновления, до обработчика и
+        // вне savepoint шага: удаление доставляется раньше экрана, а отказ шага
+        // его не отменяет. Откат всей транзакции убирает и удаление.
+        if let Incoming::Text { message_id, .. } = &incoming {
+            outbox::enqueue(
+                conn,
+                chat_id,
+                &Outgoing::Delete {
+                    message_id: *message_id,
+                },
+                Some(&delete_dedupe_key(chat_id, *message_id)),
+                now,
+            )
+            .await?;
+        }
+
         let user = users::find_active_by_telegram(&mut *conn, sender.id)
             .await
             .map_err(into_sqlx)?;
@@ -483,6 +506,7 @@ impl Bot {
             tz,
             toast: None,
             banner: None,
+            placement: Placement::Visible,
             llm_capture: self.llm_capture,
             audit: self.audit.as_ref(),
         };
@@ -657,6 +681,15 @@ impl<'a> Ctx<'a> {
     }
 }
 
+/// Ключ удаления входящего сообщения.
+///
+/// Страховка от двойной постановки: одно сообщение удаляется не больше раза.
+/// Дубли обновлений отсекаются по `update_id`, а `message_id` уникален в чате и
+/// не переиспользуется, поэтому ключ защищает от повторной записи удаления.
+fn delete_dedupe_key(chat_id: i64, message_id: i64) -> String {
+    format!("delete:{chat_id}:{message_id}")
+}
+
 fn parse_command(text: &str) -> Option<(String, &str)> {
     let rest = text.strip_prefix('/')?;
     let (command, argument) = match rest.split_once(char::is_whitespace) {
@@ -669,8 +702,14 @@ fn parse_command(text: &str) -> Option<(String, &str)> {
 
 async fn on_command(ctx: &mut Ctx<'_>, command: &str, argument: &str) -> Result<(), Fail> {
     match command {
-        "start" => onboarding::on_start(ctx, argument).await,
+        "start" => {
+            // `/start` (включая онбординг и `/start <code>`) возвращает окно
+            // даже если якорь удалён у пользователя.
+            ctx.placement = Placement::Fresh;
+            onboarding::on_start(ctx, argument).await
+        }
         "menu" => {
+            ctx.placement = Placement::Fresh;
             views::clear_conversation(&mut *ctx.conn, ctx.chat_id).await?;
             ctx.menu_or_onboarding().await
         }
@@ -689,21 +728,32 @@ async fn on_command(ctx: &mut Ctx<'_>, command: &str, argument: &str) -> Result<
             Ok(())
         }
         _ => {
-            ctx.say("Не знаю такой команды. Отправьте /help, чтобы увидеть список.")
-                .await?;
-            Ok(())
+            ctx.banner("Не знаю такой команды. Отправьте /help, чтобы увидеть список.");
+            ctx.refresh().await
         }
     }
 }
 
 const HELP: &str = "Я помогаю вести задачи и покупки всей семьёй.\n\n\
 Просто напишите, что нужно сделать, — я предложу сохранить это как задачу.\n\n\
+Ваши сообщения я удаляю из чата после обработки, а /start или /menu возвращают меню вниз чата.\n\n\
 /menu — главное меню\n\
 /settings — настройки\n\
 /cancel — отменить текущее действие\n\
 /help — эта справка";
 
 async fn on_callback(ctx: &mut Ctx<'_>, message_id: i64, data: &str) -> Result<(), Fail> {
+    let active_id = views::get(&mut *ctx.conn, ctx.chat_id)
+        .await?
+        .and_then(|view| view.message_id);
+    // Кнопка на самом якоре правит его на месте при любом исходе нажатия:
+    // повтор, устаревший токен или невалидный payload не должны прислать
+    // второй экран и удалить якорь, на который смотрит пользователь. Кнопки
+    // уведомлений с якорем не совпадают и остаются `visible`.
+    if active_id == Some(message_id) {
+        ctx.placement = Placement::InPlace;
+    }
+
     let consumed = callbacks::consume(&mut *ctx.conn, data, ctx.sender.id, ctx.now).await?;
     let token = match consumed {
         Consumed::Valid(token) => token,
@@ -725,6 +775,14 @@ async fn on_callback(ctx: &mut Ctx<'_>, message_id: i64, data: &str) -> Result<(
         }
     };
 
+    // Кнопка уведомления не правит якорь на месте, даже если её сообщение
+    // совпало с активным: уведомление не является экраном навигации. После
+    // `consume` экран открывается как `visible`; повтор и просрочка выше
+    // остаются прежними.
+    if token.scope == Scope::Notice {
+        ctx.placement = Placement::Visible;
+    }
+
     // Токен действует только пока пользователь состоит в том же household.
     let current_household = ctx.household.as_ref().map(|household| household.id);
     if token.household_id != current_household {
@@ -733,17 +791,14 @@ async fn on_callback(ctx: &mut Ctx<'_>, message_id: i64, data: &str) -> Result<(
     }
 
     // Кнопка заменённого сообщения экрана не выполняется: пользователь видит
-    // актуальный экран в активном сообщении.
-    if token.scope == Scope::Screen {
-        let active = views::get(&mut *ctx.conn, ctx.chat_id).await?;
-        if let Some(active) = active
-            && active
-                .message_id
-                .is_some_and(|active_id| active_id != message_id)
-        {
-            ctx.toast("Это сообщение устарело. Показываю актуальный экран.");
-            return ctx.refresh().await;
-        }
+    // актуальный экран в активном сообщении. Кнопка на самом якоре правит его
+    // на месте, даже если якорь засыпан уведомлением.
+    if token.scope == Scope::Screen
+        && let Some(active_id) = active_id
+        && active_id != message_id
+    {
+        ctx.toast("Это сообщение устарело. Показываю актуальный экран.");
+        return ctx.refresh().await;
     }
 
     let Ok(action) = serde_json::from_value::<Action>(token.payload) else {

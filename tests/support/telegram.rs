@@ -34,6 +34,7 @@ struct State {
     calls: Vec<Call>,
     failures: VecDeque<TelegramError>,
     edit_error: Option<TelegramError>,
+    delete_error: Option<TelegramError>,
     answers: Vec<(String, Option<String>, bool)>,
 }
 
@@ -56,6 +57,11 @@ impl FakeTelegram {
     /// Все правки будут отклоняться этой ошибкой (`None` — снять).
     pub fn reject_edits(&self, error: Option<TelegramError>) {
         self.state.lock().expect("lock").edit_error = error;
+    }
+
+    /// Все удаления будут отклоняться этой ошибкой (`None` — снять).
+    pub fn reject_deletes(&self, error: Option<TelegramError>) {
+        self.state.lock().expect("lock").delete_error = error;
     }
 
     pub fn calls(&self) -> Vec<Call> {
@@ -201,6 +207,12 @@ impl TelegramApi for FakeTelegram {
 
     async fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<(), TelegramError> {
         let mut state = self.state.lock().expect("lock");
+        // Удаление берёт только свою настройку: общая очередь `fail_next`
+        // относится к отправке и правке. Иначе сбой «на отправку» незаметно
+        // уходил бы в игнорируемую ошибку удаления старого якоря.
+        if let Some(error) = state.delete_error.clone() {
+            return Err(error);
+        }
         state.messages.remove(&(chat_id, message_id));
         state.calls.push(Call::Delete {
             chat: chat_id,
@@ -392,7 +404,7 @@ impl Harness {
         self.tick();
         for _ in 0..50 {
             match self.updates.run_once(self.now).await.expect("update pass") {
-                Pass::Processed => {}
+                Pass::Processed | Pass::Deferred | Pass::Dropped => {}
                 Pass::Idle | Pass::Failed(_) => break,
             }
         }

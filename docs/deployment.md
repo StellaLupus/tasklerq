@@ -51,18 +51,37 @@
   `shared-db`.
 - Telegram видит публичный HTTPS webhook через Synology Reverse Proxy.
 
+### 1.1. Особенности нашей среды
+
+Схема выше — достаточный минимум; для другого развёртывания ничего из этого
+раздела не нужно. Здесь только обходы, которые появились в нашей сети.
+
+- **Pingap** (`tasklerq-edge`) стоит между DSM и приложением:
+  `127.0.0.1:18080` → `tasklerq:8080`, конфиг
+  `/volume2/docker/pingap/conf/pingap.toml`, `/metrics` снаружи отдаёт `404`.
+  Приложение дополнительно публикует прямой порт `127.0.0.1:18082` для HA и
+  администрирования.
+- **Cloudflare Worker** `tasklerq-tg.tasklerq-tg.workers.dev/telegram`
+  принимает webhook Telegram и проксирует его на
+  `https://tasklerq.stellalupus.ru/webhooks/telegram`: провайдер фильтрует
+  диапазоны Telegram, прямой вход на NAS не работает.
+- **xray** — исходящие вызовы Bot API идут через
+  `HTTPS_PROXY=http://172.27.0.2:10809`
+  (`NO_PROXY=localhost,127.0.0.1,host.docker.internal`); прямой доступ к
+  Telegram из этой сети тоже фильтруется.
+
 ## 2. Что уже есть
 
 | Компонент | Факт | Что нужно сделать |
 | --- | --- | --- |
 | DNS | `tasklerq.stellalupus.ru` → `94.19.88.123` | Ничего. |
-| TLS | Сертификат Let's Encrypt для `tasklerq.*` получен, но на 443 отдаётся самоподписанный `CN=synology` (проверено 2026-10-29) | Назначить сертификат записи reverse proxy (раздел 3.2, шаг 4). |
-| Reverse Proxy | Запись создана: `HTTPS tasklerq.stellalupus.ru:443` → `http://localhost:18080`; без приложения отвечает `502` | Ничего; при `502` после запуска заменить `localhost` на `127.0.0.1`. |
-| PostgreSQL | `postgres:18-alpine` (18.6), сеть `shared-db`, порт `15433`; роль `tasklerq` (не суперпользователь) и БД `tasklerq` с `pg_trgm 1.6` созданы 2026-10-29 | Пароль из `DATABASE_URL` положить в `.env` (0600). |
-| Home Assistant | `2026.10.4`, host network, HACS | Установить custom component. |
-| AI Task | `ai_task.anthropic_claude_haiku_5_5` | Проверить вызов в Developer Tools. |
-| Telegram | Бот `@tasklerqbot` создан | Получить токен в BotFather и заполнить `.env`. |
-| Tasklerq | Кода ещё нет | Реализовать по `tasks.md`. |
+| TLS | Сертификат назначен записи reverse proxy; `https://tasklerq.stellalupus.ru/health/live` отвечает `200` (проверено 2026-11-02) | Продлевать по разделу 3.2. |
+| Reverse Proxy | `HTTPS tasklerq.stellalupus.ru:443` → `http://127.0.0.1:18080`; отвечает `200` | Ничего; при `502` проверить приложение. |
+| PostgreSQL | `postgres:18-alpine` (18.6), сеть `shared-db`, порт `15433`; роль `tasklerq` (не суперпользователь) и БД `tasklerq` с `pg_trgm 1.6` | Ничего. |
+| Home Assistant | `2026.10.4`, host network, HACS; интеграция установлена | Ничего; обновления по [`home-assistant.md`](home-assistant.md). |
+| AI Task | `ai_task.anthropic_claude_haiku_5_5` | Ничего; проверять при смене модели. |
+| Telegram | Бот `@tasklerqbot`, webhook зарегистрирован | Ничего; токен и секрет в `.env`. |
+| Tasklerq | Контейнер `tasklerq`, образ `stellalupus/tasklerq:<тег>` (на 2026-11-02 — `pr-7`), healthy | Обновления по разделу 12. |
 
 ## 3. DNS и TLS
 
@@ -73,10 +92,12 @@ dig +short tasklerq.stellalupus.ru
 # 94.19.88.123
 ```
 
-Сейчас reverse proxy создан и отвечает `502` (приложение не запущено), но
-`https://tasklerq.stellalupus.ru` отдаёт самоподписанный сертификат Synology
-(`CN=synology`): выпущенный сертификат ещё не назначен записи (шаг 3.2.4).
-Telegram такой сертификат отклонит, поэтому webhook зарегистрировать нельзя.
+TLS на публичном имени валиден: `curl -fsSI
+https://tasklerq.stellalupus.ru/health/live` отвечает `200`. Сертификат
+назначен записи reverse proxy; порядок продления — раздел 3.2.
+
+Если провайдер блокирует прямой доступ Telegram к серверу, перед origin ставят
+промежуточный прокси — см. раздел 1.1.
 
 ### 3.1. Reverse Proxy в Synology DSM
 
@@ -126,8 +147,8 @@ Telegram такой сертификат отклонит, поэтому webhoo
 curl -fsSI https://tasklerq.stellalupus.ru/health/live
 ```
 
-До реализации сервиса endpoint вернёт `502`/`404` — это нормально; важно, чтобы
-TLS уже был валиден.
+Endpoint должен отвечать `200`; `502` означает, что недоступно приложение,
+`404` — что запрос не дошёл до Tasklerq (проверьте маршрут reverse proxy).
 
 ### 3.3. Если reverse proxy не Synology
 
@@ -259,6 +280,10 @@ curl -sS -X POST \
 
 `allowed_updates` можно расширить, если появятся новые типы; для MVP
 достаточно `message` и `callback_query`.
+
+Если Telegram не может обратиться к серверу напрямую, перед origin ставят
+промежуточный прокси и указывают в `TELEGRAM_WEBHOOK_URL` его URL, а не
+`PUBLIC_BASE_URL`. В нашей среде это Cloudflare Worker (раздел 1.1).
 
 ## 6. Переменные окружения
 
@@ -597,6 +622,10 @@ sudo /usr/local/bin/docker compose exec tasklerq \
 
 ## 11. Резервное копирование
 
+На 2026-11-02 на проде скрипты в `/usr/local/bin` ещё не установлены, каталога
+`/volume2/backups/tasklerq` и cron нет — автоматических бэкапов пока нет.
+Порядок ниже нужно выполнить до первого обновления прода.
+
 Скрипты `scripts/backup.sh` и `scripts/restore.sh` работают так же, как
 ручные команды: через `docker exec`, потому что на проде `pg_dump` и
 `pg_restore` есть только внутри контейнера PostgreSQL. Установите их в
@@ -728,7 +757,8 @@ curl -fsS http://127.0.0.1:18080/health/ready
 Метрики — `GET /metrics` в формате Prometheus exposition 0.0.4. Эндпоинт не
 публичный: нужен Bearer-токен со scope `metrics:read` (токен в query не
 принимается). Без токена — `401`, без scope — `403`. Токен выпускается
-командой `tasklerq admin token create` с этим scope.
+командой `tasklerq admin token create` с этим scope. В нашей среде edge
+блокирует `/metrics`, поэтому скрейп идёт на `127.0.0.1:18082` (раздел 1.1).
 
 Пример скрейпа:
 
@@ -896,14 +926,14 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 | Секреты | Секреты читаются из окружения при старте, ротация не требует пересборки образа | `src/config/mod.rs::Config::from_env`; `src/telegram/runtime.rs::start` (читает токен и регистрирует webhook при старте) | пройдено (код); операционная ротация — 15.2 |
 | Секреты | Ротация `TELEGRAM_BOT_TOKEN`: после перезапуска используется новый токен, webhook регистрируется заново | `src/telegram/runtime.rs::start`, `src/telegram/api.rs::set_webhook`; runbook 16.5 | проверяется на живой системе (15.2) |
 | Секреты | Backup-файлы защищены правами доступа и, где возможно, шифрованием | runbook 11; проверка на NAS — 15.2 | проверяется на живой системе (15.2) |
-| Rate limits | 21-е обновление пользователя за минуту не выполняется; бот отвечает временем повтора, webhook остаётся `200` | `tests/telegram_queue.rs::the_twenty_first_message_in_a_minute_is_skipped_with_one_retry_notice`; `src/telegram/webhook.rs::receive` (ответ после постановки в очередь) | пройдено |
+| Rate limits | 21-е обновление пользователя за минуту откладывается и выполняется после освобождения слота, без сообщения в чат; отложенных не больше 20, следующее отбрасывается; webhook остаётся `200` | `tests/telegram_queue.rs::the_twenty_first_message_is_deferred_until_the_slot_frees`, `the_forty_first_message_is_dropped_when_the_deferred_queue_is_full`; `src/telegram/webhook.rs::receive` (ответ после постановки в очередь) | пройдено |
 | Rate limits | Не больше 10 LLM-разборов в минуту на пользователя | `tests/telegram_capture.rs::more_than_ten_parses_per_minute_are_rejected_without_llm` | пройдено |
 | Rate limits | Не больше 10 внешних capture в минуту на токен, `429` + `Retry-After` | `tests/capture_api.rs::the_eleventh_capture_in_a_minute_is_rate_limited_per_token` | пройдено |
 | Rate limits | Не больше 5 приглашений в час на household, с временем повтора | `tests/identity_households.rs::at_most_five_invites_per_hour_including_revoked_ones`; `tests/telegram_screens.rs::sixth_invite_within_an_hour_is_refused_with_retry_time` | пройдено |
 | Rate limits | Не больше 120 webhook-запросов в секунду на IP; лишние → `429` с `Retry-After`, остальные обрабатываются | `tests/telegram_webhook.rs::the_121st_request_from_one_ip_is_rejected_and_not_queued` | пройдено |
 | Rate limits | `429` API всегда содержит `Retry-After` | `src/http/error.rs` (`with_retry_after`); `tests/capture_api.rs::the_eleventh_capture_in_a_minute_is_rate_limited_per_token` | пройдено |
 | Rate limits | Суточная квота LLM по умолчанию 200 и настраивается | `src/config/mod.rs::LLM_DAILY_QUOTA` (200), `src/telegram/capture_worker.rs::DEFAULT_DAILY_QUOTA`; `src/config/tests.rs::defaults_match_documented_values`; `tests/telegram_capture.rs::daily_quota_stops_parsing_and_opens_the_manual_form` | пройдено |
-| Rate limits | Действия по callback ограничены лимитом пользователя | `tests/telegram_queue.rs::the_twenty_first_callback_is_not_run_and_is_answered_with_retry_time` | пройдено |
+| Rate limits | Действия по callback ограничены лимитом пользователя: сверх лимита нажатие сразу получает пустой ответ и выполняется после освобождения слота; сверх очереди отложенных отбрасывается, нажатие получает пустой ответ | `tests/telegram_queue.rs::the_twenty_first_callback_is_answered_immediately_and_runs_after_the_slot_frees`, `a_callback_over_the_deferred_queue_limit_is_dropped_with_an_empty_answer`, `a_repeatedly_deferred_callback_is_answered_once` | пройдено |
 | Rate limits | Превышения лимитов пишутся в аудит | `tests/security_audit.rs::rate_limits_are_audited_for_webhook_and_capture`, `the_telegram_update_limit_is_audited`, `the_invite_limit_is_audited` | пройдено |
 
 Проверки rate limits подтверждены тестами. Нагрузочная проверка (раздел 18) в
@@ -1077,25 +1107,28 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 ## 17. Локальная разработка
 
 ```bash
-# PostgreSQL
-docker compose -f docker-compose.dev.yml up -d postgres
+# PostgreSQL (docker-compose.yml, порт 15433)
+docker compose up -d postgres
 
 # Миграции
-cargo sqlx migrate run
+cargo run --locked -- migrate
 
-# .env для dev
+# .env для dev (или скопируйте .env.example)
 cat > .env <<'EOF'
 ENV=development
-DATABASE_URL=postgres://tasklerq:tasklerq@localhost:5432/tasklerq
-TELEGRAM_BOT_TOKEN=test
-TELEGRAM_MODE=polling
+BIND_ADDR=0.0.0.0:8080
+DATABASE_URL=postgres://tasklerq:tasklerq@127.0.0.1:15433/tasklerq?sslmode=disable
+TELEGRAM_MODE=disabled
 LLM_CAPTURE_ENABLED=false
 RUST_LOG=debug
 EOF
 
 # Запуск
-cargo run
+cargo run --locked -- serve
 ```
+
+Для `TELEGRAM_MODE=polling` нужен реальный токен тестового бота; `disabled`
+оставляет API и capture без Telegram.
 
 Для webhook локально:
 
@@ -1141,11 +1174,14 @@ household. Заливка — батчами SQL. 60 секунд открыто
 секунду (3 000 запросов) с правильным секретом: сообщения (`/menu`, быстрое
 добавление) и callback-нажатия на списки, «Мои задачи», поиск и карточки
 задач. Два сценария идут подряд на одной базе и одном потоке запросов;
-второй продолжает данные, созданные первым:
+второй продолжает данные, созданные первым. Цифры ниже — исторический прогон до
+изменений 3.3–3.4: тогда сверхлимитные обновления помечались `rate_limited` и
+сразу уходили из очереди. Сейчас они откладываются (`deferred`), а сверх 20
+отложенных отбрасываются (`dropped`); актуальное поведение — в разделе 15.1.
 
 1. **production limit** — боевой лимит 20 обновлений/мин на пользователя
    включён. После первых 20 действий каждого пользователя обновления
-   обрабатываются как `rate_limited` и всё равно уходят из очереди.
+   обрабатывались как `rate_limited` и сразу уходили из очереди.
 2. **raised update limit** — лимит пользователя поднят только внутри теста
    (`build_application_with_update_limit`, 100 000), чтобы все обновления
    прошли через обработчик. В боевых настройках лимит не меняется.
@@ -1219,7 +1255,7 @@ dead-letter пуст; во втором сценарии `processed` равно 
 - Бюджет LLM при квоте `200` разборов в сутки; модель AI Task выбирается в
   HA (сейчас Claude Haiku 5.5 через OpenRouter, ~$0.0003 за разбор).
 - Инфраструктура готова: домен, reverse proxy, сертификат, роль и БД `tasklerq`.
-  Блокирующих вопросов до реализации нет.
+  Блокирующих вопросов нет.
 - Security-чек-лист по коду пройден 2026-11-01 (раздел 15.1); новых дефектов
   не найдено, но один необъяснённый `failed=1` из нагрузочного прогона
   остаётся открытым вопросом (пункт ниже). Не отмеченные пункты 15.2

@@ -12,9 +12,13 @@ use sqlx::PgConnection;
 use support::telegram::{FakeTelegram, Harness};
 use support::{db, next_telegram_id};
 use tasklerq::security_audit::Audit;
-use tasklerq::telegram::bot::Outcome;
+use tasklerq::telegram::bot::model::{Form, Step};
+use tasklerq::telegram::bot::{Bot, Outcome};
 use tasklerq::telegram::queue::{self, Failure};
-use tasklerq::telegram::worker::{Pass, UPDATES_PER_MINUTE, UpdateHandler, UpdateWorker};
+use tasklerq::telegram::update::{self, Classified};
+use tasklerq::telegram::worker::{
+    DEFERRED_QUEUE_LIMIT, Pass, UPDATES_PER_MINUTE, UpdateHandler, UpdateWorker,
+};
 use tokio::sync::Notify;
 
 /// Обработчик, который пишет эффект в базу и первые N раз падает уже после записи.
@@ -44,6 +48,36 @@ impl UpdateHandler for Flaky {
             return Err(sqlx::Error::PoolTimedOut);
         }
         Ok(Outcome::default())
+    }
+}
+
+/// Настоящий бот, который после обработки сообщает о сбое: проверяет, что
+/// откат транзакции убирает и строку удаления входящего сообщения.
+struct BotThenFail {
+    bot: Bot,
+    failures_left: AtomicU32,
+}
+
+#[async_trait]
+impl UpdateHandler for BotThenFail {
+    async fn handle(
+        &self,
+        conn: &mut PgConnection,
+        payload: &Value,
+        now: DateTime<Utc>,
+    ) -> Result<Outcome, sqlx::Error> {
+        let parsed = update::parse(payload).map_err(|error| {
+            sqlx::Error::Protocol(format!("stored update is malformed: {error}"))
+        })?;
+        let Classified::Handle(incoming) = update::classify(&parsed) else {
+            return Ok(Outcome::default());
+        };
+        let outcome = self.bot.handle(conn, incoming, now).await?;
+        if self.failures_left.load(Ordering::SeqCst) > 0 {
+            self.failures_left.fetch_sub(1, Ordering::SeqCst);
+            return Err(sqlx::Error::PoolTimedOut);
+        }
+        Ok(outcome)
     }
 }
 
@@ -191,6 +225,64 @@ async fn temporary_failure_is_retried_with_backoff_and_applied_once() {
         Pass::Idle
     );
     assert_eq!(marker_count(&db.pool, &marker).await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rolled_back_processing_leaves_no_delete_row_and_the_retry_adds_one() {
+    let db = db().await;
+    ensure_household(&db.pool).await;
+    let chat = next_telegram_id();
+    let handler = Arc::new(BotThenFail {
+        bot: Bot::new("tasklerqbot"),
+        failures_left: AtomicU32::new(1),
+    });
+    let worker = worker(&db.pool, chat, handler, 10);
+    let mut bot = Harness::new(&db.pool, chat);
+    let update = bot.text_update("Ann", "привет");
+    let id = update["update_id"].as_i64().expect("id");
+    let t0 = Utc::now().trunc_subsecs(6);
+    enqueue_at(&db.pool, &update, t0).await;
+
+    async fn delete_rows(pool: &sqlx::PgPool, chat: i64) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM outbox WHERE chat_id = $1 AND kind = 'delete'")
+            .bind(chat)
+            .fetch_one(pool)
+            .await
+            .expect("delete rows")
+    }
+
+    // Сбой после обработки: транзакция откатывается вместе со строкой удаления.
+    assert!(matches!(
+        worker.run_once(t0).await.expect("pass"),
+        Pass::Failed(Failure::Retry(_))
+    ));
+    assert_eq!(
+        delete_rows(&db.pool, chat).await,
+        0,
+        "a rolled back update must not leave a delete row"
+    );
+
+    // Успешный повтор ставит удаление ровно один раз.
+    let t1 = t0 + Duration::seconds(1);
+    assert_eq!(worker.run_once(t1).await.expect("pass"), Pass::Processed);
+    assert_eq!(
+        delete_rows(&db.pool, chat).await,
+        1,
+        "the successful retry must delete the message once"
+    );
+    assert_eq!(status_of(&db.pool, id).await.0, "processed");
+    let message_id = update["message"]["message_id"]
+        .as_i64()
+        .expect("message id");
+    let deleted: Option<i64> = sqlx::query_scalar(
+        "SELECT (payload->>'message_id')::bigint FROM outbox
+         WHERE chat_id = $1 AND kind = 'delete'",
+    )
+    .bind(chat)
+    .fetch_optional(&db.pool)
+    .await
+    .expect("deleted message");
+    assert_eq!(deleted, Some(message_id));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -409,6 +501,26 @@ impl UpdateHandler for Recorder {
     }
 }
 
+/// Обработчик, запоминающий порядок выполненных обновлений.
+#[derive(Default)]
+struct Ordered {
+    order: std::sync::Mutex<Vec<i64>>,
+}
+
+#[async_trait]
+impl UpdateHandler for Ordered {
+    async fn handle(
+        &self,
+        _conn: &mut PgConnection,
+        payload: &Value,
+        _now: DateTime<Utc>,
+    ) -> Result<Outcome, sqlx::Error> {
+        let update_id = payload["update_id"].as_i64().unwrap_or_default();
+        self.order.lock().expect("order").push(update_id);
+        Ok(Outcome::default())
+    }
+}
+
 /// Обработчик, который первый раз падает, а затем записывает эффект.
 struct FailFirst {
     failed: std::sync::Mutex<Option<i64>>,
@@ -459,11 +571,12 @@ async fn enqueue_at(pool: &sqlx::PgPool, update: &Value, now: DateTime<Utc>) -> 
     id
 }
 
-fn limited_worker(
+fn worker_with_limit(
     pool: &sqlx::PgPool,
     chat: i64,
     handler: Arc<dyn UpdateHandler>,
     fake: Arc<FakeTelegram>,
+    per_minute: u32,
 ) -> UpdateWorker {
     UpdateWorker::new(
         pool.clone(),
@@ -474,29 +587,52 @@ fn limited_worker(
         Audit::new(pool.clone()),
     )
     .only_chat(chat)
-    .with_rate_limit(UPDATES_PER_MINUTE)
+    .with_rate_limit(per_minute)
+}
+
+fn limited_worker(
+    pool: &sqlx::PgPool,
+    chat: i64,
+    handler: Arc<dyn UpdateHandler>,
+    fake: Arc<FakeTelegram>,
+) -> UpdateWorker {
+    worker_with_limit(pool, chat, handler, fake, UPDATES_PER_MINUTE)
+}
+
+async fn available_at(pool: &sqlx::PgPool, update_id: i64) -> DateTime<Utc> {
+    sqlx::query_scalar("SELECT available_at FROM telegram_updates WHERE update_id = $1")
+        .bind(update_id)
+        .fetch_one(pool)
+        .await
+        .expect("available_at")
+}
+
+async fn owner_chat(pool: &sqlx::PgPool, owner_id: uuid::Uuid) -> i64 {
+    sqlx::query_scalar("SELECT telegram_user_id FROM users WHERE id = $1")
+        .bind(owner_id)
+        .fetch_one(pool)
+        .await
+        .expect("owner chat")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_twenty_first_message_in_a_minute_is_skipped_with_one_retry_notice() {
+async fn the_twenty_first_message_is_deferred_until_the_slot_frees() {
     let db = db().await;
-    ensure_household(&db.pool).await;
-    let chat = next_telegram_id();
+    let home = support::create_household(&db.pool).await;
+    let chat = owner_chat(&db.pool, home.owner_id).await;
     let fake = FakeTelegram::new();
-    let prefix = format!("rl{chat}");
-    let worker = limited_worker(
+    let worker = worker_with_limit(
         &db.pool,
         chat,
-        Arc::new(Recorder {
-            prefix: prefix.clone(),
-        }),
+        Arc::new(Bot::new("tasklerqbot")),
         fake.clone(),
+        UPDATES_PER_MINUTE,
     );
     let mut bot = Harness::new(&db.pool, chat);
     let now = Utc::now().trunc_subsecs(6);
 
     let mut ids = Vec::new();
-    for _ in 0..22 {
+    for _ in 0..21 {
         let update = bot.text_update("Ann", "привет");
         ids.push(enqueue_at(&db.pool, &update, now).await);
     }
@@ -504,42 +640,57 @@ async fn the_twenty_first_message_in_a_minute_is_skipped_with_one_retry_notice()
     for _ in 0..20 {
         assert_eq!(worker.run_once(now).await.expect("pass"), Pass::Processed);
     }
-    assert_eq!(recorded(&db.pool, &prefix).await, 20);
+    let before: i64 =
+        sqlx::query_scalar("SELECT coalesce(max(seq), 0) FROM outbox WHERE chat_id = $1")
+            .bind(chat)
+            .fetch_one(&db.pool)
+            .await
+            .expect("max seq");
 
-    // 21-е и 22-е обновления не выполняются, но помечаются обработанными.
-    for _ in 0..2 {
-        assert_eq!(worker.run_once(now).await.expect("pass"), Pass::Processed);
-    }
     assert_eq!(
-        recorded(&db.pool, &prefix).await,
-        20,
-        "updates over the limit must not reach the handler"
+        worker.run_once(now).await.expect("pass"),
+        Pass::Deferred,
+        "the 21st update must wait for the slot, not be processed"
     );
-    for id in ids {
-        assert_eq!(status_of(&db.pool, id).await.0, "processed");
-    }
 
-    // В чат ушло ровно одно предупреждение с временем повтора.
-    let notices: Vec<String> = sqlx::query_scalar(
-        "SELECT payload->>'html' FROM outbox WHERE chat_id = $1 AND kind = 'message'",
+    let rows: Vec<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT kind::text, coalesce((payload->>'message_id')::bigint, message_id)
+         FROM outbox WHERE chat_id = $1 AND seq > $2 ORDER BY seq",
     )
     .bind(chat)
+    .bind(before)
     .fetch_all(&db.pool)
     .await
-    .expect("notices");
-    assert_eq!(notices.len(), 1, "one notice per window: {notices:?}");
+    .expect("outbox rows");
     assert!(
-        notices[0].contains("Попробуйте через"),
-        "notice must tell when to retry: {}",
-        notices[0]
+        rows.is_empty(),
+        "a deferred update must not write a message, screen or delete: {rows:?}"
     );
+    assert_eq!(
+        status_of(&db.pool, ids[20]).await,
+        ("pending".into(), 0, None),
+        "a deferred update stays pending without a failed attempt"
+    );
+    let retry_at = now + Duration::seconds(60);
+    assert_eq!(available_at(&db.pool, ids[20]).await, retry_at);
 
-    // После окна обновление снова обрабатывается.
-    let later = now + Duration::seconds(61);
-    let update = bot.text_update("Ann", "привет");
-    enqueue_at(&db.pool, &update, later).await;
-    assert_eq!(worker.run_once(later).await.expect("pass"), Pass::Processed);
-    assert_eq!(recorded(&db.pool, &prefix).await, 21);
+    // В момент освобождения слота обновление выполняется как обычно и удаляет
+    // своё входящее сообщение.
+    assert_eq!(
+        worker.run_once(retry_at).await.expect("pass"),
+        Pass::Processed
+    );
+    assert_eq!(status_of(&db.pool, ids[20]).await.0, "processed");
+    let deleted: Option<i64> = sqlx::query_scalar(
+        "SELECT (payload->>'message_id')::bigint FROM outbox
+         WHERE chat_id = $1 AND kind = 'delete' AND (payload->>'message_id')::bigint = $2",
+    )
+    .bind(chat)
+    .bind(ids[20])
+    .fetch_optional(&db.pool)
+    .await
+    .expect("deleted message");
+    assert_eq!(deleted, Some(ids[20]));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -589,12 +740,13 @@ async fn a_retried_update_does_not_consume_the_rate_limit_twice() {
     );
     assert_eq!(recorded(&db.pool, &prefix).await, 2);
 
-    // Третье новое действие уже сверх лимита.
+    // Третье новое действие уже сверх лимита: оно откладывается, а не
+    // выполняется и не теряется.
     let third = bot.text_update("Ann", "привет");
     enqueue_at(&db.pool, &third, retry_at).await;
     assert_eq!(
         worker.run_once(retry_at).await.expect("pass"),
-        Pass::Processed
+        Pass::Deferred
     );
     assert_eq!(
         recorded(&db.pool, &prefix).await,
@@ -604,7 +756,7 @@ async fn a_retried_update_does_not_consume_the_rate_limit_twice() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_twenty_first_callback_is_not_run_and_is_answered_with_retry_time() {
+async fn the_twenty_first_callback_is_answered_immediately_and_runs_after_the_slot_frees() {
     let db = db().await;
     ensure_household(&db.pool).await;
     let chat = next_telegram_id();
@@ -621,9 +773,10 @@ async fn the_twenty_first_callback_is_not_run_and_is_answered_with_retry_time() 
     let mut bot = Harness::new(&db.pool, chat);
     let now = Utc::now().trunc_subsecs(6);
 
+    let mut ids = Vec::new();
     for _ in 0..21 {
         let update = bot.callback_update("Ann", "t:AAAAAAAAAAAAAAAA", 1);
-        enqueue_at(&db.pool, &update, now).await;
+        ids.push(enqueue_at(&db.pool, &update, now).await);
     }
 
     for _ in 0..20 {
@@ -631,23 +784,633 @@ async fn the_twenty_first_callback_is_not_run_and_is_answered_with_retry_time() 
     }
     assert_eq!(recorded(&db.pool, &prefix).await, 20);
 
-    assert_eq!(worker.run_once(now).await.expect("pass"), Pass::Processed);
+    assert_eq!(worker.run_once(now).await.expect("pass"), Pass::Deferred);
     assert_eq!(
         recorded(&db.pool, &prefix).await,
         20,
-        "the 21st callback must not change data"
+        "the 21st callback must not change data yet"
     );
 
+    // «Часики» убирает пустой ответ без текста и без окна.
     let answers = fake.answers();
     assert_eq!(
         answers.len(),
         1,
-        "the callback must be answered: {answers:?}"
+        "the deferred callback must be answered immediately: {answers:?}"
     );
-    let text = answers[0].1.as_deref().expect("toast text");
+    assert_eq!(answers[0].1, None);
+    assert!(!answers[0].2);
+    assert_eq!(
+        status_of(&db.pool, ids[20]).await,
+        ("pending".into(), 0, None)
+    );
+
+    // Действие выполняется после освобождения слота.
+    let retry_at = now + Duration::seconds(60);
+    assert_eq!(
+        worker.run_once(retry_at).await.expect("pass"),
+        Pass::Processed
+    );
+    assert_eq!(recorded(&db.pool, &prefix).await, 21);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn three_deferred_form_answers_run_in_update_id_order() {
+    let db = db().await;
+    let home = support::create_household(&db.pool).await;
+    let chat = owner_chat(&db.pool, home.owner_id).await;
+    let fake = FakeTelegram::new();
+    let mut bot = Harness::with_handler(
+        &db.pool,
+        chat,
+        Arc::new(Bot::new("tasklerqbot")),
+        fake.clone(),
+    );
+    bot.text("/menu").await;
+    bot.press("Добавить").await;
+    bot.press("Покупку").await;
+    bot.assert_screen_contains("Что купить?");
+    let active_id = bot.active().0;
+
+    let worker = worker_with_limit(&db.pool, chat, Arc::new(Bot::new("tasklerqbot")), fake, 3);
+    let t0 = (bot.now + Duration::seconds(1)).trunc_subsecs(6);
+    let name = bot.name.clone();
+
+    // Три безвредных callback занимают все три слота.
+    for _ in 0..3 {
+        let update = bot.callback_update(&name, "t:AAAAAAAAAAAAAAAA", active_id);
+        enqueue_at(&db.pool, &update, t0).await;
+    }
+    for _ in 0..3 {
+        assert_eq!(worker.run_once(t0).await.expect("pass"), Pass::Processed);
+    }
+
+    let mut ids = Vec::new();
+    for text in ["Молоко", "2", "л"] {
+        let update = bot.text_update(&name, text);
+        ids.push(enqueue_at(&db.pool, &update, t0).await);
+    }
+    for id in &ids {
+        assert_eq!(worker.run_once(t0).await.expect("pass"), Pass::Deferred);
+        assert_eq!(status_of(&db.pool, *id).await, ("pending".into(), 0, None));
+        assert_eq!(
+            available_at(&db.pool, *id).await,
+            t0 + Duration::seconds(60)
+        );
+    }
+
+    let retry_at = t0 + Duration::seconds(60);
+    for _ in 0..3 {
+        assert_eq!(
+            worker.run_once(retry_at).await.expect("pass"),
+            Pass::Processed
+        );
+    }
+
+    // Итоговое состояние формы соответствует порядку ответов.
+    let data: Value = sqlx::query_scalar("SELECT data FROM conversation_states WHERE chat_id = $1")
+        .bind(chat)
+        .fetch_one(&db.pool)
+        .await
+        .expect("form state");
+    let Ok(Form::Create(form)) = serde_json::from_value::<Form>(data) else {
+        panic!("the shopping form should still be open");
+    };
+    assert_eq!(form.step, Step::Preview);
+    assert_eq!(form.draft.title, "Молоко");
+    assert_eq!(form.draft.quantity, Some(2.0));
+    assert_eq!(form.draft.unit.as_deref(), Some("л"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_update_arriving_while_deferred_queues_behind_it() {
+    let db = db().await;
+    let chat = next_telegram_id();
+    let fake = FakeTelegram::new();
+    let handler = Arc::new(Ordered::default());
+    let worker = limited_worker(&db.pool, chat, handler.clone(), fake);
+    let mut bot = Harness::new(&db.pool, chat);
+    let now = Utc::now().trunc_subsecs(6);
+
+    for _ in 0..UPDATES_PER_MINUTE {
+        let update = bot.text_update("Ann", "привет");
+        enqueue_at(&db.pool, &update, now).await;
+    }
+    for _ in 0..UPDATES_PER_MINUTE {
+        assert_eq!(worker.run_once(now).await.expect("pass"), Pass::Processed);
+    }
+    handler.order.lock().expect("order").clear();
+
+    let first = bot.text_update("Ann", "первое");
+    let first_id = enqueue_at(&db.pool, &first, now).await;
+    assert_eq!(worker.run_once(now).await.expect("pass"), Pass::Deferred);
+
+    // Новое обновление приходит во время ожидания и упирается в тот же слот.
+    let later = now + Duration::seconds(30);
+    let second = bot.text_update("Ann", "второе");
+    let second_id = enqueue_at(&db.pool, &second, later).await;
+    assert!(second_id > first_id);
+    assert_eq!(worker.run_once(later).await.expect("pass"), Pass::Deferred);
+
+    let retry_at = now + Duration::seconds(60);
+    assert_eq!(available_at(&db.pool, first_id).await, retry_at);
+    assert_eq!(available_at(&db.pool, second_id).await, retry_at);
+
+    for _ in 0..2 {
+        assert_eq!(
+            worker.run_once(retry_at).await.expect("pass"),
+            Pass::Processed
+        );
+    }
+    assert_eq!(
+        *handler.order.lock().expect("order"),
+        vec![first_id, second_id],
+        "the new update must queue behind the earlier deferred one"
+    );
+}
+
+/// Сколько ответов на конкретный callback отправил фейковый Bot API.
+fn answers_for(fake: &FakeTelegram, query_id: &str) -> usize {
+    fake.answers()
+        .into_iter()
+        .filter(|(answered, _, _)| answered == query_id)
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_forty_first_message_is_dropped_when_the_deferred_queue_is_full() {
+    let db = db().await;
+    let home = support::create_household(&db.pool).await;
+    let chat = owner_chat(&db.pool, home.owner_id).await;
+    let fake = FakeTelegram::new();
+    let worker = limited_worker(
+        &db.pool,
+        chat,
+        Arc::new(Bot::new("tasklerqbot")),
+        fake.clone(),
+    );
+    let mut bot = Harness::new(&db.pool, chat);
+    let now = Utc::now().trunc_subsecs(6);
+
+    let mut ids = Vec::new();
+    for _ in 0..41 {
+        let update = bot.text_update("Ann", "привет");
+        ids.push(enqueue_at(&db.pool, &update, now).await);
+    }
+
+    // Первые 20 сообщений выполняются сразу.
+    for _ in 0..UPDATES_PER_MINUTE {
+        assert_eq!(worker.run_once(now).await.expect("pass"), Pass::Processed);
+    }
+    // Следующие 20 откладываются до освобождения слотов.
+    for id in &ids[20..40] {
+        assert_eq!(worker.run_once(now).await.expect("pass"), Pass::Deferred);
+        assert_eq!(status_of(&db.pool, *id).await, ("pending".into(), 0, None));
+        assert_eq!(
+            available_at(&db.pool, *id).await,
+            now + Duration::seconds(60)
+        );
+    }
+
+    let before: i64 =
+        sqlx::query_scalar("SELECT coalesce(max(seq), 0) FROM outbox WHERE chat_id = $1")
+            .bind(chat)
+            .fetch_one(&db.pool)
+            .await
+            .expect("max seq");
+
+    // Очередь отложенных заполнена: 41-е сообщение отбрасывается.
+    let dropped = ids[40];
+    assert_eq!(
+        worker.run_once(now).await.expect("pass"),
+        Pass::Dropped,
+        "the 41st message must be dropped, not deferred"
+    );
+    assert_eq!(
+        status_of(&db.pool, dropped).await,
+        ("processed".into(), 0, None),
+        "a dropped update is marked processed without a failed attempt"
+    );
+    let rows: Vec<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT kind::text, coalesce((payload->>'message_id')::bigint, message_id)
+         FROM outbox WHERE chat_id = $1 AND seq > $2 ORDER BY seq",
+    )
+    .bind(chat)
+    .bind(before)
+    .fetch_all(&db.pool)
+    .await
+    .expect("outbox rows");
     assert!(
-        text.contains("Попробуйте через"),
-        "toast must tell when to retry: {text}"
+        rows.is_empty(),
+        "a dropped update must not write a message, screen or delete: {rows:?}"
+    );
+    let deleted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox
+         WHERE chat_id = $1 AND kind = 'delete' AND (payload->>'message_id')::bigint = $2",
+    )
+    .bind(chat)
+    .bind(dropped)
+    .fetch_one(&db.pool)
+    .await
+    .expect("delete rows");
+    assert_eq!(deleted, 0, "the dropped message must stay in the chat");
+    let buried: bool = sqlx::query_scalar("SELECT buried FROM telegram_views WHERE chat_id = $1")
+        .bind(chat)
+        .fetch_one(&db.pool)
+        .await
+        .expect("view");
+    assert!(
+        buried,
+        "a dropped text leaves its message in the chat, so the view is buried"
+    );
+
+    // Освободившиеся слоты выполняют оставшиеся 20 обновлений по `update_id`.
+    let retry_at = now + Duration::seconds(60);
+    for _ in 0..UPDATES_PER_MINUTE {
+        assert_eq!(
+            worker.run_once(retry_at).await.expect("pass"),
+            Pass::Processed
+        );
+    }
+    let deleted_ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT (payload->>'message_id')::bigint FROM outbox
+         WHERE chat_id = $1 AND kind = 'delete' AND seq > $2 ORDER BY seq",
+    )
+    .bind(chat)
+    .bind(before)
+    .fetch_all(&db.pool)
+    .await
+    .expect("deleted ids");
+    assert_eq!(
+        deleted_ids,
+        ids[20..40],
+        "the deferred updates must run in update_id order"
+    );
+    for id in &ids[..40] {
+        assert_eq!(status_of(&db.pool, *id).await.0, "processed");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_already_deferred_update_is_not_dropped_when_newer_updates_fill_the_queue() {
+    let db = db().await;
+    ensure_household(&db.pool).await;
+    let chat = next_telegram_id();
+    let fake = FakeTelegram::new();
+    let handler = Arc::new(Ordered::default());
+    let worker = worker_with_limit(&db.pool, chat, handler.clone(), fake, 1);
+    let mut bot = Harness::new(&db.pool, chat);
+    let t0 = Utc::now().trunc_subsecs(6);
+
+    // Единственный слот занят.
+    let filler = bot.text_update("Ann", "слот");
+    enqueue_at(&db.pool, &filler, t0).await;
+    assert_eq!(worker.run_once(t0).await.expect("pass"), Pass::Processed);
+    handler.order.lock().expect("order").clear();
+
+    // Старое обновление уже отложено лимитером и ждёт t0+30.
+    let old = bot.text_update("Ann", "старое");
+    let old_id = enqueue_at(&db.pool, &old, t0).await;
+    sqlx::query("UPDATE telegram_updates SET available_at = $2 WHERE update_id = $1")
+        .bind(old_id)
+        .bind(t0 + Duration::seconds(30))
+        .execute(&db.pool)
+        .await
+        .expect("defer old");
+
+    // Двадцать более новых отложенных ждут позже: за время ожидания очередь
+    // заполнилась.
+    let mut newer = Vec::new();
+    for _ in 0..DEFERRED_QUEUE_LIMIT {
+        let update = bot.text_update("Ann", "новое");
+        let id = enqueue_at(&db.pool, &update, t0 + Duration::seconds(10)).await;
+        sqlx::query("UPDATE telegram_updates SET available_at = $2 WHERE update_id = $1")
+            .bind(id)
+            .bind(t0 + Duration::seconds(130))
+            .execute(&db.pool)
+            .await
+            .expect("defer new");
+        newer.push(id);
+    }
+
+    // Повторный отказ лимитера не отбрасывает старое обновление, хотя в
+    // очереди уже двадцать более новых.
+    assert_eq!(
+        worker
+            .run_once(t0 + Duration::seconds(30))
+            .await
+            .expect("pass"),
+        Pass::Deferred,
+        "an already deferred update must be deferred again, not dropped"
+    );
+    assert_eq!(
+        status_of(&db.pool, old_id).await,
+        ("pending".into(), 0, None)
+    );
+    assert_eq!(
+        available_at(&db.pool, old_id).await,
+        t0 + Duration::seconds(60)
+    );
+
+    // Оно выполняется раньше более новых, когда освобождается слот.
+    assert_eq!(
+        worker
+            .run_once(t0 + Duration::seconds(60))
+            .await
+            .expect("pass"),
+        Pass::Processed
+    );
+    assert_eq!(*handler.order.lock().expect("order"), vec![old_id]);
+    assert_eq!(
+        status_of(&db.pool, newer[0]).await.0,
+        "pending",
+        "newer deferred updates must still be waiting"
+    );
+
+    assert_eq!(
+        worker
+            .run_once(t0 + Duration::seconds(130))
+            .await
+            .expect("pass"),
+        Pass::Processed
+    );
+    assert_eq!(
+        *handler.order.lock().expect("order"),
+        vec![old_id, newer[0]],
+        "the older deferred update must run before the newer ones"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_waiting_for_a_retry_does_not_take_a_deferred_queue_slot() {
+    let db = db().await;
+    ensure_household(&db.pool).await;
+    let chat = next_telegram_id();
+    let fake = FakeTelegram::new();
+    let worker = worker_with_limit(
+        &db.pool,
+        chat,
+        Arc::new(Recorder {
+            prefix: format!("retryslot{chat}"),
+        }),
+        fake,
+        1,
+    );
+    let mut bot = Harness::new(&db.pool, chat);
+    let t0 = Utc::now().trunc_subsecs(6);
+
+    // Слот занят.
+    let filler = bot.text_update("Ann", "слот");
+    enqueue_at(&db.pool, &filler, t0).await;
+    assert_eq!(worker.run_once(t0).await.expect("pass"), Pass::Processed);
+
+    // Двадцать строк ждут повтора после сбоя: их отодвинул бэкофф, а не
+    // лимитер, поэтому предел очереди они не занимают.
+    let mut conn = db.pool.acquire().await.expect("conn");
+    for _ in 0..DEFERRED_QUEUE_LIMIT {
+        let update = bot.text_update("Ann", "сбой");
+        let id = update["update_id"].as_i64().expect("id");
+        queue::enqueue(&mut conn, id, &update, t0)
+            .await
+            .expect("enqueue");
+        queue::record_failure(&mut conn, id, "database", 10, t0)
+            .await
+            .expect("failure");
+    }
+
+    let next = bot.text_update("Ann", "новое");
+    let next_id = enqueue_at(&db.pool, &next, t0).await;
+    assert_eq!(
+        worker.run_once(t0).await.expect("pass"),
+        Pass::Deferred,
+        "retry rows must not fill the limit for new deferred updates"
+    );
+    assert_eq!(status_of(&db.pool, next_id).await.0, "pending");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_callback_over_the_deferred_queue_limit_is_dropped_with_an_empty_answer() {
+    let db = db().await;
+    ensure_household(&db.pool).await;
+    let chat = next_telegram_id();
+    let fake = FakeTelegram::new();
+    let prefix = format!("dropcb{chat}");
+    let worker = worker_with_limit(
+        &db.pool,
+        chat,
+        Arc::new(Recorder {
+            prefix: prefix.clone(),
+        }),
+        fake.clone(),
+        1,
+    );
+    let mut bot = Harness::new(&db.pool, chat);
+    let now = Utc::now().trunc_subsecs(6);
+
+    // Первое нажатие занимает единственный слот лимита.
+    let first = bot.callback_update("Ann", "t:AAAAAAAAAAAAAAAA", 1);
+    let first_id = enqueue_at(&db.pool, &first, now).await;
+    assert_eq!(worker.run_once(now).await.expect("pass"), Pass::Processed);
+
+    // Очередь отложенных уже заполнена обновлениями того же пользователя.
+    for _ in 0..20 {
+        let update = bot.callback_update("Ann", "t:BBBBBBBBBBBBBBBB", 1);
+        enqueue_at(&db.pool, &update, now + Duration::seconds(30)).await;
+    }
+
+    let dropped = bot.callback_update("Ann", "t:CCCCCCCCCCCCCCCC", 1);
+    let dropped_id = enqueue_at(&db.pool, &dropped, now).await;
+    assert_eq!(
+        worker.run_once(now).await.expect("pass"),
+        Pass::Dropped,
+        "a callback over the deferred queue limit is dropped"
+    );
+    assert_eq!(
+        recorded(&db.pool, &prefix).await,
+        1,
+        "the dropped callback must not change data"
+    );
+    let answers = fake.answers();
+    assert_eq!(
+        answers.len(),
+        1,
+        "a dropped callback must be answered once to remove the spinner: {answers:?}"
+    );
+    assert_eq!(answers[0].1, None, "the answer must have no text");
+    assert!(!answers[0].2, "the answer must not be an alert");
+    assert_eq!(status_of(&db.pool, dropped_id).await.0, "processed");
+    assert_eq!(status_of(&db.pool, first_id).await.0, "processed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repeatedly_deferred_callback_is_answered_once() {
+    let db = db().await;
+    ensure_household(&db.pool).await;
+    let chat = next_telegram_id();
+    let fake = FakeTelegram::new();
+    let prefix = format!("repeatcb{chat}");
+    let worker = worker_with_limit(
+        &db.pool,
+        chat,
+        Arc::new(Recorder {
+            prefix: prefix.clone(),
+        }),
+        fake.clone(),
+        2,
+    );
+    let mut bot = Harness::new(&db.pool, chat);
+    let t0 = Utc::now().trunc_subsecs(6);
+
+    // Две отметки в лимите: t0 и t0+10.
+    let first = bot.callback_update("Ann", "t:AAAAAAAAAAAAAAAA", 1);
+    enqueue_at(&db.pool, &first, t0).await;
+    assert_eq!(worker.run_once(t0).await.expect("pass"), Pass::Processed);
+    let second = bot.callback_update("Ann", "t:BBBBBBBBBBBBBBBB", 1);
+    enqueue_at(&db.pool, &second, t0 + Duration::seconds(10)).await;
+    assert_eq!(
+        worker
+            .run_once(t0 + Duration::seconds(10))
+            .await
+            .expect("pass"),
+        Pass::Processed
+    );
+
+    // Два новых нажатия откладываются до t0+60.
+    let mut ids = Vec::new();
+    for data in ["t:CCCCCCCCCCCCCCCC", "t:DDDDDDDDDDDDDDDD"] {
+        let update = bot.callback_update("Ann", data, 1);
+        ids.push(enqueue_at(&db.pool, &update, t0 + Duration::seconds(10)).await);
+    }
+    for id in &ids {
+        assert_eq!(
+            worker
+                .run_once(t0 + Duration::seconds(10))
+                .await
+                .expect("pass"),
+            Pass::Deferred
+        );
+        let retry_at = t0 + Duration::seconds(60);
+        assert_eq!(available_at(&db.pool, *id).await, retry_at);
+        assert_eq!(answers_for(&fake, &format!("cb{id}")), 1);
+    }
+
+    // Первое выполняется, второе снова упирается в лимит и откладывается до
+    // t0+70. Пустой ответ на уже отвеченный query_id не повторяется.
+    let retry_at = t0 + Duration::seconds(60);
+    assert_eq!(
+        worker.run_once(retry_at).await.expect("pass"),
+        Pass::Processed
+    );
+    assert_eq!(
+        worker.run_once(retry_at).await.expect("pass"),
+        Pass::Deferred
+    );
+    assert_eq!(
+        available_at(&db.pool, ids[1]).await,
+        t0 + Duration::seconds(70)
+    );
+    assert_eq!(
+        answers_for(&fake, &format!("cb{}", ids[1])),
+        1,
+        "a repeated deferral must not answer the same callback again"
+    );
+    assert_eq!(recorded(&db.pool, &prefix).await, 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn limiter_marks_at_different_times_keep_the_update_order() {
+    let db = db().await;
+    ensure_household(&db.pool).await;
+    let chat = next_telegram_id();
+    let fake = FakeTelegram::new();
+    let handler = Arc::new(Ordered::default());
+    let worker = worker_with_limit(&db.pool, chat, handler.clone(), fake, 2);
+    let mut bot = Harness::new(&db.pool, chat);
+    let t0 = Utc::now().trunc_subsecs(6);
+
+    // Две отметки в лимите в разное время.
+    let first = bot.text_update("Ann", "первое");
+    enqueue_at(&db.pool, &first, t0).await;
+    assert_eq!(worker.run_once(t0).await.expect("pass"), Pass::Processed);
+    let second = bot.text_update("Ann", "второе");
+    enqueue_at(&db.pool, &second, t0 + Duration::seconds(10)).await;
+    assert_eq!(
+        worker
+            .run_once(t0 + Duration::seconds(10))
+            .await
+            .expect("pass"),
+        Pass::Processed
+    );
+    handler.order.lock().expect("order").clear();
+
+    let mut ids = Vec::new();
+    for text in ["третье", "четвёртое", "пятое"] {
+        let update = bot.text_update("Ann", text);
+        ids.push(enqueue_at(&db.pool, &update, t0 + Duration::seconds(10)).await);
+    }
+    for id in &ids {
+        assert_eq!(
+            worker
+                .run_once(t0 + Duration::seconds(10))
+                .await
+                .expect("pass"),
+            Pass::Deferred
+        );
+        assert_eq!(
+            available_at(&db.pool, *id).await,
+            t0 + Duration::seconds(60)
+        );
+    }
+
+    // На t0+60 освобождается место от самой старой отметки: выполняется первое
+    // отложенное обновление, остальные снова ждут.
+    let first_retry = t0 + Duration::seconds(60);
+    assert_eq!(
+        worker.run_once(first_retry).await.expect("pass"),
+        Pass::Processed
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            worker.run_once(first_retry).await.expect("pass"),
+            Pass::Deferred
+        );
+    }
+    assert_eq!(
+        available_at(&db.pool, ids[1]).await,
+        t0 + Duration::seconds(70)
+    );
+    assert_eq!(
+        available_at(&db.pool, ids[2]).await,
+        t0 + Duration::seconds(70)
+    );
+    assert_eq!(*handler.order.lock().expect("order"), vec![ids[0]]);
+
+    // На t0+70 выполняется второе, третье откладывается до t0+120.
+    let second_retry = t0 + Duration::seconds(70);
+    assert_eq!(
+        worker.run_once(second_retry).await.expect("pass"),
+        Pass::Processed
+    );
+    assert_eq!(
+        worker.run_once(second_retry).await.expect("pass"),
+        Pass::Deferred
+    );
+    assert_eq!(
+        available_at(&db.pool, ids[2]).await,
+        t0 + Duration::seconds(120)
+    );
+    assert_eq!(*handler.order.lock().expect("order"), vec![ids[0], ids[1]]);
+
+    assert_eq!(
+        worker
+            .run_once(t0 + Duration::seconds(120))
+            .await
+            .expect("pass"),
+        Pass::Processed
+    );
+    assert_eq!(
+        *handler.order.lock().expect("order"),
+        vec![ids[0], ids[1], ids[2]]
     );
 }
 

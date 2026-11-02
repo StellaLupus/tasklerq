@@ -144,7 +144,11 @@ pub enum Screen {
     /// Текущий шаг формы из `conversation_states`.
     Form,
     /// Текст принят и ждёт разбора в фоне.
-    Processing,
+    Processing {
+        /// Задание разбора; у старого состояния до выкатки его нет.
+        #[serde(default)]
+        job_id: Option<Uuid>,
+    },
     /// Черновик capture: карточка, результат или причина, по которой он закрыт.
     Draft {
         /// Черновик.

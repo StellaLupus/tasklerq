@@ -29,7 +29,7 @@ use tasklerq::storage::repositories::members;
 use tasklerq::telegram::bot::{Bot, Outcome};
 use tasklerq::telegram::capture_worker::{CaptureWorker, Pass as CapturePass};
 use tasklerq::telegram::webhook::{Ingress, SECRET_HEADER};
-use tasklerq::telegram::worker::{Pass, UpdateHandler, UpdateWorker};
+use tasklerq::telegram::worker::{DEFERRED_QUEUE_LIMIT, Pass, UpdateHandler, UpdateWorker};
 use tokio::sync::Notify;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -370,16 +370,108 @@ async fn the_telegram_update_limit_is_audited() {
     }
     drop(conn);
 
-    for _ in 0..2 {
-        assert_eq!(
-            worker.run_once(Utc::now()).await.expect("pass"),
-            Pass::Processed
-        );
+    for expected in [Pass::Processed, Pass::Deferred] {
+        assert_eq!(worker.run_once(Utc::now()).await.expect("pass"), expected);
     }
 
     let limits = payloads(&db.pool, "rate_limited").await;
     assert_eq!(limits.len(), 1, "{limits:?}");
     assert_eq!(limits[0]["limit"], "telegram_updates_per_minute");
+    assert_eq!(limits[0]["user_id"], chat);
+    assert!(limits[0]["retry_after"].as_u64().unwrap_or(0) >= 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_telegram_update_is_audited() {
+    let db = isolated_db().await;
+    let chat = next_telegram_id();
+    let worker = UpdateWorker::new(
+        db.pool.clone(),
+        Arc::new(NoopHandler),
+        FakeTelegram::new(),
+        10,
+        Arc::new(Notify::new()),
+        Audit::new(db.pool.clone()),
+    )
+    .only_chat(chat)
+    .with_rate_limit(1);
+
+    let now = Utc::now();
+    let mut conn = db.pool.acquire().await.expect("connection");
+    // Очередь отложенных уже заполнена до предела. Событие `rate_limited`
+    // пишется впервые именно на отбрасывании: откладывания не было, поэтому
+    // подавление повторов его не скроет.
+    for id in 0..DEFERRED_QUEUE_LIMIT {
+        let payload = json!({
+            "update_id": 800 + id,
+            "message": {
+                "message_id": 800 + id,
+                "date": 1_700_000_000,
+                "chat": {"id": chat, "type": "private", "first_name": "Ann"},
+                "from": {"id": chat, "is_bot": false, "first_name": "Ann"},
+                "text": "привет"
+            }
+        });
+        sqlx::query(
+            "INSERT INTO telegram_updates (update_id, payload, available_at, received_at)
+             VALUES ($1, $2, $3, $3)",
+        )
+        .bind(800 + id)
+        .bind(&payload)
+        .bind(now + Duration::hours(1))
+        .execute(&mut *conn)
+        .await
+        .expect("deferred row");
+    }
+
+    // Первое обновление расходует единственный слот лимита.
+    let first = json!({
+        "update_id": 900,
+        "message": {
+            "message_id": 900,
+            "date": 1_700_000_000,
+            "chat": {"id": chat, "type": "private", "first_name": "Ann"},
+            "from": {"id": chat, "is_bot": false, "first_name": "Ann"},
+            "text": "привет"
+        }
+    });
+    tasklerq::telegram::queue::enqueue(&mut conn, 900, &first, now)
+        .await
+        .expect("first update");
+    drop(conn);
+    assert_eq!(
+        worker.run_once(now).await.expect("first pass"),
+        Pass::Processed
+    );
+    assert!(
+        payloads(&db.pool, "rate_limited").await.is_empty(),
+        "an allowed update must not be audited as rate limited"
+    );
+
+    // Второе обновление сверх слота, а очередь отложенных полна: отбрасывание.
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let second = json!({
+        "update_id": 901,
+        "message": {
+            "message_id": 901,
+            "date": 1_700_000_000,
+            "chat": {"id": chat, "type": "private", "first_name": "Ann"},
+            "from": {"id": chat, "is_bot": false, "first_name": "Ann"},
+            "text": "привет"
+        }
+    });
+    tasklerq::telegram::queue::enqueue(&mut conn, 901, &second, now)
+        .await
+        .expect("second update");
+    drop(conn);
+    assert_eq!(
+        worker.run_once(now).await.expect("second pass"),
+        Pass::Dropped
+    );
+
+    let limits = payloads(&db.pool, "rate_limited").await;
+    assert_eq!(limits.len(), 1, "{limits:?}");
+    assert_eq!(limits[0]["limit"], tasklerq::security_audit::TELEGRAM_LIMIT);
     assert_eq!(limits[0]["user_id"], chat);
     assert!(limits[0]["retry_after"].as_u64().unwrap_or(0) >= 1);
 }

@@ -4,9 +4,38 @@ mod support;
 
 use chrono::{DateTime, Duration, Utc};
 use support::notifications::*;
-use support::telegram::buttons;
+use support::telegram::{Harness, buttons};
 use tasklerq::jobs::digest::digest_occurrence_key;
 use uuid::Uuid;
+
+/// Последняя строка outbox чата — отметка перед действием.
+async fn outbox_seq_before(bot: &Harness) -> i64 {
+    sqlx::query_scalar("SELECT coalesce(max(seq), 0) FROM outbox WHERE chat_id = $1")
+        .bind(bot.chat)
+        .fetch_one(&bot.pool)
+        .await
+        .expect("outbox seq")
+}
+
+/// После `seq_before` не должно появиться ни одной строки вида `message`:
+/// уведомление выпускается именно этим видом, а экран — строкой `screen`.
+///
+/// Экран настроек после кнопки на засыпанном якоре правится на месте
+/// (`in_place`) и остаётся засыпанным, поэтому ответ формы приходит новым
+/// экраном. Это не выпуск отложенного snooze.
+async fn assert_no_notification_sent(bot: &Harness, seq_before: i64, message: &str) {
+    let kinds: Vec<String> = sqlx::query_scalar(
+        "SELECT kind::text FROM outbox
+         WHERE chat_id = $1 AND seq > $2 AND kind = 'message'
+         ORDER BY seq",
+    )
+    .bind(bot.chat)
+    .bind(seq_before)
+    .fetch_all(&bot.pool)
+    .await
+    .expect("outbox kinds");
+    assert!(kinds.is_empty(), "{message}: {kinds:?}");
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disabling_quiet_hours_releases_three_notifications_and_the_digest() {
@@ -129,11 +158,17 @@ async fn one_deferred_notification_is_released_as_an_ordinary_message() {
         );
     }
 
-    // Повторное включение и выключение не присылает ничего.
+    // Повторное включение и выключение не выпускает уведомление снова. Кнопки
+    // нажаты на самом якоре, поэтому после 2.3 экран правится на месте
+    // (`in_place`) и новых сообщений нет даже при `buried = true`.
     let sent_after_release = bot.fake.sent().len();
     bot.press("Тихие часы: выкл").await;
     bot.press("Тихие часы: вкл").await;
-    assert_eq!(bot.fake.sent().len(), sent_after_release);
+    assert_eq!(
+        bot.fake.sent().len(),
+        sent_after_release,
+        "repeated toggling must not send anything, including another notification"
+    );
     assert!(!bot.screen().contains("Накопилось"));
 }
 
@@ -505,7 +540,7 @@ async fn snooze_not_released_before_its_own_time(move_quiet_start: bool) {
     // впереди — ручной выпуск не должен его ускорять.
     bot.advance(local_utc(moscow, day, 21, 50) - bot.now);
     open_notifications(&mut bot).await;
-    let sent_before = bot.fake.sent().len();
+    let seq_before = outbox_seq_before(&bot).await;
     if move_quiet_start {
         bot.press("Начало тихих").await;
         bot.text("23:00").await;
@@ -514,11 +549,12 @@ async fn snooze_not_released_before_its_own_time(move_quiet_start: bool) {
     }
 
     assert!(!bot.screen().contains("Накопилось"), "{}", bot.screen());
-    assert_eq!(
-        bot.fake.sent().len(),
-        sent_before,
-        "snooze must not be released before its own time"
-    );
+    assert_no_notification_sent(
+        &bot,
+        seq_before,
+        "snooze must not be released before its own time",
+    )
+    .await;
     let (scheduled_at, deferred): (DateTime<Utc>, bool) =
         sqlx::query_as("SELECT scheduled_at, deferred FROM notification_deliveries WHERE id = $1")
             .bind(delivery_id)
@@ -599,18 +635,19 @@ async fn shortening_quiet_hours_does_not_release_a_snooze_early() {
     // нет, но snooze со сроком 22:30 не должен переехать на конец интервала.
     bot.advance(local_utc(moscow, day, 21, 50) - bot.now);
     open_notifications(&mut bot).await;
-    let sent_before = bot.fake.sent().len();
+    let seq_before = outbox_seq_before(&bot).await;
     bot.press("Начало тихих").await;
     bot.text("21:00").await;
     bot.press("Конец тихих").await;
     bot.text("22:00").await;
 
     assert!(!bot.screen().contains("Накопилось"), "{}", bot.screen());
-    assert_eq!(
-        bot.fake.sent().len(),
-        sent_before,
-        "snooze must not be sent before its own time"
-    );
+    assert_no_notification_sent(
+        &bot,
+        seq_before,
+        "snooze must not be sent before its own time",
+    )
+    .await;
     let (scheduled_at, deferred): (DateTime<Utc>, bool) =
         sqlx::query_as("SELECT scheduled_at, deferred FROM notification_deliveries WHERE id = $1")
             .bind(delivery_id)

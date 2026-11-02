@@ -350,7 +350,7 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
         Pass::Failed(_)
     ));
 
-    // Второе обновление сверх лимита помечается rate_limited.
+    // Второе обновление сверх лимита откладывается до освобождения слота.
     let limited_chat = next_telegram_id();
     for update_id in [6_000_020, 6_000_021] {
         let update = text_update(update_id, limited_chat, "часто");
@@ -375,8 +375,41 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
     );
     assert_eq!(
         limited_worker.run_once(now).await.expect("second limited"),
-        Pass::Processed
+        Pass::Deferred
     );
+
+    // Переполнение очереди отложенных: обновление отбрасывается.
+    let dropped_chat = next_telegram_id();
+    for offset in 0..20 {
+        let update_id = 6_000_030 + offset;
+        let update = text_update(update_id, dropped_chat, "в очереди");
+        let mut conn = db.pool.acquire().await.expect("connection");
+        queue::enqueue(&mut conn, update_id, &update, now + Duration::seconds(60))
+            .await
+            .expect("enqueue deferred");
+    }
+    let dropping_worker = UpdateWorker::new(
+        db.pool.clone(),
+        Arc::new(Noop),
+        FakeTelegram::new(),
+        5,
+        Arc::new(Notify::new()),
+        Audit::new(db.pool.clone()),
+    )
+    .only_chat(dropped_chat)
+    .with_rate_limit(1);
+    for (update_id, expected) in [(6_000_050, Pass::Processed), (6_000_051, Pass::Dropped)] {
+        let update = text_update(update_id, dropped_chat, "сверх очереди");
+        let mut conn = db.pool.acquire().await.expect("connection");
+        queue::enqueue(&mut conn, update_id, &update, now)
+            .await
+            .expect("enqueue ready");
+        drop(conn);
+        assert_eq!(
+            dropping_worker.run_once(now).await.expect("dropping"),
+            expected
+        );
+    }
 
     // Capture из Telegram: отдельный household с реальным ботом.
     let capture_chat = next_telegram_id();
@@ -503,11 +536,8 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
     assert_metric_at_least(&text, "telegram_updates_total{status=\"processed\"}", 1.0);
     assert_metric_at_least(&text, "telegram_updates_total{status=\"failed\"}", 1.0);
     assert_metric_at_least(&text, "telegram_updates_total{status=\"dead\"}", 1.0);
-    assert_metric_at_least(
-        &text,
-        "telegram_updates_total{status=\"rate_limited\"}",
-        1.0,
-    );
+    assert_metric_at_least(&text, "telegram_updates_total{status=\"deferred\"}", 1.0);
+    assert_metric_at_least(&text, "telegram_updates_total{status=\"dropped\"}", 1.0);
     assert_metric_at_least(&text, "telegram_queue_lag_seconds", 590.0);
     assert_metric_at_least(&text, "outbox_pending", 1.0);
     assert_metric_at_least(&text, "outbox_dead_total", 1.0);
