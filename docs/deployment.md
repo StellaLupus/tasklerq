@@ -66,9 +66,14 @@
   `https://tasklerq.stellalupus.ru/webhooks/telegram`: провайдер фильтрует
   диапазоны Telegram, прямой вход на NAS не работает.
 - **xray** — исходящие вызовы Bot API идут через
-  `HTTPS_PROXY=http://172.27.0.2:10809`
+  `HTTPS_PROXY=http://xray:10809`
   (`NO_PROXY=localhost,127.0.0.1,host.docker.internal`); прямой доступ к
-  Telegram из этой сети тоже фильтруется.
+  Telegram из этой сети тоже фильтруется. Контейнер `tasklerq` подключён
+  **и к `shared-db`, и к `xray_default`**: Docker изолирует bridge-сети друг
+  от друга, поэтому из `shared-db` адрес xray (`172.27.0.2:10809`) недостижим,
+  а публикация порта у xray — только на `127.0.0.1` хоста. Обращение по имени
+  `xray` резолвится через сеть `xray_default`. Без второго сетевого интерфейса
+  `setWebhook` и вся отправка в Bot API падают с `transient` (таймаут).
 
 ## 2. Что уже есть
 
@@ -81,7 +86,7 @@
 | Home Assistant | `2026.10.4`, host network, HACS; интеграция установлена | Ничего; обновления по [`home-assistant.md`](home-assistant.md). |
 | AI Task | `ai_task.anthropic_claude_haiku_5_5` | Ничего; проверять при смене модели. |
 | Telegram | Бот `@tasklerqbot`, webhook зарегистрирован | Ничего; токен и секрет в `.env`. |
-| Tasklerq | Контейнер `tasklerq`, образ `stellalupus/tasklerq:<тег>` (на 2026-11-02 — `pr-7`), healthy | Обновления по разделу 12. |
+| Tasklerq | Контейнер `tasklerq`, образ `stellalupus/tasklerq:<тег>` (на 2026-11-03 — `pr-8`), healthy | Обновления по разделу 12. |
 
 ## 3. DNS и TLS
 
@@ -899,6 +904,7 @@ curl -fsS \
 | queue lag > 5 мин | Проверить воркеры и БД. |
 | LLM errors > 20% за 15 мин | Проверить HA AI Task, квоту, OpenRouter. |
 | webhook 401 > 50 за 5 мин | Проверить секрет и источник запросов. |
+| Бот не отвечает: в логах `setWebhook failed` и `outbox` c `error: transient` | Исходящие в Bot API не доходят до xray. Проверить, что у контейнера есть сеть `xray_default` (`docker inspect tasklerq`), и `HTTPS_PROXY=http://xray:10809`. |
 | backup failed | Проверить диск, права, PostgreSQL. |
 | disk > 80% | Очистить старые backup/логи. |
 
