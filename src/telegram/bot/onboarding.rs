@@ -141,6 +141,9 @@ fn zone(label: &str, zone: &str) -> crate::telegram::rich::Button<Action> {
 
 /// Текст при активном онбординге.
 pub async fn on_text(ctx: &mut Ctx<'_>, name: Option<String>, text: &str) -> Result<(), Fail> {
+    if ctx.user.is_some() {
+        return forms::start_onboarding(ctx).await;
+    }
     match name {
         None => {
             let trimmed = text.trim();
@@ -163,6 +166,9 @@ pub async fn on_text(ctx: &mut Ctx<'_>, name: Option<String>, text: &str) -> Res
 
 /// Выбор часового пояса кнопкой.
 pub async fn choose_zone(ctx: &mut Ctx<'_>, zone: &str) -> Result<(), Fail> {
+    if ctx.user.is_some() {
+        return forms::start_onboarding(ctx).await;
+    }
     let name =
         match crate::telegram::views::conversation(&mut *ctx.conn, ctx.chat_id, ctx.now).await? {
             crate::telegram::views::Lookup::Active(conversation) => {
@@ -178,6 +184,12 @@ pub async fn choose_zone(ctx: &mut Ctx<'_>, zone: &str) -> Result<(), Fail> {
 }
 
 async fn create(ctx: &mut Ctx<'_>, name: &str, zone: &str) -> Result<(), Fail> {
+    // Пока форма была открыта, отправителя могли добавить в household.
+    // Онбординг больше не нужен: форма закрывается, показывается меню.
+    if ctx.user.is_some() {
+        return forms::start_onboarding(ctx).await;
+    }
+
     // Форма могла быть открыта до того, как администратор задал
     // `BOOTSTRAP_OWNER_TELEGRAM_ID` или появился household. Перед вставкой
     // классификатор перепроверяется целиком: не-`Onboard` закрывает форму и

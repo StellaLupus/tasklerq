@@ -12,7 +12,7 @@ use tasklerq::config::TenancyMode;
 use tasklerq::domain::error::DomainError;
 use tasklerq::domain::identity::{AuditEventType, NewMember, NoticeKind};
 use tasklerq::domain::models::{Actor, ActorType, ListKind, UserRole};
-use tasklerq::storage::repositories::households::{self, NewHousehold, NewOwner};
+use tasklerq::storage::repositories::households::{self, NewOwner};
 use tasklerq::storage::repositories::{invites, lists, members};
 use tokio::sync::Barrier;
 use uuid::Uuid;
@@ -201,14 +201,11 @@ async fn single_mode_allows_only_one_active_household() {
     let db = support::isolated_db().await;
     let now = Utc::now();
     let mut tx = db.pool.begin().await.expect("tx");
-    households::create(
+    households::create_empty(
         &mut tx,
         TenancyMode::Single,
-        NewHousehold {
-            name: "Единственная".into(),
-            timezone: "Europe/Moscow".into(),
-            owner: None,
-        },
+        "Единственная",
+        "Europe/Moscow",
         &admin::admin_actor(),
         now,
     )
@@ -217,14 +214,11 @@ async fn single_mode_allows_only_one_active_household() {
     tx.commit().await.expect("commit");
 
     let mut tx = db.pool.begin().await.expect("tx");
-    let error = households::create(
+    let error = households::create_empty(
         &mut tx,
         TenancyMode::Single,
-        NewHousehold {
-            name: "Вторая".into(),
-            timezone: "Europe/Moscow".into(),
-            owner: None,
-        },
+        "Вторая",
+        "Europe/Moscow",
         &admin::admin_actor(),
         now,
     )
@@ -261,14 +255,11 @@ async fn multi_mode_allows_more_households() {
     let now = Utc::now();
     for name in ["Первая", "Вторая"] {
         let mut tx = db.pool.begin().await.expect("tx");
-        households::create(
+        households::create_empty(
             &mut tx,
             TenancyMode::Multi,
-            NewHousehold {
-                name: name.into(),
-                timezone: "Europe/Moscow".into(),
-                owner: None,
-            },
+            name,
+            "Europe/Moscow",
             &admin::admin_actor(),
             now,
         )
@@ -290,20 +281,16 @@ async fn soft_deleted_household_frees_the_single_slot() {
     let db = support::isolated_db().await;
     let now = Utc::now();
     let mut tx = db.pool.begin().await.expect("tx");
-    let (first, no_owner) = households::create(
+    let first = households::create_empty(
         &mut tx,
         TenancyMode::Single,
-        NewHousehold {
-            name: "Первая".into(),
-            timezone: "Europe/Moscow".into(),
-            owner: None,
-        },
+        "Первая",
+        "Europe/Moscow",
         &admin::admin_actor(),
         now,
     )
     .await
     .expect("first household");
-    assert!(no_owner.is_none());
     tx.commit().await.expect("commit");
 
     sqlx::query("UPDATE households SET deleted_at = $2 WHERE id = $1")
@@ -314,14 +301,11 @@ async fn soft_deleted_household_frees_the_single_slot() {
         .expect("soft delete");
 
     let mut tx = db.pool.begin().await.expect("tx");
-    let (second, _) = households::create(
+    let second = households::create_empty(
         &mut tx,
         TenancyMode::Single,
-        NewHousehold {
-            name: "Вторая".into(),
-            timezone: "Europe/Moscow".into(),
-            owner: None,
-        },
+        "Вторая",
+        "Europe/Moscow",
         &admin::admin_actor(),
         now,
     )

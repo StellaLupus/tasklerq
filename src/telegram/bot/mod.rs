@@ -282,6 +282,11 @@ impl Ctx<'_> {
         if matches!(screen, Screen::FirstContact(_)) {
             return self.present(Screen::Menu).await;
         }
+        // Онбординг мог остаться открытым, когда отправитель уже стал
+        // участником: `start_onboarding` закроет форму и покажет меню.
+        if matches!(screen, Screen::Form) && forms::onboarding_is_open(self).await? {
+            return forms::start_onboarding(self).await;
+        }
         self.present(screen).await
     }
 

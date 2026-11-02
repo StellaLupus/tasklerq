@@ -13,7 +13,7 @@ use tasklerq::domain::first_contact::Installation;
 use tasklerq::domain::identity::NewMember;
 use tasklerq::domain::models::{Actor, UserRole};
 use tasklerq::security_audit::Audit;
-use tasklerq::storage::repositories::households::{self, NewHousehold, NewOwner};
+use tasklerq::storage::repositories::households::{self, Creator, NewOwner};
 use tasklerq::storage::repositories::invites;
 use tasklerq::telegram::bot::Bot;
 use uuid::Uuid;
@@ -50,28 +50,45 @@ async fn soft_delete_owner(pool: &PgPool, owner_id: Uuid) {
 /// Создать household извне, как это делает `admin household create`.
 async fn create_external_household(pool: &PgPool, owner: Option<i64>) -> Uuid {
     let mut conn = pool.acquire().await.expect("connection");
-    let owner = owner.map(|telegram_id| NewOwner {
-        member: NewMember {
-            telegram_user_id: telegram_id,
-            telegram_chat_id: telegram_id,
-            display_name: "External owner".to_owned(),
-            username: None,
-        },
-        timezone: Some("Europe/Moscow".to_owned()),
-    });
-    let (household, _) = households::create(
-        &mut conn,
-        TenancyMode::Single,
-        NewHousehold {
-            name: "External household".to_owned(),
-            timezone: "Europe/Moscow".to_owned(),
-            owner,
-        },
-        &tasklerq::admin::admin_actor(),
-        Utc::now(),
-    )
-    .await
-    .expect("external household");
+    let actor = tasklerq::admin::admin_actor();
+    let name = "External household";
+    let timezone = "Europe/Moscow";
+
+    let household = match owner {
+        Some(telegram_id) => {
+            let owner = NewOwner {
+                member: NewMember {
+                    telegram_user_id: telegram_id,
+                    telegram_chat_id: telegram_id,
+                    display_name: "External owner".to_owned(),
+                    username: None,
+                },
+                timezone: Some("Europe/Moscow".to_owned()),
+            };
+            let (household, _) = households::create_with_owner(
+                &mut conn,
+                TenancyMode::Single,
+                name,
+                timezone,
+                owner,
+                Creator::Admin(&actor),
+                Utc::now(),
+            )
+            .await
+            .expect("external household");
+            household
+        }
+        None => households::create_empty(
+            &mut conn,
+            TenancyMode::Single,
+            name,
+            timezone,
+            &actor,
+            Utc::now(),
+        )
+        .await
+        .expect("external household"),
+    };
     household.id
 }
 
@@ -495,6 +512,74 @@ async fn bootstrap_owner_matching_sender_completes_onboarding_after_the_form_ope
     reconfigured.assert_screen_contains("Готово");
     assert_eq!(household_count(&db.pool).await, 1);
     assert_eq!(form_count(&db.pool, sender).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zone_button_after_the_sender_became_an_owner_shows_the_menu() {
+    let db = isolated_db().await;
+    let sender = next_telegram_id();
+    let mut bot = single_harness(&db.pool, sender, None);
+
+    bot.text("/start").await;
+    bot.text("Семья").await;
+    bot.assert_screen_contains("выберите часовой пояс");
+
+    tasklerq::admin::create_household_with_owner(
+        &db.pool,
+        TenancyMode::Single,
+        "Семья",
+        "Europe/Moscow",
+        sender,
+        Some("Alice"),
+        Utc::now(),
+    )
+    .await
+    .expect("household with owner");
+
+    bot.press("Москва").await;
+
+    assert!(
+        !bot.screen().contains("Это частное пространство"),
+        "the new owner must see the menu, not the first-contact screen:\n{}",
+        bot.screen()
+    );
+    bot.assert_screen_contains("Добавить");
+    assert_eq!(form_count(&db.pool, sender).await, 0);
+    assert_eq!(household_count(&db.pool).await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zone_text_after_the_sender_became_an_owner_shows_the_menu() {
+    let db = isolated_db().await;
+    let sender = next_telegram_id();
+    let mut bot = single_harness(&db.pool, sender, None);
+
+    bot.text("/start").await;
+    bot.text("Семья").await;
+    bot.assert_screen_contains("выберите часовой пояс");
+
+    tasklerq::admin::create_household_with_owner(
+        &db.pool,
+        TenancyMode::Single,
+        "Семья",
+        "Europe/Moscow",
+        sender,
+        Some("Alice"),
+        Utc::now(),
+    )
+    .await
+    .expect("household with owner");
+
+    bot.text("Europe/Moscow").await;
+
+    assert!(
+        !bot.screen().contains("Это частное пространство"),
+        "the new owner must see the menu, not the first-contact screen:\n{}",
+        bot.screen()
+    );
+    bot.assert_screen_contains("Добавить");
+    assert_eq!(form_count(&db.pool, sender).await, 0);
+    assert_eq!(household_count(&db.pool).await, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

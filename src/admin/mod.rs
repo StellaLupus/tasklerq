@@ -106,18 +106,8 @@ pub async fn create_household(
     now: DateTime<Utc>,
 ) -> Result<Household, DomainError> {
     let mut tx = pool.begin().await?;
-    let (household, _) = households::create(
-        &mut tx,
-        mode,
-        households::NewHousehold {
-            name: name.to_owned(),
-            timezone: timezone.to_owned(),
-            owner: None,
-        },
-        &admin_actor(),
-        now,
-    )
-    .await?;
+    let household =
+        households::create_empty(&mut tx, mode, name, timezone, &admin_actor(), now).await?;
     tx.commit().await?;
 
     Ok(household)
@@ -147,25 +137,21 @@ pub async fn create_household_with_owner(
         timezone: None,
     };
 
+    let actor = admin_actor();
     let mut tx = pool.begin().await?;
-    let (household, owner) = households::create(
+    let (household, owner) = households::create_with_owner(
         &mut tx,
         mode,
-        households::NewHousehold {
-            name: name.to_owned(),
-            timezone: timezone.to_owned(),
-            owner: Some(owner),
-        },
-        &admin_actor(),
+        name,
+        timezone,
+        owner,
+        households::Creator::Admin(&actor),
         now,
     )
     .await?;
     tx.commit().await?;
 
-    Ok((
-        household,
-        owner.expect("a household created with an owner returns it"),
-    ))
+    Ok((household, owner))
 }
 
 /// Название активного household: нужно для подтверждения удаления.

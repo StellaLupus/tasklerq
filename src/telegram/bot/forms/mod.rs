@@ -62,6 +62,11 @@ async fn load(ctx: &mut Ctx<'_>) -> Result<Option<Form>, Fail> {
     }
 }
 
+/// Открыта ли у отправителя форма онбординга.
+pub(super) async fn onboarding_is_open(ctx: &mut Ctx<'_>) -> Result<bool, Fail> {
+    Ok(matches!(load(ctx).await?, Some(Form::Onboarding { .. })))
+}
+
 async fn open(ctx: &mut Ctx<'_>, form: Form) -> Result<(), Fail> {
     put(ctx, &form).await?;
     ctx.present(Screen::Form).await
@@ -215,7 +220,18 @@ pub async fn start_time(ctx: &mut Ctx<'_>, field: TimeField) -> Result<(), Fail>
 /// Классификатор решает по состоянию инсталляции, режиму размещения и
 /// `bootstrap_owner`. В неонбординговых исходах незавершённая форма
 /// онбординга закрывается, а форма не открывается.
+///
+/// Если отправитель уже стал участником, пока форма была открыта
+/// (`admin user add` или `admin household create --owner-telegram-id`), форма
+/// закрывается, а вместо неё показывается меню.
 pub async fn start_onboarding(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
+    if ctx.user.is_some() {
+        if matches!(load(ctx).await?, Some(Form::Onboarding { .. })) {
+            clear(ctx).await?;
+        }
+        return ctx.present(Screen::Menu).await;
+    }
+
     let installation = households::installation(&mut *ctx.conn).await?;
     let contact = classify(
         ctx.tenancy.mode,
