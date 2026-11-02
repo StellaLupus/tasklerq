@@ -8,13 +8,15 @@
 
 use uuid::Uuid;
 
-use crate::domain::first_contact::{FirstContact, classify};
+use crate::domain::first_contact::classify;
 use crate::domain::models::{List, ListKind};
 use crate::domain::validation::{MAX_TITLE, sanitize};
 use crate::storage::repositories::{households, items, lists};
 use crate::telegram::views::{self, Lookup};
 
-use super::model::{EditForm, Form, ItemDraft, ItemForm, Screen, Step, TimeField};
+use super::model::{
+    EditForm, FirstContactScreen, Form, ItemDraft, ItemForm, Screen, Step, TimeField,
+};
 use super::{Ctx, Fail};
 
 mod actions;
@@ -221,15 +223,13 @@ pub async fn start_onboarding(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
         ctx.sender.id,
         installation,
     );
-    match contact {
-        FirstContact::Onboard => open(ctx, Form::Onboarding { name: None }).await,
-        other => {
-            if matches!(load(ctx).await?, Some(Form::Onboarding { .. })) {
-                clear(ctx).await?;
-            }
-            ctx.present(Screen::FirstContact(other)).await
-        }
+    let Some(screen) = FirstContactScreen::from_contact(contact) else {
+        return open(ctx, Form::Onboarding { name: None }).await;
+    };
+    if matches!(load(ctx).await?, Some(Form::Onboarding { .. })) {
+        clear(ctx).await?;
     }
+    ctx.present(Screen::FirstContact(screen)).await
 }
 
 /// Сохранить состояние онбординга.

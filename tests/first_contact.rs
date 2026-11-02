@@ -10,9 +10,10 @@ use support::telegram::{FakeTelegram, Harness};
 use support::{create_household, isolated_db, next_telegram_id};
 use tasklerq::config::{TenancyConfig, TenancyMode};
 use tasklerq::domain::first_contact::Installation;
+use tasklerq::domain::identity::NewMember;
 use tasklerq::domain::models::{Actor, UserRole};
 use tasklerq::security_audit::Audit;
-use tasklerq::storage::repositories::households;
+use tasklerq::storage::repositories::households::{self, NewHousehold, NewOwner};
 use tasklerq::storage::repositories::invites;
 use tasklerq::telegram::bot::Bot;
 use uuid::Uuid;
@@ -44,6 +45,34 @@ async fn soft_delete_owner(pool: &PgPool, owner_id: Uuid) {
         .execute(pool)
         .await
         .expect("soft delete owner");
+}
+
+/// Создать household извне, как это делает `admin household create`.
+async fn create_external_household(pool: &PgPool, owner: Option<i64>) -> Uuid {
+    let mut conn = pool.acquire().await.expect("connection");
+    let owner = owner.map(|telegram_id| NewOwner {
+        member: NewMember {
+            telegram_user_id: telegram_id,
+            telegram_chat_id: telegram_id,
+            display_name: "External owner".to_owned(),
+            username: None,
+        },
+        timezone: Some("Europe/Moscow".to_owned()),
+    });
+    let (household, _) = households::create(
+        &mut conn,
+        TenancyMode::Single,
+        NewHousehold {
+            name: "External household".to_owned(),
+            timezone: "Europe/Moscow".to_owned(),
+            owner,
+        },
+        &tasklerq::admin::admin_actor(),
+        Utc::now(),
+    )
+    .await
+    .expect("external household");
+    household.id
 }
 
 /// Бот в режиме `single` на отдельной базе.
@@ -305,5 +334,132 @@ async fn text_without_a_user_in_the_invite_state_shows_the_same_screen() {
         "no onboarding form expected:\n{}",
         bot.screen()
     );
+    assert_eq!(form_count(&db.pool, sender).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_created_during_onboarding_asks_for_an_invite() {
+    let db = isolated_db().await;
+    let sender = next_telegram_id();
+    let mut bot = single_harness(&db.pool, sender, None);
+
+    bot.text("/start").await;
+    bot.assert_screen_contains("Как назовём ваше пространство");
+    bot.text("Семья").await;
+    bot.assert_screen_contains("выберите часовой пояс");
+
+    let owner = next_telegram_id();
+    let household_id = create_external_household(&db.pool, Some(owner)).await;
+
+    bot.press("Москва").await;
+
+    bot.assert_screen_contains("Это частное пространство");
+    bot.assert_screen_contains("Попросите приглашение у владельца");
+    assert!(
+        !bot.screen().contains("Данные уже изменились"),
+        "the generic conflict banner must not hide the first-contact screen:\n{}",
+        bot.screen()
+    );
+    assert_eq!(household_count(&db.pool).await, 1);
+    assert_eq!(form_count(&db.pool, sender).await, 0);
+    let member: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM users WHERE telegram_user_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(sender)
+    .fetch_optional(&db.pool)
+    .await
+    .expect("sender user");
+    assert_eq!(member, None, "the sender must not become a member");
+    let active: Uuid = sqlx::query_scalar("SELECT id FROM households WHERE deleted_at IS NULL")
+        .fetch_one(&db.pool)
+        .await
+        .expect("active household");
+    assert_eq!(active, household_id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_without_owner_created_during_onboarding_shows_the_admin_command() {
+    let db = isolated_db().await;
+    let sender = next_telegram_id();
+    let mut bot = single_harness(&db.pool, sender, None);
+
+    bot.text("/start").await;
+    bot.text("Семья").await;
+
+    create_external_household(&db.pool, None).await;
+    bot.press("Москва").await;
+
+    let command = format!("tasklerq admin user add --telegram-id {sender} --role owner");
+    bot.assert_screen_contains(&command);
+    bot.assert_screen_contains("Бот не назначает владельца сам");
+    assert!(
+        !bot.screen().contains("Данные уже изменились"),
+        "the generic conflict banner must not hide the first-contact screen:\n{}",
+        bot.screen()
+    );
+    assert_eq!(household_count(&db.pool).await, 1);
+    assert_eq!(form_count(&db.pool, sender).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_after_an_external_household_closes_onboarding() {
+    let db = isolated_db().await;
+    let sender = next_telegram_id();
+    let mut bot = single_harness(&db.pool, sender, None);
+
+    bot.text("/start").await;
+    bot.text("Семья").await;
+
+    create_external_household(&db.pool, Some(next_telegram_id())).await;
+    bot.press("Отмена").await;
+
+    bot.assert_screen_contains("Попросите приглашение у владельца");
+    assert_eq!(form_count(&db.pool, sender).await, 0);
+    assert_eq!(household_count(&db.pool).await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_after_an_owner_is_appointed_shows_the_menu() {
+    let db = isolated_db().await;
+    let household_id = create_external_household(&db.pool, None).await;
+    let sender = next_telegram_id();
+    let mut bot = single_harness(&db.pool, sender, None);
+
+    bot.text("/start").await;
+    bot.assert_screen_contains("admin user add");
+
+    tasklerq::admin::add_user(
+        &db.pool,
+        TenancyMode::Single,
+        Some(household_id),
+        UserRole::Owner,
+        sender,
+        Some("Alice"),
+        Utc::now(),
+    )
+    .await
+    .expect("owner should be added");
+
+    bot.text("/unknown").await;
+
+    assert!(
+        !bot.screen().contains("Пространство ещё не настроено"),
+        "a fresh owner must not see the stale first-contact screen:\n{}",
+        bot.screen()
+    );
+    bot.assert_screen_contains("Добавить");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_invite_code_shows_its_banner_over_the_first_contact_screen() {
+    let db = isolated_db().await;
+    let _household = create_household(&db.pool).await;
+    let sender = next_telegram_id();
+    let mut bot = single_harness(&db.pool, sender, None);
+
+    bot.text("/start no-such-code").await;
+
+    bot.assert_screen_contains("Приглашение не найдено");
+    bot.assert_screen_contains("Попросите приглашение у владельца");
     assert_eq!(form_count(&db.pool, sender).await, 0);
 }

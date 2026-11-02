@@ -3,7 +3,6 @@
 use sqlx::Acquire;
 
 use crate::domain::error::DomainError;
-use crate::domain::first_contact::FirstContact;
 use crate::domain::identity::NewMember;
 use crate::domain::settings::validate_timezone;
 use crate::storage::repositories::households::{self, NewOwner};
@@ -11,7 +10,7 @@ use crate::storage::repositories::invites;
 use crate::telegram::rich::{Span, button};
 use crate::telegram::ru;
 
-use super::model::{Action, FormAct, Screen, Ui};
+use super::model::{Action, FirstContactScreen, FormAct, Screen, Ui};
 use super::{Ctx, Fail, display_timezone, forms};
 
 const MAX_NAME: usize = 100;
@@ -111,25 +110,22 @@ pub fn view(name: Option<&str>) -> Ui {
 }
 
 /// Информационный экран первого контакта без формы онбординга.
-pub fn first_contact(contact: &FirstContact) -> Ui {
+pub fn first_contact(contact: &FirstContactScreen) -> Ui {
     match contact {
-        FirstContact::AskInvite => Ui::new()
-            .heading("Это частное пространство")
+        FirstContactScreen::AskInvite => Ui::new()
+            .heading(ru::PRIVATE_SPACE_TITLE)
             .text(ru::ASK_INVITE),
-        FirstContact::AdminCommand(telegram_id) => Ui::new()
-            .heading("Пространство ещё не настроено")
+        FirstContactScreen::AdminCommand(telegram_id) => Ui::new()
+            .heading(ru::NOT_CONFIGURED_TITLE)
             .text(ru::ADMIN_COMMAND_INTRO)
             .spans(vec![Span::Code(ru::owner_command(*telegram_id))])
-            .text("Бот не назначает владельца сам."),
-        FirstContact::NotConfigured => Ui::new()
-            .heading("Пространство ещё не настроено")
+            .text(ru::OWNER_NOT_ASSIGNED),
+        FirstContactScreen::NotConfigured => Ui::new()
+            .heading(ru::NOT_CONFIGURED_TITLE)
             .text(ru::NOT_CONFIGURED),
-        FirstContact::NeedsAdmin => Ui::new()
-            .heading("Нужен администратор")
+        FirstContactScreen::NeedsAdmin => Ui::new()
+            .heading(ru::NEEDS_ADMIN_TITLE)
             .text(ru::NEEDS_ADMIN),
-        // Форму онбординга открывает `forms::start_onboarding`, а не этот
-        // экран. Ветка нужна только для полноты модели.
-        FirstContact::Onboard => Ui::new(),
     }
 }
 
@@ -182,8 +178,12 @@ pub async fn choose_zone(ctx: &mut Ctx<'_>, zone: &str) -> Result<(), Fail> {
 
 async fn create(ctx: &mut Ctx<'_>, name: &str, zone: &str) -> Result<(), Fail> {
     let member = new_member(ctx);
-    let onboarded = households::onboard(
-        &mut *ctx.conn,
+    // Последний шаг может проиграть гонку: household успели создать извне.
+    // Вложенный savepoint (как в `accept_invite`) гасит конфликт, не трогая
+    // savepoint шага `Ctx::in_step`. Состояние перечитывается классификатором.
+    let mut savepoint = ctx.conn.begin().await?;
+    let result = households::onboard(
+        &mut savepoint,
         ctx.tenancy.mode,
         name,
         zone,
@@ -193,7 +193,27 @@ async fn create(ctx: &mut Ctx<'_>, name: &str, zone: &str) -> Result<(), Fail> {
         },
         ctx.now,
     )
-    .await?;
+    .await;
+    let onboarded = match result {
+        Ok(onboarded) => {
+            savepoint.commit().await?;
+            onboarded
+        }
+        Err(error) => {
+            savepoint.rollback().await?;
+            if matches!(
+                &error,
+                DomainError::Conflict { details, .. }
+                    if details.get("reason").and_then(|reason| reason.as_str())
+                        == Some("household_exists")
+            ) {
+                // Форму закроет `start_onboarding`; баннер не нужен: экран сам
+                // объясняет новое состояние инсталляции.
+                return forms::start_onboarding(ctx).await;
+            }
+            return Err(error.into());
+        }
+    };
     forms::finish(ctx).await?;
     ctx.tz = display_timezone(Some(&onboarded.user), Some(&onboarded.household));
     ctx.user = Some(onboarded.user);

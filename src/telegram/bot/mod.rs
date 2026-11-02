@@ -276,6 +276,11 @@ impl Ctx<'_> {
         if self.user.is_none() {
             return forms::start_onboarding(self).await;
         }
+        // Пользователь, которого администратор только что назначил владельцем,
+        // не должен видеть сохранённый экран первого контакта.
+        if matches!(screen, Screen::FirstContact(_)) {
+            return self.present(Screen::Menu).await;
+        }
         self.present(screen).await
     }
 
