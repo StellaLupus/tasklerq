@@ -939,7 +939,11 @@ async fn notification_actions_are_idempotent() {
         outbox::enqueue(
             &mut conn,
             bot.chat,
-            &Outgoing::Message { html, rich: true },
+            &Outgoing::Message {
+                html,
+                rich: true,
+                delete_after: None,
+            },
             None,
             bot.now,
         )
@@ -1061,7 +1065,11 @@ async fn open_from_notice_shows_card_in_navigation() {
         outbox::enqueue(
             &mut conn,
             bot.chat,
-            &Outgoing::Message { html, rich: true },
+            &Outgoing::Message {
+                html,
+                rich: true,
+                delete_after: None,
+            },
             None,
             bot.now,
         )

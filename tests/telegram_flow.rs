@@ -78,6 +78,7 @@ async fn deliver_message(bot: &mut Harness, html: &str) {
         &Outgoing::Message {
             html: html.to_owned(),
             rich: true,
+            delete_after: None,
         },
         None,
         bot.now,

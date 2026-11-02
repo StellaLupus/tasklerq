@@ -259,6 +259,7 @@ impl Ctx<'_> {
             &Outgoing::Message {
                 html: rich::escape(text),
                 rich: false,
+                delete_after: None,
             },
             None,
             self.now,
@@ -316,6 +317,7 @@ impl Ctx<'_> {
                 &Outgoing::Message {
                     html: rich::escape(&text),
                     rich: false,
+                    delete_after: None,
                 },
                 None,
                 self.now,

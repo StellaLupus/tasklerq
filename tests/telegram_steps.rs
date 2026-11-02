@@ -58,6 +58,7 @@ async fn write_effects(ctx: &mut Ctx<'_>) {
         &Outgoing::Message {
             html: "<p>эффект</p>".into(),
             rich: false,
+            delete_after: None,
         },
         None,
         ctx.now,

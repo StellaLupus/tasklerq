@@ -417,7 +417,11 @@ pub(crate) async fn enqueue_message(
     rich: bool,
     now: DateTime<Utc>,
 ) -> Result<i64, sqlx::Error> {
-    let outgoing = Outgoing::Message { html, rich };
+    let outgoing = Outgoing::Message {
+        html,
+        rich,
+        delete_after: None,
+    };
     match outbox::enqueue(conn, chat_id, &outgoing, Some(dedupe_key), now).await? {
         Some(seq) => Ok(seq),
         None => {
