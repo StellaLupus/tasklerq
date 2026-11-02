@@ -203,7 +203,7 @@ fn render_span(span: &Span) -> String {
 }
 
 fn quote_is_long(text: &str) -> bool {
-    text.split('\n').count() > QUOTE_MAX_LINES || text.chars().count() > QUOTE_MAX_CHARS
+    text.lines().count() > QUOTE_MAX_LINES || text.chars().count() > QUOTE_MAX_CHARS
 }
 
 /// Собрать HTML экрана. `tokens` — по одному на кнопку в порядке
@@ -363,6 +363,17 @@ mod tests {
         assert_eq!(
             render(&chars, &[]).html,
             format!("<blockquote>{}</blockquote>", "я".repeat(200))
+        );
+    }
+
+    #[test]
+    fn a_trailing_newline_does_not_add_a_quote_line() {
+        let view = View::<()>::new().quote("один\nдва\nтри\n");
+        let html = render(&view, &[]).html;
+
+        assert!(
+            !html.starts_with("<blockquote expandable>"),
+            "a trailing newline must not count as a fourth line: {html}"
         );
     }
 

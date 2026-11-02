@@ -519,6 +519,11 @@ impl OutboxWorker {
             Err(error) if error.is_retryable() => {
                 let attempts = row.attempts + 1;
                 if attempts >= MAX_ATTEMPTS {
+                    // Сообщение пользователя осталось в чате: следующий
+                    // экран должен прийти новым сообщением.
+                    if matches!(outgoing, Outgoing::Delete { .. }) {
+                        views::mark_buried(&mut tx, row.chat_id).await?;
+                    }
                     mark_dead(&mut tx, row.seq, error.code(), now).await?;
                     Delivery::Dead
                 } else {
@@ -537,6 +542,11 @@ impl OutboxWorker {
                 }
             }
             Err(error) => {
+                // Любой окончательный отказ удаления, кроме «сообщения нет»,
+                // оставляет сообщение пользователя в чате.
+                if matches!(outgoing, Outgoing::Delete { .. }) {
+                    views::mark_buried(&mut tx, row.chat_id).await?;
+                }
                 mark_dead(&mut tx, row.seq, error.code(), now).await?;
                 Delivery::Dead
             }
@@ -666,9 +676,14 @@ async fn deliver(
         }
         Outgoing::Edit { message_id, html } => {
             let rich = RichMessage { html: html.clone() };
-            replace_or_send(api, row.chat_id, Some(*message_id), &rich)
-                .await
-                .map(|(message_id, _)| message_id)
+            let (message_id, sent_new) =
+                replace_or_send(api, row.chat_id, Some(*message_id), &rich).await?;
+            // Запасной путь отправил новое сообщение ниже якоря: как и при
+            // доставке `message`, активный экран больше нельзя править на месте.
+            if sent_new {
+                views::mark_buried(conn, row.chat_id).await.map_err(db)?;
+            }
+            Ok(message_id)
         }
         Outgoing::Delete { message_id } => {
             match api.delete_message(row.chat_id, *message_id).await {

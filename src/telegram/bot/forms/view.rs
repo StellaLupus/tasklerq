@@ -1,5 +1,6 @@
 //! Экраны форм.
 
+use crate::domain::error::DomainError;
 use crate::domain::models::{Item, ItemPriority, ListKind, MonthRule, RecurrenceFreq};
 use crate::domain::validation::{MAX_SUBTASKS, MAX_TAGS};
 use crate::storage::repositories::{lists, tags, users};
@@ -15,7 +16,7 @@ use crate::telegram::bot::model::{
 };
 use crate::telegram::bot::onboarding;
 use crate::telegram::bot::screens::{back_button, clip};
-use crate::telegram::bot::{Ctx, Fail};
+use crate::telegram::bot::{Ctx, Fail, into_sqlx};
 
 // ---------------------------------------------------------------------
 // Экраны
@@ -134,10 +135,12 @@ async fn draft_summary(
     }
     if let Some(assignee) = draft.assignee {
         let household_id = ctx.household()?.id;
-        let name = users::get(&mut *ctx.conn, household_id, assignee)
-            .await
-            .map(|user| user.display_name)
-            .unwrap_or_else(|_| "—".to_owned());
+        let name = match users::get(&mut *ctx.conn, household_id, assignee).await {
+            Ok(user) => user.display_name,
+            // Исполнителя могли удалить: показываем прочерк, а не сбой.
+            Err(DomainError::NotFound) => "—".to_owned(),
+            Err(error) => return Err(Fail::Infra(into_sqlx(error))),
+        };
         lines.push(format!("Исполнитель: {}", clip(&name, 40)));
     }
     if !draft.tags.is_empty() {

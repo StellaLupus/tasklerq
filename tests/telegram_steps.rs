@@ -344,7 +344,7 @@ async fn edit_form_summary_shows_a_unit_without_quantity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn create_shopping_summary_keeps_the_chosen_quantity_and_unit() {
+async fn create_shopping_preview_keeps_the_chosen_quantity_and_unit() {
     let db = db().await;
     let mut bot = onboarded(&db.pool).await;
 
@@ -355,5 +355,8 @@ async fn create_shopping_summary_keeps_the_chosen_quantity_and_unit() {
     bot.assert_screen_contains("Количество: 2");
     bot.press("л").await;
 
+    // Выбор единицы сразу открывает предпросмотр: проверяется он, а не
+    // сводка шага.
+    bot.assert_screen_contains("Проверьте и сохраните");
     bot.assert_screen_contains("Количество: 2 л");
 }

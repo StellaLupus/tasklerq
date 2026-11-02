@@ -313,22 +313,29 @@ async fn editing_a_notification_keeps_the_buried_flag() {
             "an edit must keep the buried flag"
         );
     }
+}
 
-    // Запасной путь правки тоже не трогает признак: сообщение уже было в чате.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_fallback_with_a_new_message_buries_the_view() {
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    rig.put_view().await;
+    rig.message("<p>уведомление</p>", None)
+        .await
+        .expect("message");
+    rig.pass().await;
+    rig.set_buried(false).await;
     rig.fake.reject_edits(Some(TelegramError::MessageGone));
-    for (buried, html) in [(false, "<p>запасной 1</p>"), (true, "<p>запасной 2</p>")]
-    {
-        rig.set_buried(buried).await;
-        let message_id = rig.fake.messages(rig.chat).last().expect("notification").0;
-        let seq = rig.edit(message_id, html).await;
-        assert_eq!(rig.pass_after(SECOND).await, 1);
-        assert_eq!(rig.row(seq).await.0, "sent");
-        assert_eq!(
-            rig.buried().await,
-            buried,
-            "the edit fallback with a new message must keep the buried flag"
-        );
-    }
+    let message_id = rig.fake.messages(rig.chat).last().expect("notification").0;
+
+    let seq = rig.edit(message_id, "<p>запасной</p>").await;
+    assert_eq!(rig.pass_after(SECOND).await, 1);
+
+    assert_eq!(rig.row(seq).await.0, "sent");
+    assert!(
+        rig.buried().await,
+        "a new message sent instead of the edit lands below the anchor"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -856,6 +863,49 @@ async fn temporary_delete_failure_backs_off_and_keeps_the_row_pending() {
     assert_eq!(
         (status.as_str(), attempts, error.as_deref()),
         ("pending", 1, Some("transient"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn permanently_failed_delete_is_dead_and_buries_the_view() {
+    let _dead = DEAD_METRIC.lock().await;
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    rig.put_view().await;
+    rig.fake
+        .reject_deletes(Some(TelegramError::BadRequest("bad".into())));
+    let seq = rig.delete(61).await;
+
+    assert_eq!(rig.pass().await, 0);
+
+    assert_eq!(
+        rig.row(seq).await,
+        ("dead".into(), 0, Some("bad_request".into()), None)
+    );
+    assert!(
+        rig.buried().await,
+        "a dead delete leaves the user message in the chat, so the view is buried"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_exhausted_by_retries_is_dead_and_buries_the_view() {
+    let _dead = DEAD_METRIC.lock().await;
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    rig.put_view().await;
+    rig.fake
+        .reject_deletes(Some(TelegramError::Transient("503".into())));
+    let seq = rig.delete(62).await;
+
+    for _ in 0..MAX_ATTEMPTS {
+        rig.pass_after(StdDuration::from_secs(400)).await;
+    }
+
+    assert_eq!(rig.row(seq).await.0, "dead");
+    assert!(
+        rig.buried().await,
+        "a delete that exhausted its retries leaves the user message in the chat"
     );
 }
 

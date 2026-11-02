@@ -1047,6 +1047,51 @@ async fn a_long_source_text_is_collapsed_in_the_quote() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_quote_escapes_markup_on_the_processing_screen_and_in_the_card() {
+    let db = db().await;
+    let mut stand = stand(&db.pool, vec![Ok(two_items())]).await;
+    let text = "<b>x</b> & y";
+    let escaped = "&lt;b&gt;x&lt;/b&gt; &amp; y";
+
+    stand.bot.text(text).await;
+    let processing = stand.bot.screen();
+    assert!(
+        processing.contains(escaped),
+        "the processing quote must be escaped:\n{processing}"
+    );
+    assert!(
+        !processing.contains("<b>x</b>"),
+        "the processing quote must not contain raw markup:\n{processing}"
+    );
+
+    assert_eq!(stand.work().await, Pass::Drafted);
+    let card = stand.bot.screen();
+    assert!(
+        card.contains(escaped),
+        "the draft card quote must be escaped:\n{card}"
+    );
+    assert!(
+        !card.contains("<b>x</b>"),
+        "the draft card quote must not contain raw markup:\n{card}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_long_source_text_is_collapsed_in_the_draft_card_quote() {
+    let db = db().await;
+    let mut stand = stand(&db.pool, vec![Ok(two_items())]).await;
+    let text = "строка один\nстрока два\nстрока три\nстрока четыре";
+
+    stand.capture(text).await;
+
+    let html = stand.bot.screen();
+    assert!(
+        html.contains("<blockquote expandable>"),
+        "four lines must collapse in the draft card too:\n{html}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn closed_drafts_do_not_quote_the_source_text() {
     let db = db().await;
     let text = "позвонить маме и купить молоко";
