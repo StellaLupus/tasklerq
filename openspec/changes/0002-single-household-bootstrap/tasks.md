@@ -42,7 +42,7 @@
 ## 7. Интеграционная проверка
 
 - [x] 7.1 Прогнать `make lint` и `make test` (fmt, clippy `-D warnings`, все тесты), проверить, что всё зелёное.
-- [ ] 7.2 На staging или локальной копии с двумя household пройти Migration Plan из design: деградация видна в логе и `/health/ready`, `household list` показывает оба, токен выпускается в боте, HA переподключается, `household delete` убирает лишний household, предупреждение исчезает без перезапуска. Записать результат в PR.
+- [x] 7.2 На staging или локальной копии с двумя household пройти Migration Plan из design: деградация видна в логе и `/health/ready`, `household list` показывает оба, токен выпускается в боте, HA переподключается, `household delete` убирает лишний household, предупреждение исчезает без перезапуска. Записать результат в PR.
 - [x] 7.3 Проверить `openspec validate 0002-single-household-bootstrap --strict` и убедиться, что ошибок нет.
 
 ## Workflow follow-up
