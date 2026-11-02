@@ -116,8 +116,10 @@ pub async fn claim_next(
     }))
 }
 
-/// Сколько обновлений чата отложено на будущее (`available_at > now`).
+/// Сколько обновлений чата отложено лимитером (`available_at > now`).
 ///
+/// Строки, ожидающие повтора после сбоя (`attempts > 0`), в предел очереди не
+/// входят: бэкофф отодвигает их на будущее, но это не откладывание лимитером.
 /// Считается по тому же выражению `chat_id`, что и фильтр [`claim_next`]. В
 /// приватном чате `chat.id` равен `user.id`.
 pub async fn deferred_count(
@@ -128,7 +130,7 @@ pub async fn deferred_count(
     let sql = format!(
         "SELECT count(*)
          FROM telegram_updates
-         WHERE status = 'pending' AND available_at > $1
+         WHERE status = 'pending' AND available_at > $1 AND attempts = 0
            AND ({CHAT_ID_EXPR})::bigint = $2"
     );
     sqlx::query_scalar(&sql)

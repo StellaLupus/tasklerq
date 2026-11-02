@@ -775,6 +775,14 @@ async fn on_callback(ctx: &mut Ctx<'_>, message_id: i64, data: &str) -> Result<(
         }
     };
 
+    // Кнопка уведомления не правит якорь на месте, даже если её сообщение
+    // совпало с активным: уведомление не является экраном навигации. После
+    // `consume` экран открывается как `visible`; повтор и просрочка выше
+    // остаются прежними.
+    if token.scope == Scope::Notice {
+        ctx.placement = Placement::Visible;
+    }
+
     // Токен действует только пока пользователь состоит в том же household.
     let current_household = ctx.household.as_ref().map(|household| household.id);
     if token.household_id != current_household {

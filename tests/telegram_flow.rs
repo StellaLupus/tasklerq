@@ -478,6 +478,46 @@ async fn notification_button_opens_a_new_screen_below() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_notice_button_on_the_anchor_message_is_not_edited_in_place() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let (anchor, _) = bot.active();
+
+    // Якорь засыпан: после него в чате есть уведомления.
+    deliver_message(&mut bot, "<p>напоминание</p>").await;
+    let (notice, data) =
+        deliver_notice_button(&mut bot, "📋 В меню", Action::Go { to: Screen::Menu }).await;
+    bot.fake.clear_calls();
+
+    // Кнопка уведомления нажата на сообщении с id активного якоря: область
+    // токена всё равно не даёт ей править якорь на месте.
+    bot.press_data(&data, anchor).await;
+
+    let calls = bot.fake.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|call| matches!(call, Call::SendRich { .. })),
+        "a notice button must open a new screen: {calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|call| matches!(call, Call::EditRich { id, .. } if *id == anchor)),
+        "a notice button must not edit the anchor in place: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| matches!(call, Call::Delete { id, .. } if *id == anchor)),
+        "the old anchor must be deleted: {calls:?}"
+    );
+    let (new_id, _) = bot.active();
+    assert_ne!(new_id, anchor);
+    assert!(is_alive(&bot, notice), "the notification must stay");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repeated_start_and_menu_send_a_new_screen() {
     let db = db().await;
     let mut bot = onboarded(&db.pool).await;

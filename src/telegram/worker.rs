@@ -164,9 +164,17 @@ impl UpdateWorker {
         if job.attempts == 0
             && let Some(limited) = self.rate_limited(&job, now).await?
         {
+            // Предел относится только к новым обновлениям. Уже отложенное
+            // обновление при повторном отказе откладывается снова: пока оно
+            // ждало, очередь могли заполнить более новые, и отбрасывание
+            // старого нарушило бы их порядок.
+            //
             // Без предела флудящий пользователь заставлял бы единственный воркер
             // заново проверять все отложенные обновления на каждом слоте.
-            if queue::deferred_count(&mut tx, limited.chat_id, now).await? >= DEFERRED_QUEUE_LIMIT {
+            if !job.deferred
+                && queue::deferred_count(&mut tx, limited.chat_id, now).await?
+                    >= DEFERRED_QUEUE_LIMIT
+            {
                 queue::mark_processed(&mut tx, job.update_id, now).await?;
                 if limited.text {
                     // Обработчик не увидит текст, поэтому сообщение остаётся в
@@ -183,6 +191,9 @@ impl UpdateWorker {
                 // Событие пишется после коммита отдельным соединением: отказ не
                 // должен исчезнуть вместе с транзакцией ответа.
                 self.audit.rate_limited(limited.event, now).await;
+                // Нажатие кнопки получает пустой ответ, чтобы убрать «часики».
+                // Сообщения в чат нет: у текста ответ не предусмотрен.
+                self.answer(limited.outcome).await;
                 metrics::telegram_update("dropped");
                 log_update(job.update_id, "dropped", started);
                 return Ok(Pass::Dropped);
