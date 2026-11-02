@@ -11,11 +11,12 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::capture::breaker::CircuitBreaker;
-use crate::config::{Config, TelegramMode};
+use crate::config::{Config, TelegramMode, TenancyMode};
 use crate::http::api::capture::CaptureState;
 use crate::http::router::{AppState, build_router};
 use crate::jobs::retention::RetentionWorker;
 use crate::security_audit::Audit;
+use crate::storage::repositories::households;
 use crate::telegram::runtime::{self, StartError};
 
 /// Собранное приложение и его фоновые задачи.
@@ -51,6 +52,7 @@ pub async fn build_application_with_update_limit(
     update_limit: Option<u32>,
 ) -> Result<Application, StartError> {
     warn_if_bootstrap_owner_missing(config);
+    warn_if_multiple_households(config, &pool).await;
 
     let ai = runtime::build_ai(&config.llm);
     let breaker = Arc::new(CircuitBreaker::default());
@@ -68,7 +70,7 @@ pub async fn build_application_with_update_limit(
     )
     .await?;
 
-    let mut state = AppState::new(pool.clone(), audit);
+    let mut state = AppState::new(pool.clone(), audit).with_tenancy_mode(config.tenancy.mode);
     let mut workers = Vec::new();
     if let Some(runtime) = telegram {
         if let Some(ingress) = runtime.ingress {
@@ -105,6 +107,42 @@ fn warn_if_bootstrap_owner_missing(config: &Config) {
             "BOOTSTRAP_OWNER_TELEGRAM_ID is not set: the first person to write to the bot \
              will become the owner; set BOOTSTRAP_OWNER_TELEGRAM_ID to choose the owner explicitly"
         );
+    }
+}
+
+/// Сообщить о деградации: в режиме `single` активных household больше одного.
+///
+/// Деградация — вычисляемое состояние (design D4), поэтому лог пишется один раз
+/// при старте и содержит только число: названия и идентификаторы не нужны и
+/// могут быть чувствительными. Сбой подсчёта не мешает запуску: недоступность
+/// базы уже обработают readiness и рабочие задачи, а падение сервиса из-за
+/// диагностической проверки недопустимо.
+async fn warn_if_multiple_households(config: &Config, pool: &PgPool) {
+    if config.tenancy.mode != TenancyMode::Single {
+        return;
+    }
+
+    let counted = async {
+        let mut conn = pool.acquire().await?;
+        households::count_active(&mut conn).await
+    }
+    .await;
+
+    match counted {
+        Ok(active) if active > 1 => {
+            tracing::error!(
+                households = active,
+                "single tenancy mode with multiple active households: creating new households \
+                 is disabled; see the runbook for cleanup"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "could not count active households at startup"
+            );
+        }
     }
 }
 

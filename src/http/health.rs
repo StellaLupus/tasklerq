@@ -6,6 +6,8 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::VERSION;
+use crate::config::TenancyMode;
+use crate::storage::repositories::households;
 use crate::telegram::queue;
 
 use super::error::ApiError;
@@ -20,6 +22,10 @@ pub struct HealthResponse {
     pub version: &'static str,
     /// Время проверки в UTC.
     pub time: DateTime<Utc>,
+    /// Необязательные предупреждения о деградации; поле отсутствует, когда их
+    /// нет.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warnings: Option<Vec<&'static str>>,
 }
 
 /// `GET /health/live`: процесс отвечает.
@@ -28,6 +34,7 @@ pub async fn live() -> Json<HealthResponse> {
         status: "ok",
         version: VERSION,
         time: Utc::now(),
+        warnings: None,
     })
 }
 
@@ -56,22 +63,40 @@ pub async fn ready(State(state): State<AppState>) -> Result<Json<HealthResponse>
     }
 
     let now = Utc::now();
-    if let Some(limit) = state.queue_lag_limit {
-        // Упавший или остановленный воркер заметен по самому старому обновлению,
-        // которое давно могло быть обработано.
+    let mut warnings = None;
+    // Очередь и счёт household делят одно соединение. Счёт идёт после проверки
+    // очереди: при 503 из-за лага он уже не нужен.
+    if state.queue_lag_limit.is_some() || state.tenancy_mode == TenancyMode::Single {
         let mut conn = state.pool.acquire().await.map_err(|error| {
             tracing::warn!(error = %error, "readiness check failed");
             ApiError::service_unavailable("Database is unavailable")
         })?;
-        let oldest = queue::oldest_ready(&mut conn, now).await.map_err(|error| {
-            tracing::warn!(error = %error, "readiness check failed");
-            ApiError::service_unavailable("Database is unavailable")
-        })?;
-        if oldest.is_some_and(|oldest| now - oldest > limit) {
-            tracing::warn!("telegram update queue is lagging");
-            return Err(ApiError::service_unavailable(
-                "Telegram update queue is lagging",
-            ));
+
+        if let Some(limit) = state.queue_lag_limit {
+            // Упавший или остановленный воркер заметен по самому старому
+            // обновлению, которое давно могло быть обработано.
+            let oldest = queue::oldest_ready(&mut conn, now).await.map_err(|error| {
+                tracing::warn!(error = %error, "readiness check failed");
+                ApiError::service_unavailable("Database is unavailable")
+            })?;
+            if oldest.is_some_and(|oldest| now - oldest > limit) {
+                tracing::warn!("telegram update queue is lagging");
+                return Err(ApiError::service_unavailable(
+                    "Telegram update queue is lagging",
+                ));
+            }
+        }
+
+        if state.tenancy_mode == TenancyMode::Single {
+            // Счёт читается при каждом запросе: после `household delete`
+            // предупреждение исчезает без перезапуска.
+            let active = households::count_active(&mut conn).await.map_err(|error| {
+                tracing::warn!(error = %error, "readiness household count failed");
+                ApiError::service_unavailable("Database is unavailable")
+            })?;
+            if active > 1 {
+                warnings = Some(vec!["multiple_households"]);
+            }
         }
     }
 
@@ -79,5 +104,6 @@ pub async fn ready(State(state): State<AppState>) -> Result<Json<HealthResponse>
         status: "ok",
         version: VERSION,
         time: now,
+        warnings,
     }))
 }

@@ -10,6 +10,7 @@ use super::error::ApiError;
 use super::health;
 use super::metrics;
 use super::middleware::request_id;
+use crate::config::TenancyMode;
 use crate::security_audit::Audit;
 use crate::telegram::webhook::{self, Ingress};
 
@@ -25,6 +26,9 @@ pub struct AppState {
     /// Допустимый возраст необработанного обновления Telegram; `None`, если
     /// воркер обновлений не запущен и очередь не проверяется.
     pub queue_lag_limit: Option<chrono::Duration>,
+    /// Режим размещения: `/health/ready` считает предупреждения только в
+    /// `single`. Боевой путь выставляет значение из `config.tenancy.mode`.
+    pub tenancy_mode: TenancyMode,
     /// Внешний capture; `None`, если маршрут выключен.
     pub capture: Option<CaptureState>,
 }
@@ -41,6 +45,7 @@ impl AppState {
             pool,
             telegram: None,
             queue_lag_limit: None,
+            tenancy_mode: TenancyMode::Single,
             capture: None,
         }
     }
@@ -48,6 +53,12 @@ impl AppState {
     /// Включить `POST /api/v1/capture`.
     pub fn with_capture(mut self, capture: CaptureState) -> Self {
         self.capture = Some(capture);
+        self
+    }
+
+    /// Задать режим размещения для проверки деградации в `/health/ready`.
+    pub fn with_tenancy_mode(mut self, mode: TenancyMode) -> Self {
+        self.tenancy_mode = mode;
         self
     }
 

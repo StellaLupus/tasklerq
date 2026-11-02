@@ -585,7 +585,7 @@ curl -fsS -X POST http://127.0.0.1:18080/api/v1/capture \
 
 | Команда | Назначение |
 | --- | --- |
-| `tasklerq admin token create --name "Home Assistant" --scopes ha:read,ha:write` | Выпустить токен. Значение показывается один раз, в базе хранится только хеш. `--scopes`: `ha:read`, `ha:write`, `capture:write`, `metrics:read`. `--expires-in-days N` задаёт срок. |
+| `tasklerq admin token create [--household <id>] --name "Home Assistant" --scopes ha:read,ha:write [--expires-in-days N]` | Выпустить токен. Значение показывается один раз, в базе хранится только хеш. `--scopes`: `ha:read`, `ha:write`, `capture:write`, `metrics:read`. `--expires-in-days N` задаёт срок. |
 | `tasklerq admin token list [--household <id>]` | id, префикс, состояние, scopes и название без секретов. |
 | `tasklerq admin token revoke <id> [--yes]` | Отозвать токен. Опасная команда: без `--yes` спрашивает `y/N` в терминале; без TTY завершается ошибкой и токен не меняет. |
 | `tasklerq admin household create --name "Семья" --timezone Europe/Moscow [--owner-telegram-id <id> [--owner-name "Имя"]]` | Создать household, списки «Задачи»/«Покупки» и, если указан `--owner-telegram-id`, владельца одной транзакцией. Без владельца печатает подсказку `admin user add`. В режиме `single` второй активный household отклоняется с `409`. |
@@ -772,6 +772,13 @@ curl -fsS http://127.0.0.1:18080/health/ready
 - `route`, `status`, `duration_ms`;
 - `error_code`;
 - `version`.
+
+При деградации (в режиме `single` активных household больше одного)
+`/health/ready` продолжает отвечать `200`, но в ответе появляется поле
+`"warnings": ["multiple_households"]`. Когда предупреждений нет, поле
+`warnings` отсутствует; `/health/live` его не выдаёт. В том же состоянии при
+старте сервис пишет в лог `error` с числом активных household — без названий и
+идентификаторов.
 
 Метрики — `GET /metrics` в формате Prometheus exposition 0.0.4. Эндпоинт не
 публичный: нужен Bearer-токен со scope `metrics:read` (токен в query не
@@ -1129,6 +1136,15 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 активных household, либо после переключения `single → multi → single`. Сервис
 продолжает работать.
 
+Симптомы:
+
+- при старте в логе есть `error` с числом активных household (без названий и
+  идентификаторов);
+- `/health/ready` отвечает `200`, но содержит
+  `"warnings": ["multiple_households"]`;
+- новые пользователи в боте видят «Инсталляция требует вмешательства
+  администратора».
+
 1. `tasklerq admin household list` — найдите household с владельцем и
    задачами; лишний обычно остался без владельца или пустым.
 2. Выпустите токен для нужного household:
@@ -1147,6 +1163,10 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
    Восстановление — вручную до истечения retention
    (`UPDATE households SET deleted_at = NULL`, то же для участников).
    Отозванные токены не восстанавливаются, выпустите новые.
+
+После `household delete` предупреждение в `/health/ready` исчезает без
+перезапуска: число активных household читается при каждом запросе. Error-лог
+относится только к запуску — при следующем перезапуске его уже не будет.
 
 ## 17. Локальная разработка
 

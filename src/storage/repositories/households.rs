@@ -164,10 +164,7 @@ async fn lock_installation(conn: &mut PgConnection, mode: TenancyMode) -> Result
         .await?;
 
     if mode == TenancyMode::Single {
-        let active: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM households WHERE deleted_at IS NULL")
-                .fetch_one(&mut *conn)
-                .await?;
+        let active = count_active(conn).await?;
         if active >= 1 {
             return Err(DomainError::conflict_with(
                 "a household already exists; only one is allowed in single mode",
@@ -290,6 +287,19 @@ pub async fn get(conn: &mut PgConnection, household_id: Uuid) -> Result<Househol
     .fetch_optional(conn)
     .await?
     .ok_or(DomainError::NotFound)
+}
+
+/// Число активных household (`deleted_at IS NULL`).
+///
+/// Общий запрос для проверки единственности при создании, стартового
+/// предупреждения и `/health/ready`. [`installation`] считает то же число
+/// вместе с наличием владельца одним запросом и остаётся отдельным.
+pub async fn count_active(conn: &mut PgConnection) -> Result<i64, DomainError> {
+    Ok(
+        sqlx::query_scalar("SELECT count(*) FROM households WHERE deleted_at IS NULL")
+            .fetch_one(conn)
+            .await?,
+    )
 }
 
 /// Состояние инсталляции одним запросом: число активных household и наличие
