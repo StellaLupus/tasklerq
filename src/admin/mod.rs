@@ -35,6 +35,7 @@ pub fn admin_actor() -> Actor {
 /// Выпустить токен household. Открытое значение возвращается один раз.
 pub async fn create_token(
     pool: &PgPool,
+    mode: TenancyMode,
     household_id: Option<Uuid>,
     name: &str,
     scopes: &[String],
@@ -56,7 +57,7 @@ pub async fn create_token(
     };
 
     let mut tx = pool.begin().await?;
-    let household = resolve_household(&mut tx, household_id).await?;
+    let household = resolve_household(&mut tx, mode, household_id).await?;
     let issued = tokens::issue(
         &mut tx,
         household.id,
@@ -88,10 +89,11 @@ pub async fn revoke_token(
 /// Токены household без секретов.
 pub async fn list_tokens(
     pool: &PgPool,
+    mode: TenancyMode,
     household_id: Option<Uuid>,
 ) -> Result<Vec<ApiToken>, DomainError> {
     let mut conn = pool.acquire().await?;
-    let household = resolve_household(&mut conn, household_id).await?;
+    let household = resolve_household(&mut conn, mode, household_id).await?;
     crate::storage::repositories::tokens::list(&mut conn, household.id).await
 }
 
@@ -177,9 +179,10 @@ pub async fn delete_household(
 }
 
 /// Добавить участника. Без `household_id` используется единственный
-/// существующий household.
+/// существующий household в режиме `single`; в `multi` идентификатор обязателен.
 pub async fn add_user(
     pool: &PgPool,
+    mode: TenancyMode,
     household_id: Option<Uuid>,
     role: UserRole,
     telegram_user_id: i64,
@@ -187,7 +190,7 @@ pub async fn add_user(
     now: DateTime<Utc>,
 ) -> Result<(Household, User), DomainError> {
     let mut tx = pool.begin().await?;
-    let household = resolve_household(&mut tx, household_id).await?;
+    let household = resolve_household(&mut tx, mode, household_id).await?;
 
     // В приватном чате chat_id равен Telegram ID, поэтому CLI достаточно ID.
     let user = users::add(
@@ -467,6 +470,7 @@ struct ReminderRow {
 /// Мягко удалённые участники, списки и задачи не включаются.
 pub async fn export(
     pool: &PgPool,
+    mode: TenancyMode,
     household_id: Option<Uuid>,
     now: DateTime<Utc>,
 ) -> Result<Export, DomainError> {
@@ -474,7 +478,7 @@ pub async fn export(
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .execute(&mut *tx)
         .await?;
-    let household = resolve_household(&mut tx, household_id).await?;
+    let household = resolve_household(&mut tx, mode, household_id).await?;
     let members = users::list_active(&mut tx, household.id).await?;
     let lists = lists::list(&mut tx, household.id).await?;
     let items = items::all_for_export(&mut tx, household.id).await?;
@@ -553,28 +557,38 @@ async fn reminders_for(
     Ok(rows)
 }
 
-/// Household из аргумента или, если его не указали, единственный существующий.
+/// Household из аргумента или, если его не указали, единственный существующий
+/// в режиме `single`. В `multi` аргумент обязателен.
 pub async fn resolve_household(
     conn: &mut sqlx::PgConnection,
+    mode: TenancyMode,
     household_id: Option<Uuid>,
 ) -> Result<Household, DomainError> {
     match household_id {
         Some(id) => households::get(conn, id).await,
-        None => select_household(households::list_active(conn).await?),
+        None => select_household(mode, households::list_active(conn).await?),
     }
 }
 
-/// Выбрать household, когда администратор его не указал: допустим только
-/// единственный.
-pub fn select_household(mut all: Vec<Household>) -> Result<Household, DomainError> {
-    match all.len() {
-        0 => Err(DomainError::Validation(
-            "no household exists; create one with `admin household create`".into(),
-        )),
-        1 => Ok(all.remove(0)),
-        count => Err(DomainError::Validation(format!(
-            "{count} households exist; pass --household"
-        ))),
+/// Выбрать household, когда администратор его не указал.
+///
+/// В `single` допустим только единственный household; в `multi` без явного
+/// идентификатора команда всегда завершается ошибкой.
+pub fn select_household(
+    mode: TenancyMode,
+    mut all: Vec<Household>,
+) -> Result<Household, DomainError> {
+    match mode {
+        TenancyMode::Multi => Err(DomainError::Validation("pass --household".into())),
+        TenancyMode::Single => match all.len() {
+            0 => Err(DomainError::Validation(
+                "no household exists; create one with `admin household create`".into(),
+            )),
+            1 => Ok(all.remove(0)),
+            count => Err(DomainError::Validation(format!(
+                "{count} households exist; pass --household"
+            ))),
+        },
     }
 }
 
@@ -605,14 +619,33 @@ mod tests {
     }
 
     #[test]
-    fn implicit_household_must_be_unique() {
-        assert!(select_household(Vec::new()).is_err());
+    fn implicit_household_must_be_unique_in_single_mode() {
+        assert!(select_household(TenancyMode::Single, Vec::new()).is_err());
         let single = household("A");
         assert_eq!(
-            select_household(vec![single.clone()]).expect("single").id,
+            select_household(TenancyMode::Single, vec![single.clone()])
+                .expect("single")
+                .id,
             single.id
         );
-        assert!(select_household(vec![household("A"), household("B")]).is_err());
+        assert!(
+            select_household(TenancyMode::Single, vec![household("A"), household("B")]).is_err()
+        );
+    }
+
+    #[test]
+    fn multi_mode_requires_an_explicit_household_even_when_unique() {
+        for all in [
+            Vec::new(),
+            vec![household("A")],
+            vec![household("A"), household("B")],
+        ] {
+            let error = select_household(TenancyMode::Multi, all).expect_err("multi needs an id");
+            assert!(
+                matches!(error, DomainError::Validation(ref message) if message.contains("--household")),
+                "the error must ask for --household: {error:?}"
+            );
+        }
     }
 
     #[test]

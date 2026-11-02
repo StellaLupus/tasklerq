@@ -12,7 +12,9 @@ use uuid::Uuid;
 
 use crate::auth::access::require_user;
 use crate::domain::error::DomainError;
-use crate::domain::identity::{AuditEventType, MembershipChange, MembershipNotice, NoticeKind};
+use crate::domain::identity::{
+    AuditEventType, MembershipChange, MembershipNotice, NoticeKind, confirmation_matches,
+};
 use crate::domain::models::{Actor, EventType, Household, User, UserRole};
 
 use super::{audit, events, invites, tokens, users};
@@ -28,13 +30,6 @@ pub struct DeletedHousehold {
     pub revoked_tokens: u64,
     /// Сколько приглашений отозвано.
     pub revoked_invites: u64,
-}
-
-/// Совпадает ли подтверждение с названием household.
-///
-/// Пробелы по краям ввода не учитываются; регистр и остальные символы важны.
-pub fn confirmation_matches(name: &str, confirmation: &str) -> bool {
-    confirmation.trim() == name
 }
 
 /// Удалить участника из household. Только владелец.
@@ -378,17 +373,4 @@ async fn detach(
     }
 
     Ok(unassigned)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::confirmation_matches;
-
-    #[test]
-    fn household_name_confirmation_trims_surrounding_spaces_only() {
-        assert!(confirmation_matches("Семья", "  Семья \n"));
-        assert!(!confirmation_matches("Семья", "Семья 2"));
-        assert!(!confirmation_matches("Семья", "семья"));
-        assert!(!confirmation_matches("Семья", ""));
-    }
 }

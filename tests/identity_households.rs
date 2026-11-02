@@ -471,6 +471,7 @@ async fn admin_added_owner_skips_onboarding_and_second_owner_is_rejected() {
 
     let (_, user) = admin::add_user(
         &db.pool,
+        TenancyMode::Multi,
         Some(household.id),
         UserRole::Owner,
         telegram_id,
@@ -511,6 +512,7 @@ async fn admin_added_owner_skips_onboarding_and_second_owner_is_rejected() {
 
     let second = admin::add_user(
         &db.pool,
+        TenancyMode::Multi,
         Some(household.id),
         UserRole::Owner,
         support::next_telegram_id(),
@@ -526,6 +528,7 @@ async fn admin_added_owner_skips_onboarding_and_second_owner_is_rejected() {
     // Участник добавляется без ограничений владельца.
     let (_, member) = admin::add_user(
         &db.pool,
+        TenancyMode::Multi,
         Some(household.id),
         UserRole::Member,
         support::next_telegram_id(),
@@ -539,6 +542,7 @@ async fn admin_added_owner_skips_onboarding_and_second_owner_is_rejected() {
     // Пользователь не может состоять в двух household.
     let duplicate = admin::add_user(
         &db.pool,
+        TenancyMode::Multi,
         Some(household.id),
         UserRole::Member,
         telegram_id,

@@ -19,7 +19,7 @@ use tasklerq::admin;
 use tasklerq::auth::tokens::hash_token;
 use tasklerq::capture::breaker::CircuitBreaker;
 use tasklerq::capture::prompt::PROMPT_VERSION;
-use tasklerq::config::{CaptureConfig, SecretString};
+use tasklerq::config::{CaptureConfig, SecretString, TenancyMode};
 use tasklerq::home_assistant::{AiTask, GenerateData, HaError};
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
@@ -155,6 +155,7 @@ async fn api_authentication_failures_are_audited_without_secrets() {
     // Отозванный токен: идентификатор опознан, значение — нет.
     let revoked = admin::create_token(
         &db.pool,
+        TenancyMode::Single,
         Some(household.household_id),
         "revoked",
         &["ha:read".to_owned()],
@@ -193,6 +194,7 @@ async fn api_authentication_failures_are_audited_without_secrets() {
     // Просроченный токен.
     let expiring = admin::create_token(
         &db.pool,
+        TenancyMode::Single,
         Some(household.household_id),
         "expiring",
         &["ha:read".to_owned()],
@@ -226,6 +228,7 @@ async fn api_authentication_failures_are_audited_without_secrets() {
     // Не хватает scope.
     let read_only = admin::create_token(
         &db.pool,
+        TenancyMode::Single,
         Some(household.household_id),
         "read only",
         &["ha:read".to_owned()],
@@ -637,6 +640,7 @@ async fn token_creation_revocation_and_role_changes_are_audited() {
 
     let issued = admin::create_token(
         &db.pool,
+        TenancyMode::Single,
         Some(household.household_id),
         "Home Assistant",
         &["ha:read".to_owned(), "ha:write".to_owned()],
@@ -701,6 +705,7 @@ async fn no_secret_or_user_content_reaches_audit_payloads() {
     let household: TestHousehold = create_household(&db.pool).await;
     let issued = admin::create_token(
         &db.pool,
+        TenancyMode::Single,
         Some(household.household_id),
         "No secrets",
         &["ha:read".to_owned(), "capture:write".to_owned()],

@@ -202,3 +202,23 @@ pub struct MembershipChange {
     /// Сколько элементов потеряло исполнителя.
     pub unassigned_items: u64,
 }
+
+/// Совпадает ли подтверждение с названием household.
+///
+/// Пробелы по краям ввода не учитываются; регистр и остальные символы важны.
+pub fn confirmation_matches(name: &str, confirmation: &str) -> bool {
+    confirmation.trim() == name
+}
+
+#[cfg(test)]
+mod tests {
+    use super::confirmation_matches;
+
+    #[test]
+    fn household_name_confirmation_trims_surrounding_spaces_only() {
+        assert!(confirmation_matches("Семья", "  Семья \n"));
+        assert!(!confirmation_matches("Семья", "Семья 2"));
+        assert!(!confirmation_matches("Семья", "семья"));
+        assert!(!confirmation_matches("Семья", ""));
+    }
+}

@@ -133,7 +133,8 @@ enum WebhookCommand {
 
 #[derive(Debug, Args)]
 struct ExportArgs {
-    /// Household; без значения используется единственный существующий.
+    /// Household; в `single` можно опустить, если household единственный;
+    /// в `multi` обязателен.
     #[arg(long)]
     household: Option<Uuid>,
     /// Файл выгрузки; без значения JSON печатается в stdout.
@@ -155,7 +156,8 @@ enum TokenCommand {
     },
     /// Показать токены household без секретов.
     List {
-        /// Household; без значения используется единственный существующий.
+        /// Household; в `single` можно опустить, если household единственный;
+        /// в `multi` обязателен.
         #[arg(long)]
         household: Option<Uuid>,
     },
@@ -163,7 +165,8 @@ enum TokenCommand {
 
 #[derive(Debug, Args)]
 struct TokenCreate {
-    /// Household; без значения используется единственный существующий.
+    /// Household; в `single` можно опустить, если household единственный;
+    /// в `multi` обязателен.
     #[arg(long)]
     household: Option<Uuid>,
     /// Название токена.
@@ -233,7 +236,8 @@ enum UserCommand {
         /// Роль. Второй владелец в household не создаётся.
         #[arg(long, value_enum)]
         role: RoleArg,
-        /// Household; без значения используется единственный существующий.
+        /// Household; в `single` можно опустить, если household единственный;
+        /// в `multi` обязателен.
         #[arg(long)]
         household: Option<Uuid>,
         /// Отображаемое имя.
@@ -412,12 +416,14 @@ async fn run_admin_database(command: DatabaseCommand) -> Result<()> {
         .await
         .context("database connection failed")?;
     let now = Utc::now();
+    let tenancy = TenancyConfig::from_env().context("invalid tenancy configuration")?;
 
     match command {
         DatabaseCommand::Token(command) => match command {
             TokenCommand::Create(args) => {
                 let issued = admin::create_token(
                     &pool,
+                    tenancy.mode,
                     args.household,
                     &args.name,
                     &args.scopes,
@@ -449,7 +455,7 @@ async fn run_admin_database(command: DatabaseCommand) -> Result<()> {
                 }
             }
             TokenCommand::List { household } => {
-                for token in admin::list_tokens(&pool, household)
+                for token in admin::list_tokens(&pool, tenancy.mode, household)
                     .await
                     .map_err(explain)?
                 {
@@ -507,41 +513,38 @@ async fn run_admin_database(command: DatabaseCommand) -> Result<()> {
                 timezone,
                 owner_telegram_id,
                 owner_name,
-            } => {
-                let tenancy = TenancyConfig::from_env().context("invalid tenancy configuration")?;
-                match owner_telegram_id {
-                    Some(telegram_user_id) => {
-                        let (household, owner) = admin::create_household_with_owner(
-                            &pool,
-                            tenancy.mode,
-                            &name,
-                            &timezone,
-                            telegram_user_id,
-                            owner_name.as_deref(),
-                            now,
-                        )
-                        .await
-                        .map_err(explain)?;
-                        println!("id: {}", household.id);
-                        println!("name: {}", household.name);
-                        println!("timezone: {}", household.timezone);
-                        println!("owner: {}", owner.telegram_user_id);
-                    }
-                    None => {
-                        let household =
-                            admin::create_household(&pool, tenancy.mode, &name, &timezone, now)
-                                .await
-                                .map_err(explain)?;
-                        println!("id: {}", household.id);
-                        println!("name: {}", household.name);
-                        println!("timezone: {}", household.timezone);
-                        println!(
-                            "tasklerq admin user add --telegram-id <id> --role owner --household {}",
-                            household.id
-                        );
-                    }
+            } => match owner_telegram_id {
+                Some(telegram_user_id) => {
+                    let (household, owner) = admin::create_household_with_owner(
+                        &pool,
+                        tenancy.mode,
+                        &name,
+                        &timezone,
+                        telegram_user_id,
+                        owner_name.as_deref(),
+                        now,
+                    )
+                    .await
+                    .map_err(explain)?;
+                    println!("id: {}", household.id);
+                    println!("name: {}", household.name);
+                    println!("timezone: {}", household.timezone);
+                    println!("owner: {}", owner.telegram_user_id);
                 }
-            }
+                None => {
+                    let household =
+                        admin::create_household(&pool, tenancy.mode, &name, &timezone, now)
+                            .await
+                            .map_err(explain)?;
+                    println!("id: {}", household.id);
+                    println!("name: {}", household.name);
+                    println!("timezone: {}", household.timezone);
+                    println!(
+                        "tasklerq admin user add --telegram-id <id> --role owner --household {}",
+                        household.id
+                    );
+                }
+            },
             HouseholdCommand::List => {
                 for household in admin::list_households(&pool, now).await.map_err(explain)? {
                     let owner = household
@@ -585,6 +588,7 @@ async fn run_admin_database(command: DatabaseCommand) -> Result<()> {
             } => {
                 let (household, user) = admin::add_user(
                     &pool,
+                    tenancy.mode,
                     household,
                     role.into(),
                     telegram_id,
@@ -599,7 +603,7 @@ async fn run_admin_database(command: DatabaseCommand) -> Result<()> {
             }
         },
         DatabaseCommand::Export(args) => {
-            let export = admin::export(&pool, args.household, now)
+            let export = admin::export(&pool, tenancy.mode, args.household, now)
                 .await
                 .map_err(explain)?;
             let mut json =
@@ -657,7 +661,7 @@ fn require_name_confirmation(expected: &str) -> Result<()> {
     std::io::stdin()
         .read_line(&mut answer)
         .context("failed to read the confirmation")?;
-    if tasklerq::storage::repositories::members::confirmation_matches(expected, &answer) {
+    if tasklerq::domain::identity::confirmation_matches(expected, &answer) {
         Ok(())
     } else {
         bail!("отмена; ничего не изменено");

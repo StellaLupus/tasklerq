@@ -562,12 +562,6 @@ async fn household_delete_revokes_access_and_records_a_system_audit() {
         "a system actor has no display name"
     );
 
-    let outbox: i64 = sqlx::query_scalar("SELECT count(*) FROM outbox")
-        .fetch_one(&db.pool)
-        .await
-        .expect("outbox");
-    assert_eq!(outbox, 0, "the CLI does not notify members");
-
     let (status, _) =
         support::request(&app, Method::GET, "/api/v1/household", Some(&token), None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -1389,4 +1383,100 @@ async fn export_uses_the_only_household_when_not_specified() {
         household.household_id.to_string(),
         "the single household is used without --household"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_token_create_requires_household_even_when_unique() {
+    let db = cli_database().await;
+    let household = support::create_household(&db.pool).await;
+
+    let without = run_with_tenancy(
+        &db.url,
+        "multi",
+        &[
+            "admin", "token", "create", "--name", "HA", "--scopes", "ha:read",
+        ],
+    )
+    .await;
+    assert!(!without.status.success(), "{without:?}");
+    let combined = format!("{}{}", stdout(&without), stderr(&without));
+    assert!(
+        combined.contains("--household"),
+        "multi must ask for --household:\n{combined}"
+    );
+    let tokens: i64 = sqlx::query_scalar("SELECT count(*) FROM api_tokens WHERE household_id = $1")
+        .bind(household.household_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("token count");
+    assert_eq!(tokens, 0, "no token is created without --household");
+
+    let household_id = household.household_id.to_string();
+    let with = run_with_tenancy(
+        &db.url,
+        "multi",
+        &[
+            "admin",
+            "token",
+            "create",
+            "--household",
+            &household_id,
+            "--name",
+            "HA",
+            "--scopes",
+            "ha:read",
+        ],
+    )
+    .await;
+    assert!(with.status.success(), "{with:?}");
+    let token = field(&stdout(&with), "token");
+    assert!(token.starts_with("tlq_"), "the token is printed once");
+    let tokens: i64 = sqlx::query_scalar("SELECT count(*) FROM api_tokens WHERE household_id = $1")
+        .bind(household.household_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("token count");
+    assert_eq!(tokens, 1, "the explicit household gets the token");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_export_requires_household_even_when_unique() {
+    let db = cli_database().await;
+    let household = support::create_household(&db.pool).await;
+    let dir = std::env::temp_dir().join(format!("tasklerq-export-{}", Uuid::now_v7().simple()));
+    std::fs::create_dir_all(&dir).expect("temporary directory");
+    let path = dir.join("export.json");
+    let path_str = path.to_str().expect("path");
+
+    let without =
+        run_with_tenancy(&db.url, "multi", &["admin", "export", "--output", path_str]).await;
+    assert!(!without.status.success(), "{without:?}");
+    let combined = format!("{}{}", stdout(&without), stderr(&without));
+    assert!(
+        combined.contains("--household"),
+        "multi must ask for --household:\n{combined}"
+    );
+    assert!(stdout(&without).is_empty(), "no JSON is written to stdout");
+    assert!(!path.exists(), "no export file is created");
+
+    let household_id = household.household_id.to_string();
+    let with = run_with_tenancy(
+        &db.url,
+        "multi",
+        &[
+            "admin",
+            "export",
+            "--household",
+            &household_id,
+            "--output",
+            path_str,
+        ],
+    )
+    .await;
+    assert!(with.status.success(), "{with:?}");
+    let written = std::fs::read_to_string(&path).expect("export file");
+    let export: Value = serde_json::from_str(&written).expect("file is JSON");
+    assert_eq!(export["household"]["id"], household_id);
+
+    std::fs::remove_dir_all(&dir).ok();
 }

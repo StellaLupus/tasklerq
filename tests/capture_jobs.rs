@@ -214,7 +214,9 @@ async fn permanent_failure_does_not_retry() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn completed_job_keeps_no_text_and_is_purged_after_retention() {
-    let db = support::db().await;
+    // `purge` удаляет завершённые задания всей базы, поэтому тест работает в
+    // отдельной базе и не задевает параллельные тесты.
+    let db = support::isolated_db().await;
     let household = support::create_household(&db.pool).await;
     let chat = chat();
     let id = enqueue(&db.pool, &household, chat, "секретный подарок").await;

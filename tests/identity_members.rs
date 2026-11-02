@@ -835,6 +835,7 @@ async fn journal_is_owner_only_paged_and_free_of_secrets() {
     tx.commit().await.expect("commit");
     let issued = admin::create_token(
         &db.pool,
+        tasklerq::config::TenancyMode::Single,
         Some(household.household_id),
         "Журнал",
         &["ha:read".to_owned()],
