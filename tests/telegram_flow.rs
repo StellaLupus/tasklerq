@@ -7,10 +7,12 @@ use std::sync::Arc;
 use chrono::Duration;
 use support::telegram::{Call, FakeTelegram, Harness, buttons};
 use support::{db, next_telegram_id};
+use tasklerq::domain::models::{Actor, ActorType, ItemPatch};
+use tasklerq::storage::repositories::items;
 use tasklerq::telegram::api::TelegramError;
 use tasklerq::telegram::bot::model::{Action, Screen, Ui};
 use tasklerq::telegram::bot::{Bot, issue_and_render};
-use tasklerq::telegram::callbacks::Scope;
+use tasklerq::telegram::callbacks::{self, NewToken, Scope};
 use tasklerq::telegram::outbox::{self, Outgoing};
 use tasklerq::telegram::rich::button;
 
@@ -68,6 +70,35 @@ async fn household_of(pool: &sqlx::PgPool, telegram_id: i64) -> uuid::Uuid {
     .fetch_one(pool)
     .await
     .expect("household")
+}
+
+/// Выпустить callback-токен на действие, как это делает экран.
+async fn action_callback(bot: &Harness, action: Action) -> String {
+    let household = household_of(&bot.pool, bot.chat).await;
+    let mut conn = bot.pool.acquire().await.expect("connection");
+    callbacks::issue_many(
+        &mut conn,
+        &[NewToken {
+            telegram_user_id: bot.chat,
+            household_id: Some(household),
+            scope: Scope::Screen,
+            action: action.name(),
+            payload: serde_json::to_value(&action).expect("action payload"),
+            version: None,
+        }],
+        bot.now,
+    )
+    .await
+    .expect("callback should be issued")
+    .remove(0)
+}
+
+fn last_toast(bot: &Harness) -> Option<String> {
+    bot.fake
+        .answers()
+        .into_iter()
+        .next_back()
+        .and_then(|(_, text, _)| text)
 }
 
 /// Доставить отдельное сообщение чата (уведомление) и обновить `buried`.
@@ -387,10 +418,14 @@ async fn delete_asks_for_confirmation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn deleted_task_shows_undo_and_returns_it_to_the_list() {
+async fn deleted_task_shows_undo_and_returns_it_with_its_fields() {
     let db = db().await;
     let mut bot = onboarded(&db.pool).await;
     bot.text("Вернуть задачу").await;
+    bot.press("Срок").await;
+    bot.press("Завтра").await;
+    bot.press("Приоритет").await;
+    bot.press("Срочный").await;
     bot.press("Сохранить").await;
     bot.press("Вернуть задачу").await;
 
@@ -401,8 +436,13 @@ async fn deleted_task_shows_undo_and_returns_it_to_the_list() {
     bot.assert_has_button("К списку");
 
     let household = household_of(&db.pool, bot.chat).await;
-    let (item_id, deleted): (uuid::Uuid, bool) = sqlx::query_as(
-        "SELECT id, deleted_at IS NOT NULL FROM items
+    let (item_id, deleted, due_before, priority_before): (
+        uuid::Uuid,
+        bool,
+        Option<chrono::NaiveDate>,
+        String,
+    ) = sqlx::query_as(
+        "SELECT id, deleted_at IS NOT NULL, due_date, priority::text FROM items
          WHERE household_id = $1 AND title = $2",
     )
     .bind(household)
@@ -411,10 +451,13 @@ async fn deleted_task_shows_undo_and_returns_it_to_the_list() {
     .await
     .expect("deleted item");
     assert!(deleted, "the task must be soft-deleted before the undo");
+    assert!(due_before.is_some(), "the task must keep a due date");
+    assert_eq!(priority_before, "urgent");
 
     bot.press("Отменить").await;
     bot.assert_screen_contains("Задачи · 1");
     bot.assert_screen_contains("Вернуть задачу");
+    bot.assert_screen_contains("срочно");
     assert!(
         bot.fake
             .answers()
@@ -425,9 +468,15 @@ async fn deleted_task_shows_undo_and_returns_it_to_the_list() {
         bot.fake.answers()
     );
 
-    let (still_deleted, title, status): (bool, String, String) = sqlx::query_as(
-        "SELECT deleted_at IS NOT NULL, title, status::text FROM items
-         WHERE household_id = $1 AND id = $2",
+    let (still_deleted, title, status, due_after, priority_after): (
+        bool,
+        String,
+        String,
+        Option<chrono::NaiveDate>,
+        String,
+    ) = sqlx::query_as(
+        "SELECT deleted_at IS NOT NULL, title, status::text, due_date, priority::text
+         FROM items WHERE household_id = $1 AND id = $2",
     )
     .bind(household)
     .bind(item_id)
@@ -437,6 +486,11 @@ async fn deleted_task_shows_undo_and_returns_it_to_the_list() {
     assert!(!still_deleted, "undo must restore deleted_at");
     assert_eq!(title, "Вернуть задачу");
     assert_eq!(status, "open");
+    assert_eq!(due_after, due_before, "the due date must be restored");
+    assert_eq!(
+        priority_after, priority_before,
+        "the priority must be restored"
+    );
 
     let undone: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM item_events WHERE item_id = $1 AND undo_of IS NOT NULL",
@@ -446,6 +500,118 @@ async fn deleted_task_shows_undo_and_returns_it_to_the_list() {
     .await
     .expect("undo event");
     assert_eq!(undone, 1, "the journal must record an undo_of event");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_delete_undo_reports_that_there_is_nothing_to_undo() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Одна отмена").await;
+    bot.press("Сохранить").await;
+    bot.press("Одна отмена").await;
+    bot.press("Удалить").await;
+    bot.press("Да, удалить").await;
+
+    let household = household_of(&db.pool, bot.chat).await;
+    let (item_id, list_id): (uuid::Uuid, uuid::Uuid) =
+        sqlx::query_as("SELECT id, list_id FROM items WHERE household_id = $1 AND title = $2")
+            .bind(household)
+            .bind("Одна отмена")
+            .fetch_one(&db.pool)
+            .await
+            .expect("deleted item");
+
+    bot.press("Отменить").await;
+    bot.assert_screen_contains("Задачи · 1");
+
+    // Повторное нажатие после применённой отмены: действия больше нет, но
+    // элемент не должен исчезнуть или откатиться ещё раз.
+    let data = action_callback(
+        &bot,
+        Action::DeleteUndo {
+            item_id,
+            back: Screen::List { list_id, page: 0 },
+        },
+    )
+    .await;
+    let (message_id, _) = bot.active();
+    bot.press_data(&data, message_id).await;
+
+    assert_eq!(
+        last_toast(&bot).as_deref(),
+        Some("Нечего отменять"),
+        "a repeated undo must not pretend the undo window expired"
+    );
+    let alive: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM items WHERE id = $1 AND deleted_at IS NULL")
+            .bind(item_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("item count");
+    assert_eq!(alive, 1, "the restored item must stay exactly once");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_delete_undo_does_not_undo_a_later_edit() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Вернуть через API").await;
+    bot.press("Сохранить").await;
+    bot.press("Вернуть через API").await;
+    bot.press("Удалить").await;
+    bot.press("Да, удалить").await;
+    bot.assert_screen_contains("🗑 Удалено: Вернуть через API");
+
+    let household = household_of(&db.pool, bot.chat).await;
+    let item_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM items WHERE household_id = $1 AND title = $2")
+            .bind(household)
+            .bind("Вернуть через API")
+            .fetch_one(&db.pool)
+            .await
+            .expect("deleted item");
+
+    // Имитация API: удаление отменено и элемент изменён вне бота.
+    let system = Actor::system(ActorType::System);
+    let mut conn = db.pool.acquire().await.expect("connection");
+    items::undo_last(&mut conn, household, &system, item_id, bot.now)
+        .await
+        .expect("api undo");
+    let restored = items::get(&mut conn, household, item_id)
+        .await
+        .expect("restored item");
+    items::update(
+        &mut conn,
+        household,
+        &system,
+        item_id,
+        restored.version,
+        ItemPatch {
+            title: Some("Изменено после отмены".into()),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        bot.now,
+    )
+    .await
+    .expect("later edit");
+
+    // Устаревшая кнопка со старого экрана не должна откатывать это изменение.
+    bot.press("Отменить").await;
+    assert_eq!(
+        last_toast(&bot).as_deref(),
+        Some("Нечего отменять"),
+        "a stale undo must not report an expired window"
+    );
+
+    let (title, deleted): (String, bool) =
+        sqlx::query_as("SELECT title, deleted_at IS NOT NULL FROM items WHERE id = $1")
+            .bind(item_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("item after stale undo");
+    assert_eq!(title, "Изменено после отмены");
+    assert!(!deleted, "the stale undo must not restore the item");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -541,24 +707,72 @@ async fn deleted_task_undo_after_window_reports_expiry_and_keeps_it_deleted() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn deleted_screen_back_to_list_does_not_undo() {
+async fn deleted_purchase_undo_after_window_reports_expiry_and_keeps_it_deleted() {
     let db = db().await;
     let mut bot = onboarded(&db.pool).await;
-    bot.text("Оставить удалённой").await;
+    bot.press("Покупки").await;
+    bot.press("Добавить").await;
+    bot.text("Позднее молоко").await;
+    bot.press("1").await;
+    bot.press("л").await;
     bot.press("Сохранить").await;
-    bot.press("Оставить удалённой").await;
+    bot.press("⋯").await;
 
     bot.press("Удалить").await;
     bot.press("Да, удалить").await;
-    bot.assert_screen_contains("🗑 Удалено: Оставить удалённой");
-    bot.press("К списку").await;
-    bot.assert_screen_contains("Пока нет задач");
+    bot.assert_screen_contains("🗑 Удалено: Позднее молоко");
 
     let household = household_of(&db.pool, bot.chat).await;
     let item_id: uuid::Uuid =
         sqlx::query_scalar("SELECT id FROM items WHERE household_id = $1 AND title = $2")
             .bind(household)
-            .bind("Оставить удалённой")
+            .bind("Позднее молоко")
+            .fetch_one(&db.pool)
+            .await
+            .expect("deleted purchase");
+
+    bot.advance(Duration::minutes(11));
+    bot.press("Отменить").await;
+    bot.assert_screen_contains("Список покупок пуст");
+    assert!(!bot.screen().contains("Позднее молоко"));
+    assert_eq!(
+        last_toast(&bot).as_deref(),
+        Some("Время отмены истекло"),
+        "an expired undo of a purchase must report expiry"
+    );
+
+    let deleted: bool =
+        sqlx::query_scalar("SELECT deleted_at IS NOT NULL FROM items WHERE id = $1")
+            .bind(item_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("item after expired undo");
+    assert!(deleted, "an expired undo must not restore the purchase");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleted_purchase_back_to_list_does_not_undo() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.press("Покупки").await;
+    bot.press("Добавить").await;
+    bot.text("Оставить в удалённых").await;
+    bot.press("1").await;
+    bot.press("л").await;
+    bot.press("Сохранить").await;
+    bot.press("⋯").await;
+
+    bot.press("Удалить").await;
+    bot.press("Да, удалить").await;
+    bot.assert_screen_contains("🗑 Удалено: Оставить в удалённых");
+    bot.press("🛒 К списку").await;
+    bot.assert_screen_contains("Список покупок пуст");
+
+    let household = household_of(&db.pool, bot.chat).await;
+    let item_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM items WHERE household_id = $1 AND title = $2")
+            .bind(household)
+            .bind("Оставить в удалённых")
             .fetch_one(&db.pool)
             .await
             .expect("deleted item");
@@ -573,7 +787,7 @@ async fn deleted_screen_back_to_list_does_not_undo() {
     .fetch_one(&db.pool)
     .await
     .expect("item after back");
-    assert!(deleted, "«К списку» must not restore the task");
+    assert!(deleted, "«К списку» must not restore the purchase");
     assert_eq!(undone, 0, "«К списку» must not write an undo event");
 }
 

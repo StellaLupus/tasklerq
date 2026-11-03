@@ -14,6 +14,7 @@ use tasklerq::config::TenancyMode;
 use tasklerq::domain::models::{Actor, UserRole};
 use tasklerq::domain::settings::NotificationSettings;
 use tasklerq::jobs::scheduler::Scheduler;
+use tasklerq::storage::repositories::items;
 use tasklerq::telegram::bot::model::{Action, Form, PAGE_SIZE, Screen};
 use tasklerq::telegram::callbacks::{self, NewToken, Scope};
 use tokio::sync::Notify;
@@ -1650,6 +1651,68 @@ async fn former_owner_cannot_revoke_token_with_stale_button() {
     .await
     .expect("audit count");
     assert_eq!(events, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn member_cannot_undo_an_item_deleted_by_the_owner() {
+    let db = db().await;
+    let mut owner = onboarded_named(&db.pool, "Алексей").await;
+    let mut member = invite(&mut owner, &db.pool, "Мария").await;
+
+    let household = household_for(&db.pool, owner.chat).await;
+    let item = create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        new_item(household.tasks_list_id, "Удалённая владельцем"),
+    )
+    .await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+    items::soft_delete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        item.id,
+        Utc::now(),
+    )
+    .await
+    .expect("soft delete");
+
+    let data = action_callback(
+        &db.pool,
+        member.chat,
+        household.household_id,
+        Action::DeleteUndo {
+            item_id: item.id,
+            back: Screen::List {
+                list_id: household.tasks_list_id,
+                page: 0,
+            },
+        },
+    )
+    .await;
+    let (message_id, _) = member.active();
+    member.press_data(&data, message_id).await;
+
+    let toast = member
+        .fake
+        .answers()
+        .into_iter()
+        .next_back()
+        .and_then(|(_, text, _)| text);
+    assert_eq!(
+        toast.as_deref(),
+        Some("Недостаточно прав для этого действия.")
+    );
+
+    let deleted: bool =
+        sqlx::query_scalar("SELECT deleted_at IS NOT NULL FROM items WHERE id = $1")
+            .bind(item.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("item");
+    assert!(deleted, "a forbidden undo must not restore the item");
 }
 
 /// Текстовое представление строк таблицы для поиска утечки секрета.

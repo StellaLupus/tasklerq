@@ -1270,3 +1270,185 @@ async fn the_regular_create_form_has_no_list_button_in_the_preview() {
         stand.bot.screen()
     );
 }
+
+async fn add_second_tasks_list(pool: &sqlx::PgPool, telegram_id: i64) -> uuid::Uuid {
+    let household = household_id(pool, telegram_id).await;
+    let second = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO lists (
+             id, household_id, kind, name, is_default, is_archived, position,
+             created_at, updated_at
+         )
+         VALUES ($1, $2, 'tasks', 'Работа', false, false, 10, now(), now())",
+    )
+    .bind(second)
+    .bind(household)
+    .execute(pool)
+    .await
+    .expect("second tasks list");
+    second
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quick_form_can_return_from_list_step_to_preview() {
+    let db = db().await;
+    let mut stand = stand_with(&db.pool, vec![], DEFAULT_DAILY_QUOTA, false).await;
+
+    stand.bot.text("позвонить маме").await;
+    stand.bot.press("Список").await;
+    stand.bot.assert_screen_contains("В какой список?");
+    stand.bot.assert_has_button("Предпросмотр");
+
+    stand.bot.press("Предпросмотр").await;
+    stand.bot.assert_screen_contains("Проверьте и сохраните");
+    stand.bot.assert_screen_contains("позвонить маме");
+    stand.bot.assert_screen_contains("Список: Задачи");
+
+    let saved: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM items i
+         JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1 AND i.deleted_at IS NULL",
+    )
+    .bind(stand.bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("items");
+    assert_eq!(saved, 0, "returning to the preview must not save the form");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn regular_form_list_step_keeps_plain_list_names() {
+    let db = db().await;
+    let mut stand = stand_with(&db.pool, vec![], DEFAULT_DAILY_QUOTA, false).await;
+    add_second_tasks_list(&db.pool, stand.bot.chat).await;
+
+    stand.bot.press("Добавить").await;
+    stand.bot.press("Задачу").await;
+    stand.bot.assert_screen_contains("В какой список?");
+
+    let labels: Vec<String> = stand
+        .bot
+        .buttons()
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect();
+    assert!(
+        labels.iter().any(|label| label == "Работа"),
+        "the regular form must keep the plain list name: {labels:?}"
+    );
+    assert!(
+        labels
+            .iter()
+            .all(|label| !label.contains("📋") && !label.contains("🛒")),
+        "icons belong to the quick form only: {labels:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quick_purchase_to_task_drops_quantity_and_unit() {
+    let db = db().await;
+    let mut stand = stand_with(&db.pool, vec![], DEFAULT_DAILY_QUOTA, false).await;
+
+    stand.bot.text("Сыр").await;
+    stand.bot.press("Список").await;
+    stand.bot.press("Покупки").await;
+    stand.bot.press("Количество").await;
+    stand.bot.press("2").await;
+    stand.bot.press("Единица").await;
+    stand.bot.press("л").await;
+    stand.bot.assert_screen_contains("Количество: 2 л");
+
+    stand.bot.press("Список").await;
+    stand.bot.press("Задачи").await;
+    stand.bot.assert_screen_contains("Список: Задачи");
+    stand.bot.press("Сохранить").await;
+
+    let saved: (String, Option<f64>, Option<String>) = sqlx::query_as(
+        "SELECT l.kind::text, i.quantity::float8, i.unit
+         FROM items i
+         JOIN lists l ON l.id = i.list_id
+         JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1 AND i.deleted_at IS NULL",
+    )
+    .bind(stand.bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("item");
+    assert_eq!(saved, ("tasks".to_owned(), None, None));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quick_task_to_purchase_drops_priority_tags_and_recurrence() {
+    let db = db().await;
+    let mut stand = stand_with(&db.pool, vec![], DEFAULT_DAILY_QUOTA, false).await;
+
+    stand.bot.text("Полить цветы").await;
+    stand.bot.press("Приоритет").await;
+    stand.bot.press("Высокий").await;
+    stand.bot.press("Теги").await;
+    stand.bot.press("Новый тег").await;
+    stand.bot.text("дом").await;
+    stand.bot.press("Готово").await;
+    stand.bot.assert_screen_contains("Подзадачи");
+    stand.bot.press("Готово").await;
+    stand.bot.assert_screen_contains("Как часто повторять?");
+    stand.bot.press("Каждый день").await;
+    stand.bot.press("Каждый раз").await;
+    stand.bot.assert_screen_contains("Проверьте и сохраните");
+    stand.bot.assert_screen_contains("🏷 дом");
+    stand.bot.assert_screen_contains("🔁");
+
+    stand.bot.press("Список").await;
+    stand.bot.press("Покупки").await;
+    assert!(!stand.bot.screen().contains("Приоритет"));
+    stand.bot.assert_screen_contains("Количество:");
+    stand.bot.press("Сохранить").await;
+
+    let saved: (String, String, bool, i64) = sqlx::query_as(
+        "SELECT l.kind::text, i.priority::text,
+                i.recurrence_freq IS NOT NULL,
+                (SELECT count(*) FROM item_tags it WHERE it.item_id = i.id)
+         FROM items i
+         JOIN lists l ON l.id = i.list_id
+         JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1 AND i.deleted_at IS NULL",
+    )
+    .bind(stand.bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("item");
+    assert_eq!(
+        saved,
+        ("shopping".to_owned(), "normal".to_owned(), false, 0),
+        "a purchase must not keep task-only fields"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quick_form_switching_to_shopping_finds_a_duplicate() {
+    let db = db().await;
+    let mut stand = stand_with(&db.pool, vec![], DEFAULT_DAILY_QUOTA, false).await;
+
+    stand.bot.text("молоко").await;
+    stand.bot.press("Список").await;
+    stand.bot.press("Покупки").await;
+    stand.bot.press("Сохранить").await;
+    stand.bot.assert_screen_contains("Покупки · 1");
+
+    stand.bot.text("Молоко").await;
+    stand.bot.press("Список").await;
+    stand.bot.press("Покупки").await;
+    stand.bot.press("Сохранить").await;
+    stand.bot.assert_screen_contains("уже есть в списке");
+
+    let saved: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM items i
+         JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1 AND i.deleted_at IS NULL",
+    )
+    .bind(stand.bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("items");
+    assert_eq!(saved, 1, "the duplicate must not be saved as a second item");
+}

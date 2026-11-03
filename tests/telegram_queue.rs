@@ -648,6 +648,60 @@ async fn failed_callback_attempt_is_answered_without_text() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dead_callback_is_answered_once_and_gets_one_neutral_message() {
+    let db = db().await;
+    ensure_household(&db.pool).await;
+    let chat = next_telegram_id();
+    let fake = FakeTelegram::new();
+    let worker = UpdateWorker::new(
+        db.pool.clone(),
+        Arc::new(Flaky {
+            failures_left: AtomicU32::new(100),
+            marker: format!("dead-callback-{chat}"),
+        }),
+        fake.clone(),
+        2,
+        Arc::new(Notify::new()),
+        Audit::new(db.pool.clone()),
+    )
+    .only_chat(chat);
+    let mut bot = Harness::new(&db.pool, chat);
+    let update = bot.callback_update("Ann", "t:AAAAAAAAAAAAAAAA", 1);
+    let query_id = update["callback_query"]["id"]
+        .as_str()
+        .expect("query id")
+        .to_owned();
+    let mut now = Utc::now();
+    enqueue_at(&db.pool, &update, now).await;
+
+    let Pass::Failed(Failure::Retry(at)) = worker.run_once(now).await.expect("pass") else {
+        panic!("retry expected");
+    };
+    now = at;
+    assert_eq!(
+        worker.run_once(now).await.expect("pass"),
+        Pass::Failed(Failure::Dead)
+    );
+
+    assert_eq!(
+        answers_for(&fake, &query_id),
+        1,
+        "only the first failed attempt may answer the callback"
+    );
+    let messages = outbox_messages(&db.pool, chat).await;
+    assert_eq!(
+        messages.len(),
+        1,
+        "a dead callback must notify the user exactly once"
+    );
+    assert_eq!(
+        messages[0]["html"],
+        "Не получилось выполнить действие. Попробуйте ещё раз чуть позже."
+    );
+    assert_eq!(messages[0]["rich"], false);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dead_letter_without_chat_or_with_malformed_payload_sends_no_message() {
     let db = support::isolated_db().await;
     let chat = next_telegram_id();

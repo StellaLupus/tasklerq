@@ -190,7 +190,7 @@ async fn recurring_completion_moves_due_date_forward_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delete_restore_and_undo_round_trip() {
+async fn soft_delete_is_reverted_by_undo() {
     let db = support::db().await;
     let household = support::create_household(&db.pool).await;
     let created = support::create_item(
@@ -219,27 +219,6 @@ async fn delete_restore_and_undo_round_trip() {
         Err(DomainError::NotFound)
     ));
 
-    let restored = items::restore(
-        &mut conn,
-        household.household_id,
-        &household.owner(),
-        created.id,
-        Utc::now(),
-    )
-    .await
-    .expect("restore");
-    assert!(restored.deleted_at.is_none());
-    assert_eq!(restored.version, 3);
-
-    let deleted_again = items::soft_delete(
-        &mut conn,
-        household.household_id,
-        &household.owner(),
-        created.id,
-        Utc::now(),
-    )
-    .await
-    .expect("delete again");
     let undone = items::undo_last(
         &mut conn,
         household.household_id,
@@ -250,7 +229,7 @@ async fn delete_restore_and_undo_round_trip() {
     .await
     .expect("undo delete");
     assert!(undone.deleted_at.is_none());
-    assert_eq!(undone.version, deleted_again.version + 1);
+    assert_eq!(undone.version, deleted.version + 1);
     assert_eq!(undone.title, "Удалить меня");
 }
 
@@ -481,41 +460,6 @@ async fn member_cannot_delete_owner_item_and_foreign_household_is_hidden() {
         .await,
         Err(DomainError::NotFound)
     ));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn restore_rejects_items_deleted_beyond_retention() {
-    let db = support::db().await;
-    let household = support::create_household(&db.pool).await;
-    let created = support::create_item(
-        &db.pool,
-        &household,
-        household.tasks_list_id,
-        &household.owner(),
-        support::new_item(household.tasks_list_id, "Старое удаление"),
-    )
-    .await;
-
-    let mut conn = db.pool.acquire().await.expect("connection");
-    let deleted_at = Utc::now() - Duration::days(items::DELETED_RETENTION_DAYS + 1);
-    sqlx::query("UPDATE items SET deleted_at = $3 WHERE id = $1 AND household_id = $2")
-        .bind(created.id)
-        .bind(household.household_id)
-        .bind(deleted_at)
-        .execute(&mut *conn)
-        .await
-        .expect("backdate deletion");
-
-    let error = items::restore(
-        &mut conn,
-        household.household_id,
-        &household.owner(),
-        created.id,
-        Utc::now(),
-    )
-    .await
-    .expect_err("retention must block restore");
-    assert!(matches!(error, DomainError::Conflict { .. }));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -203,7 +203,8 @@ pub async fn clear_undo(ctx: &mut Ctx<'_>, list_id: Uuid, item_ids: &[Uuid]) -> 
     let actor = ctx.actor()?;
     let mut restored = 0_i64;
     for item_id in item_ids {
-        // `undo_last` соблюдает окно в 10 минут и отменяет только удаление.
+        // `undo_last` отменяет последнее действие в окне 10 минут; здесь это
+        // удаление выполненной позиции.
         match items::undo_last(&mut *ctx.conn, household_id, &actor, *item_id, ctx.now).await {
             Ok(_) => restored += 1,
             Err(crate::domain::error::DomainError::Database(error)) => {

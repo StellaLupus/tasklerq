@@ -292,13 +292,11 @@ pub async fn completed(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Resul
 
 /// Результат удаления с кнопкой отмены.
 pub async fn deleted(
-    ctx: &mut Ctx<'_>,
     item_id: Uuid,
     title: &str,
     shopping: bool,
     back: &Screen,
 ) -> Result<Ui, Fail> {
-    let _ = ctx;
     Ok(Ui::new()
         .heading(format!("🗑 Удалено: {}", clip(title, 80)))
         .row(vec![
@@ -436,11 +434,28 @@ pub async fn delete_do(ctx: &mut Ctx<'_>, item_id: Uuid, back: Screen) -> Result
 pub async fn delete_undo(ctx: &mut Ctx<'_>, item_id: Uuid, back: Screen) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
     let actor = ctx.actor()?;
+    // Кнопка со старого экрана «Удалено» не должна откатывать другое действие:
+    // удаление — только один из видов событий, которые умеет отменять `undo_last`.
+    match items::is_deleted(&mut *ctx.conn, household_id, item_id).await {
+        Ok(true) => {}
+        Ok(false) | Err(DomainError::NotFound) => {
+            ctx.toast("Нечего отменять");
+            return ctx.present(back).await;
+        }
+        Err(error) => return Err(error.into()),
+    }
     match items::undo_last(&mut *ctx.conn, household_id, &actor, item_id, ctx.now).await {
         Ok(item) => ctx.toast(format!("Возвращено: {}", clip(&item.title, 60))),
-        Err(DomainError::Database(error)) => return Err(Fail::Infra(error)),
-        Err(DomainError::Forbidden(_)) => ctx.toast("Недостаточно прав для этого действия."),
-        Err(_) => ctx.toast("Время отмены истекло"),
+        // Истёкшее окно — единственный конфликт с машиночитаемой причиной.
+        Err(DomainError::Conflict { details, .. })
+            if details.get("reason").and_then(|value| value.as_str())
+                == Some(items::UNDO_WINDOW_EXPIRED) =>
+        {
+            ctx.toast("Время отмены истекло")
+        }
+        // «Нечего отменять»: действия нет или элемент уже вернули.
+        Err(DomainError::Conflict { .. } | DomainError::NotFound) => ctx.toast("Нечего отменять"),
+        Err(error) => return Err(error.into()),
     }
     ctx.present(back).await
 }

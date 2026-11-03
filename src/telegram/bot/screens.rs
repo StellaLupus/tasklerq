@@ -34,7 +34,7 @@ pub async fn build(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
             title,
             shopping,
             back,
-        } => card::deleted(ctx, *item_id, title, *shopping, back).await,
+        } => card::deleted(*item_id, title, *shopping, back).await,
         Screen::ConfirmDelete { item_id, back } => card::confirm_delete(ctx, *item_id, back).await,
         Screen::Mine { page } => mine(ctx, *page).await,
         Screen::Results {
