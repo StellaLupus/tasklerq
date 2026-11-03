@@ -38,10 +38,10 @@
   (`tests/identity_households.rs::invite_lets_a_new_member_join`).
 - [x] Задача создаётся из Telegram и появляется в HA ≤60 с
   (`docs/deployment.md` §19, «HA sync»).
-- [ ] Задача завершается в HA и исчезает из открытых в Telegram
-  (`docs/deployment.md` §19, «HA sync»: показаны только события `completed` с
-  actor `home_assistant`; «6→5» относится к направлению Telegram→HA. Отдельного
-  теста на исчезновение задачи из открытых после завершения из HA нет).
+- [x] Задача завершается в HA и исчезает из открытых в Telegram (ручная
+  проверка на инсталляции 2026-11-03: задача, завершённая в `todo` HA, получила
+  событие `completed` с actor `home_assistant` и пропала из открытых в боте;
+  отдельного автотеста нет).
 - [x] Свободный текст разбирается в черновик; подтверждение создаёт элементы
   (`tests/telegram_capture.rs::save_all_creates_every_item_and_undo_removes_them`).
 - [x] При недоступности LLM работает ручная форма
@@ -66,7 +66,8 @@
   `tests/telegram_webhook.rs::readiness_fails_while_an_update_waits_longer_than_the_limit`).
 - [x] Backup восстанавливается на чистую базу
   (`tests/backup_restore.rs::backup_then_restore_into_a_new_database_keeps_migrations_and_data`).
-- [ ] `openspec validate --strict` проходит.
+- [x] `openspec validate --strict` проходит (`openspec validate --all --strict`
+  после архивации change 0001–0003).
 
 ## 3. Этапы
 
@@ -134,10 +135,7 @@ capture создаёт элементы без Telegram; fallback работае
 - Установка через HACS.
 
 **Выход:** задача из Telegram появляется в HA; завершение в HA отражается в
-Telegram (на инсталляции подтверждены только события `completed` с actor
-`home_assistant`; исчезновение задачи из открытых в Telegram отдельным тестом
-не проверено, поэтому критерий MVP остаётся `[ ]` — см. «Критерии приёмки
-MVP»); конфликт версий обрабатывается; голосовая команда в Assist создаёт
+Telegram; конфликт версий обрабатывается; голосовая команда в Assist создаёт
 задачу или покупку и озвучивает ответ.
 
 ### Этап 5. Уведомления (завершён)
@@ -152,12 +150,14 @@ MVP»); конфликт версий обрабатывается; голосо
 **Выход:** напоминание приходит один раз; после рестарта нет дублей; тихие часы
 переносят доставку.
 
-### Этап 6. Hardening и релиз (текущий: релиз v0.1.0, пункты 9.x)
+### Этап 6. Hardening и релиз (завершён)
 
-**Результат:** production-ready v0.1.0.
+**Результат:** production-ready v0.1.0 (выпущен 2026-11-03, см.
+[`CHANGELOG.md`](../CHANGELOG.md)).
 
-Реализация этапов 0–5 закончена; идёт релиз: документы, приёмка MVP и архив
-change `0001-foundation` (пункты 9.x в `tasks.md`).
+Приёмка MVP проведена, change `0001-foundation`, `0002-single-household-bootstrap`
+и `0003-telegram-screen-visibility` архивированы, действующие спецификации — в
+`openspec/specs/`.
 
 - Rate limits, security checklist.
 - Load test, backup/restore drill.
