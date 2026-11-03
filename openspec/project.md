@@ -53,7 +53,7 @@ PostgreSQL и двустороннюю интеграцию с Home Assistant.
 - Home Assistant: тонкий custom component с сущностями `todo` и `calendar`,
   синхронизация через REST API.
 - LLM-разбор свободного текста через `ai_task.generate_data` Home Assistant
-  (Google Gemini): черновик с подтверждением в Telegram и прямой capture из
+  (провайдер AI Task выбирается в HA): черновик с подтверждением в Telegram и прямой capture из
   Home Assistant без участия бота (голос, автоматизация, HTTP API).
 - Семья: один household, роли owner/member, приглашения, общие списки,
   назначение задач.
@@ -159,9 +159,9 @@ PostgreSQL и двустороннюю интеграцию с Home Assistant.
   `tasklerq.example.com` указывает на NAS, TLS и маршрутизация — через
   Synology DSM Reverse Proxy. Host-порт Tasklerq — `127.0.0.1:18080`
   (`8080` занят Zigbee2MQTT), внутренний порт контейнера — `8080`.
-- **Google Gemini через Home Assistant.** Прямой вызов Gemini из Rust не
-  планируется: LLM доступна как AI Task `ai_task.google_ai_task_2`; модель
-  выбирается в HA. HA → Tasklerq: `http://127.0.0.1:18080`; Tasklerq → HA:
+- **LLM через AI Task Home Assistant.** Прямой вызов LLM из Rust не
+  планируется: LLM доступна как сущность AI Task (`HA_AI_TASK_ENTITY_ID`);
+  провайдер и модель выбираются в HA. HA → Tasklerq: `http://127.0.0.1:18080`; Tasklerq → HA:
   `http://host.docker.internal:8123` или `http://192.168.1.10:8123`.
 - **Часовой пояс household — `Europe/Moscow`.** Исходный текст LLM-черновика
   (`raw_text`) хранится 30 дней; LLM-квота — 200 разборов в сутки на household.
@@ -231,5 +231,6 @@ PostgreSQL и двустороннюю интеграцию с Home Assistant.
 - [`docs/home-assistant.md`](../docs/home-assistant.md) — установка и интеграция.
 - [`docs/deployment.md`](../docs/deployment.md) — развёртывание и эксплуатация.
 - [`docs/roadmap.md`](../docs/roadmap.md) — этапы и дальнейшее развитие.
-- [`openspec/changes/0001-foundation/`](changes/0001-foundation/) — спецификация
-  фундамента MVP.
+- [`openspec/specs/`](specs/) — действующие спецификации.
+- [`openspec/changes/archive/`](changes/archive/) — выполненные изменения,
+  включая фундамент MVP (`2026-11-03-0001-foundation`).
