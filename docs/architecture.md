@@ -533,7 +533,7 @@ Telegram ──443──▶ Synology Reverse Proxy ──▶ 127.0.0.1:18080 tas
 | Абьюз | Rate limits, LLM-квота, 429. |
 | Приватность | Минимизация, отсутствие текста в логах, retention. |
 
-Подробно: [`security-privacy` spec](../openspec/changes/0001-foundation/specs/security-privacy/spec.md).
+Подробно: [`security-privacy` spec](../openspec/specs/security-privacy/spec.md).
 
 ## 11. Наблюдаемость
 

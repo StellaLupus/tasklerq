@@ -9,9 +9,9 @@ Tasklerq — self-hosted сервис на Rust, который объединя
 Assistant. Бот при этом не обязателен: задачи можно создавать автоматизацией
 или прямым HTTP-запросом.
 
-> **Статус:** MVP реализован; идёт синхронизация документации и подготовка
-> релиза `v0.1.0`. Актуальный прогресс — в
-> [`openspec/changes/0001-foundation/tasks.md`](openspec/changes/0001-foundation/tasks.md).
+> **Статус:** MVP выпущен как `v0.1.0` (см. [`CHANGELOG.md`](CHANGELOG.md)).
+> План MVP и его выполнение — в архиве
+> [`openspec/changes/archive/2026-11-03-0001-foundation/tasks.md`](openspec/changes/archive/2026-11-03-0001-foundation/tasks.md).
 
 ## Возможности MVP
 
@@ -124,7 +124,7 @@ Rust-сервером. Контракт API для клиента — [`docs/ha-
 | [`docs/roadmap.md`](docs/roadmap.md) | Этапы, backlog, метрики, риски. |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release notes и известные ограничения. |
 
-Спецификации поведения: [`openspec/changes/0001-foundation/specs/`](openspec/changes/0001-foundation/specs/).
+Спецификации поведения: [`openspec/specs/`](openspec/specs/).
 Контекст проекта: [`openspec/project.md`](openspec/project.md).
 
 ## Быстрый старт

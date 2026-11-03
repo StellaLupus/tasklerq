@@ -956,7 +956,7 @@ household: задачи и покупки. Выбор списка другог�
 текста: ожидание берёт его из `capture_jobs.payload`, карточка — из
 `capture_drafts.raw_text`. В `telegram_views.state` остаются только `job_id` и
 `draft_id`. Подробности и причины выбора PostgreSQL вместо брокера — в
-`openspec/changes/0001-foundation/design.md` (D4).
+`openspec/changes/archive/2026-11-03-0001-foundation/design.md` (D4).
 
 - Задание захватывается арендой на 60 секунд; упавший воркер не теряет его.
 - Повторяются только `5xx` и сетевые ошибки (до трёх попыток); таймаут, отказ

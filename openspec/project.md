@@ -231,5 +231,6 @@ PostgreSQL и двустороннюю интеграцию с Home Assistant.
 - [`docs/home-assistant.md`](../docs/home-assistant.md) — установка и интеграция.
 - [`docs/deployment.md`](../docs/deployment.md) — развёртывание и эксплуатация.
 - [`docs/roadmap.md`](../docs/roadmap.md) — этапы и дальнейшее развитие.
-- [`openspec/changes/0001-foundation/`](changes/0001-foundation/) — спецификация
-  фундамента MVP.
+- [`openspec/specs/`](specs/) — действующие спецификации.
+- [`openspec/changes/archive/`](changes/archive/) — выполненные изменения,
+  включая фундамент MVP (`2026-11-03-0001-foundation`).

@@ -91,7 +91,7 @@
   деградированном режиме с предупреждением `multiple_households` в
   `/health/ready`. Добавлены
   `admin household create --owner-telegram-id`, `admin household delete` и
-  экран «Интеграции» (`openspec/changes/0002-single-household-bootstrap/`,
+  экран «Интеграции» (`openspec/changes/archive/2026-11-03-0002-single-household-bootstrap/`,
   `docs/deployment.md` §9, §16.11; тесты `tests/first_contact.rs`,
   `tests/degradation_logs.rs`).
 - **Видимость экранов Telegram (change 0003).** Активное сообщение экрана
@@ -100,7 +100,7 @@
   удаляет после чтения. Экран разбора и карточка черновика показывают исходный
   текст цитатой. Обновления сверх лимита 20/мин откладываются до освобождения
   слота; сверх 20 отложенных — отбрасываются без ответа. В outbox добавлен вид
-  `delete` (миграция `0011`; `openspec/changes/0003-telegram-screen-visibility/`,
+  `delete` (миграция `0011`; `openspec/changes/archive/2026-11-03-0003-telegram-screen-visibility/`,
   `docs/telegram-ux.md` §6–7; тесты `tests/telegram_outbox.rs`,
   `tests/telegram_queue.rs`).
 - **Ошибки обработки обновлений Telegram.** При переходе обновления в
