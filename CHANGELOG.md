@@ -1,13 +1,15 @@
 # Changelog
 
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии —
-[SemVer](https://semver.org/lang/ru/). Раздел `0.1.0` помечен «не выпущен» до
-постановки тега `v0.1.0`.
+[SemVer](https://semver.org/lang/ru/).
 
-## [0.1.0] — не выпущен
+## [0.1.0] — 2026-11-03
 
 Первый релиз MVP: задачи и покупки в Telegram, Home Assistant и календаре,
 разбор свободного текста через Home Assistant AI Task и capture без бота.
+
+Выпуск: тег `v0.1.0` на мерж-коммите `5ed034a`; образ
+`stellalupus/tasklerq:0.1.0` (также `0.1`, `latest`, `sha-5ed034a`).
 
 ### Добавлено
 
