@@ -51,30 +51,6 @@
   `shared-db`.
 - Telegram видит публичный HTTPS webhook через Synology Reverse Proxy.
 
-### 1.1. Особенности нашей среды
-
-Схема выше — достаточный минимум; для другого развёртывания ничего из этого
-раздела не нужно. Здесь только обходы, которые появились в нашей сети.
-
-- **Pingap** (`tasklerq-edge`) стоит между DSM и приложением:
-  `127.0.0.1:18080` → `tasklerq:8080`, конфиг
-  `/volume2/docker/pingap/conf/pingap.toml`, `/metrics` снаружи отдаёт `404`.
-  Приложение дополнительно публикует прямой порт `127.0.0.1:18082` для HA и
-  администрирования.
-- **Cloudflare Worker** `tasklerq-tg.example.workers.dev/telegram`
-  принимает webhook Telegram и проксирует его на
-  `https://tasklerq.example.com/webhooks/telegram`: провайдер фильтрует
-  диапазоны Telegram, прямой вход на NAS не работает.
-- **xray** — исходящие вызовы Bot API идут через
-  `HTTPS_PROXY=http://xray:10809`
-  (`NO_PROXY=localhost,127.0.0.1,host.docker.internal`); прямой доступ к
-  Telegram из этой сети тоже фильтруется. Контейнер `tasklerq` подключён
-  **и к `shared-db`, и к `xray_default`**: Docker изолирует bridge-сети друг
-  от друга, поэтому из `shared-db` адрес xray (`172.27.0.2:10809`) недостижим,
-  а публикация порта у xray — только на `127.0.0.1` хоста. Обращение по имени
-  `xray` резолвится через сеть `xray_default`. Без второго сетевого интерфейса
-  `setWebhook` и вся отправка в Bot API падают с `transient` (таймаут).
-
 ## 2. Что уже есть
 
 | Компонент | Факт | Что нужно сделать |
@@ -102,7 +78,7 @@ https://tasklerq.example.com/health/live` отвечает `200`. Сертифи
 назначен записи reverse proxy; порядок продления — раздел 3.2.
 
 Если провайдер блокирует прямой доступ Telegram к серверу, перед origin ставят
-промежуточный прокси — см. раздел 1.1.
+промежуточный прокси (раздел 5).
 
 ### 3.1. Reverse Proxy в Synology DSM
 
@@ -290,7 +266,7 @@ curl -sS -X POST \
 
 Если Telegram не может обратиться к серверу напрямую, перед origin ставят
 промежуточный прокси и указывают в `TELEGRAM_WEBHOOK_URL` его URL, а не
-`PUBLIC_BASE_URL`. В нашей среде это Cloudflare Worker (раздел 1.1).
+`PUBLIC_BASE_URL`.
 
 ## 6. Переменные окружения
 
@@ -305,6 +281,7 @@ curl -sS -X POST \
 | `TELEGRAM_WEBHOOK_SECRET` | при `webhook` | `hex` | Секрет webhook. |
 | `TELEGRAM_WEBHOOK_URL` | при `webhook` | `https://tasklerq.example.com/webhooks/telegram` | Регистрация webhook. |
 | `TELEGRAM_BOT_USERNAME` | нет | `tasklerqbot` | Имя бота без `@` для ссылок-приглашений. |
+| `HTTPS_PROXY`, `NO_PROXY` | нет | — | Стандартные переменные HTTP-клиента: исходящие HTTPS-запросы (Bot API, HA) идут через указанный прокси, кроме адресов из `NO_PROXY` (например, `localhost,127.0.0.1,host.docker.internal`). Нужны, только если прямой доступ к Telegram из сети сервера закрыт; прокси должен быть достижим из сети контейнера. |
 | `TELEGRAM_API_BASE_URL` | нет | `https://api.telegram.org` | Служебный базовый адрес Bot API; вне `ENV=development` допускается только `https`. Подменяется на mock-сервер в тестах. |
 | `TELEGRAM_MODE` | нет | `webhook` | `webhook`/`polling` (dev)/`disabled` (headless). |
 | `TENANCY_MODE` | нет | `single` | `single` (по умолчанию) — один household на инсталляцию; `multi` — несколько. |
@@ -889,8 +866,7 @@ curl -fsS http://127.0.0.1:18080/health/ready
 закрыть этот путь на reverse proxy перед Tasklerq: отдавать на него `404` или
 `403`, а остальные пути проксировать как обычно. Подойдёт любой reverse proxy,
 умеющий фильтровать по пути: nginx, Caddy, Traefik, pingap. Скрейп при этом идёт
-в обход proxy, на loopback-порт приложения. В нашей среде так и сделано
-(раздел 1.1).
+в обход proxy, на loopback-порт приложения.
 
 Пример скрейпа:
 
@@ -931,7 +907,7 @@ curl -fsS \
 | queue lag > 5 мин | Проверить воркеры и БД. |
 | LLM errors > 20% за 15 мин | Проверить HA AI Task, квоту, OpenRouter. |
 | webhook 401 > 50 за 5 мин | Проверить секрет и источник запросов. |
-| Бот не отвечает: в логах `setWebhook failed` и `outbox` c `error: transient` | Исходящие в Bot API не доходят до xray. Проверить, что у контейнера есть сеть `xray_default` (`docker inspect tasklerq`), и `HTTPS_PROXY=http://xray:10809`. |
+| Бот не отвечает: в логах `setWebhook failed` и `outbox` c `error: transient` | Исходящие в Bot API не доходят до Telegram. Проверить доступ к `api.telegram.org` из контейнера; если исходящий трафик идёт через прокси — `HTTPS_PROXY` и доступность прокси из сети контейнера. |
 | backup failed | Проверить диск, права, PostgreSQL. |
 | disk > 80% | Очистить старые backup/логи. |
 
