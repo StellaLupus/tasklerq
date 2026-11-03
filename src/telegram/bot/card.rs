@@ -430,32 +430,49 @@ pub async fn delete_do(ctx: &mut Ctx<'_>, item_id: Uuid, back: Screen) -> Result
     .await
 }
 
-/// Отменить удаление и вернуться к списку.
-pub async fn delete_undo(ctx: &mut Ctx<'_>, item_id: Uuid, back: Screen) -> Result<(), Fail> {
+/// Итог отмены удаления одного элемента.
+pub enum UndoOutcome {
+    /// Удаление отменено; элемент возвращён (его название).
+    Restored(String),
+    /// Окно отмены истекло.
+    Expired,
+    /// Отменять нечего: действия нет или элемент уже вернули.
+    Nothing,
+}
+
+/// Отменить удаление одного элемента, только если он всё ещё удалён.
+///
+/// Кнопка со старого экрана не должна откатывать другое действие: удаление —
+/// только один из видов событий, которые умеет отменять `undo_last`.
+pub async fn undo_deleted(ctx: &mut Ctx<'_>, item_id: Uuid) -> Result<UndoOutcome, Fail> {
     let household_id = ctx.household()?.id;
     let actor = ctx.actor()?;
-    // Кнопка со старого экрана «Удалено» не должна откатывать другое действие:
-    // удаление — только один из видов событий, которые умеет отменять `undo_last`.
     match items::is_deleted(&mut *ctx.conn, household_id, item_id).await {
         Ok(true) => {}
-        Ok(false) | Err(DomainError::NotFound) => {
-            ctx.toast("Нечего отменять");
-            return ctx.present(back).await;
-        }
+        Ok(false) | Err(DomainError::NotFound) => return Ok(UndoOutcome::Nothing),
         Err(error) => return Err(error.into()),
     }
     match items::undo_last(&mut *ctx.conn, household_id, &actor, item_id, ctx.now).await {
-        Ok(item) => ctx.toast(format!("Возвращено: {}", clip(&item.title, 60))),
+        Ok(item) => Ok(UndoOutcome::Restored(item.title)),
         // Истёкшее окно — единственный конфликт с машиночитаемой причиной.
         Err(DomainError::Conflict { details, .. })
             if details.get("reason").and_then(|value| value.as_str())
                 == Some(items::UNDO_WINDOW_EXPIRED) =>
         {
-            ctx.toast("Время отмены истекло")
+            Ok(UndoOutcome::Expired)
         }
         // «Нечего отменять»: действия нет или элемент уже вернули.
-        Err(DomainError::Conflict { .. } | DomainError::NotFound) => ctx.toast("Нечего отменять"),
-        Err(error) => return Err(error.into()),
+        Err(DomainError::Conflict { .. } | DomainError::NotFound) => Ok(UndoOutcome::Nothing),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Отменить удаление и вернуться к списку.
+pub async fn delete_undo(ctx: &mut Ctx<'_>, item_id: Uuid, back: Screen) -> Result<(), Fail> {
+    match undo_deleted(ctx, item_id).await? {
+        UndoOutcome::Restored(title) => ctx.toast(format!("Возвращено: {}", clip(&title, 60))),
+        UndoOutcome::Expired => ctx.toast("Время отмены истекло"),
+        UndoOutcome::Nothing => ctx.toast("Нечего отменять"),
     }
     ctx.present(back).await
 }

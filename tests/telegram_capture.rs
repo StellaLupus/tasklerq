@@ -1179,20 +1179,7 @@ async fn quick_form_switches_to_a_shopping_list_and_saves_there() {
 async fn quick_form_can_pick_another_tasks_list_without_changing_the_type() {
     let db = db().await;
     let mut stand = stand_with(&db.pool, vec![], DEFAULT_DAILY_QUOTA, false).await;
-    let household = household_id(&db.pool, stand.bot.chat).await;
-    let second = uuid::Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO lists (
-             id, household_id, kind, name, is_default, is_archived, position,
-             created_at, updated_at
-         )
-         VALUES ($1, $2, 'tasks', 'Работа', false, false, 10, now(), now())",
-    )
-    .bind(second)
-    .bind(household)
-    .execute(&db.pool)
-    .await
-    .expect("second tasks list");
+    let second = add_second_tasks_list(&db.pool, stand.bot.chat).await;
 
     stand.bot.text("позвонить маме").await;
     stand.bot.press("Список").await;

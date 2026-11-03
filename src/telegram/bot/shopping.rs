@@ -7,6 +7,7 @@ use crate::storage::repositories::{items, lists};
 use crate::telegram::rich::button;
 use crate::telegram::ru;
 
+use super::card::{self, UndoOutcome};
 use super::model::{Action, PAGE_SIZE, Screen, Ui};
 use super::screens::{back_button, clip};
 use super::{Ctx, Fail};
@@ -200,23 +201,23 @@ pub async fn cleared(ctx: &mut Ctx<'_>, list_id: Uuid, item_ids: &[Uuid]) -> Res
 /// Вернуть очищенные позиции в течение окна отмены.
 pub async fn clear_undo(ctx: &mut Ctx<'_>, list_id: Uuid, item_ids: &[Uuid]) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
-    let actor = ctx.actor()?;
     let mut restored = 0_i64;
+    let mut expired = false;
     for item_id in item_ids {
-        // `undo_last` отменяет последнее действие в окне 10 минут; здесь это
-        // удаление выполненной позиции.
-        match items::undo_last(&mut *ctx.conn, household_id, &actor, *item_id, ctx.now).await {
-            Ok(_) => restored += 1,
-            Err(crate::domain::error::DomainError::Database(error)) => {
-                return Err(Fail::Infra(error));
-            }
-            Err(_) => {}
+        // Позиция, которую уже вернули или изменили, не трогается: helper
+        // сначала проверяет, что она всё ещё удалена.
+        match card::undo_deleted(ctx, *item_id).await? {
+            UndoOutcome::Restored(_) => restored += 1,
+            UndoOutcome::Expired => expired = true,
+            UndoOutcome::Nothing => {}
         }
     }
-    if restored == 0 {
+    if restored > 0 {
+        ctx.toast(format!("Возвращено: {}", ru::positions(restored)));
+    } else if expired {
         ctx.toast("Время отмены истекло");
     } else {
-        ctx.toast(format!("Возвращено: {}", ru::positions(restored)));
+        ctx.toast("Нечего отменять");
     }
     let kind_ok = lists::get_visible(&mut *ctx.conn, household_id, list_id)
         .await

@@ -72,6 +72,27 @@ async fn household_of(pool: &sqlx::PgPool, telegram_id: i64) -> uuid::Uuid {
     .expect("household")
 }
 
+/// Добавить покупку, отметить её купленной и очистить выполненные.
+/// Возвращает `(item_id, list_id)`.
+async fn cleared_purchase(bot: &mut Harness, title: &str) -> (uuid::Uuid, uuid::Uuid) {
+    bot.press("Покупки").await;
+    bot.press("Добавить").await;
+    bot.text(title).await;
+    bot.press("1").await;
+    bot.press("л").await;
+    bot.press("Сохранить").await;
+    bot.press(title).await;
+    bot.press("Очистить").await;
+
+    let household = household_of(&bot.pool, bot.chat).await;
+    sqlx::query_as("SELECT id, list_id FROM items WHERE household_id = $1 AND title = $2")
+        .bind(household)
+        .bind(title)
+        .fetch_one(&bot.pool)
+        .await
+        .expect("cleared purchase")
+}
+
 /// Выпустить callback-токен на действие, как это делает экран.
 async fn action_callback(bot: &Harness, action: Action) -> String {
     let household = household_of(&bot.pool, bot.chat).await;
@@ -789,6 +810,112 @@ async fn deleted_purchase_back_to_list_does_not_undo() {
     .expect("item after back");
     assert!(deleted, "«К списку» must not restore the purchase");
     assert_eq!(undone, 0, "«К списку» must not write an undo event");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_clear_undo_reports_that_there_is_nothing_to_undo() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let (item_id, list_id) = cleared_purchase(&mut bot, "Очищенное молоко").await;
+    bot.assert_screen_contains("Убрано: 1 позиция");
+
+    bot.press("Отменить").await;
+    bot.assert_screen_contains("☑ Очищенное молоко");
+
+    // Повторное нажатие после применённой отмены: действия больше нет, но
+    // позиция не должна исчезнуть или откатиться ещё раз.
+    let data = action_callback(
+        &bot,
+        Action::ClearUndo {
+            list_id,
+            item_ids: vec![item_id],
+        },
+    )
+    .await;
+    let (message_id, _) = bot.active();
+    bot.press_data(&data, message_id).await;
+
+    assert_eq!(
+        last_toast(&bot).as_deref(),
+        Some("Нечего отменять"),
+        "a repeated undo must not pretend the undo window expired"
+    );
+    let (deleted, status): (bool, String) =
+        sqlx::query_as("SELECT deleted_at IS NOT NULL, status::text FROM items WHERE id = $1")
+            .bind(item_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("item after repeated undo");
+    assert!(!deleted, "the restored purchase must stay restored");
+    assert_eq!(status, "done", "the purchase must stay bought");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_clear_undo_does_not_undo_a_later_completion() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let (item_id, list_id) = cleared_purchase(&mut bot, "Поздняя покупка").await;
+
+    bot.press("Отменить").await;
+    bot.assert_screen_contains("☑ Поздняя покупка");
+
+    // Позиция снова открыта и отмечена купленной — это уже другое действие.
+    bot.press("☑ Поздняя покупка").await;
+    bot.assert_screen_contains("☐ Поздняя покупка");
+    bot.press("☐ Поздняя покупка").await;
+    bot.assert_screen_contains("☑ Поздняя покупка");
+
+    let data = action_callback(
+        &bot,
+        Action::ClearUndo {
+            list_id,
+            item_ids: vec![item_id],
+        },
+    )
+    .await;
+    let (message_id, _) = bot.active();
+    bot.press_data(&data, message_id).await;
+
+    assert_eq!(
+        last_toast(&bot).as_deref(),
+        Some("Нечего отменять"),
+        "a stale undo must not undo a later completion"
+    );
+    let (deleted, status): (bool, String) =
+        sqlx::query_as("SELECT deleted_at IS NOT NULL, status::text FROM items WHERE id = $1")
+            .bind(item_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("item after stale undo");
+    assert!(!deleted, "the stale undo must not delete the purchase");
+    assert_eq!(status, "done", "the later completion must stay in place");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clear_undo_after_window_reports_expiry_and_keeps_purchases_deleted() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let (item_id, _) = cleared_purchase(&mut bot, "Позднее молоко").await;
+    bot.assert_screen_contains("Убрано: 1 позиция");
+
+    bot.advance(Duration::minutes(11));
+    bot.press("Отменить").await;
+
+    bot.assert_screen_contains("Список покупок пуст");
+    assert!(!bot.screen().contains("Позднее молоко"));
+    assert_eq!(
+        last_toast(&bot).as_deref(),
+        Some("Время отмены истекло"),
+        "an expired clear undo must report expiry"
+    );
+
+    let deleted: bool =
+        sqlx::query_scalar("SELECT deleted_at IS NOT NULL FROM items WHERE id = $1")
+            .bind(item_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("purchase after expired undo");
+    assert!(deleted, "an expired undo must not restore the purchase");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
