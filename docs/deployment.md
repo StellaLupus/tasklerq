@@ -322,7 +322,7 @@ curl -sS -X POST \
 | `RETENTION_OUTBOX_DAYS` | нет | `30` | Завершённый outbox (`sent`, `skipped`, `dead`) и завершённые записи `notification_deliveries` (`sent`, `cancelled`); `pending` не удаляются. |
 | `RETENTION_AUDIT_DAYS` | нет | `365` | События членства и безопасности, а также использованные, отозванные и истёкшие приглашения. Не меньше 90: столько дней показывает «Журнал». |
 | `RUST_LOG` | нет | `info,tasklerq=debug` | Логи. |
-| `TZ` | нет | `UTC` | Часовой пояс контейнера; журналы сервиса пишутся в UTC. |
+| `TZ` | нет | `UTC` | Сервисом не читается. В образе `debian:bookworm-slim` нет `tzdata`, поэтому переменная не меняет ни журналы, ни расчёты: JSON-логи всегда пишутся в UTC, а часовой пояс household задаётся IANA-именем (`households.timezone`, `chrono-tz`) и от `TZ` не зависит. |
 
 `CAPTURE_MAX_TEXT_CHARS` принимает значения от 100 до 2000. В старых
 конфигурациях могли остаться значения 2001–16000: теперь они не проходят
@@ -645,8 +645,11 @@ wget -qO- http://127.0.0.1:18080/health/live
 
 ```bash
 sudo /usr/local/bin/docker compose exec tasklerq \
-  wget -qO- http://host.docker.internal:8123/ | head
+  tasklerq healthcheck --url http://host.docker.internal:8123/manifest.json
 ```
+
+В образе Tasklerq нет `curl`/`wget`; встроенная команда `healthcheck` делает
+GET и завершается успешно на `2xx`.
 
 ## 11. Резервное копирование
 
@@ -765,6 +768,13 @@ sudo /usr/local/bin/docker compose up -d tasklerq
 
 Схема должна быть совместима с предыдущей версией (expand/contract). Если
 миграция разрушительная — откат только через restore backup.
+
+Откат тегом не проходит через миграции: `serve` применяет встроенный набор при
+каждом старте, и образ, в котором нет уже применённой миграции, завершается с
+`migration <номер> was previously applied but is missing in the resolved
+migrations`. В таком случае откатывайтесь восстановлением backup в новую базу
+или образом с прежним кодом и актуальными миграциями; подробнее — runbook
+[§16.10](#1610-откат-релиза).
 
 ## 13. Мониторинг и логи
 
@@ -1038,38 +1048,134 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 
 ### 16.1. Webhook 401
 
-1. Проверьте `TELEGRAM_WEBHOOK_SECRET` в `.env` и в `setWebhook`.
-2. `getWebhookInfo` — нет ли ошибок.
-3. Перерегистрируйте webhook.
-4. Проверьте, не удаляет ли Synology Reverse Proxy заголовок
-   `X-Telegram-Bot-Api-Secret-Token`.
-5. Перезапустите Tasklerq.
+1. Проверьте `TELEGRAM_WEBHOOK_SECRET` в `.env`. `getWebhookInfo` секрет не
+   показывает, поэтому совпадение секрета с зарегистрированным проверяется
+   только повторной регистрацией webhook (раздел 5, п. 5).
+2. Проверьте webhook: `sudo /usr/local/bin/docker compose exec tasklerq tasklerq admin webhook info` — URL и `last_error_message` без токена бота. Команда не ходит в БД и работает, даже когда PostgreSQL недоступен; если контейнер не запущен, используйте `docker compose run --rm tasklerq admin webhook info`.
+3. Перерегистрируйте webhook с секретом из `.env` (раздел 5, п. 5), затем
+   повторите `tasklerq admin webhook info`.
+4. Проверьте, что Synology Reverse Proxy передаёт заголовок
+   `X-Telegram-Bot-Api-Secret-Token` без изменений.
+5. Проверьте ответ без секрета:
+
+   ```bash
+   curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
+     "https://tasklerq.stellalupus.ru/webhooks/telegram"
+   # 401
+   ```
+
+   Тело ответа — общий `unauthorized` (`Invalid webhook secret`), без указания,
+   был секрет пустым или неверным. `404` означает, что маршрут выключен
+   (`TELEGRAM_MODE=disabled`) или URL неверный; `429` — сработал лимит
+   120 запросов/с с IP. Каждый `401` увеличивает
+   `webhook_auth_failures_total` и пишется в `audit_events` как `auth_failed`
+   (событие по IP подавляется, метрика считает все). Запрос без секрета тоже
+   считается отказом, не повторяйте его в цикле.
+6. Перезапустите Tasklerq: `setWebhook` выполняется при старте (раздел 5).
 
 ### 16.2. Очередь растёт
 
-1. `/health/ready` — статус.
-2. `tasklerq admin queue stats`.
-3. Логи воркеров: ошибки БД/Telegram.
-4. Проверьте `telegram_updates` по статусам.
-5. Если Telegram 429 — подождите, outbox сам повторит.
-6. Если БД медленная — проверьте пул, блокировки, диск.
+1. `/health/ready`: `503` с `Database is unavailable` — недоступна БД;
+   `503` с `Telegram update queue is lagging` — самое старое готовое
+   обновление ждёт дольше `QUEUE_READY_LAG_SECONDS`. Не убирайте инстанс из
+   маршрутизации webhook по этому признаку: при лаге это остановит приём
+   обновлений и усугубит задержку (раздел 6).
+2. `sudo /usr/local/bin/docker compose exec tasklerq tasklerq admin queue stats`
+   — счётчики по статусам и `oldest_ready_age_seconds`.
+3. Логи воркеров (`docker compose logs --tail=200 tasklerq`):
+   - `telegram update failed` — ошибка обработчика, поле `error`;
+   - `telegram update pass failed`, `telegram update pass panicked` — сбой
+     цикла воркера;
+   - `telegram update moved to the dead-letter queue` — исчерпаны
+     `QUEUE_MAX_ATTEMPTS`, рядом поле `metric="telegram_updates_dead"`;
+   - `outbox pass failed`, `outbox message moved to the dead-letter queue` —
+     ошибки доставки исходящих;
+   - `webhook: database unavailable`, `database operation failed`,
+     `getUpdates failed` (только `polling`).
+4. Проверьте таблицы по статусам (только чтение):
+
+   ```sql
+   SELECT status, count(*) FROM telegram_updates GROUP BY status ORDER BY status;
+   SELECT status, count(*) FROM outbox GROUP BY status ORDER BY status;
+   SELECT status, count(*) FROM capture_jobs GROUP BY status ORDER BY status;
+   SELECT status, count(*) FROM notification_deliveries GROUP BY status ORDER BY status;
+   SELECT update_id, attempts, last_error
+     FROM telegram_updates WHERE status = 'dead'
+     ORDER BY received_at DESC LIMIT 20;
+   ```
+
+   В `telegram_updates.status` только `pending`, `processed`, `dead`;
+   `failed`, `deferred`, `dropped` — исходы в метрике `telegram_updates_total`,
+   а не статусы строки. У `processed` и `dead` поле `payload` затёрто
+   (`{"redacted": true}`), поэтому `dead` нельзя перепроиграть вручную:
+   пользователь повторяет действие в боте.
+5. Если Telegram отвечает `429` на исходящие сообщения, outbox ставит
+   `next_attempt_at`, `last_error='retry_after'` и не расходует попытку —
+   просто дождитесь. `429` на webhook — это лимит 120 запросов/с с IP
+   (`webhook_rate_limited_total`), а не ответ Telegram.
+6. Если БД медленная, проверьте `db_pool_in_use` в `/metrics`, состояние
+   соединений и блокировки:
+
+   ```sql
+   SELECT pid, state, wait_event_type, wait_event, now() - query_start AS age, query
+     FROM pg_stat_activity WHERE datname = current_database();
+   SELECT pid, locktype, mode, granted FROM pg_locks WHERE NOT granted;
+   ```
+
+   Также проверьте диск и `statement_timeout` (в сервисе — 30 секунд).
 
 ### 16.3. PostgreSQL недоступен
 
 1. `sudo /usr/local/bin/docker ps --filter name=postgres`.
 2. `sudo /usr/local/bin/docker exec postgres pg_isready -U postgres`.
-3. Проверьте `DATABASE_URL`, сеть `shared-db`, пароль.
+3. Проверьте `DATABASE_URL`, сеть `shared-db` и пароль. На старте `serve`
+   подключается к БД и применяет миграции **до** открытия порта: при
+   недоступной БД процесс завершается с
+   `tasklerq: database connection failed: ...`, HTTP не поднимается, а
+   контейнер перезапускается (`restart: unless-stopped`). В работающем сервисе
+   `/health/live` отвечает `200`, `/health/ready` — `503`
+   `Database is unavailable`; webhook после проверки секрета отвечает `500`
+   `Database error` (Telegram повторит доставку), API — `500`; в логах
+   `readiness check failed`, `webhook: database unavailable`,
+   `database operation failed`, `telegram update pass failed`.
 4. Проверьте диск и логи PostgreSQL.
-5. Если база потеряна — restore backup.
+5. Если база потеряна — restore backup (раздел 11); восстановление идёт в
+   новую базу, затем переключите `DATABASE_URL`.
 6. После восстановления — `/health/ready`, проверить задачи.
 
 ### 16.4. Ошибка миграции
 
-1. Не запускайте сервис в рабочий режим.
-2. Прочитайте лог: имя миграции и SQL-ошибка.
-3. Восстановите backup, если схема частично изменена.
-4. Исправьте миграцию; проверьте на копии базы.
-5. Для production — expand/contract, без разрушительных изменений.
+1. Не запускайте новую версию в рабочий режим: `serve` применяет миграции до
+   `bind`, поэтому при ошибке HTTP не поднимается, а контейнер повторяет
+   попытку при каждом перезапуске.
+2. Прочитайте лог: `database migration failed: while executing migration
+   <номер>: <SQL-ошибка>`. Это **номер версии** миграции (число, например
+   `12`), а не имя файла; SQL-ошибку возвращает PostgreSQL. Повторить и
+   увидеть хвост:
+
+   ```bash
+   sudo /usr/local/bin/docker compose run --rm tasklerq migrate 2>&1 | tail -20
+   ```
+
+   Состояние применённых миграций:
+
+   ```bash
+   sudo /usr/local/bin/docker exec postgres psql -U postgres -d tasklerq \
+     -c "select version, description, success from _sqlx_migrations order by version;"
+   ```
+3. Все текущие миграции выполняются одной транзакцией (ни в одной нет
+   `-- no-transaction`): упавшая миграция откатывается целиком, и записи в
+   `_sqlx_migrations` не остаётся. «Частично применённой» текущей миграции
+   нет. Backup восстанавливайте, если до неё успели закоммититься
+   разрушительные миграции, схема разошлась вручную или нужна копия состояния
+   до обновления; для проверки используйте `restore.sh` в новую базу.
+4. Если в логе `migration <номер> was previously applied but has been
+   modified`, применённую миграцию отредактировали. Не меняйте её и не
+   удаляйте строку из `_sqlx_migrations`: добавьте новую миграцию с
+   исправлением.
+5. Исправьте миграцию, проверьте её на копии базы и примените
+   `tasklerq migrate`.
+6. Для production — expand/contract, без разрушительных изменений.
 
 ### 16.5. Ротация токенов
 
@@ -1077,26 +1183,56 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 
 1. Выпустите новый токен в **Настройки → 🔌 Интеграции → ➕ Выпустить токен
    для HA** (или `tasklerq admin token create`).
-2. Обновите токен в интеграции HA (reauth).
+2. Обновите токен в интеграции HA (reauth); в HA нажмите
+   **Переаутентифицироваться**.
 3. Убедитесь, что сущности доступны.
-4. Отзовите старый токен в **Настройки → 🔌 Интеграции** (кнопка
-   **🚫 Отозвать «…»**) или командой `tasklerq admin token revoke <id> --yes`.
+4. Найдите старый токен и отзовите его в **Настройки → 🔌 Интеграции**
+   (кнопка **🚫 Отозвать «…»**) или командой:
+
+   ```bash
+   sudo /usr/local/bin/docker compose exec tasklerq \
+     tasklerq admin token list
+   sudo /usr/local/bin/docker compose exec tasklerq \
+     tasklerq admin token revoke <id> --yes
+   ```
+
+   `token list` показывает id, префикс, состояние и scopes, включая
+   отозванные (в режиме `multi` добавьте `--household <id>`). Отзыв вступает
+   сразу: старый токен получает `401`.
 
 **Токен бота:**
 
 1. BotFather → `/revoke` → новый токен.
-2. Обновите `TELEGRAM_BOT_TOKEN`.
-3. Перезапустите Tasklerq.
-4. Проверьте `setWebhook`/`getWebhookInfo`.
+2. Обновите `TELEGRAM_BOT_TOKEN` и перезапустите Tasklerq.
+3. При старте webhook регистрируется заново с текущим
+   `TELEGRAM_WEBHOOK_SECRET` (раздел 5). Проверьте
+   `sudo /usr/local/bin/docker compose exec tasklerq tasklerq admin webhook info`:
+   URL и `last_error_message` без ошибок.
+4. Если меняли и `TELEGRAM_WEBHOOK_SECRET`, обновите его в `.env` до
+   перезапуска: запросы со старым секретом получат `401`. `getWebhookInfo`
+   секрет не показывает, поэтому после смены перерегистрируйте webhook
+   (раздел 5, п. 5).
 
 ### 16.6. HA не подключается
 
 1. Проверьте URL из контейнера HA: `http://127.0.0.1:18080`.
 2. Проверьте, что Tasklerq слушает `127.0.0.1:18080`.
-3. `curl` из HA к `/health/live`.
-4. Проверьте токен и scopes.
-5. Diagnostics: последняя ошибка.
-6. Перезапустите интеграцию.
+3. Проверьте `/health/live` изнутри HA:
+
+   ```bash
+   sudo /usr/local/bin/docker exec -it homeassistant sh
+   wget -qO- http://127.0.0.1:18080/health/live
+   ```
+4. Проверьте токен и scopes: `401` — неверный, истёкший или отозванный токен;
+   `403` — у токена нет нужного scope (`ha:read`/`ha:write` для сущностей,
+   `capture:write` для сервисов capture). Список токенов —
+   `sudo /usr/local/bin/docker compose exec tasklerq tasklerq admin token list`
+   (в режиме `multi` добавьте `--household <id>`).
+5. Если токен менялся или отозван, выпустите новый и выполните reauth в HA:
+   **Настройки → Устройства и службы → Tasklerq → Переаутентифицироваться**
+   (подробно — [`home-assistant.md`](home-assistant.md#reauth)).
+6. Diagnostics: последняя ошибка.
+7. Перезагрузите интеграцию (или перезапустите HA) и проверьте сущности.
 
 ### 16.7. Tasklerq не видит HA
 
@@ -1104,33 +1240,77 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 2. Для host-режима HA используйте `http://host.docker.internal:8123` или
    `http://192.168.10.110:8123`.
 3. Проверьте `extra_hosts` в compose.
-4. Проверьте `HA_TOKEN` и срок действия.
-5. Вызовите `ai_task.generate_data` в Developer Tools.
+4. Проверьте доступность HA из контейнера Tasklerq:
+
+   ```bash
+   sudo /usr/local/bin/docker compose exec tasklerq \
+     tasklerq healthcheck --url http://host.docker.internal:8123/manifest.json
+   ```
+
+   Код `0` — HA отвечает; ошибка подключения означает сеть/DNS, а не токен.
+   В образе Tasklerq нет `curl`/`wget`, поэтому проверка идёт встроенной
+   командой.
+5. Проверьте `HA_TOKEN`: неверный или отозванный токен даёт `401` от HA, в
+   логах — `llm capture request failed` с кодом ошибки. Строка
+   `LLM capture is disabled: bad HA settings` при старте означает, что
+   `HA_AI_TASK_ENTITY_ID` не похож на `ai_task.<name>` или не удалось создать
+   HTTP-клиент, а не сетевую ошибку.
+6. Вызовите `ai_task.generate_data` в Developer Tools — это проверяет AI Task
+   независимо от Tasklerq.
 
 ### 16.8. LLM не работает
 
 1. Проверьте `HA_AI_TASK_ENTITY_ID=ai_task.anthropic_claude_haiku_5_5`.
 2. Вызовите `ai_task.generate_data` в Developer Tools.
-3. Проверьте `HA_TOKEN` и срок действия.
+3. Проверьте `HA_TOKEN`; для диагностики сети и адреса — шаги 4–5 раздела 16.7.
 4. Проверьте баланс и лимиты OpenRouter.
-5. Посмотрите `llm_runs` (без текста).
-6. При необходимости `LLM_CAPTURE_ENABLED=false` — ручная форма.
+5. Посмотрите `llm_runs` (без текста):
+
+   ```sql
+   SELECT created_at, source, mode, status, error_code, latency_ms
+     FROM llm_runs ORDER BY created_at DESC LIMIT 20;
+   ```
+
+   В логах ищите `llm capture request failed` (поле `error` — код) и
+   `llm capture response rejected` (ответ не прошёл схему). Текста запроса в
+   этих строках нет.
+6. При необходимости `LLM_CAPTURE_ENABLED=false`: в Telegram откроется ручная
+   форма, а внешний `auto` при `CAPTURE_VOICE_FALLBACK_RAW=true` создаст
+   fallback-позицию (в `draft` — `503`).
 
 ### 16.9. Голосовой capture не работает
 
-1. Проверьте `CAPTURE_API_ENABLED=true` и токен со scope `capture:write`.
-2. Вызовите `tasklerq.capture` в **Developer Tools → Actions** с
-   `text`, `mode=auto`, `hint=shopping`; посмотрите ответ и ошибку.
-3. Проверьте `curl` к `POST /api/v1/capture` из контейнера HA.
+1. Проверьте `CAPTURE_API_ENABLED=true` и токен со scope `capture:write`;
+   без scope ответ `403`, при выключенном маршруте — `404`.
+2. Вызовите `tasklerq.capture` в **Developer Tools → Actions** с `text`,
+   `source: ha_voice`, `mode: auto`, `hint: shopping`; посмотрите ответ и
+   ошибку.
+3. Проверьте `curl` к `POST /api/v1/capture` из контейнера HA:
+
+   ```bash
+   curl -sS -X POST http://127.0.0.1:18080/api/v1/capture \
+     -H "Authorization: Bearer $TASKLERQ_TOKEN" \
+     -H "Content-Type: application/json" \
+     -H "Idempotency-Key: $(date +%s)" \
+     -d '{"text":"купить молоко","source":"ha_voice","mode":"auto","hint":"shopping"}'
+   ```
 4. Проверьте файл `custom_sentences/ru/tasklerq.yaml` и `intent_script`; после
    правки перезапустите HA.
 5. Проверьте `speech` в ответе сервиса — Assist озвучивает его через
    `action_response`.
-6. Если LLM отвечает дольше `CAPTURE_VOICE_TIMEOUT_MS`, должна создаваться
-   fallback-позиция; проверьте `fallback=true` и `capture_fallback_total`.
-7. Если Tasklerq вернул `429`, проверьте лимит capture и суточную квоту LLM.
-8. Для отмены последнего добавления вызовите `tasklerq.undo_last_capture`;
-   `409` означает, что элемент уже изменён.
+6. Если LLM отвечает дольше `CAPTURE_VOICE_TIMEOUT_MS` при
+   `CAPTURE_VOICE_FALLBACK_RAW=true`, должна создаваться fallback-позиция:
+   проверьте `fallback=true` в ответе, `capture_fallback_total` и строку
+   `capture fell back to the raw text` с полем `reason`.
+7. `429` в режиме `auto` — это лимит capture
+   (`CAPTURE_RATE_LIMIT_PER_MIN`, по умолчанию 10/мин на токен); проверьте
+   `Retry-After`. Исчерпанная суточная квота LLM в `auto` при включённом
+   fallback даёт позицию `fallback=true`, а не `429`; `429` за квоту возможен
+   только в `draft`.
+8. Для отмены последнего добавления вызовите `tasklerq.undo_last_capture`
+   (окно — 10 минут). `409` — элементы capture уже менялись после создания
+   (`version != 1` или статус не `open`) либо окно отмены закрыто. Если
+   отменять нечего, ответ `200` с `removed=0`.
 
 ### 16.10. Откат релиза
 
@@ -1141,6 +1321,16 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 5. Проверить `/health/ready`, логи, задачи и HA.
 6. Если схема несовместима — restore backup.
 
+**Ограничение отката по тегу.** `serve` применяет встроенные миграции при
+каждом старте, а sqlx не игнорирует миграции, которых нет в образе. Если новая
+версия применила миграцию, а в старом образе её нет, старый образ не
+запустится с ошибкой `migration <номер> was previously applied but is missing
+in the resolved migrations` (HTTP не поднимется). Поэтому откат тегом
+возможен, только если старый образ содержит все уже применённые миграции.
+Иначе восстановите backup до обновления в новую базу и переключите на неё
+`DATABASE_URL` (раздел 11) либо выпустите образ с прежним кодом и актуальным
+набором миграций. `tasklerq migrate` схему не откатывает: down-миграций нет.
+
 ### 16.11. Два household после обновления
 
 Возникает после обновления инсталляции, где в режиме `single` уже было два
@@ -1149,32 +1339,48 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 
 Симптомы:
 
-- при старте в логе есть `error` с числом активных household (без названий и
-  идентификаторов);
+- при старте в логе есть `error` `single tenancy mode with multiple active
+  households: creating new households is disabled; see the runbook for cleanup`
+  с полем `households` (число, без названий и идентификаторов);
 - `/health/ready` отвечает `200`, но содержит
   `"warnings": ["multiple_households"]`;
 - новые пользователи в боте видят «Инсталляция требует вмешательства
   администратора».
 
-1. `tasklerq admin household list` — найдите household с владельцем и
-   задачами; лишний обычно остался без владельца или пустым.
+1. `sudo /usr/local/bin/docker compose exec tasklerq tasklerq admin household list`
+   — найдите household с владельцем и задачами; лишний обычно остался без
+   владельца или пустым.
 2. Выпустите токен для нужного household — в боте через
    **Настройки → 🔌 Интеграции → ➕ Выпустить токен для HA** (если вы владелец
    этого household) или через CLI:
 
    ```bash
-   tasklerq admin token create --household <id> \
+   sudo /usr/local/bin/docker compose exec tasklerq \
+     tasklerq admin token create --household <id> \
      --name "Home Assistant" --scopes ha:read,ha:write,capture:write
    ```
 
 3. Переподключите HA с новым токеном (reauth).
 4. Удалите лишний household:
-   `tasklerq admin household delete --household <лишний> --yes`. Без `--yes`
-   команда попросит ввести название household.
-5. Удаление мягкое: household и участники помечаются удалёнными, токены и
-   приглашения отзываются сразу. Физически данные удалит retention.
-   Восстановление — вручную до истечения retention
-   (`UPDATE households SET deleted_at = NULL`, то же для участников).
+
+   ```bash
+   sudo /usr/local/bin/docker compose exec tasklerq \
+     tasklerq admin household delete --household <лишний> --yes
+   ```
+
+   Без `--yes` команда попросит ввести название household.
+5. Удаление мягкое: household и участники (`users`) помечаются удалёнными,
+   токены и приглашения отзываются сразу. Физически данные удалит retention.
+   Восстановление — вручную до истечения retention:
+
+   ```sql
+   UPDATE households SET deleted_at = NULL, updated_at = now()
+     WHERE id = '<id>';
+   UPDATE users SET deleted_at = NULL, updated_at = now()
+     WHERE household_id = '<id>';
+   ```
+
+   Если retention уже физически удалил строки, восстановление невозможно.
    Отозванные токены не восстанавливаются, выпустите новые.
 
 После `household delete` предупреждение в `/health/ready` исчезает без
