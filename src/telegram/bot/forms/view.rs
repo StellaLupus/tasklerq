@@ -1,7 +1,7 @@
 //! Экраны форм.
 
 use crate::domain::error::DomainError;
-use crate::domain::models::{Item, ItemPriority, ListKind, MonthRule, RecurrenceFreq};
+use crate::domain::models::{Item, ItemPriority, List, ListKind, MonthRule, RecurrenceFreq};
 use crate::domain::validation::{MAX_SUBTASKS, MAX_TAGS};
 use crate::storage::repositories::{lists, tags, users};
 use crate::telegram::rich::{Button, button};
@@ -195,10 +195,43 @@ async fn create_view(ctx: &mut Ctx<'_>, form: ItemForm) -> Result<Ui, Fail> {
     match form.step {
         Step::List => {
             ui = ui.heading("В какой список?");
-            for list in lists_of_kind(ctx, form.kind).await? {
-                ui = ui.row(vec![choose(clip(&list.name, 40), Choice::List(list.id))]);
+            if form.quick {
+                // Быстрая форма: один запрос всех списков, задачи затем покупки,
+                // порядок внутри типа сохраняется стабильной сортировкой.
+                let household_id = ctx.household()?.id;
+                let mut lists: Vec<List> = lists::list(&mut *ctx.conn, household_id)
+                    .await?
+                    .into_iter()
+                    .filter(|list| !list.is_archived)
+                    .collect();
+                lists.sort_by_key(|list| list.kind != ListKind::Tasks);
+                for list in lists {
+                    let icon = if list.kind == ListKind::Tasks {
+                        "📋"
+                    } else {
+                        "🛒"
+                    };
+                    let mark = if form.list_id == Some(list.id) {
+                        "● "
+                    } else {
+                        ""
+                    };
+                    ui = ui.row(vec![choose(
+                        format!("{mark}{icon} {}", clip(&list.name, 40)),
+                        Choice::List(list.id),
+                    )]);
+                }
+                Ok(ui.row(vec![
+                    go_step("👁 Предпросмотр", Step::Preview),
+                    cancel_button(),
+                ]))
+            } else {
+                // Обычная форма сохраняет тип списка и прежние подписи кнопок.
+                for list in lists_of_kind(ctx, form.kind).await? {
+                    ui = ui.row(vec![choose(clip(&list.name, 40), Choice::List(list.id))]);
+                }
+                Ok(ui.row(vec![cancel_button()]))
             }
-            Ok(ui.row(vec![cancel_button()]))
         }
         Step::Preview => preview(ctx, form, ui).await,
         step if step.expects_text() && step != Step::Subtasks => {
@@ -581,6 +614,9 @@ async fn preview(ctx: &mut Ctx<'_>, form: ItemForm, mut ui: Ui) -> Result<Ui, Fa
         button("💾 Сохранить", Action::Form { act: FormAct::Save }),
         go_step("✏️ Название", Step::Title),
     ]);
+    if form.quick {
+        ui = ui.row(vec![go_step("📋 Список", Step::List)]);
+    }
     ui = if shopping {
         ui.row(vec![
             go_step("🔢 Количество", Step::Quantity),

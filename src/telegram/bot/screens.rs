@@ -29,6 +29,12 @@ pub async fn build(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
         Screen::List { list_id, page } => list(ctx, *list_id, *page).await,
         Screen::Item { item_id, back } => card::view(ctx, *item_id, back).await,
         Screen::Completed { item_id, back } => card::completed(ctx, *item_id, back).await,
+        Screen::Deleted {
+            item_id,
+            title,
+            shopping,
+            back,
+        } => card::deleted(*item_id, title, *shopping, back).await,
         Screen::ConfirmDelete { item_id, back } => card::confirm_delete(ctx, *item_id, back).await,
         Screen::Mine { page } => mine(ctx, *page).await,
         Screen::Results {

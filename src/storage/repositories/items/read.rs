@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use sqlx::PgConnection;
 use uuid::Uuid;
 
-use super::row::{ITEM_COLUMNS, ItemRow, hydrate_many, load_item};
+use super::row::{ITEM_COLUMNS, ItemRow, hydrate_many, load_item, row_by_id};
 use crate::domain::error::DomainError;
 use crate::domain::models::Item;
 use crate::storage::repositories::lists;
@@ -16,6 +16,17 @@ pub async fn get(
     item_id: Uuid,
 ) -> Result<Item, DomainError> {
     load_item(conn, household_id, item_id).await
+}
+
+/// Удалён ли элемент мягко. Находит и уже скрытые элементы; `NotFound` —
+/// только если строки нет вовсе.
+pub async fn is_deleted(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    item_id: Uuid,
+) -> Result<bool, DomainError> {
+    let row = row_by_id(conn, household_id, item_id, true, false).await?;
+    Ok(row.deleted_at.is_some())
 }
 
 /// Элементы списка: открытые сверху, затем выполненные.

@@ -2,7 +2,7 @@
 
 use uuid::Uuid;
 
-use crate::domain::models::{Item, ItemStatus, List, ListKind, RecurrenceFreq};
+use crate::domain::models::{Item, ItemPriority, ItemStatus, List, ListKind, RecurrenceFreq};
 use crate::domain::settings::{NotificationSettingsUpdate, ProfileUpdate, parse_hhmm};
 use crate::domain::validation::validate_new_item;
 use crate::storage::repositories::{items, lists, members, users};
@@ -334,6 +334,12 @@ async fn create_action(ctx: &mut Ctx<'_>, mut form: ItemForm, act: FormAct) -> R
             ctx.present(Screen::Menu).await
         }
         FormAct::Choose(Choice::List(list_id)) => {
+            if form.quick {
+                let household_id = ctx.household()?.id;
+                let list = lists::get_visible(&mut *ctx.conn, household_id, list_id).await?;
+                switch_list(&mut form, &list);
+                return open(ctx, Form::Create(form)).await;
+            }
             form.list_id = Some(list_id);
             advance(&mut form, Step::List);
             open(ctx, Form::Create(form)).await
@@ -374,6 +380,33 @@ async fn create_action(ctx: &mut Ctx<'_>, mut form: ItemForm, act: FormAct) -> R
             version,
         } => increase(ctx, item_id, quantity, version, form).await,
     }
+}
+
+/// Переключить быструю форму на другой список, сбросив поля другого типа.
+fn switch_list(form: &mut ItemForm, list: &List) {
+    let was_shopping = form.kind != ListKind::Tasks;
+    let shopping = list.kind != ListKind::Tasks;
+    if was_shopping != shopping {
+        if shopping {
+            // У покупки нет срока, приоритета, тегов, подзадач и повторения:
+            // не сохраняем скрытые значения задачи.
+            form.draft.date = None;
+            form.draft.time = None;
+            form.draft.priority = ItemPriority::Normal;
+            form.draft.tags.clear();
+            form.draft.subtasks.clear();
+            form.draft.recurrence = None;
+        } else {
+            form.draft.quantity = None;
+            form.draft.unit = None;
+        }
+    }
+    form.kind = list.kind;
+    form.list_id = Some(list.id);
+    form.step = Step::Preview;
+    form.from_preview = false;
+    form.error = None;
+    form.duplicate = None;
 }
 
 async fn edit_action(ctx: &mut Ctx<'_>, mut form: EditForm, act: FormAct) -> Result<(), Fail> {

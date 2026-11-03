@@ -8,12 +8,12 @@ use uuid::Uuid;
 
 use super::row::{hydrate_one, load_item, load_item_any, row_by_id};
 use super::{
-    DELETED_RETENTION_DAYS, UNDO_WINDOW_MINUTES, local_today, recurrence_values, version_conflict,
+    UNDO_WINDOW_EXPIRED, UNDO_WINDOW_MINUTES, local_today, recurrence_values, version_conflict,
 };
 use crate::domain::error::DomainError;
 use crate::domain::models::{Actor, EventType, Item, ItemStatus};
 use crate::domain::recurrence::Due;
-use crate::storage::repositories::{events, lists, notifications, subtasks, tags};
+use crate::storage::repositories::{events, notifications, subtasks, tags};
 
 /// Завершить элемент.
 pub async fn complete(
@@ -234,61 +234,6 @@ pub async fn soft_delete(
     Ok(updated)
 }
 
-/// Восстановить мягко удалённый элемент.
-pub async fn restore(
-    conn: &mut PgConnection,
-    household_id: Uuid,
-    actor: &Actor,
-    item_id: Uuid,
-    now: DateTime<Utc>,
-) -> Result<Item, DomainError> {
-    let row = row_by_id(conn, household_id, item_id, true, true).await?;
-    let current = hydrate_one(conn, row.clone()).await?;
-
-    let Some(deleted_at) = row.deleted_at else {
-        return Ok(current);
-    };
-    ensure_can_modify(actor, row.created_by_user_id)?;
-
-    if now - deleted_at > Duration::days(DELETED_RETENTION_DAYS) {
-        return Err(DomainError::conflict(
-            "item can no longer be restored after the retention period",
-        ));
-    }
-
-    if lists::get(conn, household_id, row.list_id).await.is_err() {
-        return Err(DomainError::conflict(
-            "item cannot be restored because its list was deleted",
-        ));
-    }
-
-    sqlx::query(
-        "UPDATE items
-         SET deleted_at = NULL, version = version + 1, updated_at = $3
-         WHERE id = $1 AND household_id = $2",
-    )
-    .bind(item_id)
-    .bind(household_id)
-    .bind(now)
-    .execute(&mut *conn)
-    .await?;
-
-    let updated = load_item(conn, household_id, item_id).await?;
-    events::insert(
-        conn,
-        household_id,
-        item_id,
-        actor,
-        EventType::Restored,
-        json!({"before": current, "after": updated}),
-        None,
-        now,
-    )
-    .await?;
-
-    Ok(updated)
-}
-
 /// Отменить последнее действие над элементом в течение 10 минут.
 pub async fn undo_last(
     conn: &mut PgConnection,
@@ -316,7 +261,11 @@ pub async fn undo_last(
     if now - event.created_at > Duration::minutes(UNDO_WINDOW_MINUTES) {
         return Err(DomainError::conflict_with(
             "the undo window has expired",
-            json!({"event_id": event.id, "created_at": event.created_at}),
+            json!({
+                "reason": UNDO_WINDOW_EXPIRED,
+                "event_id": event.id,
+                "created_at": event.created_at,
+            }),
         ));
     }
     ensure_can_undo(actor, &event)?;

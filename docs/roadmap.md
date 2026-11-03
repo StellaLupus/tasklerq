@@ -32,26 +32,45 @@
 
 ### Критерии приёмки MVP
 
-- [ ] Новый пользователь проходит онбординг и создаёт household.
-- [ ] Владелец приглашает второго участника по deep link.
-- [ ] Задача создаётся из Telegram и появляется в HA ≤60 с.
-- [ ] Задача завершается в HA и исчезает из открытых в Telegram.
-- [ ] Свободный текст разбирается в черновик; подтверждение создаёт элементы.
-- [ ] При недоступности LLM работает ручная форма.
-- [ ] Голосовая команда в HA Assist создаёт задачу или покупку без Telegram.
-- [ ] Голосовой capture идемпотентен: повтор не создаёт дубликаты.
-- [ ] При недоступности LLM голосовой capture создаёт fallback-позицию.
-- [ ] Capture можно отменить в течение 10 минут (`undo` / `undo_last_capture`).
-- [ ] Повторяющаяся задача не создаёт дублей напоминаний после рестарта.
-- [ ] Покупка с количеством и единицей проходит полный цикл.
-- [ ] Webhook без секрета возвращает 401.
-- [ ] `/health/ready` отражает БД и очередь.
-- [ ] Backup восстанавливается на чистую базу.
+- [x] Новый пользователь проходит онбординг и создаёт household
+  (`tests/identity_households.rs::onboarding_creates_household_owner_and_default_lists`).
+- [x] Владелец приглашает второго участника по deep link
+  (`tests/identity_households.rs::invite_lets_a_new_member_join`).
+- [x] Задача создаётся из Telegram и появляется в HA ≤60 с
+  (`docs/deployment.md` §19, «HA sync»).
+- [ ] Задача завершается в HA и исчезает из открытых в Telegram
+  (`docs/deployment.md` §19, «HA sync»: показаны только события `completed` с
+  actor `home_assistant`; «6→5» относится к направлению Telegram→HA. Отдельного
+  теста на исчезновение задачи из открытых после завершения из HA нет).
+- [x] Свободный текст разбирается в черновик; подтверждение создаёт элементы
+  (`tests/telegram_capture.rs::save_all_creates_every_item_and_undo_removes_them`).
+- [x] При недоступности LLM работает ручная форма
+  (`tests/telegram_capture.rs::failed_parse_opens_the_manual_form_with_the_source_text`,
+  `tests/telegram_capture.rs::daily_quota_stops_parsing_and_opens_the_manual_form`).
+- [x] Голосовая команда в HA Assist создаёт задачу или покупку без Telegram
+  (`docs/deployment.md` §19, «Голосовой capture через Assist без Telegram»).
+- [x] Голосовой capture идемпотентен: повтор не создаёт дубликаты
+  (`tests/capture_idempotency.rs::an_auto_repeat_returns_the_first_result_without_duplicates`).
+- [x] При недоступности LLM голосовой capture создаёт fallback-позицию
+  (`tests/capture_fallback.rs::ha_unavailability_in_auto_creates_one_fallback_item`).
+- [x] Capture можно отменить в течение 10 минут (`undo` / `undo_last_capture`)
+  (`tests/capture_api.rs::undo_last_removes_only_the_latest_voice_capture`).
+- [x] Повторяющаяся задача не создаёт дублей напоминаний после рестарта
+  (`tests/notifications.rs::restart_does_not_duplicate_and_next_occurrence_gets_its_own_delivery`).
+- [x] Покупка с количеством и единицей проходит полный цикл
+  (`docs/deployment.md` §19, «Покупка»).
+- [x] Webhook без секрета возвращает 401
+  (`tests/telegram_webhook.rs::wrong_or_missing_secret_is_rejected_without_storing`).
+- [x] `/health/ready` отражает БД и очередь
+  (`tests/health.rs::readiness_requires_every_embedded_migration_to_be_successful`,
+  `tests/telegram_webhook.rs::readiness_fails_while_an_update_waits_longer_than_the_limit`).
+- [x] Backup восстанавливается на чистую базу
+  (`tests/backup_restore.rs::backup_then_restore_into_a_new_database_keeps_migrations_and_data`).
 - [ ] `openspec validate --strict` проходит.
 
 ## 3. Этапы
 
-### Этап 0. Спецификация (текущий)
+### Этап 0. Спецификация (завершён)
 
 **Результат:** OpenSpec change `0001-foundation`, проектные документы.
 
@@ -60,11 +79,11 @@
 - [x] `design.md`.
 - [x] `tasks.md`.
 - [x] README и docs.
-- [ ] Ревью и уточнение параметров развёртывания.
+- [x] Ревью и уточнение параметров развёртывания.
 
 **Выход:** согласованные спецификации, готовые к реализации.
 
-### Этап 1. Foundation
+### Этап 1. Foundation (завершён)
 
 **Результат:** собираемый сервис, БД, health, Docker, CI.
 
@@ -75,7 +94,7 @@
 
 **Выход:** `cargo test` и `docker build` проходят; `/health/ready` отвечает.
 
-### Этап 2. Домен и Telegram
+### Этап 2. Домен и Telegram (завершён)
 
 **Результат:** рабочие задачи и покупки в боте.
 
@@ -87,7 +106,7 @@
 
 **Выход:** e2e-сценарии «создать/завершить/найти/пригласить» проходят.
 
-### Этап 3. LLM-capture и внешний capture
+### Этап 3. LLM-capture и внешний capture (завершён)
 
 **Результат:** свободный текст → черновик/сразу созданные элементы, с
 Telegram и без него.
@@ -101,7 +120,7 @@ Telegram и без него.
 **Выход:** ≥90% точности на golden set; подтверждение идемпотентно; голосовой
 capture создаёт элементы без Telegram; fallback работает.
 
-### Этап 4. Home Assistant
+### Этап 4. Home Assistant (завершён)
 
 **Результат:** нативные сущности, синхронизация и голосовой вход.
 
@@ -112,13 +131,16 @@ capture создаёт элементы без Telegram; fallback работае
 - Пример пользовательских предложений (custom sentences) + `intent_script` для
   HA Assist.
 - Snapshot, конфликты, diagnostics.
-- Установка через HACS и вручную.
+- Установка через HACS.
 
 **Выход:** задача из Telegram появляется в HA; завершение в HA отражается в
-Telegram; конфликт версий обрабатывается; голосовая команда в Assist создаёт
+Telegram (на инсталляции подтверждены только события `completed` с actor
+`home_assistant`; исчезновение задачи из открытых в Telegram отдельным тестом
+не проверено, поэтому критерий MVP остаётся `[ ]` — см. «Критерии приёмки
+MVP»); конфликт версий обрабатывается; голосовая команда в Assist создаёт
 задачу или покупку и озвучивает ответ.
 
-### Этап 5. Уведомления
+### Этап 5. Уведомления (завершён)
 
 **Результат:** напоминания и сводки.
 
@@ -130,9 +152,12 @@ Telegram; конфликт версий обрабатывается; голос
 **Выход:** напоминание приходит один раз; после рестарта нет дублей; тихие часы
 переносят доставку.
 
-### Этап 6. Hardening и релиз
+### Этап 6. Hardening и релиз (текущий: релиз v0.1.0, пункты 9.x)
 
 **Результат:** production-ready v0.1.0.
+
+Реализация этапов 0–5 закончена; идёт релиз: документы, приёмка MVP и архив
+change `0001-foundation` (пункты 9.x в `tasks.md`).
 
 - Rate limits, security checklist.
 - Load test, backup/restore drill.

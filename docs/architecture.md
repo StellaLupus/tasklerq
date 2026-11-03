@@ -3,7 +3,7 @@
 ## 1. Контекст
 
 Tasklerq — семейный сервис, который работает на собственном сервере и
-объединяет три интерфейса:
+объединяет четыре интерфейса:
 
 - **Telegram** — основной способ добавить, посмотреть и завершить задачу.
 - **Home Assistant** — нативные сущности `todo` и `calendar` для дашбордов,
@@ -12,8 +12,9 @@ Tasklerq — семейный сервис, который работает на
   числе без работающего бота.
 - **Календарь** — задачи со сроком, включая повторяющиеся вхождения.
 
-Сервис не является SaaS: один экземпляр обслуживает один household (семью).
-Данные хранятся в PostgreSQL, который уже есть на сервере пользователя.
+Сервис не является SaaS: по умолчанию один экземпляр обслуживает один household
+(семью), режим `TENANCY_MODE=multi` допускает несколько. Данные хранятся в
+PostgreSQL, который уже есть на сервере пользователя.
 LLM-разбор выполняет Home Assistant через `ai_task.generate_data` (сейчас
 Claude Haiku 5.5 через OpenRouter); Tasklerq не вызывает LLM напрямую. Задачу можно создать из Telegram
 или без него — голосом, автоматизацией или прямым HTTP-запросом.
@@ -159,7 +160,9 @@ sequenceDiagram
 ```
 
 Внешний capture не создаёт запись в `outbox` и не требует Telegram. При
-недоступности LLM `auto` создаёт одну позицию из исходного текста.
+недоступности LLM `auto` создаёт одну позицию из исходного текста, если
+включён `CAPTURE_VOICE_FALLBACK_RAW` (по умолчанию `true`); иначе возвращает
+`503`.
 
 ### 3.3 Home Assistant snapshot и запись
 
@@ -230,19 +233,34 @@ sequenceDiagram
     B-->>O: уведомление о новом участнике
 ```
 
+Первый контакт зависит от `TENANCY_MODE`. В `single` на пустой инсталляции
+онбординг проходит `BOOTSTRAP_OWNER_TELEGRAM_ID`, если он задан, иначе —
+первый написавший боту; при существующем household с владельцем новый
+пользователь получает просьбу взять приглашение, household без владельца
+показывает команду администратора (чужой `BOOTSTRAP_OWNER_TELEGRAM_ID` видит
+нейтральный экран «Пространство ещё не настроено»), а при нескольких
+household — экран «Нужен администратор». В `multi` онбординг доступен каждому
+новому пользователю.
+
 ## 4. Модули Rust
 
 ```text
 src/
-├── main.rs              # сборка зависимостей, запуск axum + workers
+├── main.rs              # CLI: serve, migrate, seed, admin, healthcheck, capture-eval
+├── lib.rs
+├── app.rs               # сборка приложения и фоновых задач
 ├── config/              # env, валидация, секреты
 │   ├── mod.rs
 │   └── env_source.rs
 ├── http/
-│   ├── router.rs        # /api/v1, /webhooks, /health
+│   ├── router.rs        # /api/v1, /webhooks, /health, /metrics
 │   ├── server.rs        # запуск axum и graceful shutdown
-│   ├── middleware.rs    # request_id, auth, rate limit, body limit
-│   └── error.rs         # единый формат ошибок
+│   ├── middleware.rs    # request_id и журналирование
+│   ├── error.rs         # единый формат ошибок
+│   ├── health.rs        # live/readiness
+│   ├── metrics.rs       # Prometheus exposition
+│   └── api/             # household, lists, items, capture(s), search,
+│                        # calendar, snapshot, dto
 ├── auth/
 │   ├── tokens.rs        # API-токены: выпуск, отзыв, scopes, хеширование
 │   ├── secrets.rs       # случайные секреты (токены, коды приглашений)
@@ -251,36 +269,48 @@ src/
 │   ├── api.rs           # trait TelegramApi + HTTP-клиент
 │   ├── rich.rs          # RichMessage DTO и рендерер
 │   ├── webhook.rs       # приём и постановка в очередь
+│   ├── queue.rs         # очередь telegram_updates
 │   ├── worker.rs        # обработка updates
+│   ├── capture_worker.rs # очередь разбора текста
 │   ├── callbacks.rs     # токены и маршрутизация
-│   ├── views.rs         # экраны и состояние
-│   └── outbox.rs        # исходящие сообщения
+│   ├── views.rs         # экраны, формы и состояние чата
+│   ├── outbox.rs        # исходящие сообщения и удаление
+│   ├── runtime.rs       # запуск режимов webhook/polling/disabled
+│   └── bot/             # экраны, формы, онбординг, уведомления
 ├── domain/
-│   ├── household.rs
-│   ├── lists.rs
-│   ├── items.rs
-│   ├── recurrence.rs
-│   ├── tags.rs
-│   ├── events.rs
-│   └── search.rs
+│   ├── models.rs        # типы домена и перечисления
+│   ├── identity.rs      # приглашения, аудит, уведомления о составе
+│   ├── first_contact.rs # классификатор первого контакта
+│   ├── recurrence.rs    # движок повторений
+│   ├── calendar.rs      # развёртка календаря
+│   ├── search.rs        # фильтры и курсор поиска
+│   ├── settings.rs      # профиль и настройки уведомлений
+│   └── validation.rs    # доменная валидация полей
 ├── capture/
-│   ├── service.rs       # оркестрация разбора
+│   ├── draft.rs         # черновики и применение capture
 │   ├── schema.rs        # JSON schema
 │   ├── prompt.rs        # версионированный промпт
-│   └── validation.rs    # доменная валидация
+│   ├── validate.rs      # доменная валидация
+│   ├── llm.rs           # вызов AI Task и классификация ошибок
+│   ├── context.rs       # контекст household для разбора
+│   └── breaker.rs       # предохранитель вызовов LLM
 ├── home_assistant/
-│   ├── client.rs        # REST + ai_task
-│   └── models.rs
+│   └── mod.rs           # REST + ai_task
 ├── storage/
-│   ├── repositories/
+│   ├── repositories/    # sqlx-репозитории
 │   ├── migrations.rs
-│   └── queue.rs
+│   ├── db.rs
+│   └── seed.rs
 ├── jobs/
-│   ├── scheduler.rs
-│   ├── retention.rs
-│   └── purge.rs
+│   ├── scheduler.rs     # тик 30 с
+│   ├── delivery.rs      # доставка уведомлений
+│   ├── digest.rs        # утренняя сводка
+│   ├── batch.rs         # сводное сообщение отложенных
+│   ├── assignment.rs    # уведомления о назначении
+│   ├── quiet.rs         # тихие часы
+│   └── retention.rs     # retention и purge
 └── admin/
-    └── cli.rs
+    └── mod.rs           # операции CLI
 ```
 
 Границы модулей:
@@ -290,7 +320,8 @@ src/
   элементами.
 - `telegram` зависит от `domain` и `capture`, но не наоборот.
 - `capture` зависит от `home_assistant` и `domain`.
-- `storage` реализует порты, определённые доменом.
+- `storage` — конкретные sqlx-репозитории и миграции, без trait-портов;
+  домен не зависит от Telegram и Home Assistant.
 
 ## 5. Согласованность и идемпотентность
 
@@ -303,7 +334,7 @@ src/
 | Повтор напоминания | Уникальный `notification_deliveries`. |
 | Повтор отправки | `outbox.message_id`, идемпотентный edit. |
 | Конфликт редактирования | `version` + `409`. |
-| Удаление | Soft delete, идемпотентное восстановление. |
+| Удаление | Soft delete; отмена удаления через undo в течение 10 минут. Отдельного restore нет, через 30 дней retention удаляет запись физически. |
 
 Транзакции обязательны для:
 
@@ -334,7 +365,8 @@ src/
 
 ## 7. API
 
-Базовый путь: `/api/v1` (health-эндпоинты — вне него). Аутентификация —
+Базовый путь: `/api/v1` (health-эндпоинты и `/metrics` — вне него).
+Аутентификация —
 `Authorization: Bearer <token>`. Все ответы — JSON; время — RFC 3339;
 идентификаторы — UUID.
 
@@ -437,7 +469,7 @@ custom_components/tasklerq/
 ├── todo.py              # TodoListEntity per list
 ├── calendar.py          # CalendarEntity
 ├── diagnostics.py       # redacted dump
-├── services.py          # capture / confirm / cancel / undo_last_capture
+├── services.py          # capture / confirm_capture / cancel_capture / undo_last_capture
 ├── services.yaml        # описания полей сервисов
 ├── const.py
 ├── strings.json
@@ -476,8 +508,9 @@ Telegram ──443──▶ Synology Reverse Proxy ──▶ 127.0.0.1:18080 tas
 - HA работает в `network_mode: host`; HA → Tasklerq:
   `http://127.0.0.1:18080`, Tasklerq → HA:
   `http://host.docker.internal:8123` (или `http://192.168.10.110:8123`).
-- PostgreSQL — контейнер `postgres:18-alpine` в сети `shared-db`; Tasklerq не
-  управляет сервером БД.
+- PostgreSQL — контейнер `postgres:18-alpine`; в dev compose он публикует
+  `127.0.0.1:15433`, на NAS живёт в сети `shared-db`. Tasklerq не управляет
+  сервером БД.
 - TLS завершается Synology Reverse Proxy; webhook доступен только по HTTPS.
 - Секреты — env-file 0600 или Docker secrets.
 - Миграции — при старте под advisory lock или отдельной командой.
@@ -491,7 +524,7 @@ Telegram ──443──▶ Synology Reverse Proxy ──▶ 127.0.0.1:18080 tas
 | --- | --- |
 | Webhook | Секрет, constant-time, 401, лимит тела 1 МБ. |
 | API | Bearer-токены, SHA-256 хеш, scopes, revoke. |
-| Capture API | `capture:write`, лимит тела/текста, rate limit, `Idempotency-Key`. |
+| Capture API | `capture:write`, тело 16 КБ, текст до 2000 символов, rate limit, `Idempotency-Key`. |
 | Tenant | `household_id` во всех запросах, 404 для чужих. |
 | Callback | Одноразовые токены, привязка к user, TTL. |
 | Ввод | Валидация, экранирование HTML, параметризованный SQL. |
@@ -522,7 +555,7 @@ Telegram ──443──▶ Synology Reverse Proxy ──▶ 127.0.0.1:18080 tas
 | Integration | PostgreSQL через testcontainers, транзакции, очередь, миграции. |
 | Contract | Mock Telegram и mock HA, схема `ai_task.generate_data`. |
 | Python | Config flow, todo, calendar, diagnostics, конфликты. |
-| E2E | Docker compose + fake Telegram + fake HA. |
+| E2E | Fake Telegram и fake HA в интеграционных тестах; staging-приёмка. |
 | LLM eval | ≥30 фраз, точность извлечения ≥90%. |
 | Load | 10 пользователей, 10 000 задач, 50 webhook/с. |
 
@@ -537,7 +570,7 @@ Telegram ──443──▶ Synology Reverse Proxy ──▶ 127.0.0.1:18080 tas
 | 5 | LLM только разбор | LLM с инструментами | Безопасность, контроль, подтверждение. |
 | 6 | HA custom component | MQTT, CalDAV, AppDaemon | Нативные `todo`/`calendar`, HA Container. |
 | 7 | Polling HA 60 с | Webhook в HA, websocket | Простота, надёжность, достаточная задержка. |
-| 8 | Один household | Мультитенантность | Семейный сценарий, простая авторизация. |
+| 8 | Один household по умолчанию (`TENANCY_MODE=single`), `multi` как опция | Мультитенантность по умолчанию | Семейный сценарий, простая авторизация. |
 | 9 | Единые `items` | Отдельные tasks/shopping | Общие операции, поиск, события, HA. |
 | 10 | UUIDv7 | UUIDv4, bigserial | Сортировка по времени, безопасность в URL. |
 
@@ -560,4 +593,5 @@ Proxy, домен `tasklerq.stellalupus.ru`, бот `@tasklerqbot`, часово
 
 Осталось уточнить:
 
-- бюджет LLM при квоте 200 разборов в сутки (модель AI Task выбирается в HA).
+- бюджет LLM при квоте 200 разборов в сутки (AI Task настроен на Claude Haiku
+  5.5 через OpenRouter, сущность задаётся в HA).

@@ -117,6 +117,7 @@ pub async fn start_create(
             error: None,
             duplicate: None,
             target: None,
+            quick: false,
         }),
     )
     .await
@@ -158,6 +159,7 @@ pub async fn quick_add(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
             error: None,
             duplicate: None,
             target: None,
+            quick: true,
         }),
     )
     .await

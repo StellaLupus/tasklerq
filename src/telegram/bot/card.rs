@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use chrono::Datelike;
 use uuid::Uuid;
 
+use crate::domain::error::DomainError;
 use crate::domain::models::{
     Item, ItemPriority, ItemStatus, List, ListKind, MonthRule, Recurrence, RecurrenceFreq,
 };
@@ -289,6 +290,34 @@ pub async fn completed(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Resul
     ]))
 }
 
+/// Результат удаления с кнопкой отмены.
+pub async fn deleted(
+    item_id: Uuid,
+    title: &str,
+    shopping: bool,
+    back: &Screen,
+) -> Result<Ui, Fail> {
+    Ok(Ui::new()
+        .heading(format!("🗑 Удалено: {}", clip(title, 80)))
+        .row(vec![
+            button(
+                "↩️ Отменить",
+                Action::DeleteUndo {
+                    item_id,
+                    back: back.clone(),
+                },
+            ),
+            back_button(
+                if shopping {
+                    "🛒 К списку"
+                } else {
+                    "📋 К списку"
+                },
+                back.clone(),
+            ),
+        ]))
+}
+
 /// Подтверждение удаления.
 pub async fn confirm_delete(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui, Fail> {
     let (item, _) = load(ctx, item_id).await?;
@@ -391,7 +420,60 @@ pub async fn delete_do(ctx: &mut Ctx<'_>, item_id: Uuid, back: Screen) -> Result
     let household_id = ctx.household()?.id;
     let actor = ctx.actor()?;
     let item = items::soft_delete(&mut *ctx.conn, household_id, &actor, item_id, ctx.now).await?;
-    ctx.toast(format!("Удалено: {}", clip(&item.title, 60)));
+    let list = lists::get(&mut *ctx.conn, household_id, item.list_id).await?;
+    ctx.present(Screen::Deleted {
+        item_id: item.id,
+        title: item.title.clone(),
+        shopping: list.kind != ListKind::Tasks,
+        back: Box::new(back),
+    })
+    .await
+}
+
+/// Итог отмены удаления одного элемента.
+pub enum UndoOutcome {
+    /// Удаление отменено; элемент возвращён (его название).
+    Restored(String),
+    /// Окно отмены истекло.
+    Expired,
+    /// Отменять нечего: действия нет или элемент уже вернули.
+    Nothing,
+}
+
+/// Отменить удаление одного элемента, только если он всё ещё удалён.
+///
+/// Кнопка со старого экрана не должна откатывать другое действие: удаление —
+/// только один из видов событий, которые умеет отменять `undo_last`.
+pub async fn undo_deleted(ctx: &mut Ctx<'_>, item_id: Uuid) -> Result<UndoOutcome, Fail> {
+    let household_id = ctx.household()?.id;
+    let actor = ctx.actor()?;
+    match items::is_deleted(&mut *ctx.conn, household_id, item_id).await {
+        Ok(true) => {}
+        Ok(false) | Err(DomainError::NotFound) => return Ok(UndoOutcome::Nothing),
+        Err(error) => return Err(error.into()),
+    }
+    match items::undo_last(&mut *ctx.conn, household_id, &actor, item_id, ctx.now).await {
+        Ok(item) => Ok(UndoOutcome::Restored(item.title)),
+        // Истёкшее окно — единственный конфликт с машиночитаемой причиной.
+        Err(DomainError::Conflict { details, .. })
+            if details.get("reason").and_then(|value| value.as_str())
+                == Some(items::UNDO_WINDOW_EXPIRED) =>
+        {
+            Ok(UndoOutcome::Expired)
+        }
+        // «Нечего отменять»: действия нет или элемент уже вернули.
+        Err(DomainError::Conflict { .. } | DomainError::NotFound) => Ok(UndoOutcome::Nothing),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Отменить удаление и вернуться к списку.
+pub async fn delete_undo(ctx: &mut Ctx<'_>, item_id: Uuid, back: Screen) -> Result<(), Fail> {
+    match undo_deleted(ctx, item_id).await? {
+        UndoOutcome::Restored(title) => ctx.toast(format!("Возвращено: {}", clip(&title, 60))),
+        UndoOutcome::Expired => ctx.toast("Время отмены истекло"),
+        UndoOutcome::Nothing => ctx.toast("Нечего отменять"),
+    }
     ctx.present(back).await
 }
 
