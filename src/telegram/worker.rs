@@ -21,7 +21,9 @@ use crate::security_audit::{Audit, LimitKey, RateLimitEvent};
 
 use super::api::TelegramApi;
 use super::bot::{Answer, Bot, Outcome};
+use super::outbox::{self, Outgoing};
 use super::queue::{self, Failure};
+use super::ru;
 use super::update::{self, Classified, Incoming};
 use super::views;
 
@@ -242,6 +244,30 @@ impl UpdateWorker {
         if let Err(error) = tx.rollback().await {
             tracing::warn!(update_id = job.update_id, %error, "rollback failed");
         }
+        // Чат и callback берутся из payload до `record_failure`: при переходе в
+        // dead он затирается.
+        let failed =
+            update::parse(&job.payload)
+                .ok()
+                .and_then(|parsed| match update::classify(&parsed) {
+                    Classified::Handle(incoming) => Some(incoming),
+                    Classified::Ignore => None,
+                });
+        // Нажатие кнопки получает пустой ответ и при сбое, чтобы погасить
+        // «часики». Отвечаем только на первой неудачной попытке: повторный
+        // ответ Telegram отклонит.
+        if job.attempts == 0
+            && let Some(Incoming::Callback { query_id, .. }) = &failed
+        {
+            self.answer(Outcome {
+                answer: Some(Answer {
+                    query_id: query_id.clone(),
+                    text: None,
+                    alert: false,
+                }),
+            })
+            .await;
+        }
         let mut conn = self.pool.acquire().await?;
         let failure =
             queue::record_failure(&mut conn, job.update_id, error_code, self.max_attempts, now)
@@ -252,6 +278,11 @@ impl UpdateWorker {
                 metric = "telegram_updates_dead",
                 "telegram update moved to the dead-letter queue"
             );
+            // Уведомление — после записи dead: сбой постановки сообщения не
+            // должен отменять dead-letter. `dedupe_key` с `update_id` не даёт
+            // задвоить сообщение, если обновление обработают снова.
+            self.notify_dead(&mut conn, job.update_id, failed.as_ref(), now)
+                .await;
         }
         let status = match failure {
             Failure::Dead => "dead",
@@ -345,6 +376,38 @@ impl UpdateWorker {
             .await
         {
             tracing::debug!(error = error.code(), "answerCallbackQuery failed");
+        }
+    }
+
+    /// Поставить в outbox одно нейтральное сообщение о неудачной обработке.
+    ///
+    /// Вызывается только для `dead` и на том же соединении, где записан исход:
+    /// ошибка постановки не должна отменять dead-letter и ронять цикл воркера.
+    /// Без чата в payload (группа, неразбираемое обновление) сообщения нет.
+    async fn notify_dead(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        update_id: i64,
+        incoming: Option<&Incoming>,
+        now: DateTime<Utc>,
+    ) {
+        let chat_id = match incoming {
+            Some(Incoming::Text { chat_id, .. } | Incoming::Callback { chat_id, .. }) => *chat_id,
+            None => return,
+        };
+        let outgoing = Outgoing::Message {
+            html: ru::INTERNAL_ERROR.to_owned(),
+            rich: false,
+            delete_after: None,
+        };
+        let dedupe_key = format!("dead-update:{chat_id}:{update_id}");
+        match outbox::enqueue(conn, chat_id, &outgoing, Some(&dedupe_key), now).await {
+            Ok(_) => self.wake_outbox.notify_one(),
+            Err(error) => tracing::warn!(
+                update_id,
+                %error,
+                "failed to enqueue notice for dead-letter update"
+            ),
         }
     }
 

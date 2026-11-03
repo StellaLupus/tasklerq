@@ -120,6 +120,19 @@ async fn marker_count(pool: &sqlx::PgPool, marker: &str) -> i64 {
         .expect("count")
 }
 
+/// Сообщения (не экраны), поставленные в outbox для чата.
+async fn outbox_messages(pool: &sqlx::PgPool, chat: i64) -> Vec<Value> {
+    sqlx::query_scalar(
+        "SELECT payload FROM outbox
+         WHERE chat_id = $1 AND kind = 'message'
+         ORDER BY seq",
+    )
+    .bind(chat)
+    .fetch_all(pool)
+    .await
+    .expect("outbox messages")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn duplicate_update_id_is_stored_and_applied_once() {
     let db = db().await;
@@ -439,6 +452,264 @@ async fn panicking_handler_counts_as_failed_attempt_and_ends_in_dead_letter() {
         !payload.contains("секретный текст"),
         "dead update must not keep user text: {payload}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dead_letter_sends_one_neutral_message_after_exhausted_attempts() {
+    let db = db().await;
+    ensure_household(&db.pool).await;
+    let chat = next_telegram_id();
+    let worker = worker(
+        &db.pool,
+        chat,
+        Arc::new(Flaky {
+            failures_left: AtomicU32::new(100),
+            marker: format!("notice-{chat}"),
+        }),
+        3,
+    );
+    let mut bot = Harness::new(&db.pool, chat);
+    let update = bot.text_update("Ann", "секретный текст");
+    let mut now = Utc::now();
+    enqueue_at(&db.pool, &update, now).await;
+
+    // Повторы пользователю ничего не шлют: сообщение только после dead.
+    for _ in 0..2 {
+        let Pass::Failed(Failure::Retry(at)) = worker.run_once(now).await.expect("pass") else {
+            panic!("retry expected");
+        };
+        now = at;
+        assert!(
+            outbox_messages(&db.pool, chat).await.is_empty(),
+            "a retry must not notify the user"
+        );
+    }
+
+    assert_eq!(
+        worker.run_once(now).await.expect("pass"),
+        Pass::Failed(Failure::Dead)
+    );
+    let messages = outbox_messages(&db.pool, chat).await;
+    assert_eq!(
+        messages.len(),
+        1,
+        "a dead update must notify the user exactly once"
+    );
+    assert_eq!(
+        messages[0]["html"],
+        "Не получилось выполнить действие. Попробуйте ещё раз чуть позже."
+    );
+    assert_eq!(
+        messages[0]["rich"], false,
+        "the notice must not be a screen"
+    );
+    assert!(
+        !messages[0].to_string().contains("секретный текст"),
+        "the notice must not repeat user text"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn panicking_handler_also_notifies_user_after_dead_letter() {
+    let db = db().await;
+    ensure_household(&db.pool).await;
+    let chat = next_telegram_id();
+    let worker = worker(
+        &db.pool,
+        chat,
+        Arc::new(Panicking {
+            marker: format!("panic-notice-{chat}"),
+        }),
+        2,
+    );
+    let mut bot = Harness::new(&db.pool, chat);
+    let update = bot.text_update("Ann", "привет");
+    let mut now = Utc::now();
+    enqueue_at(&db.pool, &update, now).await;
+
+    let Pass::Failed(Failure::Retry(at)) = worker.run_once(now).await.expect("pass") else {
+        panic!("retry expected");
+    };
+    now = at;
+    assert!(outbox_messages(&db.pool, chat).await.is_empty());
+
+    assert_eq!(
+        worker.run_once(now).await.expect("pass"),
+        Pass::Failed(Failure::Dead)
+    );
+    let messages = outbox_messages(&db.pool, chat).await;
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0]["html"],
+        "Не получилось выполнить действие. Попробуйте ещё раз чуть позже."
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_dead_processing_does_not_send_a_second_message() {
+    let db = db().await;
+    ensure_household(&db.pool).await;
+    let chat = next_telegram_id();
+    let worker = worker(
+        &db.pool,
+        chat,
+        Arc::new(Flaky {
+            failures_left: AtomicU32::new(100),
+            marker: format!("dedupe-{chat}"),
+        }),
+        2,
+    );
+    let mut bot = Harness::new(&db.pool, chat);
+    let update = bot.text_update("Ann", "привет");
+    let id = update["update_id"].as_i64().expect("id");
+    let mut now = Utc::now();
+    enqueue_at(&db.pool, &update, now).await;
+
+    let Pass::Failed(Failure::Retry(at)) = worker.run_once(now).await.expect("pass") else {
+        panic!("retry expected");
+    };
+    now = at;
+    assert_eq!(
+        worker.run_once(now).await.expect("pass"),
+        Pass::Failed(Failure::Dead)
+    );
+    assert_eq!(outbox_messages(&db.pool, chat).await.len(), 1);
+
+    // Обновление доставлено повторно после сбоя: та же попытка снова уходит в
+    // dead-letter, но `dedupe_key` не даёт поставить второе сообщение.
+    sqlx::query(
+        "UPDATE telegram_updates
+         SET status = 'pending', attempts = 1, payload = $2, available_at = $3
+         WHERE update_id = $1",
+    )
+    .bind(id)
+    .bind(&update)
+    .bind(now + Duration::seconds(1))
+    .execute(&db.pool)
+    .await
+    .expect("restore update");
+
+    assert_eq!(
+        worker
+            .run_once(now + Duration::seconds(1))
+            .await
+            .expect("pass"),
+        Pass::Failed(Failure::Dead)
+    );
+    assert_eq!(
+        outbox_messages(&db.pool, chat).await.len(),
+        1,
+        "a repeated dead update must not duplicate the notice"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_callback_attempt_is_answered_without_text() {
+    let db = db().await;
+    ensure_household(&db.pool).await;
+    let chat = next_telegram_id();
+    let fake = FakeTelegram::new();
+    let worker = UpdateWorker::new(
+        db.pool.clone(),
+        Arc::new(Flaky {
+            failures_left: AtomicU32::new(100),
+            marker: format!("callback-{chat}"),
+        }),
+        fake.clone(),
+        10,
+        Arc::new(Notify::new()),
+        Audit::new(db.pool.clone()),
+    )
+    .only_chat(chat);
+    let mut bot = Harness::new(&db.pool, chat);
+    let update = bot.callback_update("Ann", "t:AAAAAAAAAAAAAAAA", 1);
+    let query_id = update["callback_query"]["id"]
+        .as_str()
+        .expect("query id")
+        .to_owned();
+    let now = Utc::now();
+    enqueue_at(&db.pool, &update, now).await;
+
+    let Pass::Failed(Failure::Retry(at)) = worker.run_once(now).await.expect("pass") else {
+        panic!("retry expected");
+    };
+    assert_eq!(
+        fake.answers(),
+        vec![(query_id.clone(), None, false)],
+        "a failed callback must be answered without text or alert"
+    );
+
+    // Повторная неудачная попытка уже не отвечает: Telegram отклонил бы ответ.
+    assert!(matches!(
+        worker.run_once(at).await.expect("pass"),
+        Pass::Failed(Failure::Retry(_))
+    ));
+    assert_eq!(answers_for(&fake, &query_id), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dead_letter_without_chat_or_with_malformed_payload_sends_no_message() {
+    let db = support::isolated_db().await;
+    let chat = next_telegram_id();
+    let now = Utc::now();
+    let worker = UpdateWorker::new(
+        db.pool.clone(),
+        Arc::new(Flaky {
+            failures_left: AtomicU32::new(100),
+            marker: format!("no-chat-{chat}"),
+        }),
+        FakeTelegram::new(),
+        1,
+        Arc::new(Notify::new()),
+        Audit::new(db.pool.clone()),
+    );
+
+    // Нажатие без сообщения: в payload нет чата.
+    let mut bot = Harness::new(&db.pool, chat);
+    let mut callback = bot.callback_update("Ann", "t:AAAAAAAAAAAAAAAA", 1);
+    callback["callback_query"]
+        .as_object_mut()
+        .expect("callback object")
+        .remove("message");
+    let callback_id = callback["update_id"].as_i64().expect("id");
+    let mut conn = db.pool.acquire().await.expect("conn");
+    queue::enqueue(&mut conn, callback_id, &callback, now)
+        .await
+        .expect("enqueue");
+    assert_eq!(
+        worker.run_once(now).await.expect("pass"),
+        Pass::Failed(Failure::Dead)
+    );
+
+    // Неразбираемое обновление: чат из него не извлечь.
+    let malformed = serde_json::json!({
+        "update_id": next_telegram_id(),
+        "message": "not an update",
+    });
+    let malformed_id = malformed["update_id"].as_i64().expect("id");
+    let mut conn = db.pool.acquire().await.expect("conn");
+    queue::enqueue(&mut conn, malformed_id, &malformed, now)
+        .await
+        .expect("enqueue");
+    assert_eq!(
+        worker.run_once(now).await.expect("pass"),
+        Pass::Failed(Failure::Dead)
+    );
+
+    let messages: i64 = sqlx::query_scalar("SELECT count(*) FROM outbox WHERE chat_id = $1")
+        .bind(chat)
+        .fetch_one(&db.pool)
+        .await
+        .expect("outbox count");
+    assert_eq!(
+        messages, 0,
+        "an update without a chat cannot be answered with a notice"
+    );
+    let all: i64 = sqlx::query_scalar("SELECT count(*) FROM outbox")
+        .fetch_one(&db.pool)
+        .await
+        .expect("outbox count");
+    assert_eq!(all, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

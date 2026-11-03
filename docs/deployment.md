@@ -1159,6 +1159,8 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
      цикла воркера;
    - `telegram update moved to the dead-letter queue` — исчерпаны
      `QUEUE_MAX_ATTEMPTS`, рядом поле `metric="telegram_updates_dead"`;
+     пользователю уже отправлено нейтральное сообщение, а нажатие кнопки
+     получило пустой ответ;
    - `outbox pass failed`, `outbox message moved to the dead-letter queue` —
      ошибки доставки исходящих;
    - `webhook: database unavailable`, `database operation failed`,
@@ -1179,7 +1181,7 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
    `failed`, `deferred`, `dropped` — исходы в метрике `telegram_updates_total`,
    а не статусы строки. У `processed` и `dead` поле `payload` затёрто
    (`{"redacted": true}`), поэтому `dead` нельзя перепроиграть вручную:
-   пользователь повторяет действие в боте.
+   пользователь уже получил нейтральное сообщение и повторяет действие в боте.
 5. Если Telegram отвечает `429` на исходящие сообщения, outbox ставит
    `next_attempt_at`, `last_error='retry_after'` и не расходует попытку —
    просто дождитесь. `429` на webhook — это лимит 120 запросов/с с IP
