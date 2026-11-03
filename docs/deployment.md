@@ -322,7 +322,7 @@ curl -sS -X POST \
 | `RETENTION_OUTBOX_DAYS` | нет | `30` | Завершённый outbox (`sent`, `skipped`, `dead`) и завершённые записи `notification_deliveries` (`sent`, `cancelled`); `pending` не удаляются. |
 | `RETENTION_AUDIT_DAYS` | нет | `365` | События членства и безопасности, а также использованные, отозванные и истёкшие приглашения. Не меньше 90: столько дней показывает «Журнал». |
 | `RUST_LOG` | нет | `info,tasklerq=debug` | Логи. |
-| `TZ` | нет | `UTC` | Часовой пояс логов. |
+| `TZ` | нет | `UTC` | Часовой пояс контейнера; журналы сервиса пишутся в UTC. |
 
 `CAPTURE_MAX_TEXT_CHARS` принимает значения от 100 до 2000. В старых
 конфигурациях могли остаться значения 2001–16000: теперь они не проходят
@@ -910,14 +910,14 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 | Webhook | Отказ аутентификации пишется в `audit_events` без секрета | `tests/security_audit.rs::a_webhook_without_the_secret_header_is_audited_as_missing_secret`; `no_secret_or_user_content_reaches_audit_payloads` | пройдено |
 | Webhook | Повторная доставка `update_id` идемпотентна | `tests/telegram_webhook.rs::duplicate_update_id_is_stored_once`; `tests/telegram_queue.rs::duplicate_update_id_is_stored_and_applied_once` | пройдено |
 | Webhook | Обновления групп, супергрупп и каналов не сохраняются | `tests/telegram_webhook.rs::group_updates_are_acknowledged_but_not_stored` | пройдено |
-| Callback | Токен непредсказуем, не длиннее 64 байт, в базе только хеш | `tests/telegram_callbacks.rs::token_fits_telegram_limit`; `token_is_stored_only_as_hash`; `src/telegram/callbacks.rs::generate`, `src/auth/secrets.rs::random_base64url` (getrandom) | пройдено |
+| Callback | Токен непредсказуем, не длиннее 64 байт, в базе только хеш | `src/telegram/callbacks.rs::token_fits_telegram_limit`; `tests/telegram_callbacks.rs::token_is_stored_only_as_hash`; `src/telegram/callbacks.rs::generate`, `src/auth/secrets.rs::random_base64url` (getrandom) | пройдено |
 | Callback | Срок жизни не больше 24 часов, истёкший токен отклоняется | `tests/telegram_callbacks.rs::lifetime_cannot_exceed_24_hours`; `expired_and_unknown_tokens_are_refused` | пройдено |
 | Callback | Токен привязан к пользователю, household, действию, payload и версии ресурса | `tests/telegram_callbacks.rs::foreign_user_cannot_use_or_burn_the_token`; `valid_token_is_consumed_once` (version); схема `callback_tokens` | пройдено |
 | Callback | Повторное нажатие не выполняет действие второй раз | `tests/telegram_callbacks.rs::valid_token_is_consumed_once`; `parallel_consumption_executes_exactly_once` | пройдено |
 | Callback | Чужой пользователь не может использовать или сжечь токен | `tests/telegram_callbacks.rs::foreign_user_cannot_use_or_burn_the_token`; `tests/telegram_screens.rs::stale_replayed_foreign_and_expired_buttons_are_handled` | пройдено |
 | Callback | Устаревший экран и истёкший токен показывают уведомление и актуальный экран | `tests/telegram_screens.rs::stale_replayed_foreign_and_expired_buttons_are_handled` | пройдено |
 | Callback | Кнопка участника, покинувшего household, устаревает даже при валидном токене | `tests/telegram_screens.rs::button_of_a_removed_member_is_stale_even_for_a_valid_token` | пройдено |
-| Callback | Действия по callback ограничены лимитом обновлений пользователя | `tests/telegram_queue.rs::the_twenty_first_callback_is_not_run_and_is_answered_with_retry_time` | пройдено |
+| Callback | Действия по callback ограничены лимитом обновлений пользователя | `tests/telegram_queue.rs::the_twenty_first_callback_is_answered_immediately_and_runs_after_the_slot_frees` | пройдено |
 | IDOR | Bearer-токен обязателен; токен в query не принимается | `tests/api.rs::authentication_and_scopes_are_enforced`; `tests/capture_api.rs::a_token_in_a_query_parameter_is_not_accepted`, `a_token_in_a_query_parameter_is_not_accepted_on_any_route`, `a_query_token_is_not_accepted_on_capture_actions_and_writes` | пройдено |
 | IDOR | Отозванный, истёкший и неизвестный токен → `401` без причины | `tests/identity_tokens.rs::revoked_and_expired_tokens_are_rejected` | пройдено |
 | IDOR | Scope проверяется на сервере: `ha:read` не пишет, `capture:write` не читает списки | `tests/api.rs::authentication_and_scopes_are_enforced`; `tests/capture_api.rs::a_token_without_capture_scope_is_forbidden_and_creates_nothing`, `a_capture_token_cannot_read_lists`, `a_capture_token_cannot_read_items` | пройдено |
@@ -1010,7 +1010,7 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 - [ ] Настроен алерт по `webhook_auth_failure_threshold_exceeded_total`
   (раздел 13); уведомление доходит до администратора.
 - [ ] `CAPTURE_API_ENABLED` соответствует политике; при `false` эндпоинты
-  capture возвращают `503`.
+  capture возвращают `404`.
 - [ ] Внешний capture требует `capture:write`; анонимный запрос — `401`.
 - [ ] Лимиты capture (`10/мин` на токен, тело 16 КБ, текст 2000) включены.
 - [ ] `Idempotency-Key` уникален; повтор не создаёт дубликаты.
@@ -1352,10 +1352,10 @@ staging у проекта нет. Период: 2026-10-31 — 2026-11-03, вр�
 | Голосовой capture через Assist без Telegram | Запросы `POST /api/v1/capture`, созданные элементы, `llm_runs` | 5 запросов с source `ha_voice` (2026-10-31 18:27 — 2026-11-01 23:00) и 1 с `ha_automation`; все `applied` в режиме `auto`, без подтверждения в Telegram. Создано 6 элементов с actor voice (2 задачи, 4 покупки). Разбор `ha_voice/auto` в среднем 3,8 с — укладывается в голосовой таймаут (см. `docs/llm-capture.md`). | пройдено |
 
 Все 8 сценариев пункта 9.3 засчитаны приёмкой. Критерии приёмки MVP
-перечислены в `docs/roadmap.md`; их отметки синхронизируются отдельным пунктом
+перечислены в `docs/roadmap.md`; их отметки синхронизированы отдельным пунктом
 (9.1). Fallback при недоступности LLM, undo и идемпотентность в объём 9.3 не
-входили и здесь не оценивались — они покрыты тестами из раздела 15.1, в том
-числе `tests/capture_fallback.rs::ha_unavailability_in_auto_creates_one_fallback_item`,
+входили и здесь не оценивались — они покрыты автотестами, в частности
+`tests/capture_fallback.rs::ha_unavailability_in_auto_creates_one_fallback_item`,
 `tests/capture_api.rs::undo_last_undoes_a_voice_fallback_capture` и
 `tests/capture_idempotency.rs::an_auto_repeat_returns_the_first_result_without_duplicates`.
 

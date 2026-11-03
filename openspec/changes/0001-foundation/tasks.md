@@ -141,7 +141,8 @@
 
 ## 9. Документация и релиз
 
-- [ ] 9.1 Синхронизировать README, `docs/architecture.md`, `docs/domain-model.md`, `docs/telegram-ux.md`, `docs/llm-capture.md`, `docs/home-assistant.md`, `docs/deployment.md`, `docs/roadmap.md` с реализацией; проверить ссылки и отсутствие противоречий.
+- [x] 9.1 Синхронизировать README, `docs/architecture.md`, `docs/domain-model.md`, `docs/telegram-ux.md`, `docs/llm-capture.md`, `docs/home-assistant.md`, `docs/deployment.md`, `docs/roadmap.md` с реализацией; проверить ссылки и отсутствие противоречий.
+  - Заметка: синхронизация шла по коду; найденные расхождения кода со спеками вынесены владельцу (восстановление удалённой задачи — только undo, спека будет поправлена; внутренняя ошибка в Telegram без сообщения; быстрая форма без выбора списка; `503` без сохранения текста при `CAPTURE_VOICE_FALLBACK_RAW=false`).
 - [ ] 9.2 Написать runbooks: webhook 401, очередь, БД недоступна, ошибка миграции, ротация токенов, HA reconnect, голосовой capture, rollback; проверить каждый шаг на staging.
 - [x] 9.3 Провести e2e-приёмку на staging: создание/завершение задачи, покупка, повторение, LLM-черновик, HA sync, напоминание, приглашение, голосовой capture через Assist без Telegram; заполнить матрицу результатов.
   - Заметка: приёмка проведена на единственной инсталляции (NAS); повторение — перенос вхождения засчитан по автотестам (решение владельца 2026-11-03); матрица — `docs/deployment.md` §19.

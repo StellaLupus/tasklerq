@@ -201,8 +201,10 @@ CHECK (recurrence_until IS NULL
 | `created_at` | `timestamptz` | NOT NULL. |
 
 Типы событий: `created`, `updated`, `completed`, `reopened`, `deleted`,
-`restored`, `assigned`, `unassigned`, `recurrence_changed`,
-`subtask_completed`, `subtask_reopened`.
+`assigned`, `unassigned`, `recurrence_changed`, `subtask_completed`,
+`subtask_reopened`; `restored` зарезервирован в enum и в runtime не
+выставляется: восстановление удалённой задачи выполняется только через undo,
+которое пишет событие с `undo_of` (для открытой задачи — `updated`).
 
 ### 3.8 `invites`
 
@@ -366,7 +368,7 @@ household, созданные через `tasklerq admin`, попадают в �
 | `recurrence_freq` | `daily`, `weekly`, `monthly`, `yearly` |
 | `month_rule` | `anchor_day`, `last_day` |
 | `actor_type` | `user`, `system`, `home_assistant`, `voice` |
-| `event_type` | `created`, `updated`, `completed`, `reopened`, `deleted`, `restored`, `assigned`, `unassigned`, `recurrence_changed`, `subtask_completed`, `subtask_reopened` |
+| `event_type` | `created`, `updated`, `completed`, `reopened`, `deleted`, `assigned`, `unassigned`, `recurrence_changed`, `subtask_completed`, `subtask_reopened`; `restored` зарезервирован |
 | `update_status` | `pending`, `processed`, `dead` |
 | `draft_status` | `pending`, `applied`, `cancelled`, `expired`; `rejected` зарезервирован |
 | `capture_source` | `telegram`, `ha_voice`, `ha_automation`, `api`, `shortcut` |
@@ -427,6 +429,9 @@ household, созданные через `tasklerq admin`, попадают в �
 Мягкое удаление сохраняет прежний статус; отмена удаления возвращает его.
 Отдельного восстановления нет: удаление отменяется только через undo в
 течение 10 минут, после 30 дней retention удаляет запись физически.
+Событие отмены ссылается на отменяемое через `undo_of`; его тип определяется
+результатом: `deleted`, если элемент после отмены удалён, `completed` или
+`reopened` при смене статуса, иначе `updated`.
 Повторяющаяся задача после завершения остаётся `open` с новым сроком, если
 следующее вхождение существует; иначе становится `done`.
 

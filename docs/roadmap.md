@@ -38,12 +38,15 @@
   (`tests/identity_households.rs::invite_lets_a_new_member_join`).
 - [x] Задача создаётся из Telegram и появляется в HA ≤60 с
   (`docs/deployment.md` §19, «HA sync»).
-- [x] Задача завершается в HA и исчезает из открытых в Telegram
-  (`docs/deployment.md` §19, «HA sync», события `completed` из HA).
+- [ ] Задача завершается в HA и исчезает из открытых в Telegram
+  (`docs/deployment.md` §19, «HA sync»: показаны только события `completed` с
+  actor `home_assistant`; «6→5» относится к направлению Telegram→HA. Отдельного
+  теста на исчезновение задачи из открытых после завершения из HA нет).
 - [x] Свободный текст разбирается в черновик; подтверждение создаёт элементы
   (`tests/telegram_capture.rs::save_all_creates_every_item_and_undo_removes_them`).
 - [x] При недоступности LLM работает ручная форма
-  (`tests/telegram_capture.rs::disabled_llm_opens_the_manual_form_without_queueing`).
+  (`tests/telegram_capture.rs::failed_parse_opens_the_manual_form_with_the_source_text`,
+  `tests/telegram_capture.rs::daily_quota_stops_parsing_and_opens_the_manual_form`).
 - [x] Голосовая команда в HA Assist создаёт задачу или покупку без Telegram
   (`docs/deployment.md` §19, «Голосовой capture через Assist без Telegram»).
 - [x] Голосовой capture идемпотентен: повтор не создаёт дубликаты
@@ -128,7 +131,7 @@ capture создаёт элементы без Telegram; fallback работае
 - Пример пользовательских предложений (custom sentences) + `intent_script` для
   HA Assist.
 - Snapshot, конфликты, diagnostics.
-- Установка через HACS и вручную.
+- Установка через HACS.
 
 **Выход:** задача из Telegram появляется в HA; завершение в HA отражается в
 Telegram; конфликт версий обрабатывается; голосовая команда в Assist создаёт
