@@ -4,15 +4,15 @@
 
 Фактическая среда:
 
-- **Synology NAS** `192.168.10.110` (`StellaLupus-NAS`), SSH на порту `2122`.
+- **Synology NAS** `192.168.1.10`, доступ по SSH.
 - **Home Assistant Container** `homeassistant`, `network_mode: host`, версия
   `2026.10.4`, конфиг `/volume2/docker/homeassistant`.
 - **HACS** установлен.
 - **PostgreSQL** `postgres:18-alpine`, контейнер `postgres`, сеть `shared-db`,
   host-порт `15433`.
 - **Reverse proxy** — встроенный Synology DSM Reverse Proxy.
-- **Домен** — `tasklerq.stellalupus.ru`; DNS уже указывает на NAS
-  (`94.19.88.123`).
+- **Домен** — `tasklerq.example.com`; DNS уже указывает на NAS
+  (`203.0.113.10`).
 
 ```text
                     Internet
@@ -21,15 +21,9 @@
                  ┌─────▼──────────────────┐
                  │ Synology DSM           │
                  │ Reverse Proxy          │
-                 │ tasklerq.stellalupus.ru│
+                 │ tasklerq.example.com   │
                  └─────┬──────────────────┘
                        │ 127.0.0.1:18080
-                 ┌─────▼──────────────┐
-                 │ tasklerq-edge      │
-                 │ (pingap)           │
-                 └─────┬──────────────┘
-                       │ tasklerq:8080
-                       │ через shared-db
                  ┌─────▼──────────┐        ┌──────────────┐
                  │ tasklerq       │───────▶│ PostgreSQL   │
                  │ container      │ shared │ postgres:18  │
@@ -51,13 +45,8 @@
 Принципы:
 
 - Tasklerq не управляет PostgreSQL и не устанавливает его.
-- Host-порт `18080` публикуется только на loopback и принадлежит edge
-  `tasklerq-edge` (pingap); снаружи — только 443.
-- **8080 занят Zigbee2MQTT** на хосте, поэтому edge публикуется на хосте как
-  `18080`. Внутри контейнера Tasklerq слушает порт из `BIND_ADDR` (`8080`).
-- Сеть `shared-db` нужна и для PostgreSQL, и для edge: edge ходит в
-  `tasklerq:8080` по имени контейнера. Без неё сервис недоступен снаружи, и
-  edge отвечает своей страницей `503`.
+- Host-порт `18080` публикуется только на loopback; снаружи — только 443.
+- **8080 занят Zigbee2MQTT**, поэтому Tasklerq использует `18080`.
 - HA работает в `network_mode: host`; Tasklerq — в bridge-сети и в
   `shared-db`.
 - Telegram видит публичный HTTPS webhook через Synology Reverse Proxy.
@@ -70,17 +59,11 @@
 - **Pingap** (`tasklerq-edge`) стоит между DSM и приложением:
   `127.0.0.1:18080` → `tasklerq:8080`, конфиг
   `/volume2/docker/pingap/conf/pingap.toml`, `/metrics` снаружи отдаёт `404`.
-  Edge подключён к `shared-db`: имя `tasklerq` резолвится только в этой сети.
-  Если отключить `shared-db` от контейнера `tasklerq`, edge не достучится до
-  upstream и на `18080` ответит собственной HTML-страницей
-  `503 Service Unavailable`, а не ответом Tasklerq; сам сервис при этом может
-  быть запущен. Внутри контейнера Tasklerq слушает порт из `BIND_ADDR`
-  (`8080`), поэтому проверять его нужно по `http://127.0.0.1:8080/...`, а не по
-  `18080`. Приложение дополнительно публикует прямой порт `127.0.0.1:18082`
-  для HA и администрирования.
-- **Cloudflare Worker** `tasklerq-tg.tasklerq-tg.workers.dev/telegram`
+  Приложение дополнительно публикует прямой порт `127.0.0.1:18082` для HA и
+  администрирования.
+- **Cloudflare Worker** `tasklerq-tg.example.workers.dev/telegram`
   принимает webhook Telegram и проксирует его на
-  `https://tasklerq.stellalupus.ru/webhooks/telegram`: провайдер фильтрует
+  `https://tasklerq.example.com/webhooks/telegram`: провайдер фильтрует
   диапазоны Telegram, прямой вход на NAS не работает.
 - **xray** — исходящие вызовы Bot API идут через
   `HTTPS_PROXY=http://xray:10809`
@@ -96,13 +79,13 @@
 
 | Компонент | Факт | Что нужно сделать |
 | --- | --- | --- |
-| DNS | `tasklerq.stellalupus.ru` → `94.19.88.123` | Ничего. |
-| TLS | Сертификат назначен записи reverse proxy; `https://tasklerq.stellalupus.ru/health/live` отвечает `200` (проверено 2026-11-02) | Продлевать по разделу 3.2. |
-| Reverse Proxy | `HTTPS tasklerq.stellalupus.ru:443` → `http://127.0.0.1:18080`; отвечает `200` | Ничего; при `502` проверить приложение. |
+| DNS | `tasklerq.example.com` → `203.0.113.10` | Ничего. |
+| TLS | Сертификат назначен записи reverse proxy; `https://tasklerq.example.com/health/live` отвечает `200` (проверено 2026-11-02) | Продлевать по разделу 3.2. |
+| Reverse Proxy | `HTTPS tasklerq.example.com:443` → `http://127.0.0.1:18080`; отвечает `200` | Ничего; при `502` проверить приложение. |
 | PostgreSQL | `postgres:18-alpine` (18.6), сеть `shared-db`, порт `15433`; роль `tasklerq` (не суперпользователь) и БД `tasklerq` с `pg_trgm 1.6` | Ничего. |
 | Home Assistant | `2026.10.4`, host network, HACS; интеграция установлена | Ничего; обновления по [`home-assistant.md`](home-assistant.md). |
 | AI Task | `ai_task.anthropic_claude_haiku_5_5` | Ничего; проверять при смене модели. |
-| Telegram | Бот `@tasklerqbot`, webhook зарегистрирован | Ничего; токен и секрет в `.env`. |
+| Telegram | Бот `@tasklerq_example_bot`, webhook зарегистрирован | Ничего; токен и секрет в `.env`. |
 | Tasklerq | Контейнер `tasklerq`, образ `stellalupus/tasklerq:<тег>` (на 2026-11-03 — `0.1.0`), healthy | Обновления по разделу 12. |
 
 ## 3. DNS и TLS
@@ -110,12 +93,12 @@
 DNS уже настроен. Проверка:
 
 ```bash
-dig +short tasklerq.stellalupus.ru
-# 94.19.88.123
+dig +short tasklerq.example.com
+# 203.0.113.10
 ```
 
 TLS на публичном имени валиден: `curl -fsSI
-https://tasklerq.stellalupus.ru/health/live` отвечает `200`. Сертификат
+https://tasklerq.example.com/health/live` отвечает `200`. Сертификат
 назначен записи reverse proxy; порядок продления — раздел 3.2.
 
 Если провайдер блокирует прямой доступ Telegram к серверу, перед origin ставят
@@ -126,7 +109,7 @@ https://tasklerq.stellalupus.ru/health/live` отвечает `200`. Серти�
 1. **Панель управления → Портал входа → Дополнительно → Reverse Proxy**.
 2. **Создать**:
    - Описание: `Tasklerq`.
-   - Источник: `HTTPS`, `tasklerq.stellalupus.ru`, порт `443`.
+   - Источник: `HTTPS`, `tasklerq.example.com`, порт `443`.
    - HSTS: включить.
    - Назначение: `HTTP`, `localhost`, порт `18080`.
    - HTTP/1.1: включить.
@@ -148,19 +131,17 @@ https://tasklerq.stellalupus.ru/health/live` отвечает `200`. Серти�
   пира;
 - если заголовка нет или последнее значение не является IP, берётся адрес пира.
 
-В Docker при прямой публикации Tasklerq `127.0.0.1:18080:8080` (минимальный
-вариант без edge) reverse proxy на хосте виден контейнеру как шлюз bridge-сети
-(`172.x.0.1`), поэтому приватные адреса считаются доверенными. В варианте с
-edge Tasklerq видит edge в сети `shared-db`; его адрес тоже приватный. Порт
-`18080` (и прямой `18082` в варианте с edge) публикуйте только на loopback:
-при прямом доступе из локальной сети клиент сам задаёт `X-Forwarded-For`, и
-лимит по IP теряет смысл.
+В Docker при публикации `127.0.0.1:18080:8080` reverse proxy на хосте виден
+контейнеру как шлюз bridge-сети (`172.x.0.1`), поэтому приватные адреса
+считаются доверенными. Порт `18080` публикуйте только на loopback: при прямом
+доступе из локальной сети клиент сам задаёт `X-Forwarded-For`, и лимит по IP
+теряет смысл.
 
 ### 3.2. Сертификат
 
 1. **Панель управления → Безопасность → Сертификат**.
 2. **Добавить → Добавить новый сертификат → Let's Encrypt**.
-3. Домен: `tasklerq.stellalupus.ru`.
+3. Домен: `tasklerq.example.com`.
 4. Назначить сертификат reverse proxy-записи Tasklerq.
 5. Убедиться, что порт 80 доступен снаружи для HTTP-01; если нет — использовать
    DNS-01 или импортировать сертификат вручную.
@@ -168,7 +149,7 @@ edge Tasklerq видит edge в сети `shared-db`; его адрес тож�
 Проверка:
 
 ```bash
-curl -fsSI https://tasklerq.stellalupus.ru/health/live
+curl -fsSI https://tasklerq.example.com/health/live
 ```
 
 Endpoint должен отвечать `200`; `502` означает, что недоступно приложение,
@@ -177,7 +158,7 @@ Endpoint должен отвечать `200`; `502` означает, что н�
 ### 3.3. Если reverse proxy не Synology
 
 Для полноты: подойдут Caddy, nginx или Traefik с тем же правилом
-`tasklerq.stellalupus.ru:443 → 127.0.0.1:18080`. Но в этой среде используется
+`tasklerq.example.com:443 → 127.0.0.1:18080`. Но в этой среде используется
 DSM, поэтому основной сценарий — раздел 3.1.
 
 ## 4. PostgreSQL
@@ -247,10 +228,10 @@ psql "postgres://postgres@127.0.0.1:15433/postgres"
 
 ## 5. Telegram-бот
 
-Бот уже создан: **[@tasklerqbot](https://t.me/tasklerqbot)**. Deep links для
-приглашений имеют вид `https://t.me/tasklerqbot?start=<code>`.
+Бот уже создан: **[@tasklerq_example_bot](https://t.me/tasklerq_example_bot)**. Deep links для
+приглашений имеют вид `https://t.me/tasklerq_example_bot?start=<code>`.
 
-1. **@BotFather** → `/mybots` → `@tasklerqbot` → **API Token** → получите
+1. **@BotFather** → `/mybots` → `@tasklerq_example_bot` → **API Token** → получите
    `TELEGRAM_BOT_TOKEN`.
 2. Придумайте `TELEGRAM_WEBHOOK_SECRET`:
 
@@ -263,8 +244,8 @@ openssl rand -hex 32
 ```dotenv
 TELEGRAM_BOT_TOKEN=123456:AA...
 TELEGRAM_WEBHOOK_SECRET=...
-PUBLIC_BASE_URL=https://tasklerq.stellalupus.ru
-TELEGRAM_WEBHOOK_URL=https://tasklerq.stellalupus.ru/webhooks/telegram
+PUBLIC_BASE_URL=https://tasklerq.example.com
+TELEGRAM_WEBHOOK_URL=https://tasklerq.example.com/webhooks/telegram
 TELEGRAM_MODE=webhook
 ```
 
@@ -282,7 +263,7 @@ curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo" | jq
 {
   "ok": true,
   "result": {
-    "url": "https://tasklerq.stellalupus.ru/webhooks/telegram",
+    "url": "https://tasklerq.example.com/webhooks/telegram",
     "has_custom_certificate": false,
     "pending_update_count": 0,
     "last_error_message": null
@@ -317,12 +298,12 @@ curl -sS -X POST \
 | --- | --- | --- | --- |
 | `ENV` | да | `production` | `production`/`development`; запрещает polling в prod. |
 | `BIND_ADDR` | нет | `0.0.0.0:8080` | Внутренний адрес HTTP-сервера. |
-| `PUBLIC_BASE_URL` | да | `https://tasklerq.stellalupus.ru` | Публичный URL. |
+| `PUBLIC_BASE_URL` | да | `https://tasklerq.example.com` | Публичный URL. |
 | `DATABASE_URL` | да | `postgres://tasklerq:...@postgres:5432/tasklerq?sslmode=disable` | PostgreSQL в сети `shared-db`. |
 | `DATABASE_MAX_CONNECTIONS` | нет | `10` | Размер пула. |
 | `TELEGRAM_BOT_TOKEN` | при `webhook`/`polling` | `123:AA...` | Токен бота; не нужен при `disabled`. |
 | `TELEGRAM_WEBHOOK_SECRET` | при `webhook` | `hex` | Секрет webhook. |
-| `TELEGRAM_WEBHOOK_URL` | при `webhook` | `https://tasklerq.stellalupus.ru/webhooks/telegram` | Регистрация webhook. |
+| `TELEGRAM_WEBHOOK_URL` | при `webhook` | `https://tasklerq.example.com/webhooks/telegram` | Регистрация webhook. |
 | `TELEGRAM_BOT_USERNAME` | нет | `tasklerqbot` | Имя бота без `@` для ссылок-приглашений. |
 | `TELEGRAM_API_BASE_URL` | нет | `https://api.telegram.org` | Служебный базовый адрес Bot API; вне `ENV=development` допускается только `https`. Подменяется на mock-сервер в тестах. |
 | `TELEGRAM_MODE` | нет | `webhook` | `webhook`/`polling` (dev)/`disabled` (headless). |
@@ -357,7 +338,7 @@ curl -sS -X POST \
 `HA_BASE_URL` — это адрес **Home Assistant для Tasklerq**, а не наоборот.
 Поскольку HA работает в host-режиме, из bridge-контейнера Tasklerq используйте
 `http://host.docker.internal:8123` (нужен `extra_hosts`) или
-`http://192.168.10.110:8123`.
+`http://192.168.1.10:8123`.
 
 Если Telegram не нужен, установите `TELEGRAM_MODE=disabled`; `TELEGRAM_BOT_TOKEN`
 и webhook-секрет в этом режиме не требуются. HTTP API, HA-компонент и внешний
@@ -383,7 +364,6 @@ services:
     restart: unless-stopped
     env_file: .env
     ports:
-      # минимальный вариант без edge; на проде с edge — "127.0.0.1:18082:8080"
       - "127.0.0.1:18080:8080"
     networks:
       - shared-db
@@ -413,13 +393,6 @@ networks:
   shared-db:
     external: true
 ```
-
-Compose выше — минимальный вариант без edge: Tasklerq сам публикуется на
-`127.0.0.1:18080`. В нашей инсталляции (раздел 1.1) `18080` принадлежит edge
-`tasklerq-edge` (pingap), а Tasklerq публикуется напрямую на
-`127.0.0.1:18082`; edge ходит в `tasklerq:8080` по сети `shared-db`. В варианте
-с edge HTML-страница `503 Service Unavailable` на `18080` означает, что edge
-не достучался до Tasklerq.
 
 Образ берётся из Docker Hub; `build: .` в production-compose не нужен. Для
 версии используйте тег `0.1.0` (опубликован вместе с релизом `v0.1.0`),
@@ -459,14 +432,13 @@ Compose выше — минимальный вариант без edge: Tasklerq
 
 Особенности:
 
-- Внутренний порт контейнера — `8080`; в минимальном варианте host-порт —
-  `18080`, потому что `8080` занят Zigbee2MQTT. В варианте с edge `18080`
-  занят edge, а Tasklerq публикуется на `18082`.
+- Внутренний порт контейнера — `8080`; host-порт — `18080`, потому что `8080`
+  занят Zigbee2MQTT.
 - Сеть `shared-db` уже существует; в ней работает `postgres`.
 - Сеть `ha` не нужна: HA в `network_mode: host`.
 - `extra_hosts` нужен, чтобы Tasklerq мог обращаться к HA по
   `host.docker.internal:8123`. Если Synology не поддерживает
-  `host-gateway`, используйте `http://192.168.10.110:8123` и удалите
+  `host-gateway`, используйте `http://192.168.1.10:8123` и удалите
   `extra_hosts`.
 
 Проверка:
@@ -485,9 +457,8 @@ sudo /usr/local/bin/docker compose logs -f --tail=100 tasklerq
 sudo ss -ltnp | grep -E ':18080|:8080'
 ```
 
-Ожидаемо в минимальном варианте: `18080` слушает Tasklerq на `127.0.0.1`,
-`8080` — Zigbee2MQTT на `0.0.0.0`. В варианте с edge: `18080` слушает pingap,
-`18082` — Tasklerq, `8080` — Zigbee2MQTT.
+Ожидаемо: `18080` слушает Tasklerq на `127.0.0.1`, `8080` — Zigbee2MQTT на
+`0.0.0.0`.
 
 ### Публикация образа
 
@@ -495,7 +466,7 @@ Workflow `.github/workflows/docker.yml` собирает `linux/amd64` и пуб
 `stellalupus/tasklerq` в Docker Hub. В настройках репозитория должны быть
 секреты:
 
-- `DOCKERHUB_USERNAME` — логин Docker Hub (`stellalupus`);
+- `DOCKERHUB_USERNAME` — логин Docker Hub;
 - `DOCKERHUB_TOKEN` — access token Docker Hub с правом **Read & Write**
   (не пароль от аккаунта; создаётся в **Account Settings → Security →
   New Access Token**).
@@ -672,9 +643,9 @@ HA работает в `network_mode: host`, Tasklerq — в bridge-сети:
 | Направление | Адрес | Комментарий |
 | --- | --- | --- |
 | HA → Tasklerq | `http://127.0.0.1:18080` | HA в host-режиме видит loopback NAS. |
-| Tasklerq → HA | `http://host.docker.internal:8123` | Через `extra_hosts`; альтернатива — `http://192.168.10.110:8123`. |
+| Tasklerq → HA | `http://host.docker.internal:8123` | Через `extra_hosts`; альтернатива — `http://192.168.1.10:8123`. |
 | Tasklerq → PostgreSQL | `postgres:5432` | Общая сеть `shared-db`. |
-| Telegram → Tasklerq | `https://tasklerq.stellalupus.ru` | Synology Reverse Proxy → `127.0.0.1:18080`. |
+| Telegram → Tasklerq | `https://tasklerq.example.com` | Synology Reverse Proxy → `127.0.0.1:18080`. |
 
 Если HA переедет в bridge-сеть, добавьте общую сеть `ha` и используйте
 `http://tasklerq:8080`; но текущая конфигурация — host.
@@ -912,8 +883,14 @@ curl -fsS http://127.0.0.1:18080/health/ready
 Метрики — `GET /metrics` в формате Prometheus exposition 0.0.4. Эндпоинт не
 публичный: нужен Bearer-токен со scope `metrics:read` (токен в query не
 принимается). Без токена — `401`, без scope — `403`. Токен выпускается
-командой `tasklerq admin token create` с этим scope. В нашей среде edge
-блокирует `/metrics`, поэтому скрейп идёт на `127.0.0.1:18082` (раздел 1.1).
+командой `tasklerq admin token create` с этим scope.
+
+Токен — не единственная защита: не публикуйте `/metrics` наружу. Лучше всего
+закрыть этот путь на reverse proxy перед Tasklerq: отдавать на него `404` или
+`403`, а остальные пути проксировать как обычно. Подойдёт любой reverse proxy,
+умеющий фильтровать по пути: nginx, Caddy, Traefik, pingap. Скрейп при этом идёт
+в обход proxy, на loopback-порт приложения. В нашей среде так и сделано
+(раздел 1.1).
 
 Пример скрейпа:
 
@@ -1105,12 +1082,10 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 
 ### 15.2. Чек-лист развёртывания
 
-- [ ] DNS указывает на NAS; TLS-сертификат `tasklerq.stellalupus.ru` валиден.
-- [ ] Synology Reverse Proxy направляет `tasklerq.stellalupus.ru:443` на
+- [ ] DNS указывает на NAS; TLS-сертификат `tasklerq.example.com` валиден.
+- [ ] Synology Reverse Proxy направляет `tasklerq.example.com:443` на
   `127.0.0.1:18080`.
-- [ ] `18080` (edge или Tasklerq в минимальном варианте) доступен только с
-  loopback; при наличии edge прямой `18082` тоже только с loopback; `8080`
-  остаётся за Zigbee2MQTT.
+- [ ] `18080` доступен только с loopback; `8080` остаётся за Zigbee2MQTT.
 - [ ] PostgreSQL `15433` не доступен из интернета.
 - [ ] Роль `tasklerq` не суперпользователь и имеет доступ только к базе
   Tasklerq.
@@ -1174,7 +1149,7 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 
    ```bash
    curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
-     "https://tasklerq.stellalupus.ru/webhooks/telegram"
+     "https://tasklerq.example.com/webhooks/telegram"
    # 401
    ```
 
@@ -1263,21 +1238,9 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 
 1. `sudo /usr/local/bin/docker ps --filter name=postgres`.
 2. `sudo /usr/local/bin/docker exec postgres pg_isready -U postgres`.
-3. Проверьте `DATABASE_URL`, сеть `shared-db` и пароль. `127.0.0.1:18080` —
-   это edge `tasklerq-edge` (pingap), а не сам Tasklerq: edge ходит в
-   `tasklerq:8080` по сети `shared-db`. HTML-страница
-   `503 Service Unavailable` на `18080` означает, что edge не достучался до
-   Tasklerq (нет сети `shared-db` или контейнер не запущен), а не что
-   недоступна БД. Проверка изнутри контейнера (Tasklerq слушает порт из
-   `BIND_ADDR`, по умолчанию `8080`):
-
-   ```bash
-   sudo /usr/local/bin/docker compose exec tasklerq \
-     tasklerq healthcheck --url http://127.0.0.1:8080/health/ready
-   ```
-
-4. На старте `serve` подключается к БД и применяет миграции **до** открытия
-   порта: при недоступной БД процесс завершается с
+3. Проверьте `DATABASE_URL`, сеть `shared-db` и пароль. На старте `serve`
+   подключается к БД и применяет миграции **до** открытия порта: при
+   недоступной БД процесс завершается с
    `tasklerq: database connection failed: ...`, HTTP не поднимается, а
    контейнер перезапускается (`restart: unless-stopped`). В работающем сервисе
    `/health/live` отвечает `200`, `/health/ready` — `503`
@@ -1285,10 +1248,10 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
    `Database error` (Telegram повторит доставку), API — `500`; в логах
    `readiness check failed`, `webhook: database unavailable`,
    `database operation failed`, `telegram update pass failed`.
-5. Проверьте диск и логи PostgreSQL.
-6. Если база потеряна — restore backup (раздел 11); восстановление идёт в
+4. Проверьте диск и логи PostgreSQL.
+5. Если база потеряна — restore backup (раздел 11); восстановление идёт в
    новую базу, затем переключите `DATABASE_URL`.
-7. После восстановления — `/health/ready`, проверить задачи.
+6. После восстановления — `/health/ready`, проверить задачи.
 
 ### 16.4. Ошибка миграции
 
@@ -1373,20 +1336,8 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 
 ### 16.6. HA не подключается
 
-1. Проверьте URL из контейнера HA: `http://127.0.0.1:18080` — это edge
-   `tasklerq-edge` (pingap), который ходит в `tasklerq:8080` по сети
-   `shared-db`; HA обращается к edge, а не напрямую к Tasklerq.
-2. Проверьте, что edge слушает `127.0.0.1:18080`, а Tasklerq внутри контейнера
-   — порт из `BIND_ADDR` (`8080`):
-
-   ```bash
-   sudo ss -ltnp | grep -E ':18080|:8080'
-   sudo /usr/local/bin/docker compose exec tasklerq \
-     tasklerq healthcheck --url http://127.0.0.1:8080/health/ready
-   ```
-
-   HTML-страница `503 Service Unavailable` от pingap на `18080` означает, что
-   edge не достучался до Tasklerq: проверьте сеть `shared-db` и контейнер.
+1. Проверьте URL из контейнера HA: `http://127.0.0.1:18080`.
+2. Проверьте, что Tasklerq слушает `127.0.0.1:18080`.
 3. Проверьте `/health/live` изнутри HA:
 
    ```bash
@@ -1408,7 +1359,7 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 
 1. Проверьте `HA_BASE_URL` — это адрес HA из Tasklerq.
 2. Для host-режима HA используйте `http://host.docker.internal:8123` или
-   `http://192.168.10.110:8123`.
+   `http://192.168.1.10:8123`.
 3. Проверьте `extra_hosts` в compose.
 4. Проверьте доступность HA из контейнера Tasklerq:
 
@@ -1563,26 +1514,24 @@ in the resolved migrations` (HTTP не поднимется). Поэтому о�
 
 ### 16.12. Прогон runbooks на инсталляции (2026-11-03)
 
-2026-11-03 оркестратор и владелец прошли runbooks раздела 16 на инсталляции
-(NAS) и обновили прод до `v0.1.0` по разделу 12. Код не менялся; ниже — что
-проверено и с каким результатом.
+2026-11-03 runbooks раздела 16 пройдены на инсталляции, после обновления до
+`v0.1.0` по разделу 12. Код не менялся.
 
 | Runbook | Что проверено | Результат |
 | --- | --- | --- |
-| 16.1 | `admin webhook info`; POST на `/webhooks/telegram` без секрета; `/metrics` снаружи | Webhook зарегистрирован на URL Worker, `last_error_message: none`; без секрета — `401`; `/metrics` снаружи — `404`. |
-| 16.2 | `/health/ready`; `admin queue stats`; SQL по статусам | `200`; очереди пусты; в outbox 4 `dead` (2 `bad_request` 31.10, 2 `transient` 03.11 до подключения сети `xray_default`, раздел 1.1). |
-| 16.3 | `ps`, `pg_isready`; имитация недоступности: `docker network disconnect shared-db tasklerq` | PostgreSQL healthy. При отключении `shared-db` сервис стал недоступен целиком: `127.0.0.1:18080` — это edge (pingap, upstream `tasklerq:8080` через `shared-db`), он отдаёт `503` HTML-страницей pingap, а не ответом Tasklerq; `/health/live` через `18080` не отвечает. После `docker network connect shared-db tasklerq` всё восстановилось (`healthy`, `200`). Старт без БД не проверялся. |
-| 16.4 | `_sqlx_migrations` | Версии 1–11, все `success`. Сценарий упавшей миграции на релизном образе не воспроизводим, не проверялся. |
-| 16.5 | Токен бота: `/revoke` в BotFather, новый токен в `.env`; API-токен: временный `ha:read`, запрос, отзыв, повтор | `docker compose restart` не перечитывает `.env`; после `docker compose up -d --force-recreate tasklerq` — `telegram webhook registered`, `webhook info` без ошибок. API-токен: `200`; токен в query — `401`; после отзыва — `401`; `token list` показывает `revoked`. |
-| 16.6/16.7 | Интеграция HA и сущности; `tasklerq healthcheck` к HA | `loaded`, сущности доступны; `rc=0`. Внутри контейнера сервис слушает `BIND_ADDR` (`8080`), а не `18080`: healthcheck на `127.0.0.1:18080` из контейнера даёт `Connection refused`. |
+| 16.1 | `admin webhook info`; POST на `/webhooks/telegram` без секрета; `/metrics` снаружи | Webhook без ошибок; без секрета — `401`; `/metrics` снаружи — `404`. |
+| 16.2 | `/health/ready`; `admin queue stats`; SQL по статусам | `200`; очереди пусты. |
+| 16.3 | `ps`, `pg_isready` | PostgreSQL доступен. |
+| 16.4 | `_sqlx_migrations` | Все миграции применены (`success`). |
+| 16.5 | Токен бота: `/revoke` в BotFather, новый токен в `.env`, пересоздание контейнера; API-токен: выпуск, запрос, отзыв, повтор | Webhook перерегистрирован без ошибок. API-токен: `200`; токен в query — `401`; после отзыва — `401`. |
+| 16.6/16.7 | Интеграция HA и сущности; `tasklerq healthcheck` к HA | Интеграция загружена, сущности доступны; HA отвечает. |
 | 16.8 | `llm_runs` | Последние разборы успешны. |
-| 16.9 | `tasklerq.capture` (`ha_voice`, `auto`, `hint: shopping`) → `tasklerq.undo_last_capture` → повтор undo | `applied`, позиция создана; undo `count: 1`; повтор — `count: 0`, «Отменять нечего…». Ответ сервиса HA содержит `count`, а `removed` — поле HTTP API `POST /api/v1/captures/undo-last`. |
-| 16.10 | backup → `image: pr-8` → pull → up → проверка → обратно `0.1.0` | Оба переключения `healthy`, webhook без ошибок; миграции у `pr-8` и `0.1.0` одинаковые (1–11), поэтому откат тегом прошёл. |
-| §11 | Скрипты backup/restore; первый дамп; restore drill | Скрипты установлены в `/usr/local/bin`, каталог `/volume2/backups/tasklerq` создан (`0700`); счётчики 7 таблиц совпали с продом, миграции 1–11; drill-база удалена. На момент прогона автозапуск и Hyper Backup ещё не были настроены; позже в тот же день их настроили — ежедневное задание в Планировщике заданий DSM (03:15, `root`) и Hyper Backup на отдельный том NAS, но копии вне NAS пока нет (раздел 11). |
-| §12 | Переход на `v0.1.0` | `/health/ready` → `version: 0.1.0`, ревизия `5ed034a`. |
+| 16.9 | `tasklerq.capture` → `tasklerq.undo_last_capture` → повтор undo | Позиция создана и отменена (`count: 1`); повтор — `count: 0`. |
+| 16.10 | backup → предыдущий тег → проверка → обратно `0.1.0` | Оба переключения прошли, сервис healthy, webhook без ошибок. |
+| §11 | Скрипты backup/restore; первый дамп; restore drill в новую базу | Данные восстановленной базы совпали с рабочей; drill-база удалена. |
 
-Не проверялось: старт без БД — не повторяли, чтобы не ронять прод; упавшая
-миграция — не воспроизводима на релизном образе.
+Не проверялось: старт без БД и упавшая миграция (на релизном образе не
+воспроизводится).
 
 ## 17. Локальная разработка
 
@@ -1733,7 +1682,7 @@ dead-letter пуст; во втором сценарии `processed` равно 
 ## 19. Приёмка MVP
 
 Приёмка проведена на единственной живой инсталляции — NAS
-(`https://tasklerq.stellalupus.ru`, образ `stellalupus/tasklerq:pr-8`, ревизия
+(`https://tasklerq.example.com`, образ `stellalupus/tasklerq:pr-8`, ревизия
 `53c612d`, Home Assistant с интеграцией `tasklerq`, entry «Семья»); отдельного
 staging у проекта нет. Период: 2026-10-31 — 2026-11-03, время — Europe/Moscow;
 ревизия образа указана на момент сверки.

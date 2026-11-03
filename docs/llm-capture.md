@@ -348,7 +348,7 @@ LLM_CAPTURE_ENABLED=true
 `HA_BASE_URL` — адрес HA **из контейнера Tasklerq**. HA работает в
 `network_mode: host`, Tasklerq — в bridge, поэтому используйте
 `http://host.docker.internal:8123` (с `extra_hosts`) или
-`http://192.168.10.110:8123`. `http://127.0.0.1:8123` подойдёт только если
+`http://192.168.1.10:8123`. `http://127.0.0.1:8123` подойдёт только если
 Tasklerq тоже запущен в host-режиме.
 
 ## 4. Запрос к Home Assistant

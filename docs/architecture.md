@@ -41,8 +41,8 @@ flowchart TB
         GEM[OpenRouter → Claude Haiku]
     end
 
-    subgraph Host["Synology NAS 192.168.10.110"]
-        RP[Synology Reverse Proxy<br/>tasklerq.stellalupus.ru]
+    subgraph Host["Synology NAS 192.168.1.10"]
+        RP[Synology Reverse Proxy<br/>tasklerq.example.com]
         subgraph Docker["Docker"]
             APP[Tasklerq<br/>Rust + axum]
             HA[Home Assistant Container<br/>network_mode: host]
@@ -507,7 +507,7 @@ Telegram ──443──▶ Synology Reverse Proxy ──▶ 127.0.0.1:18080 tas
   loopback (`8080` занят Zigbee2MQTT).
 - HA работает в `network_mode: host`; HA → Tasklerq:
   `http://127.0.0.1:18080`, Tasklerq → HA:
-  `http://host.docker.internal:8123` (или `http://192.168.10.110:8123`).
+  `http://host.docker.internal:8123` (или `http://192.168.1.10:8123`).
 - PostgreSQL — контейнер `postgres:18-alpine`; в dev compose он публикует
   `127.0.0.1:15433`, на NAS живёт в сети `shared-db`. Tasklerq не управляет
   сервером БД.
@@ -588,7 +588,7 @@ Telegram ──443──▶ Synology Reverse Proxy ──▶ 127.0.0.1:18080 tas
 
 Среда уже известна: Synology NAS, HA Container `2026.10.4` в
 `network_mode: host`, HACS, PostgreSQL 18 в сети `shared-db`, Synology Reverse
-Proxy, домен `tasklerq.stellalupus.ru`, бот `@tasklerqbot`, часовой пояс
+Proxy, домен `tasklerq.example.com`, бот `@tasklerq_example_bot`, часовой пояс
 `Europe/Moscow`, backup — Hyper Backup на внешний диск.
 
 Осталось уточнить:

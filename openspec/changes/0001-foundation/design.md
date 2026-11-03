@@ -591,7 +591,7 @@ UI обновился быстрее.
   не нажимал `/start`, поэтому уведомления начнутся после первого обращения.
 - Приглашение: 12 случайных байт → base64url 16 символов; в БД — хеш, TTL 72 ч,
   роль `member`, до 5 активных. Deep link
-  `https://t.me/tasklerqbot?start=<code>`.
+  `https://t.me/tasklerq_example_bot?start=<code>`.
 - Пользователь не может состоять в двух household. Это упрощает авторизацию:
   `user.household_id` — единственный tenant-ключ.
 - Роли: owner управляет household/участниками/списками; member работает с
@@ -677,7 +677,7 @@ timezone; один тик + SQL-выборка проще и устойчиве�
               │ Synology DSM     │
               │ Reverse Proxy    │
               │ tasklerq.        │
-              │ stellalupus.ru   │
+              │ example.com      │
               └────────┬─────────┘
                        │ 127.0.0.1:18080
               ┌────────▼───┐        ┌──────────────────┐
@@ -704,7 +704,7 @@ timezone; один тик + SQL-выборка проще и устойчиве�
   `8080`.
 - HA работает в `network_mode: host`. HA → Tasklerq:
   `http://127.0.0.1:18080`; Tasklerq → HA: `http://host.docker.internal:8123`
-  (через `extra_hosts`) или `http://192.168.10.110:8123`.
+  (через `extra_hosts`) или `http://192.168.1.10:8123`.
 - PostgreSQL — контейнер `postgres:18-alpine` в сети `shared-db`; Tasklerq
   подключается как `postgres:5432`.
 - Конфигурация — env; секреты — env-file 0600 или Docker secrets.
@@ -827,10 +827,10 @@ CLI export/import JSON после MVP.
 
 ## Open Questions
 
-Среда развёртывания определена: Synology NAS `192.168.10.110`, Synology
-Reverse Proxy, домен `tasklerq.stellalupus.ru`, PostgreSQL 18 в сети
+Среда развёртывания определена: Synology NAS `192.168.1.10`, Synology
+Reverse Proxy, домен `tasklerq.example.com`, PostgreSQL 18 в сети
 `shared-db`, HA Container `2026.10.4` в `network_mode: host`, HACS, AI Task
-`ai_task.google_ai_task_2`, бот `@tasklerqbot`, часовой пояс `Europe/Moscow`,
+`ai_task.google_ai_task_2`, бот `@tasklerq_example_bot`, часовой пояс `Europe/Moscow`,
 `raw_text` — 30 дней, backup — Hyper Backup на внешний диск.
 
 Не меняют архитектуру и спецификации, но нужны для финальной документации:

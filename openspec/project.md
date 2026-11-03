@@ -144,8 +144,8 @@ PostgreSQL и двустороннюю интеграцию с Home Assistant.
 
 ## Ограничения
 
-- **Целевая среда — Synology NAS `192.168.10.110`** (`StellaLupus-NAS`),
-  Docker/Container Manager, SSH-порт 2122. Развёртывание — Docker Compose.
+- **Целевая среда — Synology NAS `192.168.1.10`** ,
+  Docker/Container Manager, доступ по SSH. Развёртывание — Docker Compose.
 - **Home Assistant Container (Docker), версия `2026.10.4`.** Нет Supervisor,
   add-on и ingress; контейнер `homeassistant` работает в `network_mode: host`,
   конфиг — `/volume2/docker/homeassistant`, HACS установлен. Компонент
@@ -156,17 +156,17 @@ PostgreSQL и двустороннюю интеграцию с Home Assistant.
   SQLite и не должен управлять сервером БД; параметры подключения задаются
   через окружение.
 - **Публичный домен и TLS.** Telegram webhook требует валидный HTTPS; домен
-  `tasklerq.stellalupus.ru` указывает на NAS, TLS и маршрутизация — через
+  `tasklerq.example.com` указывает на NAS, TLS и маршрутизация — через
   Synology DSM Reverse Proxy. Host-порт Tasklerq — `127.0.0.1:18080`
   (`8080` занят Zigbee2MQTT), внутренний порт контейнера — `8080`.
 - **Google Gemini через Home Assistant.** Прямой вызов Gemini из Rust не
   планируется: LLM доступна как AI Task `ai_task.google_ai_task_2`; модель
   выбирается в HA. HA → Tasklerq: `http://127.0.0.1:18080`; Tasklerq → HA:
-  `http://host.docker.internal:8123` или `http://192.168.10.110:8123`.
+  `http://host.docker.internal:8123` или `http://192.168.1.10:8123`.
 - **Часовой пояс household — `Europe/Moscow`.** Исходный текст LLM-черновика
   (`raw_text`) хранится 30 дней; LLM-квота — 200 разборов в сутки на household.
-- **Telegram-бот — `@tasklerqbot`.** Deep links приглашений:
-  `https://t.me/tasklerqbot?start=<code>`. Бот — основной UI, но не обязательный
+- **Telegram-бот — `@tasklerq_example_bot`.** Deep links приглашений:
+  `https://t.me/tasklerq_example_bot?start=<code>`. Бот — основной UI, но не обязательный
   транспорт создания: capture из Home Assistant работает при недоступном боте.
 - **Capture без Telegram — первоклассный режим.** `POST /api/v1/capture`
   принимает текст от HA Assist, автоматизаций и других внешних клиентов;
