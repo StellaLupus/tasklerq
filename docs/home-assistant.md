@@ -120,7 +120,7 @@ URL зависит от сети:
 | HA в `network_mode: host`, Tasklerq на loopback (текущая среда) | `http://127.0.0.1:18080` |
 | HA и Tasklerq в одной bridge-сети | `http://tasklerq:8080` |
 | HA в bridge, Tasklerq на хосте | `http://host.docker.internal:18080` (нужен `extra_hosts`) |
-| Tasklerq за Synology Reverse Proxy | `https://tasklerq.stellalupus.ru` |
+| Tasklerq за Synology Reverse Proxy | `https://tasklerq.example.com` |
 
 Host-порт `18080` выбран потому, что `8080` на NAS занят Zigbee2MQTT.
 Внутренний порт контейнера Tasklerq остаётся `8080`.
@@ -335,7 +335,7 @@ LLM_CAPTURE_ENABLED=true
 
 `HA_BASE_URL` — это адрес HA **из контейнера Tasklerq**. Так как HA работает в
 `network_mode: host`, используйте `http://host.docker.internal:8123` (нужен
-`extra_hosts`) или `http://192.168.10.110:8123`.
+`extra_hosts`) или `http://192.168.1.10:8123`.
 
 5. Отправьте боту тестовую фразу и проверьте черновик.
 

@@ -4,15 +4,15 @@
 
 Фактическая среда:
 
-- **Synology NAS** `192.168.10.110` (`StellaLupus-NAS`), SSH на порту `2122`.
+- **Synology NAS** `192.168.1.10`, доступ по SSH.
 - **Home Assistant Container** `homeassistant`, `network_mode: host`, версия
   `2026.10.4`, конфиг `/volume2/docker/homeassistant`.
 - **HACS** установлен.
 - **PostgreSQL** `postgres:18-alpine`, контейнер `postgres`, сеть `shared-db`,
   host-порт `15433`.
 - **Reverse proxy** — встроенный Synology DSM Reverse Proxy.
-- **Домен** — `tasklerq.stellalupus.ru`; DNS уже указывает на NAS
-  (`94.19.88.123`).
+- **Домен** — `tasklerq.example.com`; DNS уже указывает на NAS
+  (`203.0.113.10`).
 
 ```text
                     Internet
@@ -21,7 +21,7 @@
                  ┌─────▼──────────────────┐
                  │ Synology DSM           │
                  │ Reverse Proxy          │
-                 │ tasklerq.stellalupus.ru│
+                 │ tasklerq.example.com   │
                  └─────┬──────────────────┘
                        │ 127.0.0.1:18080
                  ┌─────▼──────────┐        ┌──────────────┐
@@ -51,60 +51,41 @@
   `shared-db`.
 - Telegram видит публичный HTTPS webhook через Synology Reverse Proxy.
 
-### 1.1. Особенности нашей среды
-
-Схема выше — достаточный минимум; для другого развёртывания ничего из этого
-раздела не нужно. Здесь только обходы, которые появились в нашей сети.
-
-- **Pingap** (`tasklerq-edge`) стоит между DSM и приложением:
-  `127.0.0.1:18080` → `tasklerq:8080`, конфиг
-  `/volume2/docker/pingap/conf/pingap.toml`, `/metrics` снаружи отдаёт `404`.
-  Приложение дополнительно публикует прямой порт `127.0.0.1:18082` для HA и
-  администрирования.
-- **Cloudflare Worker** `tasklerq-tg.tasklerq-tg.workers.dev/telegram`
-  принимает webhook Telegram и проксирует его на
-  `https://tasklerq.stellalupus.ru/webhooks/telegram`: провайдер фильтрует
-  диапазоны Telegram, прямой вход на NAS не работает.
-- **xray** — исходящие вызовы Bot API идут через
-  `HTTPS_PROXY=http://172.27.0.2:10809`
-  (`NO_PROXY=localhost,127.0.0.1,host.docker.internal`); прямой доступ к
-  Telegram из этой сети тоже фильтруется.
-
 ## 2. Что уже есть
 
 | Компонент | Факт | Что нужно сделать |
 | --- | --- | --- |
-| DNS | `tasklerq.stellalupus.ru` → `94.19.88.123` | Ничего. |
-| TLS | Сертификат назначен записи reverse proxy; `https://tasklerq.stellalupus.ru/health/live` отвечает `200` (проверено 2026-11-02) | Продлевать по разделу 3.2. |
-| Reverse Proxy | `HTTPS tasklerq.stellalupus.ru:443` → `http://127.0.0.1:18080`; отвечает `200` | Ничего; при `502` проверить приложение. |
+| DNS | `tasklerq.example.com` → `203.0.113.10` | Ничего. |
+| TLS | Сертификат назначен записи reverse proxy; `https://tasklerq.example.com/health/live` отвечает `200` (проверено 2026-11-02) | Продлевать по разделу 3.2. |
+| Reverse Proxy | `HTTPS tasklerq.example.com:443` → `http://127.0.0.1:18080`; отвечает `200` | Ничего; при `502` проверить приложение. |
 | PostgreSQL | `postgres:18-alpine` (18.6), сеть `shared-db`, порт `15433`; роль `tasklerq` (не суперпользователь) и БД `tasklerq` с `pg_trgm 1.6` | Ничего. |
 | Home Assistant | `2026.10.4`, host network, HACS; интеграция установлена | Ничего; обновления по [`home-assistant.md`](home-assistant.md). |
 | AI Task | `ai_task.anthropic_claude_haiku_5_5` | Ничего; проверять при смене модели. |
-| Telegram | Бот `@tasklerqbot`, webhook зарегистрирован | Ничего; токен и секрет в `.env`. |
-| Tasklerq | Контейнер `tasklerq`, образ `stellalupus/tasklerq:<тег>` (на 2026-11-02 — `pr-7`), healthy | Обновления по разделу 12. |
+| Telegram | Бот `@tasklerq_example_bot`, webhook зарегистрирован | Ничего; токен и секрет в `.env`. |
+| Tasklerq | Контейнер `tasklerq`, образ `stellalupus/tasklerq:<тег>` (на 2026-11-03 — `0.1.0`), healthy | Обновления по разделу 12. |
 
 ## 3. DNS и TLS
 
 DNS уже настроен. Проверка:
 
 ```bash
-dig +short tasklerq.stellalupus.ru
-# 94.19.88.123
+dig +short tasklerq.example.com
+# 203.0.113.10
 ```
 
 TLS на публичном имени валиден: `curl -fsSI
-https://tasklerq.stellalupus.ru/health/live` отвечает `200`. Сертификат
+https://tasklerq.example.com/health/live` отвечает `200`. Сертификат
 назначен записи reverse proxy; порядок продления — раздел 3.2.
 
 Если провайдер блокирует прямой доступ Telegram к серверу, перед origin ставят
-промежуточный прокси — см. раздел 1.1.
+промежуточный прокси (раздел 5).
 
 ### 3.1. Reverse Proxy в Synology DSM
 
 1. **Панель управления → Портал входа → Дополнительно → Reverse Proxy**.
 2. **Создать**:
    - Описание: `Tasklerq`.
-   - Источник: `HTTPS`, `tasklerq.stellalupus.ru`, порт `443`.
+   - Источник: `HTTPS`, `tasklerq.example.com`, порт `443`.
    - HSTS: включить.
    - Назначение: `HTTP`, `localhost`, порт `18080`.
    - HTTP/1.1: включить.
@@ -136,7 +117,7 @@ https://tasklerq.stellalupus.ru/health/live` отвечает `200`. Серти�
 
 1. **Панель управления → Безопасность → Сертификат**.
 2. **Добавить → Добавить новый сертификат → Let's Encrypt**.
-3. Домен: `tasklerq.stellalupus.ru`.
+3. Домен: `tasklerq.example.com`.
 4. Назначить сертификат reverse proxy-записи Tasklerq.
 5. Убедиться, что порт 80 доступен снаружи для HTTP-01; если нет — использовать
    DNS-01 или импортировать сертификат вручную.
@@ -144,7 +125,7 @@ https://tasklerq.stellalupus.ru/health/live` отвечает `200`. Серти�
 Проверка:
 
 ```bash
-curl -fsSI https://tasklerq.stellalupus.ru/health/live
+curl -fsSI https://tasklerq.example.com/health/live
 ```
 
 Endpoint должен отвечать `200`; `502` означает, что недоступно приложение,
@@ -153,7 +134,7 @@ Endpoint должен отвечать `200`; `502` означает, что н�
 ### 3.3. Если reverse proxy не Synology
 
 Для полноты: подойдут Caddy, nginx или Traefik с тем же правилом
-`tasklerq.stellalupus.ru:443 → 127.0.0.1:18080`. Но в этой среде используется
+`tasklerq.example.com:443 → 127.0.0.1:18080`. Но в этой среде используется
 DSM, поэтому основной сценарий — раздел 3.1.
 
 ## 4. PostgreSQL
@@ -223,10 +204,10 @@ psql "postgres://postgres@127.0.0.1:15433/postgres"
 
 ## 5. Telegram-бот
 
-Бот уже создан: **[@tasklerqbot](https://t.me/tasklerqbot)**. Deep links для
-приглашений имеют вид `https://t.me/tasklerqbot?start=<code>`.
+Бот уже создан: **[@tasklerq_example_bot](https://t.me/tasklerq_example_bot)**. Deep links для
+приглашений имеют вид `https://t.me/tasklerq_example_bot?start=<code>`.
 
-1. **@BotFather** → `/mybots` → `@tasklerqbot` → **API Token** → получите
+1. **@BotFather** → `/mybots` → `@tasklerq_example_bot` → **API Token** → получите
    `TELEGRAM_BOT_TOKEN`.
 2. Придумайте `TELEGRAM_WEBHOOK_SECRET`:
 
@@ -239,14 +220,16 @@ openssl rand -hex 32
 ```dotenv
 TELEGRAM_BOT_TOKEN=123456:AA...
 TELEGRAM_WEBHOOK_SECRET=...
-PUBLIC_BASE_URL=https://tasklerq.stellalupus.ru
-TELEGRAM_WEBHOOK_URL=https://tasklerq.stellalupus.ru/webhooks/telegram
+PUBLIC_BASE_URL=https://tasklerq.example.com
+TELEGRAM_WEBHOOK_URL=https://tasklerq.example.com/webhooks/telegram
 TELEGRAM_MODE=webhook
 ```
 
-4. После запуска Tasklerq проверьте webhook:
+4. Пересоздайте Tasklerq, чтобы он прочитал `.env` (после правки `.env`
+   `restart` не помогает), затем проверьте webhook:
 
 ```bash
+sudo /usr/local/bin/docker compose up -d --force-recreate tasklerq
 curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo" | jq
 ```
 
@@ -256,7 +239,7 @@ curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo" | jq
 {
   "ok": true,
   "result": {
-    "url": "https://tasklerq.stellalupus.ru/webhooks/telegram",
+    "url": "https://tasklerq.example.com/webhooks/telegram",
     "has_custom_certificate": false,
     "pending_update_count": 0,
     "last_error_message": null
@@ -283,7 +266,7 @@ curl -sS -X POST \
 
 Если Telegram не может обратиться к серверу напрямую, перед origin ставят
 промежуточный прокси и указывают в `TELEGRAM_WEBHOOK_URL` его URL, а не
-`PUBLIC_BASE_URL`. В нашей среде это Cloudflare Worker (раздел 1.1).
+`PUBLIC_BASE_URL`.
 
 ## 6. Переменные окружения
 
@@ -291,13 +274,14 @@ curl -sS -X POST \
 | --- | --- | --- | --- |
 | `ENV` | да | `production` | `production`/`development`; запрещает polling в prod. |
 | `BIND_ADDR` | нет | `0.0.0.0:8080` | Внутренний адрес HTTP-сервера. |
-| `PUBLIC_BASE_URL` | да | `https://tasklerq.stellalupus.ru` | Публичный URL. |
+| `PUBLIC_BASE_URL` | да | `https://tasklerq.example.com` | Публичный URL. |
 | `DATABASE_URL` | да | `postgres://tasklerq:...@postgres:5432/tasklerq?sslmode=disable` | PostgreSQL в сети `shared-db`. |
 | `DATABASE_MAX_CONNECTIONS` | нет | `10` | Размер пула. |
 | `TELEGRAM_BOT_TOKEN` | при `webhook`/`polling` | `123:AA...` | Токен бота; не нужен при `disabled`. |
 | `TELEGRAM_WEBHOOK_SECRET` | при `webhook` | `hex` | Секрет webhook. |
-| `TELEGRAM_WEBHOOK_URL` | при `webhook` | `https://tasklerq.stellalupus.ru/webhooks/telegram` | Регистрация webhook. |
+| `TELEGRAM_WEBHOOK_URL` | при `webhook` | `https://tasklerq.example.com/webhooks/telegram` | Регистрация webhook. |
 | `TELEGRAM_BOT_USERNAME` | нет | `tasklerqbot` | Имя бота без `@` для ссылок-приглашений. |
+| `HTTPS_PROXY`, `NO_PROXY` | нет | — | Стандартные переменные HTTP-клиента: исходящие HTTPS-запросы (Bot API, HA) идут через указанный прокси, кроме адресов из `NO_PROXY` (например, `localhost,127.0.0.1,host.docker.internal`). Нужны, только если прямой доступ к Telegram из сети сервера закрыт; прокси должен быть достижим из сети контейнера. |
 | `TELEGRAM_API_BASE_URL` | нет | `https://api.telegram.org` | Служебный базовый адрес Bot API; вне `ENV=development` допускается только `https`. Подменяется на mock-сервер в тестах. |
 | `TELEGRAM_MODE` | нет | `webhook` | `webhook`/`polling` (dev)/`disabled` (headless). |
 | `TENANCY_MODE` | нет | `single` | `single` (по умолчанию) — один household на инсталляцию; `multi` — несколько. |
@@ -331,7 +315,7 @@ curl -sS -X POST \
 `HA_BASE_URL` — это адрес **Home Assistant для Tasklerq**, а не наоборот.
 Поскольку HA работает в host-режиме, из bridge-контейнера Tasklerq используйте
 `http://host.docker.internal:8123` (нужен `extra_hosts`) или
-`http://192.168.10.110:8123`.
+`http://192.168.1.10:8123`.
 
 Если Telegram не нужен, установите `TELEGRAM_MODE=disabled`; `TELEGRAM_BOT_TOKEN`
 и webhook-секрет в этом режиме не требуются. HTTP API, HA-компонент и внешний
@@ -387,10 +371,10 @@ networks:
     external: true
 ```
 
-Образ берётся из Docker Hub; `build: .` в production-compose не нужен.
-Тег `0.1.0` появится только после релиза `v0.1.0`; до него используйте
-`pr-<номер>` (для деплоя ветки PR), `sha-<короткий sha>` или `main` — см.
-[«Публикация образа»](#публикация-образа).
+Образ берётся из Docker Hub; `build: .` в production-compose не нужен. Для
+версии используйте тег `0.1.0` (опубликован вместе с релизом `v0.1.0`),
+`latest`, `sha-<короткий sha>` или `main`; для деплоя ветки PR —
+`pr-<номер>` — см. [«Публикация образа»](#публикация-образа).
 Теги публикует workflow
 [`.github/workflows/docker.yml`](../.github/workflows/docker.yml):
 
@@ -403,10 +387,10 @@ networks:
 | `pull_request` из форка | — | нет, только сборка |
 | `workflow_dispatch` с любой ветки | `sha-<короткий sha>` | да |
 
-`latest` указывает на последний релиз. Тег `<версия>` появляется после первого
-релиза (`v0.1.0`), до него деплой — по тегу `sha-…` из ручного запуска workflow
-или `main`. Ручной запуск `workflow_dispatch` по тегу публикует только
-`sha-<короткий sha>`, без тегов версии.
+`latest` указывает на последний релиз. Теги версии (`0.1.0`, `0.1`)
+опубликованы для `v0.1.0`; для фиксации точного коммита используйте
+`sha-<короткий sha>`. Ручной запуск `workflow_dispatch` по тегу публикует
+только `sha-<короткий sha>`, без тегов версии.
 
 Для деплоя ветки до мержа укажите в compose
 `image: stellalupus/tasklerq:pr-<номер>`: при каждом push в PR из этого
@@ -431,7 +415,7 @@ networks:
 - Сеть `ha` не нужна: HA в `network_mode: host`.
 - `extra_hosts` нужен, чтобы Tasklerq мог обращаться к HA по
   `host.docker.internal:8123`. Если Synology не поддерживает
-  `host-gateway`, используйте `http://192.168.10.110:8123` и удалите
+  `host-gateway`, используйте `http://192.168.1.10:8123` и удалите
   `extra_hosts`.
 
 Проверка:
@@ -459,7 +443,7 @@ Workflow `.github/workflows/docker.yml` собирает `linux/amd64` и пуб
 `stellalupus/tasklerq` в Docker Hub. В настройках репозитория должны быть
 секреты:
 
-- `DOCKERHUB_USERNAME` — логин Docker Hub (`stellalupus`);
+- `DOCKERHUB_USERNAME` — логин Docker Hub;
 - `DOCKERHUB_TOKEN` — access token Docker Hub с правом **Read & Write**
   (не пароль от аккаунта; создаётся в **Account Settings → Security →
   New Access Token**).
@@ -636,9 +620,9 @@ HA работает в `network_mode: host`, Tasklerq — в bridge-сети:
 | Направление | Адрес | Комментарий |
 | --- | --- | --- |
 | HA → Tasklerq | `http://127.0.0.1:18080` | HA в host-режиме видит loopback NAS. |
-| Tasklerq → HA | `http://host.docker.internal:8123` | Через `extra_hosts`; альтернатива — `http://192.168.10.110:8123`. |
+| Tasklerq → HA | `http://host.docker.internal:8123` | Через `extra_hosts`; альтернатива — `http://192.168.1.10:8123`. |
 | Tasklerq → PostgreSQL | `postgres:5432` | Общая сеть `shared-db`. |
-| Telegram → Tasklerq | `https://tasklerq.stellalupus.ru` | Synology Reverse Proxy → `127.0.0.1:18080`. |
+| Telegram → Tasklerq | `https://tasklerq.example.com` | Synology Reverse Proxy → `127.0.0.1:18080`. |
 
 Если HA переедет в bridge-сеть, добавьте общую сеть `ha` и используйте
 `http://tasklerq:8080`; но текущая конфигурация — host.
@@ -662,9 +646,22 @@ GET и завершается успешно на `2xx`.
 
 ## 11. Резервное копирование
 
-На 2026-11-02 на проде скрипты в `/usr/local/bin` ещё не установлены, каталога
-`/volume2/backups/tasklerq` и cron нет — автоматических бэкапов пока нет.
-Порядок ниже нужно выполнить до первого обновления прода.
+На 2026-11-03 скрипты установлены в `/usr/local/bin/tasklerq-backup.sh` и
+`/usr/local/bin/tasklerq-restore.sh`, каталог `/volume2/backups/tasklerq`
+создан с правами `0700`, первый дамп снят, restore drill в
+`tasklerq_restore_drill` пройден: счётчики 7 таблиц совпали с продом,
+применены миграции 1–11, drill-база удалена. Ежедневный запуск настроен в
+Планировщике заданий DSM: пользователь `root`, 03:15, уведомление при ошибке.
+Команда задания:
+
+```bash
+DOCKER=/usr/local/bin/docker /usr/local/bin/tasklerq-backup.sh >> /var/log/tasklerq-backup.log 2>&1
+```
+
+Hyper Backup настроен на отдельный том NAS (RAID на SSD): это защищает от
+отказа тома `volume2`, но не от потери NAS целиком. Копия за пределами NAS
+(внешний диск или облако) пока не настроена — это открытый пункт (раздел 20).
+Шаги установки ниже сохранены.
 
 Скрипты `scripts/backup.sh` и `scripts/restore.sh` работают так же, как
 ручные команды: через `docker exec`, потому что на проде `pg_dump` и
@@ -695,7 +692,9 @@ mkdir -p /volume2/backups/tasklerq
 `TASKLERQ_BACKUP_KEEP_DAYS`. На `INT`, `TERM` и `HUP` скрипт завершается с
 кодом 130, не переименовывая частичный дамп; `EXIT` удаляет временный файл.
 
-Cron:
+Расписание. Основной способ на Synology — **Планировщик заданий DSM**:
+задание от пользователя `root`, ежедневно в 03:15, с уведомлением при ошибке
+(команда — в начале раздела). Альтернатива — cron:
 
 ```cron
 15 3 * * * /usr/local/bin/tasklerq-backup.sh >> /var/log/tasklerq-backup.log 2>&1
@@ -703,9 +702,10 @@ Cron:
 
 Сбой backup — это ненулевой код выхода и строка в stderr; при запуске из cron
 она попадает в лог. Отдельной метрики в сервисе нет: скрипт работает вне
-процесса Tasklerq. Включите уведомление планировщика Synology:
-**Панель управления → Планировщик заданий → Настройки → Уведомлять при
-ошибке** (или настройте алерт на ненулевой код возврата cron/строку в логе).
+процесса Tasklerq. В Планировщике заданий Synology уведомление при ошибке
+включено: **Панель управления → Планировщик заданий → Настройки →
+Уведомлять при ошибке** (для cron настройте алерт на ненулевой код возврата
+или строку в логе).
 
 Восстановление всегда выполняется в **новую** базу. `restore.sh` отказывается
 работать, если база с таким именем уже существует, и не передаёт
@@ -732,10 +732,13 @@ sudo /usr/local/bin/tasklerq-restore.sh \
 5. Проверьте `/health/ready` и несколько задач.
 
 Локальные дампы хранятся 14 дней. Копии должны быть вынесены за пределы NAS:
-используется **Synology Hyper Backup на внешний диск**.
+для этого нужен **Synology Hyper Backup на внешний диск или в облако**. На
+2026-11-03 Hyper Backup настроен на отдельный том NAS (RAID на SSD): это
+защищает от отказа тома `volume2`, но не от потери NAS целиком, поэтому
+внешняя копия остаётся открытым пунктом (раздел 20).
 
 1. Hyper Backup → **Задание резервного копирования** → источник — папка
-   `/volume2/backups/tasklerq` на NAS, назначение — внешний диск.
+   `/volume2/backups/tasklerq` на NAS, назначение — внешний диск или облако.
 2. Расписание: ежедневно после `03:15`, например в `04:00`.
 3. Включить версионирование и шифрование; пароль хранить вне NAS.
 4. Проверить, что задание завершилось без ошибок, и раз в квартал выполнить
@@ -857,8 +860,13 @@ curl -fsS http://127.0.0.1:18080/health/ready
 Метрики — `GET /metrics` в формате Prometheus exposition 0.0.4. Эндпоинт не
 публичный: нужен Bearer-токен со scope `metrics:read` (токен в query не
 принимается). Без токена — `401`, без scope — `403`. Токен выпускается
-командой `tasklerq admin token create` с этим scope. В нашей среде edge
-блокирует `/metrics`, поэтому скрейп идёт на `127.0.0.1:18082` (раздел 1.1).
+командой `tasklerq admin token create` с этим scope.
+
+Токен — не единственная защита: не публикуйте `/metrics` наружу. Лучше всего
+закрыть этот путь на reverse proxy перед Tasklerq: отдавать на него `404` или
+`403`, а остальные пути проксировать как обычно. Подойдёт любой reverse proxy,
+умеющий фильтровать по пути: nginx, Caddy, Traefik, pingap. Скрейп при этом идёт
+в обход proxy, на loopback-порт приложения.
 
 Пример скрейпа:
 
@@ -899,6 +907,7 @@ curl -fsS \
 | queue lag > 5 мин | Проверить воркеры и БД. |
 | LLM errors > 20% за 15 мин | Проверить HA AI Task, квоту, OpenRouter. |
 | webhook 401 > 50 за 5 мин | Проверить секрет и источник запросов. |
+| Бот не отвечает: в логах `setWebhook failed` и `outbox` c `error: transient` | Исходящие в Bot API не доходят до Telegram. Проверить доступ к `api.telegram.org` из контейнера; если исходящий трафик идёт через прокси — `HTTPS_PROXY` и доступность прокси из сети контейнера. |
 | backup failed | Проверить диск, права, PostgreSQL. |
 | disk > 80% | Очистить старые backup/логи. |
 
@@ -1024,7 +1033,7 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 | Секреты | Зависимости проверяются на уязвимости в CI | `.github/workflows/ci.yml`, job `audit` (`rustsec/audit-check`) | пройдено (CI) |
 | Секреты | Строка подключения сохраняет `sslmode`; TLS к внешней БД включается на развёртывании | `src/config/tests.rs::database_url_preserves_sslmode`; `src/config/mod.rs::DatabaseConfig::from_source` | пройдено (код); TLS — 15.2 |
 | Секреты | Секреты читаются из окружения при старте, ротация не требует пересборки образа | `src/config/mod.rs::Config::from_env`; `src/telegram/runtime.rs::start` (читает токен и регистрирует webhook при старте) | пройдено (код); операционная ротация — 15.2 |
-| Секреты | Ротация `TELEGRAM_BOT_TOKEN`: после перезапуска используется новый токен, webhook регистрируется заново | `src/telegram/runtime.rs::start`, `src/telegram/api.rs::set_webhook`; runbook 16.5 | проверяется на живой системе (15.2) |
+| Секреты | Ротация `TELEGRAM_BOT_TOKEN`: после пересоздания контейнера используется новый токен, webhook регистрируется заново | `src/telegram/runtime.rs::start`, `src/telegram/api.rs::set_webhook`; runbook 16.5 | проверяется на живой системе (15.2) |
 | Секреты | Backup-файлы защищены правами доступа и, где возможно, шифрованием | runbook 11; проверка на NAS — 15.2 | проверяется на живой системе (15.2) |
 | Rate limits | 21-е обновление пользователя за минуту откладывается и выполняется после освобождения слота, без сообщения в чат; отложенных не больше 20, следующее отбрасывается; webhook остаётся `200` | `tests/telegram_queue.rs::the_twenty_first_message_is_deferred_until_the_slot_frees`, `the_forty_first_message_is_dropped_when_the_deferred_queue_is_full`; `src/telegram/webhook.rs::receive` (ответ после постановки в очередь) | пройдено |
 | Rate limits | Не больше 10 LLM-разборов в минуту на пользователя | `tests/telegram_capture.rs::more_than_ten_parses_per_minute_are_rejected_without_llm` | пройдено |
@@ -1049,8 +1058,8 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 
 ### 15.2. Чек-лист развёртывания
 
-- [ ] DNS указывает на NAS; TLS-сертификат `tasklerq.stellalupus.ru` валиден.
-- [ ] Synology Reverse Proxy направляет `tasklerq.stellalupus.ru:443` на
+- [ ] DNS указывает на NAS; TLS-сертификат `tasklerq.example.com` валиден.
+- [ ] Synology Reverse Proxy направляет `tasklerq.example.com:443` на
   `127.0.0.1:18080`.
 - [ ] `18080` доступен только с loopback; `8080` остаётся за Zigbee2MQTT.
 - [ ] PostgreSQL `15433` не доступен из интернета.
@@ -1059,11 +1068,12 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 - [ ] Для внешней БД задан `sslmode=require`; `sslmode=disable` допустим только
   внутри доверенной Docker-сети или на том же хосте.
 - [ ] `.env` имеет права `0600`; секреты не в git и не в образе.
-- [ ] Ротация секретов выполняется заменой env-file и перезапуском, без
-  пересборки образа; старые значения после перезапуска не используются.
-- [ ] Ротация `TELEGRAM_BOT_TOKEN`: после замены и перезапуска используется
-  новый токен, старый отклоняется Telegram, webhook перерегистрирован
-  (`setWebhook` успешен, `getWebhookInfo` без ошибок).
+- [ ] Ротация секретов выполняется заменой env-file и пересозданием контейнера
+  (`docker compose up -d --force-recreate tasklerq`), без пересборки образа;
+  старые значения после пересоздания не используются.
+- [ ] Ротация `TELEGRAM_BOT_TOKEN`: после замены и пересоздания контейнера
+  используется новый токен, старый отклоняется Telegram, webhook
+  перерегистрирован (`setWebhook` успешен, `getWebhookInfo` без ошибок).
 - [ ] `TELEGRAM_WEBHOOK_SECRET` случайный и длинный.
 - [ ] Webhook возвращает `401` без секрета.
 - [ ] API-токен HA имеет минимальные scopes (`ha:read`, `ha:write`,
@@ -1115,7 +1125,7 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 
    ```bash
    curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
-     "https://tasklerq.stellalupus.ru/webhooks/telegram"
+     "https://tasklerq.example.com/webhooks/telegram"
    # 401
    ```
 
@@ -1139,7 +1149,10 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
    `webhook_auth_failures_total` и пишется в `audit_events` как `auth_failed`
    (событие по IP подавляется, метрика считает все). Запрос без секрета тоже
    считается отказом, не повторяйте его в цикле.
-6. Перезапустите Tasklerq: `setWebhook` выполняется при старте (раздел 5).
+6. Пересоздайте Tasklerq, чтобы он перечитал `.env`:
+   `sudo /usr/local/bin/docker compose up -d --force-recreate tasklerq`
+   (`restart` не перечитывает `.env`). `setWebhook` выполняется при старте
+   (раздел 5).
 
 ### 16.2. Очередь растёт
 
@@ -1280,15 +1293,22 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 **Токен бота:**
 
 1. BotFather → `/revoke` → новый токен.
-2. Обновите `TELEGRAM_BOT_TOKEN` и перезапустите Tasklerq.
+2. Обновите `TELEGRAM_BOT_TOKEN` в `.env` (и `TELEGRAM_WEBHOOK_SECRET`, если
+   меняете) и пересоздайте контейнер:
+
+   ```bash
+   sudo /usr/local/bin/docker compose up -d --force-recreate tasklerq
+   ```
+
+   `docker compose restart` не перечитывает `.env`, поэтому с ним останется
+   старый токен.
 3. При старте webhook регистрируется заново с текущим
    `TELEGRAM_WEBHOOK_SECRET` (раздел 5). Проверьте
    `sudo /usr/local/bin/docker compose exec tasklerq tasklerq admin webhook info`:
    URL и `last_error_message` без ошибок.
-4. Если меняли и `TELEGRAM_WEBHOOK_SECRET`, обновите его в `.env` до
-   перезапуска: запросы со старым секретом получат `401`. `getWebhookInfo`
-   секрет не показывает, поэтому после смены перерегистрируйте webhook
-   (раздел 5, п. 5).
+4. `getWebhookInfo` секрет не показывает, поэтому после смены
+   `TELEGRAM_WEBHOOK_SECRET` перерегистрируйте webhook (раздел 5, п. 5);
+   запросы со старым секретом получат `401`.
 
 ### 16.6. HA не подключается
 
@@ -1315,7 +1335,7 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 
 1. Проверьте `HA_BASE_URL` — это адрес HA из Tasklerq.
 2. Для host-режима HA используйте `http://host.docker.internal:8123` или
-   `http://192.168.10.110:8123`.
+   `http://192.168.1.10:8123`.
 3. Проверьте `extra_hosts` в compose.
 4. Проверьте доступность HA из контейнера Tasklerq:
 
@@ -1384,10 +1404,14 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
    `Retry-After`. Исчерпанная суточная квота LLM в `auto` при включённом
    fallback даёт позицию `fallback=true`, а не `429`; `429` за квоту возможен
    только в `draft`.
-8. Для отмены последнего добавления вызовите `tasklerq.undo_last_capture`
-   (окно — 10 минут). `409` — элементы capture уже менялись после создания
+8. Для отмены последнего добавления вызовите сервис HA
+   `tasklerq.undo_last_capture` (окно — 10 минут). Ответ сервиса HA содержит
+   `count` — сколько позиций отменено, — и `speech`; поля `removed` в нём нет.
+   HTTP API `POST /api/v1/captures/undo-last` возвращает то же число в поле
+   `removed`. `409` — элементы capture уже менялись после создания
    (`version != 1` или статус не `open`) либо окно отмены закрыто. Если
-   отменять нечего, ответ `200` с `removed=0`.
+   отменять нечего, сервис HA отвечает `200` с `count: 0` и `speech`
+   «Отменять нечего…», а HTTP API — `200` с `removed: 0`.
 
 ### 16.10. Откат релиза
 
@@ -1463,6 +1487,27 @@ in the resolved migrations` (HTTP не поднимется). Поэтому о�
 После `household delete` предупреждение в `/health/ready` исчезает без
 перезапуска: число активных household читается при каждом запросе. Error-лог
 относится только к запуску — при следующем перезапуске его уже не будет.
+
+### 16.12. Прогон runbooks на инсталляции (2026-11-03)
+
+2026-11-03 runbooks раздела 16 пройдены на инсталляции, после обновления до
+`v0.1.0` по разделу 12. Код не менялся.
+
+| Runbook | Что проверено | Результат |
+| --- | --- | --- |
+| 16.1 | `admin webhook info`; POST на `/webhooks/telegram` без секрета; `/metrics` снаружи | Webhook без ошибок; без секрета — `401`; `/metrics` снаружи — `404`. |
+| 16.2 | `/health/ready`; `admin queue stats`; SQL по статусам | `200`; очереди пусты. |
+| 16.3 | `ps`, `pg_isready` | PostgreSQL доступен. |
+| 16.4 | `_sqlx_migrations` | Все миграции применены (`success`). |
+| 16.5 | Токен бота: `/revoke` в BotFather, новый токен в `.env`, пересоздание контейнера; API-токен: выпуск, запрос, отзыв, повтор | Webhook перерегистрирован без ошибок. API-токен: `200`; токен в query — `401`; после отзыва — `401`. |
+| 16.6/16.7 | Интеграция HA и сущности; `tasklerq healthcheck` к HA | Интеграция загружена, сущности доступны; HA отвечает. |
+| 16.8 | `llm_runs` | Последние разборы успешны. |
+| 16.9 | `tasklerq.capture` → `tasklerq.undo_last_capture` → повтор undo | Позиция создана и отменена (`count: 1`); повтор — `count: 0`. |
+| 16.10 | backup → предыдущий тег → проверка → обратно `0.1.0` | Оба переключения прошли, сервис healthy, webhook без ошибок. |
+| §11 | Скрипты backup/restore; первый дамп; restore drill в новую базу | Данные восстановленной базы совпали с рабочей; drill-база удалена. |
+
+Не проверялось: старт без БД и упавшая миграция (на релизном образе не
+воспроизводится).
 
 ## 17. Локальная разработка
 
@@ -1613,7 +1658,7 @@ dead-letter пуст; во втором сценарии `processed` равно 
 ## 19. Приёмка MVP
 
 Приёмка проведена на единственной живой инсталляции — NAS
-(`https://tasklerq.stellalupus.ru`, образ `stellalupus/tasklerq:pr-8`, ревизия
+(`https://tasklerq.example.com`, образ `stellalupus/tasklerq:pr-8`, ревизия
 `53c612d`, Home Assistant с интеграцией `tasklerq`, entry «Семья»); отдельного
 staging у проекта нет. Период: 2026-10-31 — 2026-11-03, время — Europe/Moscow;
 ревизия образа указана на момент сверки.
@@ -1648,6 +1693,9 @@ staging у проекта нет. Период: 2026-10-31 — 2026-11-03, вр�
   HA (сейчас Claude Haiku 5.5 через OpenRouter, ~$0.0003 за разбор).
 - Инфраструктура готова: домен, reverse proxy, сертификат, роль и БД `tasklerq`.
   Блокирующих вопросов нет.
+- Копия backup за пределами NAS не настроена: Hyper Backup пишет на отдельный
+  том NAS (RAID на SSD), что защищает от отказа `volume2`, но не от потери NAS
+  целиком. Нужен внешний диск или облако (раздел 11).
 - Security-чек-лист по коду пройден 2026-11-01 (раздел 15.1); новых дефектов
   не найдено, но один необъяснённый `failed=1` из нагрузочного прогона
   остаётся открытым вопросом (пункт ниже). Не отмеченные пункты 15.2

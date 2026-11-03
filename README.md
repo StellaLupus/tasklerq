@@ -143,7 +143,7 @@ make migrate
 # 4. Запустить сервис локально в режиме polling
 TELEGRAM_MODE=polling make dev
 
-# 5. Открыть @tasklerqbot в Telegram и отправить /start
+# 5. Открыть @tasklerq_example_bot в Telegram и отправить /start
 #    Владелец — BOOTSTRAP_OWNER_TELEGRAM_ID, иначе первый написавший боту
 
 # 6. Создать токен для внешнего capture

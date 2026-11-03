@@ -313,9 +313,9 @@ change `0001-foundation` (пункты 9.x в `tasks.md`).
 ## 8. Открытые вопросы
 
 Среда определена: Synology NAS, Synology Reverse Proxy, домен
-`tasklerq.stellalupus.ru`, PostgreSQL 18 в сети `shared-db`, HA Container
+`tasklerq.example.com`, PostgreSQL 18 в сети `shared-db`, HA Container
 `2026.10.4` в `network_mode: host`, HACS, AI Task
-`ai_task.anthropic_claude_haiku_5_5`, бот `@tasklerqbot`, часовой пояс `Europe/Moscow`,
+`ai_task.anthropic_claude_haiku_5_5`, бот `@tasklerq_example_bot`, часовой пояс `Europe/Moscow`,
 хранение `raw_text` 30 дней, backup — Hyper Backup на внешний диск.
 
 Осталось уточнить:
