@@ -397,8 +397,8 @@ networks:
 | Триггер | Теги | Публикация |
 | --- | --- | --- |
 | push в `main` | `main`, `sha-<короткий sha>` | да |
-| push тега `v*` без пререлизного суффикса (например, `v0.1.0`) | `0.1.0`, `0.1`, `latest` | да |
-| push тега `v*` с пререлизным суффиксом (например, `v0.2.0-rc1`) | только точная версия: `0.2.0-rc1` | да |
+| push тега `v*` без пререлизного суффикса (например, `v0.1.0`) | `0.1.0`, `0.1`, `latest`, `sha-<короткий sha>` | да |
+| push тега `v*` с пререлизным суффиксом (например, `v0.2.0-rc1`) | только точная версия (`0.2.0-rc1`) и `sha-<короткий sha>` | да |
 | `pull_request` из этого репозитория | `pr-<номер>`, `sha-<короткий sha головы PR>` | да |
 | `pull_request` из форка | — | нет, только сборка |
 | `workflow_dispatch` с любой ветки | `sha-<короткий sha>` | да |
@@ -477,9 +477,16 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-После публикации в Docker Hub появятся теги `0.1.0`, `0.1` и `latest`;
-в `image:` указывайте `stellalupus/tasklerq:0.1.0`, если нужна конкретная
-версия, или `:latest` для последнего релиза.
+После публикации в Docker Hub появятся теги `0.1.0`, `0.1`, `latest` и
+`sha-<короткий sha>`; в `image:` указывайте `stellalupus/tasklerq:0.1.0`, если
+нужна конкретная версия, или `:latest` для последнего релиза. Тег
+`sha-<короткий sha>` позволяет зафиксировать точный коммит релиза.
+
+`docker/metadata-action` дополнительно пишет OCI-label
+`org.opencontainers.image.revision` с полным SHA коммита, на котором собран
+образ (для PR — SHA головы PR). Label можно посмотреть командой
+`docker image inspect stellalupus/tasklerq:0.1.0 --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}'`
+и сверить с `git rev-parse HEAD` на коммите тега.
 
 Публикация PR-образа:
 
@@ -776,6 +783,28 @@ migrations`. В таком случае откатывайтесь восста�
 или образом с прежним кодом и актуальными миграциями; подробнее — runbook
 [§16.10](#1610-откат-релиза).
 
+### Переход на v0.1.0
+
+Для инсталляции, которая сейчас работает на образе из PR
+(`stellalupus/tasklerq:pr-8` или `sha-…`), действует общий порядок из начала
+раздела: backup (раздел 11) → заменить `image:` на
+`stellalupus/tasklerq:0.1.0` → `pull tasklerq` → `run --rm -T tasklerq
+migrate` (вариант B из раздела 8) → `up -d tasklerq` → проверить
+`/health/ready`. В ответе поле `version` должно быть `0.1.0`: его отдаёт
+`VERSION` из `Cargo.toml`. Затем посмотрите логи и проверьте несколько задач
+в боте и HA.
+
+Откат — по [§16.10](#1610-откат-релиза). Если образ PR уже содержал все
+миграции `0.1.0`, `migrate` — no-op и достаточно вернуть прежний тег; если
+применилась новая миграция, откат тегом невозможен, нужен restore backup до
+обновления в новую базу (раздел 11).
+
+### Развёртывание с нуля
+
+Развёртывание новой инсталляции на `v0.1.0` не отличается от общего порядка:
+выполните разделы 1–9 по порядку. Отдельных шагов для релизного тега нет;
+в `image:` сразу указывайте `stellalupus/tasklerq:0.1.0`.
+
 ## 13. Мониторинг и логи
 
 ```bash
@@ -1065,9 +1094,23 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
    ```
 
    Тело ответа — общий `unauthorized` (`Invalid webhook secret`), без указания,
-   был секрет пустым или неверным. `404` означает, что маршрут выключен
-   (`TELEGRAM_MODE=disabled`) или URL неверный; `429` — сработал лимит
-   120 запросов/с с IP. Каждый `401` увеличивает
+   был секрет пустым или неверным. `429` — сработал лимит 120 запросов/с с IP.
+   `404` возвращается, когда `state.telegram == None`
+   (`src/telegram/webhook.rs`, обработчик `receive`), а `Ingress` создаётся
+   только в режиме `webhook` и только при заданных `TELEGRAM_WEBHOOK_URL` и
+   `TELEGRAM_WEBHOOK_SECRET` (`src/telegram/runtime.rs`). Поэтому причины
+   `404` такие:
+
+   - `TELEGRAM_MODE=disabled` — маршрут выключен, бот не нужен;
+   - `TELEGRAM_MODE=polling` — webhook не поднимается (режим допустим только
+     вне `ENV=production`);
+   - запрос пришёл не на `/webhooks/telegram` или не дошёл до Tasklerq
+     (ошибка в URL, маршруте reverse proxy или edge). В режиме `webhook`
+     маршрут есть всегда: без `TELEGRAM_WEBHOOK_URL` или
+     `TELEGRAM_WEBHOOK_SECRET` конфигурация не стартует (`src/config/mod.rs`),
+     а `Ingress` создаётся при обоих значениях (`src/telegram/runtime.rs`).
+
+   Каждый `401` увеличивает
    `webhook_auth_failures_total` и пишется в `audit_events` как `auth_failed`
    (событие по IP подавляется, метрика считает все). Запрос без секрета тоже
    считается отказом, не повторяйте его в цикле.
@@ -1076,10 +1119,12 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 ### 16.2. Очередь растёт
 
 1. `/health/ready`: `503` с `Database is unavailable` — недоступна БД;
-   `503` с `Telegram update queue is lagging` — самое старое готовое
-   обновление ждёт дольше `QUEUE_READY_LAG_SECONDS`. Не убирайте инстанс из
-   маршрутизации webhook по этому признаку: при лаге это остановит приём
-   обновлений и усугубит задержку (раздел 6).
+   `503` с `Database migrations are not applied` — в `_sqlx_migrations` нет
+   версии из бинарника, есть запись с `success=false` или таблицы нет
+   (`src/http/health.rs`); `503` с `Telegram update queue is lagging` — самое
+   старое готовое обновление ждёт дольше `QUEUE_READY_LAG_SECONDS`. Не убирайте
+   инстанс из маршрутизации webhook по этому признаку: при лаге это остановит
+   приём обновлений и усугубит задержку (раздел 6).
 2. `sudo /usr/local/bin/docker compose exec tasklerq tasklerq admin queue stats`
    — счётчики по статусам и `oldest_ready_age_seconds`.
 3. Логи воркеров (`docker compose logs --tail=200 tasklerq`):
@@ -1147,14 +1192,17 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 
 1. Не запускайте новую версию в рабочий режим: `serve` применяет миграции до
    `bind`, поэтому при ошибке HTTP не поднимается, а контейнер повторяет
-   попытку при каждом перезапуске.
+   попытку при каждом перезапуске. Если сервис всё же отвечает, признак
+   проблемы — `/health/ready` с `503` `Database migrations are not applied`: в
+   `_sqlx_migrations` нет версии из бинарника, есть запись с `success=false` или
+   таблицы нет (`src/http/health.rs`).
 2. Прочитайте лог: `database migration failed: while executing migration
    <номер>: <SQL-ошибка>`. Это **номер версии** миграции (число, например
    `12`), а не имя файла; SQL-ошибку возвращает PostgreSQL. Повторить и
    увидеть хвост:
 
    ```bash
-   sudo /usr/local/bin/docker compose run --rm tasklerq migrate 2>&1 | tail -20
+   sudo /usr/local/bin/docker compose run --rm -T tasklerq migrate 2>&1 | tail -20
    ```
 
    Состояние применённых миграций:
