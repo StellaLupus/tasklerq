@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use chrono::Datelike;
 use uuid::Uuid;
 
+use crate::domain::error::DomainError;
 use crate::domain::models::{
     Item, ItemPriority, ItemStatus, List, ListKind, MonthRule, Recurrence, RecurrenceFreq,
 };
@@ -289,6 +290,36 @@ pub async fn completed(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Resul
     ]))
 }
 
+/// Результат удаления с кнопкой отмены.
+pub async fn deleted(
+    ctx: &mut Ctx<'_>,
+    item_id: Uuid,
+    title: &str,
+    shopping: bool,
+    back: &Screen,
+) -> Result<Ui, Fail> {
+    let _ = ctx;
+    Ok(Ui::new()
+        .heading(format!("🗑 Удалено: {}", clip(title, 80)))
+        .row(vec![
+            button(
+                "↩️ Отменить",
+                Action::DeleteUndo {
+                    item_id,
+                    back: back.clone(),
+                },
+            ),
+            back_button(
+                if shopping {
+                    "🛒 К списку"
+                } else {
+                    "📋 К списку"
+                },
+                back.clone(),
+            ),
+        ]))
+}
+
 /// Подтверждение удаления.
 pub async fn confirm_delete(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui, Fail> {
     let (item, _) = load(ctx, item_id).await?;
@@ -391,7 +422,26 @@ pub async fn delete_do(ctx: &mut Ctx<'_>, item_id: Uuid, back: Screen) -> Result
     let household_id = ctx.household()?.id;
     let actor = ctx.actor()?;
     let item = items::soft_delete(&mut *ctx.conn, household_id, &actor, item_id, ctx.now).await?;
-    ctx.toast(format!("Удалено: {}", clip(&item.title, 60)));
+    let list = lists::get(&mut *ctx.conn, household_id, item.list_id).await?;
+    ctx.present(Screen::Deleted {
+        item_id: item.id,
+        title: item.title.clone(),
+        shopping: list.kind != ListKind::Tasks,
+        back: Box::new(back),
+    })
+    .await
+}
+
+/// Отменить удаление и вернуться к списку.
+pub async fn delete_undo(ctx: &mut Ctx<'_>, item_id: Uuid, back: Screen) -> Result<(), Fail> {
+    let household_id = ctx.household()?.id;
+    let actor = ctx.actor()?;
+    match items::undo_last(&mut *ctx.conn, household_id, &actor, item_id, ctx.now).await {
+        Ok(item) => ctx.toast(format!("Возвращено: {}", clip(&item.title, 60))),
+        Err(DomainError::Database(error)) => return Err(Fail::Infra(error)),
+        Err(DomainError::Forbidden(_)) => ctx.toast("Недостаточно прав для этого действия."),
+        Err(_) => ctx.toast("Время отмены истекло"),
+    }
     ctx.present(back).await
 }
 

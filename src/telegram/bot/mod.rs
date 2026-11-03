@@ -883,6 +883,7 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
         Action::Undo { item_id, back } => card::undo(ctx, item_id, back).await,
         Action::DeleteAsk { item_id, back } => card::delete_ask(ctx, item_id, back).await,
         Action::DeleteDo { item_id, back } => card::delete_do(ctx, item_id, back).await,
+        Action::DeleteUndo { item_id, back } => card::delete_undo(ctx, item_id, back).await,
 
         Action::Add { list_id, kind } => forms::start_create(ctx, list_id, kind).await,
         Action::Edit {

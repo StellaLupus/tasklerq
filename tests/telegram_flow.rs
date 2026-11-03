@@ -4,6 +4,7 @@ mod support;
 
 use std::sync::Arc;
 
+use chrono::Duration;
 use support::telegram::{Call, FakeTelegram, Harness, buttons};
 use support::{db, next_telegram_id};
 use tasklerq::telegram::api::TelegramError;
@@ -380,7 +381,200 @@ async fn delete_asks_for_confirmation() {
 
     bot.press("Удалить").await;
     bot.press("Да, удалить").await;
+    bot.assert_screen_contains("🗑 Удалено: Лишнее");
+    bot.press("К списку").await;
     bot.assert_screen_contains("Пока нет задач");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleted_task_shows_undo_and_returns_it_to_the_list() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Вернуть задачу").await;
+    bot.press("Сохранить").await;
+    bot.press("Вернуть задачу").await;
+
+    bot.press("Удалить").await;
+    bot.press("Да, удалить").await;
+    bot.assert_screen_contains("🗑 Удалено: Вернуть задачу");
+    bot.assert_has_button("Отменить");
+    bot.assert_has_button("К списку");
+
+    let household = household_of(&db.pool, bot.chat).await;
+    let (item_id, deleted): (uuid::Uuid, bool) = sqlx::query_as(
+        "SELECT id, deleted_at IS NOT NULL FROM items
+         WHERE household_id = $1 AND title = $2",
+    )
+    .bind(household)
+    .bind("Вернуть задачу")
+    .fetch_one(&db.pool)
+    .await
+    .expect("deleted item");
+    assert!(deleted, "the task must be soft-deleted before the undo");
+
+    bot.press("Отменить").await;
+    bot.assert_screen_contains("Задачи · 1");
+    bot.assert_screen_contains("Вернуть задачу");
+    assert!(
+        bot.fake
+            .answers()
+            .last()
+            .and_then(|(_, text, _)| text.as_deref())
+            .is_some_and(|text| text.contains("Возвращено: Вернуть задачу")),
+        "the undo must report the restored task: {:?}",
+        bot.fake.answers()
+    );
+
+    let (still_deleted, title, status): (bool, String, String) = sqlx::query_as(
+        "SELECT deleted_at IS NOT NULL, title, status::text FROM items
+         WHERE household_id = $1 AND id = $2",
+    )
+    .bind(household)
+    .bind(item_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("restored item");
+    assert!(!still_deleted, "undo must restore deleted_at");
+    assert_eq!(title, "Вернуть задачу");
+    assert_eq!(status, "open");
+
+    let undone: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM item_events WHERE item_id = $1 AND undo_of IS NOT NULL",
+    )
+    .bind(item_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("undo event");
+    assert_eq!(undone, 1, "the journal must record an undo_of event");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleted_purchase_shows_undo_and_returns_it_to_the_list() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.press("Покупки").await;
+    bot.press("Добавить").await;
+    bot.text("Молоко").await;
+    bot.press("1").await;
+    bot.press("л").await;
+    bot.press("Сохранить").await;
+    bot.press("⋯").await;
+
+    bot.press("Удалить").await;
+    bot.press("Да, удалить").await;
+    bot.assert_screen_contains("🗑 Удалено: Молоко");
+    bot.assert_has_button("Отменить");
+    bot.assert_has_button("🛒 К списку");
+
+    let household = household_of(&db.pool, bot.chat).await;
+    let item_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM items WHERE household_id = $1 AND title = $2")
+            .bind(household)
+            .bind("Молоко")
+            .fetch_one(&db.pool)
+            .await
+            .expect("deleted purchase");
+
+    bot.press("Отменить").await;
+    bot.assert_screen_contains("Покупки · 1");
+    bot.assert_screen_contains("☐ Молоко · 1 л");
+
+    let deleted: bool =
+        sqlx::query_scalar("SELECT deleted_at IS NOT NULL FROM items WHERE id = $1")
+            .bind(item_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("purchase after undo");
+    assert!(!deleted, "undo must restore the deleted purchase");
+
+    let undone: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM item_events WHERE item_id = $1 AND undo_of IS NOT NULL",
+    )
+    .bind(item_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("undo event");
+    assert_eq!(undone, 1, "the journal must record an undo_of event");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleted_task_undo_after_window_reports_expiry_and_keeps_it_deleted() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Поздно отменять").await;
+    bot.press("Сохранить").await;
+    bot.press("Поздно отменять").await;
+
+    bot.press("Удалить").await;
+    bot.press("Да, удалить").await;
+    bot.assert_screen_contains("🗑 Удалено: Поздно отменять");
+
+    let household = household_of(&db.pool, bot.chat).await;
+    let item_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM items WHERE household_id = $1 AND title = $2")
+            .bind(household)
+            .bind("Поздно отменять")
+            .fetch_one(&db.pool)
+            .await
+            .expect("deleted item");
+
+    bot.advance(Duration::minutes(11));
+    bot.press("Отменить").await;
+    bot.assert_screen_contains("Пока нет задач");
+    assert!(
+        bot.fake
+            .answers()
+            .last()
+            .and_then(|(_, text, _)| text.as_deref())
+            .is_some_and(|text| text.contains("Время отмены истекло")),
+        "an expired undo must be reported: {:?}",
+        bot.fake.answers()
+    );
+
+    let deleted: bool =
+        sqlx::query_scalar("SELECT deleted_at IS NOT NULL FROM items WHERE id = $1")
+            .bind(item_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("item after expired undo");
+    assert!(deleted, "an expired undo must not restore the task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleted_screen_back_to_list_does_not_undo() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Оставить удалённой").await;
+    bot.press("Сохранить").await;
+    bot.press("Оставить удалённой").await;
+
+    bot.press("Удалить").await;
+    bot.press("Да, удалить").await;
+    bot.assert_screen_contains("🗑 Удалено: Оставить удалённой");
+    bot.press("К списку").await;
+    bot.assert_screen_contains("Пока нет задач");
+
+    let household = household_of(&db.pool, bot.chat).await;
+    let item_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM items WHERE household_id = $1 AND title = $2")
+            .bind(household)
+            .bind("Оставить удалённой")
+            .fetch_one(&db.pool)
+            .await
+            .expect("deleted item");
+
+    let (deleted, undone): (bool, i64) = sqlx::query_as(
+        "SELECT i.deleted_at IS NOT NULL,
+                (SELECT count(*) FROM item_events e
+                 WHERE e.item_id = i.id AND e.undo_of IS NOT NULL)
+         FROM items i WHERE i.id = $1",
+    )
+    .bind(item_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("item after back");
+    assert!(deleted, "«К списку» must not restore the task");
+    assert_eq!(undone, 0, "«К списку» must not write an undo event");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
