@@ -15,6 +15,8 @@
   время), приоритет, теги, подзадачи, исполнитель, поиск, повторения
   (`src/storage/repositories/items/`, `src/http/api/items.rs`,
   `docs/domain-model.md`; тесты `tests/item_lifecycle.rs`, `tests/search.rs`).
+  Удалённая задача скрывается из всех интерфейсов и возвращается отменой в
+  течение 10 минут; через 30 дней удаляется физически.
 - **Покупки.** Позиции с количеством и единицей измерения, отметка «куплено»,
   повторное открытие, очистка выполненных, несколько списков и чек-листов
   (`src/telegram/bot/shopping.rs`, `docs/telegram-ux.md` §4.6; тесты
@@ -38,7 +40,10 @@
   сервис `tasklerq.capture` и голосовой сценарий HA Assist, идемпотентность по
   `Idempotency-Key`, подтверждение, отмена и undo (`src/http/api/captures.rs`,
   `docs/llm-capture.md`, `docs/home-assistant.md`; тесты `tests/capture_api.rs`,
-  `tests/capture_idempotency.rs`, `tests/headless_ha.rs`).
+  `tests/capture_idempotency.rs`, `tests/headless_ha.rs`). При `503` с
+  выключенным fallback (`CAPTURE_VOICE_FALLBACK_RAW=false`) позиция и черновик
+  не создаются, исходный текст не сохраняется, а резерв `Idempotency-Key`
+  освобождается.
 - **Интеграция с Home Assistant.** Custom component: `todo`-сущность на каждый
   неархивированный список, read-only `calendar`, polling, обработка конфликтов
   версий, diagnostics и reauth; установка через HACS
@@ -95,17 +100,11 @@
 
 ### Известные ограничения
 
-- Восстановить удалённую задачу можно только через undo в течение 10 минут;
-  отдельного восстановления нет (`docs/domain-model.md`,
-  `src/storage/repositories/items/mod.rs`: `UNDO_WINDOW_MINUTES = 10`).
 - При внутренней ошибке обработки обновления Telegram пользователь не получает
   сообщения: обновление повторяется, после исчерпания попыток уходит в
   dead-letter (`docs/telegram-ux.md` §4.11, `src/telegram/worker.rs`).
 - В быстрой ручной форме нет выбора списка: позиция попадает в список задач по
   умолчанию (`docs/llm-capture.md` §15).
-- При ответе `503` и `CAPTURE_VOICE_FALLBACK_RAW=false` исходный текст не
-  сохраняется: элементы и черновик не создаются, резерв `Idempotency-Key`
-  освобождается (`docs/llm-capture.md` §10).
 - Критерии приёмки MVP, которые остались `[ ]` в `docs/roadmap.md`:
   - «Задача завершается в HA и исчезает из открытых в Telegram» — подтверждены
     только события `completed` с actor `home_assistant`, отдельного теста на

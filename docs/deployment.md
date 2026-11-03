@@ -519,6 +519,8 @@ sudo /usr/local/bin/docker compose run --rm tasklerq migrate
 sudo /usr/local/bin/docker compose up -d tasklerq
 ```
 
+`-T` добавляйте, если нет TTY (скрипт, пайп): `run --rm -T tasklerq migrate`.
+
 Рекомендуется для production, чтобы контролировать момент изменения схемы.
 
 ## 9. Первый запуск
@@ -759,6 +761,9 @@ curl -fsS http://127.0.0.1:18080/health/ready
 sudo /usr/local/bin/docker compose logs --tail=100 tasklerq
 ```
 
+`-T` у `migrate` добавляйте, если нет TTY (скрипт, пайп): `run --rm -T
+tasklerq migrate`.
+
 Порядок backup → pull → migrate → up сохраняется: backup делается до
 скачивания, migrate — до запуска новой версии.
 
@@ -798,6 +803,27 @@ migrate` (вариант B из раздела 8) → `up -d tasklerq` → пр�
 миграции `0.1.0`, `migrate` — no-op и достаточно вернуть прежний тег; если
 применилась новая миграция, откат тегом невозможен, нужен restore backup до
 обновления в новую базу (раздел 11).
+
+Проверить, будет ли `migrate` no-op, можно **до** его запуска: сравните
+версии миграций тега с уже применёнными в базе.
+
+```bash
+# На машине с клоном репозитория: версии миграций в теге.
+git ls-tree --name-only v0.1.0 migrations/ \
+  | sed -nE 's#^migrations/0*([0-9]+)_.*\.sql$#\1#p' | LC_ALL=C sort > /tmp/tag-migrations.txt
+
+# На NAS: уже применённые версии.
+sudo /usr/local/bin/docker exec postgres psql -U postgres -d tasklerq -At \
+  -c "select version from _sqlx_migrations order by version" \
+  | LC_ALL=C sort > /tmp/db-migrations.txt
+
+# Версии тега, которых ещё нет в базе.
+LC_ALL=C comm -23 /tmp/tag-migrations.txt /tmp/db-migrations.txt
+```
+
+Пустой вывод — `migrate` ничего не применит (no-op), откат тегом безопасен.
+Непустой — эти версии будут применены при `migrate`, и откат тегом не пройдёт.
+`git ls-tree` выполняется на машине с клоном репозитория; `psql` — на NAS.
 
 ### Развёртывание с нуля
 
@@ -1107,8 +1133,7 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
    - запрос пришёл не на `/webhooks/telegram` или не дошёл до Tasklerq
      (ошибка в URL, маршруте reverse proxy или edge). В режиме `webhook`
      маршрут есть всегда: без `TELEGRAM_WEBHOOK_URL` или
-     `TELEGRAM_WEBHOOK_SECRET` конфигурация не стартует (`src/config/mod.rs`),
-     а `Ingress` создаётся при обоих значениях (`src/telegram/runtime.rs`).
+     `TELEGRAM_WEBHOOK_SECRET` конфигурация не стартует (`src/config/mod.rs`).
 
    Каждый `401` увеличивает
    `webhook_auth_failures_total` и пишется в `audit_events` как `auth_failed`
@@ -1120,8 +1145,9 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 
 1. `/health/ready`: `503` с `Database is unavailable` — недоступна БД;
    `503` с `Database migrations are not applied` — в `_sqlx_migrations` нет
-   версии из бинарника, есть запись с `success=false` или таблицы нет
-   (`src/http/health.rs`); `503` с `Telegram update queue is lagging` — самое
+   версии из бинарника, есть запись с `success=false`, таблицы нет или любой
+   запрос к `_sqlx_migrations` завершился ошибкой (`src/http/health.rs`);
+   `503` с `Telegram update queue is lagging` — самое
    старое готовое обновление ждёт дольше `QUEUE_READY_LAG_SECONDS`. Не убирайте
    инстанс из маршрутизации webhook по этому признаку: при лаге это остановит
    приём обновлений и усугубит задержку (раздел 6).
@@ -1194,8 +1220,9 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
    `bind`, поэтому при ошибке HTTP не поднимается, а контейнер повторяет
    попытку при каждом перезапуске. Если сервис всё же отвечает, признак
    проблемы — `/health/ready` с `503` `Database migrations are not applied`: в
-   `_sqlx_migrations` нет версии из бинарника, есть запись с `success=false` или
-   таблицы нет (`src/http/health.rs`).
+   `_sqlx_migrations` нет версии из бинарника, есть запись с `success=false`,
+   таблицы нет или любой запрос к `_sqlx_migrations` завершился ошибкой
+   (`src/http/health.rs`).
 2. Прочитайте лог: `database migration failed: while executing migration
    <номер>: <SQL-ошибка>`. Это **номер версии** миграции (число, например
    `12`), а не имя файла; SQL-ошибку возвращает PostgreSQL. Повторить и
