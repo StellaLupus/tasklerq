@@ -507,6 +507,7 @@ async fn open_edit(
             error: None,
             duplicate: None,
             target: Some(DraftTarget { draft_id, index }),
+            quick: false,
         },
     )
     .await

@@ -958,6 +958,9 @@ pub struct ItemForm {
     /// Форма правит элемент черновика capture, а не создаёт новый.
     #[serde(default)]
     pub target: Option<DraftTarget>,
+    /// Быстрая форма: список и его тип можно сменить прямо из предпросмотра.
+    #[serde(default)]
+    pub quick: bool,
 }
 
 /// Элемент черновика capture, который правит форма.

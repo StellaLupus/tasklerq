@@ -1137,3 +1137,136 @@ async fn an_old_processing_view_without_a_job_is_shown_without_a_quote() {
     assert!(html.contains("Разбираю сообщение"), "{html}");
     assert!(!html.contains("<blockquote>"), "{html}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quick_form_switches_to_a_shopping_list_and_saves_there() {
+    let db = db().await;
+    let mut stand = stand_with(&db.pool, vec![], DEFAULT_DAILY_QUOTA, false).await;
+
+    stand.bot.text("купить молоко 2 л").await;
+    stand.bot.assert_screen_contains("Проверьте и сохраните");
+    stand.bot.assert_has_button("Список");
+    stand.bot.press("Список").await;
+    stand.bot.assert_screen_contains("В какой список?");
+    stand.bot.press("Покупки").await;
+
+    // Предпросмотр покупки: количество вместо приоритета, название сохранено.
+    stand.bot.assert_screen_contains("купить молоко 2 л");
+    stand.bot.assert_screen_contains("Количество:");
+    assert!(!stand.bot.screen().contains("Приоритет"));
+
+    stand.bot.press("Сохранить").await;
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT i.title, l.kind::text
+         FROM items i
+         JOIN lists l ON l.id = i.list_id
+         JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1 AND i.deleted_at IS NULL
+         ORDER BY i.title",
+    )
+    .bind(stand.bot.chat)
+    .fetch_all(&db.pool)
+    .await
+    .expect("items");
+    assert_eq!(
+        rows,
+        vec![("купить молоко 2 л".to_owned(), "shopping".to_owned())],
+        "the item must go to the shopping list, not to the default tasks list"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quick_form_can_pick_another_tasks_list_without_changing_the_type() {
+    let db = db().await;
+    let mut stand = stand_with(&db.pool, vec![], DEFAULT_DAILY_QUOTA, false).await;
+    let household = household_id(&db.pool, stand.bot.chat).await;
+    let second = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO lists (
+             id, household_id, kind, name, is_default, is_archived, position,
+             created_at, updated_at
+         )
+         VALUES ($1, $2, 'tasks', 'Работа', false, false, 10, now(), now())",
+    )
+    .bind(second)
+    .bind(household)
+    .execute(&db.pool)
+    .await
+    .expect("second tasks list");
+
+    stand.bot.text("позвонить маме").await;
+    stand.bot.press("Список").await;
+    stand.bot.press("Работа").await;
+
+    stand.bot.assert_screen_contains("Приоритет");
+    assert!(!stand.bot.screen().contains("Количество:"));
+    stand.bot.press("Сохранить").await;
+
+    let saved: Vec<(String, uuid::Uuid)> = sqlx::query_as(
+        "SELECT i.title, i.list_id
+         FROM items i
+         JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1 AND i.deleted_at IS NULL",
+    )
+    .bind(stand.bot.chat)
+    .fetch_all(&db.pool)
+    .await
+    .expect("items");
+    assert_eq!(saved, vec![("позвонить маме".to_owned(), second)]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn switching_to_shopping_drops_the_task_due_date() {
+    let db = db().await;
+    let mut stand = stand_with(&db.pool, vec![], DEFAULT_DAILY_QUOTA, false).await;
+
+    stand.bot.text("позвонить маме").await;
+    stand.bot.press("Срок").await;
+    stand.bot.press("Завтра").await;
+    stand.bot.assert_screen_contains("📅");
+
+    stand.bot.press("Список").await;
+    stand.bot.press("Покупки").await;
+    assert!(
+        !stand.bot.screen().contains("📅"),
+        "the shopping preview must not keep the task due date:\n{}",
+        stand.bot.screen()
+    );
+    stand.bot.assert_screen_contains("Количество:");
+
+    stand.bot.press("Сохранить").await;
+    let saved: (
+        String,
+        Option<chrono::NaiveDate>,
+        Option<chrono::DateTime<Utc>>,
+    ) = sqlx::query_as(
+        "SELECT l.kind::text, i.due_date, i.due_at
+             FROM items i
+             JOIN lists l ON l.id = i.list_id
+             JOIN users u ON u.household_id = i.household_id
+             WHERE u.telegram_user_id = $1 AND i.deleted_at IS NULL",
+    )
+    .bind(stand.bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("item");
+    assert_eq!(saved, ("shopping".to_owned(), None, None));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_regular_create_form_has_no_list_button_in_the_preview() {
+    let db = db().await;
+    let mut stand = stand_with(&db.pool, vec![], DEFAULT_DAILY_QUOTA, false).await;
+
+    stand.bot.press("Добавить").await;
+    stand.bot.press("Задачу").await;
+    stand.bot.text("Обычная задача").await;
+    stand.bot.press("Предпросмотр").await;
+
+    stand.bot.assert_screen_contains("Проверьте и сохраните");
+    assert!(
+        stand.bot.find_button("📋 Список").is_none(),
+        "the regular form must keep its type and hide the quick list switch:\n{}",
+        stand.bot.screen()
+    );
+}

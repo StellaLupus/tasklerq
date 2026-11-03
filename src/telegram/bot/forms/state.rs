@@ -374,6 +374,7 @@ mod tests {
             error: None,
             duplicate: None,
             target: None,
+            quick: false,
         };
 
         advance(&mut form, Step::Due);
@@ -399,6 +400,7 @@ mod tests {
             error: None,
             duplicate: None,
             target: None,
+            quick: false,
         };
 
         advance(&mut form, Step::Recurrence);

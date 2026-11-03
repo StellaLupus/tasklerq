@@ -195,8 +195,30 @@ async fn create_view(ctx: &mut Ctx<'_>, form: ItemForm) -> Result<Ui, Fail> {
     match form.step {
         Step::List => {
             ui = ui.heading("В какой список?");
-            for list in lists_of_kind(ctx, form.kind).await? {
-                ui = ui.row(vec![choose(clip(&list.name, 40), Choice::List(list.id))]);
+            let lists = if form.quick {
+                // Быстрая форма: показать все списки household, задачи и
+                // покупки, сохранив порядок внутри каждого типа.
+                let mut lists = lists_of_kind(ctx, ListKind::Tasks).await?;
+                lists.extend(lists_of_kind(ctx, ListKind::Shopping).await?);
+                lists
+            } else {
+                lists_of_kind(ctx, form.kind).await?
+            };
+            for list in lists {
+                let icon = if list.kind == ListKind::Tasks {
+                    "📋"
+                } else {
+                    "🛒"
+                };
+                let mark = if form.list_id == Some(list.id) {
+                    "● "
+                } else {
+                    ""
+                };
+                ui = ui.row(vec![choose(
+                    format!("{mark}{icon} {}", clip(&list.name, 40)),
+                    Choice::List(list.id),
+                )]);
             }
             Ok(ui.row(vec![cancel_button()]))
         }
@@ -581,6 +603,9 @@ async fn preview(ctx: &mut Ctx<'_>, form: ItemForm, mut ui: Ui) -> Result<Ui, Fa
         button("💾 Сохранить", Action::Form { act: FormAct::Save }),
         go_step("✏️ Название", Step::Title),
     ]);
+    if form.quick {
+        ui = ui.row(vec![go_step("📋 Список", Step::List)]);
+    }
     ui = if shopping {
         ui.row(vec![
             go_step("🔢 Количество", Step::Quantity),
