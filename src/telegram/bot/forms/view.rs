@@ -269,7 +269,7 @@ async fn create_view(ctx: &mut Ctx<'_>, form: ItemForm) -> Result<Ui, Fail> {
             Ok(
                 if matches!(step, Step::Tags | Step::Subtasks | Step::Weekdays) {
                     ui.row(vec![
-                        button("✅ Готово", Action::Form { act: FormAct::Done }),
+                        button(ru::APPLY_BUTTON, Action::Form { act: FormAct::Done }),
                         cancel_button(),
                     ])
                 } else {
@@ -325,7 +325,7 @@ async fn edit_view(ctx: &mut Ctx<'_>, form: EditForm) -> Result<Ui, Fail> {
         step,
         Step::Tags | Step::Subtasks | Step::Weekdays | Step::NewTag | Step::DueText
     ) {
-        "✅ Готово"
+        ru::APPLY_BUTTON
     } else {
         "⬅️ Назад"
     };

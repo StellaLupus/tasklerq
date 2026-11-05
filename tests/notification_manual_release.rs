@@ -151,7 +151,7 @@ async fn one_deferred_notification_is_released_as_an_ordinary_message() {
         .into_iter()
         .map(|(label, _)| label)
         .collect();
-    for label in ["Готово", "Отложить на час", "Открыть"] {
+    for label in ["Выполнено", "Отложить на час", "Открыть"] {
         assert!(
             labels.iter().any(|item| item.contains(label)),
             "{label}: {labels:?}"

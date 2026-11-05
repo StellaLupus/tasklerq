@@ -10,10 +10,14 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use tasklerq::storage::repositories::{households, users};
 use tasklerq::telegram::api::{RichMessage, TelegramApi, TelegramError, WebhookInfo};
-use tasklerq::telegram::bot::Bot;
-use tasklerq::telegram::outbox::OutboxWorker;
+use tasklerq::telegram::bot::model::{Action, Screen, Ui};
+use tasklerq::telegram::bot::{Bot, Ctx, display_timezone};
+use tasklerq::telegram::outbox::{OutboxWorker, Placement};
 use tasklerq::telegram::queue;
+use tasklerq::telegram::rich::Button;
+use tasklerq::telegram::update::Sender;
 use tasklerq::telegram::worker::{Pass, UpdateHandler, UpdateWorker};
 use tokio::sync::Notify;
 
@@ -276,6 +280,56 @@ fn harness_bot(pool: &PgPool) -> Bot {
         // возможен только в режиме `multi`.
         .with_tenancy(tasklerq::config::TenancyMode::Multi)
         .with_audit(tasklerq::security_audit::Audit::new(pool.clone()))
+}
+
+/// Показать экран с баннером и его кнопками.
+///
+/// В продуктовом коде баннер с кнопками появится в следующих пунктах этапа;
+/// пока это единственный путь проверить, что кнопки баннера получают токены, а
+/// сам баннер не попадает в `telegram_views`.
+pub async fn present_with_banner(
+    pool: &PgPool,
+    chat_id: i64,
+    now: DateTime<Utc>,
+    screen: &Screen,
+    ui: Ui,
+    text: &str,
+    buttons: Vec<Button<Action>>,
+) {
+    let mut conn = pool.acquire().await.expect("connection");
+    let user = users::find_active_by_telegram(&mut conn, chat_id)
+        .await
+        .expect("user")
+        .expect("active user");
+    let household = households::get(&mut conn, user.household_id)
+        .await
+        .expect("household");
+    let tz = display_timezone(Some(&user), Some(&household));
+    let mut ctx = Ctx {
+        conn: &mut conn,
+        now,
+        bot_username: "tasklerqbot",
+        chat_id,
+        sender: Sender {
+            id: user.telegram_user_id,
+            display_name: user.display_name.clone(),
+            username: user.username.clone(),
+        },
+        user: Some(user),
+        household: Some(household),
+        tz,
+        toast: None,
+        banner: None,
+        placement: Placement::Visible,
+        llm_capture: false,
+        tenancy: tasklerq::config::TenancyConfig {
+            mode: tasklerq::config::TenancyMode::Single,
+            bootstrap_owner: None,
+        },
+        audit: None,
+    };
+    ctx.banner_with(text, buttons);
+    ctx.show(screen, ui).await.expect("show with banner");
 }
 
 /// Сценарный стенд: один пользователь, настоящий бот и поддельный Telegram.

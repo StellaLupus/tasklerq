@@ -31,7 +31,7 @@ use crate::storage::repositories::{households, users};
 
 use super::callbacks::{self, Consumed, NewToken, Scope};
 use super::outbox::{self, Outgoing, Placement};
-use super::rich::{self, Block, Span};
+use super::rich::{self, Block, Button, Span};
 use super::update::{Incoming, Sender};
 use super::views::{self, Lookup};
 use model::{Action, Form, Screen, Ui};
@@ -113,6 +113,45 @@ impl From<DomainError> for Fail {
     }
 }
 
+/// Баннер над экраном: сообщение и необязательные кнопки.
+///
+/// Показывается при ближайшей отрисовке и нигде не сохраняется: это ответ на
+/// только что выполненное действие, а не часть экрана.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Banner {
+    /// Текст сообщения.
+    pub text: String,
+    /// Кнопки под сообщением.
+    pub buttons: Vec<Button<Action>>,
+}
+
+impl Banner {
+    /// Баннер только с текстом.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            buttons: Vec::new(),
+        }
+    }
+
+    /// Баннер с кнопками.
+    pub fn with_buttons(text: impl Into<String>, buttons: Vec<Button<Action>>) -> Self {
+        Self {
+            text: text.into(),
+            buttons,
+        }
+    }
+
+    /// Блоки баннера: жирный абзац и, если кнопки есть, их ряд.
+    fn blocks(self) -> Vec<Block<Action>> {
+        let mut blocks = vec![Block::Paragraph(vec![Span::bold(self.text)])];
+        if !self.buttons.is_empty() {
+            blocks.push(Block::Buttons(self.buttons));
+        }
+        blocks
+    }
+}
+
 /// Состояние контекста на начало шага: нужно, чтобы вернуть его при откате.
 struct StepGuard {
     user: Option<User>,
@@ -140,8 +179,8 @@ pub struct Ctx<'a> {
     pub tz: Tz,
     /// Подсказка для ответа на callback.
     pub toast: Option<(String, bool)>,
-    /// Сообщение над следующим экраном.
-    pub banner: Option<String>,
+    /// Сообщение и кнопки над следующим экраном.
+    pub banner: Option<Banner>,
     /// Правило видимости для следующего экрана. Обработчик выставляет его до
     /// вызова [`Ctx::present`]/[`Ctx::show`]; по умолчанию — [`Placement::Visible`].
     pub placement: Placement,
@@ -195,7 +234,12 @@ impl Ctx<'_> {
 
     /// Строка над экраном: сообщение об ошибке или результате.
     pub fn banner(&mut self, text: impl Into<String>) {
-        self.banner = Some(text.into());
+        self.banner = Some(Banner::text(text));
+    }
+
+    /// Баннер с кнопками над экраном.
+    pub fn banner_with(&mut self, text: impl Into<String>, buttons: Vec<Button<Action>>) {
+        self.banner = Some(Banner::with_buttons(text, buttons));
     }
 
     /// Показать экран: собрать, выпустить токены и поставить в outbox.
@@ -207,8 +251,7 @@ impl Ctx<'_> {
     /// Показать готовый экран. `screen` запоминается для перерисовки.
     pub async fn show(&mut self, screen: &Screen, mut ui: Ui) -> Result<(), Fail> {
         if let Some(banner) = self.banner.take() {
-            ui.blocks
-                .insert(0, Block::Paragraph(vec![Span::bold(banner)]));
+            ui.blocks.splice(0..0, banner.blocks());
         }
         let html = self.render(&ui, Scope::Screen, self.now).await?;
         let state = to_json(&screen.persisted())?;
@@ -450,7 +493,7 @@ impl Bot {
             household: Some(household.clone()),
             tz: display_timezone(Some(user), Some(household)),
             toast: None,
-            banner,
+            banner: banner.map(Banner::text),
             placement: Placement::Visible,
             llm_capture: self.llm_capture,
             tenancy: self.tenancy,
@@ -612,7 +655,7 @@ async fn recover(ctx: &mut Ctx<'_>, message: String, callback: bool) -> Result<(
     if callback {
         ctx.toast = Some((message.clone(), false));
     } else {
-        ctx.banner = Some(message);
+        ctx.banner = Some(Banner::text(message));
     }
     match ctx.refresh().await {
         Ok(()) => Ok(()),
@@ -964,5 +1007,31 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
         Action::DraftSave { draft_id } => capture::save(ctx, draft_id).await,
         Action::DraftCancel { draft_id } => capture::cancel(ctx, draft_id).await,
         Action::DraftUndo { draft_id } => capture::undo(ctx, draft_id).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::telegram::rich::button;
+
+    #[test]
+    fn banner_with_a_button_is_rendered_above_the_screen() {
+        let banner = Banner::with_buttons(
+            "✅ Выполнено: Оплатить интернет",
+            vec![button("↩️ Отменить", Action::Refresh)],
+        );
+        let mut ui = Ui::new().heading("Задачи · 1");
+        ui.blocks.splice(0..0, banner.blocks());
+
+        let html = rich::render(&ui, &["t:0000000000000001".to_owned()]).html;
+
+        assert_eq!(
+            html,
+            "<p><b>✅ Выполнено: Оплатить интернет</b></p>\n\
+             <tg-button-row><tg-button type=\"callback_data\" data=\"t:0000000000000001\">\
+             ↩️ Отменить</tg-button></tg-button-row>\n\
+             <h3>Задачи · 1</h3>"
+        );
     }
 }

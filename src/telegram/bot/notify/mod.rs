@@ -1,4 +1,4 @@
-//! Экраны уведомлений и действия «Готово» / «Отложить» / «Открыть».
+//! Экраны уведомлений и действия «Выполнено» / «Отложить» / «Открыть».
 //!
 //! Уведомления — отдельные сообщения, а не часть навигационного экрана,
 //! поэтому их кнопки выпускаются с областью `notice` и редактируют своё
@@ -75,7 +75,7 @@ pub fn reminder_ui(
         .text(when_line(item.due_at, item.due_date, &list.name, tz, now))
         .row(vec![
             button(
-                "✓ Готово",
+                ru::DONE_BUTTON,
                 Action::NoticeComplete {
                     item_id: item.id,
                     version: item.version,
@@ -110,7 +110,7 @@ pub fn assignment_ui(item: &Item, list: &List, tz: Tz, now: DateTime<Utc>) -> Ui
         .row(vec![
             button("📋 Открыть", Action::NoticeOpen { item_id: item.id }),
             button(
-                "✓ Готово",
+                ru::DONE_BUTTON,
                 Action::NoticeComplete {
                     item_id: item.id,
                     version: item.version,
@@ -263,7 +263,7 @@ async fn show_current(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> Resu
     }
 }
 
-/// «Готово» из уведомления.
+/// «Выполнено» из уведомления.
 pub async fn complete(
     ctx: &mut Ctx<'_>,
     message_id: i64,
@@ -289,7 +289,7 @@ pub async fn complete(
             } else {
                 None
             };
-            ctx.toast("Готово");
+            ctx.toast(ru::DONE_TOAST);
             let ui = done_ui(&item, item.list_id, next.as_deref());
             edit_notice(ctx, message_id, &ui).await
         }

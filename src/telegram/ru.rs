@@ -158,6 +158,17 @@ pub const NEEDS_ADMIN: &str = "Инсталляция требует вмеша�
 /// исчерпания повторов, когда причина уже неизвестна.
 pub const INTERNAL_ERROR: &str = "Не получилось выполнить действие. Попробуйте ещё раз чуть позже.";
 
+/// Кнопка выполнения задачи.
+pub const DONE_BUTTON: &str = "✓ Выполнено";
+/// Кнопка отметки покупки.
+pub const BOUGHT_BUTTON: &str = "✓ Куплено";
+/// Кнопка группового выполнения.
+pub const DONE_ALL_BUTTON: &str = "✓ Выполнить все";
+/// Кнопка закрытия выбора нескольких значений.
+pub const APPLY_BUTTON: &str = "Применить";
+/// Всплывающее сообщение после выполнения.
+pub const DONE_TOAST: &str = "Выполнено";
+
 /// Команда CLI для назначения владельца с подставленным Telegram ID.
 pub fn owner_command(telegram_id: i64) -> String {
     format!("tasklerq admin user add --telegram-id {telegram_id} --role owner")

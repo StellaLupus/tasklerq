@@ -165,7 +165,7 @@ fn lists_line(visible: &[&List], open: &HashMap<Uuid, i64>) -> String {
 
 fn welcome() -> Ui {
     Ui::new()
-        .heading("Готово!")
+        .heading("Пространство создано")
         .text("Созданы списки «Задачи» и «Покупки».")
         .text("Отправьте мне любую фразу — например: «завтра купить молоко и позвонить маме».")
         .row(vec![

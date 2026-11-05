@@ -15,7 +15,7 @@ use tasklerq::domain::models::{Actor, UserRole};
 use tasklerq::domain::settings::NotificationSettings;
 use tasklerq::jobs::scheduler::Scheduler;
 use tasklerq::storage::repositories::items;
-use tasklerq::telegram::bot::model::{Action, Form, PAGE_SIZE, Screen};
+use tasklerq::telegram::bot::model::{Action, Form, PAGE_SIZE, Screen, Ui};
 use tasklerq::telegram::callbacks::{self, NewToken, Scope};
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -161,6 +161,60 @@ async fn action_callback(
     .await
     .expect("callback should be issued")
     .remove(0)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn banner_with_a_button_is_shown_once_and_never_persisted() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+
+    support::telegram::present_with_banner(
+        &db.pool,
+        bot.chat,
+        bot.now,
+        &Screen::Menu,
+        Ui::new().heading("Экран под баннером"),
+        "✅ Выполнено: Оплатить интернет",
+        vec![tasklerq::telegram::rich::button(
+            "↩️ Отменить",
+            Action::Refresh,
+        )],
+    )
+    .await;
+    bot.deliver().await;
+
+    let html = bot.screen();
+    assert!(
+        html.contains("✅ Выполнено: Оплатить интернет"),
+        "banner should be visible:\n{html}"
+    );
+    assert!(
+        support::telegram::buttons(&html)
+            .iter()
+            .any(|(label, _)| label.contains("Отменить")),
+        "banner button should be visible:\n{html}"
+    );
+
+    let state: String =
+        sqlx::query_scalar("SELECT state::text FROM telegram_views WHERE chat_id = $1")
+            .bind(bot.chat)
+            .fetch_one(&db.pool)
+            .await
+            .expect("saved screen state");
+    assert!(
+        !state.contains("Оплатить интернет"),
+        "banner text must not be persisted: {state}"
+    );
+
+    // Кнопка баннера доходит до действия, а следующая отрисовка баннера не
+    // показывает: он живёт только до ближайшего экрана.
+    bot.press("Отменить").await;
+    let html = bot.screen();
+    assert!(!html.contains("Оплатить интернет"), "{html}");
+    assert!(
+        !html.contains("Отменить"),
+        "the banner button must disappear with the banner:\n{html}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -962,7 +1016,7 @@ async fn notification_actions_are_idempotent() {
             .expect("button")
             .1
     };
-    let done = button_of("Готово");
+    let done = button_of("Выполнено");
 
     // Отложить: исходное сообщение обновляется, а доставку создаёт планировщик.
     let snooze = button_of("на час");
@@ -978,7 +1032,7 @@ async fn notification_actions_are_idempotent() {
     .expect("snooze deliveries");
     assert_eq!(scheduled, 1);
 
-    // «Готово» выполняется один раз; повторное нажатие ничего не делает.
+    // «Выполнено» выполняется один раз; повторное нажатие ничего не делает.
     bot.press_data(&done, notice_id).await;
     bot.assert_latest_contains("✅ Выполнено: Оплатить интернет");
     let status: String = sqlx::query_scalar("SELECT status::text FROM items WHERE id = $1")
@@ -2098,4 +2152,130 @@ async fn stale_saved_button_is_rejected_but_the_expire_row_survives() {
         expire_status, "pending",
         "the scheduled auto-delete must survive a rejected button"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn action_labels_do_not_say_gotovo() {
+    use tasklerq::storage::repositories::notifications::NotificationKind;
+    use tasklerq::telegram::bot::notify::{self, BatchEntry, BatchEntryState};
+
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let task = create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, "Оплатить интернет"),
+    )
+    .await;
+    create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        new_item(household.shopping_list_id, "Молоко"),
+    )
+    .await;
+
+    let mut screens: Vec<Vec<(String, String)>> = Vec::new();
+
+    // Карточка задачи.
+    bot.press("Задачи").await;
+    bot.press("Оплатить интернет").await;
+    let card = support::telegram::buttons(&bot.screen());
+    assert!(
+        card.iter().any(|(label, _)| label == "✓ Выполнено"),
+        "{card:?}"
+    );
+    screens.push(card);
+    bot.press("Назад").await;
+    bot.press("Назад").await;
+
+    // Карточка покупки.
+    bot.press("Покупки").await;
+    bot.press("⋯").await;
+    screens.push(support::telegram::buttons(&bot.screen()));
+    bot.press("Назад").await;
+    bot.press("Назад").await;
+
+    // Выбор тегов в форме создания.
+    bot.press("Добавить").await;
+    bot.press("Задачу").await;
+    bot.text("Новая задача").await;
+    bot.press("Без срока").await;
+    bot.press("Обычный").await;
+    bot.press("Без исполнителя").await;
+    let tags = support::telegram::buttons(&bot.screen());
+    assert!(
+        tags.iter().any(|(label, _)| label == "Применить"),
+        "{tags:?}"
+    );
+    screens.push(tags);
+    bot.press("Отмена").await;
+
+    // Выбор тегов в форме правки.
+    bot.press("Задачи").await;
+    bot.press("Оплатить интернет").await;
+    bot.press("Теги").await;
+    let edit_tags = support::telegram::buttons(&bot.screen());
+    assert!(
+        edit_tags.iter().any(|(label, _)| label == "Применить"),
+        "{edit_tags:?}"
+    );
+    screens.push(edit_tags);
+    bot.press("Применить").await;
+
+    // Уведомление о задаче и сводное уведомление.
+    let list = tasklerq::storage::repositories::lists::get(
+        &mut db.pool.acquire().await.expect("conn"),
+        household.household_id,
+        household.tasks_list_id,
+    )
+    .await
+    .expect("list");
+    let tz: chrono_tz::Tz = "Europe/Moscow".parse().expect("tz");
+    let reminder = notify::reminder_ui(&task, &list, tz, bot.now, Some(15));
+    let batch = notify::batch_ui(
+        Uuid::now_v7(),
+        0,
+        &[BatchEntry {
+            item_id: task.id,
+            kind: NotificationKind::Reminder,
+            title: task.title.clone(),
+            when: "Сегодня · Задачи".to_owned(),
+            version: task.version,
+            state: BatchEntryState::Open,
+        }],
+        1,
+        None,
+        tz,
+    );
+    {
+        let mut conn = db.pool.acquire().await.expect("conn");
+        for ui in [&reminder, &batch] {
+            let html =
+                notify::render_notice(&mut conn, bot.chat, household.household_id, ui, bot.now)
+                    .await
+                    .expect("render notice");
+            screens.push(support::telegram::buttons(&html));
+        }
+    }
+
+    // Приветствие после создания пространства.
+    let mut fresh = Harness::new(&db.pool, next_telegram_id()).named("Bob");
+    fresh.text("/start").await;
+    fresh.text("Дом").await;
+    fresh.press("Москва").await;
+    fresh.assert_screen_contains("Пространство создано");
+    screens.push(support::telegram::buttons(&fresh.screen()));
+
+    for labels in &screens {
+        assert!(
+            !labels.iter().any(|(label, _)| label.contains("Готово")),
+            "a button still says «Готово»: {labels:?}"
+        );
+    }
 }

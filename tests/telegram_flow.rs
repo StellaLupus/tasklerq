@@ -279,10 +279,10 @@ async fn task_form_validates_and_saves() {
     bot.press("Новый тег").await;
     bot.text("дом").await;
     bot.assert_screen_contains("✓ дом");
-    bot.press("Готово").await;
+    bot.press("Применить").await;
     bot.assert_screen_contains("Подзадачи");
     bot.text("Найти договор").await;
-    bot.press("Готово").await;
+    bot.press("Применить").await;
     bot.assert_screen_contains("Как часто повторять?");
     bot.press("Не повторять").await;
     bot.assert_screen_contains("Проверьте и сохраните");

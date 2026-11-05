@@ -212,9 +212,9 @@ pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui,
     } else {
         button(
             if shopping {
-                "✓ Куплено"
+                ru::BOUGHT_BUTTON
             } else {
-                "✓ Готово"
+                ru::DONE_BUTTON
             },
             Action::Complete {
                 item_id,

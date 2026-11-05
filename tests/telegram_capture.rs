@@ -1375,9 +1375,9 @@ async fn quick_task_to_purchase_drops_priority_tags_and_recurrence() {
     stand.bot.press("Теги").await;
     stand.bot.press("Новый тег").await;
     stand.bot.text("дом").await;
-    stand.bot.press("Готово").await;
+    stand.bot.press("Применить").await;
     stand.bot.assert_screen_contains("Подзадачи");
-    stand.bot.press("Готово").await;
+    stand.bot.press("Применить").await;
     stand.bot.assert_screen_contains("Как часто повторять?");
     stand.bot.press("Каждый день").await;
     stand.bot.press("Каждый раз").await;

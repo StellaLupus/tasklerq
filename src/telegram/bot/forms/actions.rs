@@ -349,7 +349,7 @@ async fn create_action(ctx: &mut Ctx<'_>, mut form: ItemForm, act: FormAct) -> R
             match apply_choice(&mut form.draft, choice, today) {
                 Ok(()) => {
                     match step {
-                        // Многошаговые выборы остаются на экране до «Готово».
+                        // Многошаговые выборы остаются на экране до «Применить».
                         Step::Tags | Step::Subtasks | Step::Weekdays => form.error = None,
                         _ => advance(&mut form, step),
                     }

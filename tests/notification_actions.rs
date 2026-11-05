@@ -207,7 +207,7 @@ async fn scheduler_reminder_has_four_action_buttons() {
     assert!(html.contains("Оплатить интернет"), "{html}");
     let labels: Vec<String> = buttons(&html).into_iter().map(|(label, _)| label).collect();
     assert_eq!(labels.len(), 4, "{labels:?}");
-    for expected in ["Готово", "Отложить на час", "Завтра в 09:00", "Открыть"]
+    for expected in ["Выполнено", "Отложить на час", "Завтра в 09:00", "Открыть"]
     {
         assert!(
             labels.iter().any(|label| label.contains(expected)),
@@ -238,7 +238,7 @@ async fn done_from_reminder_completes_once_and_repeat_does_not_change_version() 
 
     tick_and_deliver(&mut bot, &db.pool, due - Duration::minutes(15)).await;
     let (message_id, html) = bot.latest();
-    let done = button_of(&html, "Готово");
+    let done = button_of(&html, "Выполнено");
 
     bot.press_data(&done, message_id).await;
     let (status, _, version) = item_status(&db.pool, item.id).await;
@@ -282,7 +282,7 @@ async fn done_on_recurring_task_does_not_advance_a_second_occurrence() {
 
     tick_and_deliver(&mut bot, &db.pool, due - Duration::minutes(15)).await;
     let (message_id, html) = bot.latest();
-    let done = button_of(&html, "Готово");
+    let done = button_of(&html, "Выполнено");
 
     bot.press_data(&done, message_id).await;
     let (status, _, version) = item_status(&db.pool, item.id).await;
@@ -535,7 +535,7 @@ async fn actions_on_a_deleted_task_report_unavailable_and_do_nothing() {
     let household = household_for(&db.pool, bot.chat).await;
     let due = rounded_now() + Duration::hours(3);
 
-    for label in ["Готово", "на час", "Завтра в 09:00", "Открыть"] {
+    for label in ["Выполнено", "на час", "Завтра в 09:00", "Открыть"] {
         let item = create_task(
             &db.pool,
             &household,
@@ -621,11 +621,11 @@ async fn done_and_snooze_on_a_completed_task_change_nothing() {
     assert!(bot.latest().1.contains("✅ Выполнено"));
     assert_eq!(item_status(&db.pool, snoozed.id).await.2, version);
 
-    // «Готово» по уже выполненной задаче не завершает её второй раз.
+    // «Выполнено» по уже выполненной задаче не завершает её второй раз.
     let completed = create_task(&db.pool, &household, "Ещё одна задача", due, None).await;
     tick_and_deliver(&mut bot, &db.pool, due - Duration::minutes(15)).await;
     let (message_id, html) = bot.latest();
-    let done = button_of(&html, "Готово");
+    let done = button_of(&html, "Выполнено");
     items::complete(
         &mut conn,
         household.household_id,
