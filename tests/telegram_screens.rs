@@ -348,14 +348,14 @@ async fn task_rows_have_one_button_and_open_the_card_without_changing_the_task()
     bot.press("Назад").await; // список
     bot.press("Назад").await; // меню
     bot.press("Мои задачи").await;
-    assert_one_row_without_service_buttons(&bot.screen(), "Срочная задача");
+    assert_one_element_row(&bot.screen(), "Срочная задача");
     bot.press("Назад").await;
 
     bot.press("Поиск").await;
     bot.text("задача").await;
     for title in ["Срочная задача", "Высокая задача", "Обычная задача"]
     {
-        assert_one_row_without_service_buttons(&bot.screen(), title);
+        assert_one_element_row(&bot.screen(), title);
     }
     assert!(
         !support::telegram::buttons(&bot.screen())
@@ -386,7 +386,7 @@ async fn task_rows_have_one_button_and_open_the_card_without_changing_the_task()
     bot.press("Назад").await;
     bot.press("Поиск").await;
     bot.text("молоко").await;
-    assert_one_row_without_service_buttons(&bot.screen(), "Молоко");
+    assert_one_element_row(&bot.screen(), "Молоко");
     assert!(
         support::telegram::buttons(&bot.screen())
             .iter()
@@ -396,38 +396,79 @@ async fn task_rows_have_one_button_and_open_the_card_without_changing_the_task()
     );
 }
 
-fn assert_one_row_without_service_buttons(screen: &str, title: &str) {
-    let buttons = support::telegram::buttons(screen);
-    let rows: Vec<&(String, String)> = buttons
-        .iter()
-        .filter(|(label, _)| label.contains(title))
-        .collect();
-    assert_eq!(rows.len(), 1, "one button per row: {title}\n{screen}");
-    assert!(
-        !rows[0].0.starts_with("☐"),
-        "an open row must not carry ☐: {}",
-        rows[0].0
-    );
-    assert!(
-        !buttons.iter().any(|(label, _)| label == "⋯"),
-        "no «⋯» button belongs to an element row: {buttons:?}"
-    );
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn row_taps_in_mine_and_search_open_the_card_and_back_returns() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+
+    let mut task = new_item(household.tasks_list_id, "Позвонить маме");
+    task.assignee_user_id = Some(household.owner_id);
+    create_item(&db.pool, &household, household.tasks_list_id, &actor, task).await;
+    create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        new_item(household.shopping_list_id, "Молоко"),
+    )
+    .await;
+
+    // «Мои задачи».
+    bot.press("Мои задачи").await;
+    assert_one_element_row(&bot.screen(), "Позвонить маме");
+    bot.press("Позвонить маме").await;
+    bot.assert_screen_contains("Мои задачи › Позвонить маме");
+    bot.assert_has_button("⬅️ Назад");
+    bot.press("Назад").await;
+    bot.assert_screen_contains("Мои задачи · 1");
+
+    // Поиск задачи.
+    bot.press("Назад").await;
+    bot.press("Поиск").await;
+    bot.text("Позвонить").await;
+    assert_one_element_row(&bot.screen(), "Позвонить маме");
+    bot.press("Позвонить маме").await;
+    bot.assert_screen_contains("Поиск › Позвонить маме");
+    bot.assert_has_button("⬅️ Назад");
+    bot.press("Назад").await;
+    bot.assert_screen_contains("Найдено 1 результат");
+
+    // Поиск покупки.
+    bot.press("Назад").await;
+    bot.press("Поиск").await;
+    bot.text("Молоко").await;
+    assert_one_element_row(&bot.screen(), "Молоко");
+    bot.press("Молоко").await;
+    bot.assert_screen_contains("Поиск › Молоко");
+    bot.assert_has_button("⬅️ Назад");
+    bot.press("Назад").await;
+    bot.assert_screen_contains("Молоко · Покупки");
 }
 
-fn assert_one_shopping_row(screen: &str, title: &str) {
-    let buttons = support::telegram::buttons(screen);
-    let rows: Vec<&(String, String)> = buttons
+fn assert_one_element_row(screen: &str, title: &str) {
+    let rows = support::telegram::button_rows(screen);
+    let matching: Vec<_> = rows
         .iter()
-        .filter(|(label, _)| label.contains(title))
+        .filter(|row| row.iter().any(|(label, _)| label.contains(title)))
         .collect();
     assert_eq!(
-        rows.len(),
+        matching.len(),
         1,
-        "one button per shopping row: {title}\n{screen}"
+        "exactly one row per element: {title}\n{screen}\n{rows:?}"
+    );
+    assert_eq!(
+        matching[0].len(),
+        1,
+        "exactly one button per element row: {title}\n{screen}\n{:?}",
+        matching[0]
     );
     assert!(
-        !buttons.iter().any(|(label, _)| label == "⋯"),
-        "no «⋯» button belongs to a shopping row: {buttons:?}"
+        !support::telegram::buttons(screen)
+            .iter()
+            .any(|(label, _)| label == "⋯"),
+        "no «⋯» button belongs to an element row: {screen}"
     );
 }
 
@@ -460,7 +501,7 @@ async fn shopping_row_toggles_the_purchase_and_stays_in_the_list() {
     bot.press("Покупки").await;
     bot.assert_screen_contains("Покупки · 1");
     bot.assert_screen_contains("☐ Молоко · 2 л");
-    assert_one_shopping_row(&bot.screen(), "Молоко");
+    assert_one_element_row(&bot.screen(), "Молоко");
 
     bot.press("☐ Молоко · 2 л").await;
     bot.assert_screen_contains("Покупки · 0");
@@ -530,6 +571,37 @@ async fn shopping_edit_mode_opens_the_card_and_is_kept_on_back() {
     bot.press("Покупки").await;
     bot.assert_screen_contains("Покупки · 1");
     assert!(!bot.screen().contains("правка"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_shopping_list_in_edit_mode_drops_the_edit_marker() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        new_item(household.shopping_list_id, "Молоко"),
+    )
+    .await;
+
+    bot.press("Покупки").await;
+    bot.press("Править").await;
+    bot.assert_screen_contains("Покупки · правка");
+    bot.press("Молоко").await;
+    bot.press("Удалить").await;
+    bot.press("Да, удалить").await;
+    bot.press("Назад").await;
+
+    // Список опустел в режиме правки: заголовок и кнопки — как у обычного
+    // пустого списка, чтобы из него был выход.
+    bot.assert_screen_contains("Покупки · 0");
+    bot.assert_screen_contains("Список покупок пуст");
+    assert!(!bot.screen().contains("правка"), "{}", bot.screen());
+    bot.assert_has_button("⬅️ Назад");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -639,7 +711,7 @@ async fn lists_paginate_and_counters_follow_actions() {
     bot.assert_screen_contains("Страница 2 из 2");
 
     // Завершить единственную задачу второй страницы: строка открывает
-    // карточку, «✓ Выполнено» возвращает на последнюю существующую страницу.
+    // карточку, «✓ Выполнено» возвращает на ту же страницу с баннером.
     let task = support::telegram::buttons(&bot.screen())
         .into_iter()
         .map(|(label, _)| label)
@@ -647,9 +719,8 @@ async fn lists_paginate_and_counters_follow_actions() {
         .expect("a task on the second page");
     bot.press(&task).await;
     bot.press("Выполнено").await;
-    bot.press("Назад").await;
+    bot.assert_screen_contains("✅ Выполнено:");
     bot.assert_screen_contains("Задачи · 8");
-
     bot.press("Назад").await;
     bot.assert_screen_contains("Семья · 8 задач");
     bot.assert_screen_contains("Выполнено сегодня: <b>1</b>");

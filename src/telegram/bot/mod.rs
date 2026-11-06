@@ -150,6 +150,11 @@ impl Banner {
         }
         blocks
     }
+
+    /// Поставить баннер первым блоком экрана.
+    fn prepend_to(self, ui: &mut Ui) {
+        ui.blocks.splice(0..0, self.blocks());
+    }
 }
 
 /// Состояние контекста на начало шага: нужно, чтобы вернуть его при откате.
@@ -251,7 +256,7 @@ impl Ctx<'_> {
     /// Показать готовый экран. `screen` запоминается для перерисовки.
     pub async fn show(&mut self, screen: &Screen, mut ui: Ui) -> Result<(), Fail> {
         if let Some(banner) = self.banner.take() {
-            ui.blocks.splice(0..0, banner.blocks());
+            banner.prepend_to(&mut ui);
         }
         let html = self.render(&ui, Scope::Screen, self.now).await?;
         let state = to_json(&screen.persisted())?;
@@ -1022,7 +1027,7 @@ mod tests {
             vec![button("↩️ Отменить", Action::Refresh)],
         );
         let mut ui = Ui::new().heading("Задачи · 1");
-        ui.blocks.splice(0..0, banner.blocks());
+        banner.prepend_to(&mut ui);
 
         let html = rich::render(&ui, &["t:0000000000000001".to_owned()]).html;
 

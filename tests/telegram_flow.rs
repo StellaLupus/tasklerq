@@ -4,10 +4,10 @@ mod support;
 
 use std::sync::Arc;
 
-use chrono::Duration;
+use chrono::{Duration, NaiveDate, TimeZone, Utc};
 use support::telegram::{Call, FakeTelegram, Harness, buttons};
-use support::{db, next_telegram_id};
-use tasklerq::domain::models::{Actor, ActorType, ItemPatch};
+use support::{TestHousehold, create_item, db, new_item, next_telegram_id, recurrence};
+use tasklerq::domain::models::{Actor, ActorType, ItemPatch, RecurrenceFreq, UserRole};
 use tasklerq::storage::repositories::items;
 use tasklerq::telegram::api::TelegramError;
 use tasklerq::telegram::bot::model::{Action, Screen, Ui};
@@ -70,6 +70,36 @@ async fn household_of(pool: &sqlx::PgPool, telegram_id: i64) -> uuid::Uuid {
     .fetch_one(pool)
     .await
     .expect("household")
+}
+
+async fn test_household(pool: &sqlx::PgPool, telegram_id: i64) -> TestHousehold {
+    let (household_id, owner_id): (uuid::Uuid, uuid::Uuid) = sqlx::query_as(
+        "SELECT household_id, id FROM users WHERE telegram_user_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(telegram_id)
+    .fetch_one(pool)
+    .await
+    .expect("user");
+    let list = |kind: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, uuid::Uuid>(
+                "SELECT id FROM lists WHERE household_id = $1 AND kind = $2::list_kind AND is_default",
+            )
+            .bind(household_id)
+            .bind(kind)
+            .fetch_one(&pool)
+            .await
+            .expect("list")
+        }
+    };
+    TestHousehold {
+        household_id,
+        owner_id,
+        member_id: owner_id,
+        tasks_list_id: list("tasks").await,
+        shopping_list_id: list("shopping").await,
+    }
 }
 
 /// Добавить покупку, отметить её купленной и очистить выполненные.
@@ -367,27 +397,126 @@ async fn free_text_offers_a_draft_and_cancel_discards_it() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn completing_shows_undo_and_next_occurrence_for_recurring_tasks() {
+async fn completing_from_the_card_returns_to_the_same_list_with_a_banner() {
     let db = db().await;
     let mut bot = onboarded(&db.pool).await;
 
-    bot.text("Полить цветы").await;
-    bot.press("Повторение").await;
-    bot.press("Каждый день").await;
-    bot.assert_screen_contains("Повторять каждые сколько?");
-    bot.press("Каждый раз").await;
-    bot.assert_screen_contains("Проверьте и сохраните");
-    bot.assert_screen_contains("🔁 Каждый день");
+    bot.text("Оплатить интернет").await;
     bot.press("Сохранить").await;
+    bot.text("Полить цветы").await;
+    bot.press("Сохранить").await;
+    bot.assert_screen_contains("Задачи · 2");
 
-    bot.press("Полить цветы").await;
+    bot.press("Оплатить интернет").await;
+    let (message_id, _) = bot.active();
     bot.press("Выполнено").await;
-    bot.assert_screen_contains("✅ Выполнено: Полить цветы");
-    bot.assert_screen_contains("Следующее:");
+
+    // Возврат в тот же список правит то же сообщение, а не присылает экран
+    // результата с одной кнопкой.
+    let (completed_id, html) = bot.active();
+    assert_eq!(
+        completed_id, message_id,
+        "completion must edit the card message"
+    );
+    assert!(html.contains("✅ Выполнено: Оплатить интернет"), "{html}");
+    assert!(html.contains("↩️ Отменить"), "{html}");
+    bot.assert_screen_contains("Задачи · 1");
+    bot.assert_screen_contains("Полить цветы");
+    assert!(
+        !buttons(&html).iter().any(|(label, _)| label == "К списку"),
+        "{html}"
+    );
+
+    // Отмена возвращает задачу в список и убирает баннер.
+    bot.press("Отменить").await;
+    bot.assert_screen_contains("Задачи · 2");
+    bot.assert_screen_contains("Оплатить интернет");
+    assert!(!bot.screen().contains("✅ Выполнено"), "{}", bot.screen());
+    let status: String = sqlx::query_scalar("SELECT status::text FROM items WHERE title = $1")
+        .bind("Оплатить интернет")
+        .fetch_one(&db.pool)
+        .await
+        .expect("status");
+    assert_eq!(status, "open");
+
+    // Баннер живёт до ближайшей отрисовки: переход его не показывает.
+    bot.press("Оплатить интернет").await;
+    bot.press("Выполнено").await;
+    bot.assert_screen_contains("✅ Выполнено: Оплатить интернет");
+    bot.press("Назад").await;
+    assert!(!bot.screen().contains("✅ Выполнено"), "{}", bot.screen());
+    bot.press("Задачи").await;
+    assert!(!bot.screen().contains("✅ Выполнено"), "{}", bot.screen());
+    bot.assert_screen_contains("Задачи · 1");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completing_a_recurring_task_shows_the_next_occurrence() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+
+    // Ежемесячная задача со сроком 5 ноября: следующее вхождение — 5 декабря.
+    let target = Utc
+        .with_ymd_and_hms(2025, 11, 5, 10, 0, 0)
+        .single()
+        .expect("fixed now");
+    bot.advance(target - bot.now);
+
+    let household = test_household(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut item = new_item(household.tasks_list_id, "Платить за квартиру");
+    item.due_date = Some(NaiveDate::from_ymd_opt(2025, 11, 5).expect("due date"));
+    item.recurrence = Some(recurrence(RecurrenceFreq::Monthly, Vec::new()));
+    create_item(&db.pool, &household, household.tasks_list_id, &actor, item).await;
+
+    bot.press("Задачи").await;
+    bot.press("Платить за квартиру").await;
+    bot.press("Выполнено").await;
+
+    bot.assert_screen_contains("✅ Выполнено: Платить за квартиру");
+    bot.assert_screen_contains("Следующее: пт, 5 дек");
     bot.assert_has_button("Отменить");
 
     bot.press("Отменить").await;
     bot.assert_screen_contains("Задачи · 1");
+    assert!(!bot.screen().contains("✅ Выполнено"), "{}", bot.screen());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saved_completed_state_falls_back_to_the_menu() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+
+    sqlx::query("UPDATE telegram_views SET state = $1 WHERE chat_id = $2")
+        .bind(serde_json::json!({
+            "t": "completed",
+            "item_id": uuid::Uuid::nil(),
+            "back": {"t": "menu"},
+        }))
+        .bind(bot.chat)
+        .execute(&db.pool)
+        .await
+        .expect("legacy completed state");
+
+    let data = action_callback(&bot, Action::Refresh).await;
+    let (message_id, _) = bot.active();
+    bot.press_data(&data, message_id).await;
+
+    bot.assert_screen_contains("0 задач");
+    assert!(
+        bot.fake
+            .answers()
+            .iter()
+            .all(|(_, text, alert)| text.is_none() && !alert),
+        "the legacy state must fall back without an error toast"
+    );
+    let state: serde_json::Value =
+        sqlx::query_scalar("SELECT state FROM telegram_views WHERE chat_id = $1")
+            .bind(bot.chat)
+            .fetch_one(&db.pool)
+            .await
+            .expect("saved state");
+    assert_eq!(state["t"], serde_json::json!("menu"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -100,13 +100,6 @@ pub enum Screen {
         /// Куда ведёт «Назад».
         back: Box<Screen>,
     },
-    /// Результат завершения задачи с кнопкой отмены.
-    Completed {
-        /// Элемент.
-        item_id: Uuid,
-        /// Куда ведёт «Назад».
-        back: Box<Screen>,
-    },
     /// Результат удаления с кнопкой отмены.
     Deleted {
         /// Элемент.
@@ -240,7 +233,6 @@ impl Screen {
             | Self::Processing { .. }
             | Self::Draft { .. } => 2,
             Self::Item { back, .. }
-            | Self::Completed { back, .. }
             | Self::Deleted { back, .. }
             | Self::ConfirmDelete { back, .. } => back.depth() + 1,
             Self::ConfirmClear { .. } | Self::Cleared { .. } => 3,
@@ -267,7 +259,6 @@ impl Screen {
             Self::Lists => "Все списки",
             Self::List { .. } => "Список",
             Self::Item { .. } => "Карточка",
-            Self::Completed { .. } => "Выполнено",
             Self::Deleted { .. } => "Удалено",
             Self::ConfirmDelete { .. } => "Удаление",
             Self::ConfirmClear { .. } => "Очистка",
@@ -307,7 +298,6 @@ impl Screen {
             | Self::Processing { .. }
             | Self::Draft { .. } => Vec::new(),
             Self::Item { back, .. }
-            | Self::Completed { back, .. }
             | Self::Deleted { back, .. }
             | Self::ConfirmDelete { back, .. } => {
                 let mut parents = back.parents();
@@ -1231,10 +1221,6 @@ mod tests {
         };
         let screens = vec![
             Screen::Item {
-                item_id: Uuid::nil(),
-                back: Box::new(list.clone()),
-            },
-            Screen::Completed {
                 item_id: Uuid::nil(),
                 back: Box::new(list.clone()),
             },

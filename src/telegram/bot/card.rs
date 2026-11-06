@@ -273,32 +273,6 @@ fn is_overdue(item: &Item, ctx: &Ctx<'_>) -> bool {
     }
 }
 
-/// Результат завершения задачи.
-pub async fn completed(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui, Fail> {
-    let (item, list) = load(ctx, item_id).await?;
-    let screen = Screen::Completed {
-        item_id,
-        back: Box::new(back.clone()),
-    };
-    let parent = matches!(back, Screen::List { .. }).then_some(list.name.as_str());
-    let mut ui = Ui::new()
-        .heading(screen.trail(&format!("✅ Выполнено: {}", clip(&item.title, 80)), parent));
-    if item.status == ItemStatus::Open
-        && let Some(next) = ru::due_label(item.due_at, item.due_date, ctx.tz, ctx.now)
-    {
-        ui = ui.text(format!("Следующее: {next}"));
-    }
-    let mut row = vec![button(
-        "↩️ Отменить",
-        Action::Undo {
-            item_id,
-            back: back.clone(),
-        },
-    )];
-    row.extend(nav_row(&screen, back.clone()));
-    Ok(ui.row(row))
-}
-
 /// Результат удаления с кнопкой отмены.
 pub async fn deleted(
     ctx: &mut Ctx<'_>,
@@ -390,11 +364,23 @@ pub async fn complete(
     .await?;
     let list = lists::get(&mut *ctx.conn, household.id, item.list_id).await?;
     if list.kind == ListKind::Tasks {
-        ctx.present(Screen::Completed {
-            item_id,
-            back: Box::new(back),
-        })
-        .await
+        let mut text = format!("✅ Выполнено: {}", clip(&item.title, 80));
+        if item.status == ItemStatus::Open
+            && let Some(next) = ru::due_label(item.due_at, item.due_date, ctx.tz, ctx.now)
+        {
+            text.push_str(&format!("\nСледующее: {next}"));
+        }
+        ctx.banner_with(
+            text,
+            vec![button(
+                "↩️ Отменить",
+                Action::Undo {
+                    item_id,
+                    back: back.clone(),
+                },
+            )],
+        );
+        ctx.present(back).await
     } else {
         ctx.toast(format!("Отмечено: {}", clip(&item.title, 60)));
         ctx.present(back).await

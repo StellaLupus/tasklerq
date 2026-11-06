@@ -248,22 +248,42 @@ impl TelegramApi for FakeTelegram {
 /// Разобрать кнопки сообщения: `(подпись, callback_data)`.
 pub fn buttons(html: &str) -> Vec<(String, String)> {
     let mut found = Vec::new();
-    let marker = "<tg-button type=\"callback_data\" data=\"";
     let mut rest = html;
-    while let Some(start) = rest.find(marker) {
-        let after = &rest[start + marker.len()..];
-        let Some(quote) = after.find('"') else { break };
-        let data = after[..quote].to_owned();
-        let Some(open) = after.find("\">") else { break };
-        let label_start = open + 2;
-        let Some(close) = after[label_start..].find("</tg-button>") else {
-            break;
-        };
-        let label = unescape(&after[label_start..label_start + close]);
-        found.push((label, data));
-        rest = &after[label_start + close..];
+    while let Some((button, consumed)) = next_button(rest) {
+        found.push(button);
+        rest = &rest[consumed..];
     }
     found
+}
+
+/// Разобрать ряды кнопок `tg-button-row`: по кнопкам в каждом ряду.
+pub fn button_rows(html: &str) -> Vec<Vec<(String, String)>> {
+    let mut rows = Vec::new();
+    let mut rest = html;
+    while let Some(start) = rest.find("<tg-button-row>") {
+        let after = &rest[start + "<tg-button-row>".len()..];
+        let Some(end) = after.find("</tg-button-row>") else {
+            break;
+        };
+        rows.push(buttons(&after[..end]));
+        rest = &after[end + "</tg-button-row>".len()..];
+    }
+    rows
+}
+
+/// Одна кнопка с начала строки и число занятых байт.
+fn next_button(rest: &str) -> Option<((String, String), usize)> {
+    let marker = "<tg-button type=\"callback_data\" data=\"";
+    let start = rest.find(marker)?;
+    let after = &rest[start + marker.len()..];
+    let quote = after.find('"')?;
+    let data = after[..quote].to_owned();
+    let open = after.find("\">")?;
+    let label_start = open + 2;
+    let close = after[label_start..].find("</tg-button>")?;
+    let label = unescape(&after[label_start..label_start + close]);
+    let consumed = start + marker.len() + label_start + close + "</tg-button>".len();
+    Some(((label, data), consumed))
 }
 
 pub fn unescape(text: &str) -> String {

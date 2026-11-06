@@ -32,7 +32,6 @@ pub async fn build(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
             edit,
         } => list(ctx, *list_id, *page, *edit).await,
         Screen::Item { item_id, back } => card::view(ctx, *item_id, back).await,
-        Screen::Completed { item_id, back } => card::completed(ctx, *item_id, back).await,
         Screen::Deleted {
             item_id,
             title,

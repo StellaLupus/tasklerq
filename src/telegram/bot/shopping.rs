@@ -42,7 +42,7 @@ pub async fn list_view(ctx: &mut Ctx<'_>, list: &List, page: u32, edit: bool) ->
         .filter(|item| item.status == ItemStatus::Open)
         .count();
 
-    let heading = if edit {
+    let heading = if edit && !all.is_empty() {
         format!("{} · {}", list.name, ru::EDIT_MODE_TITLE)
     } else {
         format!("{} · {open}", list.name)
