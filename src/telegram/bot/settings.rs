@@ -36,13 +36,6 @@ fn zone_label(user: &User, household: &Household) -> String {
     }
 }
 
-/// Заголовок подтверждения с путём. Если крошка обрезала вопрос, он
-/// повторяется целиком отдельным абзацем: получатель и действие должны
-/// оставаться видимыми.
-fn confirm_heading(screen: &Screen, question: &str) -> Ui {
-    screen_heading(screen, question, None)
-}
-
 /// Какая правка тихих часов запускает ручной выпуск отложенных.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ReleaseTrigger {
@@ -451,7 +444,7 @@ async fn confirm_revoke(ctx: &mut Ctx<'_>, token_id: Uuid) -> Result<Ui, Fail> {
         .ok_or(DomainError::NotFound)?;
     let screen = Screen::ConfirmRevokeToken { token_id };
     let question = ru::confirm_revoke_token(&clip(&token.name, 40), &token.prefix);
-    Ok(confirm_heading(&screen, &question)
+    Ok(screen_heading(&screen, &question, None)
         .text(ru::TOKEN_STOPS_WORKING)
         .row({
             let mut row = vec![button("Отозвать", Action::RevokeToken { token_id })];
@@ -484,7 +477,7 @@ async fn confirm_remove(ctx: &mut Ctx<'_>, user_id: Uuid) -> Result<Ui, Fail> {
     let member = users::get(&mut *ctx.conn, household_id, user_id).await?;
     let screen = Screen::ConfirmRemove { user_id };
     let question = format!("Удалить участника «{}»?", clip(&member.display_name, 40));
-    Ok(confirm_heading(&screen, &question)
+    Ok(screen_heading(&screen, &question, None)
         .text("Доступ прекратится сразу, назначенные задачи останутся без исполнителя.")
         .row({
             let mut row = vec![button("🗑 Да, удалить", Action::MemberRemove { user_id })];
@@ -499,7 +492,7 @@ async fn confirm_transfer(ctx: &mut Ctx<'_>, user_id: Uuid) -> Result<Ui, Fail> 
     let member = users::get(&mut *ctx.conn, household_id, user_id).await?;
     let screen = Screen::ConfirmTransfer { user_id };
     let question = format!("Передать владение «{}»?", clip(&member.display_name, 40));
-    Ok(confirm_heading(&screen, &question)
+    Ok(screen_heading(&screen, &question, None)
         .text("Вы станете обычным участником и не сможете управлять семьёй.")
         .row({
             let mut row = vec![button("👑 Да, передать", Action::Transfer { user_id })];

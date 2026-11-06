@@ -53,7 +53,13 @@ pub async fn list_view(
     } else {
         format!("{} · {open}", list.name)
     };
-    let mut ui = Ui::new().heading(heading);
+    let trail = Screen::List {
+        list_id: list.id,
+        page: 0,
+        edit,
+        from_lists,
+    }
+    .trail(&heading, None);
     let add = button(
         "➕ Добавить",
         Action::Add {
@@ -72,8 +78,12 @@ pub async fn list_view(
             },
             list_back(from_lists),
         ));
-        return Ok(ui.text("Список покупок пуст").row(row));
+        return Ok(Ui::new()
+            .heading(trail)
+            .text("Список покупок пуст")
+            .row(row));
     }
+    let mut ui = Ui::new().heading(trail);
 
     let pages = all.len().div_ceil(PAGE_SIZE).max(1);
     let page = usize::try_from(page).unwrap_or(0).min(pages - 1);
@@ -134,7 +144,13 @@ pub async fn list_view(
 
     let mut footer = vec![add];
     if all.iter().any(|item| item.status == ItemStatus::Done) {
-        footer.push(button("🧹 Очистить", Action::ClearAsk { list_id: list.id }));
+        footer.push(button(
+            "🧹 Очистить",
+            Action::ClearAsk {
+                list_id: list.id,
+                from_lists,
+            },
+        ));
     }
     footer.push(button(
         if edit {
@@ -168,7 +184,7 @@ async fn done_items(ctx: &mut Ctx<'_>, list_id: Uuid) -> Result<(List, Vec<Item>
 }
 
 /// Очистить выполненные позиции: с подтверждением, если их много.
-pub async fn clear_ask(ctx: &mut Ctx<'_>, list_id: Uuid) -> Result<(), Fail> {
+pub async fn clear_ask(ctx: &mut Ctx<'_>, list_id: Uuid, from_lists: bool) -> Result<(), Fail> {
     let (_, done) = done_items(ctx, list_id).await?;
     if done.is_empty() {
         ctx.toast("Нечего очищать");
@@ -177,28 +193,42 @@ pub async fn clear_ask(ctx: &mut Ctx<'_>, list_id: Uuid) -> Result<(), Fail> {
                 list_id,
                 page: 0,
                 edit: false,
-                from_lists: false,
+                from_lists,
             })
             .await;
     }
     if done.len() > CONFIRM_ABOVE {
-        return ctx.present(Screen::ConfirmClear { list_id }).await;
+        return ctx
+            .present(Screen::ConfirmClear {
+                list_id,
+                from_lists,
+            })
+            .await;
     }
-    clear_do(ctx, list_id).await
+    clear_do(ctx, list_id, from_lists).await
 }
 
 /// Подтверждение очистки.
-pub async fn confirm_clear(ctx: &mut Ctx<'_>, list_id: Uuid) -> Result<Ui, Fail> {
+pub async fn confirm_clear(ctx: &mut Ctx<'_>, list_id: Uuid, from_lists: bool) -> Result<Ui, Fail> {
     let (list, done) = done_items(ctx, list_id).await?;
-    let screen = Screen::ConfirmClear { list_id };
-    let mut row = vec![button("🧹 Да, очистить", Action::ClearDo { list_id })];
+    let screen = Screen::ConfirmClear {
+        list_id,
+        from_lists,
+    };
+    let mut row = vec![button(
+        "🧹 Да, очистить",
+        Action::ClearDo {
+            list_id,
+            from_lists,
+        },
+    )];
     row.extend(nav_row(
         &screen,
         Screen::List {
             list_id,
             page: 0,
             edit: false,
-            from_lists: false,
+            from_lists,
         },
     ));
     Ok(screen_heading(
@@ -217,7 +247,7 @@ pub async fn confirm_clear(ctx: &mut Ctx<'_>, list_id: Uuid) -> Result<Ui, Fail>
 }
 
 /// Удалить выполненные позиции.
-pub async fn clear_do(ctx: &mut Ctx<'_>, list_id: Uuid) -> Result<(), Fail> {
+pub async fn clear_do(ctx: &mut Ctx<'_>, list_id: Uuid, from_lists: bool) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
     let actor = ctx.actor()?;
     let (_, done) = done_items(ctx, list_id).await?;
@@ -228,7 +258,7 @@ pub async fn clear_do(ctx: &mut Ctx<'_>, list_id: Uuid) -> Result<(), Fail> {
                 list_id,
                 page: 0,
                 edit: false,
-                from_lists: false,
+                from_lists,
             })
             .await;
     }
@@ -240,12 +270,18 @@ pub async fn clear_do(ctx: &mut Ctx<'_>, list_id: Uuid) -> Result<(), Fail> {
     ctx.present(Screen::Cleared {
         list_id,
         item_ids: removed,
+        from_lists,
     })
     .await
 }
 
 /// Результат очистки с кнопкой отмены.
-pub async fn cleared(ctx: &mut Ctx<'_>, list_id: Uuid, item_ids: &[Uuid]) -> Result<Ui, Fail> {
+pub async fn cleared(
+    ctx: &mut Ctx<'_>,
+    list_id: Uuid,
+    item_ids: &[Uuid],
+    from_lists: bool,
+) -> Result<Ui, Fail> {
     let household_id = ctx.household()?.id;
     let parent = match lists::get_visible(&mut *ctx.conn, household_id, list_id).await {
         Ok(list) => Some(list.name),
@@ -255,12 +291,14 @@ pub async fn cleared(ctx: &mut Ctx<'_>, list_id: Uuid, item_ids: &[Uuid]) -> Res
     let screen = Screen::Cleared {
         list_id,
         item_ids: item_ids.to_vec(),
+        from_lists,
     };
     let mut row = vec![button(
         "↩️ Отменить",
         Action::ClearUndo {
             list_id,
             item_ids: item_ids.to_vec(),
+            from_lists,
         },
     )];
     row.extend(nav_row(
@@ -269,7 +307,7 @@ pub async fn cleared(ctx: &mut Ctx<'_>, list_id: Uuid, item_ids: &[Uuid]) -> Res
             list_id,
             page: 0,
             edit: false,
-            from_lists: false,
+            from_lists,
         },
     ));
     Ok(screen_heading(
@@ -284,7 +322,12 @@ pub async fn cleared(ctx: &mut Ctx<'_>, list_id: Uuid, item_ids: &[Uuid]) -> Res
 }
 
 /// Вернуть очищенные позиции в течение окна отмены.
-pub async fn clear_undo(ctx: &mut Ctx<'_>, list_id: Uuid, item_ids: &[Uuid]) -> Result<(), Fail> {
+pub async fn clear_undo(
+    ctx: &mut Ctx<'_>,
+    list_id: Uuid,
+    item_ids: &[Uuid],
+    from_lists: bool,
+) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
     let mut restored = 0_i64;
     let mut expired = false;
@@ -313,7 +356,7 @@ pub async fn clear_undo(ctx: &mut Ctx<'_>, list_id: Uuid, item_ids: &[Uuid]) -> 
             list_id,
             page: 0,
             edit: false,
-            from_lists: false,
+            from_lists,
         }
     } else {
         Screen::Menu

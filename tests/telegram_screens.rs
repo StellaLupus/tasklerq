@@ -706,6 +706,169 @@ async fn clearing_many_purchases_needs_confirmation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shopping_list_from_all_lists_keeps_the_trail_and_returns_there() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        new_item(household.shopping_list_id, "Молоко"),
+    )
+    .await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+    lists::create(
+        &mut conn,
+        household.household_id,
+        ListKind::Checklist,
+        "Дача",
+        Utc::now(),
+    )
+    .await
+    .expect("extra list");
+    drop(conn);
+
+    // Перерисовать меню: третий список включает «🗂 Все списки».
+    bot.text("/start").await;
+    bot.press("Все списки").await;
+    bot.press("Покупки").await;
+    assert!(
+        bot.screen().contains("<h3>Все списки › Покупки · 1</h3>"),
+        "a shopping list opened from «Все списки» must keep that parent in its trail:\n{}",
+        bot.screen()
+    );
+    bot.assert_has_button("⬅️ Назад");
+    bot.assert_has_button("🏠 Меню");
+
+    // Карточка из такого списка тоже показывает полный путь.
+    bot.press("Править").await;
+    bot.press("Молоко").await;
+    bot.assert_screen_contains("Все списки › Покупки › Молоко");
+    bot.press("Назад").await;
+    assert!(
+        bot.screen()
+            .contains("<h3>Все списки › Покупки · правка</h3>"),
+        "the card must return to the list opened from «Все списки»:\n{}",
+        bot.screen()
+    );
+
+    bot.press("Назад").await;
+    bot.assert_screen_contains("<h3>Все списки</h3>");
+
+    // Список из меню по-прежнему без «Все списки».
+    bot.press("Назад").await;
+    bot.press("Покупки").await;
+    assert!(
+        bot.screen().contains("<h3>Покупки · 1</h3>"),
+        "a shopping list opened from the menu must not claim «Все списки» as parent:\n{}",
+        bot.screen()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clearing_purchases_from_all_lists_keeps_the_origin() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    for n in 0..6 {
+        let item = create_item(
+            &db.pool,
+            &household,
+            household.shopping_list_id,
+            &actor,
+            new_item(household.shopping_list_id, &format!("Товар {n}")),
+        )
+        .await;
+        sqlx::query("UPDATE items SET status = 'done', completed_at = now() WHERE id = $1")
+            .bind(item.id)
+            .execute(&db.pool)
+            .await
+            .expect("done");
+    }
+    let mut conn = db.pool.acquire().await.expect("connection");
+    lists::create(
+        &mut conn,
+        household.household_id,
+        ListKind::Checklist,
+        "Дача",
+        Utc::now(),
+    )
+    .await
+    .expect("extra list");
+    drop(conn);
+
+    bot.text("/start").await;
+    bot.press("Все списки").await;
+    bot.press("Покупки").await;
+    bot.press("Очистить").await;
+    bot.assert_screen_contains("Все списки › Покупки › Удалить 6 позиций?");
+    bot.press("Да, очистить").await;
+    bot.assert_screen_contains("Все списки › Покупки › Убрано: 6 позиций");
+    bot.press("Назад").await;
+    assert!(
+        bot.screen().contains("<h3>Все списки › Покупки · 0</h3>"),
+        "after clearing, «Назад» must return to the list opened from «Все списки»:\n{}",
+        bot.screen()
+    );
+    bot.assert_screen_contains("Список покупок пуст");
+    bot.press("Назад").await;
+    bot.assert_screen_contains("<h3>Все списки</h3>");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undoing_cleared_purchases_from_all_lists_keeps_the_origin() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    for n in 0..6 {
+        let item = create_item(
+            &db.pool,
+            &household,
+            household.shopping_list_id,
+            &actor,
+            new_item(household.shopping_list_id, &format!("Товар {n}")),
+        )
+        .await;
+        sqlx::query("UPDATE items SET status = 'done', completed_at = now() WHERE id = $1")
+            .bind(item.id)
+            .execute(&db.pool)
+            .await
+            .expect("done");
+    }
+    let mut conn = db.pool.acquire().await.expect("connection");
+    lists::create(
+        &mut conn,
+        household.household_id,
+        ListKind::Checklist,
+        "Дача",
+        Utc::now(),
+    )
+    .await
+    .expect("extra list");
+    drop(conn);
+
+    bot.text("/start").await;
+    bot.press("Все списки").await;
+    bot.press("Покупки").await;
+    bot.press("Очистить").await;
+    bot.press("Да, очистить").await;
+    bot.assert_screen_contains("Все списки › Покупки › Убрано: 6 позиций");
+    bot.press("Отменить").await;
+    assert!(
+        bot.screen().contains("<h3>Все списки › Покупки · 0</h3>"),
+        "after undo, «Назад» must return to the list opened from «Все списки»:\n{}",
+        bot.screen()
+    );
+    bot.press("Назад").await;
+    bot.assert_screen_contains("<h3>Все списки</h3>");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lists_paginate_and_counters_follow_actions() {
     let db = db().await;
     let mut bot = onboarded_named(&db.pool, "Alice").await;

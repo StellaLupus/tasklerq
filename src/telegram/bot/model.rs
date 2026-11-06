@@ -124,6 +124,10 @@ pub enum Screen {
     ConfirmClear {
         /// Список.
         list_id: Uuid,
+        /// Список открыт с экрана «Все списки». Старое состояние без поля
+        /// читается как список из меню.
+        #[serde(default)]
+        from_lists: bool,
     },
     /// Результат очистки с кнопкой отмены.
     Cleared {
@@ -131,6 +135,10 @@ pub enum Screen {
         list_id: Uuid,
         /// Удалённые позиции.
         item_ids: Vec<Uuid>,
+        /// Список открыт с экрана «Все списки». Старое состояние без поля
+        /// читается как список из меню.
+        #[serde(default)]
+        from_lists: bool,
     },
     /// Подтверждение удаления участника.
     ConfirmRemove {
@@ -245,6 +253,12 @@ impl Screen {
             Self::Item { back, .. }
             | Self::Deleted { back, .. }
             | Self::ConfirmDelete { back, .. } => back.depth() + 1,
+            Self::ConfirmClear {
+                from_lists: true, ..
+            }
+            | Self::Cleared {
+                from_lists: true, ..
+            } => 4,
             Self::ConfirmClear { .. } | Self::Cleared { .. } => 3,
             Self::Profile
             | Self::Danger
@@ -321,6 +335,12 @@ impl Screen {
                 parents.push(back.crumb());
                 parents
             }
+            Self::ConfirmClear {
+                from_lists: true, ..
+            }
+            | Self::Cleared {
+                from_lists: true, ..
+            } => vec!["Все списки", "Список"],
             Self::ConfirmClear { .. } | Self::Cleared { .. } => vec!["Список"],
             Self::Notifications
             | Self::Family
@@ -584,11 +604,19 @@ pub enum Action {
     ClearAsk {
         /// Список.
         list_id: Uuid,
+        /// Список открыт с экрана «Все списки». Старый токен без поля
+        /// читается как список из меню.
+        #[serde(default)]
+        from_lists: bool,
     },
     /// Очистить выполненные.
     ClearDo {
         /// Список.
         list_id: Uuid,
+        /// Список открыт с экрана «Все списки». Старый токен без поля
+        /// читается как список из меню.
+        #[serde(default)]
+        from_lists: bool,
     },
     /// Отменить очистку выполненных.
     ClearUndo {
@@ -596,6 +624,10 @@ pub enum Action {
         list_id: Uuid,
         /// Удалённые позиции.
         item_ids: Vec<Uuid>,
+        /// Список открыт с экрана «Все списки». Старый токен без поля
+        /// читается как список из меню.
+        #[serde(default)]
+        from_lists: bool,
     },
     /// Начать ввод поискового запроса.
     SearchStart,
@@ -1288,6 +1320,49 @@ mod tests {
     }
 
     #[test]
+    fn old_clear_json_without_origin_is_read_as_opened_from_menu() {
+        let confirm: Screen = serde_json::from_value(json!({
+            "t": "confirm_clear",
+            "list_id": Uuid::nil(),
+        }))
+        .expect("legacy confirm clear screen");
+        assert_eq!(
+            confirm,
+            Screen::ConfirmClear {
+                list_id: Uuid::nil(),
+                from_lists: false,
+            }
+        );
+        let cleared: Screen = serde_json::from_value(json!({
+            "t": "cleared",
+            "list_id": Uuid::nil(),
+            "item_ids": [],
+        }))
+        .expect("legacy cleared screen");
+        assert_eq!(
+            cleared,
+            Screen::Cleared {
+                list_id: Uuid::nil(),
+                item_ids: Vec::new(),
+                from_lists: false,
+            }
+        );
+
+        let action: Action = serde_json::from_value(json!({
+            "a": "clear_do",
+            "list_id": Uuid::nil(),
+        }))
+        .expect("legacy clear action");
+        assert_eq!(
+            action,
+            Action::ClearDo {
+                list_id: Uuid::nil(),
+                from_lists: false,
+            }
+        );
+    }
+
+    #[test]
     fn deleted_screen_ignores_the_legacy_shopping_field() {
         let with_legacy: Screen = serde_json::from_value(json!({
             "t": "deleted",
@@ -1331,10 +1406,12 @@ mod tests {
             },
             Screen::ConfirmClear {
                 list_id: Uuid::nil(),
+                from_lists: false,
             },
             Screen::Cleared {
                 list_id: Uuid::nil(),
                 item_ids: Vec::new(),
+                from_lists: false,
             },
             Screen::Notifications,
             Screen::LeadTime,

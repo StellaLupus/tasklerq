@@ -45,10 +45,15 @@ pub async fn build(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
             status,
             page,
         } => results(ctx, query, *status, *page).await,
-        Screen::ConfirmClear { list_id } => super::shopping::confirm_clear(ctx, *list_id).await,
-        Screen::Cleared { list_id, item_ids } => {
-            super::shopping::cleared(ctx, *list_id, item_ids).await
-        }
+        Screen::ConfirmClear {
+            list_id,
+            from_lists,
+        } => super::shopping::confirm_clear(ctx, *list_id, *from_lists).await,
+        Screen::Cleared {
+            list_id,
+            item_ids,
+            from_lists,
+        } => super::shopping::cleared(ctx, *list_id, item_ids, *from_lists).await,
         Screen::Settings
         | Screen::Profile
         | Screen::Danger

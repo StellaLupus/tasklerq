@@ -969,6 +969,7 @@ async fn repeated_clear_undo_reports_that_there_is_nothing_to_undo() {
         Action::ClearUndo {
             list_id,
             item_ids: vec![item_id],
+            from_lists: false,
         },
     )
     .await;
@@ -1010,6 +1011,7 @@ async fn stale_clear_undo_does_not_undo_a_later_completion() {
         Action::ClearUndo {
             list_id,
             item_ids: vec![item_id],
+            from_lists: false,
         },
     )
     .await;

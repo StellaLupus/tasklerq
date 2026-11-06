@@ -942,11 +942,19 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
         } => forms::start_edit(ctx, item_id, step, back).await,
         Action::Form { act } => forms::on_action(ctx, act).await,
 
-        Action::ClearAsk { list_id } => shopping::clear_ask(ctx, list_id).await,
-        Action::ClearDo { list_id } => shopping::clear_do(ctx, list_id).await,
-        Action::ClearUndo { list_id, item_ids } => {
-            shopping::clear_undo(ctx, list_id, &item_ids).await
-        }
+        Action::ClearAsk {
+            list_id,
+            from_lists,
+        } => shopping::clear_ask(ctx, list_id, from_lists).await,
+        Action::ClearDo {
+            list_id,
+            from_lists,
+        } => shopping::clear_do(ctx, list_id, from_lists).await,
+        Action::ClearUndo {
+            list_id,
+            item_ids,
+            from_lists,
+        } => shopping::clear_undo(ctx, list_id, &item_ids, from_lists).await,
 
         Action::SearchStart => forms::start_search(ctx).await,
         Action::RenameStart => forms::start_rename(ctx).await,
