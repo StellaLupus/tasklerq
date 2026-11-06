@@ -39,6 +39,10 @@ use model::{Action, Form, Screen, Ui};
 /// Часовой пояс, если ни у пользователя, ни у household его нет.
 const FALLBACK_TIMEZONE: &str = "Europe/Moscow";
 
+/// Ответ на устаревшую версию элемента: показывается актуальное состояние.
+pub(super) const CHANGED_STATE_MESSAGE: &str =
+    "Данные уже изменились. Показываю актуальное состояние.";
+
 /// Ответ на нажатие кнопки.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Answer {
@@ -106,9 +110,7 @@ impl From<DomainError> for Fail {
             }
             DomainError::NotFound => Self::User("Не нашёл это — возможно, оно уже удалено.".into()),
             DomainError::Forbidden(_) => Self::User("Недостаточно прав для этого действия.".into()),
-            DomainError::Conflict { .. } => {
-                Self::User("Данные уже изменились. Показываю актуальное состояние.".into())
-            }
+            DomainError::Conflict { .. } => Self::User(CHANGED_STATE_MESSAGE.into()),
         }
     }
 }
@@ -940,6 +942,17 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
             step,
             back,
         } => forms::start_edit(ctx, item_id, step, back).await,
+        Action::DueSet {
+            item_id,
+            version,
+            due,
+            back,
+        } => card::set_due(ctx, item_id, version, due, back).await,
+        Action::DueText {
+            item_id,
+            version,
+            back,
+        } => forms::start_due_text(ctx, item_id, version, back).await,
         Action::Form { act } => forms::on_action(ctx, act).await,
 
         Action::ClearAsk {

@@ -487,13 +487,7 @@ async fn update_inner(
 
     let updated = load_item(conn, household_id, item_id).await?;
     let recurrence_rule_changed = match (&recurrence, &old_recurrence) {
-        (Some(new), Some(old)) => {
-            let mut new = new.clone();
-            let mut old = old.clone();
-            new.occurrence_date = None;
-            old.occurrence_date = None;
-            new != old
-        }
+        (Some(new), Some(old)) => !new.same_rule(old),
         (None, None) => false,
         _ => true,
     };

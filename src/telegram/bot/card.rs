@@ -3,18 +3,23 @@
 
 use std::collections::HashMap;
 
-use chrono::Datelike;
+use chrono::{DateTime, Datelike, Duration, Utc};
+use chrono_tz::Tz;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::models::{
-    Item, ItemPriority, ItemStatus, List, ListKind, MonthRule, Recurrence, RecurrenceFreq,
+    Field, Item, ItemPatch, ItemPriority, ItemStatus, List, ListKind, MonthRule, Recurrence,
+    RecurrenceFreq,
 };
+use crate::domain::recurrence::{Due, resolve_local};
 use crate::storage::repositories::{items, lists, users};
 use crate::telegram::rich::{Span, button};
 use crate::telegram::ru;
 
-use super::model::{Action, RecurrenceDraft, Screen, Step, Ui, screen_heading};
+use super::model::{
+    Action, QuickDue, RecurrenceDraft, Screen, Step, Ui, screen_heading, screen_heading_with,
+};
 use super::screens::{clip, nav_row};
 use super::{Ctx, Fail};
 
@@ -230,6 +235,15 @@ pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui,
             back: back.clone(),
         },
     );
+    let due_button = button(
+        "📅 Срок",
+        Action::Go {
+            to: Screen::Due {
+                item_id,
+                back: Box::new(back.clone()),
+            },
+        },
+    );
 
     if shopping {
         ui = ui
@@ -242,10 +256,7 @@ pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui,
     } else {
         ui = ui
             .row(vec![main, edit("✏️ Изменить", Step::Title)])
-            .row(vec![
-                edit("📅 Срок", Step::Due),
-                edit("🔴 Приоритет", Step::Priority),
-            ])
+            .row(vec![due_button, edit("🔴 Приоритет", Step::Priority)])
             .row(vec![
                 edit("👤 Исполнитель", Step::Assignee),
                 edit("🏷 Теги", Step::Tags),
@@ -258,6 +269,182 @@ pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui,
             .row(vec![delete]);
     }
     Ok(ui.row(nav_row(&here, back.clone())))
+}
+
+/// Экран быстрого срока.
+pub async fn due(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui, Fail> {
+    let (item, list) = load(ctx, item_id).await?;
+    let here = Screen::Due {
+        item_id,
+        back: Box::new(back.clone()),
+    };
+    let title = clip(&item.title, 40);
+    let mut parents = Vec::new();
+    if matches!(back, Screen::List { .. }) {
+        parents.push(list.name.as_str());
+    }
+    parents.push(title.as_str());
+    let mut ui = screen_heading_with(&here, "Срок", &parents);
+    match ru::due_label(item.due_at, item.due_date, ctx.tz, ctx.now) {
+        Some(due) => ui = ui.text(format!("Сейчас: {due}")),
+        None => ui = ui.text("Сейчас без срока"),
+    }
+
+    let quick = |label: &str, due: QuickDue| {
+        button(
+            label,
+            Action::DueSet {
+                item_id,
+                version: item.version,
+                due,
+                back: back.clone(),
+            },
+        )
+    };
+    ui = ui
+        .row(vec![
+            quick("Сегодня", QuickDue::Today),
+            quick("Завтра", QuickDue::Tomorrow),
+        ])
+        .row(vec![
+            quick("+1 неделя", QuickDue::WeekLater),
+            button(
+                "📅 Дата и время",
+                Action::DueText {
+                    item_id,
+                    version: item.version,
+                    back: back.clone(),
+                },
+            ),
+        ]);
+    if item.recurrence.is_none() {
+        ui = ui.row(vec![quick("Без срока", QuickDue::None)]);
+    }
+    let card = Screen::Item {
+        item_id,
+        back: Box::new(back.clone()),
+    };
+    Ok(ui.row(nav_row(&here, card)))
+}
+
+/// Сохранить выбранный быстрый срок и вернуться в карточку.
+pub async fn set_due(
+    ctx: &mut Ctx<'_>,
+    item_id: Uuid,
+    version: i32,
+    choice: QuickDue,
+    back: Screen,
+) -> Result<(), Fail> {
+    if choice != QuickDue::None {
+        let (item, _) = load(ctx, item_id).await?;
+        let due = quick_due(&item, choice, ctx.now, ctx.tz)?;
+        return apply_due(ctx, item_id, version, due, back).await;
+    }
+
+    let household = ctx.household()?.clone();
+    let actor = ctx.actor()?;
+    let (item, _) = load(ctx, item_id).await?;
+    let patch = if item.due_at.is_some() {
+        ItemPatch {
+            due_at: Field::Null,
+            ..ItemPatch::default()
+        }
+    } else if item.due_date.is_some() {
+        ItemPatch {
+            due_date: Field::Null,
+            ..ItemPatch::default()
+        }
+    } else {
+        ItemPatch::default()
+    };
+    let saved = items::update(
+        &mut *ctx.conn,
+        household.id,
+        &actor,
+        item_id,
+        version,
+        patch,
+        &household.timezone,
+        ctx.now,
+    )
+    .await;
+    finish_due(ctx, item_id, saved, back).await
+}
+
+/// Перенести срок через `reschedule_occurrence` и вернуться в карточку.
+pub async fn apply_due(
+    ctx: &mut Ctx<'_>,
+    item_id: Uuid,
+    version: i32,
+    due: Due,
+    back: Screen,
+) -> Result<(), Fail> {
+    let household = ctx.household()?.clone();
+    let actor = ctx.actor()?;
+    let saved = items::reschedule_occurrence(
+        &mut *ctx.conn,
+        household.id,
+        &actor,
+        item_id,
+        version,
+        due,
+        &household.timezone,
+        ctx.now,
+    )
+    .await;
+    finish_due(ctx, item_id, saved, back).await
+}
+
+/// Баннер нового срока и карточка; конфликт показывает актуальную карточку.
+async fn finish_due(
+    ctx: &mut Ctx<'_>,
+    item_id: Uuid,
+    saved: Result<Item, DomainError>,
+    back: Screen,
+) -> Result<(), Fail> {
+    match saved {
+        Ok(item) => match ru::due_label(item.due_at, item.due_date, ctx.tz, ctx.now) {
+            Some(due) => ctx.banner(format!("Срок: {due}")),
+            None => ctx.banner("Срок снят"),
+        },
+        Err(DomainError::Conflict { .. }) => {
+            ctx.banner(super::CHANGED_STATE_MESSAGE);
+        }
+        Err(error) => return Err(error.into()),
+    }
+    ctx.present(Screen::Item {
+        item_id,
+        back: Box::new(back),
+    })
+    .await
+}
+
+/// Срок по кнопке быстрого выбора. Время суток и вседневность сохраняются.
+fn quick_due(
+    item: &Item,
+    choice: QuickDue,
+    now: DateTime<Utc>,
+    tz: Tz,
+) -> Result<Due, DomainError> {
+    let today = now.with_timezone(&tz).date_naive();
+    let current = item
+        .due_at
+        .map(|at| at.with_timezone(&tz).date_naive())
+        .or(item.due_date);
+    let date = match choice {
+        QuickDue::Today => today,
+        QuickDue::Tomorrow => today + Duration::days(1),
+        QuickDue::WeekLater => current.map_or(today, |date| date.max(today)) + Duration::days(7),
+        QuickDue::None => unreachable!("«Без срока» не использует дату правила"),
+    };
+    match item.due_at {
+        Some(at) => Ok(Due::Timed(resolve_local(
+            tz,
+            date,
+            at.with_timezone(&tz).time(),
+        )?)),
+        None => Ok(Due::AllDay(date)),
+    }
 }
 
 fn is_overdue(item: &Item, ctx: &Ctx<'_>) -> bool {

@@ -187,6 +187,26 @@ pub async fn start_edit(
     .await
 }
 
+/// Начать ввод даты и времени для быстрого срока.
+pub async fn start_due_text(
+    ctx: &mut Ctx<'_>,
+    item_id: Uuid,
+    version: i32,
+    back: Screen,
+) -> Result<(), Fail> {
+    let household_id = ctx.household()?.id;
+    items::get(&mut *ctx.conn, household_id, item_id).await?;
+    open(
+        ctx,
+        Form::DueText {
+            item_id,
+            version,
+            back,
+        },
+    )
+    .await
+}
+
 /// Начать ввод поискового запроса.
 pub async fn start_search(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
     ctx.user()?;

@@ -511,6 +511,22 @@ async fn item_state(pool: &PgPool, item_id: Uuid) -> (i32, String) {
         .expect("item state")
 }
 
+async fn item_due(pool: &PgPool, item_id: Uuid) -> (Option<DateTime<Utc>>, Option<NaiveDate>) {
+    sqlx::query_as("SELECT due_at, due_date FROM items WHERE id = $1")
+        .bind(item_id)
+        .fetch_one(pool)
+        .await
+        .expect("item due")
+}
+
+async fn saved_screen(pool: &PgPool, chat_id: i64) -> serde_json::Value {
+    sqlx::query_scalar("SELECT state FROM telegram_views WHERE chat_id = $1")
+        .bind(chat_id)
+        .fetch_one(pool)
+        .await
+        .expect("saved screen")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shopping_row_toggles_the_purchase_and_stays_in_the_list() {
     let db = db().await;
@@ -3882,5 +3898,387 @@ async fn long_member_name_keeps_the_full_confirmation_question() {
         screen.matches(&question).count(),
         1,
         "the confirmation question must not be duplicated:\n{screen}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quick_due_tomorrow_keeps_the_time_and_returns_to_the_card() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(moscow, today, 12, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut input = new_item(household.tasks_list_id, "Оплатить интернет");
+    input.due_at = Some(local_utc(moscow, today, 18, 0));
+    let task = create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
+
+    bot.press("Задачи").await;
+    bot.press("Оплатить интернет").await;
+    bot.press("Срок").await;
+    for label in [
+        "Сегодня",
+        "Завтра",
+        "+1 неделя",
+        "Дата и время",
+        "Без срока",
+    ] {
+        bot.assert_has_button(label);
+    }
+
+    bot.press("Завтра").await;
+    bot.assert_screen_contains("Срок: завтра, 18:00");
+    bot.assert_screen_contains("Задачи › Оплатить интернет");
+    bot.assert_has_button("Выполнено");
+    assert!(
+        !bot.screen().contains("Сохранить"),
+        "quick due saves without a save button:\n{}",
+        bot.screen()
+    );
+    assert_eq!(
+        item_due(&db.pool, task.id).await,
+        (
+            Some(local_utc(moscow, today + Duration::days(1), 18, 0)),
+            None
+        ),
+        "the local time of day is kept"
+    );
+    assert_eq!(
+        saved_screen(&db.pool, bot.chat).await["t"],
+        serde_json::json!("item"),
+        "the active screen is the card"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quick_due_text_moves_only_the_recurring_occurrence() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 5).expect("date");
+    let now = local_utc(moscow, today, 9, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut input = new_item(household.tasks_list_id, "Оплатить счета");
+    input.due_date = Some(today);
+    input.recurrence = Some(support::recurrence(
+        tasklerq::domain::models::RecurrenceFreq::Monthly,
+        Vec::new(),
+    ));
+    let task = create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
+
+    bot.press("Задачи").await;
+    bot.press("Оплатить счета").await;
+    bot.press("Срок").await;
+    bot.press("Дата и время").await;
+    bot.assert_screen_contains("Введите срок");
+    bot.text("07.03").await;
+
+    bot.assert_screen_contains("Срок: послезавтра");
+    bot.assert_screen_contains("Задачи › Оплатить счета");
+    let moved = items::get(
+        &mut db.pool.acquire().await.expect("conn"),
+        household.household_id,
+        task.id,
+    )
+    .await
+    .expect("moved occurrence");
+    assert_eq!(
+        moved.due_date,
+        Some(NaiveDate::from_ymd_opt(2027, 3, 7).unwrap())
+    );
+    assert_eq!(
+        moved.recurrence.as_ref().expect("rule").occurrence_date,
+        Some(today),
+        "the original rule date stays in the slot"
+    );
+
+    bot.press("Выполнено").await;
+    bot.assert_screen_contains("Следующее: пн, 5 апр");
+    let completed = items::get(
+        &mut db.pool.acquire().await.expect("conn"),
+        household.household_id,
+        task.id,
+    )
+    .await
+    .expect("completed occurrence");
+    assert_eq!(
+        completed.due_date,
+        Some(NaiveDate::from_ymd_opt(2027, 4, 5).unwrap()),
+        "the next occurrence comes from the monthly rule, not the moved date"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quick_due_week_later_counts_from_due_but_not_before_today() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(moscow, today, 12, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+
+    let make = |title: &'static str, due: Option<NaiveDate>| {
+        let pool = db.pool.clone();
+        let actor = actor.clone();
+        async move {
+            let mut input = new_item(household.tasks_list_id, title);
+            input.due_date = due;
+            create_item(&pool, &household, household.tasks_list_id, &actor, input).await
+        }
+    };
+    let future = make(
+        "Будущая",
+        Some(NaiveDate::from_ymd_opt(2027, 3, 20).unwrap()),
+    )
+    .await;
+    let overdue = make(
+        "Просроченная",
+        Some(NaiveDate::from_ymd_opt(2027, 3, 1).unwrap()),
+    )
+    .await;
+    let undated = make("Без даты", None).await;
+
+    bot.press("Задачи").await;
+    for (title, expected) in [
+        (
+            "Будущая",
+            NaiveDate::from_ymd_opt(2027, 3, 27).expect("date"),
+        ),
+        (
+            "Просроченная",
+            NaiveDate::from_ymd_opt(2027, 3, 22).expect("date"),
+        ),
+        (
+            "Без даты",
+            NaiveDate::from_ymd_opt(2027, 3, 22).expect("date"),
+        ),
+    ] {
+        bot.press(title).await;
+        bot.press("Срок").await;
+        bot.press("+1 неделя").await;
+        let item_id = match title {
+            "Будущая" => future.id,
+            "Просроченная" => overdue.id,
+            _ => undated.id,
+        };
+        assert_eq!(
+            item_due(&db.pool, item_id).await.1,
+            Some(expected),
+            "{title}: a week counts from the due date but not before today"
+        );
+        bot.press("Назад").await; // карточка
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quick_due_today_keeps_all_day_and_gives_all_day_to_a_task_without_due() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(moscow, today, 12, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+
+    let mut all_day = new_item(household.tasks_list_id, "Вседневная");
+    all_day.due_date = Some(NaiveDate::from_ymd_opt(2027, 3, 20).unwrap());
+    let all_day = create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        all_day,
+    )
+    .await;
+    let undated = create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, "Без срока"),
+    )
+    .await;
+
+    bot.press("Задачи").await;
+    for (title, item_id) in [("Вседневная", all_day.id), ("Без срока", undated.id)]
+    {
+        bot.press(title).await;
+        bot.press("Срок").await;
+        bot.press("Сегодня").await;
+        assert_eq!(
+            item_due(&db.pool, item_id).await,
+            (None, Some(today)),
+            "{title}: «Сегодня» keeps the deadline all-day"
+        );
+        bot.press("Назад").await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quick_due_none_is_hidden_for_recurring_and_clears_an_ordinary_due() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(moscow, today, 12, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+
+    let mut ordinary = new_item(household.tasks_list_id, "Обычная");
+    ordinary.due_date = Some(today);
+    let ordinary = create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        ordinary,
+    )
+    .await;
+    let mut recurring = new_item(household.tasks_list_id, "Повторяющаяся");
+    recurring.due_date = Some(today);
+    recurring.recurrence = Some(support::recurrence(
+        tasklerq::domain::models::RecurrenceFreq::Daily,
+        Vec::new(),
+    ));
+    let recurring = create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        recurring,
+    )
+    .await;
+
+    bot.press("Задачи").await;
+    bot.press("Обычная").await;
+    bot.press("Срок").await;
+    bot.assert_has_button("Без срока");
+    bot.press("Без срока").await;
+    bot.assert_screen_contains("Срок снят");
+    assert_eq!(
+        item_due(&db.pool, ordinary.id).await,
+        (None, None),
+        "«Без срока» clears the due entirely"
+    );
+    bot.press("Назад").await;
+
+    bot.press("Повторяющаяся").await;
+    bot.press("Срок").await;
+    assert!(
+        bot.find_button("Без срока").is_none(),
+        "a recurring task has no «Без срока» button:\n{}",
+        bot.screen()
+    );
+    assert_eq!(
+        item_due(&db.pool, recurring.id).await,
+        (None, Some(today)),
+        "opening the quick due screen changes nothing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_quick_due_shows_the_current_card_and_keeps_the_new_due() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(moscow, today, 12, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut input = new_item(household.tasks_list_id, "Задача");
+    input.due_date = Some(today);
+    let task = create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
+
+    bot.press("Задачи").await;
+    bot.press("Задача").await;
+    bot.press("Срок").await;
+
+    let changed = NaiveDate::from_ymd_opt(2027, 3, 20).expect("date");
+    sqlx::query("UPDATE items SET title = 'Обновлённая', due_date = $2, version = version + 1 WHERE id = $1")
+        .bind(task.id)
+        .bind(changed)
+        .execute(&db.pool)
+        .await
+        .expect("concurrent change");
+
+    bot.press("Завтра").await;
+    bot.assert_screen_contains("Данные уже изменились");
+    bot.assert_screen_contains("Задачи › Обновлённая");
+    assert_eq!(
+        item_due(&db.pool, task.id).await,
+        (None, Some(changed)),
+        "a stale choice must not save anything"
+    );
+    assert_eq!(
+        saved_screen(&db.pool, bot.chat).await["t"],
+        serde_json::json!("item"),
+        "the actual card is shown after a conflict"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn back_from_quick_due_returns_to_the_card_with_its_own_back() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(moscow, today, 12, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, "Позвонить маме"),
+    )
+    .await;
+
+    bot.press("Задачи").await;
+    bot.press("Позвонить маме").await;
+    bot.press("Срок").await;
+    bot.assert_screen_contains("Задачи › Позвонить маме › Срок");
+    bot.assert_has_button("Меню");
+    bot.press("Назад").await;
+    bot.assert_screen_contains("Задачи › Позвонить маме");
+    bot.press("Назад").await;
+    bot.assert_screen_contains("Задачи · 1");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quick_due_text_rejects_an_invalid_date_and_keeps_the_form() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(moscow, today, 12, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut input = new_item(household.tasks_list_id, "Сдать отчёт");
+    input.due_date = Some(today);
+    let task = create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
+
+    bot.press("Задачи").await;
+    bot.press("Сдать отчёт").await;
+    bot.press("Срок").await;
+    bot.press("Дата и время").await;
+    bot.text("когда-нибудь").await;
+    bot.assert_screen_contains("Не понял срок.");
+    bot.assert_screen_contains("Введите срок");
+    assert_eq!(
+        item_due(&db.pool, task.id).await,
+        (None, Some(today)),
+        "an invalid date must not change the due"
+    );
+
+    bot.text("16.03").await;
+    bot.assert_screen_contains("Срок: завтра");
+    assert_eq!(
+        item_due(&db.pool, task.id).await,
+        (None, Some(NaiveDate::from_ymd_opt(2027, 3, 16).unwrap())),
+        "the same form accepts a valid date afterwards"
     );
 }

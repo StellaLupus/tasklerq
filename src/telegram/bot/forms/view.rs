@@ -71,6 +71,10 @@ pub async fn view(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
         Form::Onboarding { name } => Ok(onboarding::view(name.as_deref())),
         Form::Create(form) => create_view(ctx, form).await,
         Form::Edit(form) => edit_view(ctx, form).await,
+        Form::DueText { .. } => Ok(Ui::new()
+            .heading("Введите срок")
+            .text(ru::DUE_HINT)
+            .row(vec![cancel_button()])),
         Form::Search => Ok(Ui::new()
             .heading("Что ищем?")
             .text("Отправьте слово или фразу из названия, описания, тега или подзадачи.")

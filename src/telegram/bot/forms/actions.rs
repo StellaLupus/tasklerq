@@ -3,9 +3,11 @@
 use uuid::Uuid;
 
 use crate::domain::models::{Item, ItemPriority, ItemStatus, List, ListKind, RecurrenceFreq};
+use crate::domain::recurrence::Due;
 use crate::domain::settings::{NotificationSettingsUpdate, ProfileUpdate, parse_hhmm};
 use crate::domain::validation::validate_new_item;
 use crate::storage::repositories::{items, lists, members, users};
+use crate::telegram::ru;
 use crate::telegram::views::{self};
 
 use super::state::{advance, apply_choice, apply_text, today};
@@ -27,6 +29,11 @@ pub async fn on_text(ctx: &mut Ctx<'_>, form: Form, text: &str) -> Result<(), Fa
         Form::Onboarding { name } => onboarding::on_text(ctx, name, text).await,
         Form::Create(form) => create_text(ctx, form, text).await,
         Form::Edit(form) => edit_text(ctx, form, text).await,
+        Form::DueText {
+            item_id,
+            version,
+            back,
+        } => due_text(ctx, item_id, version, back, text).await,
         Form::Search => {
             if text.chars().count() > MAX_QUERY {
                 ctx.banner(format!(
@@ -248,6 +255,30 @@ async fn edit_text(ctx: &mut Ctx<'_>, mut form: EditForm, text: &str) -> Result<
     }
 }
 
+async fn due_text(
+    ctx: &mut Ctx<'_>,
+    item_id: Uuid,
+    version: i32,
+    back: Screen,
+    text: &str,
+) -> Result<(), Fail> {
+    let (_, mut draft) = load_item_draft(ctx, item_id).await?;
+    let today = today(ctx);
+    let now_time = ctx.now.with_timezone(&ctx.tz).time();
+    if let Err(message) = apply_text(Step::DueText, &mut draft, text, today, now_time) {
+        ctx.banner(message);
+        return ctx.present(Screen::Form).await;
+    }
+    let (due_at, due_date) = draft.due(ctx.tz)?;
+    let due = match (due_at, due_date) {
+        (Some(at), _) => Due::Timed(at),
+        (None, Some(date)) => Due::AllDay(date),
+        (None, None) => return Err(Fail::User(format!("Не понял срок. {}", ru::DUE_HINT))),
+    };
+    clear(ctx).await?;
+    crate::telegram::bot::card::apply_due(ctx, item_id, version, due, back).await
+}
+
 async fn finish_edit(ctx: &mut Ctx<'_>, back: Screen) -> Result<(), Fail> {
     clear(ctx).await?;
     ctx.toast("Сохранено");
@@ -301,6 +332,14 @@ pub async fn on_action(ctx: &mut Ctx<'_>, act: FormAct) -> Result<(), Fail> {
     match form {
         Form::Create(form) => create_action(ctx, form, act).await,
         Form::Edit(form) => edit_action(ctx, form, act).await,
+        Form::DueText { item_id, back, .. } => {
+            clear(ctx).await?;
+            ctx.present(Screen::Item {
+                item_id,
+                back: Box::new(back),
+            })
+            .await
+        }
         Form::Onboarding { .. }
         | Form::Search
         | Form::Rename

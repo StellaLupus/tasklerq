@@ -98,10 +98,11 @@ pub fn expand_item(
     // Без слота срок стоит на своей дате правила, и обычная серия выводится
     // целиком.
     let current_date = current.local_date(timezone);
-    let on_rule = recurrence
-        .occurrences_between(current, current_date, current_date + Duration::days(1))?
-        .contains(&current);
-    let occurrences = if recurrence.occurrence_date.is_none() && on_rule {
+    let occurrences = if recurrence.occurrence_date.is_none()
+        && recurrence
+            .occurrences_between(current, current_date, current_date + Duration::days(1))?
+            .contains(&current)
+    {
         occurrences
     } else {
         let cutoff = recurrence

@@ -104,6 +104,14 @@ pub enum Screen {
         /// Куда ведёт «Назад».
         back: Box<Screen>,
     },
+    /// Быстрый выбор срока в карточке задачи.
+    Due {
+        /// Элемент.
+        item_id: Uuid,
+        /// Экран за карточкой: туда ведёт «Назад» и туда же возвращает
+        /// сохранение срока.
+        back: Box<Screen>,
+    },
     /// Результат удаления с кнопкой отмены.
     Deleted {
         /// Элемент.
@@ -253,6 +261,7 @@ impl Screen {
             Self::Item { back, .. }
             | Self::Deleted { back, .. }
             | Self::ConfirmDelete { back, .. } => back.depth() + 1,
+            Self::Due { back, .. } => back.depth() + 2,
             Self::ConfirmClear {
                 from_lists: true, ..
             }
@@ -284,6 +293,7 @@ impl Screen {
             Self::Lists => "Все списки",
             Self::List { .. } => "Список",
             Self::Item { .. } => "Карточка",
+            Self::Due { .. } => "Срок",
             Self::Deleted { .. } => "Удалено",
             Self::ConfirmDelete { .. } => "Удаление",
             Self::ConfirmClear { .. } => "Очистка",
@@ -335,6 +345,12 @@ impl Screen {
                 parents.push(back.crumb());
                 parents
             }
+            Self::Due { back, .. } => {
+                let mut parents = back.parents();
+                parents.push(back.crumb());
+                parents.push("Карточка");
+                parents
+            }
             Self::ConfirmClear {
                 from_lists: true, ..
             }
@@ -364,15 +380,26 @@ impl Screen {
     /// длиннее 60 символов. `parent` подменяет имя непосредственного родителя,
     /// если оно зависит от данных (например, имя списка).
     pub fn trail(&self, title: &str, parent: Option<&str>) -> String {
+        match parent {
+            Some(parent) => self.trail_with(title, &[parent]),
+            None => self.trail_with(title, &[]),
+        }
+    }
+
+    /// Хлебные крошки с несколькими подменёнными родителями: `parents`
+    /// заменяют последние имена в порядке от меню к непосредственному
+    /// родителю. Так экран под карточкой показывает имя списка и название
+    /// задачи.
+    pub fn trail_with(&self, title: &str, parents: &[&str]) -> String {
         let deep = self.depth() > 2;
         let mut parts: Vec<String> = if deep {
             self.parents().into_iter().map(str::to_owned).collect()
         } else {
             Vec::new()
         };
-        if deep && let Some(parent) = parent {
-            parts.pop();
-            parts.push(parent.to_owned());
+        if deep {
+            parts.truncate(parts.len().saturating_sub(parents.len()));
+            parts.extend(parents.iter().map(|parent| (*parent).to_owned()));
         }
         parts.push(title.to_owned());
         clip_trail(parts.join(" › "))
@@ -383,7 +410,15 @@ impl Screen {
 /// текст показывается отдельным абзацем: получатель и действие должны
 /// оставаться видимыми.
 pub fn screen_heading(screen: &Screen, title: &str, parent: Option<&str>) -> Ui {
-    let trail = screen.trail(title, parent);
+    match parent {
+        Some(parent) => screen_heading_with(screen, title, &[parent]),
+        None => screen_heading_with(screen, title, &[]),
+    }
+}
+
+/// Заголовок экрана с несколькими подменёнными родителями.
+pub fn screen_heading_with(screen: &Screen, title: &str, parents: &[&str]) -> Ui {
+    let trail = screen.trail_with(title, parents);
     let mut ui = Ui::new().heading(trail.clone());
     if !trail.contains(title) {
         ui = ui.text(title.to_owned());
@@ -524,6 +559,20 @@ pub enum FormAct {
     Cancel,
 }
 
+/// Быстрый срок на экране карточки.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuickDue {
+    /// Сегодняшняя дата.
+    Today,
+    /// Завтрашняя дата.
+    Tomorrow,
+    /// Дата текущего срока не раньше сегодня плюс неделя.
+    WeekLater,
+    /// Снять срок.
+    None,
+}
+
 /// Действие кнопки.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "a", rename_all = "snake_case")]
@@ -593,6 +642,26 @@ pub enum Action {
         /// Шаг.
         step: Step,
         /// Куда вернуться.
+        back: Screen,
+    },
+    /// Выбрать быстрый срок в карточке.
+    DueSet {
+        /// Элемент.
+        item_id: Uuid,
+        /// Версия, которую видел пользователь.
+        version: i32,
+        /// Выбранный срок.
+        due: QuickDue,
+        /// Экран за карточкой.
+        back: Screen,
+    },
+    /// Ввести дату и время текстом из быстрого срока.
+    DueText {
+        /// Элемент.
+        item_id: Uuid,
+        /// Версия, которую видел пользователь.
+        version: i32,
+        /// Экран за карточкой.
         back: Screen,
     },
     /// Действие внутри формы элемента.
@@ -886,6 +955,8 @@ impl Action {
         match self {
             Self::Complete { version, .. }
             | Self::Reopen { version, .. }
+            | Self::DueSet { version, .. }
+            | Self::DueText { version, .. }
             | Self::NoticeComplete { version, .. }
             | Self::BatchComplete { version, .. } => Some(*version),
             Self::Form {
@@ -1114,6 +1185,15 @@ pub enum Form {
     Create(ItemForm),
     /// Редактирование поля существующего элемента.
     Edit(EditForm),
+    /// Ввод даты и времени для быстрого срока в карточке.
+    DueText {
+        /// Элемент.
+        item_id: Uuid,
+        /// Версия, которую видел пользователь.
+        version: i32,
+        /// Экран за карточкой.
+        back: Screen,
+    },
     /// Ожидание поискового запроса.
     Search,
     /// Новое имя пользователя.
@@ -1199,6 +1279,7 @@ impl Form {
             Self::Onboarding { .. } => "onboarding",
             Self::Create(_) => "create",
             Self::Edit(_) => "edit",
+            Self::DueText { .. } => "due_text",
             Self::Search => "search",
             Self::Rename => "rename",
             Self::DeleteHousehold => "delete_household",
@@ -1392,6 +1473,10 @@ mod tests {
         };
         let screens = vec![
             Screen::Item {
+                item_id: Uuid::nil(),
+                back: Box::new(list.clone()),
+            },
+            Screen::Due {
                 item_id: Uuid::nil(),
                 back: Box::new(list.clone()),
             },

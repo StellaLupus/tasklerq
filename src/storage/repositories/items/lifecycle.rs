@@ -49,8 +49,10 @@ pub async fn complete(
             Due::Timed(at) => at > now,
             Due::AllDay(date) => date > today,
         };
-        if row.completed_at.is_some() && future {
-            // Повторный вызов после переноса срока — идемпотентен.
+        if version.is_none() && row.completed_at.is_some() && future {
+            // Повторный вызов без версии после переноса срока идемпотентен.
+            // С версией повтор отсекает проверка выше, а новое нажатие после
+            // переноса на будущую дату должно записать выполнение.
             return Ok(current);
         }
 
@@ -152,7 +154,7 @@ pub async fn reopen(
             serde_json::from_value::<Item>(event.payload.get("before")?.clone()).ok()
         });
 
-    let (due_at, due_date, completed_at, completed_by_user_id) = match previous {
+    let (due_at, due_date, completed_at, completed_by_user_id) = match &previous {
         Some(previous) => (
             previous.due_at,
             previous.due_date,
@@ -161,11 +163,25 @@ pub async fn reopen(
         ),
         None => (row.due_at, row.due_date, None, None),
     };
+    // Слот относится к конкретному правилу. Если после выполнения правило
+    // сняли или изменили, старый слот к новому правилу не подходит — иначе
+    // `items_recurrence_shape` отвергнет строку без правила, а `next_after`
+    // посчитает следующее вхождение от чужой даты.
+    let occurrence_date = match (
+        row.recurrence(),
+        previous.as_ref().and_then(|item| item.recurrence.as_ref()),
+    ) {
+        (Some(current_rule), Some(previous_rule)) if current_rule.same_rule(previous_rule) => {
+            previous_rule.occurrence_date
+        }
+        _ => None,
+    };
 
     sqlx::query(
         "UPDATE items
          SET status = 'open', due_at = $3, due_date = $4, completed_at = $5,
-             completed_by_user_id = $6, version = version + 1, updated_at = $7
+             completed_by_user_id = $6, recurrence_occurrence_date = $7,
+             version = version + 1, updated_at = $8
          WHERE id = $1 AND household_id = $2",
     )
     .bind(item_id)
@@ -174,6 +190,7 @@ pub async fn reopen(
     .bind(due_date)
     .bind(completed_at)
     .bind(completed_by_user_id)
+    .bind(occurrence_date)
     .bind(now)
     .execute(&mut *conn)
     .await?;

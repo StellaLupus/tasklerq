@@ -51,6 +51,17 @@ impl Due {
 }
 
 impl Recurrence {
+    /// Совпадает ли правило с другим, если не учитывать слот вхождения.
+    pub fn same_rule(&self, other: &Self) -> bool {
+        self.freq == other.freq
+            && self.interval == other.interval
+            && self.byweekday == other.byweekday
+            && self.until == other.until
+            && self.timezone == other.timezone
+            && self.anchor_date == other.anchor_date
+            && self.month_rule == other.month_rule
+    }
+
     /// Разобрать IANA timezone правила.
     pub fn timezone(&self) -> Result<Tz, DomainError> {
         parse_timezone(&self.timezone)
