@@ -216,7 +216,17 @@ impl Recurrence {
     fn next_date(&self, date: NaiveDate) -> Option<NaiveDate> {
         match self.freq {
             RecurrenceFreq::Daily => {
-                date.checked_add_days(chrono::Days::new(u64::try_from(self.interval).unwrap_or(0)))
+                if date < self.anchor_date {
+                    return Some(self.anchor_date);
+                }
+                let step = i64::from(self.interval.max(1));
+                let remainder = (date - self.anchor_date).num_days().rem_euclid(step);
+                let days = if remainder == 0 {
+                    step
+                } else {
+                    step - remainder
+                };
+                date.checked_add_days(chrono::Days::new(u64::try_from(days).unwrap_or(0)))
             }
             RecurrenceFreq::Weekly => self.next_weekly_date(date),
             RecurrenceFreq::Monthly => self.next_monthly_date(date),
@@ -246,21 +256,26 @@ impl Recurrence {
     }
 
     fn next_monthly_date(&self, date: NaiveDate) -> Option<NaiveDate> {
-        let step = i32::from(self.interval);
-        let mut year = date.year();
-        let mut month = date.month();
+        let step = i32::from(self.interval.max(1));
+        let base_month = date_index(self.anchor_date);
+        let mut month = date_index(date).max(base_month);
+        let offset = month - base_month;
+        let remainder = offset % step;
+        if remainder != 0 {
+            month += step - remainder;
+        }
 
         for _ in 0..MAX_ITERATIONS {
-            let (next_year, next_month) = add_months(year, month, step);
-            year = next_year;
-            month = next_month;
+            let year = month.div_euclid(12);
+            let month_of_year = (month.rem_euclid(12) + 1) as u32;
 
             let candidate = match self.month_rule.unwrap_or(MonthRule::AnchorDay) {
-                MonthRule::LastDay => last_day_of_month(year, month),
+                MonthRule::LastDay => last_day_of_month(year, month_of_year),
                 MonthRule::AnchorDay => {
                     let Some(candidate) =
-                        NaiveDate::from_ymd_opt(year, month, self.anchor_date.day())
+                        NaiveDate::from_ymd_opt(year, month_of_year, self.anchor_date.day())
                     else {
+                        month = month.checked_add(step)?;
                         continue;
                     };
                     candidate
@@ -270,23 +285,31 @@ impl Recurrence {
             if candidate > date {
                 return Some(candidate);
             }
+
+            month = month.checked_add(step)?;
         }
 
         None
     }
 
     fn next_yearly_date(&self, date: NaiveDate) -> Option<NaiveDate> {
-        let step = i32::from(self.interval);
-        let mut year = date.year();
+        let step = i32::from(self.interval.max(1));
+        let base_year = self.anchor_date.year();
+        let mut year = date.year().max(base_year);
+        let offset = year - base_year;
+        let remainder = offset % step;
+        if remainder != 0 {
+            year += step - remainder;
+        }
 
         for _ in 0..MAX_ITERATIONS {
-            year = year.checked_add(step)?;
             if let Some(candidate) =
                 NaiveDate::from_ymd_opt(year, self.anchor_date.month(), self.anchor_date.day())
                 && candidate > date
             {
                 return Some(candidate);
             }
+            year = year.checked_add(step)?;
         }
 
         None
@@ -427,10 +450,9 @@ pub(super) fn last_day_of_month(year: i32, month: u32) -> NaiveDate {
         .expect("valid calendar month")
 }
 
-/// Прибавить месяцы к году/месяцу.
-fn add_months(year: i32, month: u32, delta: i32) -> (i32, u32) {
-    let total = year * 12 + i32::try_from(month).unwrap_or(1) - 1 + delta;
-    (total.div_euclid(12), (total.rem_euclid(12) + 1) as u32)
+/// Номер месяца от условного нуля для арифметики интервалов.
+fn date_index(date: NaiveDate) -> i32 {
+    date.year() * 12 + i32::try_from(date.month()).unwrap_or(1) - 1
 }
 
 /// Перевести локальные дату и время в UTC.

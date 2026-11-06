@@ -15,6 +15,7 @@ use tasklerq::domain::models::{
     Actor, ActorType, Field, Item, ItemPatch, ItemPriority, ItemSource, RecurrenceFreq,
     RecurrenceInput,
 };
+use tasklerq::domain::recurrence::Due;
 use tasklerq::jobs::scheduler::{Scheduler, all_day_occurrence_key, occurrence_key};
 use tasklerq::storage::repositories::items;
 use tokio::sync::Notify;
@@ -1193,6 +1194,80 @@ async fn changing_due_at_cancels_pending_delivery_for_the_old_due() {
     let rows = delivery_rows(&db.pool, item.id).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].0, "cancelled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rescheduling_an_occurrence_moves_the_pending_reminder() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(
+        &db,
+        &household,
+        "Перенести встречу",
+        Some(due),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let now = due - Duration::minutes(15);
+    insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        Some(item.id),
+        &occurrence_key(due),
+        "pending",
+        now,
+    )
+    .await
+    .expect("old due delivery");
+
+    let new_due = due + Duration::hours(2);
+    let mut conn = db.pool.acquire().await.expect("connection");
+    items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        item.id,
+        item.version,
+        Due::Timed(new_due),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("reschedule occurrence");
+    drop(conn);
+
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let stats = scheduler(&db.pool).tick(now).await.expect("moved tick");
+    assert_eq!(stats.cancelled, 1);
+    assert_eq!(stats.delivered, 0);
+    assert!(messages(&db.pool, chat).await.is_empty());
+    let rows = delivery_rows(&db.pool, item.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "cancelled");
+    assert_eq!(rows[0].1, occurrence_key(due));
+
+    let moved_at = new_due - Duration::minutes(15);
+    let stats = scheduler(&db.pool)
+        .tick(moved_at)
+        .await
+        .expect("new due tick");
+    assert_eq!(stats.planned, 1);
+    assert_eq!(stats.delivered, 1);
+    let sent = messages(&db.pool, chat).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let rows = delivery_rows(&db.pool, item.id).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(
+        rows.iter()
+            .any(|row| { row.0 == "cancelled" && row.1 == occurrence_key(due) })
+    );
+    assert!(
+        rows.iter()
+            .any(|row| { row.0 == "sent" && row.1 == occurrence_key(new_due) })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -11,7 +11,7 @@ use crate::domain::error::DomainError;
 use crate::domain::models::{
     Actor, EventType, Field, Item, ItemPatch, ItemStatus, ListKind, SubtaskInput,
 };
-use crate::domain::recurrence::parse_timezone;
+use crate::domain::recurrence::{Due, parse_timezone};
 use crate::domain::validation::{
     MAX_NOTES, MAX_TITLE, ValidatedItem, normalize_due_for_recurrence, normalize_recurrence,
     normalize_subtasks, normalize_tags, normalize_text, normalize_text_allow_empty, normalize_unit,
@@ -148,6 +148,70 @@ pub async fn update(
     household_timezone: &str,
     now: DateTime<Utc>,
 ) -> Result<Item, DomainError> {
+    update_inner(
+        conn,
+        household_id,
+        actor,
+        item_id,
+        version,
+        patch,
+        household_timezone,
+        now,
+        true,
+    )
+    .await
+}
+
+/// Перенести срок текущего вхождения, не меняя якорь серии.
+#[allow(clippy::too_many_arguments)]
+pub async fn reschedule_occurrence(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    actor: &Actor,
+    item_id: Uuid,
+    version: i32,
+    due: Due,
+    household_timezone: &str,
+    now: DateTime<Utc>,
+) -> Result<Item, DomainError> {
+    let patch = match due {
+        Due::Timed(at) => ItemPatch {
+            due_at: Field::Value(at),
+            ..ItemPatch::default()
+        },
+        Due::AllDay(date) => ItemPatch {
+            due_date: Field::Value(date),
+            ..ItemPatch::default()
+        },
+    };
+    // `false` — внутренний режим переноса вхождения: правило и якорь серии
+    // остаются прежними, а новый срок не нормализуется по правилу.
+    update_inner(
+        conn,
+        household_id,
+        actor,
+        item_id,
+        version,
+        patch,
+        household_timezone,
+        now,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn update_inner(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    actor: &Actor,
+    item_id: Uuid,
+    version: i32,
+    patch: ItemPatch,
+    household_timezone: &str,
+    now: DateTime<Utc>,
+    reanchor_series: bool,
+) -> Result<Item, DomainError> {
     let row = row_by_id(conn, household_id, item_id, false, true).await?;
     let current = hydrate_one(conn, row.clone()).await?;
     if row.version != version {
@@ -224,7 +288,10 @@ pub async fn update(
 
     match patch.recurrence {
         Field::Missing => {
-            if due_changed && let Some(rule) = recurrence.as_mut() {
+            if reanchor_series
+                && due_changed
+                && let Some(rule) = recurrence.as_mut()
+            {
                 if let Some(at) = due_at {
                     let timezone = parse_timezone(&rule.timezone)?;
                     rule.anchor_date = at.with_timezone(&timezone).date_naive();
@@ -250,13 +317,15 @@ pub async fn update(
         }
     }
 
-    (due_at, due_date) = normalize_due_for_recurrence(
-        due_at,
-        due_date,
-        recurrence.as_ref(),
-        household_timezone,
-        today,
-    )?;
+    if reanchor_series {
+        (due_at, due_date) = normalize_due_for_recurrence(
+            due_at,
+            due_date,
+            recurrence.as_ref(),
+            household_timezone,
+            today,
+        )?;
+    }
 
     let (quantity, unit) = if target_list.kind == ListKind::Tasks {
         (None, None)
