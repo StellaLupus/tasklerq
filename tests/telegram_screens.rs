@@ -1009,7 +1009,16 @@ async fn completed_task_stays_in_done_today_section_and_opens_card() {
 
     bot.press("✅ Вынести мусор").await;
     bot.assert_screen_contains("Задачи › Вынести мусор");
-    bot.assert_has_button("Вернуть");
+    for label in ["↩️ Вернуть", "✏️ Править", "🗑 Удалить"] {
+        bot.assert_has_button(label);
+    }
+    for label in ["📅 Срок", "✓ Выполнено", "✓ Куплено"] {
+        assert!(
+            bot.find_button(label).is_none(),
+            "a completed task card must not keep `{label}`:\n{}",
+            bot.screen()
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3999,6 +4008,42 @@ async fn purchase_card_shows_fields_and_only_action_buttons() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bought_purchase_card_offers_reopen_edit_and_delete() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut purchase = new_item(household.shopping_list_id, "Молоко");
+    purchase.quantity = Some(2.0);
+    purchase.unit = Some("л".into());
+    create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        purchase,
+    )
+    .await;
+
+    bot.press("Покупки").await;
+    bot.press("Молоко").await;
+    bot.press("Править").await;
+    bot.press("Молоко").await;
+
+    bot.assert_screen_contains("Покупки › Молоко");
+    for label in ["↩️ Вернуть", "✏️ Править", "🗑 Удалить"] {
+        bot.assert_has_button(label);
+    }
+    for label in ["✓ Куплено", "✓ Выполнено"] {
+        assert!(
+            bot.find_button(label).is_none(),
+            "a bought purchase card must not keep `{label}`:\n{}",
+            bot.screen()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn long_description_is_a_collapsible_quote_and_short_one_is_plain() {
     let db = db().await;
     let mut bot = onboarded_named(&db.pool, "Alice").await;
@@ -4072,6 +4117,30 @@ async fn recurring_card_shows_the_next_occurrence_after_a_moved_slot() {
     .await
     .expect("move the occurrence");
     drop(conn);
+
+    bot.press("Задачи").await;
+    bot.press("Полить цветы").await;
+    bot.assert_screen_contains("🔁 Каждую неделю: вт");
+    bot.assert_screen_contains("Следующее: вт, 17 ноя");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recurring_card_without_a_moved_slot_shows_the_next_rule_occurrence() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let now = local_utc(
+        moscow,
+        NaiveDate::from_ymd_opt(2026, 11, 6).expect("date"),
+        12,
+        0,
+    );
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut input = new_item(household.tasks_list_id, "Полить цветы");
+    input.due_date = Some(NaiveDate::from_ymd_opt(2026, 11, 10).expect("date"));
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Weekly, vec![2]));
+    create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
 
     bot.press("Задачи").await;
     bot.press("Полить цветы").await;

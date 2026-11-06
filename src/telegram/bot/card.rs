@@ -440,6 +440,8 @@ fn next_occurrence(item: &Item, ctx: &Ctx<'_>) -> Option<String> {
         return None;
     }
     let today = ctx.now.with_timezone(&ctx.tz).date_naive();
+    // Ошибку расчёта намеренно не показываем: карточка — экран просмотра, и
+    // без строки «Следующее» она должна открыться, а не упасть.
     let current = match (item.due_at, item.due_date) {
         (Some(at), _) => Due::Timed(at),
         (None, Some(date)) => Due::AllDay(date),
