@@ -380,7 +380,8 @@ async fn completing_shows_undo_and_next_occurrence_for_recurring_tasks() {
     bot.assert_screen_contains("🔁 Каждый день");
     bot.press("Сохранить").await;
 
-    bot.press("☐").await;
+    bot.press("Полить цветы").await;
+    bot.press("Выполнено").await;
     bot.assert_screen_contains("✅ Выполнено: Полить цветы");
     bot.assert_screen_contains("Следующее:");
     bot.assert_has_button("Отменить");
@@ -551,7 +552,11 @@ async fn repeated_delete_undo_reports_that_there_is_nothing_to_undo() {
         &bot,
         Action::DeleteUndo {
             item_id,
-            back: Screen::List { list_id, page: 0 },
+            back: Screen::List {
+                list_id,
+                page: 0,
+                edit: false,
+            },
         },
     )
     .await;
@@ -645,7 +650,8 @@ async fn deleted_purchase_shows_undo_and_returns_it_to_the_list() {
     bot.press("1").await;
     bot.press("л").await;
     bot.press("Сохранить").await;
-    bot.press("⋯").await;
+    bot.press("Править").await;
+    bot.press("Молоко").await;
 
     bot.press("Удалить").await;
     bot.press("Да, удалить").await;
@@ -663,7 +669,8 @@ async fn deleted_purchase_shows_undo_and_returns_it_to_the_list() {
             .expect("deleted purchase");
 
     bot.press("Отменить").await;
-    bot.assert_screen_contains("Покупки · 1");
+    // Карточка открыта из режима правки, поэтому возврат сохраняет его.
+    bot.assert_screen_contains("Покупки · правка");
     bot.assert_screen_contains("☐ Молоко · 1 л");
 
     let deleted: bool =
@@ -737,7 +744,8 @@ async fn deleted_purchase_undo_after_window_reports_expiry_and_keeps_it_deleted(
     bot.press("1").await;
     bot.press("л").await;
     bot.press("Сохранить").await;
-    bot.press("⋯").await;
+    bot.press("Править").await;
+    bot.press("Позднее молоко").await;
 
     bot.press("Удалить").await;
     bot.press("Да, удалить").await;
@@ -781,7 +789,8 @@ async fn deleted_purchase_back_to_list_does_not_undo() {
     bot.press("1").await;
     bot.press("л").await;
     bot.press("Сохранить").await;
-    bot.press("⋯").await;
+    bot.press("Править").await;
+    bot.press("Оставить в удалённых").await;
 
     bot.press("Удалить").await;
     bot.press("Да, удалить").await;

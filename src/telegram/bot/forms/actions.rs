@@ -493,7 +493,14 @@ async fn increase(
     clear(ctx).await?;
     ctx.toast("Количество увеличено");
     match form.list_id {
-        Some(list_id) => ctx.present(Screen::List { list_id, page: 0 }).await,
+        Some(list_id) => {
+            ctx.present(Screen::List {
+                list_id,
+                page: 0,
+                edit: false,
+            })
+            .await
+        }
         None => ctx.present(Screen::Menu).await,
     }
 }
@@ -560,6 +567,7 @@ async fn save_create(
     ctx.present(Screen::List {
         list_id: list.id,
         page: 0,
+        edit: false,
     })
     .await
 }

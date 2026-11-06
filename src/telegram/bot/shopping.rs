@@ -32,7 +32,7 @@ fn item_label(item: &Item) -> String {
 }
 
 /// Список покупок или чек-лист.
-pub async fn list_view(ctx: &mut Ctx<'_>, list: &List, page: u32) -> Result<Ui, Fail> {
+pub async fn list_view(ctx: &mut Ctx<'_>, list: &List, page: u32, edit: bool) -> Result<Ui, Fail> {
     let household_id = ctx.household()?.id;
     let mut all = items::list_by_list(&mut *ctx.conn, household_id, list.id).await?;
     // Сначала «Купить», затем «Куплено»; порядок внутри групп задан репозиторием.
@@ -42,7 +42,12 @@ pub async fn list_view(ctx: &mut Ctx<'_>, list: &List, page: u32) -> Result<Ui, 
         .filter(|item| item.status == ItemStatus::Open)
         .count();
 
-    let mut ui = Ui::new().heading(format!("{} · {open}", list.name));
+    let heading = if edit {
+        format!("{} · {}", list.name, ru::EDIT_MODE_TITLE)
+    } else {
+        format!("{} · {open}", list.name)
+    };
+    let mut ui = Ui::new().heading(heading);
     let add = button(
         "➕ Добавить",
         Action::Add {
@@ -56,6 +61,7 @@ pub async fn list_view(ctx: &mut Ctx<'_>, list: &List, page: u32) -> Result<Ui, 
             &Screen::List {
                 list_id: list.id,
                 page: 0,
+                edit: false,
             },
             Screen::Menu,
         ));
@@ -68,6 +74,7 @@ pub async fn list_view(ctx: &mut Ctx<'_>, list: &List, page: u32) -> Result<Ui, 
     let here = |page: usize| Screen::List {
         list_id: list.id,
         page: u32::try_from(page).unwrap_or(0),
+        edit,
     };
 
     let mut current: Option<ItemStatus> = None;
@@ -80,28 +87,28 @@ pub async fn list_view(ctx: &mut Ctx<'_>, list: &List, page: u32) -> Result<Ui, 
             });
             current = Some(item.status);
         }
-        let toggle = match item.status {
-            ItemStatus::Open => Action::Complete {
-                item_id: item.id,
-                version: item.version,
-                back: here(page),
-            },
-            ItemStatus::Done => Action::Reopen {
-                item_id: item.id,
-                version: item.version,
-                back: here(page),
-            },
-        };
-        ui = ui.row(vec![
-            button(item_label(item), toggle),
-            back_button(
-                "⋯",
-                Screen::Item {
+        let action = if edit {
+            Action::Go {
+                to: Screen::Item {
                     item_id: item.id,
                     back: Box::new(here(page)),
                 },
-            ),
-        ]);
+            }
+        } else {
+            match item.status {
+                ItemStatus::Open => Action::Complete {
+                    item_id: item.id,
+                    version: item.version,
+                    back: here(page),
+                },
+                ItemStatus::Done => Action::Reopen {
+                    item_id: item.id,
+                    version: item.version,
+                    back: here(page),
+                },
+            }
+        };
+        ui = ui.row(vec![button(item_label(item), action)]);
     }
 
     if pages > 1 {
@@ -121,6 +128,20 @@ pub async fn list_view(ctx: &mut Ctx<'_>, list: &List, page: u32) -> Result<Ui, 
     if all.iter().any(|item| item.status == ItemStatus::Done) {
         footer.push(button("🧹 Очистить", Action::ClearAsk { list_id: list.id }));
     }
+    footer.push(button(
+        if edit {
+            ru::EDIT_FINISH_BUTTON
+        } else {
+            ru::EDIT_BUTTON
+        },
+        Action::Go {
+            to: Screen::List {
+                list_id: list.id,
+                page: u32::try_from(page).unwrap_or(0),
+                edit: !edit,
+            },
+        },
+    ));
     let mut nav = vec![button("🔎 Поиск", Action::SearchStart)];
     nav.extend(nav_row(&here(page), Screen::Menu));
     Ok(ui.row(footer).row(nav))
@@ -142,7 +163,13 @@ pub async fn clear_ask(ctx: &mut Ctx<'_>, list_id: Uuid) -> Result<(), Fail> {
     let (_, done) = done_items(ctx, list_id).await?;
     if done.is_empty() {
         ctx.toast("Нечего очищать");
-        return ctx.present(Screen::List { list_id, page: 0 }).await;
+        return ctx
+            .present(Screen::List {
+                list_id,
+                page: 0,
+                edit: false,
+            })
+            .await;
     }
     if done.len() > CONFIRM_ABOVE {
         return ctx.present(Screen::ConfirmClear { list_id }).await;
@@ -155,7 +182,14 @@ pub async fn confirm_clear(ctx: &mut Ctx<'_>, list_id: Uuid) -> Result<Ui, Fail>
     let (list, done) = done_items(ctx, list_id).await?;
     let screen = Screen::ConfirmClear { list_id };
     let mut row = vec![button("🧹 Да, очистить", Action::ClearDo { list_id })];
-    row.extend(nav_row(&screen, Screen::List { list_id, page: 0 }));
+    row.extend(nav_row(
+        &screen,
+        Screen::List {
+            list_id,
+            page: 0,
+            edit: false,
+        },
+    ));
     Ok(Ui::new()
         .heading(screen.trail(
             &format!("Удалить {}?", ru::positions(i64::try_from(done.len()).unwrap_or(0))),
@@ -172,7 +206,13 @@ pub async fn clear_do(ctx: &mut Ctx<'_>, list_id: Uuid) -> Result<(), Fail> {
     let (_, done) = done_items(ctx, list_id).await?;
     if done.is_empty() {
         ctx.toast("Нечего очищать");
-        return ctx.present(Screen::List { list_id, page: 0 }).await;
+        return ctx
+            .present(Screen::List {
+                list_id,
+                page: 0,
+                edit: false,
+            })
+            .await;
     }
     let mut removed = Vec::with_capacity(done.len());
     for item in done {
@@ -205,7 +245,14 @@ pub async fn cleared(ctx: &mut Ctx<'_>, list_id: Uuid, item_ids: &[Uuid]) -> Res
             item_ids: item_ids.to_vec(),
         },
     )];
-    row.extend(nav_row(&screen, Screen::List { list_id, page: 0 }));
+    row.extend(nav_row(
+        &screen,
+        Screen::List {
+            list_id,
+            page: 0,
+            edit: false,
+        },
+    ));
     Ok(Ui::new()
         .heading(screen.trail(
             &format!(
@@ -243,7 +290,11 @@ pub async fn clear_undo(ctx: &mut Ctx<'_>, list_id: Uuid, item_ids: &[Uuid]) -> 
         .map(|list| list.kind != ListKind::Tasks)
         .unwrap_or(false);
     let target = if kind_ok {
-        Screen::List { list_id, page: 0 }
+        Screen::List {
+            list_id,
+            page: 0,
+            edit: false,
+        }
     } else {
         Screen::Menu
     };

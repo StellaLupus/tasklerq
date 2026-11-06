@@ -6,9 +6,9 @@ use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use uuid::Uuid;
 
-use crate::domain::models::{Item, ItemPriority, ItemStatus, List, ListKind, User};
+use crate::domain::models::{Item, ItemPriority, ItemStatus, List, ListKind};
 use crate::domain::search::SearchFilters;
-use crate::storage::repositories::{items, lists, users};
+use crate::storage::repositories::{items, lists};
 use crate::telegram::rich::{Span, button};
 use crate::telegram::ru;
 
@@ -26,7 +26,11 @@ pub async fn build(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
         Screen::FirstContact(contact) => Ok(super::onboarding::first_contact(contact)),
         Screen::Add => Ok(add_choice()),
         Screen::Lists => lists_screen(ctx).await,
-        Screen::List { list_id, page } => list(ctx, *list_id, *page).await,
+        Screen::List {
+            list_id,
+            page,
+            edit,
+        } => list(ctx, *list_id, *page, *edit).await,
         Screen::Item { item_id, back } => card::view(ctx, *item_id, back).await,
         Screen::Completed { item_id, back } => card::completed(ctx, *item_id, back).await,
         Screen::Deleted {
@@ -133,10 +137,18 @@ async fn menu(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
     }
 
     let tasks_target = default_of(ListKind::Tasks)
-        .map(|list_id| Screen::List { list_id, page: 0 })
+        .map(|list_id| Screen::List {
+            list_id,
+            page: 0,
+            edit: false,
+        })
         .unwrap_or(Screen::Lists);
     let shopping_target = default_of(ListKind::Shopping)
-        .map(|list_id| Screen::List { list_id, page: 0 })
+        .map(|list_id| Screen::List {
+            list_id,
+            page: 0,
+            edit: false,
+        })
         .unwrap_or(Screen::Lists);
 
     ui = ui
@@ -226,6 +238,7 @@ async fn lists_screen(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
             Screen::List {
                 list_id: list.id,
                 page: 0,
+                edit: false,
             },
         )]);
     }
@@ -324,40 +337,23 @@ pub(super) fn pager(ui: Ui, page: usize, pages: usize, make: impl Fn(usize) -> S
     ui
 }
 
-async fn member_names(ctx: &mut Ctx<'_>) -> Result<HashMap<Uuid, String>, Fail> {
-    let household_id = ctx.household()?.id;
-    let members: Vec<User> = users::list_active(&mut *ctx.conn, household_id).await?;
-    Ok(members
-        .into_iter()
-        .map(|member| (member.id, member.display_name))
-        .collect())
-}
-
-/// Подпись строки задачи: название, срок, исполнитель.
-pub fn task_label(
-    item: &Item,
-    tz: Tz,
-    now: DateTime<Utc>,
-    names: &HashMap<Uuid, String>,
-) -> String {
+/// Подпись строки задачи: название, срок и приоритет «срочно»/«высокий».
+pub fn task_label(item: &Item, tz: Tz, now: DateTime<Utc>) -> String {
     let mut label = clip(&item.title, 40);
     if let Some(due) = ru::due_label(item.due_at, item.due_date, tz, now) {
         label.push_str(&format!(" · {due}"));
     }
     label.push_str(priority_marker(item));
-    if let Some(name) = item.assignee_user_id.and_then(|id| names.get(&id)) {
-        label.push_str(&format!(" · 👤 {}", clip(name, 14)));
-    }
     label
 }
 
-async fn list(ctx: &mut Ctx<'_>, list_id: Uuid, page: u32) -> Result<Ui, Fail> {
+async fn list(ctx: &mut Ctx<'_>, list_id: Uuid, page: u32, edit: bool) -> Result<Ui, Fail> {
     let household_id = ctx.household()?.id;
     let list = lists::get_visible(&mut *ctx.conn, household_id, list_id).await?;
     if list.kind == ListKind::Tasks {
         tasks_list(ctx, &list, page).await
     } else {
-        super::shopping::list_view(ctx, &list, page).await
+        super::shopping::list_view(ctx, &list, page, edit).await
     }
 }
 
@@ -374,11 +370,11 @@ async fn tasks_list(ctx: &mut Ctx<'_>, list: &List, page: u32) -> Result<Ui, Fai
         .collect();
     sort_tasks(&mut open, ctx.tz, ctx.now);
 
-    let names = member_names(ctx).await?;
     let (start, end, page, pages) = page_bounds(open.len(), page);
     let here = |page: usize| Screen::List {
         list_id: list.id,
         page: u32::try_from(page).unwrap_or(0),
+        edit: false,
     };
 
     let mut ui =
@@ -406,23 +402,13 @@ async fn tasks_list(ctx: &mut Ctx<'_>, list: &List, page: u32) -> Result<Ui, Fai
             ui = ui.bold(section.title());
             current = Some(section);
         }
-        ui = ui.row(vec![
-            button(
-                "☐",
-                Action::Complete {
-                    item_id: item.id,
-                    version: item.version,
-                    back: here(page),
-                },
-            ),
-            go(
-                &task_label(item, ctx.tz, ctx.now, &names),
-                Screen::Item {
-                    item_id: item.id,
-                    back: Box::new(here(page)),
-                },
-            ),
-        ]);
+        ui = ui.row(vec![go(
+            &task_label(item, ctx.tz, ctx.now),
+            Screen::Item {
+                item_id: item.id,
+                back: Box::new(here(page)),
+            },
+        )]);
     }
     if done > 0 {
         ui = ui.text(format!("Выполнено: {done}"));
@@ -456,7 +442,6 @@ async fn mine(ctx: &mut Ctx<'_>, page: u32) -> Result<Ui, Fail> {
         .collect();
     sort_tasks(&mut tasks, ctx.tz, ctx.now);
 
-    let names = member_names(ctx).await?;
     let (start, end, page, pages) = page_bounds(tasks.len(), page);
     let here = |page: usize| Screen::Mine {
         page: u32::try_from(page).unwrap_or(0),
@@ -470,23 +455,13 @@ async fn mine(ctx: &mut Ctx<'_>, page: u32) -> Result<Ui, Fail> {
             .row(nav_row(&here(page), Screen::Menu)));
     }
     for item in &tasks[start..end] {
-        ui = ui.row(vec![
-            button(
-                "☐",
-                Action::Complete {
-                    item_id: item.id,
-                    version: item.version,
-                    back: here(page),
-                },
-            ),
-            go(
-                &task_label(item, ctx.tz, ctx.now, &names),
-                Screen::Item {
-                    item_id: item.id,
-                    back: Box::new(here(page)),
-                },
-            ),
-        ]);
+        ui = ui.row(vec![go(
+            &task_label(item, ctx.tz, ctx.now),
+            Screen::Item {
+                item_id: item.id,
+                back: Box::new(here(page)),
+            },
+        )]);
     }
     let current = here(page);
     let ui = pager(ui, page, pages, here);
@@ -553,12 +528,12 @@ async fn results(
     ));
     for hit in &hits[start..end] {
         let mark = if hit.item.status == ItemStatus::Done {
-            "✅"
+            "✅ "
         } else {
-            "☐"
+            ""
         };
         let mut label = format!(
-            "{mark} {} · {}",
+            "{mark}{} · {}",
             clip(&hit.item.title, 34),
             clip(&hit.list_name, 14)
         );

@@ -287,6 +287,7 @@ async fn issue_callbacks(
                 to: Screen::List {
                     list_id: household.tasks_list_id,
                     page: 0,
+                    edit: false,
                 },
             })
             .expect("action"),
@@ -297,6 +298,7 @@ async fn issue_callbacks(
                 to: Screen::List {
                     list_id: household.shopping_list_id,
                     page: 0,
+                    edit: false,
                 },
             })
             .expect("action"),
@@ -322,6 +324,7 @@ async fn issue_callbacks(
                     back: Box::new(Screen::List {
                         list_id: household.tasks_list_id,
                         page: 0,
+                        edit: false,
                     }),
                 },
             })

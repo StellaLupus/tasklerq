@@ -88,6 +88,10 @@ pub enum Screen {
         list_id: Uuid,
         /// Страница с нуля.
         page: u32,
+        /// Режим правки покупок: тап по строке открывает карточку. Старое
+        /// состояние без поля читается как обычный режим.
+        #[serde(default)]
+        edit: bool,
     },
     /// Карточка элемента.
     Item {
@@ -1175,6 +1179,7 @@ mod tests {
         let list = Screen::List {
             list_id: Uuid::nil(),
             page: 0,
+            edit: false,
         };
         assert_eq!(Screen::Menu.depth(), 1);
         assert_eq!(list.depth(), 2);
@@ -1222,6 +1227,7 @@ mod tests {
         let list = Screen::List {
             list_id: Uuid::nil(),
             page: 0,
+            edit: false,
         };
         let screens = vec![
             Screen::Item {

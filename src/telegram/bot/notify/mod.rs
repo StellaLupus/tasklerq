@@ -167,17 +167,35 @@ pub fn digest_ui(
     }
     let mut row = Vec::new();
     if let Some(list_id) = tasks_list {
-        row.push(back_button("📋 Задачи", Screen::List { list_id, page: 0 }));
+        row.push(back_button(
+            "📋 Задачи",
+            Screen::List {
+                list_id,
+                page: 0,
+                edit: false,
+            },
+        ));
     }
     if let Some(list_id) = shopping_list {
-        row.push(back_button("🛒 Покупки", Screen::List { list_id, page: 0 }));
+        row.push(back_button(
+            "🛒 Покупки",
+            Screen::List {
+                list_id,
+                page: 0,
+                edit: false,
+            },
+        ));
     }
     if total_tasks > MAX_LINES
         && let Some(list_id) = tasks_list
     {
         row.push(back_button(
             "Показать ещё",
-            Screen::List { list_id, page: 0 },
+            Screen::List {
+                list_id,
+                page: 0,
+                edit: false,
+            },
         ));
     }
     ui.row(row)
@@ -191,7 +209,14 @@ pub fn done_ui(item: &Item, list_id: Uuid, next: Option<&str>) -> Ui {
     }
     ui.row(vec![
         button("↩️ Отменить", Action::NoticeUndo { item_id: item.id }),
-        back_button(ru::OPEN_LIST_BUTTON, Screen::List { list_id, page: 0 }),
+        back_button(
+            ru::OPEN_LIST_BUTTON,
+            Screen::List {
+                list_id,
+                page: 0,
+                edit: false,
+            },
+        ),
     ])
 }
 

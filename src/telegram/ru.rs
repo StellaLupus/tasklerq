@@ -172,6 +172,12 @@ pub const DONE_TOAST: &str = "Выполнено";
 pub const BACK_BUTTON: &str = "⬅️ Назад";
 /// Кнопка возврата в главное меню.
 pub const MENU_BUTTON: &str = "🏠 Меню";
+/// Кнопка включения режима правки списка покупок.
+pub const EDIT_BUTTON: &str = "✏️ Править";
+/// Кнопка выключения режима правки списка покупок.
+pub const EDIT_FINISH_BUTTON: &str = "✓ Закончить правку";
+/// Пометка режима правки в заголовке списка покупок.
+pub const EDIT_MODE_TITLE: &str = "правка";
 /// Кнопка открытия списка из уведомления.
 pub const OPEN_LIST_BUTTON: &str = "📋 Открыть список";
 

@@ -11,7 +11,7 @@ use support::telegram::{Call, Harness};
 use support::{TestHousehold, create_item, db, new_item, next_telegram_id};
 use tasklerq::admin;
 use tasklerq::config::TenancyMode;
-use tasklerq::domain::models::{Actor, UserRole};
+use tasklerq::domain::models::{Actor, ItemPriority, UserRole};
 use tasklerq::domain::settings::NotificationSettings;
 use tasklerq::jobs::scheduler::Scheduler;
 use tasklerq::storage::repositories::items;
@@ -259,6 +259,319 @@ async fn shopping_flow_covers_duplicates_purchase_and_clear() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_rows_have_one_button_and_open_the_card_without_changing_the_task() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+
+    let mut urgent = new_item(household.tasks_list_id, "Срочная задача");
+    urgent.priority = ItemPriority::Urgent;
+    urgent.assignee_user_id = Some(household.owner_id);
+    let urgent = create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        urgent,
+    )
+    .await;
+
+    let mut high = new_item(household.tasks_list_id, "Высокая задача");
+    high.priority = ItemPriority::High;
+    create_item(&db.pool, &household, household.tasks_list_id, &actor, high).await;
+
+    let normal = create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, "Обычная задача"),
+    )
+    .await;
+
+    create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        new_item(household.shopping_list_id, "Молоко"),
+    )
+    .await;
+
+    bot.press("Задачи").await;
+    let buttons = support::telegram::buttons(&bot.screen());
+    let labels: Vec<&str> = buttons.iter().map(|(label, _)| label.as_str()).collect();
+    assert!(
+        !labels.iter().any(|label| *label == "☐" || *label == "⋯"),
+        "element rows must not keep service buttons: {labels:?}"
+    );
+    for title in ["Срочная задача", "Высокая задача", "Обычная задача"]
+    {
+        let rows: Vec<&(String, String)> = buttons
+            .iter()
+            .filter(|(label, _)| label.contains(title))
+            .collect();
+        assert_eq!(rows.len(), 1, "one full-width button per row: {title}");
+        assert!(
+            !rows[0].0.contains("👤"),
+            "the row must not show the assignee: {}",
+            rows[0].0
+        );
+    }
+    let row = |title: &str| {
+        buttons
+            .iter()
+            .find(|(label, _)| label.contains(title))
+            .map(|(label, _)| label.as_str())
+            .expect("row button")
+    };
+    assert!(row("Срочная задача").contains("🔴 срочно"), "{buttons:?}");
+    assert!(row("Высокая задача").contains("🟠 высокий"), "{buttons:?}");
+    assert!(!row("Обычная задача").contains("🔴"), "{buttons:?}");
+    assert!(!row("Обычная задача").contains("🟠"), "{buttons:?}");
+
+    let before = item_state(&db.pool, urgent.id).await;
+    bot.press("Срочная задача").await;
+    assert!(
+        bot.screen().contains("<h3>Задачи › Срочная задача</h3>"),
+        "the row must open the task card:\n{}",
+        bot.screen()
+    );
+    assert_eq!(
+        item_state(&db.pool, urgent.id).await,
+        before,
+        "opening the card must not change the task"
+    );
+
+    // «Мои задачи» и поиск используют ту же строку-кнопку.
+    bot.press("Назад").await; // список
+    bot.press("Назад").await; // меню
+    bot.press("Мои задачи").await;
+    assert_one_row_without_service_buttons(&bot.screen(), "Срочная задача");
+    bot.press("Назад").await;
+
+    bot.press("Поиск").await;
+    bot.text("задача").await;
+    for title in ["Срочная задача", "Высокая задача", "Обычная задача"]
+    {
+        assert_one_row_without_service_buttons(&bot.screen(), title);
+    }
+    assert!(
+        !support::telegram::buttons(&bot.screen())
+            .iter()
+            .any(|(label, _)| label.contains("☐")),
+        "results must not mark open items with ☐:\n{}",
+        bot.screen()
+    );
+
+    // Статус результата — текстом: выполненная задача помечена ✅.
+    sqlx::query("UPDATE items SET status = 'done', completed_at = now() WHERE id = $1")
+        .bind(normal.id)
+        .execute(&db.pool)
+        .await
+        .expect("mark done");
+    bot.press("Все").await;
+    let results = support::telegram::buttons(&bot.screen());
+    let done = results
+        .iter()
+        .find(|(label, _)| label.contains("Обычная задача"))
+        .map(|(label, _)| label.as_str())
+        .expect("done task row");
+    assert!(
+        done.starts_with("✅ "),
+        "done result must be marked: {done}"
+    );
+
+    bot.press("Назад").await;
+    bot.press("Поиск").await;
+    bot.text("молоко").await;
+    assert_one_row_without_service_buttons(&bot.screen(), "Молоко");
+    assert!(
+        support::telegram::buttons(&bot.screen())
+            .iter()
+            .any(|(label, _)| label.contains("Молоко") && label.contains("Покупки")),
+        "the result row must keep the list name:\n{}",
+        bot.screen()
+    );
+}
+
+fn assert_one_row_without_service_buttons(screen: &str, title: &str) {
+    let buttons = support::telegram::buttons(screen);
+    let rows: Vec<&(String, String)> = buttons
+        .iter()
+        .filter(|(label, _)| label.contains(title))
+        .collect();
+    assert_eq!(rows.len(), 1, "one button per row: {title}\n{screen}");
+    assert!(
+        !rows[0].0.starts_with("☐"),
+        "an open row must not carry ☐: {}",
+        rows[0].0
+    );
+    assert!(
+        !buttons.iter().any(|(label, _)| label == "⋯"),
+        "no «⋯» button belongs to an element row: {buttons:?}"
+    );
+}
+
+fn assert_one_shopping_row(screen: &str, title: &str) {
+    let buttons = support::telegram::buttons(screen);
+    let rows: Vec<&(String, String)> = buttons
+        .iter()
+        .filter(|(label, _)| label.contains(title))
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "one button per shopping row: {title}\n{screen}"
+    );
+    assert!(
+        !buttons.iter().any(|(label, _)| label == "⋯"),
+        "no «⋯» button belongs to a shopping row: {buttons:?}"
+    );
+}
+
+async fn item_state(pool: &PgPool, item_id: Uuid) -> (i32, String) {
+    sqlx::query_as("SELECT version, status::text FROM items WHERE id = $1")
+        .bind(item_id)
+        .fetch_one(pool)
+        .await
+        .expect("item state")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shopping_row_toggles_the_purchase_and_stays_in_the_list() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut item = new_item(household.shopping_list_id, "Молоко");
+    item.quantity = Some(2.0);
+    item.unit = Some("л".into());
+    let item = create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        item,
+    )
+    .await;
+
+    bot.press("Покупки").await;
+    bot.assert_screen_contains("Покупки · 1");
+    bot.assert_screen_contains("☐ Молоко · 2 л");
+    assert_one_shopping_row(&bot.screen(), "Молоко");
+
+    bot.press("☐ Молоко · 2 л").await;
+    bot.assert_screen_contains("Покупки · 0");
+    bot.assert_screen_contains("☑ Молоко · 2 л");
+    let state: serde_json::Value =
+        sqlx::query_scalar("SELECT state FROM telegram_views WHERE chat_id = $1")
+            .bind(bot.chat)
+            .fetch_one(&db.pool)
+            .await
+            .expect("saved list state");
+    assert_eq!(state["t"], serde_json::json!("list"));
+    assert_eq!(state["edit"], serde_json::json!(false));
+    assert_eq!(
+        item_state(&db.pool, item.id).await.1,
+        "done",
+        "the row tap marks the purchase"
+    );
+
+    bot.press("☑ Молоко · 2 л").await;
+    bot.assert_screen_contains("☐ Молоко · 2 л");
+    assert_eq!(item_state(&db.pool, item.id).await.1, "open");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shopping_edit_mode_opens_the_card_and_is_kept_on_back() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut item = new_item(household.shopping_list_id, "Молоко");
+    item.quantity = Some(2.0);
+    item.unit = Some("л".into());
+    let item = create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        item,
+    )
+    .await;
+
+    bot.press("Покупки").await;
+    bot.assert_has_button("✏️ Править");
+    bot.press("Править").await;
+    bot.assert_screen_contains("Покупки · правка");
+    bot.assert_has_button("✓ Закончить правку");
+
+    bot.press("☐ Молоко · 2 л").await;
+    bot.assert_screen_contains("Покупки › Молоко");
+    bot.assert_has_button("✓ Куплено");
+    assert_eq!(
+        item_state(&db.pool, item.id).await.1,
+        "open",
+        "a row in edit mode must not mark the purchase"
+    );
+
+    bot.press("Назад").await;
+    bot.assert_screen_contains("Покупки · правка");
+    bot.assert_has_button("✓ Закончить правку");
+
+    bot.press("Закончить правку").await;
+    bot.assert_screen_contains("Покупки · 1");
+    assert!(!bot.screen().contains("правка"));
+
+    // Повторный вход из меню открывает обычный режим.
+    bot.press("Назад").await;
+    bot.press("Покупки").await;
+    bot.assert_screen_contains("Покупки · 1");
+    assert!(!bot.screen().contains("правка"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn old_list_state_without_edit_is_read_as_normal_mode() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut item = new_item(household.shopping_list_id, "Молоко");
+    item.quantity = Some(2.0);
+    item.unit = Some("л".into());
+    create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        item,
+    )
+    .await;
+
+    let old_state = serde_json::json!({
+        "t": "list",
+        "list_id": household.shopping_list_id,
+        "page": 0,
+    });
+    sqlx::query("UPDATE telegram_views SET state = $1 WHERE chat_id = $2")
+        .bind(old_state)
+        .bind(bot.chat)
+        .execute(&db.pool)
+        .await
+        .expect("old list state");
+
+    let data = action_callback(&db.pool, bot.chat, household.household_id, Action::Refresh).await;
+    let (message_id, _) = bot.active();
+    bot.press_data(&data, message_id).await;
+
+    bot.assert_screen_contains("Покупки · 1");
+    bot.assert_screen_contains("☐ Молоко · 2 л");
+    assert!(!bot.screen().contains("правка"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn clearing_many_purchases_needs_confirmation() {
     let db = db().await;
     let mut bot = onboarded_named(&db.pool, "Alice").await;
@@ -309,19 +622,31 @@ async fn lists_paginate_and_counters_follow_actions() {
     bot.press("Задачи").await;
     bot.assert_screen_contains("Задачи · 9");
     bot.assert_screen_contains("Страница 1 из 2");
-    assert_eq!(
-        support::telegram::buttons(&bot.screen())
-            .iter()
-            .filter(|(l, _)| l == "☐")
-            .count(),
-        8
+    let row_buttons: Vec<_> = support::telegram::buttons(&bot.screen())
+        .into_iter()
+        .filter(|(label, _)| label.starts_with("Задача "))
+        .collect();
+    assert_eq!(row_buttons.len(), 8, "one full-width button per task row");
+    let labels: Vec<String> = support::telegram::buttons(&bot.screen())
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect();
+    assert!(
+        !labels.iter().any(|label| label == "☐" || label == "⋯"),
+        "element rows must not keep service buttons: {labels:?}"
     );
     bot.press("→").await;
     bot.assert_screen_contains("Страница 2 из 2");
 
-    // Завершить единственную задачу второй страницы: возврат на последнюю
-    // существующую страницу.
-    bot.press("☐").await;
+    // Завершить единственную задачу второй страницы: строка открывает
+    // карточку, «✓ Выполнено» возвращает на последнюю существующую страницу.
+    let task = support::telegram::buttons(&bot.screen())
+        .into_iter()
+        .map(|(label, _)| label)
+        .find(|label| label.starts_with("Задача "))
+        .expect("a task on the second page");
+    bot.press(&task).await;
+    bot.press("Выполнено").await;
     bot.press("Назад").await;
     bot.assert_screen_contains("Задачи · 8");
 
@@ -1742,6 +2067,7 @@ async fn member_cannot_undo_an_item_deleted_by_the_owner() {
             back: Screen::List {
                 list_id: household.tasks_list_id,
                 page: 0,
+                edit: false,
             },
         },
     )
@@ -2194,10 +2520,16 @@ async fn action_labels_do_not_say_gotovo() {
     bot.press("Назад").await;
     bot.press("Назад").await;
 
-    // Карточка покупки.
+    // Карточка покупки: режим правки открывает её из строки.
     bot.press("Покупки").await;
-    bot.press("⋯").await;
-    screens.push(support::telegram::buttons(&bot.screen()));
+    bot.press("Править").await;
+    bot.press("Молоко").await;
+    let purchase = support::telegram::buttons(&bot.screen());
+    assert!(
+        purchase.iter().any(|(label, _)| label == "✓ Куплено"),
+        "{purchase:?}"
+    );
+    screens.push(purchase);
     bot.press("Назад").await;
     bot.press("Назад").await;
 

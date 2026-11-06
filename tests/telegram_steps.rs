@@ -310,7 +310,8 @@ async fn edit_form_summary_shows_the_shopping_quantity() {
     .await;
 
     bot.press("Покупки").await;
-    bot.press("⋯").await;
+    bot.press("Править").await;
+    bot.press("Молоко").await;
     bot.press("Количество").await;
 
     bot.assert_screen_contains("Сколько?");
@@ -341,7 +342,8 @@ async fn edit_form_summary_shows_a_unit_without_quantity() {
         .expect("quantity without number");
 
     bot.press("Покупки").await;
-    bot.press("⋯").await;
+    bot.press("Править").await;
+    bot.press("Хлеб").await;
     bot.press("Единица").await;
 
     bot.assert_screen_contains("В чём измерять?");
