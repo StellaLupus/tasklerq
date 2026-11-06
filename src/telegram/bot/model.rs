@@ -171,8 +171,14 @@ pub enum Screen {
     },
     /// Настройки.
     Settings,
+    /// Профиль пользователя: имя и часовой пояс.
+    Profile,
+    /// Опасные действия: удаление пространства или выход.
+    Danger,
     /// Настройки уведомлений.
     Notifications,
+    /// Выбор за сколько напоминать о сроке.
+    LeadTime,
     /// Выбор часового пояса.
     Timezones,
     /// Участники household.
@@ -236,12 +242,13 @@ impl Screen {
             | Self::Deleted { back, .. }
             | Self::ConfirmDelete { back, .. } => back.depth() + 1,
             Self::ConfirmClear { .. } | Self::Cleared { .. } => 3,
-            Self::Notifications
-            | Self::Timezones
+            Self::Profile
+            | Self::Danger
+            | Self::Notifications
             | Self::Family
             | Self::Integrations { .. }
-            | Self::Journal { .. }
-            | Self::ConfirmLeave => 3,
+            | Self::Journal { .. } => 3,
+            Self::LeadTime | Self::Timezones | Self::ConfirmLeave => 4,
             Self::Member { .. } | Self::Invites | Self::ConfirmRevokeToken { .. } => 4,
             Self::ConfirmRemove { .. }
             | Self::ConfirmTransfer { .. }
@@ -271,7 +278,10 @@ impl Screen {
             Self::Mine { .. } => "Мои задачи",
             Self::Results { .. } => "Поиск",
             Self::Settings => "Настройки",
+            Self::Profile => "Профиль",
+            Self::Danger => "Опасное",
             Self::Notifications => "Уведомления",
+            Self::LeadTime => "Время напоминания",
             Self::Timezones => "Часовой пояс",
             Self::Family => "Семья",
             Self::Integrations { .. } => "Интеграции",
@@ -306,11 +316,14 @@ impl Screen {
             }
             Self::ConfirmClear { .. } | Self::Cleared { .. } => vec!["Список"],
             Self::Notifications
-            | Self::Timezones
             | Self::Family
             | Self::Integrations { .. }
-            | Self::Journal { .. } => vec!["Настройки"],
-            Self::ConfirmLeave => vec!["Настройки"],
+            | Self::Journal { .. }
+            | Self::Profile
+            | Self::Danger => vec!["Настройки"],
+            Self::LeadTime => vec!["Настройки", "Уведомления"],
+            Self::Timezones => vec!["Настройки", "Профиль"],
+            Self::ConfirmLeave => vec!["Настройки", "Опасное"],
             Self::Member { .. } | Self::Invites => vec!["Настройки", "Семья"],
             Self::ConfirmRemove { .. } | Self::ConfirmTransfer { .. } => {
                 vec!["Настройки", "Семья", "Участник"]
@@ -1242,6 +1255,9 @@ mod tests {
                 item_ids: Vec::new(),
             },
             Screen::Notifications,
+            Screen::LeadTime,
+            Screen::Profile,
+            Screen::Danger,
             Screen::Timezones,
             Screen::Family,
             Screen::Integrations { page: 0 },

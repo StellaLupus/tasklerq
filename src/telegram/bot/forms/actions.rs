@@ -68,7 +68,7 @@ async fn rename(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
             ctx.user = Some(user);
             clear(ctx).await?;
             ctx.toast("Имя обновлено");
-            ctx.present(Screen::Settings).await
+            ctx.present(Screen::Profile).await
         }
         Err(crate::domain::error::DomainError::Validation(_)) => {
             ctx.banner("Имя — от 1 до 64 символов.");
@@ -310,8 +310,9 @@ pub async fn on_action(ctx: &mut Ctx<'_>, act: FormAct) -> Result<(), Fail> {
             // У остальных форм одна кнопка — отмена.
             clear(ctx).await?;
             let back = match form {
-                Form::Rename | Form::DeleteHousehold | Form::Lead => Screen::Settings,
-                Form::Time { .. } => Screen::Notifications,
+                Form::Rename => Screen::Profile,
+                Form::DeleteHousehold => Screen::Danger,
+                Form::Lead | Form::Time { .. } => Screen::Notifications,
                 _ => Screen::Menu,
             };
             if ctx.user.is_none() {

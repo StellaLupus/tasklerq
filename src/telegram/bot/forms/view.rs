@@ -103,7 +103,7 @@ pub async fn view(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
 fn time_title(field: TimeField) -> &'static str {
     match field {
         TimeField::Digest => "Во сколько присылать сводку?",
-        TimeField::AllDay => "Во сколько напоминать о вседневных задачах?",
+        TimeField::AllDay => "Во сколько напоминать о задачах без времени?",
         TimeField::QuietStart => "Когда начинаются тихие часы?",
         TimeField::QuietEnd => "Когда заканчиваются тихие часы?",
     }

@@ -1219,33 +1219,159 @@ async fn settings_profile_timezone_and_notifications() {
     let mut bot = onboarded_named(&db.pool, "Alice").await;
 
     bot.press("Настройки").await;
+    bot.assert_screen_contains("👤 Alice");
     bot.assert_screen_contains("Часовой пояс: Europe/Moscow");
-    bot.assert_screen_contains("Напоминания: вкл, за 15 минут");
+    bot.assert_screen_contains("Роль: владелец");
+    bot.assert_has_button("Профиль");
+    bot.assert_has_button("Уведомления");
+    bot.assert_has_button("Опасное");
     bot.assert_has_button("Семья");
     bot.assert_has_button("Журнал");
+    assert!(bot.find_button("Удалить пространство").is_none());
+    assert!(bot.find_button("Выйти").is_none());
+    assert!(!bot.screen().contains("Напоминания:"));
+    assert!(!bot.screen().contains("Тихие часы:"));
 
-    bot.press("Время").await;
+    // Профиль показывает имя и пояс; выбор пояса возвращает в профиль.
+    bot.press("Профиль").await;
+    bot.assert_screen_contains("👤 Alice");
+    bot.assert_screen_contains("Часовой пояс: Europe/Moscow");
+    bot.press("Часовой пояс").await;
+    bot.assert_screen_contains("Настройки › Профиль › Часовой пояс");
     bot.press("Asia/Yekaterinburg").await;
     bot.assert_screen_contains("Часовой пояс: Asia/Yekaterinburg");
+    bot.assert_screen_contains("Профиль");
 
+    // Сохранение имени возвращает в профиль с новым именем.
     bot.press("Имя").await;
     bot.text("Алиса").await;
-    bot.assert_screen_contains("Профиль: Алиса");
+    bot.assert_screen_contains("Алиса");
 
-    bot.press("Уведомления").await;
-    bot.press("Напоминания").await;
-    bot.assert_screen_contains("Напоминания: выкл");
-    bot.press("30 мин").await;
+    // Сводок на экране настроек нет: они в разделе уведомлений.
     bot.press("Назад").await;
-    bot.assert_screen_contains("Напоминания: выкл, за 30 минут");
+    bot.assert_screen_contains("Настройки");
+    bot.press("Уведомления").await;
+    bot.assert_screen_contains("🔔 Напоминания: за 15 мин");
+
+    // Выключенные напоминания скрывают уточняющие кнопки.
+    bot.press_after("🔔 Напоминания", "Выкл").await;
+    bot.assert_screen_contains("🔔 Напоминания: выкл");
+    assert!(bot.find_button("⏱ За").is_none());
+    assert!(bot.find_button("без времени").is_none());
+
+    // Выбор срока на отдельном экране возвращает на уведомления.
+    bot.press_after("🔔 Напоминания", "Вкл").await;
+    bot.press("⏱ За 15 мин").await;
+    bot.assert_screen_contains("Настройки › Уведомления › За сколько напоминать?");
+    bot.press("30 мин").await;
+    bot.assert_screen_contains("🔔 Напоминания: за 30 мин");
 
     // Своё значение вне диапазона отклоняется, форма остаётся открытой.
-    bot.press("Уведомления").await;
+    bot.press("⏱ За 30 мин").await;
     bot.press("Своё").await;
     bot.text("2").await;
     bot.assert_screen_contains("от 5 минут");
     bot.text("45").await;
-    bot.assert_screen_contains("45");
+    bot.assert_screen_contains("Напоминания: за 45 мин");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dangerous_action_is_not_on_the_settings_screen() {
+    let db = db().await;
+    let mut owner = onboarded_named(&db.pool, "Алексей").await;
+    let mut maria = invite(&mut owner, &db.pool, "Мария").await;
+    let household = household_for(&db.pool, owner.chat).await;
+
+    // Владелец: удаления нет на настройках, но оно есть на «Опасном».
+    owner.press("Настройки").await;
+    assert!(owner.find_button("Удалить пространство").is_none());
+    owner.press("Опасное").await;
+    owner.assert_screen_contains("⚠️ Опасное");
+    owner.assert_has_button("Удалить пространство");
+    owner.press("Удалить пространство").await;
+    owner.assert_screen_contains("Для подтверждения отправьте название");
+    owner.press("Отмена").await;
+    owner.assert_screen_contains("⚠️ Опасное");
+
+    // Участник: на «Опасном» только выход.
+    maria.press("Настройки").await;
+    maria.press("Опасное").await;
+    maria.assert_has_button("Выйти");
+    assert!(maria.find_button("Удалить пространство").is_none());
+
+    // Прямое нажатие удаления по валидному токену отклоняется.
+    let (message_id, _) = maria.active();
+    let data = action_callback(
+        &db.pool,
+        maria.chat,
+        household.household_id,
+        Action::HouseholdDeleteStart,
+    )
+    .await;
+    maria.press_data(&data, message_id).await;
+    let toast = maria
+        .fake
+        .answers()
+        .into_iter()
+        .next_back()
+        .and_then(|(_, text, _)| text);
+    assert_eq!(toast.as_deref(), Some("Это доступно только владельцу."));
+    assert!(
+        !maria
+            .screen()
+            .contains("Для подтверждения отправьте название")
+    );
+
+    maria.press("Выйти").await;
+    maria.assert_screen_contains("Выйти из пространства?");
+    maria.press("Назад").await;
+    maria.assert_screen_contains("⚠️ Опасное");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quiet_hours_can_be_switched_and_hide_boundaries_when_off() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+
+    bot.press("Настройки").await;
+    bot.press("Уведомления").await;
+    bot.assert_screen_contains("🌙 Тихие часы: 22:00–08:00");
+    bot.assert_has_button("Начало тихих: 22:00");
+    bot.assert_has_button("Конец тихих: 08:00");
+
+    bot.press_after("🌙 Тихие часы", "Выкл").await;
+    bot.assert_screen_contains("🌙 Тихие часы: выкл");
+    assert!(bot.find_button("Начало тихих").is_none());
+    assert!(bot.find_button("Конец тихих").is_none());
+    bot.assert_has_button("Вкл");
+
+    bot.press_after("🌙 Тихие часы", "Вкл").await;
+    bot.assert_screen_contains("🌙 Тихие часы: 22:00–08:00");
+    bot.assert_has_button("Начало тихих: 22:00");
+    bot.assert_has_button("Конец тихих: 08:00");
+    let screen = bot.screen();
+    let quiet = &screen[screen.find("🌙 Тихие часы").expect("quiet block")..];
+    assert!(
+        support::telegram::buttons(quiet)
+            .iter()
+            .any(|(label, _)| label == "Выкл"),
+        "the toggle must name the action:\n{screen}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reminder_for_tasks_without_due_time_has_a_clear_label() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+
+    bot.press("Настройки").await;
+    bot.press("Уведомления").await;
+    bot.assert_has_button("без времени — в 09:00");
+    assert!(!bot.screen().contains("Вседневн"));
+
+    bot.press("без времени").await;
+    bot.assert_screen_contains("задачах без времени");
+    assert!(!bot.screen().contains("Вседневн"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1254,10 +1380,11 @@ async fn settings_edit_notification_times_and_reject_invalid_values() {
     let mut bot = onboarded_named(&db.pool, "Alice").await;
 
     bot.press("Настройки").await;
-    bot.assert_screen_contains("Вседневное: 09:00");
+    assert!(!bot.screen().contains("Тихие часы:"));
     bot.press("Уведомления").await;
+    bot.assert_screen_contains("🌅 Утренняя сводка: 08:30");
     bot.assert_has_button("Время сводки: 08:30");
-    bot.assert_has_button("Вседневные: 09:00");
+    bot.assert_has_button("без времени — в 09:00");
     bot.assert_has_button("Начало тихих: 22:00");
     bot.assert_has_button("Конец тихих: 08:00");
 
@@ -1271,16 +1398,17 @@ async fn settings_edit_notification_times_and_reject_invalid_values() {
         assert_eq!(settings.digest_time, "08:30", "{bad}");
     }
     bot.text("07:45").await;
-    bot.assert_screen_contains("Время сводки: 07:45");
+    bot.assert_screen_contains("🌅 Утренняя сводка: 07:45");
     assert_eq!(
         notification_settings(&db.pool, bot.chat).await.digest_time,
         "07:45"
     );
 
-    // Время вседневного напоминания.
-    bot.press("Вседневные").await;
+    // Время напоминания о задачах без срока.
+    bot.press("без времени").await;
+    bot.assert_screen_contains("задачах без времени");
     bot.text("10:15").await;
-    bot.assert_screen_contains("Вседневные: 10:15");
+    bot.assert_screen_contains("без времени — в 10:15");
     assert_eq!(
         notification_settings(&db.pool, bot.chat).await.all_day_time,
         "10:15"
@@ -1289,7 +1417,7 @@ async fn settings_edit_notification_times_and_reject_invalid_values() {
     // Начало и конец тихих часов не могут совпадать; прежний конец остаётся.
     bot.press("Начало тихих").await;
     bot.text("23:00").await;
-    bot.assert_screen_contains("Начало тихих: 23:00");
+    bot.assert_has_button("Начало тихих: 23:00");
     bot.press("Конец тихих").await;
     bot.text("23:00").await;
     bot.assert_screen_contains("не должны совпадать");
@@ -1298,7 +1426,7 @@ async fn settings_edit_notification_times_and_reject_invalid_values() {
     assert_eq!(settings.quiet_end, "08:00");
 
     bot.press("Отмена").await;
-    bot.assert_screen_contains("Конец тихих: 08:00");
+    bot.assert_has_button("Конец тихих: 08:00");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1340,13 +1468,13 @@ async fn notification_time_changes_apply_on_the_next_scheduler_tick() {
 
     // Выключаем сводку и меняем время вседневного напоминания тем же
     // экземпляром планировщика — перезапуск не нужен.
-    bot.press("Сводка").await;
+    bot.press_after("🌅 Утренняя сводка", "Выкл").await;
     assert!(
         !notification_settings(&db.pool, bot.chat)
             .await
             .digest_enabled
     );
-    bot.press("Вседневные").await;
+    bot.press("без времени").await;
     bot.text("14:00").await;
 
     let due_date = day + Duration::days(1);
@@ -1403,7 +1531,10 @@ async fn bot_answers_user_actions_during_quiet_hours() {
 
     bot.press("Настройки").await;
     bot.assert_screen_contains("Настройки");
-    bot.assert_screen_contains("Тихие часы: 22:00–08:00");
+    assert!(
+        !bot.screen().contains("Тихие часы:"),
+        "the quiet hours summary is on the notifications screen now"
+    );
     assert!(
         !bot.fake.calls().is_empty(),
         "бот должен ответить ночью сразу, не дожидаясь конца тихих часов"
@@ -1417,7 +1548,8 @@ async fn bot_answers_user_actions_during_quiet_hours() {
     assert_eq!(deliveries, 0);
 
     bot.press("Уведомления").await;
-    bot.assert_screen_contains("Начало тихих: 22:00");
+    bot.assert_screen_contains("🌙 Тихие часы: 22:00–08:00");
+    bot.assert_has_button("Начало тихих: 22:00");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1491,6 +1623,7 @@ async fn owner_manages_family_and_journal_hides_secrets() {
     member.press("Настройки").await;
     assert!(member.find_button("Семья").is_none());
     assert!(member.find_button("Журнал").is_none());
+    member.press("Опасное").await;
     member.assert_has_button("Выйти");
 
     // Журнал владельца: событие присоединения без кода и хешей.
@@ -1588,6 +1721,7 @@ async fn removal_leaving_and_transfer_notify_participants() {
 
     // Участник выходит сам.
     boris.press("Настройки").await;
+    boris.press("Опасное").await;
     boris.press("Выйти").await;
     boris.assert_screen_contains("Выйти из пространства?");
     boris.press("Да, выйти").await;
@@ -1649,8 +1783,10 @@ async fn ownership_transfer_changes_available_sections() {
             .any(|(_, text, _)| text.as_deref() == Some("Владение передано"))
     );
 
-    owner.assert_has_button("Выйти");
+    owner.assert_screen_contains("Настройки");
     assert!(owner.find_button("Семья").is_none());
+    owner.press("Опасное").await;
+    owner.assert_has_button("Выйти");
     maria.deliver().await;
     let notice = maria
         .fake
@@ -1669,6 +1805,7 @@ async fn household_deletion_requires_typing_its_name() {
     let mut maria = invite(&mut owner, &db.pool, "Мария").await;
 
     owner.press("Настройки").await;
+    owner.press("Опасное").await;
     owner.press("Удалить пространство").await;
     owner.assert_screen_contains("Для подтверждения отправьте название");
     owner.text("Не то").await;
@@ -2944,6 +3081,7 @@ async fn stale_saved_button_is_rejected_but_the_expire_row_survives() {
     owner.press("Мария").await;
     owner.press("Передать владение").await;
     owner.press("Да, передать").await;
+    owner.press("Опасное").await;
     owner.press("Выйти").await;
     owner.press("Да, выйти").await;
 
@@ -3285,12 +3423,43 @@ async fn every_screen_has_back_and_no_legacy_return_labels() {
 
     owner.press("Настройки").await;
     assert_navigation(&owner, true);
-    for label in ["Уведомления", "Время", "Журнал", "Интеграции"] {
+    for label in ["Уведомления", "Профиль", "Опасное", "Журнал", "Интеграции"]
+    {
         owner.press(label).await;
         assert_navigation(&owner, true);
         owner.press("Назад").await;
         owner.assert_screen_contains("Настройки");
     }
+
+    // Часовой пояс — ребёнок профиля, возврат после выбора ведёт в профиль.
+    owner.press("Профиль").await;
+    owner.press("Часовой пояс").await;
+    assert_navigation(&owner, true);
+    owner.assert_screen_contains("Настройки › Профиль › Часовой пояс");
+    owner.press("Назад").await;
+    owner.assert_screen_contains("Профиль");
+    owner.press("Назад").await;
+    owner.assert_screen_contains("Настройки");
+
+    // Время напоминания — ребёнок экрана уведомлений.
+    owner.press("Уведомления").await;
+    owner.press("⏱ За 15 мин").await;
+    assert_navigation(&owner, true);
+    owner.assert_screen_contains("Настройки › Уведомления › За сколько напоминать?");
+    owner.press("Назад").await;
+    owner.assert_screen_contains("Уведомления");
+    owner.press("Назад").await;
+    owner.assert_screen_contains("Настройки");
+
+    // Опасное действие ведёт в форму подтверждения, отмена возвращает назад.
+    owner.press("Опасное").await;
+    owner.press("Удалить пространство").await;
+    owner.assert_screen_contains("Для подтверждения отправьте название");
+    owner.assert_has_button("Отмена");
+    owner.press("Отмена").await;
+    owner.assert_screen_contains("⚠️ Опасное");
+    owner.press("Назад").await;
+    owner.assert_screen_contains("Настройки");
 
     owner.press("Семья").await;
     assert_navigation(&owner, true);
@@ -3330,9 +3499,13 @@ async fn every_screen_has_back_and_no_legacy_return_labels() {
     // Участнику доступен только выход; у подтверждения тоже есть навигация.
     member.press("Настройки").await;
     assert_navigation(&member, true);
+    member.press("Опасное").await;
+    assert_navigation(&member, true);
     member.press("Выйти").await;
     assert_navigation(&member, true);
-    member.press("Назад").await;
+    member.press("Назад").await; // опасное
+    assert_navigation(&member, true);
+    member.press("Назад").await; // настройки
     member.assert_screen_contains("Настройки");
 }
 

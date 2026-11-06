@@ -50,7 +50,10 @@ pub async fn build(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
             super::shopping::cleared(ctx, *list_id, item_ids).await
         }
         Screen::Settings
+        | Screen::Profile
+        | Screen::Danger
         | Screen::Notifications
+        | Screen::LeadTime
         | Screen::Timezones
         | Screen::Family
         | Screen::Integrations { .. }

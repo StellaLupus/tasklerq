@@ -182,7 +182,8 @@ async fn snooze_all_waits_for_its_due_time_after_timezone_change() {
     // 09:20 в Москве — 16:20 во Владивостоке: по новым настройкам не тихо.
     bot.advance(at + Duration::minutes(20) - bot.now);
     bot.press("Настройки").await;
-    bot.press("Время").await;
+    bot.press("Профиль").await;
+    bot.press("Часовой пояс").await;
     let sent_before = bot.fake.sent().len();
     bot.press("Asia/Vladivostok").await;
 
@@ -393,7 +394,7 @@ async fn snooze_all_waits_for_its_due_time_when_quiet_hours_change() {
     bot.advance(later - bot.now);
     open_notifications(&mut bot).await;
     let sent_before = bot.fake.sent().len();
-    bot.press("Тихие часы: вкл").await;
+    bot.press_after("🌙 Тихие часы", "Выкл").await;
 
     assert!(!bot.screen().contains("Накопилось"), "{}", bot.screen());
     assert_eq!(

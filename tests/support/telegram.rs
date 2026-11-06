@@ -585,6 +585,21 @@ impl Harness {
         self.press_data(&data, message_id).await;
     }
 
+    /// Нажать первую кнопку с подписью после текста-якоря: у одинаковых
+    /// переключателей блоков так выбирается нужный.
+    pub async fn press_after(&mut self, anchor: &str, label: &str) {
+        let (message_id, html) = self.active();
+        let start = html
+            .find(anchor)
+            .unwrap_or_else(|| panic!("anchor `{anchor}` not found on screen:\n{html}"));
+        let data = buttons(&html[start..])
+            .into_iter()
+            .find(|(text, _)| text.contains(label))
+            .unwrap_or_else(|| panic!("button `{label}` after `{anchor}` not found:\n{html}"))
+            .1;
+        self.press_data(&data, message_id).await;
+    }
+
     pub async fn press_data(&mut self, data: &str, message_id: i64) {
         let name = self.name.clone();
         let update = self.callback_update(&name, data, message_id);

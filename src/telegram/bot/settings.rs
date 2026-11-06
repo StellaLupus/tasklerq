@@ -116,7 +116,10 @@ pub(super) async fn finish_settings_change(
 pub async fn view(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
     match screen {
         Screen::Settings => settings(ctx),
+        Screen::Profile => profile(ctx),
+        Screen::Danger => danger(ctx),
         Screen::Notifications => notifications(ctx),
+        Screen::LeadTime => lead_time(ctx),
         Screen::Timezones => Ok(timezones()),
         Screen::Family => family(ctx).await,
         Screen::Integrations { page } => integrations(ctx, *page).await,
@@ -148,7 +151,7 @@ pub async fn view(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
             .text("Назначенные на вас задачи останутся без исполнителя. Вернуться можно только по новому приглашению.")
             .row({
                 let mut row = vec![button("🚪 Да, выйти", Action::Leave)];
-                row.extend(nav_row(&Screen::ConfirmLeave, Screen::Settings));
+                row.extend(nav_row(&Screen::ConfirmLeave, Screen::Danger));
                 row
             })),
         _ => Ok(Ui::new()),
@@ -158,113 +161,153 @@ pub async fn view(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
 fn settings(ctx: &Ctx<'_>) -> Result<Ui, Fail> {
     let user = ctx.user()?;
     let household = ctx.household()?;
-    let notifications = NotificationSettings::from_settings(&user.settings);
     let zone = match user.timezone.as_deref() {
         Some(zone) => zone.to_owned(),
         None => format!("{} (как в пространстве)", household.timezone),
     };
+    let role = if user.role == UserRole::Owner {
+        "владелец"
+    } else {
+        "участник"
+    };
 
     let mut ui = Ui::new()
         .heading(Screen::Settings.trail("Настройки", None))
-        .text(format!("👤 Профиль: {}", user.display_name))
+        .text(format!("👤 {}", user.display_name))
         .text(format!("🌍 Часовой пояс: {zone}"))
-        .text(format!(
-            "🔔 Напоминания: {}, за {}",
-            on_off(notifications.reminders_enabled),
-            ru::minutes(i64::from(notifications.lead_minutes))
-        ))
-        .text(format!(
-            "🌅 Сводка: {}, {}",
-            on_off(notifications.digest_enabled),
-            notifications.digest_time
-        ))
-        .text(format!("☀️ Вседневное: {}", notifications.all_day_time))
-        .text(format!(
-            "🌙 Тихие часы: {}",
-            if notifications.quiet_hours_enabled {
-                format!("{}–{}", notifications.quiet_start, notifications.quiet_end)
-            } else {
-                "выкл".to_owned()
-            }
-        ))
+        .text(format!("Роль: {role}"))
         .row(vec![
-            button("👤 Имя", Action::RenameStart),
-            back_button("🌍 Время", Screen::Timezones),
+            back_button("👤 Профиль", Screen::Profile),
+            back_button("🔔 Уведомления", Screen::Notifications),
         ])
-        .row(vec![back_button("🔔 Уведомления", Screen::Notifications)]);
+        .row(vec![back_button("⚠️ Опасное", Screen::Danger)]);
 
     if user.role == UserRole::Owner {
+        ui = ui.row(vec![
+            back_button("👥 Семья", Screen::Family),
+            back_button("📜 Журнал", Screen::Journal { page: 0 }),
+            back_button("🔌 Интеграции", Screen::Integrations { page: 0 }),
+        ]);
+    }
+    Ok(ui.row(nav_row(&Screen::Settings, Screen::Menu)))
+}
+
+fn profile(ctx: &Ctx<'_>) -> Result<Ui, Fail> {
+    let user = ctx.user()?;
+    let household = ctx.household()?;
+    let zone = match user.timezone.as_deref() {
+        Some(zone) => zone.to_owned(),
+        None => format!("{} (как в пространстве)", household.timezone),
+    };
+    Ok(Ui::new()
+        .heading(Screen::Profile.trail("Профиль", None))
+        .text(format!("👤 {}", user.display_name))
+        .text(format!("🌍 Часовой пояс: {zone}"))
+        .row(vec![
+            button("✏️ Имя", Action::RenameStart),
+            back_button("🌍 Часовой пояс", Screen::Timezones),
+        ])
+        .row(nav_row(&Screen::Profile, Screen::Settings)))
+}
+
+fn danger(ctx: &Ctx<'_>) -> Result<Ui, Fail> {
+    let user = ctx.user()?;
+    let mut ui = Ui::new().heading(Screen::Danger.trail("⚠️ Опасное", None));
+    if user.role == UserRole::Owner {
         ui = ui
-            .row(vec![
-                back_button("👥 Семья", Screen::Family),
-                back_button("📜 Журнал", Screen::Journal { page: 0 }),
-                back_button("🔌 Интеграции", Screen::Integrations { page: 0 }),
-            ])
+            .text("Удаление стирает все списки, задачи и покупки. Отменить это нельзя.")
             .row(vec![button(
                 "🗑 Удалить пространство",
                 Action::HouseholdDeleteStart,
             )]);
     } else {
-        ui = ui.row(vec![back_button("🚪 Выйти", Screen::ConfirmLeave)]);
+        ui = ui
+            .text("После выхода вернуться можно только по новому приглашению.")
+            .row(vec![back_button("🚪 Выйти", Screen::ConfirmLeave)]);
     }
-    Ok(ui.row(nav_row(&Screen::Settings, Screen::Menu)))
+    Ok(ui.row(nav_row(&Screen::Danger, Screen::Settings)))
 }
 
 fn notifications(ctx: &Ctx<'_>) -> Result<Ui, Fail> {
     let settings = NotificationSettings::from_settings(&ctx.user()?.settings);
-    let toggle = |label: &str, value: bool, setting: Setting| {
+    // Переключатель называет действие, а не текущее состояние.
+    let toggle = |value: bool, setting: Setting| {
         button(
-            format!("{label}: {}", on_off(value)),
+            if value { "Выкл" } else { "Вкл" },
             Action::Toggle { setting },
         )
     };
-    let lead = |minutes: u16| {
-        let mark = if settings.lead_minutes == minutes {
-            "● "
+
+    let mut ui = Ui::new().heading(Screen::Notifications.trail("Уведомления", None));
+
+    ui = ui.text(format!(
+        "🔔 Напоминания: {}",
+        if settings.reminders_enabled {
+            format!("за {}", ru::minutes(i64::from(settings.lead_minutes)))
         } else {
-            ""
-        };
-        button(format!("{mark}{minutes} мин"), Action::SetLead { minutes })
-    };
-    Ok(Ui::new()
-        .heading(Screen::Notifications.trail("Уведомления", None))
-        .text(format!(
-            "Напоминать о сроках за {}. Выберите другое значение:",
-            ru::minutes(i64::from(settings.lead_minutes))
-        ))
-        .row(vec![lead(5), lead(15), lead(30)])
-        .row(vec![lead(60), button("Своё…", Action::LeadStart)])
-        .row(vec![toggle(
-            "🔔 Напоминания",
-            settings.reminders_enabled,
-            Setting::Reminders,
-        )])
-        .row(vec![
-            toggle("🌅 Сводка", settings.digest_enabled, Setting::Digest),
+            "выкл".to_owned()
+        }
+    ));
+    if settings.reminders_enabled {
+        ui = ui
+            .row(vec![
+                back_button(
+                    &format!("⏱ За {}", ru::minutes(i64::from(settings.lead_minutes))),
+                    Screen::LeadTime,
+                ),
+                toggle(settings.reminders_enabled, Setting::Reminders),
+            ])
+            .row(vec![button(
+                format!("без времени — в {}", settings.all_day_time),
+                Action::TimeStart {
+                    field: TimeField::AllDay,
+                },
+            )]);
+    } else {
+        ui = ui.row(vec![toggle(settings.reminders_enabled, Setting::Reminders)]);
+    }
+
+    ui = ui.rule().text(format!(
+        "🌅 Утренняя сводка: {}",
+        if settings.digest_enabled {
+            settings.digest_time.clone()
+        } else {
+            "выкл".to_owned()
+        }
+    ));
+    ui = if settings.digest_enabled {
+        ui.row(vec![
             button(
                 format!("🕗 Время сводки: {}", settings.digest_time),
                 Action::TimeStart {
                     field: TimeField::Digest,
                 },
             ),
+            toggle(settings.digest_enabled, Setting::Digest),
         ])
-        .row(vec![button(
-            format!("☀️ Вседневные: {}", settings.all_day_time),
-            Action::TimeStart {
-                field: TimeField::AllDay,
-            },
-        )])
-        .row(vec![toggle(
-            "👤 О назначении",
-            settings.assignment_enabled,
-            Setting::Assignment,
-        )])
-        .row(vec![toggle(
-            "🌙 Тихие часы",
-            settings.quiet_hours_enabled,
-            Setting::QuietHours,
-        )])
-        .row(vec![
+    } else {
+        ui.row(vec![toggle(settings.digest_enabled, Setting::Digest)])
+    };
+
+    ui = ui.rule().text(format!(
+        "👤 О назначениях: {}",
+        on_off(settings.assignment_enabled)
+    ));
+    ui = ui.row(vec![toggle(
+        settings.assignment_enabled,
+        Setting::Assignment,
+    )]);
+
+    ui = ui.rule().text(format!(
+        "🌙 Тихие часы: {}",
+        if settings.quiet_hours_enabled {
+            format!("{}–{}", settings.quiet_start, settings.quiet_end)
+        } else {
+            "выкл".to_owned()
+        }
+    ));
+    ui = if settings.quiet_hours_enabled {
+        ui.row(vec![
             button(
                 format!("Начало тихих: {}", settings.quiet_start),
                 Action::TimeStart {
@@ -278,7 +321,39 @@ fn notifications(ctx: &Ctx<'_>) -> Result<Ui, Fail> {
                 },
             ),
         ])
-        .row(nav_row(&Screen::Notifications, Screen::Settings)))
+        .row(vec![toggle(
+            settings.quiet_hours_enabled,
+            Setting::QuietHours,
+        )])
+    } else {
+        ui.row(vec![toggle(
+            settings.quiet_hours_enabled,
+            Setting::QuietHours,
+        )])
+    };
+
+    Ok(ui.row(nav_row(&Screen::Notifications, Screen::Settings)))
+}
+
+fn lead_time(ctx: &Ctx<'_>) -> Result<Ui, Fail> {
+    let settings = NotificationSettings::from_settings(&ctx.user()?.settings);
+    let lead = |minutes: u16| {
+        let mark = if settings.lead_minutes == minutes {
+            "● "
+        } else {
+            ""
+        };
+        button(format!("{mark}{minutes} мин"), Action::SetLead { minutes })
+    };
+    Ok(Ui::new()
+        .heading(Screen::LeadTime.trail("За сколько напоминать?", None))
+        .text(format!(
+            "Сейчас: за {}.",
+            ru::minutes(i64::from(settings.lead_minutes))
+        ))
+        .row(vec![lead(5), lead(15), lead(30)])
+        .row(vec![lead(60), button("Своё…", Action::LeadStart)])
+        .row(nav_row(&Screen::LeadTime, Screen::Notifications)))
 }
 
 fn timezones() -> Ui {
@@ -304,7 +379,7 @@ fn timezones() -> Ui {
             zone: String::new(),
         },
     )])
-    .row(nav_row(&Screen::Timezones, Screen::Settings))
+    .row(nav_row(&Screen::Timezones, Screen::Profile))
 }
 
 async fn family(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
@@ -615,7 +690,7 @@ pub async fn set_timezone(ctx: &mut Ctx<'_>, zone: &str) -> Result<(), Fail> {
     .await?;
     ctx.tz = display_timezone(Some(&user), ctx.household.as_ref());
     ctx.toast("Часовой пояс обновлён");
-    finish_settings_change(ctx, user, Screen::Settings, Some(ReleaseTrigger::Timezone)).await
+    finish_settings_change(ctx, user, Screen::Profile, Some(ReleaseTrigger::Timezone)).await
 }
 
 async fn update_notifications(
