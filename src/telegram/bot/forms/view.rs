@@ -503,7 +503,7 @@ async fn preview(ctx: &mut Ctx<'_>, form: ItemForm, mut ui: Ui) -> Result<Ui, Fa
     let draft = &form.draft;
 
     if let Some(duplicate) = &form.duplicate {
-        return Ok(duplicate_view(ui, duplicate, &form));
+        return Ok(duplicate_view(ui, duplicate, &form.draft));
     }
 
     let list_name = match form.list_id {
@@ -592,10 +592,10 @@ async fn preview(ctx: &mut Ctx<'_>, form: ItemForm, mut ui: Ui) -> Result<Ui, Fa
     Ok(ui.row(vec![cancel_button()]))
 }
 
-fn duplicate_view(
+pub(super) fn duplicate_view(
     ui: Ui,
     duplicate: &crate::telegram::bot::model::Duplicate,
-    form: &ItemForm,
+    draft: &ItemDraft,
 ) -> Ui {
     let existing = match duplicate.quantity {
         Some(quantity) => format!(
@@ -609,16 +609,11 @@ fn duplicate_view(
         clip(&duplicate.title, 60)
     ));
 
-    let same_unit = form
-        .draft
-        .unit
-        .as_deref()
-        .or(Some("шт"))
-        .map(str::to_lowercase)
+    let same_unit = draft.unit.as_deref().or(Some("шт")).map(str::to_lowercase)
         == duplicate.unit.as_deref().map(str::to_lowercase);
     let mut row = Vec::new();
     if let (Some(quantity), true) = (duplicate.quantity, same_unit) {
-        let total = quantity + form.draft.quantity.unwrap_or(1.0);
+        let total = quantity + draft.quantity.unwrap_or(1.0);
         if total <= MAX_QUANTITY {
             row.push(button(
                 format!(

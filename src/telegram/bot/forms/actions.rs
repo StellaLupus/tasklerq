@@ -516,7 +516,7 @@ async fn save_create(
     .await
 }
 
-async fn find_duplicate(
+pub(super) async fn find_duplicate(
     ctx: &mut Ctx<'_>,
     list: &List,
     title: &str,

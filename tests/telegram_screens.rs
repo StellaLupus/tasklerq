@@ -257,9 +257,11 @@ async fn shopping_flow_covers_duplicates_purchase_and_clear() {
     bot.press("Добавить").await;
     bot.assert_screen_contains("Что купить?");
     bot.text("Молоко").await;
-    bot.assert_screen_contains("Сколько?");
+    bot.assert_screen_contains("Количество: 1 шт");
+    bot.press("Количество").await;
     bot.press("2").await;
-    bot.assert_screen_contains("В чём измерять?");
+    bot.assert_screen_contains("Количество: 2 шт");
+    bot.press("Единица").await;
     bot.press("л").await;
     bot.assert_screen_contains("Количество: 2 л");
     bot.press("Сохранить").await;
@@ -269,7 +271,9 @@ async fn shopping_flow_covers_duplicates_purchase_and_clear() {
     // Дубликат: предложить увеличить количество.
     bot.press("Добавить").await;
     bot.text("молоко").await;
+    bot.press("Количество").await;
     bot.press("1").await;
+    bot.press("Единица").await;
     bot.press("л").await;
     bot.press("Сохранить").await;
     bot.assert_screen_contains("уже есть в списке (2 л)");
@@ -2172,10 +2176,9 @@ async fn expired_form_asks_to_start_over() {
     let db = db().await;
     let mut bot = onboarded_named(&db.pool, "Alice").await;
     bot.press("Добавить").await;
-    bot.press("Задачу").await;
     bot.advance(Duration::minutes(16));
     bot.text("Просроченная форма").await;
-    bot.assert_screen_contains("Форма устарела. Начнём заново?");
+    bot.assert_screen_contains("правка устарела");
     let count: i64 =
         sqlx::query_scalar("SELECT count(*) FROM conversation_states WHERE chat_id = $1")
             .bind(bot.chat)
@@ -2595,7 +2598,7 @@ async fn control_characters_are_removed_from_bot_quick_add_and_form_input() {
     .expect("item");
     assert_eq!(title, "Купить молоко");
 
-    // Пошаговая форма: ввод названия очищается до сохранения в черновике.
+    // Редактор: ввод названия очищается до сохранения в черновике.
     bot.press("Добавить").await;
     bot.text("Форма\u{1} ввод\u{2}").await;
     let data: String =
@@ -2606,8 +2609,8 @@ async fn control_characters_are_removed_from_bot_quick_add_and_form_input() {
             .expect("conversation");
     let form: Form = serde_json::from_str(&data).expect("form data");
     match form {
-        Form::Create(form) => assert_eq!(form.draft.title, "Форма ввод"),
-        other => panic!("expected a create form, got {other:?}"),
+        Form::Editor(editor) => assert_eq!(editor.draft.title, "Форма ввод"),
+        other => panic!("expected an editor form, got {other:?}"),
     }
 }
 
@@ -3452,19 +3455,23 @@ async fn action_labels_do_not_say_gotovo() {
     bot.press("Назад").await;
     bot.press("Назад").await;
 
-    // Выбор тегов в форме создания.
+    // Выбор тегов в редакторе создания.
     bot.press("Добавить").await;
-    bot.press("Задачу").await;
     bot.text("Новая задача").await;
+    bot.press("Срок").await;
     bot.press("Без срока").await;
+    bot.press("Приоритет").await;
     bot.press("Обычный").await;
+    bot.press("Исполнитель").await;
     bot.press("Без исполнителя").await;
+    bot.press("Теги").await;
     let tags = support::telegram::buttons(&bot.screen());
     assert!(
         tags.iter().any(|(label, _)| label == "Применить"),
         "{tags:?}"
     );
     screens.push(tags);
+    bot.press("Назад").await;
     bot.press("Отмена").await;
 
     // Выбор тегов в форме правки.

@@ -9,6 +9,7 @@ use crate::domain::error::DomainError;
 use crate::domain::models::{
     Field, Item, ItemPatch, ListKind, MonthRule, Recurrence, RecurrenceFreq,
 };
+use crate::domain::validation::validate_new_item;
 use crate::storage::repositories::{items, lists, users};
 use crate::telegram::rich::Button;
 use crate::telegram::ru;
@@ -24,24 +25,31 @@ use crate::telegram::bot::screens::clip;
 use crate::telegram::bot::{Ctx, Fail, into_sqlx};
 
 impl Editor {
-    /// Элемент, который правит редактор.
-    fn item_id(&self) -> Uuid {
+    /// Элемент, который правит редактор; у создания его ещё нет.
+    fn item_id(&self) -> Option<Uuid> {
         match &self.target {
-            EditorTarget::Item { item_id, .. } => *item_id,
+            EditorTarget::New { .. } => None,
+            EditorTarget::Item { item_id, .. } => Some(*item_id),
         }
+    }
+
+    /// Редактор создаёт новый элемент.
+    fn is_new(&self) -> bool {
+        matches!(self.target, EditorTarget::New { .. })
     }
 
     /// Куда вернуться после сохранения или отмены.
     fn back(&self) -> &Screen {
         match &self.target {
-            EditorTarget::Item { back, .. } => back,
+            EditorTarget::New { back, .. } | EditorTarget::Item { back, .. } => back,
         }
     }
 
     /// Снимок значений при открытии.
-    fn base(&self) -> &ItemSnapshot {
+    fn base(&self) -> Option<&ItemSnapshot> {
         match &self.target {
-            EditorTarget::Item { base, .. } => base,
+            EditorTarget::New { .. } => None,
+            EditorTarget::Item { base, .. } => Some(base),
         }
     }
 
@@ -62,14 +70,14 @@ pub(super) async fn show(ctx: &mut Ctx<'_>, editor: Editor) -> Result<(), Fail> 
 }
 
 /// Экран редактора из `telegram_views`: живое состояние или «устарела».
-pub async fn screen(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui, Fail> {
+pub async fn screen(ctx: &mut Ctx<'_>, item_id: Option<Uuid>, back: &Screen) -> Result<Ui, Fail> {
     match super::load(ctx).await? {
         Some(Form::Editor(editor)) if editor.item_id() == item_id => view(ctx, editor).await,
         _ => Ok(expired_view(item_id, back)),
     }
 }
 
-fn expired_view(item_id: Uuid, back: &Screen) -> Ui {
+fn expired_view(item_id: Option<Uuid>, back: &Screen) -> Ui {
     let screen = Screen::Editor {
         item_id,
         back: Box::new(back.clone()),
@@ -94,10 +102,24 @@ pub async fn view(ctx: &mut Ctx<'_>, editor: Editor) -> Result<Ui, Fail> {
     if editor.conflict.is_some() {
         return conflict_view(ctx, &editor).await;
     }
+    if editor.duplicate.is_some() {
+        return duplicate_screen(ctx, &editor).await;
+    }
     match editor.field {
         Some(step) => field_view(ctx, &editor, step).await,
         None => main_view(ctx, &editor).await,
     }
+}
+
+async fn duplicate_screen(_ctx: &mut Ctx<'_>, editor: &Editor) -> Result<Ui, Fail> {
+    let Some(duplicate) = &editor.duplicate else {
+        return Ok(Ui::new());
+    };
+    let mut ui = Ui::new();
+    if let Some(error) = &editor.error {
+        ui = ui.bold(format!("⚠️ {error}"));
+    }
+    Ok(super::view::duplicate_view(ui, duplicate, &editor.draft))
 }
 
 fn button(label: impl Into<String>, act: FormAct) -> Button<Action> {
@@ -204,16 +226,41 @@ async fn field_view(ctx: &mut Ctx<'_>, editor: &Editor, step: Step) -> Result<Ui
 
     match step {
         Step::List => {
-            for list in super::lists_of_kind(ctx, list.kind).await? {
-                let mark = if list.id == editor.list_id {
-                    "● "
-                } else {
-                    ""
-                };
-                ui = ui.row(vec![choice(
-                    format!("{mark}{}", clip(&list.name, 40)),
-                    Choice::List(list.id),
-                )]);
+            if editor.is_new() {
+                // Создание из меню: «📋 Список» переключает и тип, как в
+                // быстрой форме, поэтому показаны все списки.
+                let household_id = ctx.household()?.id;
+                let mut lists = lists::list(&mut *ctx.conn, household_id).await?;
+                lists.retain(|list| !list.is_archived);
+                lists.sort_by_key(|list| list.kind != ListKind::Tasks);
+                for list in lists {
+                    let icon = if list.kind == ListKind::Tasks {
+                        "📋"
+                    } else {
+                        "🛒"
+                    };
+                    let mark = if list.id == editor.list_id {
+                        "● "
+                    } else {
+                        ""
+                    };
+                    ui = ui.row(vec![choice(
+                        format!("{mark}{icon} {}", clip(&list.name, 40)),
+                        Choice::List(list.id),
+                    )]);
+                }
+            } else {
+                for list in super::lists_of_kind(ctx, list.kind).await? {
+                    let mark = if list.id == editor.list_id {
+                        "● "
+                    } else {
+                        ""
+                    };
+                    ui = ui.row(vec![choice(
+                        format!("{mark}{}", clip(&list.name, 40)),
+                        Choice::List(list.id),
+                    )]);
+                }
             }
         }
         Step::Due | Step::Priority | Step::Assignee | Step::Tags | Step::Subtasks => {
@@ -255,6 +302,10 @@ async fn field_view(ctx: &mut Ctx<'_>, editor: &Editor, step: Step) -> Result<Ui
         ui = ui.row(vec![button(ru::APPLY_BUTTON, FormAct::Done)]);
     }
     let mut footer = vec![button(ru::BACK_BUTTON, FormAct::Back)];
+    if step == Step::Title {
+        // Начало создания: с поля «Название» можно отказаться целиком.
+        footer.push(button("✖ Отмена", FormAct::Cancel));
+    }
     if screen.depth() > 2 {
         footer.push(crate::telegram::rich::button(
             ru::MENU_BUTTON,
@@ -503,13 +554,27 @@ fn current_differs(field: EditorField, current: &ItemSnapshot, base: &ItemSnapsh
     }
 }
 
-/// «💾 Сохранить»: конфликты, затем один `items::update` по `touched`.
-async fn save(ctx: &mut Ctx<'_>, mut editor: Editor) -> Result<(), Fail> {
-    let (item_id, back) = (editor.item_id(), editor.back().clone());
+/// «💾 Сохранить»: создание нового или слияние правки по `touched`.
+async fn save(ctx: &mut Ctx<'_>, editor: Editor, allow_duplicate: bool) -> Result<(), Fail> {
+    if editor.is_new() {
+        return save_new(ctx, editor, allow_duplicate).await;
+    }
+    save_item(ctx, editor).await
+}
+
+/// Конфликты, затем один `items::update` по `touched`.
+async fn save_item(ctx: &mut Ctx<'_>, mut editor: Editor) -> Result<(), Fail> {
+    let item_id = editor
+        .item_id()
+        .ok_or_else(|| Fail::User("Редактор не выбрал элемент.".into()))?;
+    let back = editor.back().clone();
     let household_id = ctx.household()?.id;
     let current = items::get(&mut *ctx.conn, household_id, item_id).await?;
     let current_snapshot = ItemSnapshot::from_item(&current);
-    let base = editor.base().clone();
+    let base = editor
+        .base()
+        .cloned()
+        .ok_or_else(|| Fail::User("Редактор не выбрал элемент.".into()))?;
     let changed = changed_fields(&editor, &base, ctx.tz)?;
     if changed.is_empty() {
         super::clear(ctx).await?;
@@ -535,6 +600,87 @@ async fn save(ctx: &mut Ctx<'_>, mut editor: Editor) -> Result<(), Fail> {
         return show(ctx, editor).await;
     }
     write(ctx, editor, &current, &changed, back).await
+}
+
+/// Создать элемент из редактора.
+async fn save_new(
+    ctx: &mut Ctx<'_>,
+    mut editor: Editor,
+    allow_duplicate: bool,
+) -> Result<(), Fail> {
+    let household = ctx.household()?.clone();
+    let actor = ctx.actor()?;
+    if allow_duplicate {
+        editor.duplicate = None;
+    }
+    let list = lists::get_visible(&mut *ctx.conn, household.id, editor.list_id).await?;
+    let shopping = list.kind != ListKind::Tasks;
+
+    if editor.draft.title.trim().is_empty() {
+        editor.error = Some("Название не может быть пустым.".to_owned());
+        editor.field = Some(Step::Title);
+        return show(ctx, editor).await;
+    }
+    let (due_at, due_date) = editor.draft.due(ctx.tz)?;
+    if due_at.is_some_and(|at| at < ctx.now) || due_date.is_some_and(|date| date < today(ctx)) {
+        editor.error = Some("Срок уже прошёл.".to_owned());
+        editor.field = Some(Step::Due);
+        return show(ctx, editor).await;
+    }
+    if shopping
+        && !allow_duplicate
+        && let Some(existing) =
+            super::actions::find_duplicate(ctx, &list, &editor.draft.title).await?
+    {
+        editor.duplicate = Some(existing);
+        return show(ctx, editor).await;
+    }
+
+    let new_item = editor.draft.to_new_item(list.id, ctx.tz, list.kind)?;
+    let validated = match validate_new_item(list.kind, &household.timezone, new_item, today(ctx)) {
+        Ok(validated) => validated,
+        Err(_) => {
+            editor.error = Some("Не получилось сохранить: проверьте введённые данные.".to_owned());
+            editor.field = None;
+            return show(ctx, editor).await;
+        }
+    };
+    let assignee = editor.draft.assignee;
+    items::create(
+        &mut *ctx.conn,
+        household.id,
+        &actor,
+        list.id,
+        validated,
+        assignee,
+        ctx.now,
+    )
+    .await?;
+
+    let back = editor.back().clone();
+    super::clear(ctx).await?;
+    ctx.banner("Добавлено");
+    ctx.present(created_screen(&back, list.id)).await
+}
+
+/// Куда вернуть после создания: в сохранённый список с прежним режимом.
+fn created_screen(back: &Screen, list_id: Uuid) -> Screen {
+    match back {
+        Screen::List {
+            edit, from_lists, ..
+        } => Screen::List {
+            list_id,
+            page: 0,
+            edit: *edit,
+            from_lists: *from_lists,
+        },
+        _ => Screen::List {
+            list_id,
+            page: 0,
+            edit: false,
+            from_lists: false,
+        },
+    }
 }
 
 /// Записать изменения и вернуться на `back`.
@@ -673,7 +819,10 @@ async fn resolve_conflict(ctx: &mut Ctx<'_>, mut editor: Editor, mine: bool) -> 
     let Some(conflicts) = editor.conflict.take() else {
         return show(ctx, editor).await;
     };
-    let (item_id, back) = (editor.item_id(), editor.back().clone());
+    let item_id = editor
+        .item_id()
+        .ok_or_else(|| Fail::User("Редактор не выбрал элемент.".into()))?;
+    let back = editor.back().clone();
     if !mine {
         for field in &conflicts {
             editor.touched.remove(field);
@@ -681,7 +830,10 @@ async fn resolve_conflict(ctx: &mut Ctx<'_>, mut editor: Editor, mine: bool) -> 
     }
     let household_id = ctx.household()?.id;
     let current = items::get(&mut *ctx.conn, household_id, item_id).await?;
-    let base = editor.base().clone();
+    let base = editor
+        .base()
+        .cloned()
+        .ok_or_else(|| Fail::User("Редактор не выбрал элемент.".into()))?;
     let changed = changed_fields(&editor, &base, ctx.tz)?;
     if changed.is_empty() {
         super::clear(ctx).await?;
@@ -698,12 +850,15 @@ async fn cancel(ctx: &mut Ctx<'_>, editor: Editor) -> Result<(), Fail> {
 }
 
 async fn conflict_view(ctx: &mut Ctx<'_>, editor: &Editor) -> Result<Ui, Fail> {
-    let (item_id, back) = (editor.item_id(), editor.back().clone());
+    let item_id = editor
+        .item_id()
+        .ok_or_else(|| Fail::User("Редактор не выбрал элемент.".into()))?;
+    let back = editor.back().clone();
     let household_id = ctx.household()?.id;
     let current = items::get(&mut *ctx.conn, household_id, item_id).await?;
     let current_draft = ItemDraft::from_item(&current, ctx.tz);
     let screen = Screen::Editor {
-        item_id,
+        item_id: Some(item_id),
         back: Box::new(back),
     };
     let mut ui = screen_heading(&screen, "Конфликт при сохранении", None);
@@ -922,7 +1077,12 @@ pub(super) async fn on_action(
             };
             if step == Step::List {
                 if let Choice::List(list_id) = choice {
-                    editor.list_id = list_id;
+                    let household_id = ctx.household()?.id;
+                    let list = lists::get_visible(&mut *ctx.conn, household_id, list_id).await?;
+                    if editor.is_new() {
+                        switch_new_list(&mut editor, &list);
+                    }
+                    editor.list_id = list.id;
                     editor.touched.insert(EditorField::List);
                     editor.field = None;
                     editor.field_back = None;
@@ -951,9 +1111,20 @@ pub(super) async fn on_action(
                         if let Some(field) = EditorField::from_step(step) {
                             editor.touched.insert(field);
                         }
-                        editor.field = None;
-                        editor.field_back = None;
-                        editor.field_backup = None;
+                        // Выбор на подэкране интервала возвращает на экран
+                        // повторения, как и текстовый ввод.
+                        if step == Step::Interval {
+                            if let Some(parent) = editor.field_back.take() {
+                                editor.field = Some(parent);
+                            } else {
+                                editor.field = None;
+                                editor.field_backup = None;
+                            }
+                        } else {
+                            editor.field = None;
+                            editor.field_back = None;
+                            editor.field_backup = None;
+                        }
                         editor.error = None;
                     }
                 }
@@ -961,13 +1132,89 @@ pub(super) async fn on_action(
             }
             show(ctx, editor).await
         }
-        FormAct::Save => save(ctx, editor).await,
+        FormAct::Save => save(ctx, editor, false).await,
+        FormAct::SaveAnyway => save(ctx, editor, true).await,
+        FormAct::Increase {
+            item_id,
+            quantity,
+            version,
+        } => increase_duplicate(ctx, editor, item_id, quantity, version).await,
         FormAct::Cancel => cancel(ctx, editor).await,
         FormAct::Conflict { mine } => resolve_conflict(ctx, editor, mine).await,
         // У редактора нет «Дальше» и «Пропустить»: эти действия сюда не
         // приходят, но старый токен не должен ронять обработку.
-        FormAct::Skip | FormAct::SaveAnyway | FormAct::Increase { .. } => show(ctx, editor).await,
+        FormAct::Skip => show(ctx, editor).await,
     }
+}
+
+/// Переключение списка при создании сбрасывает поля другого типа.
+fn switch_new_list(editor: &mut Editor, list: &crate::domain::models::List) {
+    let old_kind = match &editor.target {
+        EditorTarget::New { kind, .. } => *kind,
+        EditorTarget::Item { .. } => return,
+    };
+    let was_shopping = old_kind != ListKind::Tasks;
+    let shopping = list.kind != ListKind::Tasks;
+    if was_shopping != shopping {
+        if shopping {
+            editor.draft.date = None;
+            editor.draft.time = None;
+            editor.draft.priority = crate::domain::models::ItemPriority::Normal;
+            editor.draft.tags.clear();
+            editor.draft.subtasks.clear();
+            editor.draft.recurrence = None;
+            for field in [
+                EditorField::Due,
+                EditorField::Priority,
+                EditorField::Tags,
+                EditorField::Subtasks,
+                EditorField::Recurrence,
+            ] {
+                editor.touched.remove(&field);
+            }
+        } else {
+            editor.draft.quantity = None;
+            editor.draft.unit = None;
+            editor.touched.remove(&EditorField::Quantity);
+            editor.touched.remove(&EditorField::Unit);
+        }
+    }
+    if let EditorTarget::New { kind, .. } = &mut editor.target {
+        *kind = list.kind;
+    }
+    editor.duplicate = None;
+}
+
+/// Увеличить количество найденного дубликата и вернуться в список.
+async fn increase_duplicate(
+    ctx: &mut Ctx<'_>,
+    editor: Editor,
+    item_id: Uuid,
+    quantity: f64,
+    version: i32,
+) -> Result<(), Fail> {
+    let household = ctx.household()?.clone();
+    let actor = ctx.actor()?;
+    let patch = ItemPatch {
+        quantity: Field::Value(quantity),
+        ..ItemPatch::default()
+    };
+    items::update(
+        &mut *ctx.conn,
+        household.id,
+        &actor,
+        item_id,
+        version,
+        patch,
+        &household.timezone,
+        ctx.now,
+    )
+    .await?;
+    let back = editor.back().clone();
+    let list_id = editor.list_id;
+    super::clear(ctx).await?;
+    ctx.toast("Количество увеличено");
+    ctx.present(created_screen(&back, list_id)).await
 }
 
 #[cfg(test)]

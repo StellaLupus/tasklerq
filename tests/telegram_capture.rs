@@ -1241,19 +1241,24 @@ async fn switching_to_shopping_drops_the_task_due_date() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_regular_create_form_has_no_list_button_in_the_preview() {
+async fn menu_create_opens_the_editor_with_the_list_switch() {
     let db = db().await;
     let mut stand = stand_with(&db.pool, vec![], DEFAULT_DAILY_QUOTA, false).await;
 
     stand.bot.press("Добавить").await;
-    stand.bot.press("Задачу").await;
+    stand.bot.assert_screen_contains("Как назвать задачу?");
     stand.bot.text("Обычная задача").await;
-    stand.bot.press("Предпросмотр").await;
 
-    stand.bot.assert_screen_contains("Проверьте и сохраните");
+    stand.bot.assert_screen_contains("Название: Обычная задача");
+    stand.bot.assert_screen_contains("Список: Задачи");
     assert!(
-        stand.bot.find_button("📋 Список").is_none(),
-        "the regular form must keep its type and hide the quick list switch:\n{}",
+        stand.bot.find_button("📋 Список").is_some(),
+        "creation must offer the list switch:\n{}",
+        stand.bot.screen()
+    );
+    assert!(
+        stand.bot.find_button("Предпросмотр").is_none(),
+        "creation must not have a preview step:\n{}",
         stand.bot.screen()
     );
 }
@@ -1304,13 +1309,14 @@ async fn quick_form_can_return_from_list_step_to_preview() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn regular_form_list_step_keeps_plain_list_names() {
+async fn menu_editor_list_step_offers_lists_of_both_types() {
     let db = db().await;
     let mut stand = stand_with(&db.pool, vec![], DEFAULT_DAILY_QUOTA, false).await;
     add_second_tasks_list(&db.pool, stand.bot.chat).await;
 
     stand.bot.press("Добавить").await;
-    stand.bot.press("Задачу").await;
+    stand.bot.text("Обычная задача").await;
+    stand.bot.press("Список").await;
     stand.bot.assert_screen_contains("В какой список?");
 
     let labels: Vec<String> = stand
@@ -1320,14 +1326,13 @@ async fn regular_form_list_step_keeps_plain_list_names() {
         .map(|(label, _)| label)
         .collect();
     assert!(
-        labels.iter().any(|label| label == "Работа"),
-        "the regular form must keep the plain list name: {labels:?}"
+        labels.iter().any(|label| label.contains("Работа")),
+        "the editor must offer other task lists: {labels:?}"
     );
     assert!(
-        labels
-            .iter()
-            .all(|label| !label.contains("📋") && !label.contains("🛒")),
-        "icons belong to the quick form only: {labels:?}"
+        labels.iter().any(|label| label.contains("📋 Задачи"))
+            && labels.iter().any(|label| label.contains("🛒 Покупки")),
+        "the editor switches the type through the list screen: {labels:?}"
     );
 }
 

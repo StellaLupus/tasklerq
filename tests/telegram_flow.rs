@@ -8,7 +8,9 @@ use chrono::{Datelike, Duration, NaiveDate, TimeZone, Utc};
 use chrono_tz::Tz;
 use support::telegram::{Call, FakeTelegram, Harness, buttons};
 use support::{TestHousehold, create_item, db, new_item, next_telegram_id, recurrence};
-use tasklerq::domain::models::{Actor, ActorType, Field, ItemPatch, RecurrenceFreq, UserRole};
+use tasklerq::domain::models::{
+    Actor, ActorType, Field, ItemPatch, ListKind, RecurrenceFreq, UserRole,
+};
 use tasklerq::storage::repositories::{items, users};
 use tasklerq::telegram::api::TelegramError;
 use tasklerq::telegram::bot::model::{Action, FormAct, Screen, Ui};
@@ -111,8 +113,7 @@ async fn cleared_purchase(bot: &mut Harness, title: &str) -> (uuid::Uuid, uuid::
     bot.press("Покупки").await;
     bot.press("Добавить").await;
     bot.text(title).await;
-    bot.press("1").await;
-    bot.press("л").await;
+    set_purchase_amount(bot, "1", "л").await;
     bot.press("Сохранить").await;
     bot.press(title).await;
     bot.press("Очистить").await;
@@ -289,13 +290,14 @@ async fn task_form_validates_and_saves() {
     let mut bot = onboarded(&db.pool).await;
 
     bot.press("Добавить").await;
-    bot.press("Задачу").await;
     bot.assert_screen_contains("Как назвать задачу?");
 
     bot.text("Оплатить интернет").await;
-    bot.assert_screen_contains("Когда сделать?");
+    bot.assert_screen_contains("Название: Оплатить интернет");
+    bot.assert_screen_contains("Список: Задачи");
 
-    // Неверная дата: пример формата, форма остаётся открытой.
+    // Неверная дата: пример формата, редактор остаётся открытым.
+    bot.press("Срок").await;
     bot.press("Дата и время").await;
     bot.text("когда-нибудь").await;
     bot.assert_screen_contains("Не понял срок");
@@ -303,25 +305,28 @@ async fn task_form_validates_and_saves() {
     bot.text("01.01.2020").await;
     bot.assert_screen_contains("Дата уже прошла.");
     bot.text("завтра 18:30").await;
-    bot.assert_screen_contains("Какой приоритет?");
+    bot.assert_screen_contains("Срок: Завтра, 18:30");
 
+    bot.press("Приоритет").await;
     bot.press("Высокий").await;
-    bot.assert_screen_contains("Кто исполнитель?");
+    bot.assert_screen_contains("Приоритет: 🟠 Высокий");
+    bot.press("Исполнитель").await;
     bot.press("Без исполнителя").await;
-    bot.assert_screen_contains("Теги");
+    bot.press("Теги").await;
     bot.press("Новый тег").await;
     bot.text("дом").await;
     bot.assert_screen_contains("✓ дом");
     bot.press("Применить").await;
-    bot.assert_screen_contains("Подзадачи");
+    bot.press("Подзадачи").await;
     bot.text("Найти договор").await;
     bot.press("Применить").await;
-    bot.assert_screen_contains("Как часто повторять?");
+    bot.press("Повторение").await;
     bot.press("Не повторять").await;
-    bot.assert_screen_contains("Проверьте и сохраните");
-    bot.assert_screen_contains("Оплатить интернет");
-    bot.assert_screen_contains("Завтра, 18:30");
-    bot.assert_screen_contains("🏷 дом");
+    bot.press("Применить").await;
+    bot.assert_screen_contains("Название: Оплатить интернет");
+    bot.assert_screen_contains("Срок: Завтра, 18:30");
+    bot.assert_screen_contains("Теги: дом");
+    bot.assert_screen_contains("Подзадачи: Найти договор");
 
     bot.press("Сохранить").await;
     bot.assert_screen_contains("Задачи · 1");
@@ -345,11 +350,194 @@ async fn empty_title_and_long_title_are_rejected() {
     let db = db().await;
     let mut bot = onboarded(&db.pool).await;
     bot.press("Добавить").await;
-    bot.press("Задачу").await;
 
     bot.text(&"я".repeat(201)).await;
     bot.assert_screen_contains("Название слишком длинное");
     bot.assert_screen_contains("Как назвать задачу?");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_task_from_list_uses_the_editor() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+
+    bot.press("Задачи").await;
+    bot.press("Добавить").await;
+    bot.assert_screen_contains("Как назвать задачу?");
+
+    bot.text("Оплатить интернет").await;
+    bot.assert_screen_contains("Название: Оплатить интернет");
+    bot.assert_screen_contains("Список: Задачи");
+    for (label, _) in bot.buttons() {
+        assert!(!label.contains("Дальше"), "creation: {label}");
+        assert!(!label.contains("Пропустить"), "creation: {label}");
+        assert!(!label.contains("Предпросмотр"), "creation: {label}");
+    }
+
+    bot.press("Срок").await;
+    bot.press("Завтра").await;
+    bot.assert_screen_contains("Срок: Завтра");
+    bot.assert_has_button("💾 Сохранить");
+
+    bot.press("Сохранить").await;
+    bot.assert_screen_contains("Добавлено");
+    bot.assert_screen_contains("Задачи · 1");
+    bot.assert_screen_contains("Оплатить интернет · завтра");
+
+    let household = test_household(&db.pool, bot.chat).await;
+    let task = task_row(&db.pool, household.household_id, "Оплатить интернет").await;
+    let today = bot.now.with_timezone(&moscow()).date_naive();
+    assert_eq!(task.due_date, Some(today + Duration::days(1)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_from_menu_switches_to_a_shopping_list() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+
+    bot.press("Добавить").await;
+    bot.assert_screen_contains("Как назвать задачу?");
+    bot.text("Молоко").await;
+    bot.assert_screen_contains("Список: Задачи");
+
+    bot.press("Список").await;
+    bot.assert_screen_contains("В какой список?");
+    bot.press("Покупки").await;
+    bot.assert_screen_contains("Количество: 1 шт");
+    bot.assert_has_button("🔢 Количество");
+
+    set_purchase_amount(&mut bot, "2", "шт").await;
+    bot.assert_screen_contains("Количество: 2 шт");
+    bot.press("Сохранить").await;
+    bot.assert_screen_contains("Покупки · 1");
+    bot.assert_screen_contains("☐ Молоко · 2 шт");
+
+    let household = test_household(&db.pool, bot.chat).await;
+    let saved: (String, Option<f64>) = sqlx::query_as(
+        "SELECT l.kind::text, i.quantity::float8
+         FROM items i JOIN lists l ON l.id = i.list_id
+         WHERE i.household_id = $1 AND i.title = 'Молоко' AND i.deleted_at IS NULL",
+    )
+    .bind(household.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("purchase");
+    assert_eq!(saved, ("shopping".to_owned(), Some(2.0)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_purchase_duplicate_offers_increase_and_separate() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+
+    bot.press("Покупки").await;
+    bot.press("Добавить").await;
+    bot.text("Молоко").await;
+    set_purchase_amount(&mut bot, "2", "л").await;
+    bot.press("Сохранить").await;
+    bot.assert_screen_contains("☐ Молоко · 2 л");
+
+    // Дубликат: увеличить количество существующей позиции.
+    bot.press("Добавить").await;
+    bot.text("молоко").await;
+    bot.press("Единица").await;
+    bot.press("л").await;
+    bot.press("Сохранить").await;
+    bot.assert_screen_contains("уже есть в списке (2 л)");
+    bot.press("Увеличить до 3 л").await;
+    bot.assert_screen_contains("☐ Молоко · 3 л");
+    assert_eq!(bot.screen().matches("Молоко").count(), 1);
+
+    // Дубликат: сохранить отдельной позицией.
+    bot.press("Добавить").await;
+    bot.text("молоко").await;
+    bot.press("Единица").await;
+    bot.press("л").await;
+    bot.press("Сохранить").await;
+    bot.assert_screen_contains("уже есть в списке (3 л)");
+    bot.press("Добавить отдельно").await;
+    bot.assert_screen_contains("Покупки · 2");
+
+    let household = test_household(&db.pool, bot.chat).await;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM items
+         WHERE household_id = $1 AND lower(title) = 'молоко' AND deleted_at IS NULL",
+    )
+    .bind(household.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("purchases");
+    assert_eq!(count, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn creating_can_be_cancelled_on_the_title_and_in_the_editor() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+
+    bot.press("Добавить").await;
+    bot.assert_screen_contains("Как назвать задачу?");
+    bot.press("Отмена").await;
+    bot.assert_screen_contains("📋 Задачи · 0");
+
+    bot.press("Задачи").await;
+    bot.press("Добавить").await;
+    bot.text("Не создавать").await;
+    bot.assert_has_button("💾 Сохранить");
+    bot.press("Отмена").await;
+    bot.assert_screen_contains("Задачи · 0");
+    assert!(!bot.screen().contains("Не создавать"));
+
+    let household = test_household(&db.pool, bot.chat).await;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM items WHERE household_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(household.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("items");
+    assert_eq!(count, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_from_all_lists_returns_to_all_lists() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = test_household(&db.pool, bot.chat).await;
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let work = tasklerq::storage::repositories::lists::create(
+        &mut conn,
+        household.household_id,
+        ListKind::Tasks,
+        "Работа",
+        Utc::now(),
+    )
+    .await
+    .expect("list");
+    drop(conn);
+    bot.text("/menu").await;
+
+    bot.press("Все списки").await;
+    bot.assert_screen_contains("Все списки");
+    bot.press("Работа").await;
+    bot.assert_screen_contains("Работа · 0");
+
+    bot.press("Добавить").await;
+    bot.text("Отчёт").await;
+    bot.press("Сохранить").await;
+    bot.assert_screen_contains("Работа · 1");
+
+    bot.press("Назад").await;
+    bot.assert_screen_contains("Все списки");
+    bot.assert_has_button("Работа");
+
+    let list_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT list_id FROM items WHERE household_id = $1 AND title = 'Отчёт'")
+            .bind(household.household_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("created item");
+    assert_eq!(list_id, work.id);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -512,6 +700,39 @@ async fn saved_completed_state_falls_back_to_the_menu() {
             .iter()
             .all(|(_, text, alert)| text.is_none() && !alert),
         "the legacy state must fall back without an error toast"
+    );
+    let state: serde_json::Value =
+        sqlx::query_scalar("SELECT state FROM telegram_views WHERE chat_id = $1")
+            .bind(bot.chat)
+            .fetch_one(&db.pool)
+            .await
+            .expect("saved state");
+    assert_eq!(state["t"], serde_json::json!("menu"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saved_add_state_falls_back_to_the_menu() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+
+    sqlx::query("UPDATE telegram_views SET state = $1 WHERE chat_id = $2")
+        .bind(serde_json::json!({"t": "add"}))
+        .bind(bot.chat)
+        .execute(&db.pool)
+        .await
+        .expect("legacy add state");
+
+    let data = action_callback(&bot, Action::Refresh).await;
+    let (message_id, _) = bot.active();
+    bot.press_data(&data, message_id).await;
+
+    bot.assert_screen_contains("📋 Задачи · 0");
+    assert!(
+        bot.fake
+            .answers()
+            .iter()
+            .all(|(_, text, alert)| text.is_none() && !alert),
+        "the legacy add state must fall back without an error toast"
     );
     let state: serde_json::Value =
         sqlx::query_scalar("SELECT state FROM telegram_views WHERE chat_id = $1")
@@ -800,6 +1021,20 @@ async fn editor_interval_sub_screen_returns_to_recurrence() {
     bot.press("Назад").await;
     bot.assert_screen_contains("Как часто повторять?");
     bot.assert_screen_contains("Повторение: Каждую неделю");
+
+    // Выбор интервала кнопкой возвращает на экран повторения, как и
+    // текстовый ввод: значение видно там же.
+    bot.press("Другой интервал").await;
+    bot.press("Через раз").await;
+    bot.assert_screen_contains("Как часто повторять?");
+    bot.assert_screen_contains("Каждые 2 недели");
+    bot.assert_has_button("Применить");
+
+    bot.press("Другой интервал").await;
+    bot.press("Каждый раз").await;
+    bot.assert_screen_contains("Как часто повторять?");
+    bot.assert_screen_contains("Повторение: Каждую неделю");
+    bot.assert_has_button("Применить");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1334,8 +1569,7 @@ async fn editor_changes_purchase_quantity_and_unit_in_one_save() {
     bot.press("Покупки").await;
     bot.press("Добавить").await;
     bot.text("Молоко").await;
-    bot.press("2").await;
-    bot.press("л").await;
+    set_purchase_amount(&mut bot, "2", "л").await;
     bot.press("Сохранить").await;
     bot.press("Править").await;
     bot.press("Молоко").await;
@@ -1376,6 +1610,14 @@ async fn press_exact(bot: &mut Harness, label: &str) {
         .unwrap_or_else(|| panic!("button `{label}` not found:\n{html}"))
         .1;
     bot.press_data(&data, message_id).await;
+}
+
+/// Открыть поля количества и единицы в редакторе покупки.
+async fn set_purchase_amount(bot: &mut Harness, quantity: &str, unit: &str) {
+    bot.press("Количество").await;
+    bot.press(quantity).await;
+    bot.press("Единица").await;
+    bot.press(unit).await;
 }
 
 struct TaskRow {
@@ -1645,8 +1887,7 @@ async fn deleted_purchase_shows_undo_and_returns_it_to_the_list() {
     bot.press("Покупки").await;
     bot.press("Добавить").await;
     bot.text("Молоко").await;
-    bot.press("1").await;
-    bot.press("л").await;
+    set_purchase_amount(&mut bot, "1", "л").await;
     bot.press("Сохранить").await;
     bot.press("Править").await;
     bot.press("Молоко").await;
@@ -1739,8 +1980,7 @@ async fn deleted_purchase_undo_after_window_reports_expiry_and_keeps_it_deleted(
     bot.press("Покупки").await;
     bot.press("Добавить").await;
     bot.text("Позднее молоко").await;
-    bot.press("1").await;
-    bot.press("л").await;
+    set_purchase_amount(&mut bot, "1", "л").await;
     bot.press("Сохранить").await;
     bot.press("Править").await;
     bot.press("Позднее молоко").await;
@@ -1784,8 +2024,7 @@ async fn deleted_purchase_back_to_list_does_not_undo() {
     bot.press("Покупки").await;
     bot.press("Добавить").await;
     bot.text("Оставить в удалённых").await;
-    bot.press("1").await;
-    bot.press("л").await;
+    set_purchase_amount(&mut bot, "1", "л").await;
     bot.press("Сохранить").await;
     bot.press("Править").await;
     bot.press("Оставить в удалённых").await;
@@ -2254,12 +2493,11 @@ async fn each_kind_of_incoming_text_is_deleted() {
     bot.assert_latest_contains("удаляю из чата после обработки");
     bot.assert_latest_contains("/start или /menu возвращают меню вниз чата");
 
-    // Ответ на шаг формы.
+    // Ответ на поле редактора.
     bot.press("Добавить").await;
-    bot.press("Задачу").await;
     let (message_id, rows) = send_text(&mut bot, "Оплатить интернет").await;
     delete_seq(&rows, message_id);
-    bot.assert_screen_contains("Когда сделать?");
+    bot.assert_screen_contains("Название: Оплатить интернет");
 
     // Текст на разбор.
     let id = next_telegram_id();

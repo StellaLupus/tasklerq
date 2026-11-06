@@ -166,7 +166,6 @@ async fn a_form_step_answer_is_deleted_and_the_next_step_is_shown() {
     bot.press("Москва").await;
     bot.press("меню").await;
     bot.press("Добавить").await;
-    bot.press("Задачу").await;
     bot.assert_screen_contains("Как назвать задачу?");
 
     let update = bot.text_update("Ann", "Позвонить маме");
@@ -187,8 +186,8 @@ async fn a_form_step_answer_is_deleted_and_the_next_step_is_shown() {
     .await
     .expect("delete row");
     assert_eq!(deleted, 1, "the form answer must be deleted");
-    bot.assert_screen_contains("Когда сделать?");
     bot.assert_screen_contains("Название: Позвонить маме");
+    bot.assert_has_button("💾 Сохранить");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -200,22 +199,21 @@ async fn the_second_text_step_value_is_visible_and_escaped_on_the_next_step() {
     bot.press("Москва").await;
     bot.press("меню").await;
     bot.press("Добавить").await;
-    bot.press("Задачу").await;
     bot.assert_screen_contains("Как назвать задачу?");
-    // На первом шаге ничего не принято: сводки нет.
+    // На первом шаге название ещё не принято.
     assert!(
-        !bot.screen().contains("Название:"),
-        "the first step should not show a summary:\n{}",
+        bot.screen().contains("Название: (без названия)"),
+        "the title field should show an empty draft:\n{}",
         bot.screen()
     );
 
     bot.text("Позвонить <маме> & папе").await;
-    bot.assert_screen_contains("Когда сделать?");
     bot.assert_screen_contains("Название: Позвонить &lt;маме&gt; &amp; папе");
+    bot.assert_screen_contains("Список: Задачи");
 
+    bot.press("Срок").await;
     bot.press("Дата и время").await;
     bot.text("завтра 18:30").await;
-    bot.assert_screen_contains("Какой приоритет?");
     bot.assert_screen_contains("Срок: Завтра, 18:30");
     bot.assert_screen_contains("Название: Позвонить &lt;маме&gt; &amp; папе");
 }
@@ -412,14 +410,17 @@ async fn create_shopping_preview_keeps_the_chosen_quantity_and_unit() {
     let mut bot = onboarded(&db.pool).await;
 
     bot.press("Добавить").await;
-    bot.press("Покупку").await;
     bot.text("Молоко").await;
+    bot.press("Список").await;
+    bot.press("Покупки").await;
+    bot.press("Количество").await;
     bot.press("2").await;
-    bot.assert_screen_contains("Количество: 2");
+    bot.assert_screen_contains("Количество: 2 шт");
+    bot.press("Единица").await;
     bot.press("л").await;
 
-    // Выбор единицы сразу открывает предпросмотр: проверяется он, а не
-    // сводка шага.
-    bot.assert_screen_contains("Проверьте и сохраните");
+    // Выбор единицы возвращает в редактор, где видно итоговое количество.
+    bot.assert_screen_contains("Название: Молоко");
     bot.assert_screen_contains("Количество: 2 л");
+    bot.assert_screen_contains("Список: Покупки");
 }

@@ -80,8 +80,6 @@ pub enum Screen {
     Welcome,
     /// Информационный экран первого контакта без формы онбординга.
     FirstContact(FirstContactScreen),
-    /// Выбор: добавить задачу или покупку.
-    Add,
     /// Все списки.
     Lists,
     /// Список задач или покупок.
@@ -116,8 +114,8 @@ pub enum Screen {
     },
     /// Единый редактор элемента или открытый экран его поля.
     Editor {
-        /// Элемент.
-        item_id: Uuid,
+        /// Элемент; у создания его ещё нет.
+        item_id: Option<Uuid>,
         /// Куда ведёт «✖ Отмена» и куда возвращает сохранение.
         back: Box<Screen>,
     },
@@ -255,8 +253,7 @@ impl Screen {
     pub fn depth(&self) -> usize {
         match self {
             Self::Menu | Self::Welcome | Self::FirstContact(_) => 1,
-            Self::Add
-            | Self::Lists
+            Self::Lists
             | Self::Mine { .. }
             | Self::Results { .. }
             | Self::Settings
@@ -299,7 +296,6 @@ impl Screen {
             Self::Menu => "Меню",
             Self::Welcome => "Пространство создано",
             Self::FirstContact(_) => "Первый контакт",
-            Self::Add => "Что добавить?",
             Self::Lists => "Все списки",
             Self::List { .. } => "Список",
             Self::Item { .. } => "Карточка",
@@ -337,8 +333,7 @@ impl Screen {
     fn parents(&self) -> Vec<&'static str> {
         match self {
             Self::Menu | Self::Welcome | Self::FirstContact(_) => Vec::new(),
-            Self::Add
-            | Self::Lists
+            Self::Lists
             | Self::Mine { .. }
             | Self::Results { .. }
             | Self::Settings
@@ -639,8 +634,18 @@ impl ItemSnapshot {
 
 /// Что правит единый редактор.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "target", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)] // одна цель редактора на чат
 pub enum EditorTarget {
+    /// Новый элемент: поля ещё не записаны.
+    New {
+        /// Список, в который сохранится элемент.
+        list_id: Uuid,
+        /// Вид списка на момент открытия.
+        kind: ListKind,
+        /// Куда вернуться после сохранения или отмены.
+        back: Screen,
+    },
     /// Существующий элемент.
     Item {
         /// Элемент.
@@ -793,12 +798,15 @@ pub enum Action {
         /// Куда вернуться.
         back: Screen,
     },
-    /// Начать создание элемента.
+    /// Начать создание элемента через редактор.
     Add {
-        /// Список; без значения бот предложит выбрать.
+        /// Список; без значения бот возьмёт список по умолчанию.
         list_id: Option<Uuid>,
         /// Вид списка для выбора.
         kind: ListKind,
+        /// Экран, откуда начали создание.
+        #[serde(default)]
+        back: Option<Screen>,
     },
     /// Открыть единый редактор существующего элемента.
     Edit {
@@ -1455,6 +1463,9 @@ pub struct Editor {
     /// Поля, по которым при сохранении обнаружен конфликт.
     #[serde(default)]
     pub conflict: Option<BTreeSet<EditorField>>,
+    /// Такая же позиция, найденная при сохранении покупки.
+    #[serde(default)]
+    pub duplicate: Option<Duplicate>,
 }
 
 impl Form {

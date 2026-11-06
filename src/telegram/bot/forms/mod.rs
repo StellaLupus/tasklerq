@@ -120,46 +120,46 @@ pub async fn open_create(ctx: &mut Ctx<'_>, form: ItemForm) -> Result<(), Fail> 
     open(ctx, Form::Create(form)).await
 }
 
-/// Начать создание элемента.
-pub async fn start_create(
+/// Начать создание элемента через единый редактор.
+///
+/// Из списка тип и список уже известны; из меню берётся список по умолчанию
+/// (или первый список этого типа). Поле «Название» открывается сразу.
+pub async fn start_new_editor(
     ctx: &mut Ctx<'_>,
     list_id: Option<Uuid>,
     kind: ListKind,
+    back: Option<Screen>,
 ) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
-    let (list_id, kind) = match list_id {
-        Some(list_id) => {
-            let list = lists::get_visible(&mut *ctx.conn, household_id, list_id).await?;
-            (Some(list.id), list.kind)
-        }
+    let list = match list_id {
+        Some(list_id) => lists::get_visible(&mut *ctx.conn, household_id, list_id).await?,
         None => {
             let candidates = lists_of_kind(ctx, kind).await?;
-            match candidates.as_slice() {
-                [only] => (Some(only.id), kind),
-                _ => (None, kind),
-            }
+            candidates
+                .iter()
+                .find(|list| list.is_default)
+                .or_else(|| candidates.first())
+                .cloned()
+                .ok_or_else(|| Fail::User("Нет списка для сохранения.".into()))?
         }
     };
-    let step = if list_id.is_some() {
-        Step::Title
-    } else {
-        Step::List
+    let editor = Editor {
+        target: EditorTarget::New {
+            list_id: list.id,
+            kind: list.kind,
+            back: back.unwrap_or(Screen::Menu),
+        },
+        draft: ItemDraft::default(),
+        touched: std::collections::BTreeSet::new(),
+        field: Some(Step::Title),
+        field_back: None,
+        field_backup: None,
+        list_id: list.id,
+        error: None,
+        conflict: None,
+        duplicate: None,
     };
-    open(
-        ctx,
-        Form::Create(ItemForm {
-            list_id,
-            kind,
-            step,
-            draft: ItemDraft::default(),
-            from_preview: false,
-            error: None,
-            duplicate: None,
-            target: None,
-            quick: false,
-        }),
-    )
-    .await
+    editor::show(ctx, editor).await
 }
 
 /// Свободный текст без формы: черновик с готовым названием.
@@ -230,6 +230,7 @@ pub async fn start_editor(
         list_id: item.list_id,
         error: None,
         conflict: None,
+        duplicate: None,
     };
     editor::show(ctx, editor).await
 }

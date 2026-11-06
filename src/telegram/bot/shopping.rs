@@ -65,6 +65,12 @@ pub async fn list_view(
         Action::Add {
             list_id: Some(list.id),
             kind: list.kind,
+            back: Some(Screen::List {
+                list_id: list.id,
+                page,
+                edit,
+                from_lists,
+            }),
         },
     );
     if all.is_empty() {
