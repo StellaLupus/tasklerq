@@ -563,7 +563,12 @@ mod tests {
         rule.byweekday = vec![2, 4];
 
         let next = rule
-            .next_after(Due::AllDay(date(2026, 11, 3)), Utc::now())
+            .next_after(
+                Due::AllDay(date(2026, 11, 3)),
+                Utc.with_ymd_and_hms(2026, 11, 3, 12, 0, 0)
+                    .single()
+                    .expect("fixed moment"),
+            )
             .expect("next")
             .expect("occurrence");
         assert_eq!(next, Due::AllDay(date(2026, 11, 5)));
@@ -634,7 +639,12 @@ mod tests {
         rule.interval = 3;
 
         let next = rule
-            .next_after(Due::AllDay(date(2026, 11, 1)), Utc::now())
+            .next_after(
+                Due::AllDay(date(2026, 11, 1)),
+                Utc.with_ymd_and_hms(2026, 11, 1, 12, 0, 0)
+                    .single()
+                    .expect("fixed moment"),
+            )
             .expect("next")
             .expect("occurrence");
         assert_eq!(next, Due::AllDay(date(2026, 11, 4)));

@@ -14,8 +14,8 @@ use crate::storage::repositories::{items, lists, users};
 use crate::telegram::rich::{Span, button};
 use crate::telegram::ru;
 
-use super::model::{Action, RecurrenceDraft, Screen, Step, Ui};
-use super::screens::{back_button, clip};
+use super::model::{Action, RecurrenceDraft, Screen, Step, Ui, screen_heading};
+use super::screens::{clip, nav_row};
 use super::{Ctx, Fail};
 
 /// Название приоритета с маркером, понятным без цвета.
@@ -126,8 +126,8 @@ pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui,
     };
     let shopping = list.kind != ListKind::Tasks;
     let done = item.status == ItemStatus::Done;
-
-    let mut ui = Ui::new().heading(item.title.clone());
+    let parent = matches!(back, Screen::List { .. }).then_some(list.name.as_str());
+    let mut ui = screen_heading(&here, &item.title, parent);
     if done {
         ui = ui.text("✅ Выполнено");
     }
@@ -212,9 +212,9 @@ pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui,
     } else {
         button(
             if shopping {
-                "✓ Куплено"
+                ru::BOUGHT_BUTTON
             } else {
-                "✓ Готово"
+                ru::DONE_BUTTON
             },
             Action::Complete {
                 item_id,
@@ -257,7 +257,7 @@ pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui,
             ])
             .row(vec![delete]);
     }
-    Ok(ui.row(vec![back_button("⬅️ Назад", back.clone())]))
+    Ok(ui.row(nav_row(&here, back.clone())))
 }
 
 fn is_overdue(item: &Item, ctx: &Ctx<'_>) -> bool {
@@ -269,78 +269,68 @@ fn is_overdue(item: &Item, ctx: &Ctx<'_>) -> bool {
     }
 }
 
-/// Результат завершения задачи.
-pub async fn completed(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui, Fail> {
-    let (item, _) = load(ctx, item_id).await?;
-    let mut ui = Ui::new().heading(format!("✅ Выполнено: {}", clip(&item.title, 80)));
-    if item.status == ItemStatus::Open
-        && let Some(next) = ru::due_label(item.due_at, item.due_date, ctx.tz, ctx.now)
-    {
-        ui = ui.text(format!("Следующее: {next}"));
-    }
-    Ok(ui.row(vec![
-        button(
-            "↩️ Отменить",
-            Action::Undo {
-                item_id,
-                back: back.clone(),
-            },
-        ),
-        back_button("📋 К списку", back.clone()),
-    ]))
-}
-
 /// Результат удаления с кнопкой отмены.
 pub async fn deleted(
+    ctx: &mut Ctx<'_>,
     item_id: Uuid,
     title: &str,
-    shopping: bool,
     back: &Screen,
 ) -> Result<Ui, Fail> {
-    Ok(Ui::new()
-        .heading(format!("🗑 Удалено: {}", clip(title, 80)))
-        .row(vec![
-            button(
-                "↩️ Отменить",
-                Action::DeleteUndo {
-                    item_id,
-                    back: back.clone(),
-                },
-            ),
-            back_button(
-                if shopping {
-                    "🛒 К списку"
-                } else {
-                    "📋 К списку"
-                },
-                back.clone(),
-            ),
-        ]))
+    let parent = match back {
+        Screen::List { list_id, .. } => {
+            let household_id = ctx.household()?.id;
+            match lists::get_visible(&mut *ctx.conn, household_id, *list_id).await {
+                Ok(list) => Some(list.name),
+                Err(DomainError::NotFound) => None,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        _ => None,
+    };
+    let screen = Screen::Deleted {
+        item_id,
+        title: title.to_owned(),
+        back: Box::new(back.clone()),
+    };
+    let ui = screen_heading(&screen, &format!("🗑 Удалено: {title}"), parent.as_deref());
+    let mut row = vec![button(
+        "↩️ Отменить",
+        Action::DeleteUndo {
+            item_id,
+            back: back.clone(),
+        },
+    )];
+    row.extend(nav_row(&screen, back.clone()));
+    Ok(ui.row(row))
 }
 
 /// Подтверждение удаления.
 pub async fn confirm_delete(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui, Fail> {
-    let (item, _) = load(ctx, item_id).await?;
-    let mut ui = Ui::new().heading(format!("Удалить «{}»?", clip(&item.title, 80)));
+    let (item, list) = load(ctx, item_id).await?;
+    let screen = Screen::ConfirmDelete {
+        item_id,
+        back: Box::new(back.clone()),
+    };
+    let parent = matches!(back, Screen::List { .. }).then_some(list.name.as_str());
+    let mut ui = screen_heading(&screen, &format!("Удалить «{}»?", item.title), parent);
     if item.recurrence.is_some() {
         ui = ui.text("Будет удалена вся серия повторений.");
     }
-    Ok(ui.row(vec![
-        button(
-            "🗑 Да, удалить",
-            Action::DeleteDo {
-                item_id,
-                back: back.clone(),
-            },
-        ),
-        back_button(
-            "Отмена",
-            Screen::Item {
-                item_id,
-                back: Box::new(back.clone()),
-            },
-        ),
-    ]))
+    let mut row = vec![button(
+        "🗑 Да, удалить",
+        Action::DeleteDo {
+            item_id,
+            back: back.clone(),
+        },
+    )];
+    row.extend(nav_row(
+        &screen,
+        Screen::Item {
+            item_id,
+            back: Box::new(back.clone()),
+        },
+    ));
+    Ok(ui.row(row))
 }
 
 /// Завершить элемент.
@@ -364,11 +354,23 @@ pub async fn complete(
     .await?;
     let list = lists::get(&mut *ctx.conn, household.id, item.list_id).await?;
     if list.kind == ListKind::Tasks {
-        ctx.present(Screen::Completed {
-            item_id,
-            back: Box::new(back),
-        })
-        .await
+        let mut text = format!("✅ Выполнено: {}", clip(&item.title, 80));
+        if item.status == ItemStatus::Open
+            && let Some(next) = ru::due_label(item.due_at, item.due_date, ctx.tz, ctx.now)
+        {
+            text.push_str(&format!("\nСледующее: {next}"));
+        }
+        ctx.banner_with(
+            text,
+            vec![button(
+                "↩️ Отменить",
+                Action::Undo {
+                    item_id,
+                    back: back.clone(),
+                },
+            )],
+        );
+        ctx.present(back).await
     } else {
         ctx.toast(format!("Отмечено: {}", clip(&item.title, 60)));
         ctx.present(back).await
@@ -420,11 +422,9 @@ pub async fn delete_do(ctx: &mut Ctx<'_>, item_id: Uuid, back: Screen) -> Result
     let household_id = ctx.household()?.id;
     let actor = ctx.actor()?;
     let item = items::soft_delete(&mut *ctx.conn, household_id, &actor, item_id, ctx.now).await?;
-    let list = lists::get(&mut *ctx.conn, household_id, item.list_id).await?;
     ctx.present(Screen::Deleted {
         item_id: item.id,
         title: item.title.clone(),
-        shopping: list.kind != ListKind::Tasks,
         back: Box::new(back),
     })
     .await

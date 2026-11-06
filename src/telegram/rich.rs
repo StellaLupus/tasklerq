@@ -313,13 +313,13 @@ mod tests {
         let view = View::new()
             .heading("<script>alert(1)</script>")
             .text("a < b & c > d")
-            .row(vec![button("<b>Готово</b>", ())]);
+            .row(vec![button("<b>Выполнено</b>", ())]);
         let html = render(&view, &["t:AAAAAAAAAAAAAAAA".to_owned()]).html;
 
         assert!(!html.contains("<script>"));
         assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
         assert!(html.contains("a &lt; b &amp; c &gt; d"));
-        assert!(html.contains(">&lt;b&gt;Готово&lt;/b&gt;</tg-button>"));
+        assert!(html.contains(">&lt;b&gt;Выполнено&lt;/b&gt;</tg-button>"));
     }
 
     #[test]

@@ -7,21 +7,52 @@ use std::sync::Arc;
 use axum::http::{Method, StatusCode};
 use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc};
 use sqlx::PgPool;
-use support::telegram::{Call, Harness};
+use support::telegram::{Call, FakeTelegram, Harness, button_rows};
 use support::{TestHousehold, create_item, db, new_item, next_telegram_id};
 use tasklerq::admin;
 use tasklerq::config::TenancyMode;
-use tasklerq::domain::models::{Actor, UserRole};
+use tasklerq::domain::models::{Actor, ItemPriority, ListKind, UserRole};
 use tasklerq::domain::settings::NotificationSettings;
 use tasklerq::jobs::scheduler::Scheduler;
-use tasklerq::storage::repositories::items;
-use tasklerq::telegram::bot::model::{Action, Form, PAGE_SIZE, Screen};
+use tasklerq::storage::repositories::{items, lists};
+use tasklerq::telegram::bot::Bot;
+use tasklerq::telegram::bot::model::{Action, Form, PAGE_SIZE, Screen, Ui};
 use tasklerq::telegram::callbacks::{self, NewToken, Scope};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
 async fn onboarded_named(pool: &PgPool, name: &str) -> Harness {
     let mut bot = Harness::new(pool, next_telegram_id()).named(name);
+    bot.text("/start").await;
+    bot.text("Семья").await;
+    bot.press("Москва").await;
+    bot.press("меню").await;
+    bot
+}
+
+/// Онбординг на стенде с включённым разбором текста.
+async fn onboarded_with_llm(pool: &PgPool, name: &str) -> Harness {
+    let handler = Bot::new("tasklerqbot")
+        .with_llm_capture(true)
+        .with_tenancy(TenancyMode::Multi);
+    let mut bot = Harness::with_handler(
+        pool,
+        next_telegram_id(),
+        Arc::new(handler),
+        FakeTelegram::new(),
+    )
+    .named(name);
+    bot.text("/start").await;
+    bot.text("Семья").await;
+    bot.press("Москва").await;
+    bot.press("меню").await;
+    bot
+}
+
+/// Онбординг на зафиксированном моменте: токены кнопок создаются уже в нём.
+async fn onboarded_at(pool: &PgPool, name: &str, now: DateTime<Utc>) -> Harness {
+    let mut bot = Harness::new(pool, next_telegram_id()).named(name);
+    bot.set_now(now);
     bot.text("/start").await;
     bot.text("Семья").await;
     bot.press("Москва").await;
@@ -164,6 +195,60 @@ async fn action_callback(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn banner_with_a_button_is_shown_once_and_never_persisted() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+
+    support::telegram::present_with_banner(
+        &db.pool,
+        bot.chat,
+        bot.now,
+        &Screen::Menu,
+        Ui::new().heading("Экран под баннером"),
+        "✅ Выполнено: Оплатить интернет",
+        vec![tasklerq::telegram::rich::button(
+            "↩️ Отменить",
+            Action::Refresh,
+        )],
+    )
+    .await;
+    bot.deliver().await;
+
+    let html = bot.screen();
+    assert!(
+        html.contains("✅ Выполнено: Оплатить интернет"),
+        "banner should be visible:\n{html}"
+    );
+    assert!(
+        support::telegram::buttons(&html)
+            .iter()
+            .any(|(label, _)| label.contains("Отменить")),
+        "banner button should be visible:\n{html}"
+    );
+
+    let state: String =
+        sqlx::query_scalar("SELECT state::text FROM telegram_views WHERE chat_id = $1")
+            .bind(bot.chat)
+            .fetch_one(&db.pool)
+            .await
+            .expect("saved screen state");
+    assert!(
+        !state.contains("Оплатить интернет"),
+        "banner text must not be persisted: {state}"
+    );
+
+    // Кнопка баннера доходит до действия, а следующая отрисовка баннера не
+    // показывает: он живёт только до ближайшего экрана.
+    bot.press("Отменить").await;
+    let html = bot.screen();
+    assert!(!html.contains("Оплатить интернет"), "{html}");
+    assert!(
+        !html.contains("Отменить"),
+        "the banner button must disappear with the banner:\n{html}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shopping_flow_covers_duplicates_purchase_and_clear() {
     let db = db().await;
     let mut bot = onboarded_named(&db.pool, "Alice").await;
@@ -205,6 +290,424 @@ async fn shopping_flow_covers_duplicates_purchase_and_clear() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_rows_have_one_button_and_open_the_card_without_changing_the_task() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+
+    let mut urgent = new_item(household.tasks_list_id, "Срочная задача");
+    urgent.priority = ItemPriority::Urgent;
+    urgent.assignee_user_id = Some(household.owner_id);
+    let urgent = create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        urgent,
+    )
+    .await;
+
+    let mut high = new_item(household.tasks_list_id, "Высокая задача");
+    high.priority = ItemPriority::High;
+    create_item(&db.pool, &household, household.tasks_list_id, &actor, high).await;
+
+    let normal = create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, "Обычная задача"),
+    )
+    .await;
+
+    create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        new_item(household.shopping_list_id, "Молоко"),
+    )
+    .await;
+
+    bot.press("Задачи").await;
+    let buttons = support::telegram::buttons(&bot.screen());
+    let labels: Vec<&str> = buttons.iter().map(|(label, _)| label.as_str()).collect();
+    assert!(
+        !labels.iter().any(|label| *label == "☐" || *label == "⋯"),
+        "element rows must not keep service buttons: {labels:?}"
+    );
+    for title in ["Срочная задача", "Высокая задача", "Обычная задача"]
+    {
+        let rows: Vec<&(String, String)> = buttons
+            .iter()
+            .filter(|(label, _)| label.contains(title))
+            .collect();
+        assert_eq!(rows.len(), 1, "one full-width button per row: {title}");
+        assert!(
+            !rows[0].0.contains("👤"),
+            "the row must not show the assignee: {}",
+            rows[0].0
+        );
+    }
+    let row = |title: &str| {
+        buttons
+            .iter()
+            .find(|(label, _)| label.contains(title))
+            .map(|(label, _)| label.as_str())
+            .expect("row button")
+    };
+    assert!(row("Срочная задача").contains("🔴 срочно"), "{buttons:?}");
+    assert!(row("Высокая задача").contains("🟠 высокий"), "{buttons:?}");
+    assert!(!row("Обычная задача").contains("🔴"), "{buttons:?}");
+    assert!(!row("Обычная задача").contains("🟠"), "{buttons:?}");
+
+    let before = item_state(&db.pool, urgent.id).await;
+    bot.press("Срочная задача").await;
+    assert!(
+        bot.screen().contains("<h3>Задачи › Срочная задача</h3>"),
+        "the row must open the task card:\n{}",
+        bot.screen()
+    );
+    assert_eq!(
+        item_state(&db.pool, urgent.id).await,
+        before,
+        "opening the card must not change the task"
+    );
+
+    // «Мои задачи» и поиск используют ту же строку-кнопку.
+    bot.press("Назад").await; // список
+    bot.press("Назад").await; // меню
+    bot.press("Мои задачи").await;
+    assert_one_element_row(&bot.screen(), "Срочная задача");
+    bot.press("Назад").await;
+
+    bot.press("Поиск").await;
+    bot.text("задача").await;
+    for title in ["Срочная задача", "Высокая задача", "Обычная задача"]
+    {
+        assert_one_element_row(&bot.screen(), title);
+    }
+    assert!(
+        !support::telegram::buttons(&bot.screen())
+            .iter()
+            .any(|(label, _)| label.contains("☐")),
+        "results must not mark open items with ☐:\n{}",
+        bot.screen()
+    );
+
+    // Статус результата — текстом: выполненная задача помечена ✅.
+    sqlx::query("UPDATE items SET status = 'done', completed_at = now() WHERE id = $1")
+        .bind(normal.id)
+        .execute(&db.pool)
+        .await
+        .expect("mark done");
+    bot.press("Все").await;
+    let results = support::telegram::buttons(&bot.screen());
+    let done = results
+        .iter()
+        .find(|(label, _)| label.contains("Обычная задача"))
+        .map(|(label, _)| label.as_str())
+        .expect("done task row");
+    assert!(
+        done.starts_with("✅ "),
+        "done result must be marked: {done}"
+    );
+
+    bot.press("Назад").await;
+    bot.press("Поиск").await;
+    bot.text("молоко").await;
+    assert_one_element_row(&bot.screen(), "Молоко");
+    assert!(
+        support::telegram::buttons(&bot.screen())
+            .iter()
+            .any(|(label, _)| label.contains("Молоко") && label.contains("Покупки")),
+        "the result row must keep the list name:\n{}",
+        bot.screen()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn row_taps_in_mine_and_search_open_the_card_and_back_returns() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+
+    let mut task = new_item(household.tasks_list_id, "Позвонить маме");
+    task.assignee_user_id = Some(household.owner_id);
+    create_item(&db.pool, &household, household.tasks_list_id, &actor, task).await;
+    create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        new_item(household.shopping_list_id, "Молоко"),
+    )
+    .await;
+
+    // «Мои задачи».
+    bot.press("Мои задачи").await;
+    assert_one_element_row(&bot.screen(), "Позвонить маме");
+    bot.press("Позвонить маме").await;
+    bot.assert_screen_contains("Мои задачи › Позвонить маме");
+    bot.assert_has_button("⬅️ Назад");
+    bot.press("Назад").await;
+    bot.assert_screen_contains("Мои задачи · 1");
+
+    // Поиск задачи.
+    bot.press("Назад").await;
+    bot.press("Поиск").await;
+    bot.text("Позвонить").await;
+    assert_one_element_row(&bot.screen(), "Позвонить маме");
+    bot.press("Позвонить маме").await;
+    bot.assert_screen_contains("Поиск › Позвонить маме");
+    bot.assert_has_button("⬅️ Назад");
+    bot.press("Назад").await;
+    bot.assert_screen_contains("Найдено 1 результат");
+
+    // Поиск покупки.
+    bot.press("Назад").await;
+    bot.press("Поиск").await;
+    bot.text("Молоко").await;
+    assert_one_element_row(&bot.screen(), "Молоко");
+    bot.press("Молоко").await;
+    bot.assert_screen_contains("Поиск › Молоко");
+    bot.assert_has_button("⬅️ Назад");
+    bot.press("Назад").await;
+    bot.assert_screen_contains("Молоко · Покупки");
+}
+
+fn assert_one_element_row(screen: &str, title: &str) {
+    let rows = support::telegram::button_rows(screen);
+    let matching: Vec<_> = rows
+        .iter()
+        .filter(|row| row.iter().any(|(label, _)| label.contains(title)))
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "exactly one row per element: {title}\n{screen}\n{rows:?}"
+    );
+    assert_eq!(
+        matching[0].len(),
+        1,
+        "exactly one button per element row: {title}\n{screen}\n{:?}",
+        matching[0]
+    );
+    assert!(
+        !support::telegram::buttons(screen)
+            .iter()
+            .any(|(label, _)| label == "⋯"),
+        "no «⋯» button belongs to an element row: {screen}"
+    );
+}
+
+async fn item_state(pool: &PgPool, item_id: Uuid) -> (i32, String) {
+    sqlx::query_as("SELECT version, status::text FROM items WHERE id = $1")
+        .bind(item_id)
+        .fetch_one(pool)
+        .await
+        .expect("item state")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shopping_row_toggles_the_purchase_and_stays_in_the_list() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut item = new_item(household.shopping_list_id, "Молоко");
+    item.quantity = Some(2.0);
+    item.unit = Some("л".into());
+    let item = create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        item,
+    )
+    .await;
+
+    bot.press("Покупки").await;
+    bot.assert_screen_contains("Покупки · 1");
+    bot.assert_screen_contains("☐ Молоко · 2 л");
+    assert_one_element_row(&bot.screen(), "Молоко");
+
+    bot.press("☐ Молоко · 2 л").await;
+    bot.assert_screen_contains("Покупки · 0");
+    bot.assert_screen_contains("☑ Молоко · 2 л");
+    let state: serde_json::Value =
+        sqlx::query_scalar("SELECT state FROM telegram_views WHERE chat_id = $1")
+            .bind(bot.chat)
+            .fetch_one(&db.pool)
+            .await
+            .expect("saved list state");
+    assert_eq!(state["t"], serde_json::json!("list"));
+    assert_eq!(state["edit"], serde_json::json!(false));
+    assert_eq!(
+        item_state(&db.pool, item.id).await.1,
+        "done",
+        "the row tap marks the purchase"
+    );
+
+    bot.press("☑ Молоко · 2 л").await;
+    bot.assert_screen_contains("☐ Молоко · 2 л");
+    assert_eq!(item_state(&db.pool, item.id).await.1, "open");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shopping_edit_mode_opens_the_card_and_is_kept_on_back() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut item = new_item(household.shopping_list_id, "Молоко");
+    item.quantity = Some(2.0);
+    item.unit = Some("л".into());
+    let item = create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        item,
+    )
+    .await;
+
+    bot.press("Покупки").await;
+    bot.assert_has_button("✏️ Править");
+    bot.press("Править").await;
+    bot.assert_screen_contains("Покупки · правка");
+    bot.assert_has_button("✓ Закончить правку");
+
+    bot.press("☐ Молоко · 2 л").await;
+    bot.assert_screen_contains("Покупки › Молоко");
+    bot.assert_has_button("✓ Куплено");
+    assert_eq!(
+        item_state(&db.pool, item.id).await.1,
+        "open",
+        "a row in edit mode must not mark the purchase"
+    );
+
+    bot.press("Назад").await;
+    bot.assert_screen_contains("Покупки · правка");
+    bot.assert_has_button("✓ Закончить правку");
+
+    bot.press("Закончить правку").await;
+    bot.assert_screen_contains("Покупки · 1");
+    assert!(!bot.screen().contains("правка"));
+
+    // Повторный вход из меню открывает обычный режим.
+    bot.press("Назад").await;
+    bot.press("Покупки").await;
+    bot.assert_screen_contains("Покупки · 1");
+    assert!(!bot.screen().contains("правка"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shopping_edit_finish_button_has_its_own_row() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        new_item(household.shopping_list_id, "Молоко"),
+    )
+    .await;
+
+    bot.press("Покупки").await;
+    bot.press("Править").await;
+    bot.assert_screen_contains("Покупки · правка");
+
+    // «✓ Закончить правку» длиннее соседних подписей и в ряду из трёх
+    // обрезается на узком Android-экране, поэтому должна занимать весь ряд.
+    let rows = button_rows(&bot.screen());
+    let finish_row = rows
+        .iter()
+        .find(|row| row.iter().any(|(label, _)| label == "✓ Закончить правку"))
+        .unwrap_or_else(|| panic!("finish button should be present: {rows:?}"));
+    assert_eq!(
+        finish_row.len(),
+        1,
+        "«✓ Закончить правку» должна занимать весь ряд: {rows:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_shopping_list_in_edit_mode_drops_the_edit_marker() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        new_item(household.shopping_list_id, "Молоко"),
+    )
+    .await;
+
+    bot.press("Покупки").await;
+    bot.press("Править").await;
+    bot.assert_screen_contains("Покупки · правка");
+    bot.press("Молоко").await;
+    bot.press("Удалить").await;
+    bot.press("Да, удалить").await;
+    bot.press("Назад").await;
+
+    // Список опустел в режиме правки: заголовок и кнопки — как у обычного
+    // пустого списка, чтобы из него был выход.
+    bot.assert_screen_contains("Покупки · 0");
+    bot.assert_screen_contains("Список покупок пуст");
+    assert!(!bot.screen().contains("правка"), "{}", bot.screen());
+    bot.assert_has_button("⬅️ Назад");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn old_list_state_without_edit_is_read_as_normal_mode() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut item = new_item(household.shopping_list_id, "Молоко");
+    item.quantity = Some(2.0);
+    item.unit = Some("л".into());
+    create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        item,
+    )
+    .await;
+
+    let old_state = serde_json::json!({
+        "t": "list",
+        "list_id": household.shopping_list_id,
+        "page": 0,
+    });
+    sqlx::query("UPDATE telegram_views SET state = $1 WHERE chat_id = $2")
+        .bind(old_state)
+        .bind(bot.chat)
+        .execute(&db.pool)
+        .await
+        .expect("old list state");
+
+    let data = action_callback(&db.pool, bot.chat, household.household_id, Action::Refresh).await;
+    let (message_id, _) = bot.active();
+    bot.press_data(&data, message_id).await;
+
+    bot.assert_screen_contains("Покупки · 1");
+    bot.assert_screen_contains("☐ Молоко · 2 л");
+    assert!(!bot.screen().contains("правка"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn clearing_many_purchases_needs_confirmation() {
     let db = db().await;
     let mut bot = onboarded_named(&db.pool, "Alice").await;
@@ -228,11 +731,174 @@ async fn clearing_many_purchases_needs_confirmation() {
 
     bot.press("Покупки").await;
     bot.press("Очистить").await;
-    bot.assert_screen_contains("Удалить 6 позиций?");
+    bot.assert_screen_contains("Покупки › Удалить 6 позиций?");
     bot.press("Да, очистить").await;
-    bot.assert_screen_contains("Убрано: 6 позиций");
-    bot.press("К списку").await;
+    bot.assert_screen_contains("Покупки › Убрано: 6 позиций");
+    bot.press("Назад").await;
     bot.assert_screen_contains("Список покупок пуст");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shopping_list_from_all_lists_keeps_the_trail_and_returns_there() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        new_item(household.shopping_list_id, "Молоко"),
+    )
+    .await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+    lists::create(
+        &mut conn,
+        household.household_id,
+        ListKind::Checklist,
+        "Дача",
+        Utc::now(),
+    )
+    .await
+    .expect("extra list");
+    drop(conn);
+
+    // Перерисовать меню: третий список включает «🗂 Все списки».
+    bot.text("/start").await;
+    bot.press("Все списки").await;
+    bot.press("Покупки").await;
+    assert!(
+        bot.screen().contains("<h3>Все списки › Покупки · 1</h3>"),
+        "a shopping list opened from «Все списки» must keep that parent in its trail:\n{}",
+        bot.screen()
+    );
+    bot.assert_has_button("⬅️ Назад");
+    bot.assert_has_button("🏠 Меню");
+
+    // Карточка из такого списка тоже показывает полный путь.
+    bot.press("Править").await;
+    bot.press("Молоко").await;
+    bot.assert_screen_contains("Все списки › Покупки › Молоко");
+    bot.press("Назад").await;
+    assert!(
+        bot.screen()
+            .contains("<h3>Все списки › Покупки · правка</h3>"),
+        "the card must return to the list opened from «Все списки»:\n{}",
+        bot.screen()
+    );
+
+    bot.press("Назад").await;
+    bot.assert_screen_contains("<h3>Все списки</h3>");
+
+    // Список из меню по-прежнему без «Все списки».
+    bot.press("Назад").await;
+    bot.press("Покупки").await;
+    assert!(
+        bot.screen().contains("<h3>Покупки · 1</h3>"),
+        "a shopping list opened from the menu must not claim «Все списки» as parent:\n{}",
+        bot.screen()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clearing_purchases_from_all_lists_keeps_the_origin() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    for n in 0..6 {
+        let item = create_item(
+            &db.pool,
+            &household,
+            household.shopping_list_id,
+            &actor,
+            new_item(household.shopping_list_id, &format!("Товар {n}")),
+        )
+        .await;
+        sqlx::query("UPDATE items SET status = 'done', completed_at = now() WHERE id = $1")
+            .bind(item.id)
+            .execute(&db.pool)
+            .await
+            .expect("done");
+    }
+    let mut conn = db.pool.acquire().await.expect("connection");
+    lists::create(
+        &mut conn,
+        household.household_id,
+        ListKind::Checklist,
+        "Дача",
+        Utc::now(),
+    )
+    .await
+    .expect("extra list");
+    drop(conn);
+
+    bot.text("/start").await;
+    bot.press("Все списки").await;
+    bot.press("Покупки").await;
+    bot.press("Очистить").await;
+    bot.assert_screen_contains("Все списки › Покупки › Удалить 6 позиций?");
+    bot.press("Да, очистить").await;
+    bot.assert_screen_contains("Все списки › Покупки › Убрано: 6 позиций");
+    bot.press("Назад").await;
+    assert!(
+        bot.screen().contains("<h3>Все списки › Покупки · 0</h3>"),
+        "after clearing, «Назад» must return to the list opened from «Все списки»:\n{}",
+        bot.screen()
+    );
+    bot.assert_screen_contains("Список покупок пуст");
+    bot.press("Назад").await;
+    bot.assert_screen_contains("<h3>Все списки</h3>");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undoing_cleared_purchases_from_all_lists_keeps_the_origin() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    for n in 0..6 {
+        let item = create_item(
+            &db.pool,
+            &household,
+            household.shopping_list_id,
+            &actor,
+            new_item(household.shopping_list_id, &format!("Товар {n}")),
+        )
+        .await;
+        sqlx::query("UPDATE items SET status = 'done', completed_at = now() WHERE id = $1")
+            .bind(item.id)
+            .execute(&db.pool)
+            .await
+            .expect("done");
+    }
+    let mut conn = db.pool.acquire().await.expect("connection");
+    lists::create(
+        &mut conn,
+        household.household_id,
+        ListKind::Checklist,
+        "Дача",
+        Utc::now(),
+    )
+    .await
+    .expect("extra list");
+    drop(conn);
+
+    bot.text("/start").await;
+    bot.press("Все списки").await;
+    bot.press("Покупки").await;
+    bot.press("Очистить").await;
+    bot.press("Да, очистить").await;
+    bot.assert_screen_contains("Все списки › Покупки › Убрано: 6 позиций");
+    bot.press("Отменить").await;
+    assert!(
+        bot.screen().contains("<h3>Все списки › Покупки · 0</h3>"),
+        "after undo, «Назад» must return to the list opened from «Все списки»:\n{}",
+        bot.screen()
+    );
+    bot.press("Назад").await;
+    bot.assert_screen_contains("<h3>Все списки</h3>");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -255,25 +921,495 @@ async fn lists_paginate_and_counters_follow_actions() {
     bot.press("Задачи").await;
     bot.assert_screen_contains("Задачи · 9");
     bot.assert_screen_contains("Страница 1 из 2");
-    assert_eq!(
-        support::telegram::buttons(&bot.screen())
-            .iter()
-            .filter(|(l, _)| l == "☐")
-            .count(),
-        8
+    let row_buttons: Vec<_> = support::telegram::buttons(&bot.screen())
+        .into_iter()
+        .filter(|(label, _)| label.starts_with("Задача "))
+        .collect();
+    assert_eq!(row_buttons.len(), 8, "one full-width button per task row");
+    let labels: Vec<String> = support::telegram::buttons(&bot.screen())
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect();
+    assert!(
+        !labels.iter().any(|label| label == "☐" || label == "⋯"),
+        "element rows must not keep service buttons: {labels:?}"
     );
     bot.press("→").await;
     bot.assert_screen_contains("Страница 2 из 2");
 
-    // Завершить единственную задачу второй страницы: возврат на последнюю
-    // существующую страницу.
-    bot.press("☐").await;
-    bot.press("К списку").await;
+    // Завершить единственную задачу второй страницы: строка открывает
+    // карточку, «✓ Выполнено» возвращает на ту же страницу с баннером.
+    let task = support::telegram::buttons(&bot.screen())
+        .into_iter()
+        .map(|(label, _)| label)
+        .find(|label| label.starts_with("Задача "))
+        .expect("a task on the second page");
+    bot.press(&task).await;
+    bot.press("Выполнено").await;
+    bot.assert_screen_contains("✅ Выполнено:");
     bot.assert_screen_contains("Задачи · 8");
-
     bot.press("Назад").await;
-    bot.assert_screen_contains("Семья · 8 задач");
-    bot.assert_screen_contains("Выполнено сегодня: <b>1</b>");
+    bot.assert_screen_contains("📋 Задачи · 8");
+    bot.assert_screen_contains("Выполнено: <b>1</b>");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completed_task_stays_in_done_today_section_and_opens_card() {
+    let db = db().await;
+    let now = local_utc(
+        chrono_tz::Tz::Europe__Moscow,
+        NaiveDate::from_ymd_opt(2027, 3, 15).expect("date"),
+        13,
+        47,
+    );
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, "Вынести мусор"),
+    )
+    .await;
+
+    bot.press("Задачи").await;
+    bot.press("Вынести мусор").await;
+    bot.press("Выполнено").await;
+    bot.assert_screen_contains("✅ Выполнено: Вынести мусор");
+    bot.assert_screen_contains("Выполнено сегодня");
+    bot.assert_screen_contains("✅ Вынести мусор · 13:47");
+    assert!(
+        !bot.screen().contains("Выполнено ранее"),
+        "a task completed today must not be counted as earlier:\n{}",
+        bot.screen()
+    );
+
+    bot.press("✅ Вынести мусор").await;
+    bot.assert_screen_contains("Задачи › Вынести мусор");
+    bot.assert_has_button("Вернуть");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_today_section_uses_the_users_day_boundary() {
+    let db = db().await;
+    let vladivostok = chrono_tz::Tz::Asia__Vladivostok;
+    let now = local_utc(
+        vladivostok,
+        NaiveDate::from_ymd_opt(2027, 3, 15).expect("date"),
+        23,
+        30,
+    );
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    sqlx::query("UPDATE users SET timezone = 'Asia/Vladivostok' WHERE telegram_user_id = $1")
+        .bind(bot.chat)
+        .execute(&db.pool)
+        .await
+        .expect("timezone");
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, "Вынести мусор"),
+    )
+    .await;
+
+    bot.press("Задачи").await;
+    bot.press("Вынести мусор").await;
+    bot.press("Выполнено").await;
+    bot.assert_screen_contains("✅ Вынести мусор · 23:30");
+
+    // Полночь во Владивостоке наступает раньше, чем в UTC: вчерашнее
+    // выполнение больше не попадает в раздел.
+    let next_day = local_utc(
+        vladivostok,
+        NaiveDate::from_ymd_opt(2027, 3, 16).expect("date"),
+        0,
+        10,
+    );
+    bot.set_now(next_day);
+    bot.press("Назад").await;
+    bot.press("Задачи").await;
+    assert!(
+        !bot.screen().contains("Выполнено сегодня"),
+        "yesterday's completions must disappear:\n{}",
+        bot.screen()
+    );
+    assert!(!bot.screen().contains("✅ Вынести мусор"));
+    bot.assert_screen_contains("Выполнено ранее: 1");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recurring_task_is_shown_open_and_done_today() {
+    let db = db().await;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(chrono_tz::Tz::Europe__Moscow, today, 9, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut input = new_item(household.tasks_list_id, "Полить цветы");
+    input.due_date = Some(today);
+    input.recurrence = Some(support::recurrence(
+        tasklerq::domain::models::RecurrenceFreq::Daily,
+        Vec::new(),
+    ));
+    create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
+
+    bot.press("Задачи").await;
+    bot.press("Полить цветы").await;
+    bot.press("Выполнено").await;
+    bot.assert_screen_contains("Выполнено сегодня");
+    bot.assert_screen_contains("✅ Полить цветы · 09:00");
+
+    let labels: Vec<String> = support::telegram::buttons(&bot.screen())
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect();
+    assert!(
+        labels.iter().any(|label| label == "Полить цветы · завтра"),
+        "the recurring task stays open with the next due date: {labels:?}"
+    );
+    assert_eq!(
+        labels
+            .iter()
+            .filter(|label| label.contains("Полить цветы"))
+            .count(),
+        2,
+        "the task is shown twice: open and completed today"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_recurring_occurrences_are_listed_in_done_today() {
+    let db = db().await;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(chrono_tz::Tz::Europe__Moscow, today, 9, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut input = new_item(household.tasks_list_id, "Полить цветы");
+    input.due_date = Some(today);
+    input.recurrence = Some(support::recurrence(
+        tasklerq::domain::models::RecurrenceFreq::Daily,
+        Vec::new(),
+    ));
+    let task = create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
+
+    bot.press("Задачи").await;
+    bot.press("Полить цветы").await;
+    bot.press("Выполнено").await;
+    bot.assert_screen_contains("✅ Полить цветы · 09:00");
+
+    // Следующее вхождение уже наступило: снимаем отметку и выполняем его.
+    sqlx::query("UPDATE items SET completed_at = NULL WHERE id = $1")
+        .bind(task.id)
+        .execute(&db.pool)
+        .await
+        .expect("prepare second occurrence");
+    bot.set_now(now + Duration::minutes(1));
+    bot.press("Полить цветы · завтра").await;
+    bot.press("Выполнено").await;
+
+    let labels: Vec<String> = support::telegram::buttons(&bot.screen())
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect();
+    let completions: Vec<&String> = labels
+        .iter()
+        .filter(|label| label.starts_with("✅ Полить цветы"))
+        .collect();
+    assert_eq!(
+        completions.len(),
+        2,
+        "two occurrences give two rows: {labels:?}"
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|label| label == "✅ Полить цветы · 09:00")
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|label| label == "✅ Полить цветы · 09:01")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_today_counter_is_visible_on_every_page() {
+    let db = db().await;
+    let now = local_utc(
+        chrono_tz::Tz::Europe__Moscow,
+        NaiveDate::from_ymd_opt(2027, 3, 15).expect("date"),
+        10,
+        0,
+    );
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    for n in 0..10 {
+        create_item(
+            &db.pool,
+            &household,
+            household.tasks_list_id,
+            &actor,
+            new_item(household.tasks_list_id, &format!("Задача {n}")),
+        )
+        .await;
+    }
+
+    bot.press("Задачи").await;
+    bot.press("Задача 0").await;
+    bot.press("Выполнено").await;
+    bot.assert_screen_contains("Задачи · 9 · ✅ 1");
+
+    bot.press("→").await;
+    bot.assert_screen_contains("Страница 2 из 2");
+    bot.assert_screen_contains("Задачи · 9 · ✅ 1");
+    bot.assert_screen_contains("Выполнено сегодня");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undone_completion_disappears_from_done_today() {
+    let db = db().await;
+    let now = local_utc(
+        chrono_tz::Tz::Europe__Moscow,
+        NaiveDate::from_ymd_opt(2027, 3, 15).expect("date"),
+        13,
+        47,
+    );
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, "Вынести мусор"),
+    )
+    .await;
+
+    bot.press("Задачи").await;
+    bot.press("Вынести мусор").await;
+    bot.press("Выполнено").await;
+    bot.assert_screen_contains("Выполнено сегодня");
+
+    bot.press("Отменить").await;
+    assert!(
+        !bot.screen().contains("Выполнено сегодня"),
+        "an undone completion must disappear:\n{}",
+        bot.screen()
+    );
+    assert!(!bot.screen().contains("✅ Вынести мусор"));
+    bot.assert_screen_contains("Вынести мусор");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn menu_counters_follow_a_completion() {
+    let db = db().await;
+    let now = local_utc(
+        chrono_tz::Tz::Europe__Moscow,
+        NaiveDate::from_ymd_opt(2027, 3, 15).expect("date"),
+        10,
+        0,
+    );
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, "Оплатить интернет"),
+    )
+    .await;
+
+    bot.text("/start").await;
+    bot.assert_screen_contains("📋 Задачи · 1");
+    bot.assert_screen_contains("Выполнено: <b>0</b>");
+
+    bot.press("Задачи").await;
+    bot.press("Оплатить интернет").await;
+    bot.press("Выполнено").await;
+    bot.press("Назад").await;
+
+    bot.assert_screen_contains("📋 Задачи · 0");
+    bot.assert_screen_contains("Выполнено: <b>1</b>");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn menu_counters_keep_a_completed_recurring_task_open() {
+    let db = db().await;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(chrono_tz::Tz::Europe__Moscow, today, 9, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut input = new_item(household.tasks_list_id, "Полить цветы");
+    input.due_date = Some(today);
+    input.recurrence = Some(support::recurrence(
+        tasklerq::domain::models::RecurrenceFreq::Daily,
+        Vec::new(),
+    ));
+    create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
+
+    bot.text("/start").await;
+    bot.assert_screen_contains("📋 Задачи · 1");
+    bot.assert_screen_contains("Выполнено: <b>0</b>");
+
+    bot.press("Задачи").await;
+    bot.press("Полить цветы").await;
+    bot.press("Выполнено").await;
+    bot.press("Назад").await;
+
+    bot.assert_screen_contains("📋 Задачи · 1");
+    bot.assert_screen_contains("Выполнено: <b>1</b>");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn menu_counters_do_not_repeat_the_lists_line() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    for n in 0..12 {
+        create_item(
+            &db.pool,
+            &household,
+            household.tasks_list_id,
+            &actor,
+            new_item(household.tasks_list_id, &format!("Задача {n}")),
+        )
+        .await;
+    }
+    for n in 0..7 {
+        create_item(
+            &db.pool,
+            &household,
+            household.shopping_list_id,
+            &actor,
+            new_item(household.shopping_list_id, &format!("Позиция {n}")),
+        )
+        .await;
+    }
+
+    bot.text("/start").await;
+    bot.assert_screen_contains("📋 Задачи · 12");
+    bot.assert_screen_contains("🛒 Покупки · 7");
+    assert!(
+        !bot.screen().contains("Списки:"),
+        "the lists line must be gone:\n{}",
+        bot.screen()
+    );
+    bot.assert_screen_contains("Напишите название задачи");
+    assert!(
+        !bot.screen().contains("я разберу"),
+        "without LLM the hint must not promise parsing:\n{}",
+        bot.screen()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn menu_hint_promises_parsing_when_llm_capture_is_enabled() {
+    let db = db().await;
+    let bot = onboarded_with_llm(&db.pool, "Alice").await;
+    bot.assert_screen_contains("Напишите задачу или покупку — я разберу.");
+    assert!(
+        !bot.screen().contains("открою форму"),
+        "with LLM the hint must not promise a form:\n{}",
+        bot.screen()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn menu_and_mine_screen_use_the_same_assigned_counter() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    for n in 0..60 {
+        let mut item = new_item(household.tasks_list_id, &format!("Моя {n}"));
+        item.assignee_user_id = Some(household.owner_id);
+        create_item(&db.pool, &household, household.tasks_list_id, &actor, item).await;
+    }
+
+    bot.text("/start").await;
+    bot.assert_screen_contains("👤 Мои задачи · 60");
+    bot.press("Мои задачи").await;
+    bot.assert_screen_contains("Мои задачи · 60");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn menu_today_counter_uses_the_users_day_boundary() {
+    let db = db().await;
+    let vladivostok = chrono_tz::Tz::Asia__Vladivostok;
+    // Полночь во Владивостоке уже наступила, а в UTC ещё 15 марта.
+    let now = local_utc(
+        vladivostok,
+        NaiveDate::from_ymd_opt(2027, 3, 16).expect("date"),
+        1,
+        0,
+    );
+    let today = NaiveDate::from_ymd_opt(2027, 3, 16).expect("date");
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    sqlx::query("UPDATE users SET timezone = 'Asia/Vladivostok' WHERE telegram_user_id = $1")
+        .bind(bot.chat)
+        .execute(&db.pool)
+        .await
+        .expect("timezone");
+
+    let mut later_today = new_item(household.tasks_list_id, "Сегодня позже");
+    later_today.due_at = Some(local_utc(vladivostok, today, 2, 0));
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        later_today,
+    )
+    .await;
+    let mut today_without_time = new_item(household.tasks_list_id, "Сегодня без времени");
+    today_without_time.due_date = Some(today);
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        today_without_time,
+    )
+    .await;
+    let mut yesterday = new_item(household.tasks_list_id, "Вчера");
+    yesterday.due_date = NaiveDate::from_ymd_opt(2027, 3, 15);
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        yesterday,
+    )
+    .await;
+    let mut tomorrow = new_item(household.tasks_list_id, "Завтра");
+    tomorrow.due_date = NaiveDate::from_ymd_opt(2027, 3, 17);
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        tomorrow,
+    )
+    .await;
+
+    bot.text("/start").await;
+    bot.assert_screen_contains("Просрочено: <b>1</b>");
+    bot.assert_screen_contains("На сегодня: <b>2</b>");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -329,33 +1465,166 @@ async fn settings_profile_timezone_and_notifications() {
     let mut bot = onboarded_named(&db.pool, "Alice").await;
 
     bot.press("Настройки").await;
+    bot.assert_screen_contains("👤 Alice");
     bot.assert_screen_contains("Часовой пояс: Europe/Moscow");
-    bot.assert_screen_contains("Напоминания: вкл, за 15 минут");
+    bot.assert_screen_contains("Роль: владелец");
+    bot.assert_has_button("Профиль");
+    bot.assert_has_button("Уведомления");
+    bot.assert_has_button("Опасное");
     bot.assert_has_button("Семья");
     bot.assert_has_button("Журнал");
+    assert!(bot.find_button("Удалить пространство").is_none());
+    assert!(bot.find_button("Выйти").is_none());
+    assert!(!bot.screen().contains("Напоминания:"));
+    assert!(!bot.screen().contains("Тихие часы:"));
 
-    bot.press("Время").await;
+    // Профиль показывает имя и пояс; выбор пояса возвращает в профиль.
+    bot.press("Профиль").await;
+    bot.assert_screen_contains("👤 Alice");
+    bot.assert_screen_contains("Часовой пояс: Europe/Moscow");
+    bot.press("Часовой пояс").await;
+    bot.assert_screen_contains("Настройки › Профиль › Часовой пояс");
     bot.press("Asia/Yekaterinburg").await;
     bot.assert_screen_contains("Часовой пояс: Asia/Yekaterinburg");
+    bot.assert_screen_contains("Настройки › Профиль");
 
+    // Сохранение имени возвращает в профиль с новым именем.
     bot.press("Имя").await;
     bot.text("Алиса").await;
-    bot.assert_screen_contains("Профиль: Алиса");
+    bot.assert_screen_contains("Алиса");
 
-    bot.press("Уведомления").await;
-    bot.press("Напоминания").await;
-    bot.assert_screen_contains("Напоминания: выкл");
-    bot.press("30 мин").await;
+    // Сводок на экране настроек нет: они в разделе уведомлений.
     bot.press("Назад").await;
-    bot.assert_screen_contains("Напоминания: выкл, за 30 минут");
+    bot.assert_screen_contains("Настройки");
+    bot.press("Уведомления").await;
+    bot.assert_screen_contains("🔔 Напоминания: за 15 мин");
+
+    // Выключенные напоминания скрывают уточняющие кнопки.
+    bot.press_after("🔔 Напоминания", "Выкл").await;
+    bot.assert_screen_contains("🔔 Напоминания: выкл");
+    assert!(bot.find_button("⏱ За").is_none());
+    assert!(bot.find_button("без времени").is_none());
+
+    // Выбор срока на отдельном экране возвращает на уведомления.
+    bot.press_after("🔔 Напоминания", "Вкл").await;
+    bot.press("⏱ За 15 мин").await;
+    bot.assert_screen_contains("Настройки › Уведомления › За сколько напоминать?");
+    bot.press("30 мин").await;
+    bot.assert_screen_contains("🔔 Напоминания: за 30 мин");
 
     // Своё значение вне диапазона отклоняется, форма остаётся открытой.
-    bot.press("Уведомления").await;
+    bot.press("⏱ За 30 мин").await;
     bot.press("Своё").await;
     bot.text("2").await;
     bot.assert_screen_contains("от 5 минут");
     bot.text("45").await;
-    bot.assert_screen_contains("45");
+    bot.assert_screen_contains("Напоминания: за 45 мин");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dangerous_action_is_not_on_the_settings_screen() {
+    let db = db().await;
+    let mut owner = onboarded_named(&db.pool, "Алексей").await;
+    let mut maria = invite(&mut owner, &db.pool, "Мария").await;
+    let household = household_for(&db.pool, owner.chat).await;
+
+    // Владелец: удаления нет на настройках, но оно есть на «Опасном».
+    owner.press("Настройки").await;
+    assert!(owner.find_button("Удалить пространство").is_none());
+    owner.press("Опасное").await;
+    owner.assert_screen_contains("⚠️ Опасное");
+    owner.assert_has_button("Удалить пространство");
+    owner.press("Удалить пространство").await;
+    owner.assert_screen_contains("Для подтверждения отправьте название");
+    owner.press("Отмена").await;
+    owner.assert_screen_contains("⚠️ Опасное");
+
+    // Участник: на «Опасном» только выход.
+    maria.press("Настройки").await;
+    maria.press("Опасное").await;
+    maria.assert_has_button("Выйти");
+    assert!(maria.find_button("Удалить пространство").is_none());
+
+    // Прямое нажатие удаления по валидному токену отклоняется.
+    let (message_id, _) = maria.active();
+    let data = action_callback(
+        &db.pool,
+        maria.chat,
+        household.household_id,
+        Action::HouseholdDeleteStart,
+    )
+    .await;
+    maria.press_data(&data, message_id).await;
+    let toast = maria
+        .fake
+        .answers()
+        .into_iter()
+        .next_back()
+        .and_then(|(_, text, _)| text);
+    assert_eq!(toast.as_deref(), Some("Это доступно только владельцу."));
+    assert!(
+        !maria
+            .screen()
+            .contains("Для подтверждения отправьте название")
+    );
+
+    maria.press("Выйти").await;
+    maria.assert_screen_contains("Выйти из пространства?");
+    maria.press("Назад").await;
+    maria.assert_screen_contains("⚠️ Опасное");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quiet_hours_can_be_switched_and_hide_boundaries_when_off() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+
+    bot.press("Настройки").await;
+    bot.press("Уведомления").await;
+    bot.assert_screen_contains("🌙 Тихие часы: 22:00–08:00");
+    bot.assert_has_button("Начало тихих: 22:00");
+    bot.assert_has_button("Конец тихих: 08:00");
+
+    bot.press_after("🌙 Тихие часы", "Выкл").await;
+    bot.assert_screen_contains("🌙 Тихие часы: выкл");
+    assert!(bot.find_button("Начало тихих").is_none());
+    assert!(bot.find_button("Конец тихих").is_none());
+    let screen = bot.screen();
+    let quiet = &screen[screen.find("🌙 Тихие часы").expect("quiet block")..];
+    assert!(
+        support::telegram::buttons(quiet)
+            .iter()
+            .any(|(label, _)| label == "Вкл"),
+        "the quiet-hours block must offer «Вкл»:\n{screen}"
+    );
+
+    bot.press_after("🌙 Тихие часы", "Вкл").await;
+    bot.assert_screen_contains("🌙 Тихие часы: 22:00–08:00");
+    bot.assert_has_button("Начало тихих: 22:00");
+    bot.assert_has_button("Конец тихих: 08:00");
+    let screen = bot.screen();
+    let quiet = &screen[screen.find("🌙 Тихие часы").expect("quiet block")..];
+    assert!(
+        support::telegram::buttons(quiet)
+            .iter()
+            .any(|(label, _)| label == "Выкл"),
+        "the toggle must name the action:\n{screen}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reminder_for_tasks_without_due_time_has_a_clear_label() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+
+    bot.press("Настройки").await;
+    bot.press("Уведомления").await;
+    bot.assert_has_button("без времени — в 09:00");
+    assert!(!bot.screen().contains("Вседневн"));
+
+    bot.press("без времени").await;
+    bot.assert_screen_contains("задачах без времени");
+    assert!(!bot.screen().contains("Вседневн"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -364,10 +1633,11 @@ async fn settings_edit_notification_times_and_reject_invalid_values() {
     let mut bot = onboarded_named(&db.pool, "Alice").await;
 
     bot.press("Настройки").await;
-    bot.assert_screen_contains("Вседневное: 09:00");
+    assert!(!bot.screen().contains("Тихие часы:"));
     bot.press("Уведомления").await;
+    bot.assert_screen_contains("🌅 Утренняя сводка: 08:30");
     bot.assert_has_button("Время сводки: 08:30");
-    bot.assert_has_button("Вседневные: 09:00");
+    bot.assert_has_button("без времени — в 09:00");
     bot.assert_has_button("Начало тихих: 22:00");
     bot.assert_has_button("Конец тихих: 08:00");
 
@@ -381,16 +1651,17 @@ async fn settings_edit_notification_times_and_reject_invalid_values() {
         assert_eq!(settings.digest_time, "08:30", "{bad}");
     }
     bot.text("07:45").await;
-    bot.assert_screen_contains("Время сводки: 07:45");
+    bot.assert_screen_contains("🌅 Утренняя сводка: 07:45");
     assert_eq!(
         notification_settings(&db.pool, bot.chat).await.digest_time,
         "07:45"
     );
 
-    // Время вседневного напоминания.
-    bot.press("Вседневные").await;
+    // Время напоминания о задачах без срока.
+    bot.press("без времени").await;
+    bot.assert_screen_contains("задачах без времени");
     bot.text("10:15").await;
-    bot.assert_screen_contains("Вседневные: 10:15");
+    bot.assert_screen_contains("без времени — в 10:15");
     assert_eq!(
         notification_settings(&db.pool, bot.chat).await.all_day_time,
         "10:15"
@@ -399,7 +1670,7 @@ async fn settings_edit_notification_times_and_reject_invalid_values() {
     // Начало и конец тихих часов не могут совпадать; прежний конец остаётся.
     bot.press("Начало тихих").await;
     bot.text("23:00").await;
-    bot.assert_screen_contains("Начало тихих: 23:00");
+    bot.assert_has_button("Начало тихих: 23:00");
     bot.press("Конец тихих").await;
     bot.text("23:00").await;
     bot.assert_screen_contains("не должны совпадать");
@@ -408,7 +1679,7 @@ async fn settings_edit_notification_times_and_reject_invalid_values() {
     assert_eq!(settings.quiet_end, "08:00");
 
     bot.press("Отмена").await;
-    bot.assert_screen_contains("Конец тихих: 08:00");
+    bot.assert_has_button("Конец тихих: 08:00");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -450,13 +1721,13 @@ async fn notification_time_changes_apply_on_the_next_scheduler_tick() {
 
     // Выключаем сводку и меняем время вседневного напоминания тем же
     // экземпляром планировщика — перезапуск не нужен.
-    bot.press("Сводка").await;
+    bot.press_after("🌅 Утренняя сводка", "Выкл").await;
     assert!(
         !notification_settings(&db.pool, bot.chat)
             .await
             .digest_enabled
     );
-    bot.press("Вседневные").await;
+    bot.press("без времени").await;
     bot.text("14:00").await;
 
     let due_date = day + Duration::days(1);
@@ -513,7 +1784,10 @@ async fn bot_answers_user_actions_during_quiet_hours() {
 
     bot.press("Настройки").await;
     bot.assert_screen_contains("Настройки");
-    bot.assert_screen_contains("Тихие часы: 22:00–08:00");
+    assert!(
+        !bot.screen().contains("Тихие часы:"),
+        "the quiet hours summary is on the notifications screen now"
+    );
     assert!(
         !bot.fake.calls().is_empty(),
         "бот должен ответить ночью сразу, не дожидаясь конца тихих часов"
@@ -527,7 +1801,8 @@ async fn bot_answers_user_actions_during_quiet_hours() {
     assert_eq!(deliveries, 0);
 
     bot.press("Уведомления").await;
-    bot.assert_screen_contains("Начало тихих: 22:00");
+    bot.assert_screen_contains("🌙 Тихие часы: 22:00–08:00");
+    bot.assert_has_button("Начало тихих: 22:00");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -601,6 +1876,7 @@ async fn owner_manages_family_and_journal_hides_secrets() {
     member.press("Настройки").await;
     assert!(member.find_button("Семья").is_none());
     assert!(member.find_button("Журнал").is_none());
+    member.press("Опасное").await;
     member.assert_has_button("Выйти");
 
     // Журнал владельца: событие присоединения без кода и хешей.
@@ -651,7 +1927,7 @@ async fn invites_can_be_revoked_and_are_single_use() {
         .collect();
     owner.assert_screen_contains("Действует 72 часа");
 
-    owner.press("Все приглашения").await;
+    owner.press("Назад").await;
     owner.assert_screen_contains("Активных: 1 из 5");
     owner.press("Отозвать").await;
     owner.assert_screen_contains("Активных приглашений нет");
@@ -672,7 +1948,7 @@ async fn sixth_invite_within_an_hour_is_refused_with_retry_time() {
 
     for _ in 0..5 {
         owner.press("Создать приглашение").await;
-        owner.press("Все приглашения").await;
+        owner.press("Назад").await;
     }
     owner.press("Создать приглашение").await;
 
@@ -698,6 +1974,7 @@ async fn removal_leaving_and_transfer_notify_participants() {
 
     // Участник выходит сам.
     boris.press("Настройки").await;
+    boris.press("Опасное").await;
     boris.press("Выйти").await;
     boris.assert_screen_contains("Выйти из пространства?");
     boris.press("Да, выйти").await;
@@ -759,8 +2036,10 @@ async fn ownership_transfer_changes_available_sections() {
             .any(|(_, text, _)| text.as_deref() == Some("Владение передано"))
     );
 
-    owner.assert_has_button("Выйти");
+    owner.assert_screen_contains("Настройки");
     assert!(owner.find_button("Семья").is_none());
+    owner.press("Опасное").await;
+    owner.assert_has_button("Выйти");
     maria.deliver().await;
     let notice = maria
         .fake
@@ -779,6 +2058,7 @@ async fn household_deletion_requires_typing_its_name() {
     let mut maria = invite(&mut owner, &db.pool, "Мария").await;
 
     owner.press("Настройки").await;
+    owner.press("Опасное").await;
     owner.press("Удалить пространство").await;
     owner.assert_screen_contains("Для подтверждения отправьте название");
     owner.text("Не то").await;
@@ -962,7 +2242,7 @@ async fn notification_actions_are_idempotent() {
             .expect("button")
             .1
     };
-    let done = button_of("Готово");
+    let done = button_of("Выполнено");
 
     // Отложить: исходное сообщение обновляется, а доставку создаёт планировщик.
     let snooze = button_of("на час");
@@ -978,7 +2258,7 @@ async fn notification_actions_are_idempotent() {
     .expect("snooze deliveries");
     assert_eq!(scheduled, 1);
 
-    // «Готово» выполняется один раз; повторное нажатие ничего не делает.
+    // «Выполнено» выполняется один раз; повторное нажатие ничего не делает.
     bot.press_data(&done, notice_id).await;
     bot.assert_latest_contains("✅ Выполнено: Оплатить интернет");
     let status: String = sqlx::query_scalar("SELECT status::text FROM items WHERE id = $1")
@@ -1688,6 +2968,8 @@ async fn member_cannot_undo_an_item_deleted_by_the_owner() {
             back: Screen::List {
                 list_id: household.tasks_list_id,
                 page: 0,
+                edit: false,
+                from_lists: false,
             },
         },
     )
@@ -2053,6 +3335,7 @@ async fn stale_saved_button_is_rejected_but_the_expire_row_survives() {
     owner.press("Мария").await;
     owner.press("Передать владение").await;
     owner.press("Да, передать").await;
+    owner.press("Опасное").await;
     owner.press("Выйти").await;
     owner.press("Да, выйти").await;
 
@@ -2097,5 +3380,507 @@ async fn stale_saved_button_is_rejected_but_the_expire_row_survives() {
     assert_eq!(
         expire_status, "pending",
         "the scheduled auto-delete must survive a rejected button"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn action_labels_do_not_say_gotovo() {
+    use tasklerq::storage::repositories::notifications::NotificationKind;
+    use tasklerq::telegram::bot::notify::{self, BatchEntry, BatchEntryState};
+
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let task = create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, "Оплатить интернет"),
+    )
+    .await;
+    create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        new_item(household.shopping_list_id, "Молоко"),
+    )
+    .await;
+
+    let mut screens: Vec<Vec<(String, String)>> = Vec::new();
+
+    // Карточка задачи.
+    bot.press("Задачи").await;
+    bot.press("Оплатить интернет").await;
+    let card = support::telegram::buttons(&bot.screen());
+    assert!(
+        card.iter().any(|(label, _)| label == "✓ Выполнено"),
+        "{card:?}"
+    );
+    screens.push(card);
+    bot.press("Назад").await;
+    bot.press("Назад").await;
+
+    // Карточка покупки: режим правки открывает её из строки.
+    bot.press("Покупки").await;
+    bot.press("Править").await;
+    bot.press("Молоко").await;
+    let purchase = support::telegram::buttons(&bot.screen());
+    assert!(
+        purchase.iter().any(|(label, _)| label == "✓ Куплено"),
+        "{purchase:?}"
+    );
+    screens.push(purchase);
+    bot.press("Назад").await;
+    bot.press("Назад").await;
+
+    // Выбор тегов в форме создания.
+    bot.press("Добавить").await;
+    bot.press("Задачу").await;
+    bot.text("Новая задача").await;
+    bot.press("Без срока").await;
+    bot.press("Обычный").await;
+    bot.press("Без исполнителя").await;
+    let tags = support::telegram::buttons(&bot.screen());
+    assert!(
+        tags.iter().any(|(label, _)| label == "Применить"),
+        "{tags:?}"
+    );
+    screens.push(tags);
+    bot.press("Отмена").await;
+
+    // Выбор тегов в форме правки.
+    bot.press("Задачи").await;
+    bot.press("Оплатить интернет").await;
+    bot.press("Теги").await;
+    let edit_tags = support::telegram::buttons(&bot.screen());
+    assert!(
+        edit_tags.iter().any(|(label, _)| label == "Применить"),
+        "{edit_tags:?}"
+    );
+    screens.push(edit_tags);
+    bot.press("Применить").await;
+
+    // Уведомление о задаче и сводное уведомление.
+    let list = tasklerq::storage::repositories::lists::get(
+        &mut db.pool.acquire().await.expect("conn"),
+        household.household_id,
+        household.tasks_list_id,
+    )
+    .await
+    .expect("list");
+    let tz: chrono_tz::Tz = "Europe/Moscow".parse().expect("tz");
+    let reminder = notify::reminder_ui(&task, &list, tz, bot.now, Some(15));
+    let batch = notify::batch_ui(
+        Uuid::now_v7(),
+        0,
+        &[BatchEntry {
+            item_id: task.id,
+            kind: NotificationKind::Reminder,
+            title: task.title.clone(),
+            when: "Сегодня · Задачи".to_owned(),
+            version: task.version,
+            state: BatchEntryState::Open,
+        }],
+        1,
+        None,
+        tz,
+    );
+    {
+        let mut conn = db.pool.acquire().await.expect("conn");
+        for ui in [&reminder, &batch] {
+            let html =
+                notify::render_notice(&mut conn, bot.chat, household.household_id, ui, bot.now)
+                    .await
+                    .expect("render notice");
+            screens.push(support::telegram::buttons(&html));
+        }
+    }
+
+    // Приветствие после создания пространства.
+    let mut fresh = Harness::new(&db.pool, next_telegram_id()).named("Bob");
+    fresh.text("/start").await;
+    fresh.text("Дом").await;
+    fresh.press("Москва").await;
+    fresh.assert_screen_contains("Пространство создано");
+    screens.push(support::telegram::buttons(&fresh.screen()));
+
+    for labels in &screens {
+        assert!(
+            !labels.iter().any(|(label, _)| label.contains("Готово")),
+            "a button still says «Готово»: {labels:?}"
+        );
+    }
+}
+
+fn assert_navigation(bot: &Harness, expect_back: bool) {
+    let labels: Vec<String> = support::telegram::buttons(&bot.screen())
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect();
+    assert!(
+        !labels
+            .iter()
+            .any(|label| label.contains("В меню") || label.contains("К списку")),
+        "a legacy navigation label is still shown: {labels:?}\n{}",
+        bot.screen()
+    );
+    if expect_back {
+        assert!(
+            labels.iter().any(|label| label == "⬅️ Назад"),
+            "no «⬅️ Назад» on screen: {labels:?}\n{}",
+            bot.screen()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_from_menu_has_back_to_menu_and_no_home() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+
+    bot.press("Задачи").await;
+    bot.assert_screen_contains("Задачи · 0");
+    let labels: Vec<String> = support::telegram::buttons(&bot.screen())
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect();
+    assert!(labels.iter().any(|label| label == "⬅️ Назад"), "{labels:?}");
+    assert!(!labels.iter().any(|label| label == "🏠 Меню"), "{labels:?}");
+
+    bot.press("Назад").await;
+    bot.assert_screen_contains("📋 Задачи · 0");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn card_from_list_starts_with_the_list_trail_and_has_home() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, "Оплатить интернет"),
+    )
+    .await;
+
+    bot.press("Задачи").await;
+    bot.press("Оплатить интернет").await;
+
+    assert!(
+        bot.screen().contains("<h3>Задачи › Оплатить интернет</h3>"),
+        "card heading must show the list trail:\n{}",
+        bot.screen()
+    );
+    let labels: Vec<String> = support::telegram::buttons(&bot.screen())
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect();
+    assert!(labels.iter().any(|label| label == "⬅️ Назад"), "{labels:?}");
+    assert!(labels.iter().any(|label| label == "🏠 Меню"), "{labels:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn long_card_title_stays_visible_below_the_clipped_trail() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let title = "Очень длинное название задачи, которое не помещается в хлебные крошки";
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, title),
+    )
+    .await;
+
+    bot.press("Задачи").await;
+    bot.press("Очень длинное").await;
+    let screen = bot.screen();
+    assert!(
+        screen.contains("<h3>Задачи › Очень длинное"),
+        "the card must start with its trail:\n{screen}"
+    );
+    assert!(
+        screen.contains(title),
+        "the full title must remain visible below the trail:\n{screen}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn long_task_title_is_fully_visible_in_delete_confirmation() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let title = "Очень длинное название задачи, которое точно не помещается в хлебные крошки";
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, title),
+    )
+    .await;
+
+    bot.press("Задачи").await;
+    bot.press("Очень длинное").await;
+    bot.press("Удалить").await;
+
+    let question = format!("Удалить «{title}»?");
+    let screen = bot.screen();
+    assert!(
+        screen.contains(&question),
+        "the delete confirmation must keep the full title:\n{screen}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_from_all_lists_returns_to_all_lists() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, "Оплатить интернет"),
+    )
+    .await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+    lists::create(
+        &mut conn,
+        household.household_id,
+        ListKind::Checklist,
+        "Дача",
+        Utc::now(),
+    )
+    .await
+    .expect("extra list");
+    drop(conn);
+
+    // Перерисовать меню: третий список включает «🗂 Все списки».
+    bot.text("/start").await;
+    bot.press("Все списки").await;
+    bot.assert_screen_contains("<h3>Все списки</h3>");
+
+    bot.press("Задачи").await;
+    assert!(
+        bot.screen().contains("<h3>Все списки › Задачи · 1</h3>"),
+        "a list opened from «Все списки» must keep that parent in its trail:\n{}",
+        bot.screen()
+    );
+
+    // Карточка из такого списка возвращается в него с тем же признаком.
+    bot.press("Оплатить интернет").await;
+    bot.assert_screen_contains("Все списки › Задачи › Оплатить интернет");
+    bot.press("Назад").await;
+    assert!(
+        bot.screen().contains("<h3>Все списки › Задачи · 1</h3>"),
+        "the card must return to the list opened from «Все списки»:\n{}",
+        bot.screen()
+    );
+
+    bot.press("Назад").await;
+    bot.assert_screen_contains("<h3>Все списки</h3>");
+
+    // Список из меню по-прежнему возвращает в меню.
+    bot.press("Назад").await;
+    bot.press("Задачи").await;
+    assert!(
+        bot.screen().contains("<h3>Задачи · 1</h3>"),
+        "a list opened from the menu must not claim «Все списки» as parent:\n{}",
+        bot.screen()
+    );
+    bot.press("Назад").await;
+    bot.assert_screen_contains("📋 Задачи · 1");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_screen_has_back_and_no_legacy_return_labels() {
+    let db = db().await;
+    let mut owner = onboarded_named(&db.pool, "Алексей").await;
+    let mut member = invite(&mut owner, &db.pool, "Мария").await;
+    let household = household_for(&db.pool, owner.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, "Оплатить интернет"),
+    )
+    .await;
+    for n in 0..6 {
+        let item = create_item(
+            &db.pool,
+            &household,
+            household.shopping_list_id,
+            &actor,
+            new_item(household.shopping_list_id, &format!("Товар {n}")),
+        )
+        .await;
+        sqlx::query("UPDATE items SET status = 'done', completed_at = now() WHERE id = $1")
+            .bind(item.id)
+            .execute(&db.pool)
+            .await
+            .expect("done");
+    }
+    let _token = cli_token(&db.pool, household.household_id, "Home Assistant").await;
+
+    // Меню — единственный экран без «Назад».
+    assert_navigation(&owner, false);
+
+    owner.press("Задачи").await;
+    assert_navigation(&owner, true);
+    owner.press("Оплатить интернет").await;
+    assert_navigation(&owner, true);
+    owner.press("Удалить").await;
+    assert_navigation(&owner, true);
+    owner.press("Назад").await; // карточка
+    owner.press("Назад").await; // список
+    owner.press("Назад").await; // меню
+
+    owner.press("Мои задачи").await;
+    assert_navigation(&owner, true);
+    owner.press("Назад").await;
+
+    owner.press("Поиск").await;
+    owner.text("Оплатить").await;
+    assert_navigation(&owner, true);
+    owner.press("Назад").await;
+
+    owner.press("Покупки").await;
+    assert_navigation(&owner, true);
+    owner.press("Очистить").await;
+    assert_navigation(&owner, true);
+    owner.press("Назад").await; // список
+    owner.press("Назад").await; // меню
+
+    owner.press("Настройки").await;
+    assert_navigation(&owner, true);
+    for label in ["Уведомления", "Профиль", "Опасное", "Журнал", "Интеграции"]
+    {
+        owner.press(label).await;
+        assert_navigation(&owner, true);
+        owner.press("Назад").await;
+        owner.assert_screen_contains("Настройки");
+    }
+
+    // Часовой пояс — ребёнок профиля, возврат после выбора ведёт в профиль.
+    owner.press("Профиль").await;
+    owner.press("Часовой пояс").await;
+    assert_navigation(&owner, true);
+    owner.assert_screen_contains("Настройки › Профиль › Часовой пояс");
+    owner.press("Назад").await;
+    owner.assert_screen_contains("Настройки › Профиль");
+    owner.press("Назад").await;
+    owner.assert_screen_contains("Настройки");
+
+    // Время напоминания — ребёнок экрана уведомлений.
+    owner.press("Уведомления").await;
+    owner.press("⏱ За 15 мин").await;
+    assert_navigation(&owner, true);
+    owner.assert_screen_contains("Настройки › Уведомления › За сколько напоминать?");
+    owner.press("Назад").await;
+    owner.assert_screen_contains("Уведомления");
+    owner.press("Назад").await;
+    owner.assert_screen_contains("Настройки");
+
+    // Опасное действие ведёт в форму подтверждения, отмена возвращает назад.
+    owner.press("Опасное").await;
+    owner.press("Удалить пространство").await;
+    owner.assert_screen_contains("Для подтверждения отправьте название");
+    owner.assert_has_button("Отмена");
+    owner.press("Отмена").await;
+    owner.assert_screen_contains("⚠️ Опасное");
+    owner.press("Назад").await;
+    owner.assert_screen_contains("Настройки");
+
+    owner.press("Семья").await;
+    assert_navigation(&owner, true);
+    owner.press("Пригласить").await;
+    assert_navigation(&owner, true);
+    owner.press("Создать приглашение").await;
+    assert_navigation(&owner, true);
+    owner.press("Назад").await; // приглашения
+    assert_navigation(&owner, true);
+    owner.press("Назад").await; // семья
+    owner.assert_screen_contains("Семья");
+
+    owner.press("Мария").await;
+    assert_navigation(&owner, true);
+    owner.press("Удалить").await;
+    assert_navigation(&owner, true);
+    owner.press("Назад").await; // карточка участника
+    owner.press("Передать владение").await;
+    assert_navigation(&owner, true);
+    owner.press("Назад").await; // карточка участника
+    owner.press("Назад").await; // семья
+    owner.press("Назад").await; // настройки
+    owner.press("Назад").await; // меню
+
+    owner.press("Настройки").await;
+    owner.press("Интеграции").await;
+    owner.press("Отозвать").await;
+    assert_navigation(&owner, true);
+    assert!(
+        owner
+            .screen()
+            .contains("Настройки › Интеграции › Отозвать токен"),
+        "the token confirm screen must show its trail:\n{}",
+        owner.screen()
+    );
+
+    // Участнику доступен только выход; у подтверждения тоже есть навигация.
+    member.press("Настройки").await;
+    assert_navigation(&member, true);
+    member.press("Опасное").await;
+    assert_navigation(&member, true);
+    member.press("Выйти").await;
+    assert_navigation(&member, true);
+    member.press("Назад").await; // опасное
+    assert_navigation(&member, true);
+    member.press("Назад").await; // настройки
+    member.assert_screen_contains("Настройки");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn long_member_name_keeps_the_full_confirmation_question() {
+    let db = db().await;
+    let mut owner = onboarded_named(&db.pool, "Алексей").await;
+    let maria = invite(&mut owner, &db.pool, "Мария").await;
+    let long_name = "Александра-Екатерина";
+    sqlx::query("UPDATE users SET display_name = $1 WHERE telegram_user_id = $2")
+        .bind(long_name)
+        .bind(maria.chat)
+        .execute(&db.pool)
+        .await
+        .expect("long member name");
+
+    owner.press("Настройки").await;
+    owner.press("Семья").await;
+    owner.press("Александра").await;
+    owner.press("Передать владение").await;
+
+    let question = format!("Передать владение «{long_name}»?");
+    let screen = owner.screen();
+    assert!(
+        screen.contains(&question),
+        "the confirmation must keep the full recipient:\n{screen}"
+    );
+    assert_eq!(
+        screen.matches(&question).count(),
+        1,
+        "the confirmation question must not be duplicated:\n{screen}"
     );
 }

@@ -1,4 +1,4 @@
-//! Экраны уведомлений и действия «Готово» / «Отложить» / «Открыть».
+//! Экраны уведомлений и действия «Выполнено» / «Отложить» / «Открыть».
 //!
 //! Уведомления — отдельные сообщения, а не часть навигационного экрана,
 //! поэтому их кнопки выпускаются с областью `notice` и редактируют своё
@@ -75,7 +75,7 @@ pub fn reminder_ui(
         .text(when_line(item.due_at, item.due_date, &list.name, tz, now))
         .row(vec![
             button(
-                "✓ Готово",
+                ru::DONE_BUTTON,
                 Action::NoticeComplete {
                     item_id: item.id,
                     version: item.version,
@@ -110,7 +110,7 @@ pub fn assignment_ui(item: &Item, list: &List, tz: Tz, now: DateTime<Utc>) -> Ui
         .row(vec![
             button("📋 Открыть", Action::NoticeOpen { item_id: item.id }),
             button(
-                "✓ Готово",
+                ru::DONE_BUTTON,
                 Action::NoticeComplete {
                     item_id: item.id,
                     version: item.version,
@@ -167,17 +167,38 @@ pub fn digest_ui(
     }
     let mut row = Vec::new();
     if let Some(list_id) = tasks_list {
-        row.push(back_button("📋 Задачи", Screen::List { list_id, page: 0 }));
+        row.push(back_button(
+            "📋 Задачи",
+            Screen::List {
+                list_id,
+                page: 0,
+                edit: false,
+                from_lists: false,
+            },
+        ));
     }
     if let Some(list_id) = shopping_list {
-        row.push(back_button("🛒 Покупки", Screen::List { list_id, page: 0 }));
+        row.push(back_button(
+            "🛒 Покупки",
+            Screen::List {
+                list_id,
+                page: 0,
+                edit: false,
+                from_lists: false,
+            },
+        ));
     }
     if total_tasks > MAX_LINES
         && let Some(list_id) = tasks_list
     {
         row.push(back_button(
             "Показать ещё",
-            Screen::List { list_id, page: 0 },
+            Screen::List {
+                list_id,
+                page: 0,
+                edit: false,
+                from_lists: false,
+            },
         ));
     }
     ui.row(row)
@@ -191,7 +212,15 @@ pub fn done_ui(item: &Item, list_id: Uuid, next: Option<&str>) -> Ui {
     }
     ui.row(vec![
         button("↩️ Отменить", Action::NoticeUndo { item_id: item.id }),
-        back_button("📋 К списку", Screen::List { list_id, page: 0 }),
+        back_button(
+            ru::OPEN_LIST_BUTTON,
+            Screen::List {
+                list_id,
+                page: 0,
+                edit: false,
+                from_lists: false,
+            },
+        ),
     ])
 }
 
@@ -257,13 +286,13 @@ async fn show_current(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> Resu
         None => {
             let ui = Ui::new()
                 .heading("Задача больше недоступна")
-                .row(vec![back_button("📋 В меню", Screen::Menu)]);
+                .row(vec![back_button(ru::MENU_BUTTON, Screen::Menu)]);
             edit_notice(ctx, message_id, &ui).await
         }
     }
 }
 
-/// «Готово» из уведомления.
+/// «Выполнено» из уведомления.
 pub async fn complete(
     ctx: &mut Ctx<'_>,
     message_id: i64,
@@ -289,7 +318,7 @@ pub async fn complete(
             } else {
                 None
             };
-            ctx.toast("Готово");
+            ctx.toast(ru::DONE_TOAST);
             let ui = done_ui(&item, item.list_id, next.as_deref());
             edit_notice(ctx, message_id, &ui).await
         }

@@ -114,7 +114,7 @@ pub fn batch_ui(
             )),
             BatchEntryState::Open => {
                 let done = button(
-                    "✓ Готово",
+                    ru::DONE_BUTTON,
                     Action::BatchComplete {
                         batch_id,
                         item_id: entry.item_id,
@@ -179,7 +179,7 @@ pub fn batch_ui(
     }
 
     ui.row(vec![
-        button("✓ Завершить все", Action::BatchCompleteAll { batch_id }),
+        button(ru::DONE_ALL_BUTTON, Action::BatchCompleteAll { batch_id }),
         button(
             "😴 Отложить все на час",
             Action::BatchSnoozeAll { batch_id },
@@ -209,7 +209,7 @@ pub async fn batch_page(
     render_batch(ctx, message_id, batch_id).await
 }
 
-/// «Готово» в блоке сводного сообщения.
+/// «Выполнено» в блоке сводного сообщения.
 pub async fn batch_complete(
     ctx: &mut Ctx<'_>,
     message_id: i64,
@@ -236,7 +236,7 @@ pub async fn batch_complete(
     match result {
         Ok(_) => {
             set_batch_done(ctx, batch_id, item_id).await?;
-            ctx.toast("Готово");
+            ctx.toast(ru::DONE_TOAST);
         }
         Err(DomainError::Database(error)) => return Err(Fail::Infra(error)),
         Err(DomainError::Conflict { .. } | DomainError::NotFound) => {
@@ -298,7 +298,7 @@ pub async fn batch_open(
     }
 }
 
-/// «Завершить все» в сводном сообщении.
+/// «Выполнить все» в сводном сообщении.
 ///
 /// Завершает все ещё открытые задачи, включая блоки, уже отложенные «На час»:
 /// их snooze-доставка становится устаревшей и отменяется планировщиком. Блоки

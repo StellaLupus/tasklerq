@@ -171,12 +171,12 @@ async fn five_deferred_notifications_become_one_message_and_digest_stays_separat
     assert_eq!(block_count(batch, "😴 отложенное"), 1, "{batch}");
     assert_eq!(block_count(batch, "👤 назначение"), 1, "{batch}");
     let labels: Vec<String> = buttons(batch).into_iter().map(|(label, _)| label).collect();
-    assert!(labels.iter().any(|label| label.contains("Завершить все")));
+    assert!(labels.iter().any(|label| label.contains("Выполнить все")));
     for label in [
-        "Готово",
+        "Выполнено",
         "На час",
         "Открыть",
-        "Завершить все",
+        "Выполнить все",
         "Отложить все на час",
     ] {
         assert!(
@@ -236,7 +236,7 @@ async fn one_deferred_notification_is_an_ordinary_message() {
         .into_iter()
         .map(|(label, _)| label)
         .collect();
-    for label in ["Готово", "Отложить на час", "Завтра в 09:00", "Открыть"]
+    for label in ["Выполнено", "Отложить на час", "Завтра в 09:00", "Открыть"]
     {
         assert!(
             labels.iter().any(|item| item.contains(label)),

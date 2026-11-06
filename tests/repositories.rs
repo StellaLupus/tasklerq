@@ -2,11 +2,11 @@
 
 mod support;
 
-use chrono::Utc;
+use chrono::{NaiveDate, TimeZone, Utc};
 use tasklerq::config::TenancyMode;
 use tasklerq::domain::error::DomainError;
 use tasklerq::domain::identity::NewMember;
-use tasklerq::domain::models::{ItemPriority, ItemStatus, ListKind, SubtaskInput};
+use tasklerq::domain::models::{ItemPriority, ItemStatus, ListKind, RecurrenceFreq, SubtaskInput};
 use tasklerq::storage::repositories::households::{self, NewOwner};
 use tasklerq::storage::repositories::{items, lists, tags, users};
 use uuid::Uuid;
@@ -486,4 +486,225 @@ async fn batch_hydration_keeps_tags_and_subtasks_per_item() {
     .expect("search");
     let found: Vec<_> = hits.into_iter().map(|hit| hit.item).collect();
     assert_eq!(summarize(&found), expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn menu_counts_use_local_today_and_completion_events() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let actor = household.owner();
+    let tz = chrono_tz::Tz::Asia__Vladivostok;
+    let now = tz
+        .with_ymd_and_hms(2027, 3, 16, 1, 0, 0)
+        .single()
+        .expect("local now")
+        .with_timezone(&Utc);
+    let today = NaiveDate::from_ymd_opt(2027, 3, 16).expect("today");
+    let yesterday = NaiveDate::from_ymd_opt(2027, 3, 15).expect("yesterday");
+    let tomorrow = NaiveDate::from_ymd_opt(2027, 3, 17).expect("tomorrow");
+
+    let mut later_today = support::new_item(household.tasks_list_id, "Сегодня позже");
+    later_today.due_at = Some(
+        tz.with_ymd_and_hms(2027, 3, 16, 2, 0, 0)
+            .single()
+            .expect("timed due")
+            .with_timezone(&Utc),
+    );
+    support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        later_today,
+    )
+    .await;
+    let mut today_without_time = support::new_item(household.tasks_list_id, "Сегодня без времени");
+    today_without_time.due_date = Some(today);
+    support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        today_without_time,
+    )
+    .await;
+    let mut overdue = support::new_item(household.tasks_list_id, "Вчера");
+    overdue.due_date = Some(yesterday);
+    let overdue = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        overdue,
+    )
+    .await;
+    let mut later = support::new_item(household.tasks_list_id, "Завтра");
+    later.due_date = Some(tomorrow);
+    support::create_item(&db.pool, &household, household.tasks_list_id, &actor, later).await;
+
+    let mut recurring = support::new_item(household.tasks_list_id, "Полить цветы");
+    recurring.due_date = Some(today);
+    recurring.recurrence = Some(tasklerq::domain::models::RecurrenceInput {
+        freq: RecurrenceFreq::Daily,
+        interval: Some(1),
+        byweekday: Vec::new(),
+        until: None,
+        timezone: Some("Asia/Vladivostok".into()),
+        anchor_date: None,
+        month_rule: None,
+    });
+    let recurring = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        recurring,
+    )
+    .await;
+
+    support::create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        support::new_item(household.shopping_list_id, "Молоко"),
+    )
+    .await;
+    let shopping_done = support::create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        support::new_item(household.shopping_list_id, "Хлеб"),
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &actor,
+        overdue.id,
+        Some(overdue.version),
+        "Asia/Vladivostok",
+        now,
+    )
+    .await
+    .expect("complete a task");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &actor,
+        recurring.id,
+        Some(recurring.version),
+        "Asia/Vladivostok",
+        now,
+    )
+    .await
+    .expect("complete a recurring task");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &actor,
+        shopping_done.id,
+        Some(shopping_done.version),
+        "Asia/Vladivostok",
+        now,
+    )
+    .await
+    .expect("complete a shopping item");
+
+    let counts = items::menu_counts(&mut conn, household.household_id, "Asia/Vladivostok", now)
+        .await
+        .expect("menu counts");
+
+    // Открыты: две задачи на сегодня, завтра и повторяющаяся (она осталась
+    // открытой со следующим вхождением).
+    assert_eq!(counts.open_tasks, 4);
+    assert_eq!(counts.overdue_tasks, 0);
+    assert_eq!(counts.due_today_tasks, 2);
+    assert_eq!(counts.open_shopping, 1);
+    assert_eq!(
+        counts.done_today, 2,
+        "only task completion events count, recurring ones too"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_assigned_tasks_counts_only_open_own_tasks_in_visible_task_lists() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let owner = household.owner();
+
+    let mut mine = support::new_item(household.tasks_list_id, "Моя задача");
+    mine.assignee_user_id = Some(household.member_id);
+    support::create_item(&db.pool, &household, household.tasks_list_id, &owner, mine).await;
+
+    let mut done = support::new_item(household.tasks_list_id, "Выполненная");
+    done.assignee_user_id = Some(household.member_id);
+    let done =
+        support::create_item(&db.pool, &household, household.tasks_list_id, &owner, done).await;
+
+    let mut other = support::new_item(household.tasks_list_id, "Чужая");
+    other.assignee_user_id = Some(household.owner_id);
+    support::create_item(&db.pool, &household, household.tasks_list_id, &owner, other).await;
+
+    let mut shopping = support::new_item(household.shopping_list_id, "Покупка");
+    shopping.assignee_user_id = Some(household.member_id);
+    support::create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &owner,
+        shopping,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let archived = lists::create(
+        &mut conn,
+        household.household_id,
+        ListKind::Tasks,
+        "Архив",
+        Utc::now(),
+    )
+    .await
+    .expect("archive list");
+    let mut archived_item = support::new_item(archived.id, "В архиве");
+    archived_item.assignee_user_id = Some(household.member_id);
+    drop(conn);
+
+    support::create_item(&db.pool, &household, archived.id, &owner, archived_item).await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &owner,
+        done.id,
+        Some(done.version),
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("complete an assigned task");
+    lists::update(
+        &mut conn,
+        household.household_id,
+        archived.id,
+        None,
+        Some(true),
+        true,
+        Utc::now(),
+    )
+    .await
+    .expect("archive the list");
+
+    let count = items::open_assigned_tasks(&mut conn, household.household_id, household.member_id)
+        .await
+        .expect("assigned count");
+    assert_eq!(
+        count, 1,
+        "only the open own task in a visible tasks list counts"
+    );
 }

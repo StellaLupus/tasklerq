@@ -15,7 +15,7 @@ use crate::telegram::bot::model::{
     Action, Choice, EditForm, Form, FormAct, ItemDraft, ItemForm, Screen, Step, TimeField, Ui,
 };
 use crate::telegram::bot::onboarding;
-use crate::telegram::bot::screens::{back_button, clip};
+use crate::telegram::bot::screens::{clip, nav_row};
 use crate::telegram::bot::{Ctx, Fail, into_sqlx};
 
 // ---------------------------------------------------------------------
@@ -64,7 +64,7 @@ pub async fn view(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
         return Ok(Ui::new()
             .heading("Форма устарела")
             .text("Начнём заново?")
-            .row(vec![back_button("В меню", to)]));
+            .row(nav_row(&Screen::Form, to)));
     };
 
     match form {
@@ -103,7 +103,7 @@ pub async fn view(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
 fn time_title(field: TimeField) -> &'static str {
     match field {
         TimeField::Digest => "Во сколько присылать сводку?",
-        TimeField::AllDay => "Во сколько напоминать о вседневных задачах?",
+        TimeField::AllDay => "Во сколько напоминать о задачах без времени?",
         TimeField::QuietStart => "Когда начинаются тихие часы?",
         TimeField::QuietEnd => "Когда заканчиваются тихие часы?",
     }
@@ -269,7 +269,7 @@ async fn create_view(ctx: &mut Ctx<'_>, form: ItemForm) -> Result<Ui, Fail> {
             Ok(
                 if matches!(step, Step::Tags | Step::Subtasks | Step::Weekdays) {
                     ui.row(vec![
-                        button("✅ Готово", Action::Form { act: FormAct::Done }),
+                        button(ru::APPLY_BUTTON, Action::Form { act: FormAct::Done }),
                         cancel_button(),
                     ])
                 } else {
@@ -325,9 +325,9 @@ async fn edit_view(ctx: &mut Ctx<'_>, form: EditForm) -> Result<Ui, Fail> {
         step,
         Step::Tags | Step::Subtasks | Step::Weekdays | Step::NewTag | Step::DueText
     ) {
-        "✅ Готово"
+        ru::APPLY_BUTTON
     } else {
-        "⬅️ Назад"
+        ru::BACK_BUTTON
     };
     Ok(ui.row(vec![button(
         done_label,

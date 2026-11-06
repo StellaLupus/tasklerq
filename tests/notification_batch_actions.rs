@@ -26,7 +26,7 @@ async fn done_in_a_block_completes_once_and_repeat_does_not_change_it() {
 
     tick_and_deliver(&mut bot, &db.pool, morning).await;
     let (message_id, html) = bot.latest();
-    let done = button_of(&html, "Готово");
+    let done = button_of(&html, "Выполнено");
     bot.press_data(&done, message_id).await;
     assert_eq!(item_status(&db.pool, first.id).await.0, "done");
     let (_, edited) = bot.latest();
@@ -74,7 +74,7 @@ async fn complete_all_skips_a_task_changed_after_release_and_repeat_changes_noth
     .await
     .expect("external change");
     let (message_id, html) = bot.latest();
-    let complete_all = button_of(&html, "Завершить все");
+    let complete_all = button_of(&html, "Выполнить все");
     bot.press_data(&complete_all, message_id).await;
 
     assert_eq!(item_status(&db.pool, items[0].id).await.0, "done");
@@ -89,7 +89,7 @@ async fn complete_all_skips_a_task_changed_after_release_and_repeat_changes_noth
         item_status(&db.pool, items[1].id).await.1,
         item_status(&db.pool, items[2].id).await.1,
     ];
-    let again = button_of(&edited, "Завершить все");
+    let again = button_of(&edited, "Выполнить все");
     bot.press_data(&again, message_id).await;
     assert_eq!(
         versions,
@@ -182,7 +182,8 @@ async fn snooze_all_waits_for_its_due_time_after_timezone_change() {
     // 09:20 в Москве — 16:20 во Владивостоке: по новым настройкам не тихо.
     bot.advance(at + Duration::minutes(20) - bot.now);
     bot.press("Настройки").await;
-    bot.press("Время").await;
+    bot.press("Профиль").await;
+    bot.press("Часовой пояс").await;
     let sent_before = bot.fake.sent().len();
     bot.press("Asia/Vladivostok").await;
 
@@ -274,7 +275,7 @@ async fn complete_all_finishes_a_snoozed_block_and_cancels_its_snooze() {
     bot.press_data(&snooze, message_id).await;
     let (_, edited) = bot.latest();
     assert!(edited.contains("😴 Напомню в"), "{edited}");
-    // Отложена одна из двух задач; «Завершить все» должен взять и её блок.
+    // Отложена одна из двух задач; «Выполнить все» должен взять и её блок.
     let (snoozed_item, snoozed_at): (Uuid, DateTime<Utc>) = sqlx::query_as(
         "SELECT item_id, scheduled_at FROM notification_deliveries
          WHERE kind = 'snooze' AND status = 'pending'",
@@ -283,7 +284,7 @@ async fn complete_all_finishes_a_snoozed_block_and_cancels_its_snooze() {
     .await
     .expect("snooze delivery");
 
-    let complete_all = button_of(&edited, "Завершить все");
+    let complete_all = button_of(&edited, "Выполнить все");
     bot.press_data(&complete_all, message_id).await;
 
     assert_eq!(item_status(&db.pool, first.id).await.0, "done");
@@ -393,7 +394,7 @@ async fn snooze_all_waits_for_its_due_time_when_quiet_hours_change() {
     bot.advance(later - bot.now);
     open_notifications(&mut bot).await;
     let sent_before = bot.fake.sent().len();
-    bot.press("Тихие часы: вкл").await;
+    bot.press_after("🌙 Тихие часы", "Выкл").await;
 
     assert!(!bot.screen().contains("Накопилось"), "{}", bot.screen());
     assert_eq!(
@@ -439,7 +440,7 @@ async fn deleted_task_in_a_block_shows_that_it_is_gone_and_does_nothing() {
 
     tick_and_deliver(&mut bot, &db.pool, morning).await;
     let (message_id, html) = bot.latest();
-    let done = button_of(&html, "Готово");
+    let done = button_of(&html, "Выполнено");
     let mut conn = db.pool.acquire().await.expect("conn");
     items::soft_delete(
         &mut conn,
@@ -583,7 +584,7 @@ async fn complete_all_moves_a_recurring_task_by_one_occurrence_and_repeat_change
 
     tick_and_deliver(&mut bot, &db.pool, morning).await;
     let (message_id, html) = bot.latest();
-    let complete_all = button_of(&html, "Завершить все");
+    let complete_all = button_of(&html, "Выполнить все");
     bot.press_data(&complete_all, message_id).await;
 
     let (status, version, next_due) = item_status(&db.pool, recurring.id).await;
@@ -597,7 +598,7 @@ async fn complete_all_moves_a_recurring_task_by_one_occurrence_and_repeat_change
     assert_eq!(item_status(&db.pool, plain.id).await.0, "done");
 
     let (_, edited) = bot.latest();
-    let again = button_of(&edited, "Завершить все");
+    let again = button_of(&edited, "Выполнить все");
     bot.press_data(&again, message_id).await;
     assert_eq!(item_status(&db.pool, recurring.id).await.1, version);
     assert_eq!(item_status(&db.pool, recurring.id).await.2, next_due);
@@ -621,7 +622,7 @@ async fn changed_task_block_is_redrawn_and_the_old_version_only_refreshes_it() {
 
     tick_and_deliver(&mut bot, &db.pool, morning).await;
     let (message_id, html) = bot.latest();
-    let done = button_of(&html, "Готово");
+    let done = button_of(&html, "Выполнено");
     let changed_due = due + Duration::hours(2);
     sqlx::query(
         "UPDATE items
@@ -634,7 +635,7 @@ async fn changed_task_block_is_redrawn_and_the_old_version_only_refreshes_it() {
     .await
     .expect("external change");
 
-    // «Готово» по устаревшей версии не завершает, а перерисовывает блок.
+    // «Выполнено» по устаревшей версии не завершает, а перерисовывает блок.
     bot.press_data(&done, message_id).await;
     let (status, version, due_at) = item_status(&db.pool, first.id).await;
     assert_eq!(status, "open");
@@ -652,12 +653,12 @@ async fn changed_task_block_is_redrawn_and_the_old_version_only_refreshes_it() {
     assert_eq!(toast.as_deref(), Some("Задача уже изменилась"));
     let done_buttons: Vec<String> = buttons(&edited)
         .into_iter()
-        .filter(|(label, _)| label.contains("Готово"))
+        .filter(|(label, _)| label.contains("Выполнено"))
         .map(|(_, data)| data)
         .collect();
     assert_eq!(done_buttons.len(), 2, "{edited}");
 
-    // «Готово» по новой версии завершает задачу.
+    // «Выполнено» по новой версии завершает задачу.
     bot.press_data(&done_buttons[0], message_id).await;
     assert_eq!(item_status(&db.pool, first.id).await.0, "done");
     assert_eq!(completed_events(&db.pool, first.id).await, 1);
@@ -680,7 +681,7 @@ async fn archived_list_block_has_its_own_label_and_does_nothing() {
 
     tick_and_deliver(&mut bot, &db.pool, morning).await;
     let (message_id, html) = bot.latest();
-    let done = button_of(&html, "Готово");
+    let done = button_of(&html, "Выполнено");
     sqlx::query("UPDATE lists SET is_default = false, is_archived = true WHERE id = $1")
         .bind(household.tasks_list_id)
         .execute(&db.pool)
@@ -695,7 +696,7 @@ async fn archived_list_block_has_its_own_label_and_does_nothing() {
     assert_eq!(completed_events(&db.pool, first.id).await, 0);
 }
 
-/// После «Завершить все» блоки, по которым действие уже невозможно, не меняются.
+/// После «Выполнить все» блоки, по которым действие уже невозможно, не меняются.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn complete_all_keeps_done_missing_and_archived_blocks_unchanged() {
     let db = support::isolated_db().await;
@@ -755,7 +756,7 @@ async fn complete_all_keeps_done_missing_and_archived_blocks_unchanged() {
         .await
         .expect("archive list");
 
-    let done_button = button_of(&html, "Готово");
+    let done_button = button_of(&html, "Выполнено");
     bot.press_data(&done_button, message_id).await;
     let before = batch_message(&bot, message_id);
     assert!(before.contains("✅ Выполнено"), "{before}");
@@ -764,7 +765,7 @@ async fn complete_all_keeps_done_missing_and_archived_blocks_unchanged() {
     let done_version = item_status(&db.pool, done.id).await.1;
     let archived_version = item_status(&db.pool, archived.id).await.1;
 
-    let complete_all = button_of(&before, "Завершить все");
+    let complete_all = button_of(&before, "Выполнить все");
     bot.press_data(&complete_all, message_id).await;
 
     assert_eq!(item_status(&db.pool, open.id).await.0, "done");
@@ -785,7 +786,7 @@ async fn complete_all_keeps_done_missing_and_archived_blocks_unchanged() {
     assert!(after.contains("Задача удалена"), "{after}");
     assert!(after.contains("Список в архиве"), "{after}");
 
-    let again = button_of(&after, "Завершить все");
+    let again = button_of(&after, "Выполнить все");
     bot.press_data(&again, message_id).await;
     // Кнопки получают новые callback-токены на каждую отрисовку: сравниваем
     // видимую часть сообщения.
@@ -798,7 +799,7 @@ async fn complete_all_keeps_done_missing_and_archived_blocks_unchanged() {
     assert_eq!(
         visible(&batch_message(&bot, message_id)),
         visible(&after),
-        "a repeated «Завершить все» must not change the message"
+        "a repeated «Выполнить все» must not change the message"
     );
 }
 
@@ -839,7 +840,7 @@ async fn assignment_from_an_archived_list_keeps_its_actions_in_a_block() {
     assert!(!html.contains("Список в архиве"), "{html}");
     assert_eq!(block_count(&html, "👤 назначение"), 2, "{html}");
 
-    let done = button_of(&html, "Готово");
+    let done = button_of(&html, "Выполнено");
     bot.press_data(&done, message_id).await;
     assert_eq!(item_status(&db.pool, first.id).await.0, "done");
 

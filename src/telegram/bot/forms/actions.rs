@@ -68,7 +68,7 @@ async fn rename(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
             ctx.user = Some(user);
             clear(ctx).await?;
             ctx.toast("Имя обновлено");
-            ctx.present(Screen::Settings).await
+            ctx.present(Screen::Profile).await
         }
         Err(crate::domain::error::DomainError::Validation(_)) => {
             ctx.banner("Имя — от 1 до 64 символов.");
@@ -310,8 +310,9 @@ pub async fn on_action(ctx: &mut Ctx<'_>, act: FormAct) -> Result<(), Fail> {
             // У остальных форм одна кнопка — отмена.
             clear(ctx).await?;
             let back = match form {
-                Form::Rename | Form::DeleteHousehold | Form::Lead => Screen::Settings,
-                Form::Time { .. } => Screen::Notifications,
+                Form::Rename => Screen::Profile,
+                Form::DeleteHousehold => Screen::Danger,
+                Form::Lead | Form::Time { .. } => Screen::Notifications,
                 _ => Screen::Menu,
             };
             if ctx.user.is_none() {
@@ -349,7 +350,7 @@ async fn create_action(ctx: &mut Ctx<'_>, mut form: ItemForm, act: FormAct) -> R
             match apply_choice(&mut form.draft, choice, today) {
                 Ok(()) => {
                     match step {
-                        // Многошаговые выборы остаются на экране до «Готово».
+                        // Многошаговые выборы остаются на экране до «Применить».
                         Step::Tags | Step::Subtasks | Step::Weekdays => form.error = None,
                         _ => advance(&mut form, step),
                     }
@@ -493,7 +494,15 @@ async fn increase(
     clear(ctx).await?;
     ctx.toast("Количество увеличено");
     match form.list_id {
-        Some(list_id) => ctx.present(Screen::List { list_id, page: 0 }).await,
+        Some(list_id) => {
+            ctx.present(Screen::List {
+                list_id,
+                page: 0,
+                edit: false,
+                from_lists: false,
+            })
+            .await
+        }
         None => ctx.present(Screen::Menu).await,
     }
 }
@@ -560,6 +569,8 @@ async fn save_create(
     ctx.present(Screen::List {
         list_id: list.id,
         page: 0,
+        edit: false,
+        from_lists: false,
     })
     .await
 }

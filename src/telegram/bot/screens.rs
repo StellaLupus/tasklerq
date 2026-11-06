@@ -1,14 +1,14 @@
 //! Сборка экранов: меню, списки, «Мои задачи» и поиск.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use uuid::Uuid;
 
-use crate::domain::models::{Item, ItemPriority, ItemStatus, List, ListKind, User};
+use crate::domain::models::{Item, ItemPriority, ItemStatus, List, ListKind};
 use crate::domain::search::SearchFilters;
-use crate::storage::repositories::{items, lists, users};
+use crate::storage::repositories::{items, lists};
 use crate::telegram::rich::{Span, button};
 use crate::telegram::ru;
 
@@ -26,15 +26,18 @@ pub async fn build(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
         Screen::FirstContact(contact) => Ok(super::onboarding::first_contact(contact)),
         Screen::Add => Ok(add_choice()),
         Screen::Lists => lists_screen(ctx).await,
-        Screen::List { list_id, page } => list(ctx, *list_id, *page).await,
+        Screen::List {
+            list_id,
+            page,
+            edit,
+            from_lists,
+        } => list(ctx, *list_id, *page, *edit, *from_lists).await,
         Screen::Item { item_id, back } => card::view(ctx, *item_id, back).await,
-        Screen::Completed { item_id, back } => card::completed(ctx, *item_id, back).await,
         Screen::Deleted {
             item_id,
             title,
-            shopping,
             back,
-        } => card::deleted(*item_id, title, *shopping, back).await,
+        } => card::deleted(ctx, *item_id, title, back).await,
         Screen::ConfirmDelete { item_id, back } => card::confirm_delete(ctx, *item_id, back).await,
         Screen::Mine { page } => mine(ctx, *page).await,
         Screen::Results {
@@ -42,12 +45,20 @@ pub async fn build(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
             status,
             page,
         } => results(ctx, query, *status, *page).await,
-        Screen::ConfirmClear { list_id } => super::shopping::confirm_clear(ctx, *list_id).await,
-        Screen::Cleared { list_id, item_ids } => {
-            super::shopping::cleared(ctx, *list_id, item_ids).await
-        }
+        Screen::ConfirmClear {
+            list_id,
+            from_lists,
+        } => super::shopping::confirm_clear(ctx, *list_id, *from_lists).await,
+        Screen::Cleared {
+            list_id,
+            item_ids,
+            from_lists,
+        } => super::shopping::cleared(ctx, *list_id, item_ids, *from_lists).await,
         Screen::Settings
+        | Screen::Profile
+        | Screen::Danger
         | Screen::Notifications
+        | Screen::LeadTime
         | Screen::Timezones
         | Screen::Family
         | Screen::Integrations { .. }
@@ -71,6 +82,25 @@ pub fn back_button(label: &str, to: Screen) -> crate::telegram::rich::Button<Act
     go(label, to)
 }
 
+/// Ряд навигации: «⬅️ Назад» на `back`, а глубже двух шагов ещё «🏠 Меню».
+pub fn nav_row(screen: &Screen, back: Screen) -> Vec<crate::telegram::rich::Button<Action>> {
+    let mut buttons = vec![back_button(ru::BACK_BUTTON, back)];
+    if screen.depth() > 2 {
+        buttons.push(back_button(ru::MENU_BUTTON, Screen::Menu));
+    }
+    buttons
+}
+
+/// Куда ведёт «⬅️ Назад» со списка: в «Все списки», если он оттуда открыт,
+/// иначе в меню.
+pub fn list_back(from_lists: bool) -> Screen {
+    if from_lists {
+        Screen::Lists
+    } else {
+        Screen::Menu
+    }
+}
+
 /// Сократить подпись кнопки.
 pub fn clip(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
@@ -91,7 +121,9 @@ fn priority_marker(item: &Item) -> &'static str {
 
 async fn menu(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
     let household = ctx.household()?.clone();
+    let user_id = ctx.user()?.id;
     let counts = items::menu_counts(&mut *ctx.conn, household.id, ctx.tz.name(), ctx.now).await?;
+    let mine_count = items::open_assigned_tasks(&mut *ctx.conn, household.id, user_id).await?;
     let all_lists = lists::list(&mut *ctx.conn, household.id).await?;
     let visible: Vec<&List> = all_lists.iter().filter(|list| !list.is_archived).collect();
     let open = items::open_counts_by_list(&mut *ctx.conn, household.id).await?;
@@ -103,41 +135,59 @@ async fn menu(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
             .or_else(|| visible.iter().find(|list| list.kind == kind))
             .map(|list| list.id)
     };
+    let open_in = |list_id: Option<Uuid>, fallback: i64| {
+        list_id.map_or(fallback, |list_id| open.get(&list_id).copied().unwrap_or(0))
+    };
+    let tasks_list = default_of(ListKind::Tasks);
+    let shopping_list = default_of(ListKind::Shopping);
+    let tasks_count = open_in(tasks_list, counts.open_tasks);
+    let shopping_count = open_in(shopping_list, counts.open_shopping);
 
-    let summary = lists_line(&visible, &open);
+    let hint = if ctx.llm_capture {
+        ru::MENU_HINT
+    } else {
+        ru::MENU_HINT_NO_LLM
+    };
     let mut ui = Ui::new()
-        .heading(format!(
-            "{} · {}",
-            household.name,
-            ru::tasks(counts.open_tasks)
-        ))
+        .heading(household.name)
         .spans(vec![
             Span::text("Просрочено: "),
             Span::bold(counts.overdue_tasks.to_string()),
-            Span::text(" · Покупки: "),
-            Span::bold(counts.open_shopping.to_string()),
-            Span::text(" · Выполнено сегодня: "),
+            Span::text(" · На сегодня: "),
+            Span::bold(counts.due_today_tasks.to_string()),
+            Span::text(" · Выполнено: "),
             Span::bold(counts.done_today.to_string()),
-        ]);
-    if !summary.is_empty() {
-        ui = ui.text(format!("Списки: {summary}"));
-    }
+        ])
+        .text(hint);
 
-    let tasks_target = default_of(ListKind::Tasks)
-        .map(|list_id| Screen::List { list_id, page: 0 })
+    let tasks_target = tasks_list
+        .map(|list_id| Screen::List {
+            list_id,
+            page: 0,
+            edit: false,
+            from_lists: false,
+        })
         .unwrap_or(Screen::Lists);
-    let shopping_target = default_of(ListKind::Shopping)
-        .map(|list_id| Screen::List { list_id, page: 0 })
+    let shopping_target = shopping_list
+        .map(|list_id| Screen::List {
+            list_id,
+            page: 0,
+            edit: false,
+            from_lists: false,
+        })
         .unwrap_or(Screen::Lists);
 
     ui = ui
         .row(vec![
             go("➕ Добавить", Screen::Add),
-            go("🛒 Покупки", shopping_target),
+            go(&format!("🛒 Покупки · {shopping_count}"), shopping_target),
         ])
         .row(vec![
-            go("📋 Задачи", tasks_target),
-            go("👤 Мои задачи", Screen::Mine { page: 0 }),
+            go(&format!("📋 Задачи · {tasks_count}"), tasks_target),
+            go(
+                &format!("👤 Мои задачи · {mine_count}"),
+                Screen::Mine { page: 0 },
+            ),
         ])
         .row(vec![
             button("🔎 Поиск", Action::SearchStart),
@@ -149,23 +199,9 @@ async fn menu(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
     Ok(ui)
 }
 
-fn lists_line(visible: &[&List], open: &HashMap<Uuid, i64>) -> String {
-    visible
-        .iter()
-        .map(|list| {
-            format!(
-                "{} ({})",
-                list.name,
-                open.get(&list.id).copied().unwrap_or(0)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 fn welcome() -> Ui {
     Ui::new()
-        .heading("Готово!")
+        .heading("Пространство создано")
         .text("Созданы списки «Задачи» и «Покупки».")
         .text("Отправьте мне любую фразу — например: «завтра купить молоко и позвонить маме».")
         .row(vec![
@@ -193,7 +229,7 @@ fn add_choice() -> Ui {
                 },
             ),
         ])
-        .row(vec![go("⬅️ В меню", Screen::Menu)])
+        .row(nav_row(&Screen::Add, Screen::Menu))
 }
 
 async fn lists_screen(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
@@ -217,10 +253,12 @@ async fn lists_screen(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
             Screen::List {
                 list_id: list.id,
                 page: 0,
+                edit: false,
+                from_lists: true,
             },
         )]);
     }
-    Ok(ui.row(vec![go("⬅️ В меню", Screen::Menu)]))
+    Ok(ui.row(nav_row(&Screen::Lists, Screen::Menu)))
 }
 
 /// Раздел списка задач по сроку.
@@ -315,49 +353,59 @@ pub(super) fn pager(ui: Ui, page: usize, pages: usize, make: impl Fn(usize) -> S
     ui
 }
 
-async fn member_names(ctx: &mut Ctx<'_>) -> Result<HashMap<Uuid, String>, Fail> {
-    let household_id = ctx.household()?.id;
-    let members: Vec<User> = users::list_active(&mut *ctx.conn, household_id).await?;
-    Ok(members
-        .into_iter()
-        .map(|member| (member.id, member.display_name))
-        .collect())
-}
-
-/// Подпись строки задачи: название, срок, исполнитель.
-pub fn task_label(
-    item: &Item,
-    tz: Tz,
-    now: DateTime<Utc>,
-    names: &HashMap<Uuid, String>,
-) -> String {
+/// Подпись строки задачи: название, срок и приоритет «срочно»/«высокий».
+pub fn task_label(item: &Item, tz: Tz, now: DateTime<Utc>) -> String {
     let mut label = clip(&item.title, 40);
     if let Some(due) = ru::due_label(item.due_at, item.due_date, tz, now) {
         label.push_str(&format!(" · {due}"));
     }
     label.push_str(priority_marker(item));
-    if let Some(name) = item.assignee_user_id.and_then(|id| names.get(&id)) {
-        label.push_str(&format!(" · 👤 {}", clip(name, 14)));
-    }
     label
 }
 
-async fn list(ctx: &mut Ctx<'_>, list_id: Uuid, page: u32) -> Result<Ui, Fail> {
+/// Подпись строки выполненной сегодня задачи: «✅ Название · 13:47».
+pub fn completion_label(completion: &items::completions::Completion, tz: Tz) -> String {
+    format!(
+        "✅ {} · {}",
+        clip(&completion.title, 40),
+        completion.completed_at.with_timezone(&tz).format("%H:%M")
+    )
+}
+
+async fn list(
+    ctx: &mut Ctx<'_>,
+    list_id: Uuid,
+    page: u32,
+    edit: bool,
+    from_lists: bool,
+) -> Result<Ui, Fail> {
     let household_id = ctx.household()?.id;
     let list = lists::get_visible(&mut *ctx.conn, household_id, list_id).await?;
     if list.kind == ListKind::Tasks {
-        tasks_list(ctx, &list, page).await
+        tasks_list(ctx, &list, page, from_lists).await
     } else {
-        super::shopping::list_view(ctx, &list, page).await
+        super::shopping::list_view(ctx, &list, page, edit, from_lists).await
     }
 }
 
-async fn tasks_list(ctx: &mut Ctx<'_>, list: &List, page: u32) -> Result<Ui, Fail> {
+async fn tasks_list(
+    ctx: &mut Ctx<'_>,
+    list: &List,
+    page: u32,
+    from_lists: bool,
+) -> Result<Ui, Fail> {
     let household_id = ctx.household()?.id;
     let all = items::list_by_list(&mut *ctx.conn, household_id, list.id).await?;
-    let done = all
+    let since = items::completions::day_start(ctx.tz, ctx.now);
+    let done_today =
+        items::completions::for_list_since(&mut *ctx.conn, household_id, list.id, since).await?;
+    let done_today_ids: HashSet<Uuid> = done_today
         .iter()
-        .filter(|item| item.status == ItemStatus::Done)
+        .map(|completion| completion.item_id)
+        .collect();
+    let done_earlier = all
+        .iter()
+        .filter(|item| item.status == ItemStatus::Done && !done_today_ids.contains(&item.id))
         .count();
     let mut open: Vec<Item> = all
         .into_iter()
@@ -365,75 +413,90 @@ async fn tasks_list(ctx: &mut Ctx<'_>, list: &List, page: u32) -> Result<Ui, Fai
         .collect();
     sort_tasks(&mut open, ctx.tz, ctx.now);
 
-    let names = member_names(ctx).await?;
     let (start, end, page, pages) = page_bounds(open.len(), page);
     let here = |page: usize| Screen::List {
         list_id: list.id,
         page: u32::try_from(page).unwrap_or(0),
+        edit: false,
+        from_lists,
     };
 
-    let mut ui = Ui::new().heading(format!("{} · {}", list.name, open.len()));
+    let mut heading = format!("{} · {}", list.name, open.len());
+    if !done_today.is_empty() {
+        heading.push_str(&format!(" · {}", ru::done_today_counter(done_today.len())));
+    }
+    let mut ui = Ui::new().heading(here(page).trail(&heading, None));
+    let last_page = page + 1 == pages;
+    let show_done_today = last_page && !done_today.is_empty();
     if open.is_empty() {
         ui = ui.text("Пока нет задач");
-        if done > 0 {
-            ui = ui.text(format!("Выполнено ранее: {done}"));
-        }
-        return Ok(ui.row(vec![
-            button(
-                "➕ Добавить",
-                Action::Add {
-                    list_id: Some(list.id),
-                    kind: ListKind::Tasks,
-                },
-            ),
-            go("⬅️ Назад", Screen::Menu),
-        ]));
-    }
-
-    let mut current: Option<Section> = None;
-    for item in &open[start..end] {
-        let section = section_of(item, ctx.tz, ctx.now);
-        if current != Some(section) {
-            ui = ui.bold(section.title());
-            current = Some(section);
-        }
-        ui = ui.row(vec![
-            button(
-                "☐",
-                Action::Complete {
-                    item_id: item.id,
-                    version: item.version,
-                    back: here(page),
-                },
-            ),
-            go(
-                &task_label(item, ctx.tz, ctx.now, &names),
+    } else {
+        let mut current: Option<Section> = None;
+        for item in &open[start..end] {
+            let section = section_of(item, ctx.tz, ctx.now);
+            if current != Some(section) {
+                ui = ui.bold(section.title());
+                current = Some(section);
+            }
+            ui = ui.row(vec![go(
+                &task_label(item, ctx.tz, ctx.now),
                 Screen::Item {
                     item_id: item.id,
                     back: Box::new(here(page)),
                 },
-            ),
-        ]);
+            )]);
+        }
     }
-    if done > 0 {
-        ui = ui.text(format!("Выполнено: {done}"));
+    if done_earlier > 0 {
+        let label = if open.is_empty() {
+            "Выполнено ранее"
+        } else {
+            "Выполнено"
+        };
+        ui = ui.text(format!("{label}: {done_earlier}"));
     }
+    if show_done_today {
+        ui = done_today_section(ui, &done_today, ctx.tz, here(page));
+    }
+    let current = here(page);
     let ui = pager(ui, page, pages, here);
-    Ok(ui.row(vec![
-        button(
-            "➕ Добавить",
-            Action::Add {
-                list_id: Some(list.id),
-                kind: ListKind::Tasks,
+    let mut row = vec![button(
+        "➕ Добавить",
+        Action::Add {
+            list_id: Some(list.id),
+            kind: ListKind::Tasks,
+        },
+    )];
+    row.extend(nav_row(&current, list_back(from_lists)));
+    Ok(ui.row(row))
+}
+
+/// Последний раздел списка задач: выполнения этого списка с начала дня.
+fn done_today_section(
+    mut ui: Ui,
+    done_today: &[items::completions::Completion],
+    tz: Tz,
+    back: Screen,
+) -> Ui {
+    ui = ui.bold(ru::DONE_TODAY_TITLE);
+    for completion in done_today {
+        ui = ui.row(vec![go(
+            &completion_label(completion, tz),
+            Screen::Item {
+                item_id: completion.item_id,
+                back: Box::new(back.clone()),
             },
-        ),
-        go("⬅️ Назад", Screen::Menu),
-    ]))
+        )]);
+    }
+    ui
 }
 
 async fn mine(ctx: &mut Ctx<'_>, page: u32) -> Result<Ui, Fail> {
     let household_id = ctx.household()?.id;
     let user_id = ctx.user()?.id;
+    // Заголовок считает по тому же счётчику, что и кнопка меню: поиск ниже
+    // ограничен MAX_LIMIT и не должен уменьшать число в заголовке.
+    let total = items::open_assigned_tasks(&mut *ctx.conn, household_id, user_id).await?;
     let filters = SearchFilters {
         assignee_user_id: Some(user_id),
         limit: crate::domain::search::MAX_LIMIT,
@@ -447,39 +510,29 @@ async fn mine(ctx: &mut Ctx<'_>, page: u32) -> Result<Ui, Fail> {
         .collect();
     sort_tasks(&mut tasks, ctx.tz, ctx.now);
 
-    let names = member_names(ctx).await?;
     let (start, end, page, pages) = page_bounds(tasks.len(), page);
     let here = |page: usize| Screen::Mine {
         page: u32::try_from(page).unwrap_or(0),
     };
 
-    let mut ui = Ui::new().heading(format!("Мои задачи · {}", tasks.len()));
+    let mut ui = Ui::new().heading(here(page).trail(&format!("Мои задачи · {total}"), None));
     if tasks.is_empty() {
         return Ok(ui
             .text("Вам пока ничего не назначено")
-            .row(vec![go("⬅️ Назад", Screen::Menu)]));
+            .row(nav_row(&here(page), Screen::Menu)));
     }
     for item in &tasks[start..end] {
-        ui = ui.row(vec![
-            button(
-                "☐",
-                Action::Complete {
-                    item_id: item.id,
-                    version: item.version,
-                    back: here(page),
-                },
-            ),
-            go(
-                &task_label(item, ctx.tz, ctx.now, &names),
-                Screen::Item {
-                    item_id: item.id,
-                    back: Box::new(here(page)),
-                },
-            ),
-        ]);
+        ui = ui.row(vec![go(
+            &task_label(item, ctx.tz, ctx.now),
+            Screen::Item {
+                item_id: item.id,
+                back: Box::new(here(page)),
+            },
+        )]);
     }
+    let current = here(page);
     let ui = pager(ui, page, pages, here);
-    Ok(ui.row(vec![go("⬅️ Назад", Screen::Menu)]))
+    Ok(ui.row(nav_row(&current, Screen::Menu)))
 }
 
 async fn results(
@@ -523,12 +576,11 @@ async fn results(
         filter_row("Все", StatusFilter::All),
     ];
 
-    let mut ui = Ui::new().heading("Поиск");
+    let mut ui = Ui::new().heading(here(0).trail("Поиск", None));
     if hits.is_empty() {
-        return Ok(ui.text("Ничего не нашлось").row(filters_row).row(vec![
-            button("✏️ Изменить запрос", Action::SearchStart),
-            go("⬅️ Назад", Screen::Menu),
-        ]));
+        let mut row = vec![button("✏️ Изменить запрос", Action::SearchStart)];
+        row.extend(nav_row(&here(0), Screen::Menu));
+        return Ok(ui.text("Ничего не нашлось").row(filters_row).row(row));
     }
 
     let (start, end, page, pages) = page_bounds(hits.len(), page);
@@ -543,12 +595,12 @@ async fn results(
     ));
     for hit in &hits[start..end] {
         let mark = if hit.item.status == ItemStatus::Done {
-            "✅"
+            "✅ "
         } else {
-            "☐"
+            ""
         };
         let mut label = format!(
-            "{mark} {} · {}",
+            "{mark}{} · {}",
             clip(&hit.item.title, 34),
             clip(&hit.list_name, 14)
         );
@@ -573,11 +625,11 @@ async fn results(
             },
         )]);
     }
+    let current = here(page);
     let ui = pager(ui, page, pages, here).row(filters_row);
-    Ok(ui.row(vec![
-        button("✏️ Изменить запрос", Action::SearchStart),
-        go("⬅️ Назад", Screen::Menu),
-    ]))
+    let mut row = vec![button("✏️ Изменить запрос", Action::SearchStart)];
+    row.extend(nav_row(&current, Screen::Menu));
+    Ok(ui.row(row))
 }
 
 #[cfg(test)]

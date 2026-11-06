@@ -10,10 +10,14 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use tasklerq::storage::repositories::{households, users};
 use tasklerq::telegram::api::{RichMessage, TelegramApi, TelegramError, WebhookInfo};
-use tasklerq::telegram::bot::Bot;
-use tasklerq::telegram::outbox::OutboxWorker;
+use tasklerq::telegram::bot::model::{Action, Screen, Ui};
+use tasklerq::telegram::bot::{Bot, Ctx, display_timezone};
+use tasklerq::telegram::outbox::{OutboxWorker, Placement};
 use tasklerq::telegram::queue;
+use tasklerq::telegram::rich::Button;
+use tasklerq::telegram::update::Sender;
 use tasklerq::telegram::worker::{Pass, UpdateHandler, UpdateWorker};
 use tokio::sync::Notify;
 
@@ -244,22 +248,42 @@ impl TelegramApi for FakeTelegram {
 /// Разобрать кнопки сообщения: `(подпись, callback_data)`.
 pub fn buttons(html: &str) -> Vec<(String, String)> {
     let mut found = Vec::new();
-    let marker = "<tg-button type=\"callback_data\" data=\"";
     let mut rest = html;
-    while let Some(start) = rest.find(marker) {
-        let after = &rest[start + marker.len()..];
-        let Some(quote) = after.find('"') else { break };
-        let data = after[..quote].to_owned();
-        let Some(open) = after.find("\">") else { break };
-        let label_start = open + 2;
-        let Some(close) = after[label_start..].find("</tg-button>") else {
-            break;
-        };
-        let label = unescape(&after[label_start..label_start + close]);
-        found.push((label, data));
-        rest = &after[label_start + close..];
+    while let Some((button, consumed)) = next_button(rest) {
+        found.push(button);
+        rest = &rest[consumed..];
     }
     found
+}
+
+/// Разобрать ряды кнопок `tg-button-row`: по кнопкам в каждом ряду.
+pub fn button_rows(html: &str) -> Vec<Vec<(String, String)>> {
+    let mut rows = Vec::new();
+    let mut rest = html;
+    while let Some(start) = rest.find("<tg-button-row>") {
+        let after = &rest[start + "<tg-button-row>".len()..];
+        let Some(end) = after.find("</tg-button-row>") else {
+            break;
+        };
+        rows.push(buttons(&after[..end]));
+        rest = &after[end + "</tg-button-row>".len()..];
+    }
+    rows
+}
+
+/// Одна кнопка с начала строки и число занятых байт.
+fn next_button(rest: &str) -> Option<((String, String), usize)> {
+    let marker = "<tg-button type=\"callback_data\" data=\"";
+    let start = rest.find(marker)?;
+    let after = &rest[start + marker.len()..];
+    let quote = after.find('"')?;
+    let data = after[..quote].to_owned();
+    let open = after.find("\">")?;
+    let label_start = open + 2;
+    let close = after[label_start..].find("</tg-button>")?;
+    let label = unescape(&after[label_start..label_start + close]);
+    let consumed = start + marker.len() + label_start + close + "</tg-button>".len();
+    Some(((label, data), consumed))
 }
 
 pub fn unescape(text: &str) -> String {
@@ -276,6 +300,56 @@ fn harness_bot(pool: &PgPool) -> Bot {
         // возможен только в режиме `multi`.
         .with_tenancy(tasklerq::config::TenancyMode::Multi)
         .with_audit(tasklerq::security_audit::Audit::new(pool.clone()))
+}
+
+/// Показать экран с баннером и его кнопками.
+///
+/// В продуктовом коде баннер с кнопками появится в следующих пунктах этапа;
+/// пока это единственный путь проверить, что кнопки баннера получают токены, а
+/// сам баннер не попадает в `telegram_views`.
+pub async fn present_with_banner(
+    pool: &PgPool,
+    chat_id: i64,
+    now: DateTime<Utc>,
+    screen: &Screen,
+    ui: Ui,
+    text: &str,
+    buttons: Vec<Button<Action>>,
+) {
+    let mut conn = pool.acquire().await.expect("connection");
+    let user = users::find_active_by_telegram(&mut conn, chat_id)
+        .await
+        .expect("user")
+        .expect("active user");
+    let household = households::get(&mut conn, user.household_id)
+        .await
+        .expect("household");
+    let tz = display_timezone(Some(&user), Some(&household));
+    let mut ctx = Ctx {
+        conn: &mut conn,
+        now,
+        bot_username: "tasklerqbot",
+        chat_id,
+        sender: Sender {
+            id: user.telegram_user_id,
+            display_name: user.display_name.clone(),
+            username: user.username.clone(),
+        },
+        user: Some(user),
+        household: Some(household),
+        tz,
+        toast: None,
+        banner: None,
+        placement: Placement::Visible,
+        llm_capture: false,
+        tenancy: tasklerq::config::TenancyConfig {
+            mode: tasklerq::config::TenancyMode::Single,
+            bootstrap_owner: None,
+        },
+        audit: None,
+    };
+    ctx.banner_with(text, buttons);
+    ctx.show(screen, ui).await.expect("show with banner");
 }
 
 /// Сценарный стенд: один пользователь, настоящий бот и поддельный Telegram.
@@ -348,6 +422,12 @@ impl Harness {
     /// Сдвинуть время стенда вперёд относительно реального.
     pub fn advance(&mut self, by: Duration) {
         self.skew += by;
+        self.tick();
+    }
+
+    /// Поставить время стенда на заданный момент.
+    pub fn set_now(&mut self, at: DateTime<Utc>) {
+        self.skew = at - Utc::now();
         self.tick();
     }
 
@@ -501,6 +581,21 @@ impl Harness {
             .into_iter()
             .find(|(text, _)| text.contains(label))
             .unwrap_or_else(|| panic!("button `{label}` not found on screen:\n{html}"))
+            .1;
+        self.press_data(&data, message_id).await;
+    }
+
+    /// Нажать первую кнопку с подписью после текста-якоря: у одинаковых
+    /// переключателей блоков так выбирается нужный.
+    pub async fn press_after(&mut self, anchor: &str, label: &str) {
+        let (message_id, html) = self.active();
+        let start = html
+            .find(anchor)
+            .unwrap_or_else(|| panic!("anchor `{anchor}` not found on screen:\n{html}"));
+        let data = buttons(&html[start..])
+            .into_iter()
+            .find(|(text, _)| text.contains(label))
+            .unwrap_or_else(|| panic!("button `{label}` after `{anchor}` not found:\n{html}"))
             .1;
         self.press_data(&data, message_id).await;
     }

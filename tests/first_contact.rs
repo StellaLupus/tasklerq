@@ -509,7 +509,7 @@ async fn bootstrap_owner_matching_sender_completes_onboarding_after_the_form_ope
     let mut reconfigured = single_harness(&db.pool, sender, Some(sender));
     reconfigured.press_data(&data, message_id).await;
 
-    reconfigured.assert_screen_contains("Готово");
+    reconfigured.assert_screen_contains("Пространство создано");
     assert_eq!(household_count(&db.pool).await, 1);
     assert_eq!(form_count(&db.pool, sender).await, 0);
 }

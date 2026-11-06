@@ -65,7 +65,7 @@ async fn disabling_quiet_hours_releases_three_notifications_and_the_digest() {
     .await;
 
     open_notifications(&mut bot).await;
-    bot.press("Тихие часы: вкл").await;
+    bot.press_after("🌙 Тихие часы", "Выкл").await;
 
     let screen = bot.screen();
     assert!(screen.contains("Тихие часы выключены"), "{screen}");
@@ -140,7 +140,7 @@ async fn one_deferred_notification_is_released_as_an_ordinary_message() {
     deferred_reminder(&db.pool, &household, item.id, due, release_at).await;
 
     open_notifications(&mut bot).await;
-    bot.press("Тихие часы: вкл").await;
+    bot.press_after("🌙 Тихие часы", "Выкл").await;
 
     let screen = bot.screen();
     assert!(screen.contains("Накопилось 1 уведомление"), "{screen}");
@@ -151,7 +151,7 @@ async fn one_deferred_notification_is_released_as_an_ordinary_message() {
         .into_iter()
         .map(|(label, _)| label)
         .collect();
-    for label in ["Готово", "Отложить на час", "Открыть"] {
+    for label in ["Выполнено", "Отложить на час", "Открыть"] {
         assert!(
             labels.iter().any(|item| item.contains(label)),
             "{label}: {labels:?}"
@@ -162,8 +162,8 @@ async fn one_deferred_notification_is_released_as_an_ordinary_message() {
     // нажаты на самом якоре, поэтому после 2.3 экран правится на месте
     // (`in_place`) и новых сообщений нет даже при `buried = true`.
     let sent_after_release = bot.fake.sent().len();
-    bot.press("Тихие часы: выкл").await;
-    bot.press("Тихие часы: вкл").await;
+    bot.press_after("🌙 Тихие часы", "Вкл").await;
+    bot.press_after("🌙 Тихие часы", "Выкл").await;
     assert_eq!(
         bot.fake.sent().len(),
         sent_after_release,
@@ -185,7 +185,7 @@ async fn disabling_quiet_hours_with_nothing_deferred_sends_no_notice() {
 
     open_notifications(&mut bot).await;
     let sent_before = bot.fake.sent().len();
-    bot.press("Тихие часы: вкл").await;
+    bot.press_after("🌙 Тихие часы", "Выкл").await;
 
     assert!(!bot.screen().contains("Накопилось"));
     assert_eq!(bot.fake.sent().len(), sent_before);
@@ -325,7 +325,8 @@ async fn timezone_change_that_leaves_quiet_hours_releases_deferred() {
     }
 
     bot.press("Настройки").await;
-    bot.press("Время").await;
+    bot.press("Профиль").await;
+    bot.press("Часовой пояс").await;
     // 06:00 в Москве — 13:00 во Владивостоке: по новым настройкам уже не тихо.
     bot.press("Asia/Vladivostok").await;
 
@@ -385,7 +386,7 @@ async fn manual_release_does_not_touch_another_participant() {
     .await;
 
     open_notifications(&mut bot).await;
-    bot.press("Тихие часы: вкл").await;
+    bot.press_after("🌙 Тихие часы", "Выкл").await;
 
     assert!(bot.screen().contains("Накопилось 1 уведомление"));
     assert!(
@@ -438,7 +439,7 @@ async fn manual_release_waits_for_the_scheduler_recipient_lock() {
     let chat = bot.chat;
     let fake = bot.fake.clone();
     let sent_before = fake.sent().len();
-    let mut press = Box::pin(bot.press("Тихие часы: вкл"));
+    let mut press = Box::pin(bot.press_after("🌙 Тихие часы", "Выкл"));
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(300), &mut press)
             .await
@@ -545,7 +546,7 @@ async fn snooze_not_released_before_its_own_time(move_quiet_start: bool) {
         bot.press("Начало тихих").await;
         bot.text("23:00").await;
     } else {
-        bot.press("Тихие часы: вкл").await;
+        bot.press_after("🌙 Тихие часы", "Выкл").await;
     }
 
     assert!(!bot.screen().contains("Накопилось"), "{}", bot.screen());
@@ -774,7 +775,7 @@ async fn manual_release_sends_deferred_as_one_batch_and_restores_a_future_snooze
 
     open_notifications(&mut bot).await;
     let sent_before = bot.fake.sent().len();
-    bot.press("Тихие часы: вкл").await;
+    bot.press_after("🌙 Тихие часы", "Выкл").await;
 
     let screen = bot.screen();
     assert!(screen.contains("Накопилось 2 уведомления"), "{screen}");
@@ -857,7 +858,7 @@ async fn manual_release_sends_nothing_when_the_scheduler_already_delivered() {
     let chat = bot.chat;
     let fake = bot.fake.clone();
     let sent_before = fake.sent().len();
-    let mut press = Box::pin(bot.press("Тихие часы: вкл"));
+    let mut press = Box::pin(bot.press_after("🌙 Тихие часы", "Выкл"));
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(300), &mut press)
             .await

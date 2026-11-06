@@ -4,10 +4,10 @@ mod support;
 
 use std::sync::Arc;
 
-use chrono::Duration;
+use chrono::{Duration, NaiveDate, TimeZone, Utc};
 use support::telegram::{Call, FakeTelegram, Harness, buttons};
-use support::{db, next_telegram_id};
-use tasklerq::domain::models::{Actor, ActorType, ItemPatch};
+use support::{TestHousehold, create_item, db, new_item, next_telegram_id, recurrence};
+use tasklerq::domain::models::{Actor, ActorType, ItemPatch, RecurrenceFreq, UserRole};
 use tasklerq::storage::repositories::items;
 use tasklerq::telegram::api::TelegramError;
 use tasklerq::telegram::bot::model::{Action, Screen, Ui};
@@ -43,7 +43,8 @@ async fn onboarding_creates_household_once() {
 
     // Повторный /start не создаёт второй household и открывает меню.
     bot.text("/start").await;
-    bot.assert_screen_contains("Семья Ивановых · 0 задач");
+    bot.assert_screen_contains("Семья Ивановых");
+    bot.assert_screen_contains("📋 Задачи · 0");
     let total: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE telegram_user_id = $1")
         .bind(id)
         .fetch_one(&db.pool)
@@ -70,6 +71,36 @@ async fn household_of(pool: &sqlx::PgPool, telegram_id: i64) -> uuid::Uuid {
     .fetch_one(pool)
     .await
     .expect("household")
+}
+
+async fn test_household(pool: &sqlx::PgPool, telegram_id: i64) -> TestHousehold {
+    let (household_id, owner_id): (uuid::Uuid, uuid::Uuid) = sqlx::query_as(
+        "SELECT household_id, id FROM users WHERE telegram_user_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(telegram_id)
+    .fetch_one(pool)
+    .await
+    .expect("user");
+    let list = |kind: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, uuid::Uuid>(
+                "SELECT id FROM lists WHERE household_id = $1 AND kind = $2::list_kind AND is_default",
+            )
+            .bind(household_id)
+            .bind(kind)
+            .fetch_one(&pool)
+            .await
+            .expect("list")
+        }
+    };
+    TestHousehold {
+        household_id,
+        owner_id,
+        member_id: owner_id,
+        tasks_list_id: list("tasks").await,
+        shopping_list_id: list("shopping").await,
+    }
 }
 
 /// Добавить покупку, отметить её купленной и очистить выполненные.
@@ -241,7 +272,7 @@ async fn navigation_edits_the_single_active_message() {
     bot.assert_screen_contains("Задачи · 0");
     bot.assert_screen_contains("Пока нет задач");
     bot.press("Назад").await;
-    bot.assert_screen_contains("Семья · 0 задач");
+    bot.assert_screen_contains("📋 Задачи · 0");
     bot.press("Покупки").await;
     bot.assert_screen_contains("Список покупок пуст");
 
@@ -279,10 +310,10 @@ async fn task_form_validates_and_saves() {
     bot.press("Новый тег").await;
     bot.text("дом").await;
     bot.assert_screen_contains("✓ дом");
-    bot.press("Готово").await;
+    bot.press("Применить").await;
     bot.assert_screen_contains("Подзадачи");
     bot.text("Найти договор").await;
-    bot.press("Готово").await;
+    bot.press("Применить").await;
     bot.assert_screen_contains("Как часто повторять?");
     bot.press("Не повторять").await;
     bot.assert_screen_contains("Проверьте и сохраните");
@@ -350,7 +381,7 @@ async fn free_text_offers_a_draft_and_cancel_discards_it() {
     bot.assert_screen_contains("Проверьте и сохраните");
     bot.assert_screen_contains("позвонить маме");
     bot.press("Отмена").await;
-    bot.assert_screen_contains("Семья · 0 задач");
+    bot.assert_screen_contains("📋 Задачи · 0");
 
     let household = household_of(&db.pool, bot.chat).await;
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM items WHERE household_id = $1")
@@ -367,26 +398,126 @@ async fn free_text_offers_a_draft_and_cancel_discards_it() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn completing_shows_undo_and_next_occurrence_for_recurring_tasks() {
+async fn completing_from_the_card_returns_to_the_same_list_with_a_banner() {
     let db = db().await;
     let mut bot = onboarded(&db.pool).await;
 
-    bot.text("Полить цветы").await;
-    bot.press("Повторение").await;
-    bot.press("Каждый день").await;
-    bot.assert_screen_contains("Повторять каждые сколько?");
-    bot.press("Каждый раз").await;
-    bot.assert_screen_contains("Проверьте и сохраните");
-    bot.assert_screen_contains("🔁 Каждый день");
+    bot.text("Оплатить интернет").await;
     bot.press("Сохранить").await;
+    bot.text("Полить цветы").await;
+    bot.press("Сохранить").await;
+    bot.assert_screen_contains("Задачи · 2");
 
-    bot.press("☐").await;
-    bot.assert_screen_contains("✅ Выполнено: Полить цветы");
-    bot.assert_screen_contains("Следующее:");
+    bot.press("Оплатить интернет").await;
+    let (message_id, _) = bot.active();
+    bot.press("Выполнено").await;
+
+    // Возврат в тот же список правит то же сообщение, а не присылает экран
+    // результата с одной кнопкой.
+    let (completed_id, html) = bot.active();
+    assert_eq!(
+        completed_id, message_id,
+        "completion must edit the card message"
+    );
+    assert!(html.contains("✅ Выполнено: Оплатить интернет"), "{html}");
+    assert!(html.contains("↩️ Отменить"), "{html}");
+    bot.assert_screen_contains("Задачи · 1");
+    bot.assert_screen_contains("Полить цветы");
+    assert!(
+        !buttons(&html).iter().any(|(label, _)| label == "К списку"),
+        "{html}"
+    );
+
+    // Отмена возвращает задачу в список и убирает баннер.
+    bot.press("Отменить").await;
+    bot.assert_screen_contains("Задачи · 2");
+    bot.assert_screen_contains("Оплатить интернет");
+    assert!(!bot.screen().contains("✅ Выполнено"), "{}", bot.screen());
+    let status: String = sqlx::query_scalar("SELECT status::text FROM items WHERE title = $1")
+        .bind("Оплатить интернет")
+        .fetch_one(&db.pool)
+        .await
+        .expect("status");
+    assert_eq!(status, "open");
+
+    // Баннер живёт до ближайшей отрисовки: переход его не показывает.
+    bot.press("Оплатить интернет").await;
+    bot.press("Выполнено").await;
+    bot.assert_screen_contains("✅ Выполнено: Оплатить интернет");
+    bot.press("Назад").await;
+    assert!(!bot.screen().contains("✅ Выполнено"), "{}", bot.screen());
+    bot.press("Задачи").await;
+    assert!(!bot.screen().contains("✅ Выполнено"), "{}", bot.screen());
+    bot.assert_screen_contains("Задачи · 1");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completing_a_recurring_task_shows_the_next_occurrence() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+
+    // Ежемесячная задача со сроком 5 ноября: следующее вхождение — 5 декабря.
+    let target = Utc
+        .with_ymd_and_hms(2025, 11, 5, 10, 0, 0)
+        .single()
+        .expect("fixed now");
+    bot.advance(target - bot.now);
+
+    let household = test_household(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut item = new_item(household.tasks_list_id, "Платить за квартиру");
+    item.due_date = Some(NaiveDate::from_ymd_opt(2025, 11, 5).expect("due date"));
+    item.recurrence = Some(recurrence(RecurrenceFreq::Monthly, Vec::new()));
+    create_item(&db.pool, &household, household.tasks_list_id, &actor, item).await;
+
+    bot.press("Задачи").await;
+    bot.press("Платить за квартиру").await;
+    bot.press("Выполнено").await;
+
+    bot.assert_screen_contains("✅ Выполнено: Платить за квартиру");
+    bot.assert_screen_contains("Следующее: пт, 5 дек");
     bot.assert_has_button("Отменить");
 
     bot.press("Отменить").await;
     bot.assert_screen_contains("Задачи · 1");
+    assert!(!bot.screen().contains("✅ Выполнено"), "{}", bot.screen());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saved_completed_state_falls_back_to_the_menu() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+
+    sqlx::query("UPDATE telegram_views SET state = $1 WHERE chat_id = $2")
+        .bind(serde_json::json!({
+            "t": "completed",
+            "item_id": uuid::Uuid::nil(),
+            "back": {"t": "menu"},
+        }))
+        .bind(bot.chat)
+        .execute(&db.pool)
+        .await
+        .expect("legacy completed state");
+
+    let data = action_callback(&bot, Action::Refresh).await;
+    let (message_id, _) = bot.active();
+    bot.press_data(&data, message_id).await;
+
+    bot.assert_screen_contains("📋 Задачи · 0");
+    assert!(
+        bot.fake
+            .answers()
+            .iter()
+            .all(|(_, text, alert)| text.is_none() && !alert),
+        "the legacy state must fall back without an error toast"
+    );
+    let state: serde_json::Value =
+        sqlx::query_scalar("SELECT state FROM telegram_views WHERE chat_id = $1")
+            .bind(bot.chat)
+            .fetch_one(&db.pool)
+            .await
+            .expect("saved state");
+    assert_eq!(state["t"], serde_json::json!("menu"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -428,13 +559,13 @@ async fn delete_asks_for_confirmation() {
 
     bot.press("Удалить").await;
     bot.assert_screen_contains("Удалить «Лишнее»?");
-    bot.press("Отмена").await;
+    bot.press("Назад").await;
     bot.assert_screen_contains("Приоритет:");
 
     bot.press("Удалить").await;
     bot.press("Да, удалить").await;
-    bot.assert_screen_contains("🗑 Удалено: Лишнее");
-    bot.press("К списку").await;
+    bot.assert_screen_contains("Задачи › 🗑 Удалено: Лишнее");
+    bot.press("Назад").await;
     bot.assert_screen_contains("Пока нет задач");
 }
 
@@ -454,7 +585,7 @@ async fn deleted_task_shows_undo_and_returns_it_with_its_fields() {
     bot.press("Да, удалить").await;
     bot.assert_screen_contains("🗑 Удалено: Вернуть задачу");
     bot.assert_has_button("Отменить");
-    bot.assert_has_button("К списку");
+    bot.assert_has_button("Назад");
 
     let household = household_of(&db.pool, bot.chat).await;
     let (item_id, deleted, due_before, priority_before): (
@@ -551,7 +682,12 @@ async fn repeated_delete_undo_reports_that_there_is_nothing_to_undo() {
         &bot,
         Action::DeleteUndo {
             item_id,
-            back: Screen::List { list_id, page: 0 },
+            back: Screen::List {
+                list_id,
+                page: 0,
+                edit: false,
+                from_lists: false,
+            },
         },
     )
     .await;
@@ -645,13 +781,14 @@ async fn deleted_purchase_shows_undo_and_returns_it_to_the_list() {
     bot.press("1").await;
     bot.press("л").await;
     bot.press("Сохранить").await;
-    bot.press("⋯").await;
+    bot.press("Править").await;
+    bot.press("Молоко").await;
 
     bot.press("Удалить").await;
     bot.press("Да, удалить").await;
     bot.assert_screen_contains("🗑 Удалено: Молоко");
     bot.assert_has_button("Отменить");
-    bot.assert_has_button("🛒 К списку");
+    bot.assert_has_button("Назад");
 
     let household = household_of(&db.pool, bot.chat).await;
     let item_id: uuid::Uuid =
@@ -663,7 +800,8 @@ async fn deleted_purchase_shows_undo_and_returns_it_to_the_list() {
             .expect("deleted purchase");
 
     bot.press("Отменить").await;
-    bot.assert_screen_contains("Покупки · 1");
+    // Карточка открыта из режима правки, поэтому возврат сохраняет его.
+    bot.assert_screen_contains("Покупки · правка");
     bot.assert_screen_contains("☐ Молоко · 1 л");
 
     let deleted: bool =
@@ -737,7 +875,8 @@ async fn deleted_purchase_undo_after_window_reports_expiry_and_keeps_it_deleted(
     bot.press("1").await;
     bot.press("л").await;
     bot.press("Сохранить").await;
-    bot.press("⋯").await;
+    bot.press("Править").await;
+    bot.press("Позднее молоко").await;
 
     bot.press("Удалить").await;
     bot.press("Да, удалить").await;
@@ -781,12 +920,13 @@ async fn deleted_purchase_back_to_list_does_not_undo() {
     bot.press("1").await;
     bot.press("л").await;
     bot.press("Сохранить").await;
-    bot.press("⋯").await;
+    bot.press("Править").await;
+    bot.press("Оставить в удалённых").await;
 
     bot.press("Удалить").await;
     bot.press("Да, удалить").await;
     bot.assert_screen_contains("🗑 Удалено: Оставить в удалённых");
-    bot.press("🛒 К списку").await;
+    bot.press("Назад").await;
     bot.assert_screen_contains("Список покупок пуст");
 
     let household = household_of(&db.pool, bot.chat).await;
@@ -808,8 +948,8 @@ async fn deleted_purchase_back_to_list_does_not_undo() {
     .fetch_one(&db.pool)
     .await
     .expect("item after back");
-    assert!(deleted, "«К списку» must not restore the purchase");
-    assert_eq!(undone, 0, "«К списку» must not write an undo event");
+    assert!(deleted, "«Назад» must not restore the purchase");
+    assert_eq!(undone, 0, "«Назад» must not write an undo event");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -829,6 +969,7 @@ async fn repeated_clear_undo_reports_that_there_is_nothing_to_undo() {
         Action::ClearUndo {
             list_id,
             item_ids: vec![item_id],
+            from_lists: false,
         },
     )
     .await;
@@ -870,6 +1011,7 @@ async fn stale_clear_undo_does_not_undo_a_later_completion() {
         Action::ClearUndo {
             list_id,
             item_ids: vec![item_id],
+            from_lists: false,
         },
     )
     .await;
@@ -987,7 +1129,7 @@ async fn notification_button_opens_a_new_screen_below() {
     let (anchor, _) = bot.active();
 
     let (notice, data) =
-        deliver_notice_button(&mut bot, "📋 В меню", Action::Go { to: Screen::Menu }).await;
+        deliver_notice_button(&mut bot, "🏠 Меню", Action::Go { to: Screen::Menu }).await;
     bot.fake.clear_calls();
 
     bot.press_data(&data, notice).await;
@@ -1010,7 +1152,7 @@ async fn notification_button_opens_a_new_screen_below() {
     assert!(new_id > notice);
     assert!(!is_alive(&bot, anchor));
     assert!(is_alive(&bot, notice));
-    bot.assert_screen_contains("Семья · 0 задач");
+    bot.assert_screen_contains("📋 Задачи · 0");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1022,7 +1164,7 @@ async fn a_notice_button_on_the_anchor_message_is_not_edited_in_place() {
     // Якорь засыпан: после него в чате есть уведомления.
     deliver_message(&mut bot, "<p>напоминание</p>").await;
     let (notice, data) =
-        deliver_notice_button(&mut bot, "📋 В меню", Action::Go { to: Screen::Menu }).await;
+        deliver_notice_button(&mut bot, "🏠 Меню", Action::Go { to: Screen::Menu }).await;
     bot.fake.clear_calls();
 
     // Кнопка уведомления нажата на сообщении с id активного якоря: область
@@ -1079,7 +1221,7 @@ async fn repeated_start_and_menu_send_a_new_screen() {
         let (new_id, _) = bot.active();
         assert_ne!(new_id, anchor, "{command} must not edit the old anchor");
         assert!(!is_alive(&bot, anchor));
-        bot.assert_screen_contains("Семья · 0 задач");
+        bot.assert_screen_contains("📋 Задачи · 0");
     }
 }
 
@@ -1136,7 +1278,7 @@ async fn screen_is_sent_even_when_the_old_anchor_cannot_be_deleted() {
     let (new_id, _) = bot.active();
     assert_ne!(new_id, anchor);
     assert!(is_alive(&bot, anchor), "the old anchor stays in the chat");
-    bot.assert_screen_contains("Семья · 0 задач");
+    bot.assert_screen_contains("📋 Задачи · 0");
 
     // Кнопка старого сообщения обрабатывается как устаревшая.
     let data = buttons(&old_html)
@@ -1163,7 +1305,7 @@ async fn screen_is_sent_even_when_the_old_anchor_cannot_be_deleted() {
     );
     // Действие не выполнилось: остались в меню, а не в списке задач.
     assert_eq!(bot.active().0, new_id);
-    bot.assert_screen_contains("Семья · 0 задач");
+    bot.assert_screen_contains("📋 Задачи · 0");
     assert!(!bot.screen().contains("Пока нет задач"));
 }
 
@@ -1268,6 +1410,26 @@ async fn each_kind_of_incoming_text_is_deleted() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn help_text_is_a_stable_snapshot() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+
+    bot.text("/help").await;
+
+    let expected = concat!(
+        "Я помогаю вести задачи и покупки всей семьёй.\n\n",
+        "Напишите, что нужно сделать: с включённым разбором я разделю текст на задачи и покупки и покажу черновик, а без разбора открою форму с этим текстом в названии.\n\n",
+        "По экранам можно ходить кнопками «⬅️ Назад» и «🏠 Меню»; хлебные крошки в заголовке показывают путь.\n\n",
+        "Ваши сообщения я удаляю из чата после обработки, а /start или /menu возвращают меню вниз чата.\n\n",
+        "/menu — главное меню\n",
+        "/settings — настройки\n",
+        "/cancel — отменить текущее действие\n",
+        "/help — эта справка",
+    );
+    assert_eq!(bot.latest().1, expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_delete_keeps_the_result_and_sends_the_next_screen_below() {
     let db = db().await;
     let mut bot = onboarded(&db.pool).await;
@@ -1359,4 +1521,40 @@ async fn double_tap_on_a_buried_anchor_keeps_editing_it_in_place() {
         "a repeated tap must not delete the anchor: {calls:?}"
     );
     assert_eq!(bot.active().0, anchor);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn back_from_card_returns_to_the_same_list_page_in_the_same_message() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+
+    for n in 0..9 {
+        bot.text(&format!("Задача {n}")).await;
+        bot.press("Сохранить").await;
+    }
+    bot.press("Назад").await;
+    bot.fake.clear_calls();
+
+    bot.press("Задачи").await;
+    bot.press("→").await;
+    bot.assert_screen_contains("Страница 2 из 2");
+    let (anchor, _) = bot.active();
+
+    let task = buttons(&bot.screen())
+        .into_iter()
+        .map(|(label, _)| label)
+        .find(|label| label.starts_with("Задача "))
+        .expect("a task on the second page");
+    bot.press(&task).await;
+    bot.assert_screen_contains(&format!("Задачи › {task}"));
+
+    bot.press("Назад").await;
+    bot.assert_screen_contains("Страница 2 из 2");
+    assert_eq!(
+        bot.active().0,
+        anchor,
+        "the same screen message must be edited"
+    );
+    assert!(bot.fake.sent().is_empty(), "{:?}", bot.fake.sent());
+    assert_eq!(bot.fake.messages(bot.chat).len(), 1);
 }

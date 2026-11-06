@@ -25,7 +25,7 @@ use super::forms;
 use super::model::{
     Action, DraftTarget, ItemDraft, ItemForm, RecurrenceDraft, Screen, Step, SubtaskDraft, Ui,
 };
-use super::screens::back_button;
+use super::screens::nav_row;
 use super::{Ctx, Fail};
 
 mod clarify;
@@ -92,10 +92,11 @@ pub async fn processing(ctx: &mut Ctx<'_>, job_id: Option<Uuid>) -> Result<Ui, F
     if let Some(text) = text.as_deref().filter(|text| !text.is_empty()) {
         ui = ui.quote(text);
     }
+    let screen = Screen::Processing { job_id };
     Ok(ui
-        .heading("⏳ Разбираю сообщение…")
+        .heading(screen.trail("⏳ Разбираю сообщение…", None))
         .text("Это займёт несколько секунд. Задачи появятся после вашего подтверждения.")
-        .row(vec![back_button("🏠 Меню", Screen::Menu)]))
+        .row(nav_row(&screen, Screen::Menu)))
 }
 
 fn kind_icon(kind: ListKind) -> &'static str {
@@ -121,30 +122,32 @@ pub async fn view(ctx: &mut Ctx<'_>, draft_id: Uuid) -> Result<Ui, Fail> {
     let household_id = ctx.household()?.id;
     let view = draft::view(&mut *ctx.conn, household_id, draft_id, ctx.now).await?;
 
+    let screen = Screen::Draft { draft_id };
     match view.draft.status {
         DraftStatus::Applied => return saved(ctx, &view).await,
         DraftStatus::Cancelled | DraftStatus::Rejected => {
-            return Ok(closed("Черновик отменён.", "Ничего не сохранено."));
+            return Ok(closed("Черновик отменён.", "Ничего не сохранено.", &screen));
         }
-        DraftStatus::Expired => return Ok(expired()),
-        DraftStatus::Pending if view.draft.is_expired(ctx.now) => return Ok(expired()),
+        DraftStatus::Expired => return Ok(expired(&screen)),
+        DraftStatus::Pending if view.draft.is_expired(ctx.now) => return Ok(expired(&screen)),
         DraftStatus::Pending => {}
     }
     Ok(card(ctx, &view))
 }
 
-fn expired() -> Ui {
+fn expired(screen: &Screen) -> Ui {
     closed(
         "Черновик устарел.",
         "Он хранится 15 минут. Отправьте текст ещё раз, и я разберу его заново.",
+        screen,
     )
 }
 
-fn closed(title: &str, hint: &str) -> Ui {
+fn closed(title: &str, hint: &str, screen: &Screen) -> Ui {
     Ui::new()
         .heading(title)
         .text(hint)
-        .row(vec![back_button("🏠 Меню", Screen::Menu)])
+        .row(nav_row(screen, Screen::Menu))
 }
 
 fn card(ctx: &Ctx<'_>, view: &DraftView) -> Ui {
@@ -301,7 +304,13 @@ async fn saved(ctx: &mut Ctx<'_>, view: &DraftView) -> Result<Ui, Fail> {
     }
 
     if created.is_empty() {
-        return Ok(closed("Сохранение отменено.", "Эти элементы удалены."));
+        return Ok(closed(
+            "Сохранение отменено.",
+            "Эти элементы удалены.",
+            &Screen::Draft {
+                draft_id: view.draft.id,
+            },
+        ));
     }
 
     let mut ui = Ui::new().heading(format!(
@@ -330,7 +339,12 @@ async fn saved(ctx: &mut Ctx<'_>, view: &DraftView) -> Result<Ui, Fail> {
             },
         ));
     }
-    buttons.push(back_button("🏠 Меню", Screen::Menu));
+    buttons.extend(nav_row(
+        &Screen::Draft {
+            draft_id: view.draft.id,
+        },
+        Screen::Menu,
+    ));
     Ok(ui.row(buttons))
 }
 

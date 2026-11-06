@@ -495,7 +495,7 @@ async fn the_invite_limit_is_audited() {
 
     for _ in 0..5 {
         owner.press("Создать приглашение").await;
-        owner.press("Все приглашения").await;
+        owner.press("Назад").await;
     }
     owner.press("Создать приглашение").await;
 
