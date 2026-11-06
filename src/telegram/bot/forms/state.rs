@@ -2,7 +2,6 @@
 
 use chrono::{Datelike, NaiveDate};
 
-use crate::domain::models::{ListKind, RecurrenceFreq};
 use crate::domain::validation::{
     MAX_NOTES, MAX_SUBTASKS, MAX_TAG, MAX_TAGS, MAX_TITLE, MAX_UNIT, sanitize,
 };
@@ -10,9 +9,7 @@ use crate::telegram::ru;
 
 use super::MAX_QUANTITY;
 use crate::telegram::bot::Ctx;
-use crate::telegram::bot::model::{
-    Choice, ItemDraft, ItemForm, RecurrenceDraft, Step, SubtaskDraft,
-};
+use crate::telegram::bot::model::{Choice, ItemDraft, RecurrenceDraft, Step, SubtaskDraft};
 
 pub(super) fn today(ctx: &Ctx<'_>) -> NaiveDate {
     ctx.now.with_timezone(&ctx.tz).date_naive()
@@ -198,50 +195,18 @@ pub(super) fn apply_text(
         | Step::Tags
         | Step::Recurrence
         | Step::Weekdays
-        | Step::MonthRule
-        | Step::Preview => {
+        | Step::MonthRule => {
             return Err("Здесь нужно нажать кнопку.".to_owned());
         }
     }
     Ok(())
 }
 
-/// Следующий шаг создания после завершённого.
-pub(super) fn advance(form: &mut ItemForm, finished: Step) {
-    let shopping = form.kind != ListKind::Tasks;
-    let (next, leaf) = match finished {
-        Step::List => (Step::Title, false),
-        Step::Title => (if shopping { Step::Quantity } else { Step::Due }, true),
-        Step::Due | Step::DueText => (Step::Priority, true),
-        Step::Priority => (Step::Assignee, true),
-        Step::Assignee => (if shopping { Step::Preview } else { Step::Tags }, true),
-        Step::Tags | Step::NewTag => (Step::Subtasks, true),
-        Step::Subtasks => (Step::Recurrence, true),
-        Step::Recurrence => match form.draft.recurrence.as_ref().map(|rule| rule.freq) {
-            None => (Step::Preview, true),
-            Some(RecurrenceFreq::Weekly) => (Step::Weekdays, false),
-            Some(RecurrenceFreq::Monthly) => (Step::MonthRule, false),
-            Some(_) => (Step::Interval, false),
-        },
-        Step::Weekdays | Step::MonthRule => (Step::Interval, false),
-        Step::Interval => (Step::Preview, false),
-        Step::Quantity => (Step::Unit, true),
-        Step::Unit | Step::Notes | Step::Preview => (Step::Preview, false),
-    };
-    form.step = if form.from_preview && leaf {
-        Step::Preview
-    } else {
-        next
-    };
-    if form.step == Step::Preview {
-        form.from_preview = false;
-    }
-    form.error = None;
-}
-
 #[cfg(test)]
 mod tests {
     use chrono::NaiveTime;
+
+    use crate::domain::models::RecurrenceFreq;
 
     use super::*;
 
@@ -361,53 +326,5 @@ mod tests {
             draft.recurrence.as_ref().map(|rule| rule.weekdays.clone()),
             Some(vec![1])
         );
-    }
-
-    #[test]
-    fn creation_flow_skips_to_preview_when_editing_from_it() {
-        let mut form = ItemForm {
-            list_id: None,
-            kind: ListKind::Tasks,
-            step: Step::Due,
-            draft: ItemDraft::default(),
-            from_preview: true,
-            error: None,
-            duplicate: None,
-            target: None,
-            quick: false,
-        };
-
-        advance(&mut form, Step::Due);
-        assert_eq!(form.step, Step::Preview);
-        assert!(!form.from_preview);
-
-        form.step = Step::Title;
-        advance(&mut form, Step::Title);
-        assert_eq!(form.step, Step::Due);
-    }
-
-    #[test]
-    fn recurrence_choice_chains_to_details_even_from_preview() {
-        let mut form = ItemForm {
-            list_id: None,
-            kind: ListKind::Tasks,
-            step: Step::Recurrence,
-            draft: ItemDraft {
-                recurrence: Some(RecurrenceDraft::new(RecurrenceFreq::Weekly, 1)),
-                ..ItemDraft::default()
-            },
-            from_preview: true,
-            error: None,
-            duplicate: None,
-            target: None,
-            quick: false,
-        };
-
-        advance(&mut form, Step::Recurrence);
-        assert_eq!(form.step, Step::Weekdays);
-        advance(&mut form, Step::Weekdays);
-        assert_eq!(form.step, Step::Interval);
-        advance(&mut form, Step::Interval);
-        assert_eq!(form.step, Step::Preview);
     }
 }

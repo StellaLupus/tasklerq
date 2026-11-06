@@ -1,21 +1,20 @@
 //! Экраны форм.
 
-use crate::domain::error::DomainError;
-use crate::domain::models::{ItemPriority, List, ListKind, MonthRule, RecurrenceFreq};
+use crate::domain::models::{ItemPriority, MonthRule, RecurrenceFreq};
 use crate::domain::validation::{MAX_SUBTASKS, MAX_TAGS};
-use crate::storage::repositories::{lists, tags, users};
+use crate::storage::repositories::{tags, users};
 use crate::telegram::rich::{Button, button};
 use crate::telegram::ru;
 use crate::telegram::views::{self, Lookup};
 
-use super::{MAX_QUANTITY, lists_of_kind};
-use crate::telegram::bot::card::{describe_recurrence_draft, priority_label};
+use super::MAX_QUANTITY;
+use crate::telegram::bot::card::priority_label;
 use crate::telegram::bot::model::{
-    Action, Choice, Form, FormAct, ItemDraft, ItemForm, Screen, Step, TimeField, Ui,
+    Action, Choice, Form, FormAct, ItemDraft, Screen, Step, TimeField, Ui,
 };
 use crate::telegram::bot::onboarding;
 use crate::telegram::bot::screens::{clip, nav_row};
-use crate::telegram::bot::{Ctx, Fail, into_sqlx};
+use crate::telegram::bot::{Ctx, Fail};
 
 use super::editor;
 
@@ -70,7 +69,6 @@ pub async fn view(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
 
     match form {
         Form::Onboarding { name } => Ok(onboarding::view(name.as_deref())),
-        Form::Create(form) => create_view(ctx, form).await,
         Form::Editor(editor_form) => editor::view(ctx, editor_form).await,
         Form::LegacyEdit => Ok(Ui::new()
             .heading("Правка устарела")
@@ -123,172 +121,6 @@ fn time_title(field: TimeField) -> &'static str {
 /// Показываются над вопросом шага, чтобы после удаления ответа пользователя
 /// введённое значение оставалось видимым. На первом шаге черновик пуст и
 /// сводки нет; предпросмотр показывает карточку целиком и сводку не получает.
-async fn draft_summary(
-    ctx: &mut Ctx<'_>,
-    draft: &ItemDraft,
-    shopping: bool,
-) -> Result<Vec<String>, Fail> {
-    let mut lines = Vec::new();
-    if !draft.title.trim().is_empty() {
-        lines.push(format!("Название: {}", clip(&draft.title, 80)));
-    }
-    // Сводка не должна ломать экран шага: неразрешимый локальный срок
-    // покажет предпросмотр, а здесь строка просто пропускается.
-    if let Ok((due_at, due_date)) = draft.due(ctx.tz)
-        && let Some(due) = ru::due_label(due_at, due_date, ctx.tz, ctx.now)
-    {
-        lines.push(format!("Срок: {}", ru::capitalize(&due)));
-    }
-    if !shopping && draft.priority != ItemPriority::Normal {
-        lines.push(format!("Приоритет: {}", priority_label(draft.priority)));
-    }
-    if let Some(assignee) = draft.assignee {
-        let household_id = ctx.household()?.id;
-        let name = match users::get(&mut *ctx.conn, household_id, assignee).await {
-            Ok(user) => user.display_name,
-            // Исполнителя могли удалить: показываем прочерк, а не сбой.
-            Err(DomainError::NotFound) => "—".to_owned(),
-            Err(error) => return Err(Fail::Infra(into_sqlx(error))),
-        };
-        lines.push(format!("Исполнитель: {}", clip(&name, 40)));
-    }
-    if !draft.tags.is_empty() {
-        lines.push(format!("Теги: {}", clip(&draft.tags.join(", "), 80)));
-    }
-    if !draft.subtasks.is_empty() {
-        let titles: Vec<&str> = draft
-            .subtasks
-            .iter()
-            .map(|subtask| subtask.title.as_str())
-            .collect();
-        lines.push(format!("Подзадачи: {}", clip(&titles.join(", "), 80)));
-    }
-    if let Some(rule) = &draft.recurrence {
-        lines.push(format!("Повторение: {}", describe_recurrence_draft(rule)));
-    }
-    if shopping {
-        if let Some(quantity) = draft.quantity {
-            lines.push(format!(
-                "Количество: {}",
-                ru::quantity_label(quantity, draft.unit.as_deref())
-            ));
-        } else if let Some(unit) = &draft.unit {
-            lines.push(format!("Единица: {}", clip(unit, 16)));
-        }
-    }
-    if let Some(notes) = &draft.notes {
-        lines.push(format!("Описание: {}", clip(notes, 60)));
-    }
-    Ok(lines)
-}
-
-async fn create_view(ctx: &mut Ctx<'_>, form: ItemForm) -> Result<Ui, Fail> {
-    let shopping = form.kind != ListKind::Tasks;
-    let mut ui = Ui::new();
-    if let Some(error) = &form.error {
-        ui = ui.bold(format!("⚠️ {error}"));
-    }
-    if form.step != Step::Preview {
-        for line in draft_summary(ctx, &form.draft, shopping).await? {
-            ui = ui.text(line);
-        }
-    }
-    let optional_footer = |ui: Ui| {
-        ui.row(vec![
-            button("⏭ Дальше", Action::Form { act: FormAct::Skip }),
-            go_step("👁 Предпросмотр", Step::Preview),
-        ])
-        .row(vec![cancel_button()])
-    };
-
-    match form.step {
-        Step::List => {
-            ui = ui.heading("В какой список?");
-            if form.quick {
-                // Быстрая форма: один запрос всех списков, задачи затем покупки,
-                // порядок внутри типа сохраняется стабильной сортировкой.
-                let household_id = ctx.household()?.id;
-                let mut lists: Vec<List> = lists::list(&mut *ctx.conn, household_id)
-                    .await?
-                    .into_iter()
-                    .filter(|list| !list.is_archived)
-                    .collect();
-                lists.sort_by_key(|list| list.kind != ListKind::Tasks);
-                for list in lists {
-                    let icon = if list.kind == ListKind::Tasks {
-                        "📋"
-                    } else {
-                        "🛒"
-                    };
-                    let mark = if form.list_id == Some(list.id) {
-                        "● "
-                    } else {
-                        ""
-                    };
-                    ui = ui.row(vec![choose(
-                        format!("{mark}{icon} {}", clip(&list.name, 40)),
-                        Choice::List(list.id),
-                    )]);
-                }
-                Ok(ui.row(vec![
-                    go_step("👁 Предпросмотр", Step::Preview),
-                    cancel_button(),
-                ]))
-            } else {
-                // Обычная форма сохраняет тип списка и прежние подписи кнопок.
-                for list in lists_of_kind(ctx, form.kind).await? {
-                    ui = ui.row(vec![choose(clip(&list.name, 40), Choice::List(list.id))]);
-                }
-                Ok(ui.row(vec![cancel_button()]))
-            }
-        }
-        Step::Preview => preview(ctx, form, ui).await,
-        step if step.expects_text() && step != Step::Subtasks => {
-            let ui = ui
-                .heading(prompt_title(step, shopping))
-                .text(prompt_hint(step, &form.draft));
-            let ui = match step {
-                Step::Quantity => ui.row(vec![
-                    choose("1", Choice::Quantity(1.0)),
-                    choose("2", Choice::Quantity(2.0)),
-                    choose("3", Choice::Quantity(3.0)),
-                    choose("5", Choice::Quantity(5.0)),
-                ]),
-                Step::Unit => units_row(ui),
-                Step::Interval => ui.row(vec![
-                    choose("Каждый раз", Choice::Interval(1)),
-                    choose("Через раз", Choice::Interval(2)),
-                ]),
-                _ => ui,
-            };
-            Ok(if step == Step::Title {
-                ui.row(vec![cancel_button()])
-            } else if matches!(step, Step::Quantity | Step::Unit | Step::Notes) && shopping {
-                ui.row(vec![
-                    go_step("👁 Предпросмотр", Step::Preview),
-                    cancel_button(),
-                ])
-            } else {
-                optional_footer(ui)
-            })
-        }
-        step => {
-            let ui = ui.heading(prompt_title(step, shopping));
-            let ui = choice_buttons(ctx, ui, step, &form.draft).await?;
-            Ok(
-                if matches!(step, Step::Tags | Step::Subtasks | Step::Weekdays) {
-                    ui.row(vec![
-                        button(ru::APPLY_BUTTON, Action::Form { act: FormAct::Done }),
-                        cancel_button(),
-                    ])
-                } else {
-                    optional_footer(ui)
-                },
-            )
-        }
-    }
-}
-
 pub(super) fn units_row(ui: Ui) -> Ui {
     ui.row(vec![
         choose("шт", Choice::Unit("шт".into())),
@@ -320,7 +152,6 @@ pub(super) fn prompt_title(step: Step, shopping: bool) -> &'static str {
         Step::Quantity => "Сколько?",
         Step::Unit => "В чём измерять?",
         Step::Notes => "Описание",
-        Step::Preview => "Проверьте и сохраните",
     }
 }
 
@@ -491,105 +322,9 @@ pub(super) async fn choice_buttons(
         | Step::Interval
         | Step::Quantity
         | Step::Unit
-        | Step::Notes
-        | Step::Preview => {}
+        | Step::Notes => {}
     }
     Ok(ui)
-}
-
-async fn preview(ctx: &mut Ctx<'_>, form: ItemForm, mut ui: Ui) -> Result<Ui, Fail> {
-    let household_id = ctx.household()?.id;
-    let shopping = form.kind != ListKind::Tasks;
-    let draft = &form.draft;
-
-    if let Some(duplicate) = &form.duplicate {
-        return Ok(duplicate_view(ui, duplicate, &form.draft));
-    }
-
-    let list_name = match form.list_id {
-        Some(list_id) => {
-            lists::get(&mut *ctx.conn, household_id, list_id)
-                .await?
-                .name
-        }
-        None => "—".to_owned(),
-    };
-    let title = if draft.title.trim().is_empty() {
-        "(без названия)".to_owned()
-    } else {
-        draft.title.clone()
-    };
-    ui = ui
-        .bold("Проверьте и сохраните")
-        .heading(title)
-        .text(format!("Список: {list_name}"));
-
-    if shopping {
-        ui = ui.text(format!(
-            "Количество: {}",
-            ru::quantity_label(
-                draft.quantity.unwrap_or(1.0),
-                draft.unit.as_deref().or(Some("шт"))
-            )
-        ));
-    }
-    if let Some(due) = ru::due_label(draft.due(ctx.tz)?.0, draft.due(ctx.tz)?.1, ctx.tz, ctx.now) {
-        ui = ui.text(format!("📅 {}", ru::capitalize(&due)));
-    }
-    if !shopping {
-        ui = ui.text(format!("Приоритет: {}", priority_label(draft.priority)));
-    }
-    if let Some(assignee) = draft.assignee {
-        let name = users::get(&mut *ctx.conn, household_id, assignee)
-            .await
-            .map(|user| user.display_name)
-            .unwrap_or_else(|_| "—".to_owned());
-        ui = ui.text(format!("👤 {name}"));
-    }
-    if !draft.tags.is_empty() {
-        ui = ui.text(format!("🏷 {}", draft.tags.join(", ")));
-    }
-    if !draft.subtasks.is_empty() {
-        ui = ui.text(format!("🧩 Подзадач: {}", draft.subtasks.len()));
-    }
-    if let Some(rule) = &draft.recurrence {
-        ui = ui.text(format!("🔁 {}", describe_recurrence_draft(rule)));
-    }
-    if let Some(notes) = &draft.notes {
-        ui = ui.details("Описание", notes.clone());
-    }
-
-    ui = ui.row(vec![
-        button("💾 Сохранить", Action::Form { act: FormAct::Save }),
-        go_step("✏️ Название", Step::Title),
-    ]);
-    if form.quick {
-        ui = ui.row(vec![go_step("📋 Список", Step::List)]);
-    }
-    ui = if shopping {
-        ui.row(vec![
-            go_step("🔢 Количество", Step::Quantity),
-            go_step("📏 Единица", Step::Unit),
-        ])
-        .row(vec![
-            go_step("📝 Заметка", Step::Notes),
-            go_step("👤 Исполнитель", Step::Assignee),
-        ])
-    } else {
-        ui.row(vec![
-            go_step("📅 Срок", Step::Due),
-            go_step("🔴 Приоритет", Step::Priority),
-        ])
-        .row(vec![
-            go_step("👤 Исполнитель", Step::Assignee),
-            go_step("🏷 Теги", Step::Tags),
-        ])
-        .row(vec![
-            go_step("🧩 Подзадачи", Step::Subtasks),
-            go_step("🔁 Повторение", Step::Recurrence),
-        ])
-    };
-    Ok(ui.row(vec![cancel_button()]))
 }
 
 pub(super) fn duplicate_view(

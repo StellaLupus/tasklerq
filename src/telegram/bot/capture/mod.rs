@@ -16,14 +16,14 @@ use crate::domain::models::{
 };
 use crate::storage::repositories::capture_jobs::{self, NewJob};
 use crate::storage::repositories::drafts::DRAFT_TTL_MINUTES;
-use crate::storage::repositories::items;
+use crate::storage::repositories::{items, lists};
 use crate::telegram::rich::{Span, button};
 use crate::telegram::ru;
 
 use super::card::{describe_recurrence_draft, priority_label};
 use super::forms;
 use super::model::{
-    Action, DraftTarget, ItemDraft, ItemForm, RecurrenceDraft, Screen, Step, SubtaskDraft, Ui,
+    Action, Editor, EditorTarget, ItemDraft, RecurrenceDraft, Screen, Step, SubtaskDraft, Ui,
 };
 use super::screens::nav_row;
 use super::{Ctx, Fail};
@@ -478,21 +478,21 @@ pub async fn undo(ctx: &mut Ctx<'_>, draft_id: Uuid) -> Result<(), Fail> {
     ctx.present(Screen::Menu).await
 }
 
-/// «Изменить»: форма создания, заполненная элементом черновика.
+/// «Изменить»: редактор пункта черновика.
 pub async fn edit(ctx: &mut Ctx<'_>, draft_id: Uuid, index: usize) -> Result<(), Fail> {
-    open_edit(ctx, draft_id, index, Step::Preview).await
+    open_editor(ctx, draft_id, index, None).await
 }
 
-/// «Выбрать дату» в уточняющем вопросе: та же форма, сразу на шаге срока.
+/// «Выбрать дату» в уточняющем вопросе: тот же редактор сразу на поле срока.
 pub async fn edit_due(ctx: &mut Ctx<'_>, draft_id: Uuid, index: usize) -> Result<(), Fail> {
-    open_edit(ctx, draft_id, index, Step::Due).await
+    open_editor(ctx, draft_id, index, Some(Step::Due)).await
 }
 
-async fn open_edit(
+async fn open_editor(
     ctx: &mut Ctx<'_>,
     draft_id: Uuid,
     index: usize,
-    step: Step,
+    field: Option<Step>,
 ) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
     let view = draft::view(&mut *ctx.conn, household_id, draft_id, ctx.now).await?;
@@ -507,75 +507,84 @@ async fn open_edit(
         return Err(fail(DraftError::NoSuchItem(index)));
     };
 
-    let kind = checked.kind;
-    let list_id = checked.list_id;
-    let draft_item = seed(raw, &view);
-    forms::open_create(
-        ctx,
-        ItemForm {
-            list_id,
-            kind,
-            step: if list_id.is_some() { step } else { Step::List },
-            draft: draft_item,
-            from_preview: false,
-            error: None,
-            duplicate: None,
-            target: Some(DraftTarget { draft_id, index }),
-            quick: false,
+    let list_missing = checked.list_id.is_none();
+    let list = match checked.list_id {
+        Some(list_id) => lists::get_visible(&mut *ctx.conn, household_id, list_id).await?,
+        None => default_list(ctx, checked.kind).await?,
+    };
+    let values = seed(raw, &view);
+    let editor = Editor {
+        target: EditorTarget::DraftItem {
+            draft_id,
+            index,
+            kind: checked.kind,
+            list_missing,
         },
-    )
-    .await
+        field_backup: if list_missing {
+            None
+        } else {
+            field.map(|_| values.clone())
+        },
+        draft: values,
+        touched: std::collections::BTreeSet::new(),
+        field: if list_missing {
+            Some(Step::List)
+        } else {
+            field
+        },
+        field_back: None,
+        list_id: list.id,
+        error: None,
+        conflict: None,
+        duplicate: None,
+    };
+    forms::open_editor(ctx, editor).await
 }
 
-/// Сохранить результат формы в элемент черновика.
-pub async fn save_form(ctx: &mut Ctx<'_>, mut form: ItemForm) -> Result<(), Fail> {
-    let Some(target) = form.target else {
-        return Ok(());
-    };
+/// Список для пункта черновика без выбранного списка.
+async fn default_list(
+    ctx: &mut Ctx<'_>,
+    kind: ListKind,
+) -> Result<crate::domain::models::List, Fail> {
     let household_id = ctx.household()?.id;
-    let Some(list_id) = form.list_id else {
-        form.step = Step::List;
-        form.error = Some("Выберите список.".to_owned());
-        return forms::open_create(ctx, form).await;
-    };
-    let list =
-        crate::storage::repositories::lists::get_visible(&mut *ctx.conn, household_id, list_id)
-            .await?;
+    let all = lists::list(&mut *ctx.conn, household_id).await?;
+    all.iter()
+        .filter(|list| !list.is_archived)
+        .find(|list| list.kind == kind && list.is_default)
+        .or_else(|| {
+            all.iter()
+                .find(|list| !list.is_archived && list.kind == kind)
+        })
+        .or_else(|| {
+            all.iter()
+                .find(|list| !list.is_archived && list.kind == ListKind::Tasks)
+        })
+        .or_else(|| all.iter().find(|list| !list.is_archived))
+        .cloned()
+        .ok_or_else(|| Fail::User("Нет списка для сохранения.".into()))
+}
 
-    let previous = draft::view(&mut *ctx.conn, household_id, target.draft_id, ctx.now)
+/// Записать пункт в черновик и перепроверить его.
+pub(super) async fn save_draft_item(
+    ctx: &mut Ctx<'_>,
+    draft_id: Uuid,
+    index: usize,
+    list_id: Uuid,
+    values: &ItemDraft,
+) -> Result<(), Fail> {
+    let household_id = ctx.household()?.id;
+    let list = lists::get_visible(&mut *ctx.conn, household_id, list_id).await?;
+    let previous = draft::view(&mut *ctx.conn, household_id, draft_id, ctx.now)
         .await?
         .raw
-        .get(target.index)
+        .get(index)
         .and_then(|raw| raw.recurrence.as_ref().and_then(|rule| rule.until.clone()));
 
-    let item = to_raw(&form.draft, list.kind, &list.name, previous);
-    draft::replace_item(
-        &mut *ctx.conn,
-        household_id,
-        target.draft_id,
-        target.index,
-        item,
-        ctx.now,
-    )
-    .await
-    .map_err(fail)?;
-
-    forms::finish(ctx).await?;
-    ctx.toast("Изменено");
-    ctx.present(Screen::Draft {
-        draft_id: target.draft_id,
-    })
-    .await
-}
-
-/// Выйти из формы правки назад к черновику.
-pub async fn leave_form(ctx: &mut Ctx<'_>, target: DraftTarget) -> Result<(), Fail> {
-    forms::finish(ctx).await?;
-    ctx.toast("Отменено");
-    ctx.present(Screen::Draft {
-        draft_id: target.draft_id,
-    })
-    .await
+    let item = to_raw(values, list.kind, &list.name, previous);
+    draft::replace_item(&mut *ctx.conn, household_id, draft_id, index, item, ctx.now)
+        .await
+        .map_err(fail)?;
+    Ok(())
 }
 
 fn parse_priority(value: &str) -> ItemPriority {

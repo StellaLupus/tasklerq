@@ -323,6 +323,39 @@ async fn old_step_edit_json_is_reported_as_an_expired_edit() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn old_create_json_is_reported_as_an_expired_edit() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+
+    sqlx::query(
+        "INSERT INTO conversation_states (
+             chat_id, telegram_user_id, kind, data, expires_at
+         )
+         VALUES ($1, $1, 'create', $2, $3)",
+    )
+    .bind(bot.chat)
+    .bind(json!({
+        "form": "create",
+        "list_id": uuid::Uuid::nil(),
+        "kind": "tasks",
+        "step": "title",
+        "draft": {"title": "Старая форма"},
+    }))
+    .bind(bot.now + Duration::minutes(15))
+    .execute(&db.pool)
+    .await
+    .expect("legacy create state");
+
+    bot.text("Не должно упасть").await;
+    bot.assert_screen_contains("правка устарела");
+    assert!(
+        bot.fake.answers().iter().all(|(_, _, alert)| !alert),
+        "a legacy create must not raise an alert: {:?}",
+        bot.fake.answers()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn editor_expires_after_fifteen_minutes() {
     let db = db().await;
     let mut bot = onboarded(&db.pool).await;
@@ -343,6 +376,45 @@ async fn editor_expires_after_fifteen_minutes() {
             .await
             .expect("conversations");
     assert_eq!(conversations, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_editor_expiry_does_not_promise_a_card() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.press("Добавить").await;
+    bot.assert_screen_contains("Как назвать задачу?");
+
+    bot.advance(Duration::minutes(16));
+    bot.text("Позднее название").await;
+
+    bot.assert_screen_contains("Правка устарела");
+    bot.assert_has_button("В меню");
+    assert!(
+        bot.find_button("Открыть карточку").is_none(),
+        "a new element has no card to open:\n{}",
+        bot.screen()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_editor_expiry_from_a_list_offers_the_list() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.press("Задачи").await;
+    bot.press("Добавить").await;
+    bot.assert_screen_contains("Как назвать задачу?");
+
+    bot.advance(Duration::minutes(16));
+    bot.text("Позднее название").await;
+
+    bot.assert_screen_contains("Правка устарела");
+    bot.assert_has_button("К списку");
+    assert!(
+        bot.find_button("Открыть карточку").is_none(),
+        "a new element has no card to open:\n{}",
+        bot.screen()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

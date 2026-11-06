@@ -1,10 +1,9 @@
-//! Пошаговые формы: создание и редактирование элементов, поиск и ввод
-//! значений настроек.
+//! Формы бота: единый редактор элемента, поиск и ввод значений настроек.
 //!
 //! Состояние формы лежит в `conversation_states` (одна форма на чат, 15
-//! минут). Создание копит поля в черновике и сохраняет их одной операцией;
-//! редактирование применяет каждое изменение к элементу сразу, поэтому
-//! черновик там — это текущее состояние элемента.
+//! минут). Редактор копит поля в черновике и сохраняет их одной операцией:
+//! для нового элемента создаёт его, для существующего применяет изменения, для
+//! пункта черновика LLM переписывает сам пункт.
 
 use uuid::Uuid;
 
@@ -15,8 +14,8 @@ use crate::storage::repositories::{households, items, lists};
 use crate::telegram::views::{self, Lookup};
 
 use super::model::{
-    Editor, EditorTarget, FirstContactScreen, Form, ItemDraft, ItemForm, ItemSnapshot, Screen,
-    Step, TimeField,
+    Editor, EditorTarget, FirstContactScreen, Form, ItemDraft, ItemSnapshot, Screen, Step,
+    TimeField,
 };
 use super::{Ctx, Fail};
 
@@ -67,13 +66,13 @@ async fn load(ctx: &mut Ctx<'_>) -> Result<Option<Form>, Fail> {
 
 /// Разобрать состояние формы.
 ///
-/// Сохранённый JSON прежней пошаговой правки (`{"form":"edit", …}`) больше не
-/// разбирается в `Editor`: он превращается в [`Form::LegacyEdit`], и бот
-/// сообщает, что правка устарела.
+/// Сохранённый JSON прежних форм (`{"form":"create", …}`, `{"form":"edit", …}`)
+/// больше не разбирается в `Editor`: он превращается в [`Form::LegacyEdit`], и
+/// бот сообщает, что правка устарела.
 pub(super) fn parse(data: serde_json::Value) -> Option<Form> {
     match serde_json::from_value::<Form>(data.clone()) {
         Ok(form) => Some(form),
-        Err(_) if data.get("form").and_then(|form| form.as_str()) == Some("edit") => {
+        Err(_) if data.get("form").and_then(|form| form.as_str()).is_some() => {
             Some(Form::LegacyEdit)
         }
         Err(_) => None,
@@ -115,9 +114,9 @@ async fn open(ctx: &mut Ctx<'_>, form: Form) -> Result<(), Fail> {
 // Входы в формы
 // ---------------------------------------------------------------------
 
-/// Открыть готовую форму создания (правка элемента черновика capture).
-pub async fn open_create(ctx: &mut Ctx<'_>, form: ItemForm) -> Result<(), Fail> {
-    open(ctx, Form::Create(form)).await
+/// Открыть единый редактор, уже собранный вызывающей стороной.
+pub async fn open_editor(ctx: &mut Ctx<'_>, editor: Editor) -> Result<(), Fail> {
+    editor::show(ctx, editor).await
 }
 
 /// Начать создание элемента через единый редактор.
@@ -162,7 +161,7 @@ pub async fn start_new_editor(
     editor::show(ctx, editor).await
 }
 
-/// Свободный текст без формы: черновик с готовым названием.
+/// Свободный текст без формы: редактор нового элемента с готовым названием.
 pub async fn quick_add(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
     let cleaned = sanitize(text);
     let text = cleaned.trim();
@@ -184,24 +183,26 @@ pub async fn quick_add(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
         })
         .ok_or_else(|| Fail::User("Нет списка задач для сохранения.".into()))?;
 
-    open(
-        ctx,
-        Form::Create(ItemForm {
-            list_id: Some(list.id),
-            kind: ListKind::Tasks,
-            step: Step::Preview,
-            draft: ItemDraft {
-                title: text.to_owned(),
-                ..ItemDraft::default()
-            },
-            from_preview: false,
-            error: None,
-            duplicate: None,
-            target: None,
-            quick: true,
-        }),
-    )
-    .await
+    let editor = Editor {
+        target: EditorTarget::New {
+            list_id: list.id,
+            kind: list.kind,
+            back: Screen::Menu,
+        },
+        draft: ItemDraft {
+            title: text.to_owned(),
+            ..ItemDraft::default()
+        },
+        touched: std::collections::BTreeSet::new(),
+        field: None,
+        field_back: None,
+        field_backup: None,
+        list_id: list.id,
+        error: None,
+        conflict: None,
+        duplicate: None,
+    };
+    editor::show(ctx, editor).await
 }
 
 /// Открыть единый редактор существующего элемента.
@@ -217,7 +218,7 @@ pub async fn start_editor(
     let editor = Editor {
         target: EditorTarget::Item {
             item_id,
-            base: ItemSnapshot::from_item(&item),
+            base: Box::new(ItemSnapshot::from_item(&item)),
             back,
         },
         // Поле, открытое прямо из карточки, тоже должно откатываться

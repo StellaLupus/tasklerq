@@ -484,8 +484,6 @@ pub enum Step {
     Unit,
     /// Заметка.
     Notes,
-    /// Предпросмотр.
-    Preview,
 }
 
 impl Step {
@@ -554,7 +552,6 @@ impl EditorField {
             Step::List => Some(Self::List),
             Step::Quantity => Some(Self::Quantity),
             Step::Unit => Some(Self::Unit),
-            Step::Preview => None,
         }
     }
 
@@ -635,7 +632,6 @@ impl ItemSnapshot {
 /// Что правит единый редактор.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "target", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)] // одна цель редактора на чат
 pub enum EditorTarget {
     /// Новый элемент: поля ещё не записаны.
     New {
@@ -651,9 +647,22 @@ pub enum EditorTarget {
         /// Элемент.
         item_id: Uuid,
         /// Значения полей при открытии редактора.
-        base: ItemSnapshot,
+        base: Box<ItemSnapshot>,
         /// Куда вернуться после сохранения или отмены.
         back: Screen,
+    },
+    /// Пункт черновика LLM: правится в черновике, а не в элементе.
+    DraftItem {
+        /// Черновик.
+        draft_id: Uuid,
+        /// Номер элемента с нуля.
+        index: usize,
+        /// Вид списка пункта на момент открытия.
+        kind: ListKind,
+        /// У пункта не было выбранного списка: перед сохранением его нужно
+        /// выбрать.
+        #[serde(default)]
+        list_missing: bool,
     },
 }
 
@@ -701,8 +710,6 @@ pub enum FormAct {
     Choose(Choice),
     /// Перейти к шагу.
     Go(Step),
-    /// Пропустить шаг.
-    Skip,
     /// Закончить многошаговый выбор (теги, подзадачи, дни).
     Done,
     /// Вернуться в редактор с экрана поля без изменения поля.
@@ -1049,7 +1056,7 @@ pub enum Action {
         /// Какой день выбрать.
         choice: DueChoice,
     },
-    /// Открыть форму правки сразу на шаге срока.
+    /// Открыть редактор правки сразу на поле срока.
     DraftEditDue {
         /// Черновик.
         draft_id: Uuid,
@@ -1313,7 +1320,7 @@ impl ItemDraft {
             Step::Quantity => patch.quantity = self.quantity.map_or(Field::Null, Field::Value),
             Step::Unit => patch.unit = self.unit.clone().map_or(Field::Null, Field::Value),
             Step::Notes => patch.notes = self.notes.clone().map_or(Field::Null, Field::Value),
-            Step::List | Step::Preview => {}
+            Step::List => {}
         }
         Ok(patch)
     }
@@ -1355,12 +1362,11 @@ pub enum Form {
         /// Название household после первого шага.
         name: Option<String>,
     },
-    /// Создание элемента.
-    Create(ItemForm),
     /// Единый редактор существующего элемента или пункта черновика.
     Editor(Editor),
-    /// Прежняя пошаговая правка поля. В базе не создаётся; так читается
-    /// сохранённый JSON `{"form":"edit", …}` и трактуется как истёкшая правка.
+    /// Прежняя пошаговая форма или правка поля. В базе не создаётся; так
+    /// читается сохранённый JSON `{"form":"create", …}` или
+    /// `{"form":"edit", …}` и трактуется как истёкшая правка.
     #[serde(rename = "legacy_edit")]
     LegacyEdit,
     /// Ввод даты и времени для быстрого срока в карточке.
@@ -1385,41 +1391,6 @@ pub enum Form {
         /// Какое время редактируется.
         field: TimeField,
     },
-}
-
-/// Создание элемента.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ItemForm {
-    /// Список, если уже выбран.
-    pub list_id: Option<Uuid>,
-    /// Вид списка.
-    pub kind: ListKind,
-    /// Текущий шаг.
-    pub step: Step,
-    /// Заполненные поля.
-    pub draft: ItemDraft,
-    /// После шага вернуться к предпросмотру.
-    pub from_preview: bool,
-    /// Последняя ошибка ввода.
-    pub error: Option<String>,
-    /// Найденная такая же позиция списка покупок.
-    #[serde(default)]
-    pub duplicate: Option<Duplicate>,
-    /// Форма правит элемент черновика capture, а не создаёт новый.
-    #[serde(default)]
-    pub target: Option<DraftTarget>,
-    /// Быстрая форма: список и его тип можно сменить прямо из предпросмотра.
-    #[serde(default)]
-    pub quick: bool,
-}
-
-/// Элемент черновика capture, который правит форма.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DraftTarget {
-    /// Черновик.
-    pub draft_id: Uuid,
-    /// Номер элемента с нуля.
-    pub index: usize,
 }
 
 /// Позиция, которая уже есть в списке.
@@ -1473,7 +1444,6 @@ impl Form {
     pub fn kind_name(&self) -> &'static str {
         match self {
             Self::Onboarding { .. } => "onboarding",
-            Self::Create(_) => "create",
             Self::Editor(_) => "editor",
             Self::LegacyEdit => "legacy_edit",
             Self::DueText { .. } => "due_text",

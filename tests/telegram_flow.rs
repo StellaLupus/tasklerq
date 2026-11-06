@@ -568,7 +568,7 @@ async fn free_text_offers_a_draft_and_cancel_discards_it() {
     let mut bot = onboarded(&db.pool).await;
 
     bot.text("позвонить маме").await;
-    bot.assert_screen_contains("Проверьте и сохраните");
+    bot.assert_screen_contains("Название: позвонить маме");
     bot.assert_screen_contains("позвонить маме");
     bot.press("Отмена").await;
     bot.assert_screen_contains("📋 Задачи · 0");
@@ -1520,24 +1520,134 @@ async fn editor_recurrence_sets_weekdays_and_interval_on_one_screen() {
     assert_eq!(rule, (2, vec![2, 5]));
 }
 
+fn assert_no_step_buttons(bot: &Harness, context: &str) {
+    for (label, _) in bot.buttons() {
+        assert!(!label.contains("Дальше"), "{context}: {label}");
+        assert!(!label.contains("Пропустить"), "{context}: {label}");
+    }
+}
+
+async fn walk_editor_fields(bot: &mut Harness, fields: &[&str]) {
+    for field in fields {
+        bot.press(field).await;
+        assert_no_step_buttons(bot, field);
+        bot.press("Назад").await;
+        assert_no_step_buttons(bot, "editor");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn editor_and_its_fields_have_no_step_buttons() {
     let db = db().await;
     let mut bot = onboarded(&db.pool).await;
+
+    // Создание задачи: поле названия, редактор и все экраны полей.
+    bot.press("Добавить").await;
+    assert_no_step_buttons(&bot, "title");
     bot.text("Без шагов").await;
+    assert_no_step_buttons(&bot, "creation");
+    walk_editor_fields(
+        &mut bot,
+        &[
+            "Срок",
+            "Приоритет",
+            "Исполнитель",
+            "Теги",
+            "Подзадачи",
+            "Повторение",
+            "Описание",
+            "Список",
+            "Название",
+        ],
+    )
+    .await;
     bot.press("Сохранить").await;
+
+    // Правка существующей задачи.
     bot.press("Без шагов").await;
     bot.press("Изменить").await;
+    assert_no_step_buttons(&bot, "edit");
+    walk_editor_fields(
+        &mut bot,
+        &[
+            "Срок",
+            "Приоритет",
+            "Исполнитель",
+            "Теги",
+            "Подзадачи",
+            "Повторение",
+            "Описание",
+            "Список",
+            "Название",
+        ],
+    )
+    .await;
+    bot.press("Отмена").await;
+    bot.press("Назад").await;
 
-    for (label, _) in bot.buttons() {
-        assert!(!label.contains("Дальше"), "editor: {label}");
-        assert!(!label.contains("Пропустить"), "editor: {label}");
-    }
-    bot.press("Теги").await;
-    for (label, _) in bot.buttons() {
-        assert!(!label.contains("Дальше"), "field: {label}");
-        assert!(!label.contains("Пропустить"), "field: {label}");
-    }
+    // Создание покупки: другой набор полей.
+    bot.press("Добавить").await;
+    bot.text("Покупка").await;
+    bot.press("Список").await;
+    bot.press("Покупки").await;
+    assert_no_step_buttons(&bot, "purchase creation");
+    walk_editor_fields(
+        &mut bot,
+        &[
+            "Количество",
+            "Единица",
+            "Заметка",
+            "Исполнитель",
+            "Список",
+            "Название",
+        ],
+    )
+    .await;
+    bot.press("Отмена").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn existing_title_field_has_no_cancel_but_a_new_one_does() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Без отмены").await;
+    bot.press("Сохранить").await;
+    bot.press("Без отмены").await;
+    bot.press("Изменить").await;
+
+    bot.press("Название").await;
+    bot.assert_has_button("Назад");
+    assert!(
+        bot.find_button("Отмена").is_none(),
+        "an existing item must not offer cancel on the title field:\n{}",
+        bot.screen()
+    );
+    bot.press("Назад").await;
+
+    bot.press("Отмена").await;
+    bot.press("Назад").await;
+    bot.press("Добавить").await;
+    bot.assert_has_button("Отмена");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn back_on_the_first_title_screen_cancels_creation() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.press("Добавить").await;
+    bot.assert_screen_contains("Как назвать задачу?");
+
+    bot.press("Назад").await;
+
+    bot.assert_screen_contains("📋 Задачи · 0");
+    assert!(!bot.screen().contains("Название:"));
+    let household = household_of(&db.pool, bot.chat).await;
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM items WHERE household_id = $1")
+        .bind(household)
+        .fetch_one(&db.pool)
+        .await
+        .expect("count");
+    assert_eq!(count, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2224,7 +2334,7 @@ async fn text_after_notification_sends_a_new_screen_below() {
     );
     assert!(!is_alive(&bot, anchor), "the old anchor must be gone");
     assert!(is_alive(&bot, notice), "the notification must stay");
-    bot.assert_screen_contains("Проверьте и сохраните");
+    bot.assert_screen_contains("Название: купить молоко");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2431,7 +2541,7 @@ async fn text_on_visible_screen_edits_it_in_place() {
     );
     assert_eq!(bot.active().0, anchor);
     assert_eq!(bot.fake.messages(bot.chat).len(), 1);
-    bot.assert_screen_contains("Проверьте и сохраните");
+    bot.assert_screen_contains("Название: купить молоко");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2468,7 +2578,7 @@ async fn incoming_text_is_deleted_before_the_screen_is_edited() {
         "the delete must be delivered before the edit: {calls:?}"
     );
     assert_eq!(bot.active().0, anchor);
-    bot.assert_screen_contains("Проверьте и сохраните");
+    bot.assert_screen_contains("Название: купить молоко");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2555,7 +2665,7 @@ async fn failed_delete_keeps_the_result_and_sends_the_next_screen_below() {
     .expect("delete row");
     assert_eq!(status, "skipped", "an undeletable message is not an error");
 
-    bot.assert_screen_contains("Проверьте и сохраните");
+    bot.assert_screen_contains("Название: купить молоко");
     let (new_id, _) = bot.active();
     assert_ne!(new_id, anchor, "a buried screen must be sent anew");
     assert!(new_id > anchor, "the new screen must be below the old one");

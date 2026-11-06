@@ -2583,8 +2583,8 @@ async fn control_characters_are_removed_from_bot_quick_add_and_form_input() {
             .expect("conversation");
     let form: Form = serde_json::from_str(&data).expect("form data");
     match form {
-        Form::Create(form) => assert_eq!(form.draft.title, "Купить молоко"),
-        other => panic!("expected a create form, got {other:?}"),
+        Form::Editor(editor) => assert_eq!(editor.draft.title, "Купить молоко"),
+        other => panic!("expected an editor, got {other:?}"),
     }
     bot.press("Сохранить").await;
     let title: String = sqlx::query_scalar(

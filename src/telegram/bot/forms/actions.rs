@@ -2,19 +2,16 @@
 
 use uuid::Uuid;
 
-use crate::domain::models::{Item, ItemPriority, ItemStatus, List, ListKind};
+use crate::domain::models::{Item, ItemStatus, List};
 use crate::domain::recurrence::Due;
 use crate::domain::settings::{NotificationSettingsUpdate, ProfileUpdate, parse_hhmm};
-use crate::domain::validation::validate_new_item;
-use crate::storage::repositories::{items, lists, members, users};
+use crate::storage::repositories::{items, members, users};
 use crate::telegram::ru;
 use crate::telegram::views::{self};
 
-use super::state::{advance, apply_choice, apply_text, today};
-use super::{MAX_QUERY, clear, load, open, start_onboarding};
-use crate::telegram::bot::model::{
-    Choice, Form, FormAct, ItemDraft, ItemForm, Screen, Step, TimeField,
-};
+use super::state::{apply_text, today};
+use super::{MAX_QUERY, clear, load, start_onboarding};
+use crate::telegram::bot::model::{Form, FormAct, ItemDraft, Screen, Step, TimeField};
 use crate::telegram::bot::onboarding;
 use crate::telegram::bot::settings::{self, ReleaseTrigger};
 use crate::telegram::bot::{Ctx, Fail};
@@ -29,7 +26,6 @@ use super::editor;
 pub async fn on_text(ctx: &mut Ctx<'_>, form: Form, text: &str) -> Result<(), Fail> {
     match form {
         Form::Onboarding { name } => onboarding::on_text(ctx, name, text).await,
-        Form::Create(form) => create_text(ctx, form, text).await,
         Form::Editor(editor_form) => editor::on_text(ctx, editor_form, text).await,
         Form::LegacyEdit => legacy_expired(ctx).await,
         Form::DueText {
@@ -220,27 +216,6 @@ async fn delete_household(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
         .await
 }
 
-async fn create_text(ctx: &mut Ctx<'_>, mut form: ItemForm, text: &str) -> Result<(), Fail> {
-    let step = form.step;
-    let today = today(ctx);
-    let now_time = ctx.now.with_timezone(&ctx.tz).time();
-    match apply_text(step, &mut form.draft, text, today, now_time) {
-        Ok(()) => {
-            match step {
-                // Теги и подзадачи добавляются по одному, форма остаётся на шаге.
-                Step::NewTag => form.step = Step::Tags,
-                Step::Subtasks => form.error = None,
-                _ => advance(&mut form, step),
-            }
-            open(ctx, Form::Create(form)).await
-        }
-        Err(message) => {
-            form.error = Some(message);
-            open(ctx, Form::Create(form)).await
-        }
-    }
-}
-
 async fn due_text(
     ctx: &mut Ctx<'_>,
     item_id: Uuid,
@@ -285,7 +260,6 @@ pub async fn on_action(ctx: &mut Ctx<'_>, act: FormAct) -> Result<(), Fail> {
         return super::expired(ctx).await;
     };
     match form {
-        Form::Create(form) => create_action(ctx, form, act).await,
         Form::Editor(editor_form) => editor::on_action(ctx, editor_form, act).await,
         Form::LegacyEdit => legacy_expired(ctx).await,
         Form::DueText { item_id, back, .. } => {
@@ -316,204 +290,6 @@ pub async fn on_action(ctx: &mut Ctx<'_>, act: FormAct) -> Result<(), Fail> {
             ctx.present(back).await
         }
     }
-}
-
-async fn create_action(ctx: &mut Ctx<'_>, mut form: ItemForm, act: FormAct) -> Result<(), Fail> {
-    let today = today(ctx);
-    match act {
-        FormAct::Cancel => {
-            if let Some(target) = form.target {
-                return crate::telegram::bot::capture::leave_form(ctx, target).await;
-            }
-            clear(ctx).await?;
-            ctx.toast("Отменено");
-            ctx.present(Screen::Menu).await
-        }
-        FormAct::Choose(Choice::List(list_id)) => {
-            if form.quick {
-                let household_id = ctx.household()?.id;
-                let list = lists::get_visible(&mut *ctx.conn, household_id, list_id).await?;
-                switch_list(&mut form, &list);
-                return open(ctx, Form::Create(form)).await;
-            }
-            form.list_id = Some(list_id);
-            advance(&mut form, Step::List);
-            open(ctx, Form::Create(form)).await
-        }
-        FormAct::Choose(choice) => {
-            let step = form.step;
-            match apply_choice(&mut form.draft, choice, today) {
-                Ok(()) => {
-                    match step {
-                        // Многошаговые выборы остаются на экране до «Применить».
-                        Step::Tags | Step::Subtasks | Step::Weekdays => form.error = None,
-                        _ => advance(&mut form, step),
-                    }
-                }
-                Err(message) => form.error = Some(message),
-            }
-            open(ctx, Form::Create(form)).await
-        }
-        FormAct::Go(step) => {
-            form.from_preview = form.step == Step::Preview;
-            form.step = step;
-            form.error = None;
-            open(ctx, Form::Create(form)).await
-        }
-        FormAct::Skip | FormAct::Done => {
-            let step = form.step;
-            advance(&mut form, step);
-            open(ctx, Form::Create(form)).await
-        }
-        // Кнопки редактора не должны двигать шаг чужого мастера: старый
-        // токен просто перерисовывает текущий экран.
-        FormAct::Back | FormAct::Conflict { .. } => open(ctx, Form::Create(form)).await,
-        FormAct::Save | FormAct::SaveAnyway if form.target.is_some() => {
-            crate::telegram::bot::capture::save_form(ctx, form).await
-        }
-        FormAct::Save => save_create(ctx, form, false).await,
-        FormAct::SaveAnyway => save_create(ctx, form, true).await,
-        FormAct::Increase {
-            item_id,
-            quantity,
-            version,
-        } => increase(ctx, item_id, quantity, version, form).await,
-    }
-}
-
-/// Переключить быструю форму на другой список, сбросив поля другого типа.
-fn switch_list(form: &mut ItemForm, list: &List) {
-    let was_shopping = form.kind != ListKind::Tasks;
-    let shopping = list.kind != ListKind::Tasks;
-    if was_shopping != shopping {
-        if shopping {
-            // У покупки нет срока, приоритета, тегов, подзадач и повторения:
-            // не сохраняем скрытые значения задачи.
-            form.draft.date = None;
-            form.draft.time = None;
-            form.draft.priority = ItemPriority::Normal;
-            form.draft.tags.clear();
-            form.draft.subtasks.clear();
-            form.draft.recurrence = None;
-        } else {
-            form.draft.quantity = None;
-            form.draft.unit = None;
-        }
-    }
-    form.kind = list.kind;
-    form.list_id = Some(list.id);
-    form.step = Step::Preview;
-    form.from_preview = false;
-    form.error = None;
-    form.duplicate = None;
-}
-
-async fn increase(
-    ctx: &mut Ctx<'_>,
-    item_id: Uuid,
-    quantity: f64,
-    version: i32,
-    form: ItemForm,
-) -> Result<(), Fail> {
-    let household = ctx.household()?.clone();
-    let actor = ctx.actor()?;
-    let patch = crate::domain::models::ItemPatch {
-        quantity: crate::domain::models::Field::Value(quantity),
-        ..Default::default()
-    };
-    items::update(
-        &mut *ctx.conn,
-        household.id,
-        &actor,
-        item_id,
-        version,
-        patch,
-        &household.timezone,
-        ctx.now,
-    )
-    .await?;
-    clear(ctx).await?;
-    ctx.toast("Количество увеличено");
-    match form.list_id {
-        Some(list_id) => {
-            ctx.present(Screen::List {
-                list_id,
-                page: 0,
-                edit: false,
-                from_lists: false,
-            })
-            .await
-        }
-        None => ctx.present(Screen::Menu).await,
-    }
-}
-
-async fn save_create(
-    ctx: &mut Ctx<'_>,
-    mut form: ItemForm,
-    allow_duplicate: bool,
-) -> Result<(), Fail> {
-    let household = ctx.household()?.clone();
-    let actor = ctx.actor()?;
-    let Some(list_id) = form.list_id else {
-        form.step = Step::List;
-        form.error = Some("Выберите список.".to_owned());
-        return open(ctx, Form::Create(form)).await;
-    };
-    let list = lists::get_visible(&mut *ctx.conn, household.id, list_id).await?;
-
-    if form.draft.title.trim().is_empty() {
-        form.step = Step::Title;
-        form.error = Some("Название не может быть пустым.".to_owned());
-        return open(ctx, Form::Create(form)).await;
-    }
-    let due = form.draft.due(ctx.tz)?;
-    if due.0.is_some_and(|at| at < ctx.now) || due.1.is_some_and(|date| date < today(ctx)) {
-        form.step = Step::Due;
-        form.error = Some("Срок уже прошёл.".to_owned());
-        return open(ctx, Form::Create(form)).await;
-    }
-
-    if list.kind != ListKind::Tasks
-        && !allow_duplicate
-        && let Some(existing) = find_duplicate(ctx, &list, &form.draft.title).await?
-    {
-        form.duplicate = Some(existing);
-        form.step = Step::Preview;
-        return open(ctx, Form::Create(form)).await;
-    }
-
-    let new_item = form.draft.to_new_item(list.id, ctx.tz, list.kind)?;
-    let today = today(ctx);
-    let validated = match validate_new_item(list.kind, &household.timezone, new_item, today) {
-        Ok(validated) => validated,
-        Err(_) => {
-            form.error = Some("Не получилось сохранить: проверьте введённые данные.".to_owned());
-            form.step = Step::Preview;
-            return open(ctx, Form::Create(form)).await;
-        }
-    };
-    let assignee = form.draft.assignee;
-    items::create(
-        &mut *ctx.conn,
-        household.id,
-        &actor,
-        list.id,
-        validated,
-        assignee,
-        ctx.now,
-    )
-    .await?;
-
-    clear(ctx).await?;
-    ctx.toast("Сохранено");
-    ctx.present(Screen::List {
-        list_id: list.id,
-        page: 0,
-        edit: false,
-        from_lists: false,
-    })
-    .await
 }
 
 pub(super) async fn find_duplicate(

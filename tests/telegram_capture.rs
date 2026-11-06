@@ -360,8 +360,12 @@ async fn editing_an_item_goes_through_the_form_and_back_to_the_card() {
     stand.capture("позвонить маме и купить молоко").await;
 
     stand.bot.press("Изменить 1").await;
-    stand.bot.assert_screen_contains("Проверьте и сохраните");
+    stand.bot.assert_screen_contains("Название: Позвонить маме");
     stand.bot.assert_screen_contains("Позвонить маме");
+    for (label, _) in stand.bot.buttons() {
+        assert!(!label.contains("Дальше"), "draft editor: {label}");
+        assert!(!label.contains("Пропустить"), "draft editor: {label}");
+    }
 
     stand.bot.press("Название").await;
     stand.bot.text("Позвонить бабушке").await;
@@ -386,6 +390,34 @@ async fn editing_an_item_goes_through_the_form_and_back_to_the_card() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editing_a_draft_item_changes_only_the_draft_and_keeps_the_quote() {
+    let db = db().await;
+    let mut stand = stand(&db.pool, vec![Ok(two_items())]).await;
+    let text = "позвонить маме и купить молоко";
+    stand.capture(text).await;
+
+    stand.bot.press("Изменить 1").await;
+    stand.bot.assert_screen_contains("Название: Позвонить маме");
+    stand.bot.press("Срок").await;
+    stand.bot.press("Завтра").await;
+    stand.bot.assert_screen_contains("Срок: Завтра");
+    stand.bot.press("Сохранить").await;
+
+    stand.bot.assert_screen_contains("Разобрал: 2 позиции");
+    stand.bot.assert_screen_contains("Срок: завтра");
+    let html = stand.bot.screen();
+    assert!(
+        html.contains("<blockquote>") && html.contains(text),
+        "the quote must survive the return from the editor:\n{html}"
+    );
+    assert_eq!(
+        stand.household_items().await,
+        0,
+        "editing a draft item creates nothing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn leaving_the_edit_form_returns_to_the_unchanged_card() {
     let db = db().await;
     let mut stand = stand(&db.pool, vec![Ok(two_items())]).await;
@@ -396,6 +428,59 @@ async fn leaving_the_edit_form_returns_to_the_unchanged_card() {
 
     stand.bot.assert_screen_contains("Разобрал: 2 позиции");
     stand.bot.assert_screen_contains("Молоко");
+    let html = stand.bot.screen();
+    assert!(
+        html.contains("<blockquote>"),
+        "the quote must survive cancelling the edit:\n{html}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn draft_item_without_a_list_requires_the_list_field() {
+    let db = db().await;
+    let items = json!({"items": [{"target_kind": "checklist", "title": "Проверка"}]});
+    let mut stand = stand(&db.pool, vec![Ok(items)]).await;
+    stand.capture("сделать проверку").await;
+
+    stand.bot.assert_screen_contains("Нет подходящего списка");
+    stand.bot.press("Изменить 1").await;
+    stand.bot.assert_screen_contains("В какой список?");
+
+    stand.bot.press("Назад").await;
+    stand.bot.press("Сохранить").await;
+    stand.bot.assert_screen_contains("Выберите список.");
+    stand.bot.assert_screen_contains("В какой список?");
+
+    stand.bot.press("Задачи").await;
+    stand.bot.assert_screen_contains("Список: Задачи");
+    stand.bot.press("Сохранить").await;
+    stand.bot.assert_screen_contains("Проверка");
+    stand.bot.assert_screen_contains("Список: Задачи");
+    assert_eq!(
+        stand.household_items().await,
+        0,
+        "fixing a draft item creates nothing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_draft_editor_returns_to_the_draft_without_a_card_promise() {
+    let db = db().await;
+    let mut stand = stand(&db.pool, vec![Ok(two_items())]).await;
+    stand.capture("позвонить маме и купить молоко").await;
+
+    stand.bot.press("Изменить 1").await;
+    stand.bot.assert_screen_contains("Название: Позвонить маме");
+    stand.bot.advance(Duration::minutes(16));
+    stand.bot.text("Поздний ответ").await;
+
+    stand.bot.assert_screen_contains("Правка устарела");
+    stand.bot.assert_has_button("К черновику");
+    assert!(
+        stand.bot.find_button("Открыть карточку").is_none(),
+        "a draft item is not a card:\n{}",
+        stand.bot.screen()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -780,10 +865,20 @@ async fn failed_parse_opens_the_manual_form_with_the_source_text() {
     stand.bot.text("купить молоко").await;
     assert_eq!(stand.work().await, Pass::Dead);
 
-    stand.bot.assert_screen_contains("Проверьте и сохраните");
-    stand.bot.assert_screen_contains("купить молоко");
+    stand
+        .bot
+        .assert_screen_contains("Не получилось разобрать сообщение");
+    stand.bot.assert_screen_contains("Название: купить молоко");
+    stand.bot.assert_screen_contains("Список: Задачи");
+    for (label, _) in stand.bot.buttons() {
+        assert!(!label.contains("Дальше"), "quick form: {label}");
+        assert!(!label.contains("Пропустить"), "quick form: {label}");
+    }
     stand.bot.assert_has_button("Сохранить");
     assert_eq!(stand.ai.calls(), 1);
+
+    stand.bot.press("Сохранить").await;
+    assert_eq!(stand.household_items().await, 1, "saving creates the task");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -797,7 +892,9 @@ async fn circuit_breaker_skips_the_llm_after_five_failures_and_recovers() {
     for number in 1..=5 {
         stand.bot.text(&format!("дело {number}")).await;
         assert_eq!(stand.work().await, Pass::Dead);
-        stand.bot.assert_screen_contains("Проверьте и сохраните");
+        stand
+            .bot
+            .assert_screen_contains(&format!("Название: дело {number}"));
         stand.bot.press("Отмена").await;
     }
     assert_eq!(stand.ai.calls(), 5);
@@ -922,7 +1019,7 @@ async fn disabled_llm_opens_the_manual_form_without_queueing() {
 
     stand.bot.text("купить хлеб").await;
 
-    stand.bot.assert_screen_contains("Проверьте и сохраните");
+    stand.bot.assert_screen_contains("Название: купить хлеб");
     stand.bot.assert_screen_contains("купить хлеб");
     assert_eq!(stand.jobs().await, 0);
     assert_eq!(stand.ai.calls(), 0);
@@ -1144,7 +1241,9 @@ async fn quick_form_switches_to_a_shopping_list_and_saves_there() {
     let mut stand = stand_with(&db.pool, vec![], DEFAULT_DAILY_QUOTA, false).await;
 
     stand.bot.text("купить молоко 2 л").await;
-    stand.bot.assert_screen_contains("Проверьте и сохраните");
+    stand
+        .bot
+        .assert_screen_contains("Название: купить молоко 2 л");
     stand.bot.assert_has_button("Список");
     stand.bot.press("Список").await;
     stand.bot.assert_screen_contains("В какой список?");
@@ -1203,24 +1302,43 @@ async fn quick_form_can_pick_another_tasks_list_without_changing_the_type() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn switching_to_shopping_drops_the_task_due_date() {
+async fn switching_to_shopping_drops_task_fields_and_back() {
     let db = db().await;
     let mut stand = stand_with(&db.pool, vec![], DEFAULT_DAILY_QUOTA, false).await;
 
     stand.bot.text("позвонить маме").await;
     stand.bot.press("Срок").await;
     stand.bot.press("Завтра").await;
-    stand.bot.assert_screen_contains("📅");
+    stand.bot.assert_screen_contains("Срок: Завтра");
+    stand.bot.press("Теги").await;
+    stand.bot.press("Новый тег").await;
+    stand.bot.text("дом").await;
+    stand.bot.press("Применить").await;
+    stand.bot.assert_screen_contains("Теги: дом");
 
     stand.bot.press("Список").await;
     stand.bot.press("Покупки").await;
     assert!(
-        !stand.bot.screen().contains("📅"),
-        "the shopping preview must not keep the task due date:\n{}",
+        !stand.bot.screen().contains("Срок:"),
+        "the shopping editor must not keep the task due date:\n{}",
+        stand.bot.screen()
+    );
+    assert!(
+        !stand.bot.screen().contains("Теги:"),
+        "the shopping editor must not keep task tags:\n{}",
         stand.bot.screen()
     );
     stand.bot.assert_screen_contains("Количество:");
 
+    // Обратно в задачу: поля покупки сброшены, поля задачи пусты.
+    stand.bot.press("Список").await;
+    stand.bot.press("Задачи").await;
+    stand.bot.assert_screen_contains("Срок: без срока");
+    stand.bot.assert_screen_contains("Теги: нет");
+
+    // Покупка без срока и тегов сохраняется.
+    stand.bot.press("Список").await;
+    stand.bot.press("Покупки").await;
     stand.bot.press("Сохранить").await;
     let saved: (
         String,
@@ -1282,18 +1400,17 @@ async fn add_second_tasks_list(pool: &sqlx::PgPool, telegram_id: i64) -> uuid::U
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn quick_form_can_return_from_list_step_to_preview() {
+async fn quick_form_can_return_from_list_step_to_the_editor() {
     let db = db().await;
     let mut stand = stand_with(&db.pool, vec![], DEFAULT_DAILY_QUOTA, false).await;
 
     stand.bot.text("позвонить маме").await;
     stand.bot.press("Список").await;
     stand.bot.assert_screen_contains("В какой список?");
-    stand.bot.assert_has_button("Предпросмотр");
+    stand.bot.assert_has_button("Назад");
 
-    stand.bot.press("Предпросмотр").await;
-    stand.bot.assert_screen_contains("Проверьте и сохраните");
-    stand.bot.assert_screen_contains("позвонить маме");
+    stand.bot.press("Назад").await;
+    stand.bot.assert_screen_contains("Название: позвонить маме");
     stand.bot.assert_screen_contains("Список: Задачи");
 
     let saved: i64 = sqlx::query_scalar(
@@ -1305,7 +1422,7 @@ async fn quick_form_can_return_from_list_step_to_preview() {
     .fetch_one(&db.pool)
     .await
     .expect("items");
-    assert_eq!(saved, 0, "returning to the preview must not save the form");
+    assert_eq!(saved, 0, "returning from the list must not save the form");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1353,6 +1470,11 @@ async fn quick_purchase_to_task_drops_quantity_and_unit() {
     stand.bot.press("Список").await;
     stand.bot.press("Задачи").await;
     stand.bot.assert_screen_contains("Список: Задачи");
+    assert!(
+        !stand.bot.screen().contains("Количество:"),
+        "the task editor must not keep the purchase quantity:\n{}",
+        stand.bot.screen()
+    );
     stand.bot.press("Сохранить").await;
 
     let saved: (String, Option<f64>, Option<String>) = sqlx::query_as(
@@ -1381,14 +1503,13 @@ async fn quick_task_to_purchase_drops_priority_tags_and_recurrence() {
     stand.bot.press("Новый тег").await;
     stand.bot.text("дом").await;
     stand.bot.press("Применить").await;
-    stand.bot.assert_screen_contains("Подзадачи");
+    stand.bot.assert_screen_contains("Теги: дом");
+    stand.bot.press("Подзадачи").await;
     stand.bot.press("Применить").await;
-    stand.bot.assert_screen_contains("Как часто повторять?");
+    stand.bot.press("Повторение").await;
     stand.bot.press("Каждый день").await;
-    stand.bot.press("Каждый раз").await;
-    stand.bot.assert_screen_contains("Проверьте и сохраните");
-    stand.bot.assert_screen_contains("🏷 дом");
-    stand.bot.assert_screen_contains("🔁");
+    stand.bot.press("Применить").await;
+    stand.bot.assert_screen_contains("Повторение: Каждый день");
 
     stand.bot.press("Список").await;
     stand.bot.press("Покупки").await;

@@ -18,46 +18,54 @@ use super::state::{apply_choice, apply_text, today};
 use super::view::{choice_buttons, prompt_hint, prompt_title, units_row};
 use crate::telegram::bot::card::{describe_recurrence_draft, priority_label};
 use crate::telegram::bot::model::{
-    Action, Choice, Editor, EditorField, EditorTarget, Form, FormAct, ItemDraft, ItemSnapshot,
-    RecurrenceDraft, Screen, Step, Ui, screen_heading, screen_heading_with,
+    Action, Choice, Duplicate, Editor, EditorField, EditorTarget, Form, FormAct, ItemDraft,
+    ItemSnapshot, RecurrenceDraft, Screen, Step, Ui, screen_heading, screen_heading_with,
 };
 use crate::telegram::bot::screens::clip;
 use crate::telegram::bot::{Ctx, Fail, into_sqlx};
 
 impl Editor {
-    /// Элемент, который правит редактор; у создания его ещё нет.
-    fn item_id(&self) -> Option<Uuid> {
-        match &self.target {
-            EditorTarget::New { .. } => None,
-            EditorTarget::Item { item_id, .. } => Some(*item_id),
-        }
-    }
-
     /// Редактор создаёт новый элемент.
     fn is_new(&self) -> bool {
         matches!(self.target, EditorTarget::New { .. })
     }
 
-    /// Куда вернуться после сохранения или отмены.
-    fn back(&self) -> &Screen {
+    /// Редактор правит пункт черновика LLM.
+    fn is_draft_item(&self) -> bool {
+        matches!(self.target, EditorTarget::DraftItem { .. })
+    }
+
+    /// Экран «Список» переключает и тип: так создают элемент и правят пункт
+    /// черновика без выбранного списка.
+    fn allows_list_switch(&self) -> bool {
+        self.is_new() || self.is_draft_item()
+    }
+
+    /// Идентификатор элемента и экран возврата в одном разборе цели.
+    fn screen_parts(&self) -> (Option<Uuid>, Screen) {
         match &self.target {
-            EditorTarget::New { back, .. } | EditorTarget::Item { back, .. } => back,
+            EditorTarget::New { back, .. } => (None, back.clone()),
+            EditorTarget::Item { item_id, back, .. } => (Some(*item_id), back.clone()),
+            EditorTarget::DraftItem { draft_id, .. } => (
+                None,
+                Screen::Draft {
+                    draft_id: *draft_id,
+                },
+            ),
         }
     }
 
-    /// Снимок значений при открытии.
-    fn base(&self) -> Option<&ItemSnapshot> {
-        match &self.target {
-            EditorTarget::New { .. } => None,
-            EditorTarget::Item { base, .. } => Some(base),
-        }
+    /// Куда вернуться после сохранения или отмены.
+    fn back(&self) -> Screen {
+        self.screen_parts().1
     }
 
     /// Экран редактора для `telegram_views`.
     fn screen(&self) -> Screen {
+        let (item_id, back) = self.screen_parts();
         Screen::Editor {
-            item_id: self.item_id(),
-            back: Box::new(self.back().clone()),
+            item_id,
+            back: Box::new(back),
         }
     }
 }
@@ -72,7 +80,15 @@ pub(super) async fn show(ctx: &mut Ctx<'_>, editor: Editor) -> Result<(), Fail> 
 /// Экран редактора из `telegram_views`: живое состояние или «устарела».
 pub async fn screen(ctx: &mut Ctx<'_>, item_id: Option<Uuid>, back: &Screen) -> Result<Ui, Fail> {
     match super::load(ctx).await? {
-        Some(Form::Editor(editor)) if editor.item_id() == item_id => view(ctx, editor).await,
+        Some(Form::Editor(editor))
+            if editor.screen()
+                == (Screen::Editor {
+                    item_id,
+                    back: Box::new(back.clone()),
+                }) =>
+        {
+            view(ctx, editor).await
+        }
         _ => Ok(expired_view(item_id, back)),
     }
 }
@@ -82,8 +98,14 @@ fn expired_view(item_id: Option<Uuid>, back: &Screen) -> Ui {
         item_id,
         back: Box::new(back.clone()),
     };
+    let label = match (item_id, back) {
+        (Some(_), _) => "Открыть карточку",
+        (None, Screen::Draft { .. }) => "К черновику",
+        (None, Screen::Menu) => "В меню",
+        (None, _) => "К списку",
+    };
     let mut row = vec![crate::telegram::rich::button(
-        "Открыть карточку",
+        label,
         Action::Go { to: back.clone() },
     )];
     if screen.depth() > 2 {
@@ -102,8 +124,8 @@ pub async fn view(ctx: &mut Ctx<'_>, editor: Editor) -> Result<Ui, Fail> {
     if editor.conflict.is_some() {
         return conflict_view(ctx, &editor).await;
     }
-    if editor.duplicate.is_some() {
-        return duplicate_screen(ctx, &editor).await;
+    if let Some(duplicate) = &editor.duplicate {
+        return Ok(duplicate_screen(&editor, duplicate));
     }
     match editor.field {
         Some(step) => field_view(ctx, &editor, step).await,
@@ -111,15 +133,12 @@ pub async fn view(ctx: &mut Ctx<'_>, editor: Editor) -> Result<Ui, Fail> {
     }
 }
 
-async fn duplicate_screen(_ctx: &mut Ctx<'_>, editor: &Editor) -> Result<Ui, Fail> {
-    let Some(duplicate) = &editor.duplicate else {
-        return Ok(Ui::new());
-    };
+fn duplicate_screen(editor: &Editor, duplicate: &Duplicate) -> Ui {
     let mut ui = Ui::new();
     if let Some(error) = &editor.error {
         ui = ui.bold(format!("⚠️ {error}"));
     }
-    Ok(super::view::duplicate_view(ui, duplicate, &editor.draft))
+    super::view::duplicate_view(ui, duplicate, &editor.draft)
 }
 
 fn button(label: impl Into<String>, act: FormAct) -> Button<Action> {
@@ -226,9 +245,9 @@ async fn field_view(ctx: &mut Ctx<'_>, editor: &Editor, step: Step) -> Result<Ui
 
     match step {
         Step::List => {
-            if editor.is_new() {
-                // Создание из меню: «📋 Список» переключает и тип, как в
-                // быстрой форме, поэтому показаны все списки.
+            if editor.allows_list_switch() {
+                // Создание из меню и пункт черновика без списка: «📋 Список»
+                // переключает и тип, поэтому показаны все списки.
                 let household_id = ctx.household()?.id;
                 let mut lists = lists::list(&mut *ctx.conn, household_id).await?;
                 lists.retain(|list| !list.is_archived);
@@ -291,8 +310,7 @@ async fn field_view(ctx: &mut Ctx<'_>, editor: &Editor, step: Step) -> Result<Ui
         | Step::NewTag
         | Step::Weekdays
         | Step::MonthRule
-        | Step::Notes
-        | Step::Preview => {}
+        | Step::Notes => {}
     }
 
     if matches!(
@@ -302,8 +320,12 @@ async fn field_view(ctx: &mut Ctx<'_>, editor: &Editor, step: Step) -> Result<Ui
         ui = ui.row(vec![button(ru::APPLY_BUTTON, FormAct::Done)]);
     }
     let mut footer = vec![button(ru::BACK_BUTTON, FormAct::Back)];
-    if step == Step::Title {
-        // Начало создания: с поля «Название» можно отказаться целиком.
+    if step == Step::Title
+        && editor.is_new()
+        && editor.field_back.is_none()
+        && editor.field_backup.is_none()
+    {
+        // Начало создания: с первого поля «Название» можно отказаться целиком.
         footer.push(button("✖ Отмена", FormAct::Cancel));
     }
     if screen.depth() > 2 {
@@ -554,27 +576,34 @@ fn current_differs(field: EditorField, current: &ItemSnapshot, base: &ItemSnapsh
     }
 }
 
-/// «💾 Сохранить»: создание нового или слияние правки по `touched`.
+/// «💾 Сохранить»: создание, слияние правки по `touched` или запись пункта
+/// черновика.
 async fn save(ctx: &mut Ctx<'_>, editor: Editor, allow_duplicate: bool) -> Result<(), Fail> {
-    if editor.is_new() {
-        return save_new(ctx, editor, allow_duplicate).await;
+    match &editor.target {
+        EditorTarget::New { .. } => save_new(ctx, editor, allow_duplicate).await,
+        EditorTarget::Item { .. } => save_item(ctx, editor).await,
+        EditorTarget::DraftItem { list_missing, .. } => {
+            if *list_missing && !editor.touched.contains(&EditorField::List) {
+                let mut editor = editor;
+                editor.error = Some("Выберите список.".to_owned());
+                editor.field = Some(Step::List);
+                return show(ctx, editor).await;
+            }
+            save_draft(ctx, editor).await
+        }
     }
-    save_item(ctx, editor).await
 }
 
 /// Конфликты, затем один `items::update` по `touched`.
 async fn save_item(ctx: &mut Ctx<'_>, mut editor: Editor) -> Result<(), Fail> {
-    let item_id = editor
-        .item_id()
-        .ok_or_else(|| Fail::User("Редактор не выбрал элемент.".into()))?;
-    let back = editor.back().clone();
+    let (item_id, base) = match &editor.target {
+        EditorTarget::Item { item_id, base, .. } => (*item_id, base.as_ref().clone()),
+        _ => return show(ctx, editor).await,
+    };
+    let back = editor.back();
     let household_id = ctx.household()?.id;
     let current = items::get(&mut *ctx.conn, household_id, item_id).await?;
     let current_snapshot = ItemSnapshot::from_item(&current);
-    let base = editor
-        .base()
-        .cloned()
-        .ok_or_else(|| Fail::User("Редактор не выбрал элемент.".into()))?;
     let changed = changed_fields(&editor, &base, ctx.tz)?;
     if changed.is_empty() {
         super::clear(ctx).await?;
@@ -657,10 +686,31 @@ async fn save_new(
     )
     .await?;
 
-    let back = editor.back().clone();
+    let back = editor.back();
     super::clear(ctx).await?;
     ctx.banner("Добавлено");
     ctx.present(created_screen(&back, list.id)).await
+}
+
+/// Записать пункт в черновик, перепроверить его и вернуться к карточке.
+async fn save_draft(ctx: &mut Ctx<'_>, editor: Editor) -> Result<(), Fail> {
+    let (draft_id, index) = match &editor.target {
+        EditorTarget::DraftItem {
+            draft_id, index, ..
+        } => (*draft_id, *index),
+        _ => return show(ctx, editor).await,
+    };
+    crate::telegram::bot::capture::save_draft_item(
+        ctx,
+        draft_id,
+        index,
+        editor.list_id,
+        &editor.draft,
+    )
+    .await?;
+    super::clear(ctx).await?;
+    ctx.toast("Изменено");
+    ctx.present(Screen::Draft { draft_id }).await
 }
 
 /// Куда вернуть после создания: в сохранённый список с прежним режимом.
@@ -819,10 +869,11 @@ async fn resolve_conflict(ctx: &mut Ctx<'_>, mut editor: Editor, mine: bool) -> 
     let Some(conflicts) = editor.conflict.take() else {
         return show(ctx, editor).await;
     };
-    let item_id = editor
-        .item_id()
-        .ok_or_else(|| Fail::User("Редактор не выбрал элемент.".into()))?;
-    let back = editor.back().clone();
+    let (item_id, base) = match &editor.target {
+        EditorTarget::Item { item_id, base, .. } => (*item_id, base.as_ref().clone()),
+        _ => return show(ctx, editor).await,
+    };
+    let back = editor.back();
     if !mine {
         for field in &conflicts {
             editor.touched.remove(field);
@@ -830,10 +881,6 @@ async fn resolve_conflict(ctx: &mut Ctx<'_>, mut editor: Editor, mine: bool) -> 
     }
     let household_id = ctx.household()?.id;
     let current = items::get(&mut *ctx.conn, household_id, item_id).await?;
-    let base = editor
-        .base()
-        .cloned()
-        .ok_or_else(|| Fail::User("Редактор не выбрал элемент.".into()))?;
     let changed = changed_fields(&editor, &base, ctx.tz)?;
     if changed.is_empty() {
         super::clear(ctx).await?;
@@ -843,17 +890,18 @@ async fn resolve_conflict(ctx: &mut Ctx<'_>, mut editor: Editor, mine: bool) -> 
 }
 
 async fn cancel(ctx: &mut Ctx<'_>, editor: Editor) -> Result<(), Fail> {
-    let back = editor.back().clone();
+    let back = editor.back();
     super::clear(ctx).await?;
     ctx.toast("Отменено");
     ctx.present(back).await
 }
 
 async fn conflict_view(ctx: &mut Ctx<'_>, editor: &Editor) -> Result<Ui, Fail> {
-    let item_id = editor
-        .item_id()
-        .ok_or_else(|| Fail::User("Редактор не выбрал элемент.".into()))?;
-    let back = editor.back().clone();
+    let EditorTarget::Item { item_id, .. } = &editor.target else {
+        return main_view(ctx, editor).await;
+    };
+    let item_id = *item_id;
+    let back = editor.back();
     let household_id = ctx.household()?.id;
     let current = items::get(&mut *ctx.conn, household_id, item_id).await?;
     let current_draft = ItemDraft::from_item(&current, ctx.tz);
@@ -1050,13 +1098,19 @@ pub(super) async fn on_action(
             }
             if let Some(parent) = editor.field_back.take() {
                 editor.field = Some(parent);
-            } else {
-                if let Some(backup) = editor.field_backup.take() {
-                    editor.draft = backup;
-                }
+                editor.error = None;
+            } else if let Some(backup) = editor.field_backup.take() {
+                editor.draft = backup;
                 editor.field = None;
+                editor.error = None;
+            } else if editor.is_new() && editor.field == Some(Step::Title) {
+                // Первое поле создания: «Назад» — это отказ, а не пустой
+                // редактор.
+                return cancel(ctx, editor).await;
+            } else {
+                editor.field = None;
+                editor.error = None;
             }
-            editor.error = None;
             show(ctx, editor).await
         }
         FormAct::Done => {
@@ -1079,8 +1133,8 @@ pub(super) async fn on_action(
                 if let Choice::List(list_id) = choice {
                     let household_id = ctx.household()?.id;
                     let list = lists::get_visible(&mut *ctx.conn, household_id, list_id).await?;
-                    if editor.is_new() {
-                        switch_new_list(&mut editor, &list);
+                    if editor.allows_list_switch() {
+                        switch_list(&mut editor, &list);
                     }
                     editor.list_id = list.id;
                     editor.touched.insert(EditorField::List);
@@ -1141,16 +1195,14 @@ pub(super) async fn on_action(
         } => increase_duplicate(ctx, editor, item_id, quantity, version).await,
         FormAct::Cancel => cancel(ctx, editor).await,
         FormAct::Conflict { mine } => resolve_conflict(ctx, editor, mine).await,
-        // У редактора нет «Дальше» и «Пропустить»: эти действия сюда не
-        // приходят, но старый токен не должен ронять обработку.
-        FormAct::Skip => show(ctx, editor).await,
     }
 }
 
-/// Переключение списка при создании сбрасывает поля другого типа.
-fn switch_new_list(editor: &mut Editor, list: &crate::domain::models::List) {
+/// Переключение списка при создании или правке пункта черновика сбрасывает
+/// поля другого типа.
+fn switch_list(editor: &mut Editor, list: &crate::domain::models::List) {
     let old_kind = match &editor.target {
-        EditorTarget::New { kind, .. } => *kind,
+        EditorTarget::New { kind, .. } | EditorTarget::DraftItem { kind, .. } => *kind,
         EditorTarget::Item { .. } => return,
     };
     let was_shopping = old_kind != ListKind::Tasks;
@@ -1179,8 +1231,9 @@ fn switch_new_list(editor: &mut Editor, list: &crate::domain::models::List) {
             editor.touched.remove(&EditorField::Unit);
         }
     }
-    if let EditorTarget::New { kind, .. } = &mut editor.target {
-        *kind = list.kind;
+    match &mut editor.target {
+        EditorTarget::New { kind, .. } | EditorTarget::DraftItem { kind, .. } => *kind = list.kind,
+        EditorTarget::Item { .. } => {}
     }
     editor.duplicate = None;
 }
@@ -1210,7 +1263,7 @@ async fn increase_duplicate(
         ctx.now,
     )
     .await?;
-    let back = editor.back().clone();
+    let back = editor.back();
     let list_id = editor.list_id;
     super::clear(ctx).await?;
     ctx.toast("Количество увеличено");
