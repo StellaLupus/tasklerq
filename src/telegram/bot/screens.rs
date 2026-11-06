@@ -34,7 +34,7 @@ pub async fn build(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
             title,
             shopping,
             back,
-        } => card::deleted(*item_id, title, *shopping, back).await,
+        } => card::deleted(ctx, *item_id, title, *shopping, back).await,
         Screen::ConfirmDelete { item_id, back } => card::confirm_delete(ctx, *item_id, back).await,
         Screen::Mine { page } => mine(ctx, *page).await,
         Screen::Results {
@@ -69,6 +69,15 @@ fn go(label: &str, to: Screen) -> crate::telegram::rich::Button<Action> {
 /// Кнопка возврата.
 pub fn back_button(label: &str, to: Screen) -> crate::telegram::rich::Button<Action> {
     go(label, to)
+}
+
+/// Ряд навигации: «⬅️ Назад» на `back`, а глубже двух шагов ещё «🏠 Меню».
+pub fn nav_row(screen: &Screen, back: Screen) -> Vec<crate::telegram::rich::Button<Action>> {
+    let mut buttons = vec![back_button(ru::BACK_BUTTON, back)];
+    if screen.depth() > 2 {
+        buttons.push(back_button(ru::MENU_BUTTON, Screen::Menu));
+    }
+    buttons
 }
 
 /// Сократить подпись кнопки.
@@ -193,7 +202,7 @@ fn add_choice() -> Ui {
                 },
             ),
         ])
-        .row(vec![go("⬅️ В меню", Screen::Menu)])
+        .row(nav_row(&Screen::Add, Screen::Menu))
 }
 
 async fn lists_screen(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
@@ -220,7 +229,7 @@ async fn lists_screen(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
             },
         )]);
     }
-    Ok(ui.row(vec![go("⬅️ В меню", Screen::Menu)]))
+    Ok(ui.row(nav_row(&Screen::Lists, Screen::Menu)))
 }
 
 /// Раздел списка задач по сроку.
@@ -372,22 +381,22 @@ async fn tasks_list(ctx: &mut Ctx<'_>, list: &List, page: u32) -> Result<Ui, Fai
         page: u32::try_from(page).unwrap_or(0),
     };
 
-    let mut ui = Ui::new().heading(format!("{} · {}", list.name, open.len()));
+    let mut ui =
+        Ui::new().heading(here(page).trail(&format!("{} · {}", list.name, open.len()), None));
     if open.is_empty() {
         ui = ui.text("Пока нет задач");
         if done > 0 {
             ui = ui.text(format!("Выполнено ранее: {done}"));
         }
-        return Ok(ui.row(vec![
-            button(
-                "➕ Добавить",
-                Action::Add {
-                    list_id: Some(list.id),
-                    kind: ListKind::Tasks,
-                },
-            ),
-            go("⬅️ Назад", Screen::Menu),
-        ]));
+        let mut row = vec![button(
+            "➕ Добавить",
+            Action::Add {
+                list_id: Some(list.id),
+                kind: ListKind::Tasks,
+            },
+        )];
+        row.extend(nav_row(&here(page), Screen::Menu));
+        return Ok(ui.row(row));
     }
 
     let mut current: Option<Section> = None;
@@ -418,17 +427,17 @@ async fn tasks_list(ctx: &mut Ctx<'_>, list: &List, page: u32) -> Result<Ui, Fai
     if done > 0 {
         ui = ui.text(format!("Выполнено: {done}"));
     }
+    let current = here(page);
     let ui = pager(ui, page, pages, here);
-    Ok(ui.row(vec![
-        button(
-            "➕ Добавить",
-            Action::Add {
-                list_id: Some(list.id),
-                kind: ListKind::Tasks,
-            },
-        ),
-        go("⬅️ Назад", Screen::Menu),
-    ]))
+    let mut row = vec![button(
+        "➕ Добавить",
+        Action::Add {
+            list_id: Some(list.id),
+            kind: ListKind::Tasks,
+        },
+    )];
+    row.extend(nav_row(&current, Screen::Menu));
+    Ok(ui.row(row))
 }
 
 async fn mine(ctx: &mut Ctx<'_>, page: u32) -> Result<Ui, Fail> {
@@ -453,11 +462,12 @@ async fn mine(ctx: &mut Ctx<'_>, page: u32) -> Result<Ui, Fail> {
         page: u32::try_from(page).unwrap_or(0),
     };
 
-    let mut ui = Ui::new().heading(format!("Мои задачи · {}", tasks.len()));
+    let mut ui =
+        Ui::new().heading(here(page).trail(&format!("Мои задачи · {}", tasks.len()), None));
     if tasks.is_empty() {
         return Ok(ui
             .text("Вам пока ничего не назначено")
-            .row(vec![go("⬅️ Назад", Screen::Menu)]));
+            .row(nav_row(&here(page), Screen::Menu)));
     }
     for item in &tasks[start..end] {
         ui = ui.row(vec![
@@ -478,8 +488,9 @@ async fn mine(ctx: &mut Ctx<'_>, page: u32) -> Result<Ui, Fail> {
             ),
         ]);
     }
+    let current = here(page);
     let ui = pager(ui, page, pages, here);
-    Ok(ui.row(vec![go("⬅️ Назад", Screen::Menu)]))
+    Ok(ui.row(nav_row(&current, Screen::Menu)))
 }
 
 async fn results(
@@ -523,12 +534,11 @@ async fn results(
         filter_row("Все", StatusFilter::All),
     ];
 
-    let mut ui = Ui::new().heading("Поиск");
+    let mut ui = Ui::new().heading(here(0).trail("Поиск", None));
     if hits.is_empty() {
-        return Ok(ui.text("Ничего не нашлось").row(filters_row).row(vec![
-            button("✏️ Изменить запрос", Action::SearchStart),
-            go("⬅️ Назад", Screen::Menu),
-        ]));
+        let mut row = vec![button("✏️ Изменить запрос", Action::SearchStart)];
+        row.extend(nav_row(&here(0), Screen::Menu));
+        return Ok(ui.text("Ничего не нашлось").row(filters_row).row(row));
     }
 
     let (start, end, page, pages) = page_bounds(hits.len(), page);
@@ -573,11 +583,11 @@ async fn results(
             },
         )]);
     }
+    let current = here(page);
     let ui = pager(ui, page, pages, here).row(filters_row);
-    Ok(ui.row(vec![
-        button("✏️ Изменить запрос", Action::SearchStart),
-        go("⬅️ Назад", Screen::Menu),
-    ]))
+    let mut row = vec![button("✏️ Изменить запрос", Action::SearchStart)];
+    row.extend(nav_row(&current, Screen::Menu));
+    Ok(ui.row(row))
 }
 
 #[cfg(test)]

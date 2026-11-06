@@ -18,7 +18,7 @@ use crate::telegram::rich::{Span, button, escape};
 use crate::telegram::ru;
 
 use super::model::{Action, PAGE_SIZE, Screen, Setting, TimeField, Ui};
-use super::screens::{back_button, clip, page_bounds, pager};
+use super::screens::{back_button, clip, nav_row, page_bounds, pager};
 use super::{Ctx, Fail, delete_dedupe_key, display_timezone, issue_and_render};
 
 /// Сколько живёт сообщение с открытым токеном: час после доставки.
@@ -26,6 +26,18 @@ const SECRET_MESSAGE_TTL: u32 = 60 * 60;
 
 fn on_off(value: bool) -> &'static str {
     if value { "вкл" } else { "выкл" }
+}
+
+/// Заголовок подтверждения с путём. Если крошка обрезала вопрос, он
+/// повторяется целиком отдельным абзацем: получатель и действие должны
+/// оставаться видимыми.
+fn confirm_heading(screen: &Screen, question: &str) -> Ui {
+    let heading = screen.trail(question, None);
+    let mut ui = Ui::new().heading(heading.clone());
+    if !heading.contains(question) {
+        ui = ui.text(question.to_owned());
+    }
+    ui
 }
 
 /// Какая правка тихих часов запускает ручной выпуск отложенных.
@@ -111,28 +123,34 @@ pub async fn view(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
         Screen::ConfirmRevokeToken { token_id } => confirm_revoke(ctx, *token_id).await,
         Screen::Member { user_id } => member(ctx, *user_id).await,
         Screen::Invites => invites_screen(ctx).await,
-        Screen::InviteCreated { code, .. } => {
+        Screen::InviteCreated { invite_id, code } => {
             let link = invites::deep_link(ctx.bot_username, code);
+            let screen = Screen::InviteCreated {
+                invite_id: *invite_id,
+                code: code.clone(),
+            };
             Ok(Ui::new()
-                .heading("Приглашение создано")
+                .heading(screen.trail("Приглашение создано", None))
                 .text(format!("Действует {}.", ru::hours(invites::TTL_HOURS)))
                 .spans(vec![Span::Code(link)])
                 .text("Отправьте ссылку тому, кого хотите пригласить. Повторно показать её нельзя.")
-                .row(vec![
-                    back_button("📨 Все приглашения", Screen::Invites),
-                    back_button("⬅️ К участникам", Screen::Family),
-                ]))
+                .row({
+                    let mut row = nav_row(&screen, Screen::Invites);
+                    row.push(back_button("👥 К участникам", Screen::Family));
+                    row
+                }))
         }
         Screen::Journal { page } => journal(ctx, *page).await,
         Screen::ConfirmRemove { user_id } => confirm_remove(ctx, *user_id).await,
         Screen::ConfirmTransfer { user_id } => confirm_transfer(ctx, *user_id).await,
         Screen::ConfirmLeave => Ok(Ui::new()
-            .heading("Выйти из пространства?")
+            .heading(Screen::ConfirmLeave.trail("Выйти из пространства?", None))
             .text("Назначенные на вас задачи останутся без исполнителя. Вернуться можно только по новому приглашению.")
-            .row(vec![
-                button("🚪 Да, выйти", Action::Leave),
-                back_button("Отмена", Screen::Settings),
-            ])),
+            .row({
+                let mut row = vec![button("🚪 Да, выйти", Action::Leave)];
+                row.extend(nav_row(&Screen::ConfirmLeave, Screen::Settings));
+                row
+            })),
         _ => Ok(Ui::new()),
     }
 }
@@ -147,7 +165,7 @@ fn settings(ctx: &Ctx<'_>) -> Result<Ui, Fail> {
     };
 
     let mut ui = Ui::new()
-        .heading("Настройки")
+        .heading(Screen::Settings.trail("Настройки", None))
         .text(format!("👤 Профиль: {}", user.display_name))
         .text(format!("🌍 Часовой пояс: {zone}"))
         .text(format!(
@@ -189,7 +207,7 @@ fn settings(ctx: &Ctx<'_>) -> Result<Ui, Fail> {
     } else {
         ui = ui.row(vec![back_button("🚪 Выйти", Screen::ConfirmLeave)]);
     }
-    Ok(ui.row(vec![back_button("⬅️ Назад", Screen::Menu)]))
+    Ok(ui.row(nav_row(&Screen::Settings, Screen::Menu)))
 }
 
 fn notifications(ctx: &Ctx<'_>) -> Result<Ui, Fail> {
@@ -209,7 +227,7 @@ fn notifications(ctx: &Ctx<'_>) -> Result<Ui, Fail> {
         button(format!("{mark}{minutes} мин"), Action::SetLead { minutes })
     };
     Ok(Ui::new()
-        .heading("Уведомления")
+        .heading(Screen::Notifications.trail("Уведомления", None))
         .text(format!(
             "Напоминать о сроках за {}. Выберите другое значение:",
             ru::minutes(i64::from(settings.lead_minutes))
@@ -260,11 +278,11 @@ fn notifications(ctx: &Ctx<'_>) -> Result<Ui, Fail> {
                 },
             ),
         ])
-        .row(vec![back_button("⬅️ Назад", Screen::Settings)]))
+        .row(nav_row(&Screen::Notifications, Screen::Settings)))
 }
 
 fn timezones() -> Ui {
-    let mut ui = Ui::new().heading("Часовой пояс");
+    let mut ui = Ui::new().heading(Screen::Timezones.trail("Часовой пояс", None));
     for chunk in SUGGESTED_TIMEZONES.chunks(2) {
         ui = ui.row(
             chunk
@@ -286,7 +304,7 @@ fn timezones() -> Ui {
             zone: String::new(),
         },
     )])
-    .row(vec![back_button("⬅️ Назад", Screen::Settings)])
+    .row(nav_row(&Screen::Timezones, Screen::Settings))
 }
 
 async fn family(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
@@ -295,7 +313,7 @@ async fn family(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
     let household_id = ctx.household()?.id;
     let members = users::list_active(&mut *ctx.conn, household_id).await?;
 
-    let mut ui = Ui::new().heading("Семья");
+    let mut ui = Ui::new().heading(Screen::Family.trail("Семья", None));
     let lines: Vec<String> = members
         .iter()
         .map(|member| {
@@ -316,7 +334,7 @@ async fn family(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
             Screen::Member { user_id: member.id },
         )]);
     }
-    Ok(ui.row(vec![back_button("⬅️ Назад", Screen::Settings)]))
+    Ok(ui.row(nav_row(&Screen::Family, Screen::Settings)))
 }
 
 async fn integrations(ctx: &mut Ctx<'_>, page: u32) -> Result<Ui, Fail> {
@@ -327,8 +345,9 @@ async fn integrations(ctx: &mut Ctx<'_>, page: u32) -> Result<Ui, Fail> {
     let here = |page: usize| Screen::Integrations {
         page: u32::try_from(page).unwrap_or(0),
     };
+    let current = here(page);
 
-    let mut ui = Ui::new().heading(ru::INTEGRATIONS_TITLE);
+    let mut ui = Ui::new().heading(current.trail(ru::INTEGRATIONS_TITLE, None));
     if active.is_empty() {
         ui = ui.text(ru::INTEGRATIONS_EMPTY);
     } else {
@@ -346,10 +365,9 @@ async fn integrations(ctx: &mut Ctx<'_>, page: u32) -> Result<Ui, Fail> {
         }
     }
     let ui = pager(ui, page, pages, here);
-    Ok(ui.row(vec![
-        button(ru::ISSUE_HA_TOKEN_BUTTON, Action::IssueHaToken),
-        back_button("⬅️ Назад", Screen::Settings),
-    ]))
+    let mut row = vec![button(ru::ISSUE_HA_TOKEN_BUTTON, Action::IssueHaToken)];
+    row.extend(nav_row(&current, Screen::Settings));
+    Ok(ui.row(row))
 }
 
 async fn confirm_revoke(ctx: &mut Ctx<'_>, token_id: Uuid) -> Result<Ui, Fail> {
@@ -359,16 +377,15 @@ async fn confirm_revoke(ctx: &mut Ctx<'_>, token_id: Uuid) -> Result<Ui, Fail> {
         .await?
         .filter(|token| token.household_id == household_id)
         .ok_or(DomainError::NotFound)?;
-    Ok(Ui::new()
-        .heading(ru::confirm_revoke_token(
-            &clip(&token.name, 40),
-            &token.prefix,
-        ))
+    let screen = Screen::ConfirmRevokeToken { token_id };
+    let question = ru::confirm_revoke_token(&clip(&token.name, 40), &token.prefix);
+    Ok(confirm_heading(&screen, &question)
         .text(ru::TOKEN_STOPS_WORKING)
-        .row(vec![
-            button("Отозвать", Action::RevokeToken { token_id }),
-            back_button("Отмена", Screen::Integrations { page: 0 }),
-        ]))
+        .row({
+            let mut row = vec![button("Отозвать", Action::RevokeToken { token_id })];
+            row.extend(nav_row(&screen, Screen::Integrations { page: 0 }));
+            row
+        }))
 }
 
 async fn member(ctx: &mut Ctx<'_>, user_id: Uuid) -> Result<Ui, Fail> {
@@ -376,7 +393,7 @@ async fn member(ctx: &mut Ctx<'_>, user_id: Uuid) -> Result<Ui, Fail> {
     let household_id = ctx.household()?.id;
     let member = users::get(&mut *ctx.conn, household_id, user_id).await?;
     Ok(Ui::new()
-        .heading(member.display_name)
+        .heading(Screen::Member { user_id }.trail(&member.display_name, None))
         .text(if member.role == UserRole::Owner {
             "Владелец"
         } else {
@@ -386,39 +403,37 @@ async fn member(ctx: &mut Ctx<'_>, user_id: Uuid) -> Result<Ui, Fail> {
             button("👑 Передать владение", Action::TransferAsk { user_id }),
             button("🗑 Удалить", Action::MemberRemoveAsk { user_id }),
         ])
-        .row(vec![back_button("⬅️ Назад", Screen::Family)]))
+        .row(nav_row(&Screen::Member { user_id }, Screen::Family)))
 }
 
 async fn confirm_remove(ctx: &mut Ctx<'_>, user_id: Uuid) -> Result<Ui, Fail> {
     ctx.require_owner()?;
     let household_id = ctx.household()?.id;
     let member = users::get(&mut *ctx.conn, household_id, user_id).await?;
-    Ok(Ui::new()
-        .heading(format!(
-            "Удалить участника «{}»?",
-            clip(&member.display_name, 40)
-        ))
+    let screen = Screen::ConfirmRemove { user_id };
+    let question = format!("Удалить участника «{}»?", clip(&member.display_name, 40));
+    Ok(confirm_heading(&screen, &question)
         .text("Доступ прекратится сразу, назначенные задачи останутся без исполнителя.")
-        .row(vec![
-            button("🗑 Да, удалить", Action::MemberRemove { user_id }),
-            back_button("Отмена", Screen::Member { user_id }),
-        ]))
+        .row({
+            let mut row = vec![button("🗑 Да, удалить", Action::MemberRemove { user_id })];
+            row.extend(nav_row(&screen, Screen::Member { user_id }));
+            row
+        }))
 }
 
 async fn confirm_transfer(ctx: &mut Ctx<'_>, user_id: Uuid) -> Result<Ui, Fail> {
     ctx.require_owner()?;
     let household_id = ctx.household()?.id;
     let member = users::get(&mut *ctx.conn, household_id, user_id).await?;
-    Ok(Ui::new()
-        .heading(format!(
-            "Передать владение «{}»?",
-            clip(&member.display_name, 40)
-        ))
+    let screen = Screen::ConfirmTransfer { user_id };
+    let question = format!("Передать владение «{}»?", clip(&member.display_name, 40));
+    Ok(confirm_heading(&screen, &question)
         .text("Вы станете обычным участником и не сможете управлять семьёй.")
-        .row(vec![
-            button("👑 Да, передать", Action::Transfer { user_id }),
-            back_button("Отмена", Screen::Member { user_id }),
-        ]))
+        .row({
+            let mut row = vec![button("👑 Да, передать", Action::Transfer { user_id })];
+            row.extend(nav_row(&screen, Screen::Member { user_id }));
+            row
+        }))
 }
 
 async fn invites_screen(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
@@ -427,7 +442,7 @@ async fn invites_screen(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
     let actor = ctx.actor()?;
     let active = invites::list_active(&mut *ctx.conn, household_id, &actor, ctx.now).await?;
 
-    let mut ui = Ui::new().heading("Приглашения");
+    let mut ui = Ui::new().heading(Screen::Invites.trail("Приглашения", None));
     if active.is_empty() {
         ui = ui.text("Активных приглашений нет.");
     } else {
@@ -448,7 +463,7 @@ async fn invites_screen(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
     }
     Ok(ui
         .row(vec![button("➕ Создать приглашение", Action::InviteCreate)])
-        .row(vec![back_button("⬅️ Назад", Screen::Family)]))
+        .row(nav_row(&Screen::Invites, Screen::Family)))
 }
 
 fn source_label(actor_type: ActorType) -> Option<&'static str> {
@@ -528,15 +543,18 @@ async fn journal(ctx: &mut Ctx<'_>, page: u32) -> Result<Ui, Fail> {
     )
     .await?;
 
-    let mut ui = Ui::new().heading("Журнал за 90 дней");
+    let mut ui = Ui::new().heading(Screen::Journal { page }.trail("Журнал за 90 дней", None));
     if events.is_empty() {
         return Ok(ui
             .text("Событий пока нет.")
-            .row(vec![back_button("⬅️ Назад", Screen::Settings)]));
+            .row(nav_row(&Screen::Journal { page }, Screen::Settings)));
     }
 
     let pages = events.len().div_ceil(PAGE_SIZE).max(1);
     let page = usize::try_from(page).unwrap_or(0).min(pages - 1);
+    let current = Screen::Journal {
+        page: u32::try_from(page).unwrap_or(0),
+    };
     let slice = &events[page * PAGE_SIZE..((page + 1) * PAGE_SIZE).min(events.len())];
     let lines: Vec<String> = slice
         .iter()
@@ -568,7 +586,7 @@ async fn journal(ctx: &mut Ctx<'_>, page: u32) -> Result<Ui, Fail> {
             .text(format!("Страница {} из {pages}", page + 1))
             .row(row);
     }
-    Ok(ui.row(vec![back_button("⬅️ Назад", Screen::Settings)]))
+    Ok(ui.row(nav_row(&current, Screen::Settings)))
 }
 
 // ---------------------------------------------------------------------

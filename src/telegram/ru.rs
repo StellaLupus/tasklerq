@@ -168,6 +168,12 @@ pub const DONE_ALL_BUTTON: &str = "✓ Выполнить все";
 pub const APPLY_BUTTON: &str = "Применить";
 /// Всплывающее сообщение после выполнения.
 pub const DONE_TOAST: &str = "Выполнено";
+/// Кнопка возврата на предыдущий экран.
+pub const BACK_BUTTON: &str = "⬅️ Назад";
+/// Кнопка возврата в главное меню.
+pub const MENU_BUTTON: &str = "🏠 Меню";
+/// Кнопка открытия списка из уведомления.
+pub const OPEN_LIST_BUTTON: &str = "📋 Открыть список";
 
 /// Команда CLI для назначения владельца с подставленным Telegram ID.
 pub fn owner_command(telegram_id: i64) -> String {

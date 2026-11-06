@@ -191,7 +191,7 @@ pub fn done_ui(item: &Item, list_id: Uuid, next: Option<&str>) -> Ui {
     }
     ui.row(vec![
         button("↩️ Отменить", Action::NoticeUndo { item_id: item.id }),
-        back_button("📋 К списку", Screen::List { list_id, page: 0 }),
+        back_button(ru::OPEN_LIST_BUTTON, Screen::List { list_id, page: 0 }),
     ])
 }
 
@@ -257,7 +257,7 @@ async fn show_current(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> Resu
         None => {
             let ui = Ui::new()
                 .heading("Задача больше недоступна")
-                .row(vec![back_button("📋 В меню", Screen::Menu)]);
+                .row(vec![back_button(ru::MENU_BUTTON, Screen::Menu)]);
             edit_notice(ctx, message_id, &ui).await
         }
     }

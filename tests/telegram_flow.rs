@@ -428,13 +428,13 @@ async fn delete_asks_for_confirmation() {
 
     bot.press("Удалить").await;
     bot.assert_screen_contains("Удалить «Лишнее»?");
-    bot.press("Отмена").await;
+    bot.press("Назад").await;
     bot.assert_screen_contains("Приоритет:");
 
     bot.press("Удалить").await;
     bot.press("Да, удалить").await;
-    bot.assert_screen_contains("🗑 Удалено: Лишнее");
-    bot.press("К списку").await;
+    bot.assert_screen_contains("Задачи › 🗑 Удалено: Лишнее");
+    bot.press("Назад").await;
     bot.assert_screen_contains("Пока нет задач");
 }
 
@@ -454,7 +454,7 @@ async fn deleted_task_shows_undo_and_returns_it_with_its_fields() {
     bot.press("Да, удалить").await;
     bot.assert_screen_contains("🗑 Удалено: Вернуть задачу");
     bot.assert_has_button("Отменить");
-    bot.assert_has_button("К списку");
+    bot.assert_has_button("Назад");
 
     let household = household_of(&db.pool, bot.chat).await;
     let (item_id, deleted, due_before, priority_before): (
@@ -651,7 +651,7 @@ async fn deleted_purchase_shows_undo_and_returns_it_to_the_list() {
     bot.press("Да, удалить").await;
     bot.assert_screen_contains("🗑 Удалено: Молоко");
     bot.assert_has_button("Отменить");
-    bot.assert_has_button("🛒 К списку");
+    bot.assert_has_button("Назад");
 
     let household = household_of(&db.pool, bot.chat).await;
     let item_id: uuid::Uuid =
@@ -786,7 +786,7 @@ async fn deleted_purchase_back_to_list_does_not_undo() {
     bot.press("Удалить").await;
     bot.press("Да, удалить").await;
     bot.assert_screen_contains("🗑 Удалено: Оставить в удалённых");
-    bot.press("🛒 К списку").await;
+    bot.press("Назад").await;
     bot.assert_screen_contains("Список покупок пуст");
 
     let household = household_of(&db.pool, bot.chat).await;
@@ -808,8 +808,8 @@ async fn deleted_purchase_back_to_list_does_not_undo() {
     .fetch_one(&db.pool)
     .await
     .expect("item after back");
-    assert!(deleted, "«К списку» must not restore the purchase");
-    assert_eq!(undone, 0, "«К списку» must not write an undo event");
+    assert!(deleted, "«Назад» must not restore the purchase");
+    assert_eq!(undone, 0, "«Назад» must not write an undo event");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -987,7 +987,7 @@ async fn notification_button_opens_a_new_screen_below() {
     let (anchor, _) = bot.active();
 
     let (notice, data) =
-        deliver_notice_button(&mut bot, "📋 В меню", Action::Go { to: Screen::Menu }).await;
+        deliver_notice_button(&mut bot, "🏠 Меню", Action::Go { to: Screen::Menu }).await;
     bot.fake.clear_calls();
 
     bot.press_data(&data, notice).await;
@@ -1022,7 +1022,7 @@ async fn a_notice_button_on_the_anchor_message_is_not_edited_in_place() {
     // Якорь засыпан: после него в чате есть уведомления.
     deliver_message(&mut bot, "<p>напоминание</p>").await;
     let (notice, data) =
-        deliver_notice_button(&mut bot, "📋 В меню", Action::Go { to: Screen::Menu }).await;
+        deliver_notice_button(&mut bot, "🏠 Меню", Action::Go { to: Screen::Menu }).await;
     bot.fake.clear_calls();
 
     // Кнопка уведомления нажата на сообщении с id активного якоря: область
@@ -1359,4 +1359,40 @@ async fn double_tap_on_a_buried_anchor_keeps_editing_it_in_place() {
         "a repeated tap must not delete the anchor: {calls:?}"
     );
     assert_eq!(bot.active().0, anchor);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn back_from_card_returns_to_the_same_list_page_in_the_same_message() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+
+    for n in 0..9 {
+        bot.text(&format!("Задача {n}")).await;
+        bot.press("Сохранить").await;
+    }
+    bot.press("Назад").await;
+    bot.fake.clear_calls();
+
+    bot.press("Задачи").await;
+    bot.press("→").await;
+    bot.assert_screen_contains("Страница 2 из 2");
+    let (anchor, _) = bot.active();
+
+    let task = buttons(&bot.screen())
+        .into_iter()
+        .map(|(label, _)| label)
+        .find(|label| label.starts_with("Задача "))
+        .expect("a task on the second page");
+    bot.press(&task).await;
+    bot.assert_screen_contains(&format!("Задачи › {task}"));
+
+    bot.press("Назад").await;
+    bot.assert_screen_contains("Страница 2 из 2");
+    assert_eq!(
+        bot.active().0,
+        anchor,
+        "the same screen message must be edited"
+    );
+    assert!(bot.fake.sent().is_empty(), "{:?}", bot.fake.sent());
+    assert_eq!(bot.fake.messages(bot.chat).len(), 1);
 }

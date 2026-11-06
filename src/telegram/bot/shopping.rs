@@ -9,7 +9,7 @@ use crate::telegram::ru;
 
 use super::card::{self, UndoOutcome};
 use super::model::{Action, PAGE_SIZE, Screen, Ui};
-use super::screens::{back_button, clip};
+use super::screens::{back_button, clip, nav_row};
 use super::{Ctx, Fail};
 
 /// Подтверждение нужно, если выполненных позиций больше этого числа.
@@ -51,9 +51,15 @@ pub async fn list_view(ctx: &mut Ctx<'_>, list: &List, page: u32) -> Result<Ui, 
         },
     );
     if all.is_empty() {
-        return Ok(ui
-            .text("Список покупок пуст")
-            .row(vec![add, back_button("⬅️ Назад", Screen::Menu)]));
+        let mut row = vec![add];
+        row.extend(nav_row(
+            &Screen::List {
+                list_id: list.id,
+                page: 0,
+            },
+            Screen::Menu,
+        ));
+        return Ok(ui.text("Список покупок пуст").row(row));
     }
 
     let pages = all.len().div_ceil(PAGE_SIZE).max(1);
@@ -115,10 +121,9 @@ pub async fn list_view(ctx: &mut Ctx<'_>, list: &List, page: u32) -> Result<Ui, 
     if all.iter().any(|item| item.status == ItemStatus::Done) {
         footer.push(button("🧹 Очистить", Action::ClearAsk { list_id: list.id }));
     }
-    Ok(ui.row(footer).row(vec![
-        button("🔎 Поиск", Action::SearchStart),
-        back_button("⬅️ Назад", Screen::Menu),
-    ]))
+    let mut nav = vec![button("🔎 Поиск", Action::SearchStart)];
+    nav.extend(nav_row(&here(page), Screen::Menu));
+    Ok(ui.row(footer).row(nav))
 }
 
 async fn done_items(ctx: &mut Ctx<'_>, list_id: Uuid) -> Result<(List, Vec<Item>), Fail> {
@@ -148,13 +153,16 @@ pub async fn clear_ask(ctx: &mut Ctx<'_>, list_id: Uuid) -> Result<(), Fail> {
 /// Подтверждение очистки.
 pub async fn confirm_clear(ctx: &mut Ctx<'_>, list_id: Uuid) -> Result<Ui, Fail> {
     let (list, done) = done_items(ctx, list_id).await?;
+    let screen = Screen::ConfirmClear { list_id };
+    let mut row = vec![button("🧹 Да, очистить", Action::ClearDo { list_id })];
+    row.extend(nav_row(&screen, Screen::List { list_id, page: 0 }));
     Ok(Ui::new()
-        .heading(format!("Удалить {}?", ru::positions(i64::try_from(done.len()).unwrap_or(0))))
+        .heading(screen.trail(
+            &format!("Удалить {}?", ru::positions(i64::try_from(done.len()).unwrap_or(0))),
+            Some(&list.name),
+        ))
         .text(format!("Из списка «{}» будут убраны выполненные позиции. Это можно отменить в течение 10 минут.", list.name))
-        .row(vec![
-            button("🧹 Да, очистить", Action::ClearDo { list_id }),
-            back_button("Отмена", Screen::List { list_id, page: 0 }),
-        ]))
+        .row(row))
 }
 
 /// Удалить выполненные позиции.
@@ -180,22 +188,33 @@ pub async fn clear_do(ctx: &mut Ctx<'_>, list_id: Uuid) -> Result<(), Fail> {
 
 /// Результат очистки с кнопкой отмены.
 pub async fn cleared(ctx: &mut Ctx<'_>, list_id: Uuid, item_ids: &[Uuid]) -> Result<Ui, Fail> {
-    let _ = ctx;
+    let household_id = ctx.household()?.id;
+    let parent = match lists::get_visible(&mut *ctx.conn, household_id, list_id).await {
+        Ok(list) => Some(list.name),
+        Err(crate::domain::error::DomainError::NotFound) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let screen = Screen::Cleared {
+        list_id,
+        item_ids: item_ids.to_vec(),
+    };
+    let mut row = vec![button(
+        "↩️ Отменить",
+        Action::ClearUndo {
+            list_id,
+            item_ids: item_ids.to_vec(),
+        },
+    )];
+    row.extend(nav_row(&screen, Screen::List { list_id, page: 0 }));
     Ok(Ui::new()
-        .heading(format!(
-            "Убрано: {}",
-            ru::positions(i64::try_from(item_ids.len()).unwrap_or(0))
-        ))
-        .row(vec![
-            button(
-                "↩️ Отменить",
-                Action::ClearUndo {
-                    list_id,
-                    item_ids: item_ids.to_vec(),
-                },
+        .heading(screen.trail(
+            &format!(
+                "Убрано: {}",
+                ru::positions(i64::try_from(item_ids.len()).unwrap_or(0))
             ),
-            back_button("🛒 К списку", Screen::List { list_id, page: 0 }),
-        ]))
+            parent.as_deref(),
+        ))
+        .row(row))
 }
 
 /// Вернуть очищенные позиции в течение окна отмены.

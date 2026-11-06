@@ -166,9 +166,9 @@ pub struct Batch {
     pub chat_id: i64,
     /// Текущая страница с нуля.
     pub page: i32,
-    /// Сколько задач завершило «Завершить все».
+    /// Сколько задач завершило «✓ Выполнить все».
     pub result_completed: Option<i32>,
-    /// Сколько задач уже изменились к моменту «Завершить все».
+    /// Сколько задач уже изменились к моменту «✓ Выполнить все».
     pub result_changed: Option<i32>,
 }
 
@@ -223,7 +223,7 @@ pub async fn set_batch_page(
     Ok(())
 }
 
-/// Запомнить итог «Завершить все».
+/// Запомнить итог «✓ Выполнить все».
 pub async fn set_batch_result(
     conn: &mut PgConnection,
     id: Uuid,

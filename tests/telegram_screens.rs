@@ -282,10 +282,10 @@ async fn clearing_many_purchases_needs_confirmation() {
 
     bot.press("Покупки").await;
     bot.press("Очистить").await;
-    bot.assert_screen_contains("Удалить 6 позиций?");
+    bot.assert_screen_contains("Покупки › Удалить 6 позиций?");
     bot.press("Да, очистить").await;
-    bot.assert_screen_contains("Убрано: 6 позиций");
-    bot.press("К списку").await;
+    bot.assert_screen_contains("Покупки › Убрано: 6 позиций");
+    bot.press("Назад").await;
     bot.assert_screen_contains("Список покупок пуст");
 }
 
@@ -322,7 +322,7 @@ async fn lists_paginate_and_counters_follow_actions() {
     // Завершить единственную задачу второй страницы: возврат на последнюю
     // существующую страницу.
     bot.press("☐").await;
-    bot.press("К списку").await;
+    bot.press("Назад").await;
     bot.assert_screen_contains("Задачи · 8");
 
     bot.press("Назад").await;
@@ -705,7 +705,7 @@ async fn invites_can_be_revoked_and_are_single_use() {
         .collect();
     owner.assert_screen_contains("Действует 72 часа");
 
-    owner.press("Все приглашения").await;
+    owner.press("Назад").await;
     owner.assert_screen_contains("Активных: 1 из 5");
     owner.press("Отозвать").await;
     owner.assert_screen_contains("Активных приглашений нет");
@@ -726,7 +726,7 @@ async fn sixth_invite_within_an_hour_is_refused_with_retry_time() {
 
     for _ in 0..5 {
         owner.press("Создать приглашение").await;
-        owner.press("Все приглашения").await;
+        owner.press("Назад").await;
     }
     owner.press("Создать приглашение").await;
 
@@ -2278,4 +2278,248 @@ async fn action_labels_do_not_say_gotovo() {
             "a button still says «Готово»: {labels:?}"
         );
     }
+}
+
+fn assert_navigation(bot: &Harness, expect_back: bool) {
+    let labels: Vec<String> = support::telegram::buttons(&bot.screen())
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect();
+    assert!(
+        !labels
+            .iter()
+            .any(|label| label.contains("В меню") || label.contains("К списку")),
+        "a legacy navigation label is still shown: {labels:?}\n{}",
+        bot.screen()
+    );
+    if expect_back {
+        assert!(
+            labels.iter().any(|label| label == "⬅️ Назад"),
+            "no «⬅️ Назад» on screen: {labels:?}\n{}",
+            bot.screen()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_from_menu_has_back_to_menu_and_no_home() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+
+    bot.press("Задачи").await;
+    bot.assert_screen_contains("Задачи · 0");
+    let labels: Vec<String> = support::telegram::buttons(&bot.screen())
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect();
+    assert!(labels.iter().any(|label| label == "⬅️ Назад"), "{labels:?}");
+    assert!(!labels.iter().any(|label| label == "🏠 Меню"), "{labels:?}");
+
+    bot.press("Назад").await;
+    bot.assert_screen_contains("Семья · 0 задач");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn card_from_list_starts_with_the_list_trail_and_has_home() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, "Оплатить интернет"),
+    )
+    .await;
+
+    bot.press("Задачи").await;
+    bot.press("Оплатить интернет").await;
+
+    assert!(
+        bot.screen().contains("<h3>Задачи › Оплатить интернет</h3>"),
+        "card heading must show the list trail:\n{}",
+        bot.screen()
+    );
+    let labels: Vec<String> = support::telegram::buttons(&bot.screen())
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect();
+    assert!(labels.iter().any(|label| label == "⬅️ Назад"), "{labels:?}");
+    assert!(labels.iter().any(|label| label == "🏠 Меню"), "{labels:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn long_card_title_stays_visible_below_the_clipped_trail() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let title = "Очень длинное название задачи, которое не помещается в хлебные крошки";
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, title),
+    )
+    .await;
+
+    bot.press("Задачи").await;
+    bot.press("Очень длинное").await;
+    let screen = bot.screen();
+    assert!(
+        screen.contains("<h3>Задачи › Очень длинное"),
+        "the card must start with its trail:\n{screen}"
+    );
+    assert!(
+        screen.contains(title),
+        "the full title must remain visible below the trail:\n{screen}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_screen_has_back_and_no_legacy_return_labels() {
+    let db = db().await;
+    let mut owner = onboarded_named(&db.pool, "Алексей").await;
+    let mut member = invite(&mut owner, &db.pool, "Мария").await;
+    let household = household_for(&db.pool, owner.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, "Оплатить интернет"),
+    )
+    .await;
+    for n in 0..6 {
+        let item = create_item(
+            &db.pool,
+            &household,
+            household.shopping_list_id,
+            &actor,
+            new_item(household.shopping_list_id, &format!("Товар {n}")),
+        )
+        .await;
+        sqlx::query("UPDATE items SET status = 'done', completed_at = now() WHERE id = $1")
+            .bind(item.id)
+            .execute(&db.pool)
+            .await
+            .expect("done");
+    }
+    let _token = cli_token(&db.pool, household.household_id, "Home Assistant").await;
+
+    // Меню — единственный экран без «Назад».
+    assert_navigation(&owner, false);
+
+    owner.press("Задачи").await;
+    assert_navigation(&owner, true);
+    owner.press("Оплатить интернет").await;
+    assert_navigation(&owner, true);
+    owner.press("Удалить").await;
+    assert_navigation(&owner, true);
+    owner.press("Назад").await; // карточка
+    owner.press("Назад").await; // список
+    owner.press("Назад").await; // меню
+
+    owner.press("Мои задачи").await;
+    assert_navigation(&owner, true);
+    owner.press("Назад").await;
+
+    owner.press("Поиск").await;
+    owner.text("Оплатить").await;
+    assert_navigation(&owner, true);
+    owner.press("Назад").await;
+
+    owner.press("Покупки").await;
+    assert_navigation(&owner, true);
+    owner.press("Очистить").await;
+    assert_navigation(&owner, true);
+    owner.press("Назад").await; // список
+    owner.press("Назад").await; // меню
+
+    owner.press("Настройки").await;
+    assert_navigation(&owner, true);
+    for label in ["Уведомления", "Время", "Журнал", "Интеграции"] {
+        owner.press(label).await;
+        assert_navigation(&owner, true);
+        owner.press("Назад").await;
+        owner.assert_screen_contains("Настройки");
+    }
+
+    owner.press("Семья").await;
+    assert_navigation(&owner, true);
+    owner.press("Пригласить").await;
+    assert_navigation(&owner, true);
+    owner.press("Создать приглашение").await;
+    assert_navigation(&owner, true);
+    owner.press("Назад").await; // приглашения
+    assert_navigation(&owner, true);
+    owner.press("Назад").await; // семья
+    owner.assert_screen_contains("Семья");
+
+    owner.press("Мария").await;
+    assert_navigation(&owner, true);
+    owner.press("Удалить").await;
+    assert_navigation(&owner, true);
+    owner.press("Назад").await; // карточка участника
+    owner.press("Передать владение").await;
+    assert_navigation(&owner, true);
+    owner.press("Назад").await; // карточка участника
+    owner.press("Назад").await; // семья
+    owner.press("Назад").await; // настройки
+    owner.press("Назад").await; // меню
+
+    owner.press("Настройки").await;
+    owner.press("Интеграции").await;
+    owner.press("Отозвать").await;
+    assert_navigation(&owner, true);
+    assert!(
+        owner
+            .screen()
+            .contains("Настройки › Интеграции › Отозвать токен"),
+        "the token confirm screen must show its trail:\n{}",
+        owner.screen()
+    );
+
+    // Участнику доступен только выход; у подтверждения тоже есть навигация.
+    member.press("Настройки").await;
+    assert_navigation(&member, true);
+    member.press("Выйти").await;
+    assert_navigation(&member, true);
+    member.press("Назад").await;
+    member.assert_screen_contains("Настройки");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn long_member_name_keeps_the_full_confirmation_question() {
+    let db = db().await;
+    let mut owner = onboarded_named(&db.pool, "Алексей").await;
+    let maria = invite(&mut owner, &db.pool, "Мария").await;
+    let long_name = "Александра-Екатерина";
+    sqlx::query("UPDATE users SET display_name = $1 WHERE telegram_user_id = $2")
+        .bind(long_name)
+        .bind(maria.chat)
+        .execute(&db.pool)
+        .await
+        .expect("long member name");
+
+    owner.press("Настройки").await;
+    owner.press("Семья").await;
+    owner.press("Александра").await;
+    owner.press("Передать владение").await;
+
+    let question = format!("Передать владение «{long_name}»?");
+    let screen = owner.screen();
+    assert!(
+        screen.contains(&question),
+        "the confirmation must keep the full recipient:\n{screen}"
+    );
+    assert_eq!(
+        screen.matches(&question).count(),
+        1,
+        "the confirmation question must not be duplicated:\n{screen}"
+    );
 }

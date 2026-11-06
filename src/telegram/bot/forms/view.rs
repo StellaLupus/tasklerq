@@ -15,7 +15,7 @@ use crate::telegram::bot::model::{
     Action, Choice, EditForm, Form, FormAct, ItemDraft, ItemForm, Screen, Step, TimeField, Ui,
 };
 use crate::telegram::bot::onboarding;
-use crate::telegram::bot::screens::{back_button, clip};
+use crate::telegram::bot::screens::{clip, nav_row};
 use crate::telegram::bot::{Ctx, Fail, into_sqlx};
 
 // ---------------------------------------------------------------------
@@ -64,7 +64,7 @@ pub async fn view(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
         return Ok(Ui::new()
             .heading("Форма устарела")
             .text("Начнём заново?")
-            .row(vec![back_button("В меню", to)]));
+            .row(nav_row(&Screen::Form, to)));
     };
 
     match form {

@@ -100,7 +100,7 @@ pub enum Screen {
     Completed {
         /// Элемент.
         item_id: Uuid,
-        /// Куда ведёт «К списку».
+        /// Куда ведёт «Назад».
         back: Box<Screen>,
     },
     /// Результат удаления с кнопкой отмены.
@@ -109,9 +109,10 @@ pub enum Screen {
         item_id: Uuid,
         /// Название на момент удаления.
         title: String,
-        /// Удалён из списка покупок: подпись кнопки возврата.
+        /// Удалён из списка покупок: поле сохранено ради формата JSON и на
+        /// подписи кнопок больше не влияет.
         shopping: bool,
-        /// Куда ведёт «К списку».
+        /// Куда ведёт «Назад».
         back: Box<Screen>,
     },
     /// Подтверждение удаления.
@@ -220,6 +221,139 @@ impl Screen {
             other => other.clone(),
         }
     }
+
+    /// Глубина экрана от главного меню: меню — 1, его прямые разделы — 2.
+    pub fn depth(&self) -> usize {
+        match self {
+            Self::Menu | Self::Welcome | Self::FirstContact(_) => 1,
+            Self::Add
+            | Self::Lists
+            | Self::List { .. }
+            | Self::Mine { .. }
+            | Self::Results { .. }
+            | Self::Settings
+            | Self::Form
+            | Self::Processing { .. }
+            | Self::Draft { .. } => 2,
+            Self::Item { back, .. }
+            | Self::Completed { back, .. }
+            | Self::Deleted { back, .. }
+            | Self::ConfirmDelete { back, .. } => back.depth() + 1,
+            Self::ConfirmClear { .. } | Self::Cleared { .. } => 3,
+            Self::Notifications
+            | Self::Timezones
+            | Self::Family
+            | Self::Integrations { .. }
+            | Self::Journal { .. }
+            | Self::ConfirmLeave => 3,
+            Self::Member { .. } | Self::Invites | Self::ConfirmRevokeToken { .. } => 4,
+            Self::ConfirmRemove { .. }
+            | Self::ConfirmTransfer { .. }
+            | Self::InviteCreated { .. } => 5,
+        }
+    }
+
+    /// Короткое имя экрана для хлебных крошек.
+    fn crumb(&self) -> &'static str {
+        match self {
+            Self::Menu => "Меню",
+            Self::Welcome => "Пространство создано",
+            Self::FirstContact(_) => "Первый контакт",
+            Self::Add => "Что добавить?",
+            Self::Lists => "Все списки",
+            Self::List { .. } => "Список",
+            Self::Item { .. } => "Карточка",
+            Self::Completed { .. } => "Выполнено",
+            Self::Deleted { .. } => "Удалено",
+            Self::ConfirmDelete { .. } => "Удаление",
+            Self::ConfirmClear { .. } => "Очистка",
+            Self::Cleared { .. } => "Очищено",
+            Self::ConfirmRemove { .. } => "Удаление участника",
+            Self::ConfirmTransfer { .. } => "Передача владения",
+            Self::ConfirmRevokeToken { .. } => "Отзыв токена",
+            Self::ConfirmLeave => "Выход",
+            Self::InviteCreated { .. } => "Приглашение создано",
+            Self::Mine { .. } => "Мои задачи",
+            Self::Results { .. } => "Поиск",
+            Self::Settings => "Настройки",
+            Self::Notifications => "Уведомления",
+            Self::Timezones => "Часовой пояс",
+            Self::Family => "Семья",
+            Self::Integrations { .. } => "Интеграции",
+            Self::Member { .. } => "Участник",
+            Self::Invites => "Приглашения",
+            Self::Journal { .. } => "Журнал",
+            Self::Form => "Форма",
+            Self::Processing { .. } => "Разбираю сообщение…",
+            Self::Draft { .. } => "Черновик",
+        }
+    }
+
+    /// Короткие имена родителей от меню, без текущего экрана.
+    fn parents(&self) -> Vec<&'static str> {
+        match self {
+            Self::Menu | Self::Welcome | Self::FirstContact(_) => Vec::new(),
+            Self::Add
+            | Self::Lists
+            | Self::List { .. }
+            | Self::Mine { .. }
+            | Self::Results { .. }
+            | Self::Settings
+            | Self::Form
+            | Self::Processing { .. }
+            | Self::Draft { .. } => Vec::new(),
+            Self::Item { back, .. }
+            | Self::Completed { back, .. }
+            | Self::Deleted { back, .. }
+            | Self::ConfirmDelete { back, .. } => {
+                let mut parents = back.parents();
+                parents.push(back.crumb());
+                parents
+            }
+            Self::ConfirmClear { .. } | Self::Cleared { .. } => vec!["Список"],
+            Self::Notifications
+            | Self::Timezones
+            | Self::Family
+            | Self::Integrations { .. }
+            | Self::Journal { .. } => vec!["Настройки"],
+            Self::ConfirmLeave => vec!["Настройки"],
+            Self::Member { .. } | Self::Invites => vec!["Настройки", "Семья"],
+            Self::ConfirmRemove { .. } | Self::ConfirmTransfer { .. } => {
+                vec!["Настройки", "Семья", "Участник"]
+            }
+            Self::ConfirmRevokeToken { .. } => vec!["Настройки", "Интеграции"],
+            Self::InviteCreated { .. } => vec!["Настройки", "Семья", "Приглашения"],
+        }
+    }
+
+    /// Хлебные крошки экрана: имена родителей и `title` через « › », не
+    /// длиннее 60 символов. `parent` подменяет имя непосредственного родителя,
+    /// если оно зависит от данных (например, имя списка).
+    pub fn trail(&self, title: &str, parent: Option<&str>) -> String {
+        let deep = self.depth() > 2;
+        let mut parts: Vec<String> = if deep {
+            self.parents().into_iter().map(str::to_owned).collect()
+        } else {
+            Vec::new()
+        };
+        if deep && let Some(parent) = parent {
+            parts.pop();
+            parts.push(parent.to_owned());
+        }
+        parts.push(title.to_owned());
+        clip_trail(parts.join(" › "))
+    }
+}
+
+/// Обрезать хлебные крошки до 60 символов.
+fn clip_trail(text: String) -> String {
+    const MAX: usize = 60;
+    if text.chars().count() <= MAX {
+        return text;
+    }
+    let mut clipped: String = text.chars().take(MAX.saturating_sub(1)).collect();
+    clipped.push('…');
+    clipped
 }
 
 /// Шаг формы элемента.
@@ -1034,5 +1168,119 @@ mod tests {
                 .expect("ask invite screen"),
             Screen::FirstContact(FirstContactScreen::AskInvite)
         );
+    }
+
+    #[test]
+    fn trail_follows_depth_and_replaces_the_data_dependent_parent() {
+        let list = Screen::List {
+            list_id: Uuid::nil(),
+            page: 0,
+        };
+        assert_eq!(Screen::Menu.depth(), 1);
+        assert_eq!(list.depth(), 2);
+        assert_eq!(list.trail("Задачи · 3", Some("Задачи")), "Задачи · 3");
+
+        let card = Screen::Item {
+            item_id: Uuid::nil(),
+            back: Box::new(list.clone()),
+        };
+        assert_eq!(card.depth(), 3);
+        assert_eq!(
+            card.trail("Оплатить интернет", Some("Задачи")),
+            "Задачи › Оплатить интернет"
+        );
+
+        let confirm = Screen::ConfirmDelete {
+            item_id: Uuid::nil(),
+            back: Box::new(list),
+        };
+        assert_eq!(confirm.depth(), 3);
+        assert_eq!(
+            confirm.trail("Удалить «Оплатить интернет»?", Some("Задачи")),
+            "Задачи › Удалить «Оплатить интернет»?"
+        );
+
+        let member = Screen::Member {
+            user_id: Uuid::nil(),
+        };
+        assert_eq!(member.depth(), 4);
+        assert_eq!(member.trail("Мария", None), "Настройки › Семья › Мария");
+    }
+
+    #[test]
+    fn trail_is_clipped_to_sixty_characters() {
+        let fits = "я".repeat(60);
+        assert_eq!(Screen::Menu.trail(&fits, None), fits);
+
+        let clipped = Screen::Menu.trail(&"я".repeat(61), None);
+        assert_eq!(clipped.chars().count(), 60);
+        assert_eq!(clipped, format!("{}…", "я".repeat(59)));
+    }
+
+    #[test]
+    fn every_deep_screen_has_a_parent_for_each_level() {
+        let list = Screen::List {
+            list_id: Uuid::nil(),
+            page: 0,
+        };
+        let screens = vec![
+            Screen::Item {
+                item_id: Uuid::nil(),
+                back: Box::new(list.clone()),
+            },
+            Screen::Completed {
+                item_id: Uuid::nil(),
+                back: Box::new(list.clone()),
+            },
+            Screen::Deleted {
+                item_id: Uuid::nil(),
+                title: "Задача".into(),
+                shopping: false,
+                back: Box::new(list.clone()),
+            },
+            Screen::ConfirmDelete {
+                item_id: Uuid::nil(),
+                back: Box::new(list),
+            },
+            Screen::ConfirmClear {
+                list_id: Uuid::nil(),
+            },
+            Screen::Cleared {
+                list_id: Uuid::nil(),
+                item_ids: Vec::new(),
+            },
+            Screen::Notifications,
+            Screen::Timezones,
+            Screen::Family,
+            Screen::Integrations { page: 0 },
+            Screen::Invites,
+            Screen::Journal { page: 0 },
+            Screen::Member {
+                user_id: Uuid::nil(),
+            },
+            Screen::ConfirmRemove {
+                user_id: Uuid::nil(),
+            },
+            Screen::ConfirmTransfer {
+                user_id: Uuid::nil(),
+            },
+            Screen::ConfirmRevokeToken {
+                token_id: Uuid::nil(),
+            },
+            Screen::ConfirmLeave,
+            Screen::InviteCreated {
+                invite_id: Uuid::nil(),
+                code: String::new(),
+            },
+        ];
+
+        for screen in screens {
+            assert!(screen.depth() > 2, "{screen:?}");
+            assert_eq!(
+                screen.depth(),
+                screen.parents().len() + 2,
+                "each deep level needs a parent: {screen:?}"
+            );
+        }
     }
 }
