@@ -2298,7 +2298,7 @@ async fn editor_assignment_with_other_fields_notifies_once() {
     };
 
     bot.press("Одно уведомление").await;
-    bot.press("Изменить").await;
+    bot.press("Править").await;
     bot.press("Срок").await;
     bot.press("Завтра").await;
     bot.press("Исполнитель").await;

@@ -18,7 +18,7 @@ use crate::telegram::rich::{Span, button};
 use crate::telegram::ru;
 
 use super::model::{
-    Action, QuickDue, RecurrenceDraft, Screen, Step, Ui, screen_heading, screen_heading_with,
+    Action, QuickDue, RecurrenceDraft, Screen, Ui, screen_heading, screen_heading_with,
 };
 use super::screens::{clip, nav_row};
 use super::{Ctx, Fail};
@@ -166,6 +166,9 @@ pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui,
     }
     if let Some(rule) = &item.recurrence {
         ui = ui.text(format!("🔁 {}", describe_recurrence(rule)));
+        if let Some(next) = next_occurrence(&item, ctx) {
+            ui = ui.text(format!("Следующее: {next}"));
+        }
     }
     let (done_count, total) = item.subtask_progress();
     if total > 0 {
@@ -192,19 +195,17 @@ pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui,
         .as_deref()
         .filter(|notes| !notes.trim().is_empty())
     {
-        ui = ui.details("Описание", notes.to_owned());
+        ui = ui.quote(notes.to_owned());
     }
 
-    let edit = |label: &str, field: Option<Step>| {
-        button(
-            label,
-            Action::Edit {
-                item_id,
-                field,
-                back: here.clone(),
-            },
-        )
-    };
+    let edit = button(
+        ru::EDIT_BUTTON,
+        Action::Edit {
+            item_id,
+            field: None,
+            back: here.clone(),
+        },
+    );
     let main = if done {
         button(
             "↩️ Вернуть",
@@ -245,28 +246,10 @@ pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui,
         },
     );
 
-    if shopping {
-        ui = ui
-            .row(vec![main, edit("🔢 Количество", Some(Step::Quantity))])
-            .row(vec![
-                edit("📏 Единица", Some(Step::Unit)),
-                edit("📝 Заметка", Some(Step::Notes)),
-            ])
-            .row(vec![edit("👤 Исполнитель", Some(Step::Assignee)), delete]);
+    if shopping || done {
+        ui = ui.row(vec![main, edit]).row(vec![delete]);
     } else {
-        ui = ui
-            .row(vec![main, edit("✏️ Изменить", None)])
-            .row(vec![due_button, edit("🔴 Приоритет", Some(Step::Priority))])
-            .row(vec![
-                edit("👤 Исполнитель", Some(Step::Assignee)),
-                edit("🏷 Теги", Some(Step::Tags)),
-            ])
-            .row(vec![
-                edit("🧩 Подзадачи", Some(Step::Subtasks)),
-                edit("🔁 Повторение", Some(Step::Recurrence)),
-                edit("📝 Описание", Some(Step::Notes)),
-            ])
-            .row(vec![delete]);
+        ui = ui.row(vec![main, due_button]).row(vec![edit, delete]);
     }
     Ok(ui.row(nav_row(&here, back.clone())))
 }
@@ -444,6 +427,28 @@ fn quick_due(
             at.with_timezone(&tz).time(),
         )?)),
         None => Ok(Due::AllDay(date)),
+    }
+}
+
+/// Вхождение, которое станет сроком после выполнения текущего.
+///
+/// Совпадает с расчётом `complete`: текущий срок (или первое вхождение серии
+/// без срока) и слот `occurrence_date` перенесённого вхождения.
+fn next_occurrence(item: &Item, ctx: &Ctx<'_>) -> Option<String> {
+    let rule = item.recurrence.as_ref()?;
+    if item.status == ItemStatus::Done {
+        return None;
+    }
+    let today = ctx.now.with_timezone(&ctx.tz).date_naive();
+    let current = match (item.due_at, item.due_date) {
+        (Some(at), _) => Due::Timed(at),
+        (None, Some(date)) => Due::AllDay(date),
+        (None, None) => rule.first_due(today).ok()?,
+    };
+    let next = rule.next_after(current, ctx.now).ok()??;
+    match next {
+        Due::Timed(at) => ru::due_label(Some(at), None, ctx.tz, ctx.now),
+        Due::AllDay(date) => ru::due_label(None, Some(date), ctx.tz, ctx.now),
     }
 }
 

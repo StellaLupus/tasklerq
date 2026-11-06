@@ -72,7 +72,12 @@ async fn load(ctx: &mut Ctx<'_>) -> Result<Option<Form>, Fail> {
 pub(super) fn parse(data: serde_json::Value) -> Option<Form> {
     match serde_json::from_value::<Form>(data.clone()) {
         Ok(form) => Some(form),
-        Err(_) if data.get("form").and_then(|form| form.as_str()).is_some() => {
+        Err(_)
+            if matches!(
+                data.get("form").and_then(|form| form.as_str()),
+                Some("create" | "edit")
+            ) =>
+        {
             Some(Form::LegacyEdit)
         }
         Err(_) => None,

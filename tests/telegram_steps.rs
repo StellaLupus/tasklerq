@@ -356,13 +356,40 @@ async fn old_create_json_is_reported_as_an_expired_edit() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn damaged_state_of_another_form_is_not_an_expired_edit() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+
+    sqlx::query(
+        "INSERT INTO conversation_states (
+             chat_id, telegram_user_id, kind, data, expires_at
+         )
+         VALUES ($1, $1, 'due_text', $2, $3)",
+    )
+    .bind(bot.chat)
+    .bind(json!({"form": "due_text"}))
+    .bind(bot.now + Duration::minutes(15))
+    .execute(&db.pool)
+    .await
+    .expect("damaged due text state");
+
+    bot.text("Не должно упасть").await;
+    bot.assert_screen_contains("Семья");
+    assert!(
+        !bot.screen().contains("правка устарела"),
+        "another form's damaged state must not look like an expired edit:\n{}",
+        bot.screen()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn editor_expires_after_fifteen_minutes() {
     let db = db().await;
     let mut bot = onboarded(&db.pool).await;
     bot.text("Истекающая правка").await;
     bot.press("Сохранить").await;
     bot.press("Истекающая правка").await;
-    bot.press("Изменить").await;
+    bot.press("Править").await;
     bot.assert_has_button("💾 Сохранить");
 
     bot.advance(Duration::minutes(16));
@@ -437,6 +464,7 @@ async fn edit_form_summary_shows_the_shopping_quantity() {
     bot.press("Покупки").await;
     bot.press("Править").await;
     bot.press("Молоко").await;
+    bot.press("Править").await;
     bot.press("Количество").await;
 
     bot.assert_screen_contains("Сколько?");
@@ -469,6 +497,7 @@ async fn edit_form_summary_shows_a_unit_without_quantity() {
     bot.press("Покупки").await;
     bot.press("Править").await;
     bot.press("Хлеб").await;
+    bot.press("Править").await;
     bot.press("Единица").await;
 
     bot.assert_screen_contains("В чём измерять?");

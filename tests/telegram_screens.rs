@@ -11,7 +11,8 @@ use support::telegram::{Call, FakeTelegram, Harness, button_rows};
 use support::{TestHousehold, create_item, db, new_item, next_telegram_id};
 use tasklerq::admin;
 use tasklerq::config::TenancyMode;
-use tasklerq::domain::models::{Actor, ItemPriority, ListKind, UserRole};
+use tasklerq::domain::models::{Actor, ItemPriority, ListKind, RecurrenceFreq, UserRole};
+use tasklerq::domain::recurrence::Due;
 use tasklerq::domain::settings::NotificationSettings;
 use tasklerq::jobs::scheduler::Scheduler;
 use tasklerq::storage::repositories::{items, lists};
@@ -3477,6 +3478,7 @@ async fn action_labels_do_not_say_gotovo() {
     // Выбор тегов в форме правки.
     bot.press("Задачи").await;
     bot.press("Оплатить интернет").await;
+    bot.press("Править").await;
     bot.press("Теги").await;
     let edit_tags = support::telegram::buttons(&bot.screen());
     assert!(
@@ -3906,6 +3908,208 @@ async fn long_member_name_keeps_the_full_confirmation_question() {
         1,
         "the confirmation question must not be duplicated:\n{screen}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_card_shows_fields_and_only_action_buttons() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut task = new_item(household.tasks_list_id, "Оплатить интернет");
+    task.priority = ItemPriority::High;
+    task.tags = vec!["дом".into()];
+    task.subtasks = vec![support::subtask("Найти договор")];
+    task.assignee_user_id = Some(household.owner_id);
+    create_item(&db.pool, &household, household.tasks_list_id, &actor, task).await;
+
+    bot.press("Задачи").await;
+    bot.press("Оплатить интернет").await;
+
+    for label in ["✓ Выполнено", "📅 Срок", "✏️ Править", "🗑 Удалить"]
+    {
+        bot.assert_has_button(label);
+    }
+    for label in [
+        "Приоритет",
+        "Исполнитель",
+        "Теги",
+        "Подзадачи",
+        "Повторение",
+        "Описание",
+    ] {
+        assert!(
+            bot.find_button(label).is_none(),
+            "the card must not keep the field button `{label}`:\n{}",
+            bot.screen()
+        );
+    }
+    bot.assert_has_button("Назад");
+    bot.assert_has_button("Меню");
+
+    bot.assert_screen_contains("Приоритет: 🟠 Высокий");
+    bot.assert_screen_contains("🏷 дом");
+    bot.assert_screen_contains("👤 Alice");
+    bot.assert_screen_contains("🧩 Подзадачи: 0 из 1");
+    bot.assert_screen_contains("Список: Задачи");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn purchase_card_shows_fields_and_only_action_buttons() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut purchase = new_item(household.shopping_list_id, "Молоко");
+    purchase.quantity = Some(2.0);
+    purchase.unit = Some("л".into());
+    purchase.notes = Some("Безлактозное".into());
+    purchase.assignee_user_id = Some(household.owner_id);
+    create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        purchase,
+    )
+    .await;
+
+    bot.press("Покупки").await;
+    bot.press("Править").await;
+    bot.press("Молоко").await;
+
+    for label in ["✓ Куплено", "✏️ Править", "🗑 Удалить"] {
+        bot.assert_has_button(label);
+    }
+    for label in ["Количество", "Единица", "Заметка", "Исполнитель"]
+    {
+        assert!(
+            bot.find_button(label).is_none(),
+            "the purchase card must not keep the field button `{label}`:\n{}",
+            bot.screen()
+        );
+    }
+    bot.assert_has_button("Назад");
+    bot.assert_has_button("Меню");
+
+    bot.assert_screen_contains("Количество: 2 л");
+    bot.assert_screen_contains("👤 Alice");
+    bot.assert_screen_contains("Список: Покупки");
+    bot.assert_screen_contains("Безлактозное");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn long_description_is_a_collapsible_quote_and_short_one_is_plain() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut long = new_item(household.tasks_list_id, "Длинное описание");
+    long.notes = Some(
+        "Первая строка описания\nВторая строка описания\nТретья строка описания\nЧетвёртая строка описания"
+            .into(),
+    );
+    create_item(&db.pool, &household, household.tasks_list_id, &actor, long).await;
+    let mut short = new_item(household.tasks_list_id, "Короткое описание");
+    short.notes = Some("Одна короткая строка".into());
+    create_item(&db.pool, &household, household.tasks_list_id, &actor, short).await;
+
+    bot.press("Задачи").await;
+    bot.press("Длинное описание").await;
+    let html = bot.screen();
+    assert!(
+        html.contains("<blockquote expandable>"),
+        "a long description must be collapsed:\n{html}"
+    );
+    assert!(
+        html.contains("Четвёртая строка описания"),
+        "the description must be shown in full:\n{html}"
+    );
+    bot.press("Назад").await;
+
+    bot.press("Короткое описание").await;
+    let html = bot.screen();
+    assert!(
+        html.contains("<blockquote>"),
+        "a short description stays a plain quote:\n{html}"
+    );
+    assert!(
+        !html.contains("<blockquote expandable>"),
+        "a short description must not be collapsed:\n{html}"
+    );
+    assert!(html.contains("Одна короткая строка"), "{html}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recurring_card_shows_the_next_occurrence_after_a_moved_slot() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let now = local_utc(
+        moscow,
+        NaiveDate::from_ymd_opt(2026, 11, 6).expect("date"),
+        12,
+        0,
+    );
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut input = new_item(household.tasks_list_id, "Полить цветы");
+    input.due_date = Some(NaiveDate::from_ymd_opt(2026, 11, 10).expect("date"));
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Weekly, vec![2]));
+    let task = create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &actor,
+        task.id,
+        task.version,
+        Due::AllDay(NaiveDate::from_ymd_opt(2026, 11, 6).expect("date")),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("move the occurrence");
+    drop(conn);
+
+    bot.press("Задачи").await;
+    bot.press("Полить цветы").await;
+    bot.assert_screen_contains("🔁 Каждую неделю: вт");
+    bot.assert_screen_contains("Следующее: вт, 17 ноя");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn card_edit_opens_the_editor_and_save_returns_to_the_card() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, "Оплатить интернет"),
+    )
+    .await;
+
+    bot.press("Задачи").await;
+    bot.press("Оплатить интернет").await;
+    bot.press("Править").await;
+    bot.assert_screen_contains("Название: Оплатить интернет");
+    bot.assert_has_button("💾 Сохранить");
+
+    bot.press("Приоритет").await;
+    bot.press("Срочный").await;
+    bot.press("Сохранить").await;
+
+    bot.assert_screen_contains("Задачи › Оплатить интернет");
+    bot.assert_screen_contains("Приоритет: 🔴 Срочный");
+    for label in ["✓ Выполнено", "📅 Срок", "✏️ Править", "🗑 Удалить"]
+    {
+        bot.assert_has_button(label);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

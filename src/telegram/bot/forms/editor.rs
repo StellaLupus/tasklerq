@@ -122,7 +122,10 @@ fn expired_view(item_id: Option<Uuid>, back: &Screen) -> Ui {
 /// Экран редактора или открытого поля.
 pub async fn view(ctx: &mut Ctx<'_>, editor: Editor) -> Result<Ui, Fail> {
     if editor.conflict.is_some() {
-        return conflict_view(ctx, &editor).await;
+        let EditorTarget::Item { item_id, .. } = &editor.target else {
+            return main_view(ctx, &editor).await;
+        };
+        return conflict_view(ctx, &editor, *item_id).await;
     }
     if let Some(duplicate) = &editor.duplicate {
         return Ok(duplicate_screen(&editor, duplicate));
@@ -581,25 +584,37 @@ fn current_differs(field: EditorField, current: &ItemSnapshot, base: &ItemSnapsh
 async fn save(ctx: &mut Ctx<'_>, editor: Editor, allow_duplicate: bool) -> Result<(), Fail> {
     match &editor.target {
         EditorTarget::New { .. } => save_new(ctx, editor, allow_duplicate).await,
-        EditorTarget::Item { .. } => save_item(ctx, editor).await,
-        EditorTarget::DraftItem { list_missing, .. } => {
+        EditorTarget::Item { item_id, base, .. } => {
+            let item_id = *item_id;
+            let base = base.as_ref().clone();
+            save_item(ctx, editor, item_id, base).await
+        }
+        EditorTarget::DraftItem {
+            draft_id,
+            index,
+            list_missing,
+            ..
+        } => {
+            let draft_id = *draft_id;
+            let index = *index;
             if *list_missing && !editor.touched.contains(&EditorField::List) {
                 let mut editor = editor;
                 editor.error = Some("Выберите список.".to_owned());
                 editor.field = Some(Step::List);
                 return show(ctx, editor).await;
             }
-            save_draft(ctx, editor).await
+            save_draft(ctx, editor, draft_id, index).await
         }
     }
 }
 
 /// Конфликты, затем один `items::update` по `touched`.
-async fn save_item(ctx: &mut Ctx<'_>, mut editor: Editor) -> Result<(), Fail> {
-    let (item_id, base) = match &editor.target {
-        EditorTarget::Item { item_id, base, .. } => (*item_id, base.as_ref().clone()),
-        _ => return show(ctx, editor).await,
-    };
+async fn save_item(
+    ctx: &mut Ctx<'_>,
+    mut editor: Editor,
+    item_id: Uuid,
+    base: ItemSnapshot,
+) -> Result<(), Fail> {
     let back = editor.back();
     let household_id = ctx.household()?.id;
     let current = items::get(&mut *ctx.conn, household_id, item_id).await?;
@@ -693,13 +708,12 @@ async fn save_new(
 }
 
 /// Записать пункт в черновик, перепроверить его и вернуться к карточке.
-async fn save_draft(ctx: &mut Ctx<'_>, editor: Editor) -> Result<(), Fail> {
-    let (draft_id, index) = match &editor.target {
-        EditorTarget::DraftItem {
-            draft_id, index, ..
-        } => (*draft_id, *index),
-        _ => return show(ctx, editor).await,
-    };
+async fn save_draft(
+    ctx: &mut Ctx<'_>,
+    editor: Editor,
+    draft_id: Uuid,
+    index: usize,
+) -> Result<(), Fail> {
     crate::telegram::bot::capture::save_draft_item(
         ctx,
         draft_id,
@@ -865,13 +879,15 @@ fn merge(target: &mut ItemPatch, source: ItemPatch) {
 }
 
 /// Ответ на кнопку от «Оставить мой» / «Оставить текущий».
-async fn resolve_conflict(ctx: &mut Ctx<'_>, mut editor: Editor, mine: bool) -> Result<(), Fail> {
+async fn resolve_conflict(
+    ctx: &mut Ctx<'_>,
+    mut editor: Editor,
+    item_id: Uuid,
+    base: ItemSnapshot,
+    mine: bool,
+) -> Result<(), Fail> {
     let Some(conflicts) = editor.conflict.take() else {
         return show(ctx, editor).await;
-    };
-    let (item_id, base) = match &editor.target {
-        EditorTarget::Item { item_id, base, .. } => (*item_id, base.as_ref().clone()),
-        _ => return show(ctx, editor).await,
     };
     let back = editor.back();
     if !mine {
@@ -896,11 +912,7 @@ async fn cancel(ctx: &mut Ctx<'_>, editor: Editor) -> Result<(), Fail> {
     ctx.present(back).await
 }
 
-async fn conflict_view(ctx: &mut Ctx<'_>, editor: &Editor) -> Result<Ui, Fail> {
-    let EditorTarget::Item { item_id, .. } = &editor.target else {
-        return main_view(ctx, editor).await;
-    };
-    let item_id = *item_id;
+async fn conflict_view(ctx: &mut Ctx<'_>, editor: &Editor, item_id: Uuid) -> Result<Ui, Fail> {
     let back = editor.back();
     let household_id = ctx.household()?.id;
     let current = items::get(&mut *ctx.conn, household_id, item_id).await?;
@@ -1194,7 +1206,14 @@ pub(super) async fn on_action(
             version,
         } => increase_duplicate(ctx, editor, item_id, quantity, version).await,
         FormAct::Cancel => cancel(ctx, editor).await,
-        FormAct::Conflict { mine } => resolve_conflict(ctx, editor, mine).await,
+        FormAct::Conflict { mine } => {
+            let EditorTarget::Item { item_id, base, .. } = &editor.target else {
+                return show(ctx, editor).await;
+            };
+            let item_id = *item_id;
+            let base = base.as_ref().clone();
+            resolve_conflict(ctx, editor, item_id, base, mine).await
+        }
     }
 }
 

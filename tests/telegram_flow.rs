@@ -754,7 +754,8 @@ async fn card_edit_accumulates_fields_until_save() {
     bot.assert_screen_contains("Приоритет: ⚪ Обычный");
     bot.assert_screen_contains("Список: Задачи");
 
-    // Кнопка поля в карточке открывает редактор сразу на этом поле.
+    // Карточка — экран просмотра: поля правятся в редакторе.
+    bot.press("Править").await;
     bot.press("Приоритет").await;
     bot.assert_screen_contains("Какой приоритет?");
     bot.press("Срочный").await;
@@ -802,7 +803,7 @@ async fn editor_saves_several_fields_with_one_version_and_one_event() {
     assert_eq!(item.version, 1);
 
     bot.press("Несколько полей").await;
-    bot.press("Изменить").await;
+    bot.press("Править").await;
     bot.press("Срок").await;
     bot.press("Завтра").await;
     bot.assert_screen_contains("Срок: Завтра");
@@ -853,7 +854,7 @@ async fn editor_keeps_other_field_changes_without_a_conflict() {
     let item = task_row(&db.pool, household.household_id, "Разные поля").await;
 
     bot.press("Разные поля").await;
-    bot.press("Изменить").await;
+    bot.press("Править").await;
     bot.press("Срок").await;
     bot.press("Завтра").await;
 
@@ -900,7 +901,7 @@ async fn editor_conflict_offers_both_values_and_both_outcomes() {
     let other_day = today + Duration::days(5);
 
     bot.press("Одно поле").await;
-    bot.press("Изменить").await;
+    bot.press("Править").await;
     bot.press("Срок").await;
     bot.press("Завтра").await;
     bot.press("Название").await;
@@ -950,7 +951,7 @@ async fn editor_conflict_offers_both_values_and_both_outcomes() {
     assert_eq!(kept_current.version, item.version + 2);
 
     // Второй заход: «Оставить мой» записывает нашу дату.
-    bot.press("Изменить").await;
+    bot.press("Править").await;
     bot.press("Срок").await;
     bot.press("Завтра").await;
     let before_second = task_row(&db.pool, household.household_id, "Наш заголовок").await;
@@ -990,6 +991,7 @@ async fn editor_field_opened_from_card_reverts_on_back() {
     let item = task_row(&db.pool, household.household_id, "Поле из карточки назад").await;
 
     bot.press("Поле из карточки назад").await;
+    bot.press("Править").await;
     bot.press("Повторение").await;
     bot.press("Каждую неделю").await;
     bot.assert_screen_contains("Повторение: Каждую неделю");
@@ -1010,7 +1012,7 @@ async fn editor_interval_sub_screen_returns_to_recurrence() {
     bot.text("Подэкран интервала").await;
     bot.press("Сохранить").await;
     bot.press("Подэкран интервала").await;
-    bot.press("Изменить").await;
+    bot.press("Править").await;
     bot.press("Повторение").await;
     bot.press("Каждую неделю").await;
     bot.press("Другой интервал").await;
@@ -1047,7 +1049,7 @@ async fn editor_conflict_current_with_no_other_changes_writes_nothing() {
     let item = task_row(&db.pool, household.household_id, "Только конфликт").await;
 
     bot.press("Только конфликт").await;
-    bot.press("Изменить").await;
+    bot.press("Править").await;
     bot.press("Название").await;
     bot.text("Наш вариант").await;
 
@@ -1091,7 +1093,7 @@ async fn editor_conflict_can_show_two_fields_at_once() {
     let other_day = today + Duration::days(5);
 
     bot.press("Два конфликта").await;
-    bot.press("Изменить").await;
+    bot.press("Править").await;
     bot.press("Срок").await;
     bot.press("Завтра").await;
     bot.press("Название").await;
@@ -1161,7 +1163,7 @@ async fn editor_validation_error_keeps_the_editor_open() {
     };
 
     bot.press("Ошибка валидации").await;
-    bot.press("Изменить").await;
+    bot.press("Править").await;
     bot.press("Исполнитель").await;
     bot.press("Борис").await;
     sqlx::query("UPDATE users SET deleted_at = now() WHERE id = $1")
@@ -1257,7 +1259,7 @@ async fn editor_cancel_keeps_the_item_unchanged() {
     let item = task_row(&db.pool, household.household_id, "Отмена правки").await;
 
     bot.press("Отмена правки").await;
-    bot.press("Изменить").await;
+    bot.press("Править").await;
     bot.press("Название").await;
     bot.text("Не сохранять").await;
     bot.press("Отмена").await;
@@ -1282,7 +1284,7 @@ async fn editor_invalid_date_keeps_the_field_and_earlier_changes() {
     bot.text("Кривая дата").await;
     bot.press("Сохранить").await;
     bot.press("Кривая дата").await;
-    bot.press("Изменить").await;
+    bot.press("Править").await;
     bot.press("Название").await;
     bot.text("Новое имя").await;
     bot.assert_screen_contains("Название: Новое имя");
@@ -1330,7 +1332,7 @@ async fn editor_date_without_time_makes_a_timed_task_all_day() {
 
     bot.press("Задачи").await;
     bot.press("Со временем").await;
-    bot.press("Изменить").await;
+    bot.press("Править").await;
     bot.press("Срок").await;
     bot.press("Дата и время").await;
     let day_after_tomorrow = tomorrow + Duration::days(1);
@@ -1367,7 +1369,7 @@ async fn editor_list_field_moves_only_between_lists_of_the_same_kind() {
     drop(conn);
 
     bot.press("Перенести в список").await;
-    bot.press("Изменить").await;
+    bot.press("Править").await;
     bot.press("Список").await;
     let labels: Vec<String> = support::telegram::buttons(&bot.screen())
         .into_iter()
@@ -1411,7 +1413,7 @@ async fn editor_can_clear_a_due_date() {
 
     bot.press("Задачи").await;
     bot.press("Снять срок").await;
-    bot.press("Изменить").await;
+    bot.press("Править").await;
     bot.press("Срок").await;
     bot.press("Без срока").await;
     bot.assert_screen_contains("Срок: без срока");
@@ -1429,7 +1431,7 @@ async fn editor_field_answer_is_deleted_and_visible_in_the_editor() {
     bot.text("Ответ полю").await;
     bot.press("Сохранить").await;
     bot.press("Ответ полю").await;
-    bot.press("Изменить").await;
+    bot.press("Править").await;
     bot.press("Название").await;
 
     let update = bot.text_update("Alice", "Позвонить маме");
@@ -1461,7 +1463,7 @@ async fn editor_due_choice_returns_to_the_editor() {
     bot.text("Вернуться в редактор").await;
     bot.press("Сохранить").await;
     bot.press("Вернуться в редактор").await;
-    bot.press("Изменить").await;
+    bot.press("Править").await;
 
     bot.press("Срок").await;
     bot.assert_screen_contains("Когда сделать?");
@@ -1483,7 +1485,7 @@ async fn editor_recurrence_sets_weekdays_and_interval_on_one_screen() {
     let today_weekday = i16::try_from(today.weekday().number_from_monday()).expect("weekday");
 
     bot.press("Повторение").await;
-    bot.press("Изменить").await;
+    bot.press("Править").await;
     bot.press("Повторение").await;
     bot.assert_screen_contains("Как часто повторять?");
     bot.press("Каждую неделю").await;
@@ -1565,7 +1567,7 @@ async fn editor_and_its_fields_have_no_step_buttons() {
 
     // Правка существующей задачи.
     bot.press("Без шагов").await;
-    bot.press("Изменить").await;
+    bot.press("Править").await;
     assert_no_step_buttons(&bot, "edit");
     walk_editor_fields(
         &mut bot,
@@ -1604,6 +1606,99 @@ async fn editor_and_its_fields_have_no_step_buttons() {
     )
     .await;
     bot.press("Отмена").await;
+
+    // Быстрая форма без разбора текста: тот же редактор с готовым названием.
+    bot.press("Назад").await;
+    bot.text("Быстрая форма").await;
+    assert_no_step_buttons(&bot, "quick form");
+    walk_editor_fields(
+        &mut bot,
+        &[
+            "Срок",
+            "Приоритет",
+            "Исполнитель",
+            "Теги",
+            "Подзадачи",
+            "Повторение",
+            "Описание",
+            "Список",
+            "Название",
+        ],
+    )
+    .await;
+    bot.press("Отмена").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn draft_item_fields_have_no_step_buttons() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let (household_id, user_id): (uuid::Uuid, uuid::Uuid) = sqlx::query_as(
+        "SELECT household_id, id FROM users WHERE telegram_user_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("user");
+    let draft_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO capture_drafts (
+             id, household_id, user_id, chat_id, source, mode, raw_text, parsed,
+             status, expires_at
+         )
+         VALUES ($1, $2, $3, $4, 'telegram', 'draft', 'проверка', $5, 'pending', $6)",
+    )
+    .bind(draft_id)
+    .bind(household_id)
+    .bind(user_id)
+    .bind(bot.chat)
+    .bind(serde_json::json!({
+        "items": [{
+            "target_kind": "checklist",
+            "target_list": null,
+            "title": "Проверка",
+            "notes": null,
+            "due_date": null,
+            "due_time": null,
+            "priority": null,
+            "assignee": null,
+            "assignee_id": null,
+            "tags": [],
+            "quantity": null,
+            "unit": null,
+            "subtasks": [],
+            "recurrence": null
+        }],
+        "clarifications": [],
+        "clarifications_answered": 0
+    }))
+    .bind(bot.now + Duration::hours(1))
+    .execute(&db.pool)
+    .await
+    .expect("draft row");
+
+    let data = action_callback(&bot, Action::DraftEdit { draft_id, index: 0 }).await;
+    let (message_id, _) = bot.active();
+    bot.press_data(&data, message_id).await;
+    bot.assert_screen_contains("В какой список?");
+    bot.press("Назад").await;
+
+    assert_no_step_buttons(&bot, "draft item");
+    walk_editor_fields(
+        &mut bot,
+        &[
+            "Срок",
+            "Приоритет",
+            "Исполнитель",
+            "Теги",
+            "Подзадачи",
+            "Повторение",
+            "Описание",
+            "Список",
+            "Название",
+        ],
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1613,7 +1708,7 @@ async fn existing_title_field_has_no_cancel_but_a_new_one_does() {
     bot.text("Без отмены").await;
     bot.press("Сохранить").await;
     bot.press("Без отмены").await;
-    bot.press("Изменить").await;
+    bot.press("Править").await;
 
     bot.press("Название").await;
     bot.assert_has_button("Назад");
@@ -1651,7 +1746,7 @@ async fn back_on_the_first_title_screen_cancels_creation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn card_field_button_opens_the_editor_on_that_field_and_back_returns() {
+async fn card_edit_button_opens_the_editor_and_back_returns() {
     let db = db().await;
     let mut bot = onboarded(&db.pool).await;
     bot.text("Поле карточки").await;
@@ -1660,6 +1755,7 @@ async fn card_field_button_opens_the_editor_on_that_field_and_back_returns() {
     let item = task_row(&db.pool, household.household_id, "Поле карточки").await;
 
     bot.press("Поле карточки").await;
+    bot.press("Править").await;
     bot.press("Теги").await;
     bot.assert_screen_contains("Теги");
     bot.assert_has_button("Применить");
@@ -1683,6 +1779,7 @@ async fn editor_changes_purchase_quantity_and_unit_in_one_save() {
     bot.press("Сохранить").await;
     bot.press("Править").await;
     bot.press("Молоко").await;
+    bot.press("Править").await;
 
     let household = test_household(&db.pool, bot.chat).await;
     let item = task_row(&db.pool, household.household_id, "Молоко").await;
