@@ -112,6 +112,9 @@ impl Recurrence {
             };
 
             let after_current = candidate_date > current_date;
+            let after_slot = self
+                .occurrence_date
+                .is_none_or(|slot| candidate_date > slot);
             let after_completion = candidate_date > completion_date;
             let timed_after_completion = match next {
                 Due::Timed(at) => at > completed_at,
@@ -122,7 +125,7 @@ impl Recurrence {
                 _ => after_current,
             };
 
-            if timed_after_current && timed_after_completion {
+            if timed_after_current && after_slot && timed_after_completion {
                 return Ok(Some(next));
             }
 
@@ -405,6 +408,7 @@ impl RecurrenceInput {
             timezone,
             anchor_date,
             month_rule,
+            occurrence_date: None,
         })
     }
 }
@@ -507,6 +511,7 @@ mod tests {
             timezone: timezone.to_owned(),
             anchor_date: anchor,
             month_rule,
+            occurrence_date: None,
         }
     }
 
@@ -670,6 +675,132 @@ mod tests {
             .expect("next")
             .expect("occurrence");
         assert_eq!(next, Due::AllDay(date(2026, 11, 4)));
+    }
+
+    #[test]
+    fn daily_interval_skips_to_the_next_grid_date() {
+        let mut rule = rule(
+            RecurrenceFreq::Daily,
+            date(2026, 11, 1),
+            "Europe/Moscow",
+            None,
+        );
+        rule.interval = 3;
+
+        let next = rule
+            .next_after(
+                Due::AllDay(date(2026, 11, 2)),
+                Utc.with_ymd_and_hms(2026, 11, 2, 12, 0, 0)
+                    .single()
+                    .expect("fixed moment"),
+            )
+            .expect("next")
+            .expect("occurrence");
+        assert_eq!(next, Due::AllDay(date(2026, 11, 4)));
+    }
+
+    #[test]
+    fn daily_date_before_anchor_starts_at_the_anchor() {
+        let rule = rule(
+            RecurrenceFreq::Daily,
+            date(2026, 11, 10),
+            "Europe/Moscow",
+            None,
+        );
+
+        let next = rule
+            .next_after(
+                Due::AllDay(date(2026, 11, 6)),
+                Utc.with_ymd_and_hms(2026, 11, 6, 12, 0, 0)
+                    .single()
+                    .expect("fixed moment"),
+            )
+            .expect("next")
+            .expect("occurrence");
+        assert_eq!(next, Due::AllDay(date(2026, 11, 10)));
+    }
+
+    #[test]
+    fn monthly_interval_skips_months_off_the_anchor_grid() {
+        let mut rule = rule(
+            RecurrenceFreq::Monthly,
+            date(2026, 1, 15),
+            "Europe/Moscow",
+            Some(MonthRule::AnchorDay),
+        );
+        rule.interval = 2;
+
+        let next = rule
+            .next_after(
+                Due::AllDay(date(2026, 2, 15)),
+                Utc.with_ymd_and_hms(2026, 2, 15, 12, 0, 0)
+                    .single()
+                    .expect("fixed moment"),
+            )
+            .expect("next")
+            .expect("occurrence");
+        assert_eq!(next, Due::AllDay(date(2026, 3, 15)));
+    }
+
+    #[test]
+    fn yearly_interval_skips_years_off_the_anchor_grid() {
+        let mut rule = rule(
+            RecurrenceFreq::Yearly,
+            date(2026, 3, 10),
+            "Europe/Moscow",
+            None,
+        );
+        rule.interval = 2;
+
+        let next = rule
+            .next_after(
+                Due::AllDay(date(2027, 3, 10)),
+                Utc.with_ymd_and_hms(2027, 3, 10, 12, 0, 0)
+                    .single()
+                    .expect("fixed moment"),
+            )
+            .expect("next")
+            .expect("occurrence");
+        assert_eq!(next, Due::AllDay(date(2028, 3, 10)));
+    }
+
+    #[test]
+    fn next_after_skips_the_occurrence_slot() {
+        let mut rule = rule(
+            RecurrenceFreq::Weekly,
+            date(2026, 11, 3),
+            "Europe/Moscow",
+            None,
+        );
+        rule.byweekday = vec![2];
+        rule.occurrence_date = Some(date(2026, 11, 10));
+
+        let next = rule
+            .next_after(
+                Due::AllDay(date(2026, 11, 6)),
+                Utc.with_ymd_and_hms(2026, 11, 6, 12, 0, 0)
+                    .single()
+                    .expect("fixed moment"),
+            )
+            .expect("next")
+            .expect("occurrence");
+        assert_eq!(next, Due::AllDay(date(2026, 11, 17)));
+    }
+
+    #[test]
+    fn recurrence_json_without_occurrence_date_reads_as_none() {
+        let rule: Recurrence = serde_json::from_value(serde_json::json!({
+            "freq": "weekly",
+            "interval": 1,
+            "byweekday": [2],
+            "until": null,
+            "timezone": "Europe/Moscow",
+            "anchor_date": "2026-11-03",
+            "month_rule": null
+        }))
+        .expect("old snapshot parses");
+
+        assert_eq!(rule.occurrence_date, None);
     }
 
     #[test]

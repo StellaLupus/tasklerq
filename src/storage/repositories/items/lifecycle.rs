@@ -63,7 +63,9 @@ pub async fn complete(
                 sqlx::query(
                     "UPDATE items
                      SET status = 'open', completed_at = $3, completed_by_user_id = $4,
-                         due_at = $5, due_date = $6, version = version + 1, updated_at = $3
+                         due_at = $5, due_date = $6,
+                         recurrence_occurrence_date = NULL,
+                         version = version + 1, updated_at = $3
                      WHERE id = $1 AND household_id = $2",
                 )
                 .bind(item_id)
@@ -79,6 +81,7 @@ pub async fn complete(
                 sqlx::query(
                     "UPDATE items
                      SET status = 'done', completed_at = $3, completed_by_user_id = $4,
+                         recurrence_occurrence_date = NULL,
                          version = version + 1, updated_at = $3
                      WHERE id = $1 AND household_id = $2",
                 )
@@ -324,6 +327,7 @@ pub async fn undo_last(
         recurrence_timezone,
         recurrence_anchor_date,
         recurrence_month_rule,
+        recurrence_occurrence_date,
     ) = recurrence_values(before.recurrence.as_ref());
 
     sqlx::query(
@@ -336,8 +340,8 @@ pub async fn undo_last(
              recurrence_freq = $19, recurrence_interval = $20,
              recurrence_byweekday = $21, recurrence_until = $22,
              recurrence_timezone = $23, recurrence_anchor_date = $24,
-             recurrence_month_rule = $25, deleted_at = $26,
-             version = $27, updated_at = $28
+             recurrence_month_rule = $25, recurrence_occurrence_date = $26,
+             deleted_at = $27, version = $28, updated_at = $29
          WHERE id = $1 AND household_id = $2",
     )
     .bind(item_id)
@@ -365,6 +369,7 @@ pub async fn undo_last(
     .bind(recurrence_timezone)
     .bind(recurrence_anchor_date)
     .bind(recurrence_month_rule)
+    .bind(recurrence_occurrence_date)
     .bind(before.deleted_at)
     .bind(current.version + 1)
     .bind(now)

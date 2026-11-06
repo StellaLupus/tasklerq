@@ -333,6 +333,10 @@ pub struct Recurrence {
     pub anchor_date: NaiveDate,
     /// Правило месячного повторения.
     pub month_rule: Option<MonthRule>,
+    /// Дата правила, которую занимает перенесённое вхождение; `None` — срок
+    /// стоит на своей дате правила.
+    #[serde(default)]
+    pub occurrence_date: Option<NaiveDate>,
 }
 
 /// Входные данные правила повторения до валидации.

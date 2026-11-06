@@ -35,6 +35,7 @@ type RecurrenceColumns = (
     Option<String>,
     Option<NaiveDate>,
     Option<MonthRule>,
+    Option<NaiveDate>,
 );
 
 fn recurrence_values(recurrence: Option<&Recurrence>) -> RecurrenceColumns {
@@ -47,8 +48,9 @@ fn recurrence_values(recurrence: Option<&Recurrence>) -> RecurrenceColumns {
             Some(rule.timezone.clone()),
             Some(rule.anchor_date),
             rule.month_rule,
+            rule.occurrence_date,
         ),
-        None => (None, None, None, None, None, None, None),
+        None => (None, None, None, None, None, None, None, None),
     }
 }
 

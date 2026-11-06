@@ -94,18 +94,22 @@ pub fn expand_item(
     let occurrences = recurrence.occurrences_between(current, start, end)?;
 
     // Перенесённое вхождение — исключение из правила. Показываем его на новом
-    // сроке, а вхождения правила не позже него не дублируем: следующее
-    // вхождение серии снова считается по правилу.
+    // сроке, а вхождения правила не позже слота и нового срока не дублируем.
+    // Без слота срок стоит на своей дате правила, и обычная серия выводится
+    // целиком.
     let current_date = current.local_date(timezone);
     let on_rule = recurrence
         .occurrences_between(current, current_date, current_date + Duration::days(1))?
         .contains(&current);
-    let occurrences = if on_rule {
+    let occurrences = if recurrence.occurrence_date.is_none() && on_rule {
         occurrences
     } else {
+        let cutoff = recurrence
+            .occurrence_date
+            .map_or(current_date, |slot| current_date.max(slot));
         let mut occurrences: Vec<_> = occurrences
             .into_iter()
-            .filter(|occurrence| occurrence.local_date(timezone) > current_date)
+            .filter(|occurrence| occurrence.local_date(timezone) > cutoff)
             .collect();
         if current_date >= start && current_date < end {
             occurrences.push(current);

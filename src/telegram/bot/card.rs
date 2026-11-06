@@ -492,6 +492,7 @@ mod tests {
             timezone: "Europe/Moscow".into(),
             anchor_date: NaiveDate::from_ymd_opt(2026, 11, 5).expect("date"),
             month_rule: Some(MonthRule::AnchorDay),
+            occurrence_date: None,
         }
     }
 

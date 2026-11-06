@@ -362,6 +362,12 @@ async fn reschedule_occurrence_matches_update_without_recurrence() {
 
     let now = utc(2025, 11, 6, 12);
     let mut conn = db.pool.acquire().await.expect("connection");
+    // Позиция в списке зависит от порядка создания, а не от переноса срока.
+    sqlx::query("UPDATE items SET position = 0 WHERE id = ANY($1)")
+        .bind(vec![left.id, right.id])
+        .execute(&mut *conn)
+        .await
+        .expect("align positions");
     let moved = items::reschedule_occurrence(
         &mut conn,
         household.household_id,
@@ -416,18 +422,21 @@ async fn reschedule_occurrence_matches_update_without_recurrence() {
     .into_iter()
     .find(|event| event.event_type == EventType::Updated)
     .expect("updated event");
-    assert_eq!(moved_event.event_type, EventType::Updated);
-    assert_eq!(moved_event.event_type, updated_event.event_type);
-    for key in ["before", "after"] {
-        assert_eq!(
-            moved_event.payload[key]["due_date"],
-            updated_event.payload[key]["due_date"]
-        );
-        assert_eq!(
-            moved_event.payload[key]["version"],
-            updated_event.payload[key]["version"]
-        );
-    }
+
+    let normalize = |mut payload: serde_json::Value| {
+        for key in ["before", "after"] {
+            let item = payload[key].as_object_mut().expect("item snapshot");
+            item.insert("id".into(), serde_json::Value::Null);
+            item.insert("created_at".into(), serde_json::Value::Null);
+            item.insert("updated_at".into(), serde_json::Value::Null);
+        }
+        payload
+    };
+    assert_eq!(
+        normalize(moved_event.payload),
+        normalize(updated_event.payload),
+        "rescheduling a task without recurrence writes the same event as update"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -522,6 +531,399 @@ async fn reschedule_occurrence_does_not_normalize_last_day() {
     .await
     .expect("complete");
     assert_eq!(completed.due_date, Some(date(2025, 11, 30)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reschedule_occurrence_earlier_than_its_slot_keeps_the_slot() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let anchor = date(2026, 11, 10);
+    let mut input = support::new_item(household.tasks_list_id, "Вынести мусор");
+    input.due_date = Some(anchor);
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Weekly, vec![2]));
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let now = utc(2026, 11, 6, 12);
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let moved = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        created.version,
+        Due::AllDay(date(2026, 11, 6)),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("reschedule earlier than the slot");
+    assert_eq!(moved.due_date, Some(date(2026, 11, 6)));
+    let moved_rule = moved.recurrence.as_ref().expect("rule");
+    assert_eq!(moved_rule.occurrence_date, Some(anchor));
+    assert_eq!(moved_rule.anchor_date, anchor);
+
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(moved.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("complete before the slot");
+    assert_eq!(completed.due_date, Some(date(2026, 11, 17)));
+    assert_eq!(
+        completed.recurrence.as_ref().expect("rule").occurrence_date,
+        None,
+        "completion clears the slot"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reschedule_occurrence_of_an_overdue_slot_moves_to_today() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let anchor = date(2026, 11, 3);
+    let mut input = support::new_item(household.tasks_list_id, "Полить цветы");
+    input.due_date = Some(anchor);
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Weekly, vec![2]));
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let now = utc(2026, 11, 6, 12);
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let moved = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        created.version,
+        Due::AllDay(date(2026, 11, 6)),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("reschedule overdue occurrence");
+    assert_eq!(
+        moved.recurrence.as_ref().expect("rule").occurrence_date,
+        Some(anchor)
+    );
+
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(moved.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("complete overdue occurrence");
+    assert_eq!(completed.due_date, Some(date(2026, 11, 10)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_reschedule_keeps_the_first_slot() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let anchor = date(2026, 11, 10);
+    let mut input = support::new_item(household.tasks_list_id, "Проверить почту");
+    input.due_date = Some(anchor);
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Weekly, vec![2]));
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let first = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        created.version,
+        Due::AllDay(date(2026, 11, 6)),
+        "Europe/Moscow",
+        utc(2026, 11, 6, 12),
+    )
+    .await
+    .expect("first reschedule");
+    assert_eq!(
+        first.recurrence.as_ref().expect("rule").occurrence_date,
+        Some(anchor)
+    );
+
+    let second = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        first.version,
+        Due::AllDay(date(2026, 11, 3)),
+        "Europe/Moscow",
+        utc(2026, 11, 3, 12),
+    )
+    .await
+    .expect("second reschedule");
+    assert_eq!(second.due_date, Some(date(2026, 11, 3)));
+    assert_eq!(
+        second.recurrence.as_ref().expect("rule").occurrence_date,
+        Some(anchor)
+    );
+
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(second.version),
+        "Europe/Moscow",
+        utc(2026, 11, 3, 12),
+    )
+    .await
+    .expect("complete after repeated reschedule");
+    assert_eq!(completed.due_date, Some(date(2026, 11, 17)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reschedule_back_to_the_slot_clears_it() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let anchor = date(2026, 11, 10);
+    let mut input = support::new_item(household.tasks_list_id, "Оплатить счета");
+    input.due_date = Some(anchor);
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Weekly, vec![2]));
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let now = utc(2026, 11, 6, 12);
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let moved = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        created.version,
+        Due::AllDay(date(2026, 11, 6)),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("move away from the slot");
+    assert_eq!(
+        moved.recurrence.as_ref().expect("rule").occurrence_date,
+        Some(anchor)
+    );
+
+    let returned = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        moved.version,
+        Due::AllDay(anchor),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("move back to the slot");
+    assert_eq!(returned.due_date, Some(anchor));
+    assert_eq!(
+        returned.recurrence.as_ref().expect("rule").occurrence_date,
+        None,
+        "returning to the slot clears it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_due_clears_the_slot() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let anchor = date(2026, 11, 10);
+    let mut input = support::new_item(household.tasks_list_id, "Сдать отчёт");
+    input.due_date = Some(anchor);
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Weekly, vec![2]));
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let now = utc(2026, 11, 6, 12);
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let moved = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        created.version,
+        Due::AllDay(date(2026, 11, 6)),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("reschedule occurrence");
+    assert_eq!(
+        moved.recurrence.as_ref().expect("rule").occurrence_date,
+        Some(anchor)
+    );
+
+    let updated = items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        moved.version,
+        ItemPatch {
+            due_date: Field::Value(date(2026, 11, 7)),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("update due");
+    assert_eq!(
+        updated.recurrence.as_ref().expect("rule").occurrence_date,
+        None
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undo_after_reschedule_restores_the_previous_due_and_slot() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let anchor = date(2026, 11, 10);
+    let mut input = support::new_item(household.tasks_list_id, "Позвонить врачу");
+    input.due_date = Some(anchor);
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Weekly, vec![2]));
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let first = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        created.version,
+        Due::AllDay(date(2026, 11, 6)),
+        "Europe/Moscow",
+        utc(2027, 1, 1, 12),
+    )
+    .await
+    .expect("first reschedule");
+
+    let now = utc(2027, 1, 1, 13);
+    let second = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        first.version,
+        Due::AllDay(date(2026, 11, 3)),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("second reschedule");
+    assert_eq!(
+        second.recurrence.as_ref().expect("rule").occurrence_date,
+        Some(anchor)
+    );
+
+    let restored = items::undo_last(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        now,
+    )
+    .await
+    .expect("undo reschedule");
+    assert_eq!(restored.due_date, Some(date(2026, 11, 6)));
+    assert_eq!(
+        restored.recurrence.as_ref().expect("rule").occurrence_date,
+        Some(anchor),
+        "the slot from payload.before is restored"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn event_snapshot_without_occurrence_date_parses() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let mut input = support::new_item(household.tasks_list_id, "Старый снимок");
+    input.due_date = Some(date(2026, 11, 10));
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Weekly, vec![2]));
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let event = tasklerq::storage::repositories::events::for_item(
+        &mut conn,
+        household.household_id,
+        created.id,
+    )
+    .await
+    .expect("events")
+    .into_iter()
+    .find(|event| event.event_type == EventType::Created)
+    .expect("created event");
+    let mut snapshot = event.payload["after"].clone();
+    snapshot["recurrence"]
+        .as_object_mut()
+        .expect("recurrence object")
+        .remove("occurrence_date");
+
+    let parsed: tasklerq::domain::models::Item =
+        serde_json::from_value(snapshot).expect("old event snapshot parses");
+    assert_eq!(
+        parsed.recurrence.expect("rule").occurrence_date,
+        None,
+        "a snapshot without the field gets no slot"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

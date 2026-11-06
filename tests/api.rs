@@ -921,6 +921,69 @@ async fn snapshot_truncates_calendar_instead_of_failing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recurrence_occurrence_date_is_read_only() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let token =
+        support::issue_token(&db.pool, household.household_id, &["ha:read", "ha:write"]).await;
+    let app = support::app(&db.pool);
+
+    let (status, created) = support::request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/lists/{}/items", household.tasks_list_id),
+        Some(&token),
+        Some(json!({
+            "title": "Вынести мусор",
+            "due_date": "2026-11-10",
+            "recurrence": {"freq": "weekly", "byweekday": [2]}
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create item: {created}");
+    assert_eq!(created["recurrence"]["occurrence_date"], json!(null));
+    let item_id = created["id"].as_str().expect("item id").to_owned();
+
+    let (status, fetched) = support::request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/items/{item_id}"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        fetched["recurrence"]["occurrence_date"],
+        json!(null),
+        "the response exposes the slot as null without a reschedule"
+    );
+
+    let (status, patched) = support::request(
+        &app,
+        Method::PATCH,
+        &format!("/api/v1/items/{item_id}"),
+        Some(&token),
+        Some(json!({
+            "version": 1,
+            "recurrence": {
+                "freq": "weekly",
+                "byweekday": [2],
+                "anchor_date": "2026-11-10",
+                "occurrence_date": "2026-11-03"
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "patch item: {patched}");
+    assert_eq!(
+        patched["recurrence"]["occurrence_date"],
+        json!(null),
+        "PATCH does not accept the read-only slot"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn control_characters_are_removed_from_stored_user_text() {
     let db = support::db().await;
     let household = support::create_household(&db.pool).await;
