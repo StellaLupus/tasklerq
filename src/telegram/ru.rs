@@ -127,6 +127,11 @@ pub fn due_label(
     due_date.map(|date| date_label(date, today))
 }
 
+/// Счётчик выполненных сегодня в шапке списка задач.
+pub fn done_today_counter(count: usize) -> String {
+    format!("✅ {count}")
+}
+
 /// С заглавной буквы.
 pub fn capitalize(text: &str) -> String {
     let mut chars = text.chars();
@@ -172,6 +177,8 @@ pub const DONE_TOAST: &str = "Выполнено";
 pub const BACK_BUTTON: &str = "⬅️ Назад";
 /// Кнопка возврата в главное меню.
 pub const MENU_BUTTON: &str = "🏠 Меню";
+/// Раздел выполненных сегодня задач в списке.
+pub const DONE_TODAY_TITLE: &str = "Выполнено сегодня";
 /// Кнопка включения режима правки списка покупок.
 pub const EDIT_BUTTON: &str = "✏️ Править";
 /// Кнопка выключения режима правки списка покупок.

@@ -425,6 +425,12 @@ impl Harness {
         self.tick();
     }
 
+    /// Поставить время стенда на заданный момент.
+    pub fn set_now(&mut self, at: DateTime<Utc>) {
+        self.skew = at - Utc::now();
+        self.tick();
+    }
+
     /// Время стенда следует за реальным плюс накопленный сдвиг.
     fn tick(&mut self) {
         self.now = Utc::now() + self.skew;

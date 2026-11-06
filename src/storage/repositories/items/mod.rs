@@ -1,5 +1,6 @@
 //! Репозиторий элементов, жизненный цикл, журнал и поиск.
 
+pub mod completions;
 mod find;
 mod lifecycle;
 mod read;

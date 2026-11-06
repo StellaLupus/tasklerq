@@ -2,9 +2,9 @@
 
 mod support;
 
-use chrono::{Datelike, Duration, Utc};
+use chrono::{Datelike, Duration, SubsecRound, Utc};
 use tasklerq::domain::error::DomainError;
-use tasklerq::domain::models::{ItemPatch, ItemStatus, ListKind};
+use tasklerq::domain::models::{EventType, ItemPatch, ItemStatus, ListKind};
 use tasklerq::storage::repositories::{items, lists};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -670,4 +670,776 @@ async fn assignee_must_belong_to_the_household() {
     .await
     .expect("own member can be assigned");
     assert_eq!(assigned.assignee_user_id, Some(household.member_id));
+}
+
+/// Записи выполнений списка с начала суток до `now`.
+async fn completions(
+    conn: &mut sqlx::PgConnection,
+    household: &support::TestHousehold,
+    since: chrono::DateTime<Utc>,
+) -> Vec<items::completions::Completion> {
+    items::completions::for_list_since(conn, household.household_id, household.tasks_list_id, since)
+        .await
+        .expect("completions")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undone_completion_is_not_listed() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        support::new_item(household.tasks_list_id, "Вынести мусор"),
+    )
+    .await;
+    let now = Utc::now().trunc_subsecs(6);
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(created.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("complete");
+    assert_eq!(
+        completions(&mut conn, &household, now - Duration::days(1))
+            .await
+            .len(),
+        1
+    );
+
+    items::undo_last(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        now + Duration::seconds(1),
+    )
+    .await
+    .expect("undo");
+
+    assert!(
+        completions(&mut conn, &household, now - Duration::days(1))
+            .await
+            .is_empty(),
+        "an undone completion must disappear"
+    );
+    assert_eq!(
+        completed.completed_at,
+        Some(now),
+        "completion is recorded at the actual moment"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undoing_a_rename_does_not_add_a_completion() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        support::new_item(household.tasks_list_id, "Вынести мусор"),
+    )
+    .await;
+    let now = Utc::now().trunc_subsecs(6);
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(created.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("complete");
+    items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        completed.version,
+        ItemPatch {
+            title: Some("Вынести мусор и картон".into()),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        now + Duration::seconds(1),
+    )
+    .await
+    .expect("rename");
+    items::undo_last(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        now + Duration::seconds(2),
+    )
+    .await
+    .expect("undo rename");
+
+    let listed = completions(&mut conn, &household, now - Duration::days(1)).await;
+    assert_eq!(
+        listed.len(),
+        1,
+        "the compensating event is not a completion"
+    );
+    assert_eq!(listed[0].completed_at, now);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undoing_a_delete_does_not_add_a_completion() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        support::new_item(household.tasks_list_id, "Вынести мусор"),
+    )
+    .await;
+    let now = Utc::now().trunc_subsecs(6);
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(created.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("complete");
+    items::soft_delete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        now + Duration::seconds(1),
+    )
+    .await
+    .expect("delete");
+    items::undo_last(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        now + Duration::seconds(2),
+    )
+    .await
+    .expect("undo delete");
+
+    let listed = completions(&mut conn, &household, now - Duration::days(1)).await;
+    assert_eq!(
+        listed.len(),
+        1,
+        "the compensating event is not a completion"
+    );
+    assert_eq!(listed[0].completed_at, now);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undoing_a_reopen_restores_the_original_completion() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        support::new_item(household.tasks_list_id, "Вынести мусор"),
+    )
+    .await;
+    let now = Utc::now().trunc_subsecs(6);
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(created.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("complete");
+    items::reopen(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(completed.version),
+        now + Duration::seconds(1),
+    )
+    .await
+    .expect("reopen");
+    items::undo_last(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        now + Duration::seconds(2),
+    )
+    .await
+    .expect("undo reopen");
+
+    let listed = completions(&mut conn, &household, now - Duration::days(1)).await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0].completed_at, now,
+        "the original completion keeps its time"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reopen_after_undoing_a_rename_hides_the_old_completion() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        support::new_item(household.tasks_list_id, "Вынести мусор"),
+    )
+    .await;
+    let now = Utc::now().trunc_subsecs(6);
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(created.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("complete");
+    items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        completed.version,
+        ItemPatch {
+            title: Some("Вынести мусор и картон".into()),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        now + Duration::seconds(1),
+    )
+    .await
+    .expect("rename");
+    let restored = items::undo_last(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        now + Duration::seconds(2),
+    )
+    .await
+    .expect("undo rename");
+    items::reopen(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(restored.version),
+        now + Duration::seconds(3),
+    )
+    .await
+    .expect("reopen");
+
+    assert!(
+        completions(&mut conn, &household, now - Duration::days(1))
+            .await
+            .is_empty(),
+        "a compensating completed event must not mask the reopen"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn second_completion_after_reopen_is_listed() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        support::new_item(household.tasks_list_id, "Вынести мусор"),
+    )
+    .await;
+    let now = Utc::now().trunc_subsecs(6);
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(created.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("first completion");
+    let reopened = items::reopen(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(completed.version),
+        now + Duration::seconds(1),
+    )
+    .await
+    .expect("reopen");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(reopened.version),
+        "Europe/Moscow",
+        now + Duration::seconds(2),
+    )
+    .await
+    .expect("second completion");
+
+    let listed = completions(&mut conn, &household, now - Duration::days(1)).await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].completed_at, now + Duration::seconds(2));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completion_list_id_prefers_the_snapshot_and_falls_back_to_the_item() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        support::new_item(household.tasks_list_id, "Вынести мусор"),
+    )
+    .await;
+    let now = Utc::now().trunc_subsecs(6);
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(created.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("complete");
+
+    sqlx::query("UPDATE items SET list_id = $2 WHERE id = $1")
+        .bind(created.id)
+        .bind(household.shopping_list_id)
+        .execute(&mut *conn)
+        .await
+        .expect("move the item");
+
+    let tasks = items::completions::for_list_since(
+        &mut conn,
+        household.household_id,
+        household.tasks_list_id,
+        now - Duration::days(1),
+    )
+    .await
+    .expect("tasks completions");
+    assert_eq!(
+        tasks.len(),
+        1,
+        "the snapshot list wins over the current item list"
+    );
+    let shopping = items::completions::for_list_since(
+        &mut conn,
+        household.household_id,
+        household.shopping_list_id,
+        now - Duration::days(1),
+    )
+    .await
+    .expect("shopping completions");
+    assert!(shopping.is_empty());
+
+    sqlx::query(
+        "UPDATE item_events
+         SET payload = jsonb_set(payload, '{before,list_id}', '\"not-a-uuid\"'::jsonb)
+         WHERE id = $1",
+    )
+    .bind(tasks[0].event_id)
+    .execute(&mut *conn)
+    .await
+    .expect("break the snapshot list");
+
+    let shopping = items::completions::for_list_since(
+        &mut conn,
+        household.household_id,
+        household.shopping_list_id,
+        now - Duration::days(1),
+    )
+    .await
+    .expect("fallback completions");
+    assert_eq!(shopping.len(), 1, "a broken snapshot list falls back");
+
+    sqlx::query(
+        "UPDATE item_events
+         SET payload = jsonb_set(payload, '{before}', (payload->'before') - 'list_id')
+         WHERE id = $1",
+    )
+    .bind(tasks[0].event_id)
+    .execute(&mut *conn)
+    .await
+    .expect("drop the snapshot list");
+
+    let shopping = items::completions::for_list_since(
+        &mut conn,
+        household.household_id,
+        household.shopping_list_id,
+        now - Duration::days(1),
+    )
+    .await
+    .expect("fallback completions");
+    assert_eq!(shopping.len(), 1, "a missing snapshot list falls back");
+    let tasks = items::completions::for_list_since(
+        &mut conn,
+        household.household_id,
+        household.tasks_list_id,
+        now - Duration::days(1),
+    )
+    .await
+    .expect("tasks without snapshot list");
+    assert!(tasks.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reopened_completion_without_undo_link_is_not_listed() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        support::new_item(household.tasks_list_id, "Вынести мусор"),
+    )
+    .await;
+    let now = Utc::now();
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(created.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("complete");
+    items::reopen(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(completed.version),
+        now + Duration::seconds(1),
+    )
+    .await
+    .expect("reopen");
+
+    let events = tasklerq::storage::repositories::events::for_item(
+        &mut conn,
+        household.household_id,
+        created.id,
+    )
+    .await
+    .expect("events");
+    let reopened = events
+        .iter()
+        .find(|event| event.event_type == EventType::Reopened)
+        .expect("reopened event");
+    assert!(
+        reopened.undo_of.is_none(),
+        "reopen still writes no undo link"
+    );
+
+    assert!(
+        completions(&mut conn, &household, now - Duration::days(1))
+            .await
+            .is_empty(),
+        "a completion returned to work must disappear"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completion_keeps_the_title_from_the_moment_of_completion() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        support::new_item(household.tasks_list_id, "Полить цветы"),
+    )
+    .await;
+    let now = Utc::now();
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(created.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("complete");
+    items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        completed.version,
+        ItemPatch {
+            title: Some("Полить цветы на балконе".into()),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        now + Duration::seconds(1),
+    )
+    .await
+    .expect("rename");
+
+    let listed = completions(&mut conn, &household, now - Duration::days(1)).await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].title, "Полить цветы");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completion_snapshot_without_title_is_tolerated() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let mut input = support::new_item(household.tasks_list_id, "Вынести мусор");
+    input.due_at = Some(Utc::now() + Duration::hours(2));
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+    let now = Utc::now();
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(created.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("complete");
+
+    sqlx::query(
+        "UPDATE item_events
+         SET payload = jsonb_set(
+             payload,
+             '{before}',
+             ((payload->'before') - 'title') || '{\"due_at\": \"not-a-date\"}'::jsonb
+         )
+         WHERE item_id = $1 AND event_type = 'completed'",
+    )
+    .bind(created.id)
+    .execute(&mut *conn)
+    .await
+    .expect("break the snapshot");
+
+    let listed = completions(&mut conn, &household, now - Duration::days(1)).await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].title, items::completions::UNTITLED);
+    assert_eq!(listed[0].due_at, None, "a broken due date is tolerated");
+    assert_eq!(listed[0].item_id, completed.id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleted_item_completions_are_not_listed() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        support::new_item(household.tasks_list_id, "Вынести мусор"),
+    )
+    .await;
+    let now = Utc::now();
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(created.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("complete");
+    items::soft_delete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        now + Duration::seconds(1),
+    )
+    .await
+    .expect("delete");
+
+    assert!(
+        completions(&mut conn, &household, now - Duration::days(1))
+            .await
+            .is_empty(),
+        "deleted items must not contribute completions"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completions_are_filtered_by_list() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let task = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        support::new_item(household.tasks_list_id, "Задача"),
+    )
+    .await;
+    let purchase = support::create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &household.owner(),
+        support::new_item(household.shopping_list_id, "Молоко"),
+    )
+    .await;
+    let task_id = task.id;
+    for item in [task, purchase] {
+        items::complete(
+            &mut conn,
+            household.household_id,
+            &household.owner(),
+            item.id,
+            Some(item.version),
+            "Europe/Moscow",
+            now,
+        )
+        .await
+        .expect("complete");
+    }
+
+    let listed = completions(&mut conn, &household, now - Duration::days(1)).await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].item_id, task_id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recurring_completions_keep_their_planned_due_dates() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let today = Utc::now().date_naive();
+    let mut input = support::new_item(household.tasks_list_id, "Полить цветы");
+    input.due_date = Some(today);
+    input.recurrence = Some(support::recurrence(
+        tasklerq::domain::models::RecurrenceFreq::Daily,
+        Vec::new(),
+    ));
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+    let now = Utc::now();
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let first = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(created.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("first completion");
+    assert_eq!(first.status, ItemStatus::Open);
+
+    // Второе вхождение: следующее вхождение уже наступило. Возвращаем срок и
+    // снимаем отметку, чтобы `complete` записал ещё одно выполнение.
+    let second_due = today + Duration::days(1);
+    sqlx::query("UPDATE items SET completed_at = NULL, due_date = $2 WHERE id = $1")
+        .bind(created.id)
+        .bind(second_due)
+        .execute(&mut *conn)
+        .await
+        .expect("prepare second occurrence");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        None,
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("second completion");
+
+    let listed = completions(&mut conn, &household, now - Duration::days(1)).await;
+    assert_eq!(listed.len(), 2);
+    let mut due_dates: Vec<_> = listed.iter().map(|entry| entry.due_date).collect();
+    due_dates.sort();
+    assert_eq!(due_dates, vec![Some(today), Some(second_due)]);
 }

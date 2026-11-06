@@ -346,6 +346,15 @@ pub fn task_label(item: &Item, tz: Tz, now: DateTime<Utc>) -> String {
     label
 }
 
+/// Подпись строки выполненной сегодня задачи: «✅ Название · 13:47».
+pub fn completion_label(completion: &items::completions::Completion, tz: Tz) -> String {
+    format!(
+        "✅ {} · {}",
+        clip(&completion.title, 40),
+        completion.completed_at.with_timezone(&tz).format("%H:%M")
+    )
+}
+
 async fn list(ctx: &mut Ctx<'_>, list_id: Uuid, page: u32, edit: bool) -> Result<Ui, Fail> {
     let household_id = ctx.household()?.id;
     let list = lists::get_visible(&mut *ctx.conn, household_id, list_id).await?;
@@ -369,6 +378,10 @@ async fn tasks_list(ctx: &mut Ctx<'_>, list: &List, page: u32) -> Result<Ui, Fai
         .collect();
     sort_tasks(&mut open, ctx.tz, ctx.now);
 
+    let since = items::completions::day_start(ctx.tz, ctx.now);
+    let done_today =
+        items::completions::for_list_since(&mut *ctx.conn, household_id, list.id, since).await?;
+
     let (start, end, page, pages) = page_bounds(open.len(), page);
     let here = |page: usize| Screen::List {
         list_id: list.id,
@@ -376,41 +389,42 @@ async fn tasks_list(ctx: &mut Ctx<'_>, list: &List, page: u32) -> Result<Ui, Fai
         edit: false,
     };
 
-    let mut ui =
-        Ui::new().heading(here(page).trail(&format!("{} · {}", list.name, open.len()), None));
+    let mut heading = format!("{} · {}", list.name, open.len());
+    if !done_today.is_empty() {
+        heading.push_str(&format!(" · {}", ru::done_today_counter(done_today.len())));
+    }
+    let mut ui = Ui::new().heading(here(page).trail(&heading, None));
+    let last_page = page + 1 == pages;
+    let show_done_today = last_page && !done_today.is_empty();
     if open.is_empty() {
         ui = ui.text("Пока нет задач");
-        if done > 0 {
-            ui = ui.text(format!("Выполнено ранее: {done}"));
+    } else {
+        let mut current: Option<Section> = None;
+        for item in &open[start..end] {
+            let section = section_of(item, ctx.tz, ctx.now);
+            if current != Some(section) {
+                ui = ui.bold(section.title());
+                current = Some(section);
+            }
+            ui = ui.row(vec![go(
+                &task_label(item, ctx.tz, ctx.now),
+                Screen::Item {
+                    item_id: item.id,
+                    back: Box::new(here(page)),
+                },
+            )]);
         }
-        let mut row = vec![button(
-            "➕ Добавить",
-            Action::Add {
-                list_id: Some(list.id),
-                kind: ListKind::Tasks,
-            },
-        )];
-        row.extend(nav_row(&here(page), Screen::Menu));
-        return Ok(ui.row(row));
-    }
-
-    let mut current: Option<Section> = None;
-    for item in &open[start..end] {
-        let section = section_of(item, ctx.tz, ctx.now);
-        if current != Some(section) {
-            ui = ui.bold(section.title());
-            current = Some(section);
-        }
-        ui = ui.row(vec![go(
-            &task_label(item, ctx.tz, ctx.now),
-            Screen::Item {
-                item_id: item.id,
-                back: Box::new(here(page)),
-            },
-        )]);
     }
     if done > 0 {
-        ui = ui.text(format!("Выполнено: {done}"));
+        let label = if open.is_empty() {
+            "Выполнено ранее"
+        } else {
+            "Выполнено"
+        };
+        ui = ui.text(format!("{label}: {done}"));
+    }
+    if show_done_today {
+        ui = done_today_section(ui, &done_today, ctx.tz, here(page));
     }
     let current = here(page);
     let ui = pager(ui, page, pages, here);
@@ -423,6 +437,26 @@ async fn tasks_list(ctx: &mut Ctx<'_>, list: &List, page: u32) -> Result<Ui, Fai
     )];
     row.extend(nav_row(&current, Screen::Menu));
     Ok(ui.row(row))
+}
+
+/// Последний раздел списка задач: выполнения этого списка с начала дня.
+fn done_today_section(
+    mut ui: Ui,
+    done_today: &[items::completions::Completion],
+    tz: Tz,
+    back: Screen,
+) -> Ui {
+    ui = ui.bold(ru::DONE_TODAY_TITLE);
+    for completion in done_today {
+        ui = ui.row(vec![go(
+            &completion_label(completion, tz),
+            Screen::Item {
+                item_id: completion.item_id,
+                back: Box::new(back.clone()),
+            },
+        )]);
+    }
+    ui
 }
 
 async fn mine(ctx: &mut Ctx<'_>, page: u32) -> Result<Ui, Fail> {

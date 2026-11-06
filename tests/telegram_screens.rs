@@ -29,6 +29,17 @@ async fn onboarded_named(pool: &PgPool, name: &str) -> Harness {
     bot
 }
 
+/// Онбординг на зафиксированном моменте: токены кнопок создаются уже в нём.
+async fn onboarded_at(pool: &PgPool, name: &str, now: DateTime<Utc>) -> Harness {
+    let mut bot = Harness::new(pool, next_telegram_id()).named(name);
+    bot.set_now(now);
+    bot.text("/start").await;
+    bot.text("Семья").await;
+    bot.press("Москва").await;
+    bot.press("меню").await;
+    bot
+}
+
 async fn household_for(pool: &PgPool, telegram_id: i64) -> TestHousehold {
     let (household_id, owner_id): (Uuid, Uuid) = sqlx::query_as(
         "SELECT household_id, id FROM users WHERE telegram_user_id = $1 AND deleted_at IS NULL",
@@ -724,6 +735,257 @@ async fn lists_paginate_and_counters_follow_actions() {
     bot.press("Назад").await;
     bot.assert_screen_contains("Семья · 8 задач");
     bot.assert_screen_contains("Выполнено сегодня: <b>1</b>");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completed_task_stays_in_done_today_section_and_opens_card() {
+    let db = db().await;
+    let now = local_utc(
+        chrono_tz::Tz::Europe__Moscow,
+        NaiveDate::from_ymd_opt(2027, 3, 15).expect("date"),
+        13,
+        47,
+    );
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, "Вынести мусор"),
+    )
+    .await;
+
+    bot.press("Задачи").await;
+    bot.press("Вынести мусор").await;
+    bot.press("Выполнено").await;
+    bot.assert_screen_contains("✅ Выполнено: Вынести мусор");
+    bot.assert_screen_contains("Выполнено сегодня");
+    bot.assert_screen_contains("✅ Вынести мусор · 13:47");
+
+    bot.press("✅ Вынести мусор").await;
+    bot.assert_screen_contains("Задачи › Вынести мусор");
+    bot.assert_has_button("Вернуть");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_today_section_uses_the_users_day_boundary() {
+    let db = db().await;
+    let vladivostok = chrono_tz::Tz::Asia__Vladivostok;
+    let now = local_utc(
+        vladivostok,
+        NaiveDate::from_ymd_opt(2027, 3, 15).expect("date"),
+        23,
+        30,
+    );
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    sqlx::query("UPDATE users SET timezone = 'Asia/Vladivostok' WHERE telegram_user_id = $1")
+        .bind(bot.chat)
+        .execute(&db.pool)
+        .await
+        .expect("timezone");
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, "Вынести мусор"),
+    )
+    .await;
+
+    bot.press("Задачи").await;
+    bot.press("Вынести мусор").await;
+    bot.press("Выполнено").await;
+    bot.assert_screen_contains("✅ Вынести мусор · 23:30");
+
+    // Полночь во Владивостоке наступает раньше, чем в UTC: вчерашнее
+    // выполнение больше не попадает в раздел.
+    let next_day = local_utc(
+        vladivostok,
+        NaiveDate::from_ymd_opt(2027, 3, 16).expect("date"),
+        0,
+        10,
+    );
+    bot.set_now(next_day);
+    bot.press("Назад").await;
+    bot.press("Задачи").await;
+    assert!(
+        !bot.screen().contains("Выполнено сегодня"),
+        "yesterday's completions must disappear:\n{}",
+        bot.screen()
+    );
+    assert!(!bot.screen().contains("✅ Вынести мусор"));
+    bot.assert_screen_contains("Выполнено ранее: 1");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recurring_task_is_shown_open_and_done_today() {
+    let db = db().await;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(chrono_tz::Tz::Europe__Moscow, today, 9, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut input = new_item(household.tasks_list_id, "Полить цветы");
+    input.due_date = Some(today);
+    input.recurrence = Some(support::recurrence(
+        tasklerq::domain::models::RecurrenceFreq::Daily,
+        Vec::new(),
+    ));
+    create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
+
+    bot.press("Задачи").await;
+    bot.press("Полить цветы").await;
+    bot.press("Выполнено").await;
+    bot.assert_screen_contains("Выполнено сегодня");
+    bot.assert_screen_contains("✅ Полить цветы · 09:00");
+
+    let labels: Vec<String> = support::telegram::buttons(&bot.screen())
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect();
+    assert!(
+        labels.iter().any(|label| label == "Полить цветы · завтра"),
+        "the recurring task stays open with the next due date: {labels:?}"
+    );
+    assert_eq!(
+        labels
+            .iter()
+            .filter(|label| label.contains("Полить цветы"))
+            .count(),
+        2,
+        "the task is shown twice: open and completed today"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_recurring_occurrences_are_listed_in_done_today() {
+    let db = db().await;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(chrono_tz::Tz::Europe__Moscow, today, 9, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut input = new_item(household.tasks_list_id, "Полить цветы");
+    input.due_date = Some(today);
+    input.recurrence = Some(support::recurrence(
+        tasklerq::domain::models::RecurrenceFreq::Daily,
+        Vec::new(),
+    ));
+    let task = create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
+
+    bot.press("Задачи").await;
+    bot.press("Полить цветы").await;
+    bot.press("Выполнено").await;
+    bot.assert_screen_contains("✅ Полить цветы · 09:00");
+
+    // Следующее вхождение уже наступило: снимаем отметку и выполняем его.
+    sqlx::query("UPDATE items SET completed_at = NULL WHERE id = $1")
+        .bind(task.id)
+        .execute(&db.pool)
+        .await
+        .expect("prepare second occurrence");
+    bot.set_now(now + Duration::minutes(1));
+    bot.press("Полить цветы · завтра").await;
+    bot.press("Выполнено").await;
+
+    let labels: Vec<String> = support::telegram::buttons(&bot.screen())
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect();
+    let completions: Vec<&String> = labels
+        .iter()
+        .filter(|label| label.starts_with("✅ Полить цветы"))
+        .collect();
+    assert_eq!(
+        completions.len(),
+        2,
+        "two occurrences give two rows: {labels:?}"
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|label| label == "✅ Полить цветы · 09:00")
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|label| label == "✅ Полить цветы · 09:01")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_today_counter_is_visible_on_every_page() {
+    let db = db().await;
+    let now = local_utc(
+        chrono_tz::Tz::Europe__Moscow,
+        NaiveDate::from_ymd_opt(2027, 3, 15).expect("date"),
+        10,
+        0,
+    );
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    for n in 0..10 {
+        create_item(
+            &db.pool,
+            &household,
+            household.tasks_list_id,
+            &actor,
+            new_item(household.tasks_list_id, &format!("Задача {n}")),
+        )
+        .await;
+    }
+
+    bot.press("Задачи").await;
+    bot.press("Задача 0").await;
+    bot.press("Выполнено").await;
+    bot.assert_screen_contains("Задачи · 9 · ✅ 1");
+
+    bot.press("→").await;
+    bot.assert_screen_contains("Страница 2 из 2");
+    bot.assert_screen_contains("Задачи · 9 · ✅ 1");
+    bot.assert_screen_contains("Выполнено сегодня");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undone_completion_disappears_from_done_today() {
+    let db = db().await;
+    let now = local_utc(
+        chrono_tz::Tz::Europe__Moscow,
+        NaiveDate::from_ymd_opt(2027, 3, 15).expect("date"),
+        13,
+        47,
+    );
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, "Вынести мусор"),
+    )
+    .await;
+
+    bot.press("Задачи").await;
+    bot.press("Вынести мусор").await;
+    bot.press("Выполнено").await;
+    bot.assert_screen_contains("Выполнено сегодня");
+
+    bot.press("Отменить").await;
+    assert!(
+        !bot.screen().contains("Выполнено сегодня"),
+        "an undone completion must disappear:\n{}",
+        bot.screen()
+    );
+    assert!(!bot.screen().contains("✅ Вынести мусор"));
+    bot.assert_screen_contains("Вынести мусор");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
