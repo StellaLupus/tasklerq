@@ -17,7 +17,7 @@ use crate::telegram::outbox::{self, Outgoing};
 use crate::telegram::rich::{Span, button, escape};
 use crate::telegram::ru;
 
-use super::model::{Action, PAGE_SIZE, Screen, Setting, TimeField, Ui};
+use super::model::{Action, PAGE_SIZE, Screen, Setting, TimeField, Ui, screen_heading};
 use super::screens::{back_button, clip, nav_row, page_bounds, pager};
 use super::{Ctx, Fail, delete_dedupe_key, display_timezone, issue_and_render};
 
@@ -40,12 +40,7 @@ fn zone_label(user: &User, household: &Household) -> String {
 /// повторяется целиком отдельным абзацем: получатель и действие должны
 /// оставаться видимыми.
 fn confirm_heading(screen: &Screen, question: &str) -> Ui {
-    let heading = screen.trail(question, None);
-    let mut ui = Ui::new().heading(heading.clone());
-    if !heading.contains(question) {
-        ui = ui.text(question.to_owned());
-    }
-    ui
+    screen_heading(screen, question, None)
 }
 
 /// Какая правка тихих часов запускает ручной выпуск отложенных.

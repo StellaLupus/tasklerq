@@ -11,10 +11,10 @@ use support::telegram::{Call, FakeTelegram, Harness};
 use support::{TestHousehold, create_item, db, new_item, next_telegram_id};
 use tasklerq::admin;
 use tasklerq::config::TenancyMode;
-use tasklerq::domain::models::{Actor, ItemPriority, UserRole};
+use tasklerq::domain::models::{Actor, ItemPriority, ListKind, UserRole};
 use tasklerq::domain::settings::NotificationSettings;
 use tasklerq::jobs::scheduler::Scheduler;
-use tasklerq::storage::repositories::items;
+use tasklerq::storage::repositories::{items, lists};
 use tasklerq::telegram::bot::Bot;
 use tasklerq::telegram::bot::model::{Action, Form, PAGE_SIZE, Screen, Ui};
 use tasklerq::telegram::callbacks::{self, NewToken, Scope};
@@ -2773,6 +2773,7 @@ async fn member_cannot_undo_an_item_deleted_by_the_owner() {
                 list_id: household.tasks_list_id,
                 page: 0,
                 edit: false,
+                from_lists: false,
             },
         },
     )
@@ -3415,6 +3416,97 @@ async fn long_card_title_stays_visible_below_the_clipped_trail() {
         screen.contains(title),
         "the full title must remain visible below the trail:\n{screen}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn long_task_title_is_fully_visible_in_delete_confirmation() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let title = "Очень длинное название задачи, которое точно не помещается в хлебные крошки";
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, title),
+    )
+    .await;
+
+    bot.press("Задачи").await;
+    bot.press("Очень длинное").await;
+    bot.press("Удалить").await;
+
+    let question = format!("Удалить «{title}»?");
+    let screen = bot.screen();
+    assert!(
+        screen.contains(&question),
+        "the delete confirmation must keep the full title:\n{screen}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_from_all_lists_returns_to_all_lists() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, "Оплатить интернет"),
+    )
+    .await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+    lists::create(
+        &mut conn,
+        household.household_id,
+        ListKind::Checklist,
+        "Дача",
+        Utc::now(),
+    )
+    .await
+    .expect("extra list");
+    drop(conn);
+
+    // Перерисовать меню: третий список включает «🗂 Все списки».
+    bot.text("/start").await;
+    bot.press("Все списки").await;
+    bot.assert_screen_contains("<h3>Все списки</h3>");
+
+    bot.press("Задачи").await;
+    assert!(
+        bot.screen().contains("<h3>Все списки › Задачи · 1</h3>"),
+        "a list opened from «Все списки» must keep that parent in its trail:\n{}",
+        bot.screen()
+    );
+
+    // Карточка из такого списка возвращается в него с тем же признаком.
+    bot.press("Оплатить интернет").await;
+    bot.assert_screen_contains("Все списки › Задачи › Оплатить интернет");
+    bot.press("Назад").await;
+    assert!(
+        bot.screen().contains("<h3>Все списки › Задачи · 1</h3>"),
+        "the card must return to the list opened from «Все списки»:\n{}",
+        bot.screen()
+    );
+
+    bot.press("Назад").await;
+    bot.assert_screen_contains("<h3>Все списки</h3>");
+
+    // Список из меню по-прежнему возвращает в меню.
+    bot.press("Назад").await;
+    bot.press("Задачи").await;
+    assert!(
+        bot.screen().contains("<h3>Задачи · 1</h3>"),
+        "a list opened from the menu must not claim «Все списки» as parent:\n{}",
+        bot.screen()
+    );
+    bot.press("Назад").await;
+    bot.assert_screen_contains("📋 Задачи · 1");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

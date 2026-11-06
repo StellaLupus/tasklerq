@@ -499,6 +499,7 @@ async fn increase(
                 list_id,
                 page: 0,
                 edit: false,
+                from_lists: false,
             })
             .await
         }
@@ -569,6 +570,7 @@ async fn save_create(
         list_id: list.id,
         page: 0,
         edit: false,
+        from_lists: false,
     })
     .await
 }

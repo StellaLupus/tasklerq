@@ -60,7 +60,7 @@ pub fn day_start(timezone: Tz, now: DateTime<Utc>) -> DateTime<Utc> {
                 .and_then(|local| timezone.from_local_datetime(&local).earliest())
         })
         .map(|local| local.with_timezone(&Utc))
-        .unwrap_or(now)
+        .expect("a local date has at least one existing hour")
 }
 
 /// Выполнения household с `since`, начиная с поздних, по одному списку.

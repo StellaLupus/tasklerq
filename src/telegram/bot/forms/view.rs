@@ -327,7 +327,7 @@ async fn edit_view(ctx: &mut Ctx<'_>, form: EditForm) -> Result<Ui, Fail> {
     ) {
         ru::APPLY_BUTTON
     } else {
-        "⬅️ Назад"
+        ru::BACK_BUTTON
     };
     Ok(ui.row(vec![button(
         done_label,

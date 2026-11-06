@@ -173,6 +173,7 @@ pub fn digest_ui(
                 list_id,
                 page: 0,
                 edit: false,
+                from_lists: false,
             },
         ));
     }
@@ -183,6 +184,7 @@ pub fn digest_ui(
                 list_id,
                 page: 0,
                 edit: false,
+                from_lists: false,
             },
         ));
     }
@@ -195,6 +197,7 @@ pub fn digest_ui(
                 list_id,
                 page: 0,
                 edit: false,
+                from_lists: false,
             },
         ));
     }
@@ -215,6 +218,7 @@ pub fn done_ui(item: &Item, list_id: Uuid, next: Option<&str>) -> Ui {
                 list_id,
                 page: 0,
                 edit: false,
+                from_lists: false,
             },
         ),
     ])

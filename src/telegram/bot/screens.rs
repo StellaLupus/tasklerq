@@ -30,14 +30,14 @@ pub async fn build(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
             list_id,
             page,
             edit,
-        } => list(ctx, *list_id, *page, *edit).await,
+            from_lists,
+        } => list(ctx, *list_id, *page, *edit, *from_lists).await,
         Screen::Item { item_id, back } => card::view(ctx, *item_id, back).await,
         Screen::Deleted {
             item_id,
             title,
-            shopping,
             back,
-        } => card::deleted(ctx, *item_id, title, *shopping, back).await,
+        } => card::deleted(ctx, *item_id, title, back).await,
         Screen::ConfirmDelete { item_id, back } => card::confirm_delete(ctx, *item_id, back).await,
         Screen::Mine { page } => mine(ctx, *page).await,
         Screen::Results {
@@ -84,6 +84,16 @@ pub fn nav_row(screen: &Screen, back: Screen) -> Vec<crate::telegram::rich::Butt
         buttons.push(back_button(ru::MENU_BUTTON, Screen::Menu));
     }
     buttons
+}
+
+/// Куда ведёт «⬅️ Назад» со списка: в «Все списки», если он оттуда открыт,
+/// иначе в меню.
+pub fn list_back(from_lists: bool) -> Screen {
+    if from_lists {
+        Screen::Lists
+    } else {
+        Screen::Menu
+    }
 }
 
 /// Сократить подпись кнопки.
@@ -150,6 +160,7 @@ async fn menu(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
             list_id,
             page: 0,
             edit: false,
+            from_lists: false,
         })
         .unwrap_or(Screen::Lists);
     let shopping_target = shopping_list
@@ -157,6 +168,7 @@ async fn menu(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
             list_id,
             page: 0,
             edit: false,
+            from_lists: false,
         })
         .unwrap_or(Screen::Lists);
 
@@ -237,6 +249,7 @@ async fn lists_screen(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
                 list_id: list.id,
                 page: 0,
                 edit: false,
+                from_lists: true,
             },
         )]);
     }
@@ -354,17 +367,28 @@ pub fn completion_label(completion: &items::completions::Completion, tz: Tz) -> 
     )
 }
 
-async fn list(ctx: &mut Ctx<'_>, list_id: Uuid, page: u32, edit: bool) -> Result<Ui, Fail> {
+async fn list(
+    ctx: &mut Ctx<'_>,
+    list_id: Uuid,
+    page: u32,
+    edit: bool,
+    from_lists: bool,
+) -> Result<Ui, Fail> {
     let household_id = ctx.household()?.id;
     let list = lists::get_visible(&mut *ctx.conn, household_id, list_id).await?;
     if list.kind == ListKind::Tasks {
-        tasks_list(ctx, &list, page).await
+        tasks_list(ctx, &list, page, from_lists).await
     } else {
-        super::shopping::list_view(ctx, &list, page, edit).await
+        super::shopping::list_view(ctx, &list, page, edit, from_lists).await
     }
 }
 
-async fn tasks_list(ctx: &mut Ctx<'_>, list: &List, page: u32) -> Result<Ui, Fail> {
+async fn tasks_list(
+    ctx: &mut Ctx<'_>,
+    list: &List,
+    page: u32,
+    from_lists: bool,
+) -> Result<Ui, Fail> {
     let household_id = ctx.household()?.id;
     let all = items::list_by_list(&mut *ctx.conn, household_id, list.id).await?;
     let since = items::completions::day_start(ctx.tz, ctx.now);
@@ -389,6 +413,7 @@ async fn tasks_list(ctx: &mut Ctx<'_>, list: &List, page: u32) -> Result<Ui, Fai
         list_id: list.id,
         page: u32::try_from(page).unwrap_or(0),
         edit: false,
+        from_lists,
     };
 
     let mut heading = format!("{} · {}", list.name, open.len());
@@ -437,7 +462,7 @@ async fn tasks_list(ctx: &mut Ctx<'_>, list: &List, page: u32) -> Result<Ui, Fai
             kind: ListKind::Tasks,
         },
     )];
-    row.extend(nav_row(&current, Screen::Menu));
+    row.extend(nav_row(&current, list_back(from_lists)));
     Ok(ui.row(row))
 }
 

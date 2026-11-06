@@ -14,7 +14,7 @@ use crate::storage::repositories::{items, lists, users};
 use crate::telegram::rich::{Span, button};
 use crate::telegram::ru;
 
-use super::model::{Action, RecurrenceDraft, Screen, Step, Ui};
+use super::model::{Action, RecurrenceDraft, Screen, Step, Ui, screen_heading};
 use super::screens::{clip, nav_row};
 use super::{Ctx, Fail};
 
@@ -127,11 +127,7 @@ pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui,
     let shopping = list.kind != ListKind::Tasks;
     let done = item.status == ItemStatus::Done;
     let parent = matches!(back, Screen::List { .. }).then_some(list.name.as_str());
-    let heading = here.trail(&item.title, parent);
-    let mut ui = Ui::new().heading(heading.clone());
-    if !heading.contains(&item.title) {
-        ui = ui.text(item.title.clone());
-    }
+    let mut ui = screen_heading(&here, &item.title, parent);
     if done {
         ui = ui.text("✅ Выполнено");
     }
@@ -278,7 +274,6 @@ pub async fn deleted(
     ctx: &mut Ctx<'_>,
     item_id: Uuid,
     title: &str,
-    shopping: bool,
     back: &Screen,
 ) -> Result<Ui, Fail> {
     let parent = match back {
@@ -295,13 +290,9 @@ pub async fn deleted(
     let screen = Screen::Deleted {
         item_id,
         title: title.to_owned(),
-        shopping,
         back: Box::new(back.clone()),
     };
-    let ui = Ui::new().heading(screen.trail(
-        &format!("🗑 Удалено: {}", clip(title, 80)),
-        parent.as_deref(),
-    ));
+    let ui = screen_heading(&screen, &format!("🗑 Удалено: {title}"), parent.as_deref());
     let mut row = vec![button(
         "↩️ Отменить",
         Action::DeleteUndo {
@@ -321,8 +312,7 @@ pub async fn confirm_delete(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> 
         back: Box::new(back.clone()),
     };
     let parent = matches!(back, Screen::List { .. }).then_some(list.name.as_str());
-    let mut ui =
-        Ui::new().heading(screen.trail(&format!("Удалить «{}»?", clip(&item.title, 80)), parent));
+    let mut ui = screen_heading(&screen, &format!("Удалить «{}»?", item.title), parent);
     if item.recurrence.is_some() {
         ui = ui.text("Будет удалена вся серия повторений.");
     }
@@ -432,11 +422,9 @@ pub async fn delete_do(ctx: &mut Ctx<'_>, item_id: Uuid, back: Screen) -> Result
     let household_id = ctx.household()?.id;
     let actor = ctx.actor()?;
     let item = items::soft_delete(&mut *ctx.conn, household_id, &actor, item_id, ctx.now).await?;
-    let list = lists::get(&mut *ctx.conn, household_id, item.list_id).await?;
     ctx.present(Screen::Deleted {
         item_id: item.id,
         title: item.title.clone(),
-        shopping: list.kind != ListKind::Tasks,
         back: Box::new(back),
     })
     .await

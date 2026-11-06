@@ -8,8 +8,8 @@ use crate::telegram::rich::button;
 use crate::telegram::ru;
 
 use super::card::{self, UndoOutcome};
-use super::model::{Action, PAGE_SIZE, Screen, Ui};
-use super::screens::{back_button, clip, nav_row};
+use super::model::{Action, PAGE_SIZE, Screen, Ui, screen_heading};
+use super::screens::{back_button, clip, list_back, nav_row};
 use super::{Ctx, Fail};
 
 /// Подтверждение нужно, если выполненных позиций больше этого числа.
@@ -32,7 +32,13 @@ fn item_label(item: &Item) -> String {
 }
 
 /// Список покупок или чек-лист.
-pub async fn list_view(ctx: &mut Ctx<'_>, list: &List, page: u32, edit: bool) -> Result<Ui, Fail> {
+pub async fn list_view(
+    ctx: &mut Ctx<'_>,
+    list: &List,
+    page: u32,
+    edit: bool,
+    from_lists: bool,
+) -> Result<Ui, Fail> {
     let household_id = ctx.household()?.id;
     let mut all = items::list_by_list(&mut *ctx.conn, household_id, list.id).await?;
     // Сначала «Купить», затем «Куплено»; порядок внутри групп задан репозиторием.
@@ -62,8 +68,9 @@ pub async fn list_view(ctx: &mut Ctx<'_>, list: &List, page: u32, edit: bool) ->
                 list_id: list.id,
                 page: 0,
                 edit: false,
+                from_lists,
             },
-            Screen::Menu,
+            list_back(from_lists),
         ));
         return Ok(ui.text("Список покупок пуст").row(row));
     }
@@ -75,6 +82,7 @@ pub async fn list_view(ctx: &mut Ctx<'_>, list: &List, page: u32, edit: bool) ->
         list_id: list.id,
         page: u32::try_from(page).unwrap_or(0),
         edit,
+        from_lists,
     };
 
     let mut current: Option<ItemStatus> = None;
@@ -139,11 +147,12 @@ pub async fn list_view(ctx: &mut Ctx<'_>, list: &List, page: u32, edit: bool) ->
                 list_id: list.id,
                 page: u32::try_from(page).unwrap_or(0),
                 edit: !edit,
+                from_lists,
             },
         },
     ));
     let mut nav = vec![button("🔎 Поиск", Action::SearchStart)];
-    nav.extend(nav_row(&here(page), Screen::Menu));
+    nav.extend(nav_row(&here(page), list_back(from_lists)));
     Ok(ui.row(footer).row(nav))
 }
 
@@ -168,6 +177,7 @@ pub async fn clear_ask(ctx: &mut Ctx<'_>, list_id: Uuid) -> Result<(), Fail> {
                 list_id,
                 page: 0,
                 edit: false,
+                from_lists: false,
             })
             .await;
     }
@@ -188,15 +198,22 @@ pub async fn confirm_clear(ctx: &mut Ctx<'_>, list_id: Uuid) -> Result<Ui, Fail>
             list_id,
             page: 0,
             edit: false,
+            from_lists: false,
         },
     ));
-    Ok(Ui::new()
-        .heading(screen.trail(
-            &format!("Удалить {}?", ru::positions(i64::try_from(done.len()).unwrap_or(0))),
-            Some(&list.name),
-        ))
-        .text(format!("Из списка «{}» будут убраны выполненные позиции. Это можно отменить в течение 10 минут.", list.name))
-        .row(row))
+    Ok(screen_heading(
+        &screen,
+        &format!(
+            "Удалить {}?",
+            ru::positions(i64::try_from(done.len()).unwrap_or(0))
+        ),
+        Some(&list.name),
+    )
+    .text(format!(
+        "Из списка «{}» будут убраны выполненные позиции. Это можно отменить в течение 10 минут.",
+        list.name
+    ))
+    .row(row))
 }
 
 /// Удалить выполненные позиции.
@@ -211,6 +228,7 @@ pub async fn clear_do(ctx: &mut Ctx<'_>, list_id: Uuid) -> Result<(), Fail> {
                 list_id,
                 page: 0,
                 edit: false,
+                from_lists: false,
             })
             .await;
     }
@@ -251,17 +269,18 @@ pub async fn cleared(ctx: &mut Ctx<'_>, list_id: Uuid, item_ids: &[Uuid]) -> Res
             list_id,
             page: 0,
             edit: false,
+            from_lists: false,
         },
     ));
-    Ok(Ui::new()
-        .heading(screen.trail(
-            &format!(
-                "Убрано: {}",
-                ru::positions(i64::try_from(item_ids.len()).unwrap_or(0))
-            ),
-            parent.as_deref(),
-        ))
-        .row(row))
+    Ok(screen_heading(
+        &screen,
+        &format!(
+            "Убрано: {}",
+            ru::positions(i64::try_from(item_ids.len()).unwrap_or(0))
+        ),
+        parent.as_deref(),
+    )
+    .row(row))
 }
 
 /// Вернуть очищенные позиции в течение окна отмены.
@@ -294,6 +313,7 @@ pub async fn clear_undo(ctx: &mut Ctx<'_>, list_id: Uuid, item_ids: &[Uuid]) -> 
             list_id,
             page: 0,
             edit: false,
+            from_lists: false,
         }
     } else {
         Screen::Menu

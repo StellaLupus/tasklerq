@@ -92,6 +92,10 @@ pub enum Screen {
         /// состояние без поля читается как обычный режим.
         #[serde(default)]
         edit: bool,
+        /// Список открыт с экрана «Все списки»: «Назад» ведёт туда, а не в
+        /// меню. Старое состояние без поля читается как список из меню.
+        #[serde(default)]
+        from_lists: bool,
     },
     /// Карточка элемента.
     Item {
@@ -106,9 +110,6 @@ pub enum Screen {
         item_id: Uuid,
         /// Название на момент удаления.
         title: String,
-        /// Удалён из списка покупок: поле сохранено ради формата JSON и на
-        /// подписи кнопок больше не влияет.
-        shopping: bool,
         /// Куда ведёт «Назад».
         back: Box<Screen>,
     },
@@ -231,13 +232,16 @@ impl Screen {
             Self::Menu | Self::Welcome | Self::FirstContact(_) => 1,
             Self::Add
             | Self::Lists
-            | Self::List { .. }
             | Self::Mine { .. }
             | Self::Results { .. }
             | Self::Settings
             | Self::Form
             | Self::Processing { .. }
             | Self::Draft { .. } => 2,
+            Self::List {
+                from_lists: true, ..
+            } => 3,
+            Self::List { .. } => 2,
             Self::Item { back, .. }
             | Self::Deleted { back, .. }
             | Self::ConfirmDelete { back, .. } => back.depth() + 1,
@@ -300,13 +304,16 @@ impl Screen {
             Self::Menu | Self::Welcome | Self::FirstContact(_) => Vec::new(),
             Self::Add
             | Self::Lists
-            | Self::List { .. }
             | Self::Mine { .. }
             | Self::Results { .. }
             | Self::Settings
             | Self::Form
             | Self::Processing { .. }
             | Self::Draft { .. } => Vec::new(),
+            Self::List {
+                from_lists: true, ..
+            } => vec!["Все списки"],
+            Self::List { .. } => Vec::new(),
             Self::Item { back, .. }
             | Self::Deleted { back, .. }
             | Self::ConfirmDelete { back, .. } => {
@@ -350,6 +357,18 @@ impl Screen {
         parts.push(title.to_owned());
         clip_trail(parts.join(" › "))
     }
+}
+
+/// Заголовок экрана с хлебными крошками. Если крошки обрезали `title`, полный
+/// текст показывается отдельным абзацем: получатель и действие должны
+/// оставаться видимыми.
+pub fn screen_heading(screen: &Screen, title: &str, parent: Option<&str>) -> Ui {
+    let trail = screen.trail(title, parent);
+    let mut ui = Ui::new().heading(trail.clone());
+    if !trail.contains(title) {
+        ui = ui.text(title.to_owned());
+    }
+    ui
 }
 
 /// Обрезать хлебные крошки до 60 символов.
@@ -1183,6 +1202,7 @@ mod tests {
             list_id: Uuid::nil(),
             page: 0,
             edit: false,
+            from_lists: false,
         };
         assert_eq!(Screen::Menu.depth(), 1);
         assert_eq!(list.depth(), 2);
@@ -1226,11 +1246,74 @@ mod tests {
     }
 
     #[test]
+    fn list_from_all_lists_is_deeper_and_keeps_the_lists_parent() {
+        let list = Screen::List {
+            list_id: Uuid::nil(),
+            page: 0,
+            edit: false,
+            from_lists: true,
+        };
+        assert_eq!(list.depth(), 3);
+        assert_eq!(list.trail("Задачи · 3", None), "Все списки › Задачи · 3");
+
+        let card = Screen::Item {
+            item_id: Uuid::nil(),
+            back: Box::new(list),
+        };
+        assert_eq!(card.depth(), 4);
+        assert_eq!(
+            card.trail("Оплатить интернет", Some("Задачи")),
+            "Все списки › Задачи › Оплатить интернет"
+        );
+    }
+
+    #[test]
+    fn old_list_json_without_origin_is_read_as_opened_from_menu() {
+        let screen: Screen = serde_json::from_value(json!({
+            "t": "list",
+            "list_id": Uuid::nil(),
+            "page": 0,
+            "edit": false,
+        }))
+        .expect("legacy list screen");
+        assert_eq!(
+            screen,
+            Screen::List {
+                list_id: Uuid::nil(),
+                page: 0,
+                edit: false,
+                from_lists: false,
+            }
+        );
+    }
+
+    #[test]
+    fn deleted_screen_ignores_the_legacy_shopping_field() {
+        let with_legacy: Screen = serde_json::from_value(json!({
+            "t": "deleted",
+            "item_id": Uuid::nil(),
+            "title": "Молоко",
+            "shopping": true,
+            "back": {"t": "menu"},
+        }))
+        .expect("legacy deleted screen");
+        let current: Screen = serde_json::from_value(json!({
+            "t": "deleted",
+            "item_id": Uuid::nil(),
+            "title": "Молоко",
+            "back": {"t": "menu"},
+        }))
+        .expect("deleted screen");
+        assert_eq!(with_legacy, current);
+    }
+
+    #[test]
     fn every_deep_screen_has_a_parent_for_each_level() {
         let list = Screen::List {
             list_id: Uuid::nil(),
             page: 0,
             edit: false,
+            from_lists: false,
         };
         let screens = vec![
             Screen::Item {
@@ -1240,7 +1323,6 @@ mod tests {
             Screen::Deleted {
                 item_id: Uuid::nil(),
                 title: "Задача".into(),
-                shopping: false,
                 back: Box::new(list.clone()),
             },
             Screen::ConfirmDelete {

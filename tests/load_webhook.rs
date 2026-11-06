@@ -288,6 +288,7 @@ async fn issue_callbacks(
                     list_id: household.tasks_list_id,
                     page: 0,
                     edit: false,
+                    from_lists: false,
                 },
             })
             .expect("action"),
@@ -299,6 +300,7 @@ async fn issue_callbacks(
                     list_id: household.shopping_list_id,
                     page: 0,
                     edit: false,
+                    from_lists: false,
                 },
             })
             .expect("action"),
@@ -325,6 +327,7 @@ async fn issue_callbacks(
                         list_id: household.tasks_list_id,
                         page: 0,
                         edit: false,
+                        from_lists: false,
                     }),
                 },
             })

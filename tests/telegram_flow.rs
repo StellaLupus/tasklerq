@@ -686,6 +686,7 @@ async fn repeated_delete_undo_reports_that_there_is_nothing_to_undo() {
                 list_id,
                 page: 0,
                 edit: false,
+                from_lists: false,
             },
         },
     )
