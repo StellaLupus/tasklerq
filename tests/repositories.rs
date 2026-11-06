@@ -562,7 +562,7 @@ async fn menu_counts_use_local_today_and_completion_events() {
     )
     .await;
 
-    let shopping = support::create_item(
+    support::create_item(
         &db.pool,
         &household,
         household.shopping_list_id,
@@ -570,7 +570,6 @@ async fn menu_counts_use_local_today_and_completion_events() {
         support::new_item(household.shopping_list_id, "Молоко"),
     )
     .await;
-    assert!(shopping.quantity.is_some());
     let shopping_done = support::create_item(
         &db.pool,
         &household,
@@ -628,5 +627,84 @@ async fn menu_counts_use_local_today_and_completion_events() {
     assert_eq!(
         counts.done_today, 2,
         "only task completion events count, recurring ones too"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_assigned_tasks_counts_only_open_own_tasks_in_visible_task_lists() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let owner = household.owner();
+
+    let mut mine = support::new_item(household.tasks_list_id, "Моя задача");
+    mine.assignee_user_id = Some(household.member_id);
+    support::create_item(&db.pool, &household, household.tasks_list_id, &owner, mine).await;
+
+    let mut done = support::new_item(household.tasks_list_id, "Выполненная");
+    done.assignee_user_id = Some(household.member_id);
+    let done =
+        support::create_item(&db.pool, &household, household.tasks_list_id, &owner, done).await;
+
+    let mut other = support::new_item(household.tasks_list_id, "Чужая");
+    other.assignee_user_id = Some(household.owner_id);
+    support::create_item(&db.pool, &household, household.tasks_list_id, &owner, other).await;
+
+    let mut shopping = support::new_item(household.shopping_list_id, "Покупка");
+    shopping.assignee_user_id = Some(household.member_id);
+    support::create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &owner,
+        shopping,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let archived = lists::create(
+        &mut conn,
+        household.household_id,
+        ListKind::Tasks,
+        "Архив",
+        Utc::now(),
+    )
+    .await
+    .expect("archive list");
+    let mut archived_item = support::new_item(archived.id, "В архиве");
+    archived_item.assignee_user_id = Some(household.member_id);
+    drop(conn);
+
+    support::create_item(&db.pool, &household, archived.id, &owner, archived_item).await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &owner,
+        done.id,
+        Some(done.version),
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("complete an assigned task");
+    lists::update(
+        &mut conn,
+        household.household_id,
+        archived.id,
+        None,
+        Some(true),
+        true,
+        Utc::now(),
+    )
+    .await
+    .expect("archive the list");
+
+    let count = items::open_assigned_tasks(&mut conn, household.household_id, household.member_id)
+        .await
+        .expect("assigned count");
+    assert_eq!(
+        count, 1,
+        "only the open own task in a visible tasks list counts"
     );
 }

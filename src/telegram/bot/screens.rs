@@ -464,6 +464,9 @@ fn done_today_section(
 async fn mine(ctx: &mut Ctx<'_>, page: u32) -> Result<Ui, Fail> {
     let household_id = ctx.household()?.id;
     let user_id = ctx.user()?.id;
+    // Заголовок считает по тому же счётчику, что и кнопка меню: поиск ниже
+    // ограничен MAX_LIMIT и не должен уменьшать число в заголовке.
+    let total = items::open_assigned_tasks(&mut *ctx.conn, household_id, user_id).await?;
     let filters = SearchFilters {
         assignee_user_id: Some(user_id),
         limit: crate::domain::search::MAX_LIMIT,
@@ -482,8 +485,7 @@ async fn mine(ctx: &mut Ctx<'_>, page: u32) -> Result<Ui, Fail> {
         page: u32::try_from(page).unwrap_or(0),
     };
 
-    let mut ui =
-        Ui::new().heading(here(page).trail(&format!("Мои задачи · {}", tasks.len()), None));
+    let mut ui = Ui::new().heading(here(page).trail(&format!("Мои задачи · {total}"), None));
     if tasks.is_empty() {
         return Ok(ui
             .text("Вам пока ничего не назначено")

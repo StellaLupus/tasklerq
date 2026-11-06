@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::identity::{AuditEvent, AuditEventType};
-use crate::domain::models::{Actor, ActorType, User, UserRole};
+use crate::domain::models::{Actor, ActorType, Household, User, UserRole};
 use crate::domain::settings::{
     NotificationSettings, NotificationSettingsUpdate, ProfileUpdate, SUGGESTED_TIMEZONES,
     validate_timezone,
@@ -26,6 +26,14 @@ const SECRET_MESSAGE_TTL: u32 = 60 * 60;
 
 fn on_off(value: bool) -> &'static str {
     if value { "вкл" } else { "выкл" }
+}
+
+/// Часовой пояс пользователя с пометкой, если выбран пояс пространства.
+fn zone_label(user: &User, household: &Household) -> String {
+    match user.timezone.as_deref() {
+        Some(zone) => zone.to_owned(),
+        None => format!("{} (как в пространстве)", household.timezone),
+    }
 }
 
 /// Заголовок подтверждения с путём. Если крошка обрезала вопрос, он
@@ -161,10 +169,7 @@ pub async fn view(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
 fn settings(ctx: &Ctx<'_>) -> Result<Ui, Fail> {
     let user = ctx.user()?;
     let household = ctx.household()?;
-    let zone = match user.timezone.as_deref() {
-        Some(zone) => zone.to_owned(),
-        None => format!("{} (как в пространстве)", household.timezone),
-    };
+    let zone = zone_label(user, household);
     let role = if user.role == UserRole::Owner {
         "владелец"
     } else {
@@ -195,10 +200,7 @@ fn settings(ctx: &Ctx<'_>) -> Result<Ui, Fail> {
 fn profile(ctx: &Ctx<'_>) -> Result<Ui, Fail> {
     let user = ctx.user()?;
     let household = ctx.household()?;
-    let zone = match user.timezone.as_deref() {
-        Some(zone) => zone.to_owned(),
-        None => format!("{} (как в пространстве)", household.timezone),
-    };
+    let zone = zone_label(user, household);
     Ok(Ui::new()
         .heading(Screen::Profile.trail("Профиль", None))
         .text(format!("👤 {}", user.display_name))

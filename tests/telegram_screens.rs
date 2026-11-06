@@ -7,7 +7,7 @@ use std::sync::Arc;
 use axum::http::{Method, StatusCode};
 use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc};
 use sqlx::PgPool;
-use support::telegram::{Call, Harness};
+use support::telegram::{Call, FakeTelegram, Harness};
 use support::{TestHousehold, create_item, db, new_item, next_telegram_id};
 use tasklerq::admin;
 use tasklerq::config::TenancyMode;
@@ -15,6 +15,7 @@ use tasklerq::domain::models::{Actor, ItemPriority, UserRole};
 use tasklerq::domain::settings::NotificationSettings;
 use tasklerq::jobs::scheduler::Scheduler;
 use tasklerq::storage::repositories::items;
+use tasklerq::telegram::bot::Bot;
 use tasklerq::telegram::bot::model::{Action, Form, PAGE_SIZE, Screen, Ui};
 use tasklerq::telegram::callbacks::{self, NewToken, Scope};
 use tokio::sync::Notify;
@@ -22,6 +23,25 @@ use uuid::Uuid;
 
 async fn onboarded_named(pool: &PgPool, name: &str) -> Harness {
     let mut bot = Harness::new(pool, next_telegram_id()).named(name);
+    bot.text("/start").await;
+    bot.text("Семья").await;
+    bot.press("Москва").await;
+    bot.press("меню").await;
+    bot
+}
+
+/// Онбординг на стенде с включённым разбором текста.
+async fn onboarded_with_llm(pool: &PgPool, name: &str) -> Harness {
+    let handler = Bot::new("tasklerqbot")
+        .with_llm_capture(true)
+        .with_tenancy(TenancyMode::Multi);
+    let mut bot = Harness::with_handler(
+        pool,
+        next_telegram_id(),
+        Arc::new(handler),
+        FakeTelegram::new(),
+    )
+    .named(name);
     bot.text("/start").await;
     bot.text("Семья").await;
     bot.press("Москва").await;
@@ -1100,6 +1120,36 @@ async fn menu_counters_do_not_repeat_the_lists_line() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn menu_hint_promises_parsing_when_llm_capture_is_enabled() {
+    let db = db().await;
+    let bot = onboarded_with_llm(&db.pool, "Alice").await;
+    bot.assert_screen_contains("Напишите задачу или покупку — я разберу.");
+    assert!(
+        !bot.screen().contains("открою форму"),
+        "with LLM the hint must not promise a form:\n{}",
+        bot.screen()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn menu_and_mine_screen_use_the_same_assigned_counter() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    for n in 0..60 {
+        let mut item = new_item(household.tasks_list_id, &format!("Моя {n}"));
+        item.assignee_user_id = Some(household.owner_id);
+        create_item(&db.pool, &household, household.tasks_list_id, &actor, item).await;
+    }
+
+    bot.text("/start").await;
+    bot.assert_screen_contains("👤 Мои задачи · 60");
+    bot.press("Мои задачи").await;
+    bot.assert_screen_contains("Мои задачи · 60");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn menu_today_counter_uses_the_users_day_boundary() {
     let db = db().await;
     let vladivostok = chrono_tz::Tz::Asia__Vladivostok;
@@ -1240,7 +1290,7 @@ async fn settings_profile_timezone_and_notifications() {
     bot.assert_screen_contains("Настройки › Профиль › Часовой пояс");
     bot.press("Asia/Yekaterinburg").await;
     bot.assert_screen_contains("Часовой пояс: Asia/Yekaterinburg");
-    bot.assert_screen_contains("Профиль");
+    bot.assert_screen_contains("Настройки › Профиль");
 
     // Сохранение имени возвращает в профиль с новым именем.
     bot.press("Имя").await;
@@ -1343,7 +1393,14 @@ async fn quiet_hours_can_be_switched_and_hide_boundaries_when_off() {
     bot.assert_screen_contains("🌙 Тихие часы: выкл");
     assert!(bot.find_button("Начало тихих").is_none());
     assert!(bot.find_button("Конец тихих").is_none());
-    bot.assert_has_button("Вкл");
+    let screen = bot.screen();
+    let quiet = &screen[screen.find("🌙 Тихие часы").expect("quiet block")..];
+    assert!(
+        support::telegram::buttons(quiet)
+            .iter()
+            .any(|(label, _)| label == "Вкл"),
+        "the quiet-hours block must offer «Вкл»:\n{screen}"
+    );
 
     bot.press_after("🌙 Тихие часы", "Вкл").await;
     bot.assert_screen_contains("🌙 Тихие часы: 22:00–08:00");
@@ -3437,7 +3494,7 @@ async fn every_screen_has_back_and_no_legacy_return_labels() {
     assert_navigation(&owner, true);
     owner.assert_screen_contains("Настройки › Профиль › Часовой пояс");
     owner.press("Назад").await;
-    owner.assert_screen_contains("Профиль");
+    owner.assert_screen_contains("Настройки › Профиль");
     owner.press("Назад").await;
     owner.assert_screen_contains("Настройки");
 

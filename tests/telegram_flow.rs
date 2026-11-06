@@ -1407,6 +1407,26 @@ async fn each_kind_of_incoming_text_is_deleted() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn help_text_is_a_stable_snapshot() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+
+    bot.text("/help").await;
+
+    let expected = concat!(
+        "Я помогаю вести задачи и покупки всей семьёй.\n\n",
+        "Напишите, что нужно сделать: с включённым разбором я разделю текст на задачи и покупки и покажу черновик, а без разбора открою форму с этим текстом в названии.\n\n",
+        "По экранам можно ходить кнопками «⬅️ Назад» и «🏠 Меню»; хлебные крошки в заголовке показывают путь.\n\n",
+        "Ваши сообщения я удаляю из чата после обработки, а /start или /menu возвращают меню вниз чата.\n\n",
+        "/menu — главное меню\n",
+        "/settings — настройки\n",
+        "/cancel — отменить текущее действие\n",
+        "/help — эта справка",
+    );
+    assert_eq!(bot.latest().1, expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_delete_keeps_the_result_and_sends_the_next_screen_below() {
     let db = db().await;
     let mut bot = onboarded(&db.pool).await;
