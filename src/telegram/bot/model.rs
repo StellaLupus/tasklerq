@@ -388,29 +388,41 @@ impl Screen {
     }
 
     /// Хлебные крошки экрана: имена родителей и `title` через « › », не
-    /// длиннее 60 символов. `parent` подменяет имя непосредственного родителя,
-    /// если оно зависит от данных (например, имя списка).
+    /// длиннее 60 символов. `parent` подменяет имя списка-родителя, если оно
+    /// зависит от данных.
     pub fn trail(&self, title: &str, parent: Option<&str>) -> String {
-        match parent {
-            Some(parent) => self.trail_with(title, &[parent]),
-            None => self.trail_with(title, &[]),
-        }
+        self.trail_with_names(title, parent, None, None)
     }
 
-    /// Хлебные крошки с несколькими подменёнными родителями: `parents`
-    /// заменяют последние имена в порядке от меню к непосредственному
-    /// родителю. Так экран под карточкой показывает имя списка и название
-    /// задачи.
-    pub fn trail_with(&self, title: &str, parents: &[&str]) -> String {
+    /// Крошки по фактической цепочке `back` с настоящими именами: вместо
+    /// служебного «Список» подставляется имя списка, вместо «Карточка» —
+    /// название элемента, а `extra` добавляет служебный экран между последним
+    /// родителем и заголовком (например, «Редактор»).
+    pub fn trail_with_names(
+        &self,
+        title: &str,
+        list_name: Option<&str>,
+        card_title: Option<&str>,
+        extra: Option<&str>,
+    ) -> String {
         let deep = self.depth() > 2;
         let mut parts: Vec<String> = if deep {
             self.parents().into_iter().map(str::to_owned).collect()
         } else {
             Vec::new()
         };
-        if deep {
-            parts.truncate(parts.len().saturating_sub(parents.len()));
-            parts.extend(parents.iter().map(|parent| (*parent).to_owned()));
+        for part in &mut parts {
+            let replacement = match part.as_str() {
+                "Список" => list_name,
+                "Карточка" => card_title,
+                _ => None,
+            };
+            if let Some(replacement) = replacement {
+                *part = replacement.to_owned();
+            }
+        }
+        if deep && let Some(extra) = extra {
+            parts.push(extra.to_owned());
         }
         parts.push(title.to_owned());
         clip_trail(parts.join(" › "))
@@ -421,15 +433,19 @@ impl Screen {
 /// текст показывается отдельным абзацем: получатель и действие должны
 /// оставаться видимыми.
 pub fn screen_heading(screen: &Screen, title: &str, parent: Option<&str>) -> Ui {
-    match parent {
-        Some(parent) => screen_heading_with(screen, title, &[parent]),
-        None => screen_heading_with(screen, title, &[]),
-    }
+    screen_heading_names(screen, title, parent, None, None)
 }
 
-/// Заголовок экрана с несколькими подменёнными родителями.
-pub fn screen_heading_with(screen: &Screen, title: &str, parents: &[&str]) -> Ui {
-    let trail = screen.trail_with(title, parents);
+/// Заголовок экрана с крошками по цепочке `back` и настоящими именами
+/// списка и карточки.
+pub fn screen_heading_names(
+    screen: &Screen,
+    title: &str,
+    list_name: Option<&str>,
+    card_title: Option<&str>,
+    extra: Option<&str>,
+) -> Ui {
+    let trail = screen.trail_with_names(title, list_name, card_title, extra);
     let mut ui = Ui::new().heading(trail.clone());
     if !trail.contains(title) {
         ui = ui.text(title.to_owned());
@@ -635,8 +651,6 @@ impl ItemSnapshot {
 pub enum EditorTarget {
     /// Новый элемент: поля ещё не записаны.
     New {
-        /// Список, в который сохранится элемент.
-        list_id: Uuid,
         /// Вид списка на момент открытия.
         kind: ListKind,
         /// Куда вернуться после сохранения или отмены.
@@ -819,9 +833,6 @@ pub enum Action {
     Edit {
         /// Элемент.
         item_id: Uuid,
-        /// Поле, на котором открыть редактор; `None` — сам редактор.
-        #[serde(default)]
-        field: Option<Step>,
         /// Куда вернуться после сохранения или отмены.
         back: Screen,
     },
@@ -1200,7 +1211,12 @@ pub struct ItemDraft {
 impl ItemDraft {
     /// Черновик по существующему элементу.
     pub fn from_item(item: &Item, timezone: Tz) -> Self {
-        let (date, time) = match (item.due_at, item.due_date) {
+        Self::from_snapshot(&ItemSnapshot::from_item(item), timezone)
+    }
+
+    /// Черновик по снимку значений элемента.
+    pub fn from_snapshot(snapshot: &ItemSnapshot, timezone: Tz) -> Self {
+        let (date, time) = match (snapshot.due_at, snapshot.due_date) {
             (Some(at), _) => {
                 let local = at.with_timezone(&timezone);
                 (Some(local.date_naive()), Some(local.time()))
@@ -1208,24 +1224,17 @@ impl ItemDraft {
             (None, date) => (date, None),
         };
         Self {
-            title: item.title.clone(),
-            notes: item.notes.clone(),
+            title: snapshot.title.clone(),
+            notes: snapshot.notes.clone(),
             date,
             time,
-            priority: item.priority,
-            assignee: item.assignee_user_id,
-            tags: item.tags.iter().map(|tag| tag.name.clone()).collect(),
-            subtasks: item
-                .subtasks
-                .iter()
-                .map(|subtask| SubtaskDraft {
-                    title: subtask.title.clone(),
-                    done: subtask.status == ItemStatus::Done,
-                })
-                .collect(),
-            recurrence: item.recurrence.as_ref().map(RecurrenceDraft::from_rule),
-            quantity: item.quantity,
-            unit: item.unit.clone(),
+            priority: snapshot.priority,
+            assignee: snapshot.assignee,
+            tags: snapshot.tags.clone(),
+            subtasks: snapshot.subtasks.clone(),
+            recurrence: snapshot.recurrence.as_ref().map(RecurrenceDraft::from_rule),
+            quantity: snapshot.quantity,
+            unit: snapshot.unit.clone(),
         }
     }
 
@@ -1434,6 +1443,11 @@ pub struct Editor {
     /// Поля, по которым при сохранении обнаружен конфликт.
     #[serde(default)]
     pub conflict: Option<BTreeSet<EditorField>>,
+    /// Снимок текущего значения, показанный на экране конфликта: «Оставить
+    /// мой» сравнивает поля с ним, а не с более поздней правкой другого
+    /// участника.
+    #[serde(default)]
+    pub conflict_seen: Option<Box<ItemSnapshot>>,
     /// Такая же позиция, найденная при сохранении покупки.
     #[serde(default)]
     pub duplicate: Option<Duplicate>,
@@ -1461,6 +1475,42 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn old_edit_callback_with_field_is_read() {
+        let action: Action = serde_json::from_value(json!({
+            "a": "edit",
+            "item_id": Uuid::nil(),
+            "field": "due",
+            "back": {"t": "menu"},
+        }))
+        .expect("old edit token");
+        assert_eq!(
+            action,
+            Action::Edit {
+                item_id: Uuid::nil(),
+                back: Screen::Menu,
+            }
+        );
+    }
+
+    #[test]
+    fn old_new_target_with_list_id_is_read() {
+        let target: EditorTarget = serde_json::from_value(json!({
+            "target": "new",
+            "list_id": Uuid::nil(),
+            "kind": "tasks",
+            "back": {"t": "menu"},
+        }))
+        .expect("old new target");
+        assert_eq!(
+            target,
+            EditorTarget::New {
+                kind: ListKind::Tasks,
+                back: Screen::Menu,
+            }
+        );
+    }
 
     #[test]
     fn first_contact_screen_cannot_represent_onboarding() {

@@ -149,7 +149,6 @@ pub async fn start_new_editor(
     };
     let editor = Editor {
         target: EditorTarget::New {
-            list_id: list.id,
             kind: list.kind,
             back: back.unwrap_or(Screen::Menu),
         },
@@ -161,6 +160,7 @@ pub async fn start_new_editor(
         list_id: list.id,
         error: None,
         conflict: None,
+        conflict_seen: None,
         duplicate: None,
     };
     editor::show(ctx, editor).await
@@ -190,7 +190,6 @@ pub async fn quick_add(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
 
     let editor = Editor {
         target: EditorTarget::New {
-            list_id: list.id,
             kind: list.kind,
             back: Screen::Menu,
         },
@@ -205,18 +204,14 @@ pub async fn quick_add(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
         list_id: list.id,
         error: None,
         conflict: None,
+        conflict_seen: None,
         duplicate: None,
     };
     editor::show(ctx, editor).await
 }
 
 /// Открыть единый редактор существующего элемента.
-pub async fn start_editor(
-    ctx: &mut Ctx<'_>,
-    item_id: Uuid,
-    field: Option<Step>,
-    back: Screen,
-) -> Result<(), Fail> {
+pub async fn start_editor(ctx: &mut Ctx<'_>, item_id: Uuid, back: Screen) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
     let item = items::get(&mut *ctx.conn, household_id, item_id).await?;
     let draft = ItemDraft::from_item(&item, ctx.tz);
@@ -226,16 +221,15 @@ pub async fn start_editor(
             base: Box::new(ItemSnapshot::from_item(&item)),
             back,
         },
-        // Поле, открытое прямо из карточки, тоже должно откатываться
-        // «Назад» без изменения элемента.
-        field_backup: field.map(|_| draft.clone()),
         draft,
         touched: std::collections::BTreeSet::new(),
-        field,
+        field: None,
         field_back: None,
+        field_backup: None,
         list_id: item.list_id,
         error: None,
         conflict: None,
+        conflict_seen: None,
         duplicate: None,
     };
     editor::show(ctx, editor).await

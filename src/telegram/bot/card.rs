@@ -18,7 +18,7 @@ use crate::telegram::rich::{Span, button};
 use crate::telegram::ru;
 
 use super::model::{
-    Action, QuickDue, RecurrenceDraft, Screen, Ui, screen_heading, screen_heading_with,
+    Action, QuickDue, RecurrenceDraft, Screen, Ui, screen_heading, screen_heading_names,
 };
 use super::screens::{clip, nav_row};
 use super::{Ctx, Fail};
@@ -202,7 +202,6 @@ pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui,
         ru::EDIT_BUTTON,
         Action::Edit {
             item_id,
-            field: None,
             back: here.clone(),
         },
     );
@@ -262,12 +261,7 @@ pub async fn due(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui, 
         back: Box::new(back.clone()),
     };
     let title = clip(&item.title, 40);
-    let mut parents = Vec::new();
-    if matches!(back, Screen::List { .. }) {
-        parents.push(list.name.as_str());
-    }
-    parents.push(title.as_str());
-    let mut ui = screen_heading_with(&here, "Срок", &parents);
+    let mut ui = screen_heading_names(&here, "Срок", Some(&list.name), Some(&title), None);
     match ru::due_label(item.due_at, item.due_date, ctx.tz, ctx.now) {
         Some(due) => ui = ui.text(format!("Сейчас: {due}")),
         None => ui = ui.text("Сейчас без срока"),

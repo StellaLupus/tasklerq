@@ -395,6 +395,7 @@ async fn editor_expires_after_fifteen_minutes() {
     bot.advance(Duration::minutes(16));
     bot.text("Поздний ответ").await;
     bot.assert_screen_contains("Правка устарела");
+    bot.assert_screen_contains("Задачи › Карточка › Правка устарела");
     bot.assert_has_button("Открыть карточку");
     let conversations: i64 =
         sqlx::query_scalar("SELECT count(*) FROM conversation_states WHERE chat_id = $1")
@@ -436,6 +437,7 @@ async fn new_editor_expiry_from_a_list_offers_the_list() {
     bot.text("Позднее название").await;
 
     bot.assert_screen_contains("Правка устарела");
+    bot.assert_screen_contains("Задачи › Правка устарела");
     bot.assert_has_button("К списку");
     assert!(
         bot.find_button("Открыть карточку").is_none(),

@@ -536,6 +536,7 @@ async fn open_editor(
         list_id: list.id,
         error: None,
         conflict: None,
+        conflict_seen: None,
         duplicate: None,
     };
     forms::open_editor(ctx, editor).await

@@ -927,6 +927,7 @@ async fn editor_conflict_offers_both_values_and_both_outcomes() {
 
     bot.press("Сохранить").await;
     bot.assert_screen_contains("Конфликт при сохранении");
+    bot.assert_screen_contains("Задачи › Карточка › Конфликт при сохранении");
     bot.assert_screen_contains("Оставить мой");
     bot.assert_screen_contains("Оставить текущий");
     bot.assert_screen_contains("Мой:");
@@ -974,11 +975,179 @@ async fn editor_conflict_offers_both_values_and_both_outcomes() {
     .expect("other due again");
     bot.press("Сохранить").await;
     bot.assert_screen_contains("Оставить мой");
+    let conflict_version = task_row(&db.pool, household.household_id, "Наш заголовок").await;
     bot.press("Оставить мой").await;
 
     let mine = task_row(&db.pool, household.household_id, "Наш заголовок").await;
     assert_eq!(mine.due_date, Some(tomorrow));
-    assert_eq!(mine.version, before_second.version + 2);
+    assert_eq!(
+        mine.version,
+        conflict_version.version + 1,
+        "without new changes «Оставить мой» writes once"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_conflict_rechecks_fields_changed_while_it_is_open() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Повторный конфликт").await;
+    bot.press("Сохранить").await;
+    let household = test_household(&db.pool, bot.chat).await;
+    let item = task_row(&db.pool, household.household_id, "Повторный конфликт").await;
+    let member = {
+        let mut conn = db.pool.acquire().await.expect("conn");
+        users::add(
+            &mut conn,
+            household.household_id,
+            UserRole::Member,
+            support::new_member("Борис"),
+            &household.owner(),
+            Utc::now(),
+        )
+        .await
+        .expect("member")
+    };
+    let today = bot.now.with_timezone(&moscow()).date_naive();
+    let tomorrow = today + Duration::days(1);
+    let other_day = today + Duration::days(5);
+
+    bot.press("Повторный конфликт").await;
+    bot.press("Править").await;
+    bot.press("Срок").await;
+    bot.press("Завтра").await;
+    bot.press("Исполнитель").await;
+    bot.press("Борис").await;
+
+    // Другой участник ставит свою дату, а пока открыт экран конфликта —
+    // меняет и исполнителя, которого мы тоже правили.
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let due_change = items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        item.id,
+        item.version,
+        ItemPatch {
+            due_date: Field::Value(other_day),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("other due");
+    bot.press("Сохранить").await;
+    bot.assert_screen_contains("Конфликт при сохранении");
+    items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        item.id,
+        due_change.version,
+        ItemPatch {
+            assignee_user_id: Field::Value(household.owner_id),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("other assignee");
+
+    // «Оставить мой» по сроку перечитывает элемент и находит новый
+    // конфликт по исполнителю: срок ещё не записан.
+    bot.press("Оставить мой").await;
+    bot.assert_screen_contains("Конфликт при сохранении");
+    bot.assert_screen_contains("Исполнитель:");
+    let during = task_row(&db.pool, household.household_id, "Повторный конфликт").await;
+    assert_eq!(
+        during.due_date,
+        Some(other_day),
+        "the due must not be written before the new conflict is resolved"
+    );
+
+    bot.press("Оставить мой").await;
+    let saved = task_row(&db.pool, household.household_id, "Повторный конфликт").await;
+    assert_eq!(saved.due_date, Some(tomorrow));
+    assert_eq!(saved.assignee, Some(member.id));
+    assert_eq!(
+        saved.version,
+        during.version + 1,
+        "the second choice must save everything in one write"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_conflict_rechecks_the_same_field_changed_again() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Срок меняется дважды").await;
+    bot.press("Сохранить").await;
+    let household = test_household(&db.pool, bot.chat).await;
+    let item = task_row(&db.pool, household.household_id, "Срок меняется дважды").await;
+    let today = bot.now.with_timezone(&moscow()).date_naive();
+    let tomorrow = today + Duration::days(1);
+    let other_day = today + Duration::days(5);
+    let third_day = today + Duration::days(6);
+
+    bot.press("Срок меняется дважды").await;
+    bot.press("Править").await;
+    bot.press("Срок").await;
+    bot.press("Завтра").await;
+
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let first_change = items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        item.id,
+        item.version,
+        ItemPatch {
+            due_date: Field::Value(other_day),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("first due");
+    bot.press("Сохранить").await;
+    bot.assert_screen_contains("Конфликт при сохранении");
+
+    // Другой участник снова меняет то же поле, пока открыт экран конфликта.
+    let second_change = items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        item.id,
+        first_change.version,
+        ItemPatch {
+            due_date: Field::Value(third_day),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("second due");
+
+    // «Оставить мой» сравнивает с тем, что было на экране, и показывает
+    // новый конфликт вместо записи.
+    bot.press("Оставить мой").await;
+    bot.assert_screen_contains("Конфликт при сохранении");
+    let during = task_row(&db.pool, household.household_id, "Срок меняется дважды").await;
+    assert_eq!(
+        during.due_date,
+        Some(third_day),
+        "the newer change must not be overwritten before the new conflict is resolved"
+    );
+    assert_eq!(during.version, second_change.version);
+
+    bot.press("Оставить мой").await;
+    let saved = task_row(&db.pool, household.household_id, "Срок меняется дважды").await;
+    assert_eq!(saved.due_date, Some(tomorrow));
+    assert_eq!(saved.version, during.version + 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1493,12 +1662,15 @@ async fn editor_recurrence_sets_weekdays_and_interval_on_one_screen() {
         2 => press_exact(&mut bot, "пт").await,
         5 => press_exact(&mut bot, "вт").await,
         _ => {
+            // Последний выбранный день снять нельзя, поэтому сначала
+            // добавляем вторник, затем убираем сегодняшний день и добавляем
+            // пятницу.
+            press_exact(&mut bot, "вт").await;
             press_exact(
                 &mut bot,
                 ru::weekday_short(u32::try_from(today_weekday).unwrap_or(1)),
             )
             .await;
-            press_exact(&mut bot, "вт").await;
             press_exact(&mut bot, "пт").await;
         }
     }

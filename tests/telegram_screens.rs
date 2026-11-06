@@ -1012,7 +1012,7 @@ async fn completed_task_stays_in_done_today_section_and_opens_card() {
     for label in ["↩️ Вернуть", "✏️ Править", "🗑 Удалить"] {
         bot.assert_has_button(label);
     }
-    for label in ["📅 Срок", "✓ Выполнено", "✓ Куплено"] {
+    for label in ["📅 Срок", "✓ Выполнено"] {
         assert!(
             bot.find_button(label).is_none(),
             "a completed task card must not keep `{label}`:\n{}",
@@ -1337,10 +1337,15 @@ async fn menu_counters_do_not_repeat_the_lists_line() {
         "the lists line must be gone:\n{}",
         bot.screen()
     );
-    bot.assert_screen_contains("Напишите название задачи");
+    bot.assert_screen_contains("Напишите название задачи — открою редактор задачи.");
     assert!(
         !bot.screen().contains("я разберу"),
         "without LLM the hint must not promise parsing:\n{}",
+        bot.screen()
+    );
+    assert!(
+        !bot.screen().contains("открою форму"),
+        "without LLM the hint must not promise a form:\n{}",
         bot.screen()
     );
 }
@@ -1351,8 +1356,8 @@ async fn menu_hint_promises_parsing_when_llm_capture_is_enabled() {
     let bot = onboarded_with_llm(&db.pool, "Alice").await;
     bot.assert_screen_contains("Напишите задачу или покупку — я разберу.");
     assert!(
-        !bot.screen().contains("открою форму"),
-        "with LLM the hint must not promise a form:\n{}",
+        !bot.screen().contains("открою редактор"),
+        "with LLM the hint must not promise an editor:\n{}",
         bot.screen()
     );
 }
@@ -4179,6 +4184,40 @@ async fn card_edit_opens_the_editor_and_save_returns_to_the_card() {
     {
         bot.assert_has_button(label);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_task_editor_crumbs_do_not_mention_the_card() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+
+    bot.press("Задачи").await;
+    bot.press("Добавить").await;
+
+    bot.assert_screen_contains("Задачи › ");
+    bot.assert_screen_contains("Как назвать задачу?");
+    assert!(
+        !bot.screen().contains("Карточка"),
+        "a new item has no card in its path:\n{}",
+        bot.screen()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_from_mine_keeps_the_mine_parent_in_crumbs() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut task = new_item(household.tasks_list_id, "Позвонить маме");
+    task.assignee_user_id = Some(household.owner_id);
+    create_item(&db.pool, &household, household.tasks_list_id, &actor, task).await;
+
+    bot.press("Мои задачи").await;
+    bot.press("Позвонить маме").await;
+    bot.press("Править").await;
+
+    bot.assert_screen_contains("Мои задачи › Карточка › Позвонить маме");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

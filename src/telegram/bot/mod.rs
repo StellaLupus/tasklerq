@@ -937,11 +937,7 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
             kind,
             back,
         } => forms::start_new_editor(ctx, list_id, kind, back).await,
-        Action::Edit {
-            item_id,
-            field,
-            back,
-        } => forms::start_editor(ctx, item_id, field, back).await,
+        Action::Edit { item_id, back } => forms::start_editor(ctx, item_id, back).await,
         Action::DueSet {
             item_id,
             version,

@@ -19,7 +19,7 @@ use super::view::{choice_buttons, prompt_hint, prompt_title, units_row};
 use crate::telegram::bot::card::{describe_recurrence_draft, priority_label};
 use crate::telegram::bot::model::{
     Action, Choice, Duplicate, Editor, EditorField, EditorTarget, Form, FormAct, ItemDraft,
-    ItemSnapshot, RecurrenceDraft, Screen, Step, Ui, screen_heading, screen_heading_with,
+    ItemSnapshot, RecurrenceDraft, Screen, Step, Ui, screen_heading_names,
 };
 use crate::telegram::bot::screens::clip;
 use crate::telegram::bot::{Ctx, Fail, into_sqlx};
@@ -89,15 +89,16 @@ pub async fn screen(ctx: &mut Ctx<'_>, item_id: Option<Uuid>, back: &Screen) -> 
         {
             view(ctx, editor).await
         }
-        _ => Ok(expired_view(item_id, back)),
+        _ => expired_view(ctx, item_id, back).await,
     }
 }
 
-fn expired_view(item_id: Option<Uuid>, back: &Screen) -> Ui {
+async fn expired_view(ctx: &mut Ctx<'_>, item_id: Option<Uuid>, back: &Screen) -> Result<Ui, Fail> {
     let screen = Screen::Editor {
         item_id,
         back: Box::new(back.clone()),
     };
+    let list_name = expired_list_name(ctx, item_id, back).await?;
     let label = match (item_id, back) {
         (Some(_), _) => "Открыть карточку",
         (None, Screen::Draft { .. }) => "К черновику",
@@ -114,9 +115,38 @@ fn expired_view(item_id: Option<Uuid>, back: &Screen) -> Ui {
             Action::Go { to: Screen::Menu },
         ));
     }
-    screen_heading(&screen, "Правка устарела", None)
-        .text("Начнём заново?")
-        .row(row)
+    Ok(
+        screen_heading_names(&screen, "Правка устарела", list_name.as_deref(), None, None)
+            .text("Начнём заново?")
+            .row(row),
+    )
+}
+
+/// Имя списка для крошек истёкшего редактора: у правки — список элемента, у
+/// создания из списка — сам список.
+async fn expired_list_name(
+    ctx: &mut Ctx<'_>,
+    item_id: Option<Uuid>,
+    back: &Screen,
+) -> Result<Option<String>, Fail> {
+    let household_id = ctx.household()?.id;
+    let list_id = match (item_id, back) {
+        (Some(item_id), _) => match items::get(&mut *ctx.conn, household_id, item_id).await {
+            Ok(item) => Some(item.list_id),
+            Err(DomainError::NotFound) => None,
+            Err(error) => return Err(error.into()),
+        },
+        (None, Screen::List { list_id, .. }) => Some(*list_id),
+        _ => None,
+    };
+    match list_id {
+        Some(list_id) => match lists::get(&mut *ctx.conn, household_id, list_id).await {
+            Ok(list) => Ok(Some(list.name)),
+            Err(DomainError::NotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        },
+        None => Ok(None),
+    }
 }
 
 /// Экран редактора или открытого поля.
@@ -173,7 +203,7 @@ async fn main_view(ctx: &mut Ctx<'_>, editor: &Editor) -> Result<Ui, Fail> {
     } else {
         clip(&editor.draft.title, 60)
     };
-    let mut ui = screen_heading_with(&screen, &title, &[list.name.as_str(), "Карточка"]);
+    let mut ui = screen_heading_names(&screen, &title, Some(&list.name), None, None);
     if let Some(error) = &editor.error {
         ui = ui.bold(format!("⚠️ {error}"));
     }
@@ -238,9 +268,11 @@ async fn field_view(ctx: &mut Ctx<'_>, editor: &Editor, step: Step) -> Result<Ui
     for line in values(ctx, editor, shopping).await? {
         ui = ui.text(line);
     }
-    ui = ui.heading(screen.trail_with(
+    ui = ui.heading(screen.trail_with_names(
         prompt_title(step, shopping),
-        &[list.name.as_str(), "Карточка", "Редактор"],
+        Some(&list.name),
+        None,
+        Some("Редактор"),
     ));
     if step.expects_text() && step != Step::Subtasks {
         ui = ui.text(prompt_hint(step, &editor.draft));
@@ -579,6 +611,49 @@ fn current_differs(field: EditorField, current: &ItemSnapshot, base: &ItemSnapsh
     }
 }
 
+/// Поля `touched`, которые другой участник изменил с момента открытия и по
+/// которым наше значение отличается от текущего.
+fn conflicts(
+    editor: &Editor,
+    current: &ItemSnapshot,
+    base: &ItemSnapshot,
+    changed: &BTreeSet<EditorField>,
+    timezone: chrono_tz::Tz,
+) -> Result<BTreeSet<EditorField>, DomainError> {
+    let mut conflicts = BTreeSet::new();
+    for field in changed {
+        let current_changed = current_differs(*field, current, base);
+        let ours_equals_current =
+            value_eq(*field, &editor.draft, editor.list_id, current, timezone)?;
+        if current_changed && !ours_equals_current {
+            conflicts.insert(*field);
+        }
+    }
+    Ok(conflicts)
+}
+
+/// Принять значение поля из снимка, который видел пользователь: после
+/// «Оставить мой» базой этого поля становится текущее значение на экране
+/// конфликта, иначе чужая правка снова всплывёт конфликтом.
+fn adopt(base: &mut ItemSnapshot, seen: &ItemSnapshot, field: EditorField) {
+    match field {
+        EditorField::Title => base.title.clone_from(&seen.title),
+        EditorField::Due => {
+            base.due_at = seen.due_at;
+            base.due_date = seen.due_date;
+        }
+        EditorField::Priority => base.priority = seen.priority,
+        EditorField::Assignee => base.assignee = seen.assignee,
+        EditorField::Tags => base.tags.clone_from(&seen.tags),
+        EditorField::Subtasks => base.subtasks.clone_from(&seen.subtasks),
+        EditorField::Recurrence => base.recurrence.clone_from(&seen.recurrence),
+        EditorField::Notes => base.notes.clone_from(&seen.notes),
+        EditorField::List => base.list_id = seen.list_id,
+        EditorField::Quantity => base.quantity = seen.quantity,
+        EditorField::Unit => base.unit.clone_from(&seen.unit),
+    }
+}
+
 /// «💾 Сохранить»: создание, слияние правки по `touched` или запись пункта
 /// черновика.
 async fn save(ctx: &mut Ctx<'_>, editor: Editor, allow_duplicate: bool) -> Result<(), Fail> {
@@ -625,22 +700,10 @@ async fn save_item(
         return ctx.present(back).await;
     }
 
-    let mut conflicts = BTreeSet::new();
-    for field in &changed {
-        let current_changed = current_differs(*field, &current_snapshot, &base);
-        let ours_equals_current = value_eq(
-            *field,
-            &editor.draft,
-            editor.list_id,
-            &current_snapshot,
-            ctx.tz,
-        )?;
-        if current_changed && !ours_equals_current {
-            conflicts.insert(*field);
-        }
-    }
+    let conflicts = conflicts(&editor, &current_snapshot, &base, &changed, ctx.tz)?;
     if !conflicts.is_empty() {
         editor.conflict = Some(conflicts);
+        editor.conflict_seen = Some(Box::new(current_snapshot));
         return show(ctx, editor).await;
     }
     write(ctx, editor, &current, &changed, back).await
@@ -883,24 +946,46 @@ async fn resolve_conflict(
     ctx: &mut Ctx<'_>,
     mut editor: Editor,
     item_id: Uuid,
-    base: ItemSnapshot,
+    mut base: ItemSnapshot,
     mine: bool,
 ) -> Result<(), Fail> {
-    let Some(conflicts) = editor.conflict.take() else {
+    let Some(resolved) = editor.conflict.take() else {
         return show(ctx, editor).await;
     };
     let back = editor.back();
-    if !mine {
-        for field in &conflicts {
+    let household_id = ctx.household()?.id;
+    let current = items::get(&mut *ctx.conn, household_id, item_id).await?;
+    let current_snapshot = ItemSnapshot::from_item(&current);
+    let seen = editor
+        .conflict_seen
+        .take()
+        .unwrap_or_else(|| Box::new(current_snapshot.clone()));
+    if mine {
+        // «Оставить мой» — это база поля из экрана конфликта: элементы,
+        // которые другой участник успел изменить, пока экран был открыт,
+        // проверяются заново, а уже решённые поля конфликтом не считаются.
+        for field in &resolved {
+            adopt(&mut base, seen.as_ref(), *field);
+        }
+    } else {
+        for field in &resolved {
             editor.touched.remove(field);
         }
     }
-    let household_id = ctx.household()?.id;
-    let current = items::get(&mut *ctx.conn, household_id, item_id).await?;
+    if mine && let EditorTarget::Item { base: stored, .. } = &mut editor.target {
+        // Решённые поля остаются в базе и для следующего экрана конфликта.
+        **stored = base.clone();
+    }
     let changed = changed_fields(&editor, &base, ctx.tz)?;
     if changed.is_empty() {
         super::clear(ctx).await?;
         return ctx.present(back).await;
+    }
+    let next = conflicts(&editor, &current_snapshot, &base, &changed, ctx.tz)?;
+    if !next.is_empty() {
+        editor.conflict = Some(next);
+        editor.conflict_seen = Some(Box::new(current_snapshot));
+        return show(ctx, editor).await;
     }
     write(ctx, editor, &current, &changed, back).await
 }
@@ -914,18 +999,31 @@ async fn cancel(ctx: &mut Ctx<'_>, editor: Editor) -> Result<(), Fail> {
 
 async fn conflict_view(ctx: &mut Ctx<'_>, editor: &Editor, item_id: Uuid) -> Result<Ui, Fail> {
     let back = editor.back();
+    let (current_draft, list_id) = match editor.conflict_seen.as_deref() {
+        Some(seen) => (ItemDraft::from_snapshot(seen, ctx.tz), seen.list_id),
+        None => {
+            let household_id = ctx.household()?.id;
+            let current = items::get(&mut *ctx.conn, household_id, item_id).await?;
+            (ItemDraft::from_item(&current, ctx.tz), current.list_id)
+        }
+    };
     let household_id = ctx.household()?.id;
-    let current = items::get(&mut *ctx.conn, household_id, item_id).await?;
-    let current_draft = ItemDraft::from_item(&current, ctx.tz);
+    let list = lists::get(&mut *ctx.conn, household_id, list_id).await?;
     let screen = Screen::Editor {
         item_id: Some(item_id),
         back: Box::new(back),
     };
-    let mut ui = screen_heading(&screen, "Конфликт при сохранении", None);
+    let mut ui = screen_heading_names(
+        &screen,
+        "Конфликт при сохранении",
+        Some(&list.name),
+        None,
+        None,
+    );
     if let Some(conflicts) = &editor.conflict {
         for field in conflicts {
             let ours = field_value(ctx, *field, &editor.draft, editor.list_id).await?;
-            let theirs = field_value(ctx, *field, &current_draft, current.list_id).await?;
+            let theirs = field_value(ctx, *field, &current_draft, list_id).await?;
             ui = ui
                 .bold(format!("{}:", field_title(*field)))
                 .text(format!("Мой: {ours}"))
@@ -1103,6 +1201,7 @@ pub(super) async fn on_action(
             // «Назад» из конфликта возвращает в редактор с нашими значениями:
             // выбор ещё не сделан, элемент не менялся.
             if editor.conflict.take().is_some() {
+                editor.conflict_seen = None;
                 editor.field = None;
                 editor.field_back = None;
                 editor.error = None;

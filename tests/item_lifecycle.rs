@@ -2574,9 +2574,11 @@ async fn recurring_completions_keep_their_planned_due_dates() {
 async fn reopen_after_the_last_occurrence_keeps_the_earlier_completion() {
     let db = support::db().await;
     let household = support::create_household(&db.pool).await;
-    let today = Utc::now().date_naive();
-    let tomorrow = today + Duration::days(1);
     let now = Utc::now().trunc_subsecs(6);
+    // `complete` считает «сегодня» в поясе household: при UTC-дате тест
+    // ломается после 21:00 UTC, когда в Москве уже следующие сутки.
+    let today = now.with_timezone(&chrono_tz::Europe::Moscow).date_naive();
+    let tomorrow = today + Duration::days(1);
     let mut input = support::new_item(household.tasks_list_id, "Полить цветы");
     input.due_date = Some(today);
     let mut rule = support::recurrence(tasklerq::domain::models::RecurrenceFreq::Daily, Vec::new());
