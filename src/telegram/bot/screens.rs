@@ -1,6 +1,6 @@
 //! Сборка экранов: меню, списки, «Мои задачи» и поиск.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
@@ -103,7 +103,9 @@ fn priority_marker(item: &Item) -> &'static str {
 
 async fn menu(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
     let household = ctx.household()?.clone();
+    let user_id = ctx.user()?.id;
     let counts = items::menu_counts(&mut *ctx.conn, household.id, ctx.tz.name(), ctx.now).await?;
+    let mine_count = items::open_assigned_tasks(&mut *ctx.conn, household.id, user_id).await?;
     let all_lists = lists::list(&mut *ctx.conn, household.id).await?;
     let visible: Vec<&List> = all_lists.iter().filter(|list| !list.is_archived).collect();
     let open = items::open_counts_by_list(&mut *ctx.conn, household.id).await?;
@@ -115,34 +117,39 @@ async fn menu(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
             .or_else(|| visible.iter().find(|list| list.kind == kind))
             .map(|list| list.id)
     };
+    let open_in = |list_id: Option<Uuid>, fallback: i64| {
+        list_id.map_or(fallback, |list_id| open.get(&list_id).copied().unwrap_or(0))
+    };
+    let tasks_list = default_of(ListKind::Tasks);
+    let shopping_list = default_of(ListKind::Shopping);
+    let tasks_count = open_in(tasks_list, counts.open_tasks);
+    let shopping_count = open_in(shopping_list, counts.open_shopping);
 
-    let summary = lists_line(&visible, &open);
+    let hint = if ctx.llm_capture {
+        ru::MENU_HINT
+    } else {
+        ru::MENU_HINT_NO_LLM
+    };
     let mut ui = Ui::new()
-        .heading(format!(
-            "{} · {}",
-            household.name,
-            ru::tasks(counts.open_tasks)
-        ))
+        .heading(household.name)
         .spans(vec![
             Span::text("Просрочено: "),
             Span::bold(counts.overdue_tasks.to_string()),
-            Span::text(" · Покупки: "),
-            Span::bold(counts.open_shopping.to_string()),
-            Span::text(" · Выполнено сегодня: "),
+            Span::text(" · На сегодня: "),
+            Span::bold(counts.due_today_tasks.to_string()),
+            Span::text(" · Выполнено: "),
             Span::bold(counts.done_today.to_string()),
-        ]);
-    if !summary.is_empty() {
-        ui = ui.text(format!("Списки: {summary}"));
-    }
+        ])
+        .text(hint);
 
-    let tasks_target = default_of(ListKind::Tasks)
+    let tasks_target = tasks_list
         .map(|list_id| Screen::List {
             list_id,
             page: 0,
             edit: false,
         })
         .unwrap_or(Screen::Lists);
-    let shopping_target = default_of(ListKind::Shopping)
+    let shopping_target = shopping_list
         .map(|list_id| Screen::List {
             list_id,
             page: 0,
@@ -153,11 +160,14 @@ async fn menu(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
     ui = ui
         .row(vec![
             go("➕ Добавить", Screen::Add),
-            go("🛒 Покупки", shopping_target),
+            go(&format!("🛒 Покупки · {shopping_count}"), shopping_target),
         ])
         .row(vec![
-            go("📋 Задачи", tasks_target),
-            go("👤 Мои задачи", Screen::Mine { page: 0 }),
+            go(&format!("📋 Задачи · {tasks_count}"), tasks_target),
+            go(
+                &format!("👤 Мои задачи · {mine_count}"),
+                Screen::Mine { page: 0 },
+            ),
         ])
         .row(vec![
             button("🔎 Поиск", Action::SearchStart),
@@ -167,20 +177,6 @@ async fn menu(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
         ui = ui.row(vec![go("🗂 Все списки", Screen::Lists)]);
     }
     Ok(ui)
-}
-
-fn lists_line(visible: &[&List], open: &HashMap<Uuid, i64>) -> String {
-    visible
-        .iter()
-        .map(|list| {
-            format!(
-                "{} ({})",
-                list.name,
-                open.get(&list.id).copied().unwrap_or(0)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 fn welcome() -> Ui {
@@ -368,19 +364,22 @@ async fn list(ctx: &mut Ctx<'_>, list_id: Uuid, page: u32, edit: bool) -> Result
 async fn tasks_list(ctx: &mut Ctx<'_>, list: &List, page: u32) -> Result<Ui, Fail> {
     let household_id = ctx.household()?.id;
     let all = items::list_by_list(&mut *ctx.conn, household_id, list.id).await?;
-    let done = all
+    let since = items::completions::day_start(ctx.tz, ctx.now);
+    let done_today =
+        items::completions::for_list_since(&mut *ctx.conn, household_id, list.id, since).await?;
+    let done_today_ids: HashSet<Uuid> = done_today
         .iter()
-        .filter(|item| item.status == ItemStatus::Done)
+        .map(|completion| completion.item_id)
+        .collect();
+    let done_earlier = all
+        .iter()
+        .filter(|item| item.status == ItemStatus::Done && !done_today_ids.contains(&item.id))
         .count();
     let mut open: Vec<Item> = all
         .into_iter()
         .filter(|item| item.status == ItemStatus::Open)
         .collect();
     sort_tasks(&mut open, ctx.tz, ctx.now);
-
-    let since = items::completions::day_start(ctx.tz, ctx.now);
-    let done_today =
-        items::completions::for_list_since(&mut *ctx.conn, household_id, list.id, since).await?;
 
     let (start, end, page, pages) = page_bounds(open.len(), page);
     let here = |page: usize| Screen::List {
@@ -415,13 +414,13 @@ async fn tasks_list(ctx: &mut Ctx<'_>, list: &List, page: u32) -> Result<Ui, Fai
             )]);
         }
     }
-    if done > 0 {
+    if done_earlier > 0 {
         let label = if open.is_empty() {
             "Выполнено ранее"
         } else {
             "Выполнено"
         };
-        ui = ui.text(format!("{label}: {done}"));
+        ui = ui.text(format!("{label}: {done_earlier}"));
     }
     if show_done_today {
         ui = done_today_section(ui, &done_today, ctx.tz, here(page));

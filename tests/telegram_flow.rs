@@ -43,7 +43,8 @@ async fn onboarding_creates_household_once() {
 
     // Повторный /start не создаёт второй household и открывает меню.
     bot.text("/start").await;
-    bot.assert_screen_contains("Семья Ивановых · 0 задач");
+    bot.assert_screen_contains("Семья Ивановых");
+    bot.assert_screen_contains("📋 Задачи · 0");
     let total: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE telegram_user_id = $1")
         .bind(id)
         .fetch_one(&db.pool)
@@ -271,7 +272,7 @@ async fn navigation_edits_the_single_active_message() {
     bot.assert_screen_contains("Задачи · 0");
     bot.assert_screen_contains("Пока нет задач");
     bot.press("Назад").await;
-    bot.assert_screen_contains("Семья · 0 задач");
+    bot.assert_screen_contains("📋 Задачи · 0");
     bot.press("Покупки").await;
     bot.assert_screen_contains("Список покупок пуст");
 
@@ -380,7 +381,7 @@ async fn free_text_offers_a_draft_and_cancel_discards_it() {
     bot.assert_screen_contains("Проверьте и сохраните");
     bot.assert_screen_contains("позвонить маме");
     bot.press("Отмена").await;
-    bot.assert_screen_contains("Семья · 0 задач");
+    bot.assert_screen_contains("📋 Задачи · 0");
 
     let household = household_of(&db.pool, bot.chat).await;
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM items WHERE household_id = $1")
@@ -502,7 +503,7 @@ async fn saved_completed_state_falls_back_to_the_menu() {
     let (message_id, _) = bot.active();
     bot.press_data(&data, message_id).await;
 
-    bot.assert_screen_contains("0 задач");
+    bot.assert_screen_contains("📋 Задачи · 0");
     assert!(
         bot.fake
             .answers()
@@ -1148,7 +1149,7 @@ async fn notification_button_opens_a_new_screen_below() {
     assert!(new_id > notice);
     assert!(!is_alive(&bot, anchor));
     assert!(is_alive(&bot, notice));
-    bot.assert_screen_contains("Семья · 0 задач");
+    bot.assert_screen_contains("📋 Задачи · 0");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1217,7 +1218,7 @@ async fn repeated_start_and_menu_send_a_new_screen() {
         let (new_id, _) = bot.active();
         assert_ne!(new_id, anchor, "{command} must not edit the old anchor");
         assert!(!is_alive(&bot, anchor));
-        bot.assert_screen_contains("Семья · 0 задач");
+        bot.assert_screen_contains("📋 Задачи · 0");
     }
 }
 
@@ -1274,7 +1275,7 @@ async fn screen_is_sent_even_when_the_old_anchor_cannot_be_deleted() {
     let (new_id, _) = bot.active();
     assert_ne!(new_id, anchor);
     assert!(is_alive(&bot, anchor), "the old anchor stays in the chat");
-    bot.assert_screen_contains("Семья · 0 задач");
+    bot.assert_screen_contains("📋 Задачи · 0");
 
     // Кнопка старого сообщения обрабатывается как устаревшая.
     let data = buttons(&old_html)
@@ -1301,7 +1302,7 @@ async fn screen_is_sent_even_when_the_old_anchor_cannot_be_deleted() {
     );
     // Действие не выполнилось: остались в меню, а не в списке задач.
     assert_eq!(bot.active().0, new_id);
-    bot.assert_screen_contains("Семья · 0 задач");
+    bot.assert_screen_contains("📋 Задачи · 0");
     assert!(!bot.screen().contains("Пока нет задач"));
 }
 

@@ -1443,3 +1443,74 @@ async fn recurring_completions_keep_their_planned_due_dates() {
     due_dates.sort();
     assert_eq!(due_dates, vec![Some(today), Some(second_due)]);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reopen_after_the_last_occurrence_keeps_the_earlier_completion() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let today = Utc::now().date_naive();
+    let tomorrow = today + Duration::days(1);
+    let now = Utc::now().trunc_subsecs(6);
+    let mut input = support::new_item(household.tasks_list_id, "Полить цветы");
+    input.due_date = Some(today);
+    let mut rule = support::recurrence(tasklerq::domain::models::RecurrenceFreq::Daily, Vec::new());
+    rule.until = Some(tomorrow);
+    input.recurrence = Some(rule);
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    // Первое вхождение: серия продолжается, задача остаётся открытой.
+    let first = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(created.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("complete the first occurrence");
+    assert_eq!(first.status, ItemStatus::Open);
+
+    // Последнее вхождение: следующего нет, задача становится выполненной.
+    let second_at = now + Duration::days(1);
+    let second = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(first.version),
+        "Europe/Moscow",
+        second_at,
+    )
+    .await
+    .expect("complete the last occurrence");
+    assert_eq!(second.status, ItemStatus::Done);
+
+    items::reopen(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(second.version),
+        second_at + Duration::seconds(1),
+    )
+    .await
+    .expect("reopen the last occurrence");
+
+    let listed = completions(&mut conn, &household, now - Duration::days(1)).await;
+    assert_eq!(
+        listed.len(),
+        1,
+        "reopen hides only the last completion, not the earlier one"
+    );
+    assert_eq!(listed[0].completed_at, now);
+}

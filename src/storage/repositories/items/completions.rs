@@ -79,6 +79,22 @@ pub async fn for_list_since(
     list_id: Uuid,
     since: DateTime<Utc>,
 ) -> Result<Vec<Completion>, DomainError> {
+    Ok(for_household_since(conn, household_id, since)
+        .await?
+        .into_iter()
+        .filter(|completion| completion.list_id == list_id)
+        .collect())
+}
+
+/// Выполнения household с `since` по всем спискам, начиная с поздних.
+///
+/// Правило отбора то же, что у [`for_list_since`]; фильтр по списку остаётся
+/// вызывающему, потому что `list_id` берётся из снимка выполнения.
+pub async fn for_household_since(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    since: DateTime<Utc>,
+) -> Result<Vec<Completion>, DomainError> {
     let rows = sqlx::query_as::<_, CompletionRow>(
         "SELECT e.id, e.item_id, e.actor_user_id, e.created_at, e.payload,
                 i.list_id AS current_list_id
@@ -121,11 +137,7 @@ pub async fn for_list_since(
     .fetch_all(conn)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(Completion::from)
-        .filter(|completion| completion.list_id == list_id)
-        .collect())
+    Ok(rows.into_iter().map(Completion::from).collect())
 }
 
 impl From<CompletionRow> for Completion {

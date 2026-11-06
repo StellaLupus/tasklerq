@@ -2,11 +2,11 @@
 
 mod support;
 
-use chrono::Utc;
+use chrono::{NaiveDate, TimeZone, Utc};
 use tasklerq::config::TenancyMode;
 use tasklerq::domain::error::DomainError;
 use tasklerq::domain::identity::NewMember;
-use tasklerq::domain::models::{ItemPriority, ItemStatus, ListKind, SubtaskInput};
+use tasklerq::domain::models::{ItemPriority, ItemStatus, ListKind, RecurrenceFreq, SubtaskInput};
 use tasklerq::storage::repositories::households::{self, NewOwner};
 use tasklerq::storage::repositories::{items, lists, tags, users};
 use uuid::Uuid;
@@ -486,4 +486,147 @@ async fn batch_hydration_keeps_tags_and_subtasks_per_item() {
     .expect("search");
     let found: Vec<_> = hits.into_iter().map(|hit| hit.item).collect();
     assert_eq!(summarize(&found), expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn menu_counts_use_local_today_and_completion_events() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let actor = household.owner();
+    let tz = chrono_tz::Tz::Asia__Vladivostok;
+    let now = tz
+        .with_ymd_and_hms(2027, 3, 16, 1, 0, 0)
+        .single()
+        .expect("local now")
+        .with_timezone(&Utc);
+    let today = NaiveDate::from_ymd_opt(2027, 3, 16).expect("today");
+    let yesterday = NaiveDate::from_ymd_opt(2027, 3, 15).expect("yesterday");
+    let tomorrow = NaiveDate::from_ymd_opt(2027, 3, 17).expect("tomorrow");
+
+    let mut later_today = support::new_item(household.tasks_list_id, "Сегодня позже");
+    later_today.due_at = Some(
+        tz.with_ymd_and_hms(2027, 3, 16, 2, 0, 0)
+            .single()
+            .expect("timed due")
+            .with_timezone(&Utc),
+    );
+    support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        later_today,
+    )
+    .await;
+    let mut today_without_time = support::new_item(household.tasks_list_id, "Сегодня без времени");
+    today_without_time.due_date = Some(today);
+    support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        today_without_time,
+    )
+    .await;
+    let mut overdue = support::new_item(household.tasks_list_id, "Вчера");
+    overdue.due_date = Some(yesterday);
+    let overdue = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        overdue,
+    )
+    .await;
+    let mut later = support::new_item(household.tasks_list_id, "Завтра");
+    later.due_date = Some(tomorrow);
+    support::create_item(&db.pool, &household, household.tasks_list_id, &actor, later).await;
+
+    let mut recurring = support::new_item(household.tasks_list_id, "Полить цветы");
+    recurring.due_date = Some(today);
+    recurring.recurrence = Some(tasklerq::domain::models::RecurrenceInput {
+        freq: RecurrenceFreq::Daily,
+        interval: Some(1),
+        byweekday: Vec::new(),
+        until: None,
+        timezone: Some("Asia/Vladivostok".into()),
+        anchor_date: None,
+        month_rule: None,
+    });
+    let recurring = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        recurring,
+    )
+    .await;
+
+    let shopping = support::create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        support::new_item(household.shopping_list_id, "Молоко"),
+    )
+    .await;
+    assert!(shopping.quantity.is_some());
+    let shopping_done = support::create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        support::new_item(household.shopping_list_id, "Хлеб"),
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &actor,
+        overdue.id,
+        Some(overdue.version),
+        "Asia/Vladivostok",
+        now,
+    )
+    .await
+    .expect("complete a task");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &actor,
+        recurring.id,
+        Some(recurring.version),
+        "Asia/Vladivostok",
+        now,
+    )
+    .await
+    .expect("complete a recurring task");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &actor,
+        shopping_done.id,
+        Some(shopping_done.version),
+        "Asia/Vladivostok",
+        now,
+    )
+    .await
+    .expect("complete a shopping item");
+
+    let counts = items::menu_counts(&mut conn, household.household_id, "Asia/Vladivostok", now)
+        .await
+        .expect("menu counts");
+
+    // Открыты: две задачи на сегодня, завтра и повторяющаяся (она осталась
+    // открытой со следующим вхождением).
+    assert_eq!(counts.open_tasks, 4);
+    assert_eq!(counts.overdue_tasks, 0);
+    assert_eq!(counts.due_today_tasks, 2);
+    assert_eq!(counts.open_shopping, 1);
+    assert_eq!(
+        counts.done_today, 2,
+        "only task completion events count, recurring ones too"
+    );
 }
