@@ -34,7 +34,7 @@ use super::outbox::{self, Outgoing, Placement};
 use super::rich::{self, Block, Button, Span};
 use super::update::{Incoming, Sender};
 use super::views::{self, Lookup};
-use model::{Action, Form, Screen, Ui};
+use model::{Action, Screen, Ui};
 
 /// Часовой пояс, если ни у пользователя, ни у household его нет.
 const FALLBACK_TIMEZONE: &str = "Europe/Moscow";
@@ -683,19 +683,15 @@ async fn on_text(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
 
     match views::conversation(&mut *ctx.conn, ctx.chat_id, ctx.now).await? {
         Lookup::Active(conversation) if conversation.telegram_user_id == ctx.sender.id => {
-            match serde_json::from_value::<Form>(conversation.data) {
-                Ok(form) => forms::on_text(ctx, form, text).await,
-                Err(_) => {
+            match forms::parse(conversation.data) {
+                Some(form) => forms::on_text(ctx, form, text).await,
+                None => {
                     views::clear_conversation(&mut *ctx.conn, ctx.chat_id).await?;
                     ctx.present(Screen::Menu).await
                 }
             }
         }
-        Lookup::Expired(_) => {
-            views::clear_conversation(&mut *ctx.conn, ctx.chat_id).await?;
-            ctx.banner("Форма устарела. Начнём заново?");
-            ctx.menu_or_onboarding().await
-        }
+        Lookup::Expired(_) => forms::expired(ctx).await,
         _ => {
             if ctx.user.is_none() {
                 return forms::start_onboarding(ctx).await;
@@ -939,9 +935,9 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
         Action::Add { list_id, kind } => forms::start_create(ctx, list_id, kind).await,
         Action::Edit {
             item_id,
-            step,
+            field,
             back,
-        } => forms::start_edit(ctx, item_id, step, back).await,
+        } => forms::start_editor(ctx, item_id, field, back).await,
         Action::DueSet {
             item_id,
             version,

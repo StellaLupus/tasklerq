@@ -4,17 +4,19 @@ mod support;
 
 use std::sync::Arc;
 
-use chrono::{Duration, NaiveDate, TimeZone, Utc};
+use chrono::{Datelike, Duration, NaiveDate, TimeZone, Utc};
+use chrono_tz::Tz;
 use support::telegram::{Call, FakeTelegram, Harness, buttons};
 use support::{TestHousehold, create_item, db, new_item, next_telegram_id, recurrence};
-use tasklerq::domain::models::{Actor, ActorType, ItemPatch, RecurrenceFreq, UserRole};
-use tasklerq::storage::repositories::items;
+use tasklerq::domain::models::{Actor, ActorType, Field, ItemPatch, RecurrenceFreq, UserRole};
+use tasklerq::storage::repositories::{items, users};
 use tasklerq::telegram::api::TelegramError;
-use tasklerq::telegram::bot::model::{Action, Screen, Ui};
+use tasklerq::telegram::bot::model::{Action, FormAct, Screen, Ui};
 use tasklerq::telegram::bot::{Bot, issue_and_render};
 use tasklerq::telegram::callbacks::{self, NewToken, Scope};
 use tasklerq::telegram::outbox::{self, Outgoing};
 use tasklerq::telegram::rich::button;
+use tasklerq::telegram::ru;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn onboarding_creates_household_once() {
@@ -521,7 +523,7 @@ async fn saved_completed_state_falls_back_to_the_menu() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn card_shows_details_and_edit_applies_immediately() {
+async fn card_edit_accumulates_fields_until_save() {
     let db = db().await;
     let mut bot = onboarded(&db.pool).await;
     bot.text("Сдать отчёт").await;
@@ -531,22 +533,887 @@ async fn card_shows_details_and_edit_applies_immediately() {
     bot.assert_screen_contains("Приоритет: ⚪ Обычный");
     bot.assert_screen_contains("Список: Задачи");
 
+    // Кнопка поля в карточке открывает редактор сразу на этом поле.
     bot.press("Приоритет").await;
+    bot.assert_screen_contains("Какой приоритет?");
     bot.press("Срочный").await;
     bot.assert_screen_contains("Приоритет: 🔴 Срочный");
 
-    bot.press("Изменить").await;
+    bot.press("Название").await;
     bot.text("Сдать отчёт за квартал").await;
-    bot.assert_screen_contains("Сдать отчёт за квартал");
+    bot.assert_screen_contains("Название: Сдать отчёт за квартал");
 
     bot.press("Срок").await;
     bot.press("Сегодня").await;
+    bot.assert_screen_contains("Срок: Сегодня");
+
+    // До «Сохранить» карточка не показывает новых значений.
+    let household = household_of(&db.pool, bot.chat).await;
+    let before: (String, String) = sqlx::query_as(
+        "SELECT title, priority::text FROM items WHERE household_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(household)
+    .fetch_one(&db.pool)
+    .await
+    .expect("item before save");
+    assert_eq!(before, ("Сдать отчёт".to_owned(), "normal".to_owned()));
+
+    bot.press("Сохранить").await;
+    bot.assert_screen_contains("Сдать отчёт за квартал");
     bot.assert_screen_contains("📅 Сегодня");
+    bot.assert_screen_contains("Приоритет: 🔴 Срочный");
 
     // Назад возвращает список на прежнюю позицию.
     bot.press("Назад").await;
     bot.assert_screen_contains("Задачи · 1");
     bot.assert_screen_contains("🔴 срочно");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_saves_several_fields_with_one_version_and_one_event() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Несколько полей").await;
+    bot.press("Сохранить").await;
+
+    let household = test_household(&db.pool, bot.chat).await;
+    let item = task_row(&db.pool, household.household_id, "Несколько полей").await;
+    assert_eq!(item.version, 1);
+
+    bot.press("Несколько полей").await;
+    bot.press("Изменить").await;
+    bot.press("Срок").await;
+    bot.press("Завтра").await;
+    bot.assert_screen_contains("Срок: Завтра");
+    let name: String =
+        sqlx::query_scalar("SELECT display_name FROM users WHERE telegram_user_id = $1")
+            .bind(bot.chat)
+            .fetch_one(&db.pool)
+            .await
+            .expect("name");
+    bot.press("Исполнитель").await;
+    bot.press(&name).await;
+    bot.assert_screen_contains(&format!("Исполнитель: {name}"));
+
+    // До «Сохранить» элемент прежний.
+    let untouched = task_row(&db.pool, household.household_id, "Несколько полей").await;
+    assert_eq!(untouched.version, 1);
+    assert!(untouched.due_date.is_none());
+    assert!(untouched.assignee.is_none());
+
+    bot.press("Сохранить").await;
+    bot.assert_screen_contains(&format!("👤 {name}"));
+
+    let saved = task_row(&db.pool, household.household_id, "Несколько полей").await;
+    let today = bot.now.with_timezone(&moscow()).date_naive();
+    assert_eq!(saved.version, 2);
+    assert_eq!(saved.due_date, Some(today + Duration::days(1)));
+    assert_eq!(saved.assignee, Some(household.owner_id));
+
+    let events: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM item_events
+         WHERE item_id = $1 AND event_type <> 'created'",
+    )
+    .bind(saved.id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("events");
+    assert_eq!(events, 1, "one save must write one event");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_keeps_other_field_changes_without_a_conflict() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Разные поля").await;
+    bot.press("Сохранить").await;
+
+    let household = test_household(&db.pool, bot.chat).await;
+    let item = task_row(&db.pool, household.household_id, "Разные поля").await;
+
+    bot.press("Разные поля").await;
+    bot.press("Изменить").await;
+    bot.press("Срок").await;
+    bot.press("Завтра").await;
+
+    // Другой участник меняет исполнителя, пока редактор открыт.
+    let mut conn = db.pool.acquire().await.expect("conn");
+    items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        item.id,
+        item.version,
+        ItemPatch {
+            assignee_user_id: Field::Value(household.owner_id),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("other assignee");
+
+    bot.press("Сохранить").await;
+    bot.assert_screen_contains("Приоритет:");
+    assert!(!bot.screen().contains("Конфликт"), "{}", bot.screen());
+
+    let saved = task_row(&db.pool, household.household_id, "Разные поля").await;
+    let today = bot.now.with_timezone(&moscow()).date_naive();
+    assert_eq!(saved.due_date, Some(today + Duration::days(1)));
+    assert_eq!(saved.assignee, Some(household.owner_id));
+    assert_eq!(saved.version, item.version + 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_conflict_offers_both_values_and_both_outcomes() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Одно поле").await;
+    bot.press("Сохранить").await;
+
+    let household = test_household(&db.pool, bot.chat).await;
+    let item = task_row(&db.pool, household.household_id, "Одно поле").await;
+    let today = bot.now.with_timezone(&moscow()).date_naive();
+    let tomorrow = today + Duration::days(1);
+    let other_day = today + Duration::days(5);
+
+    bot.press("Одно поле").await;
+    bot.press("Изменить").await;
+    bot.press("Срок").await;
+    bot.press("Завтра").await;
+    bot.press("Название").await;
+    bot.text("Наш заголовок").await;
+
+    // Другой участник ставит свою дату.
+    let mut conn = db.pool.acquire().await.expect("conn");
+    items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        item.id,
+        item.version,
+        ItemPatch {
+            due_date: Field::Value(other_day),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("other due");
+
+    bot.press("Сохранить").await;
+    bot.assert_screen_contains("Конфликт при сохранении");
+    bot.assert_screen_contains("Оставить мой");
+    bot.assert_screen_contains("Оставить текущий");
+    bot.assert_screen_contains("Мой:");
+    bot.assert_screen_contains("Сейчас:");
+    bot.assert_screen_contains(&ru::capitalize(
+        &ru::due_label(None, Some(tomorrow), moscow(), bot.now).expect("tomorrow"),
+    ));
+    bot.assert_screen_contains(&ru::capitalize(
+        &ru::due_label(None, Some(other_day), moscow(), bot.now).expect("other day"),
+    ));
+    let conflict = task_row(&db.pool, household.household_id, "Одно поле").await;
+    assert_eq!(conflict.due_date, Some(other_day));
+    assert_eq!(
+        conflict.title, "Одно поле",
+        "nothing changes before the choice"
+    );
+
+    // «Оставить текущий»: его срок остаётся, наш заголовок сохраняется.
+    bot.press("Оставить текущий").await;
+    let kept_current = task_row(&db.pool, household.household_id, "Наш заголовок").await;
+    assert_eq!(kept_current.due_date, Some(other_day));
+    assert_eq!(kept_current.version, item.version + 2);
+
+    // Второй заход: «Оставить мой» записывает нашу дату.
+    bot.press("Изменить").await;
+    bot.press("Срок").await;
+    bot.press("Завтра").await;
+    let before_second = task_row(&db.pool, household.household_id, "Наш заголовок").await;
+    let second_other = today + Duration::days(6);
+    let mut conn = db.pool.acquire().await.expect("conn");
+    items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        before_second.id,
+        before_second.version,
+        ItemPatch {
+            due_date: Field::Value(second_other),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("other due again");
+    bot.press("Сохранить").await;
+    bot.assert_screen_contains("Оставить мой");
+    bot.press("Оставить мой").await;
+
+    let mine = task_row(&db.pool, household.household_id, "Наш заголовок").await;
+    assert_eq!(mine.due_date, Some(tomorrow));
+    assert_eq!(mine.version, before_second.version + 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_field_opened_from_card_reverts_on_back() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Поле из карточки назад").await;
+    bot.press("Сохранить").await;
+    let household = test_household(&db.pool, bot.chat).await;
+    let item = task_row(&db.pool, household.household_id, "Поле из карточки назад").await;
+
+    bot.press("Поле из карточки назад").await;
+    bot.press("Повторение").await;
+    bot.press("Каждую неделю").await;
+    bot.assert_screen_contains("Повторение: Каждую неделю");
+
+    bot.press("Назад").await;
+    bot.assert_screen_contains("Повторение: нет");
+    bot.assert_has_button("💾 Сохранить");
+    bot.press("Сохранить").await;
+
+    let saved = task_row(&db.pool, household.household_id, "Поле из карточки назад").await;
+    assert_eq!(saved.version, item.version, "back must not change the item");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_interval_sub_screen_returns_to_recurrence() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Подэкран интервала").await;
+    bot.press("Сохранить").await;
+    bot.press("Подэкран интервала").await;
+    bot.press("Изменить").await;
+    bot.press("Повторение").await;
+    bot.press("Каждую неделю").await;
+    bot.press("Другой интервал").await;
+    bot.assert_screen_contains("Повторять каждые сколько?");
+    bot.assert_has_button("Каждый раз");
+    bot.assert_has_button("Через раз");
+
+    bot.press("Назад").await;
+    bot.assert_screen_contains("Как часто повторять?");
+    bot.assert_screen_contains("Повторение: Каждую неделю");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_conflict_current_with_no_other_changes_writes_nothing() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Только конфликт").await;
+    bot.press("Сохранить").await;
+    let household = test_household(&db.pool, bot.chat).await;
+    let item = task_row(&db.pool, household.household_id, "Только конфликт").await;
+
+    bot.press("Только конфликт").await;
+    bot.press("Изменить").await;
+    bot.press("Название").await;
+    bot.text("Наш вариант").await;
+
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let other = items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        item.id,
+        item.version,
+        ItemPatch {
+            title: Some("Вариант другого".into()),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("other title");
+
+    bot.press("Сохранить").await;
+    bot.press("Оставить текущий").await;
+
+    let kept = task_row(&db.pool, household.household_id, "Вариант другого").await;
+    assert_eq!(
+        kept.version, other.version,
+        "no remaining changes, no write"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_conflict_can_show_two_fields_at_once() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Два конфликта").await;
+    bot.press("Сохранить").await;
+    let household = test_household(&db.pool, bot.chat).await;
+    let item = task_row(&db.pool, household.household_id, "Два конфликта").await;
+    let today = bot.now.with_timezone(&moscow()).date_naive();
+    let our_day = today + Duration::days(1);
+    let other_day = today + Duration::days(5);
+
+    bot.press("Два конфликта").await;
+    bot.press("Изменить").await;
+    bot.press("Срок").await;
+    bot.press("Завтра").await;
+    bot.press("Название").await;
+    bot.text("Наш заголовок").await;
+
+    let mut conn = db.pool.acquire().await.expect("conn");
+    items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        item.id,
+        item.version,
+        ItemPatch {
+            title: Some("Его заголовок".into()),
+            due_date: Field::Value(other_day),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("other fields");
+
+    bot.press("Сохранить").await;
+    bot.assert_screen_contains("Конфликт при сохранении");
+    assert_eq!(bot.screen().matches("Мой:").count(), 2, "{}", bot.screen());
+    bot.assert_screen_contains("Срок:");
+    bot.assert_screen_contains("Название:");
+    bot.assert_screen_contains(&ru::capitalize(
+        &ru::due_label(None, Some(our_day), moscow(), bot.now).expect("our day"),
+    ));
+    bot.assert_screen_contains(&ru::capitalize(
+        &ru::due_label(None, Some(other_day), moscow(), bot.now).expect("other day"),
+    ));
+
+    // «Назад» из конфликта возвращает в редактор, ничего не записывая.
+    bot.press("Назад").await;
+    bot.assert_has_button("💾 Сохранить");
+    bot.assert_screen_contains("Название: Наш заголовок");
+    bot.press("Сохранить").await;
+    bot.assert_screen_contains("Конфликт при сохранении");
+
+    bot.press("Оставить текущий").await;
+    let saved = task_row(&db.pool, household.household_id, "Его заголовок").await;
+    assert_eq!(saved.due_date, Some(other_day));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_validation_error_keeps_the_editor_open() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Ошибка валидации").await;
+    bot.press("Сохранить").await;
+    let household = test_household(&db.pool, bot.chat).await;
+    let member = {
+        let mut conn = db.pool.acquire().await.expect("conn");
+        users::add(
+            &mut conn,
+            household.household_id,
+            UserRole::Member,
+            support::new_member("Борис"),
+            &household.owner(),
+            Utc::now(),
+        )
+        .await
+        .expect("member")
+    };
+
+    bot.press("Ошибка валидации").await;
+    bot.press("Изменить").await;
+    bot.press("Исполнитель").await;
+    bot.press("Борис").await;
+    sqlx::query("UPDATE users SET deleted_at = now() WHERE id = $1")
+        .bind(member.id)
+        .execute(&db.pool)
+        .await
+        .expect("delete member");
+
+    bot.press("Сохранить").await;
+    bot.assert_screen_contains("Проверьте введённые значения.");
+    bot.assert_has_button("💾 Сохранить");
+    let conversations: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM conversation_states WHERE chat_id = $1")
+            .bind(bot.chat)
+            .fetch_one(&db.pool)
+            .await
+            .expect("conversations");
+    assert_eq!(conversations, 1, "the editor must stay open");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn old_edit_callback_with_step_opens_the_editor() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Старый токен").await;
+    bot.press("Сохранить").await;
+    let household = test_household(&db.pool, bot.chat).await;
+    let item = task_row(&db.pool, household.household_id, "Старый токен").await;
+    bot.press("Старый токен").await;
+
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let data = callbacks::issue_many(
+        &mut conn,
+        &[NewToken {
+            telegram_user_id: bot.chat,
+            household_id: Some(household.household_id),
+            scope: Scope::Screen,
+            action: "edit".to_owned(),
+            payload: serde_json::json!({
+                "a": "edit",
+                "item_id": item.id,
+                "step": "title",
+                "back": {"t": "menu"},
+            }),
+            version: None,
+        }],
+        bot.now,
+    )
+    .await
+    .expect("token")
+    .remove(0);
+    let (message_id, _) = bot.active();
+    bot.press_data(&data, message_id).await;
+    bot.assert_has_button("💾 Сохранить");
+    bot.assert_screen_contains("Название: Старый токен");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_edit_button_reports_an_expired_edit() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    sqlx::query(
+        "INSERT INTO conversation_states (
+             chat_id, telegram_user_id, kind, data, expires_at
+         )
+         VALUES ($1, $1, 'edit', $2, $3)",
+    )
+    .bind(bot.chat)
+    .bind(serde_json::json!({
+        "form": "edit",
+        "item_id": uuid::Uuid::nil(),
+        "step": "title",
+        "back": {"t": "menu"},
+    }))
+    .bind(bot.now + Duration::minutes(15))
+    .execute(&db.pool)
+    .await
+    .expect("legacy edit state");
+
+    let data = action_callback(&bot, Action::Form { act: FormAct::Save }).await;
+    let (message_id, _) = bot.active();
+    bot.press_data(&data, message_id).await;
+    bot.assert_screen_contains("правка устарела");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_cancel_keeps_the_item_unchanged() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Отмена правки").await;
+    bot.press("Сохранить").await;
+    let household = test_household(&db.pool, bot.chat).await;
+    let item = task_row(&db.pool, household.household_id, "Отмена правки").await;
+
+    bot.press("Отмена правки").await;
+    bot.press("Изменить").await;
+    bot.press("Название").await;
+    bot.text("Не сохранять").await;
+    bot.press("Отмена").await;
+
+    bot.assert_screen_contains("Отмена правки");
+    assert!(!bot.screen().contains("Не сохранять"), "{}", bot.screen());
+    let saved = task_row(&db.pool, household.household_id, "Отмена правки").await;
+    assert_eq!(saved.version, item.version);
+    let conversations: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM conversation_states WHERE chat_id = $1")
+            .bind(bot.chat)
+            .fetch_one(&db.pool)
+            .await
+            .expect("conversations");
+    assert_eq!(conversations, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_invalid_date_keeps_the_field_and_earlier_changes() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Кривая дата").await;
+    bot.press("Сохранить").await;
+    bot.press("Кривая дата").await;
+    bot.press("Изменить").await;
+    bot.press("Название").await;
+    bot.text("Новое имя").await;
+    bot.assert_screen_contains("Название: Новое имя");
+
+    bot.press("Срок").await;
+    bot.press("Дата и время").await;
+    bot.text("когда-нибудь").await;
+    bot.assert_screen_contains("Не понял срок");
+    bot.assert_screen_contains("Примеры:");
+    bot.assert_screen_contains("Название: Новое имя");
+
+    bot.press("Назад").await;
+    bot.assert_screen_contains("Когда сделать?");
+    bot.assert_screen_contains("Название: Новое имя");
+    bot.press("Назад").await;
+    bot.assert_screen_contains("Название: Новое имя");
+    bot.press("Сохранить").await;
+    bot.assert_screen_contains("Новое имя");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_date_without_time_makes_a_timed_task_all_day() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = test_household(&db.pool, bot.chat).await;
+    let tz = moscow();
+    let tomorrow = (bot.now + Duration::days(1))
+        .with_timezone(&tz)
+        .date_naive();
+    let due_at = tz
+        .with_ymd_and_hms(tomorrow.year(), tomorrow.month(), tomorrow.day(), 18, 0, 0)
+        .single()
+        .expect("local due")
+        .with_timezone(&Utc);
+    let mut task = new_item(household.tasks_list_id, "Со временем");
+    task.due_at = Some(due_at);
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        task,
+    )
+    .await;
+
+    bot.press("Задачи").await;
+    bot.press("Со временем").await;
+    bot.press("Изменить").await;
+    bot.press("Срок").await;
+    bot.press("Дата и время").await;
+    let day_after_tomorrow = tomorrow + Duration::days(1);
+    bot.text(&format!(
+        "{:02}.{:02}",
+        day_after_tomorrow.day(),
+        day_after_tomorrow.month()
+    ))
+    .await;
+    bot.press("Сохранить").await;
+
+    let saved = task_row(&db.pool, household.household_id, "Со временем").await;
+    assert_eq!(saved.due_at, None, "a date alone removes the time");
+    assert_eq!(saved.due_date, Some(day_after_tomorrow));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_list_field_moves_only_between_lists_of_the_same_kind() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Перенести в список").await;
+    bot.press("Сохранить").await;
+    let household = test_household(&db.pool, bot.chat).await;
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let dacha = tasklerq::storage::repositories::lists::create(
+        &mut conn,
+        household.household_id,
+        tasklerq::domain::models::ListKind::Tasks,
+        "Дача",
+        Utc::now(),
+    )
+    .await
+    .expect("list");
+    drop(conn);
+
+    bot.press("Перенести в список").await;
+    bot.press("Изменить").await;
+    bot.press("Список").await;
+    let labels: Vec<String> = support::telegram::buttons(&bot.screen())
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect();
+    assert!(labels.iter().any(|label| label == "Дача"), "{labels:?}");
+    assert!(
+        labels.iter().all(|label| !label.contains("Покупки")),
+        "shopping lists must not be offered for a task: {labels:?}"
+    );
+    bot.press("Дача").await;
+    bot.assert_screen_contains("Список: Дача");
+    bot.press("Сохранить").await;
+    bot.assert_screen_contains("Список: Дача");
+
+    let saved = task_row(&db.pool, household.household_id, "Перенести в список").await;
+    let list_id: uuid::Uuid = sqlx::query_scalar("SELECT list_id FROM items WHERE id = $1")
+        .bind(saved.id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("list id");
+    assert_eq!(list_id, dacha.id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_can_clear_a_due_date() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = test_household(&db.pool, bot.chat).await;
+    let today = bot.now.with_timezone(&moscow()).date_naive();
+    let mut task = new_item(household.tasks_list_id, "Снять срок");
+    task.due_date = Some(today + Duration::days(1));
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        task,
+    )
+    .await;
+
+    bot.press("Задачи").await;
+    bot.press("Снять срок").await;
+    bot.press("Изменить").await;
+    bot.press("Срок").await;
+    bot.press("Без срока").await;
+    bot.assert_screen_contains("Срок: без срока");
+    bot.press("Сохранить").await;
+
+    let saved = task_row(&db.pool, household.household_id, "Снять срок").await;
+    assert_eq!(saved.due_at, None);
+    assert_eq!(saved.due_date, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_field_answer_is_deleted_and_visible_in_the_editor() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Ответ полю").await;
+    bot.press("Сохранить").await;
+    bot.press("Ответ полю").await;
+    bot.press("Изменить").await;
+    bot.press("Название").await;
+
+    let update = bot.text_update("Alice", "Позвонить маме");
+    let message_id = update["message"]["message_id"]
+        .as_i64()
+        .expect("message id");
+    bot.enqueue(update).await;
+    bot.pump().await;
+
+    let deleted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox
+         WHERE chat_id = $1 AND kind = 'delete'
+           AND coalesce((payload->>'message_id')::bigint, message_id) = $2",
+    )
+    .bind(bot.chat)
+    .bind(message_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("delete");
+    assert_eq!(deleted, 1);
+    bot.assert_screen_contains("Название: Позвонить маме");
+    bot.assert_has_button("💾 Сохранить");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_due_choice_returns_to_the_editor() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Вернуться в редактор").await;
+    bot.press("Сохранить").await;
+    bot.press("Вернуться в редактор").await;
+    bot.press("Изменить").await;
+
+    bot.press("Срок").await;
+    bot.assert_screen_contains("Когда сделать?");
+    bot.press("Завтра").await;
+    bot.assert_screen_contains("Срок: Завтра");
+    bot.assert_has_button("💾 Сохранить");
+    bot.assert_has_button("🔴 Приоритет");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_recurrence_sets_weekdays_and_interval_on_one_screen() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Повторение").await;
+    bot.press("Сохранить").await;
+    let household = test_household(&db.pool, bot.chat).await;
+    let item = task_row(&db.pool, household.household_id, "Повторение").await;
+    let today = bot.now.with_timezone(&moscow()).date_naive();
+    let today_weekday = i16::try_from(today.weekday().number_from_monday()).expect("weekday");
+
+    bot.press("Повторение").await;
+    bot.press("Изменить").await;
+    bot.press("Повторение").await;
+    bot.assert_screen_contains("Как часто повторять?");
+    bot.press("Каждую неделю").await;
+    match today_weekday {
+        2 => press_exact(&mut bot, "пт").await,
+        5 => press_exact(&mut bot, "вт").await,
+        _ => {
+            press_exact(
+                &mut bot,
+                ru::weekday_short(u32::try_from(today_weekday).unwrap_or(1)),
+            )
+            .await;
+            press_exact(&mut bot, "вт").await;
+            press_exact(&mut bot, "пт").await;
+        }
+    }
+    bot.press("Через раз").await;
+    // Всё ещё тот же экран, без перехода на отдельные шаги.
+    bot.assert_screen_contains("Как часто повторять?");
+    bot.assert_has_button("Применить");
+    bot.assert_screen_contains("Каждую неделю");
+    bot.press("Применить").await;
+    bot.assert_has_button("💾 Сохранить");
+    bot.press("Сохранить").await;
+
+    let saved = task_row(&db.pool, household.household_id, "Повторение").await;
+    assert_eq!(saved.version, item.version + 1);
+    let rule: (i16, Vec<i16>) =
+        sqlx::query_as("SELECT recurrence_interval, recurrence_byweekday FROM items WHERE id = $1")
+            .bind(saved.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("rule");
+    assert_eq!(rule, (2, vec![2, 5]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_and_its_fields_have_no_step_buttons() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Без шагов").await;
+    bot.press("Сохранить").await;
+    bot.press("Без шагов").await;
+    bot.press("Изменить").await;
+
+    for (label, _) in bot.buttons() {
+        assert!(!label.contains("Дальше"), "editor: {label}");
+        assert!(!label.contains("Пропустить"), "editor: {label}");
+    }
+    bot.press("Теги").await;
+    for (label, _) in bot.buttons() {
+        assert!(!label.contains("Дальше"), "field: {label}");
+        assert!(!label.contains("Пропустить"), "field: {label}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn card_field_button_opens_the_editor_on_that_field_and_back_returns() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Поле карточки").await;
+    bot.press("Сохранить").await;
+    let household = test_household(&db.pool, bot.chat).await;
+    let item = task_row(&db.pool, household.household_id, "Поле карточки").await;
+
+    bot.press("Поле карточки").await;
+    bot.press("Теги").await;
+    bot.assert_screen_contains("Теги");
+    bot.assert_has_button("Применить");
+    bot.assert_has_button("⬅️ Назад");
+
+    bot.press("Назад").await;
+    bot.assert_has_button("💾 Сохранить");
+    bot.assert_has_button("🔴 Приоритет");
+    let unchanged = task_row(&db.pool, household.household_id, "Поле карточки").await;
+    assert_eq!(unchanged.version, item.version);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_changes_purchase_quantity_and_unit_in_one_save() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.press("Покупки").await;
+    bot.press("Добавить").await;
+    bot.text("Молоко").await;
+    bot.press("2").await;
+    bot.press("л").await;
+    bot.press("Сохранить").await;
+    bot.press("Править").await;
+    bot.press("Молоко").await;
+
+    let household = test_household(&db.pool, bot.chat).await;
+    let item = task_row(&db.pool, household.household_id, "Молоко").await;
+
+    bot.press("Количество").await;
+    bot.press("3").await;
+    bot.assert_screen_contains("Количество: 3 л");
+    bot.press("Единица").await;
+    bot.press("кг").await;
+    bot.assert_screen_contains("Единица: кг");
+    bot.press("Сохранить").await;
+    bot.assert_screen_contains("Количество: 3 кг");
+
+    let saved = task_row(&db.pool, household.household_id, "Молоко").await;
+    assert_eq!(saved.version, item.version + 1);
+    let amount: (f64, String) =
+        sqlx::query_as("SELECT quantity::float8, unit FROM items WHERE id = $1")
+            .bind(saved.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("amount");
+    assert_eq!(amount, (3.0, "кг".to_owned()));
+}
+
+fn moscow() -> Tz {
+    "Europe/Moscow".parse().expect("timezone")
+}
+
+/// Нажать кнопку с точной подписью (с необязательной отметкой «✓ »).
+async fn press_exact(bot: &mut Harness, label: &str) {
+    let (message_id, html) = bot.active();
+    let data = support::telegram::buttons(&html)
+        .into_iter()
+        .find(|(text, _)| text.trim_start_matches("✓ ").trim() == label)
+        .unwrap_or_else(|| panic!("button `{label}` not found:\n{html}"))
+        .1;
+    bot.press_data(&data, message_id).await;
+}
+
+struct TaskRow {
+    id: uuid::Uuid,
+    version: i32,
+    due_at: Option<chrono::DateTime<Utc>>,
+    due_date: Option<NaiveDate>,
+    assignee: Option<uuid::Uuid>,
+    title: String,
+}
+
+#[allow(clippy::type_complexity)]
+async fn task_row(pool: &sqlx::PgPool, household_id: uuid::Uuid, title: &str) -> TaskRow {
+    let (id, version, due_at, due_date, assignee, title): (
+        uuid::Uuid,
+        i32,
+        Option<chrono::DateTime<Utc>>,
+        Option<NaiveDate>,
+        Option<uuid::Uuid>,
+        String,
+    ) = sqlx::query_as(
+        "SELECT id, version, due_at, due_date, assignee_user_id, title
+         FROM items
+         WHERE household_id = $1 AND title = $2 AND deleted_at IS NULL",
+    )
+    .bind(household_id)
+    .bind(title)
+    .fetch_one(pool)
+    .await
+    .expect("item row");
+    TaskRow {
+        id,
+        version,
+        due_at,
+        due_date,
+        assignee,
+        title,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

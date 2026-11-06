@@ -2,7 +2,7 @@
 
 mod support;
 
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use serde_json::json;
 use sqlx::PgConnection;
 use support::telegram::Harness;
@@ -290,6 +290,61 @@ async fn stand_household(pool: &sqlx::PgPool, chat: i64) -> support::TestHouseho
         tasks_list_id: list("tasks").await.expect("default tasks list"),
         shopping_list_id: list("shopping").await.expect("default shopping list"),
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn old_step_edit_json_is_reported_as_an_expired_edit() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+
+    sqlx::query(
+        "INSERT INTO conversation_states (
+             chat_id, telegram_user_id, kind, data, expires_at
+         )
+         VALUES ($1, $1, 'edit', $2, $3)",
+    )
+    .bind(bot.chat)
+    .bind(json!({
+        "form": "edit",
+        "item_id": uuid::Uuid::nil(),
+        "step": "title",
+        "back": {"t": "menu"},
+    }))
+    .bind(bot.now + Duration::minutes(15))
+    .execute(&db.pool)
+    .await
+    .expect("legacy edit state");
+
+    bot.text("Не должно упасть").await;
+    bot.assert_screen_contains("правка устарела");
+    assert!(
+        bot.fake.answers().iter().all(|(_, _, alert)| !alert),
+        "a legacy edit must not raise an alert: {:?}",
+        bot.fake.answers()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_expires_after_fifteen_minutes() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Истекающая правка").await;
+    bot.press("Сохранить").await;
+    bot.press("Истекающая правка").await;
+    bot.press("Изменить").await;
+    bot.assert_has_button("💾 Сохранить");
+
+    bot.advance(Duration::minutes(16));
+    bot.text("Поздний ответ").await;
+    bot.assert_screen_contains("Правка устарела");
+    bot.assert_has_button("Открыть карточку");
+    let conversations: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM conversation_states WHERE chat_id = $1")
+            .bind(bot.chat)
+            .fetch_one(&db.pool)
+            .await
+            .expect("conversations");
+    assert_eq!(conversations, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1,22 +1,23 @@
 //! Экраны форм.
 
 use crate::domain::error::DomainError;
-use crate::domain::models::{Item, ItemPriority, List, ListKind, MonthRule, RecurrenceFreq};
+use crate::domain::models::{ItemPriority, List, ListKind, MonthRule, RecurrenceFreq};
 use crate::domain::validation::{MAX_SUBTASKS, MAX_TAGS};
 use crate::storage::repositories::{lists, tags, users};
 use crate::telegram::rich::{Button, button};
 use crate::telegram::ru;
 use crate::telegram::views::{self, Lookup};
 
-use super::actions::load_item_draft;
 use super::{MAX_QUANTITY, lists_of_kind};
 use crate::telegram::bot::card::{describe_recurrence_draft, priority_label};
 use crate::telegram::bot::model::{
-    Action, Choice, EditForm, Form, FormAct, ItemDraft, ItemForm, Screen, Step, TimeField, Ui,
+    Action, Choice, Form, FormAct, ItemDraft, ItemForm, Screen, Step, TimeField, Ui,
 };
 use crate::telegram::bot::onboarding;
 use crate::telegram::bot::screens::{clip, nav_row};
 use crate::telegram::bot::{Ctx, Fail, into_sqlx};
+
+use super::editor;
 
 // ---------------------------------------------------------------------
 // Экраны
@@ -52,7 +53,7 @@ fn go_step(label: &str, step: Step) -> Button<Action> {
 /// Текущий шаг формы.
 pub async fn view(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
     let form = match views::conversation(&mut *ctx.conn, ctx.chat_id, ctx.now).await? {
-        Lookup::Active(conversation) => serde_json::from_value::<Form>(conversation.data).ok(),
+        Lookup::Active(conversation) => super::parse(conversation.data),
         _ => None,
     };
     let Some(form) = form else {
@@ -70,7 +71,11 @@ pub async fn view(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
     match form {
         Form::Onboarding { name } => Ok(onboarding::view(name.as_deref())),
         Form::Create(form) => create_view(ctx, form).await,
-        Form::Edit(form) => edit_view(ctx, form).await,
+        Form::Editor(editor_form) => editor::view(ctx, editor_form).await,
+        Form::LegacyEdit => Ok(Ui::new()
+            .heading("Правка устарела")
+            .text("Начнём заново?")
+            .row(nav_row(&Screen::Form, Screen::Menu))),
         Form::DueText { .. } => Ok(Ui::new()
             .heading("Введите срок")
             .text(ru::DUE_HINT)
@@ -269,7 +274,7 @@ async fn create_view(ctx: &mut Ctx<'_>, form: ItemForm) -> Result<Ui, Fail> {
         }
         step => {
             let ui = ui.heading(prompt_title(step, shopping));
-            let ui = choice_buttons(ctx, ui, step, &form.draft, None).await?;
+            let ui = choice_buttons(ctx, ui, step, &form.draft).await?;
             Ok(
                 if matches!(step, Step::Tags | Step::Subtasks | Step::Weekdays) {
                     ui.row(vec![
@@ -284,62 +289,7 @@ async fn create_view(ctx: &mut Ctx<'_>, form: ItemForm) -> Result<Ui, Fail> {
     }
 }
 
-async fn edit_view(ctx: &mut Ctx<'_>, form: EditForm) -> Result<Ui, Fail> {
-    let (item, draft) = load_item_draft(ctx, form.item_id).await?;
-    let shopping = {
-        let household_id = ctx.household()?.id;
-        lists::get(&mut *ctx.conn, household_id, item.list_id)
-            .await?
-            .kind
-            != ListKind::Tasks
-    };
-    let mut ui = Ui::new();
-    if let Some(error) = &form.error {
-        ui = ui.bold(format!("⚠️ {error}"));
-    }
-    for line in draft_summary(ctx, &draft, shopping).await? {
-        ui = ui.text(line);
-    }
-    let step = form.step;
-    ui = ui.heading(prompt_title(step, shopping));
-    if step.expects_text() && step != Step::Subtasks {
-        ui = ui.text(prompt_hint(step, &draft));
-        ui = match step {
-            Step::Quantity => ui.row(vec![
-                choose("1", Choice::Quantity(1.0)),
-                choose("2", Choice::Quantity(2.0)),
-                choose("3", Choice::Quantity(3.0)),
-                choose("5", Choice::Quantity(5.0)),
-            ]),
-            Step::Unit => units_row(ui),
-            Step::Interval => ui.row(vec![
-                choose("Каждый раз", Choice::Interval(1)),
-                choose("Через раз", Choice::Interval(2)),
-            ]),
-            Step::Notes => ui.row(vec![button(
-                "🧹 Убрать",
-                Action::Form { act: FormAct::Skip },
-            )]),
-            _ => ui,
-        };
-    } else {
-        ui = choice_buttons(ctx, ui, step, &draft, Some(&item)).await?;
-    }
-    let done_label = if matches!(
-        step,
-        Step::Tags | Step::Subtasks | Step::Weekdays | Step::NewTag | Step::DueText
-    ) {
-        ru::APPLY_BUTTON
-    } else {
-        ru::BACK_BUTTON
-    };
-    Ok(ui.row(vec![button(
-        done_label,
-        Action::Form { act: FormAct::Done },
-    )]))
-}
-
-fn units_row(ui: Ui) -> Ui {
+pub(super) fn units_row(ui: Ui) -> Ui {
     ui.row(vec![
         choose("шт", Choice::Unit("шт".into())),
         choose("кг", Choice::Unit("кг".into())),
@@ -351,7 +301,7 @@ fn units_row(ui: Ui) -> Ui {
     ])
 }
 
-fn prompt_title(step: Step, shopping: bool) -> &'static str {
+pub(super) fn prompt_title(step: Step, shopping: bool) -> &'static str {
     match step {
         Step::List => "В какой список?",
         Step::Title if shopping => "Что купить?",
@@ -374,7 +324,7 @@ fn prompt_title(step: Step, shopping: bool) -> &'static str {
     }
 }
 
-fn prompt_hint(step: Step, draft: &ItemDraft) -> String {
+pub(super) fn prompt_hint(step: Step, draft: &ItemDraft) -> String {
     match step {
         Step::Title => "Отправьте название сообщением (до 200 символов).".to_owned(),
         Step::DueText => ru::DUE_HINT.to_owned(),
@@ -391,14 +341,12 @@ fn prompt_hint(step: Step, draft: &ItemDraft) -> String {
     }
 }
 
-/// Кнопки выбора для шагов без текстового ввода. `item` задан при
-/// редактировании существующего элемента.
-async fn choice_buttons(
+/// Кнопки выбора для шагов без текстового ввода.
+pub(super) async fn choice_buttons(
     ctx: &mut Ctx<'_>,
     mut ui: Ui,
     step: Step,
     draft: &ItemDraft,
-    item: Option<&Item>,
 ) -> Result<Ui, Fail> {
     let household_id = ctx.household()?.id;
     match step {
@@ -525,9 +473,6 @@ async fn choice_buttons(
                 .collect();
             for chunk in buttons.chunks(4) {
                 ui = ui.row(chunk.to_vec());
-            }
-            if item.is_some() {
-                ui = ui.row(vec![go_step("🔢 Интервал", Step::Interval)]);
             }
         }
         Step::MonthRule => {

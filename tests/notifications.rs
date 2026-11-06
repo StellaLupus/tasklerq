@@ -10,14 +10,15 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use serde_json::json;
 use sqlx::PgPool;
-use support::{TestDb, TestHousehold};
+use support::telegram::Harness;
+use support::{TestDb, TestHousehold, new_member, next_telegram_id};
 use tasklerq::domain::models::{
     Actor, ActorType, Field, Item, ItemPatch, ItemPriority, ItemSource, RecurrenceFreq,
-    RecurrenceInput,
+    RecurrenceInput, UserRole,
 };
 use tasklerq::domain::recurrence::Due;
 use tasklerq::jobs::scheduler::{Scheduler, all_day_occurrence_key, occurrence_key};
-use tasklerq::storage::repositories::items;
+use tasklerq::storage::repositories::{items, users};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
@@ -2258,6 +2259,55 @@ async fn archived_list_tasks_get_no_reminders_and_no_digest() {
     let sent = messages(&db.pool, chat).await;
     assert_eq!(sent.len(), 1, "{sent:?}");
     assert!(!sent[0].contains("Задача в архиве"), "{sent:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_assignment_with_other_fields_notifies_once() {
+    let db = support::db().await;
+    let mut bot = Harness::new(&db.pool, next_telegram_id()).named("Alice");
+    bot.text("/start").await;
+    bot.text("Семья").await;
+    bot.press("Москва").await;
+    bot.press("меню").await;
+    bot.text("Одно уведомление").await;
+    bot.press("Сохранить").await;
+
+    let (household_id, item_id): (Uuid, Uuid) = sqlx::query_as(
+        "SELECT i.household_id, i.id FROM items i
+         JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1 AND i.deleted_at IS NULL",
+    )
+    .bind(bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("item");
+
+    let member = new_member("Борис");
+    let member = {
+        let mut conn = db.pool.acquire().await.expect("conn");
+        users::add(
+            &mut conn,
+            household_id,
+            UserRole::Member,
+            member,
+            &Actor::system(ActorType::System),
+            Utc::now(),
+        )
+        .await
+        .expect("member")
+    };
+
+    bot.press("Одно уведомление").await;
+    bot.press("Изменить").await;
+    bot.press("Срок").await;
+    bot.press("Завтра").await;
+    bot.press("Исполнитель").await;
+    bot.press("Борис").await;
+    bot.press("Сохранить").await;
+
+    let rows = assignment_rows(&db.pool, item_id, member.id).await;
+    assert_eq!(rows.len(), 1, "one save must notify once: {rows:?}");
+    assert_eq!(rows[0].0, "pending");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

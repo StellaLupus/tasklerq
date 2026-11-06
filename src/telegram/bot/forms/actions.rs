@@ -2,7 +2,7 @@
 
 use uuid::Uuid;
 
-use crate::domain::models::{Item, ItemPriority, ItemStatus, List, ListKind, RecurrenceFreq};
+use crate::domain::models::{Item, ItemPriority, ItemStatus, List, ListKind};
 use crate::domain::recurrence::Due;
 use crate::domain::settings::{NotificationSettingsUpdate, ProfileUpdate, parse_hhmm};
 use crate::domain::validation::validate_new_item;
@@ -13,11 +13,13 @@ use crate::telegram::views::{self};
 use super::state::{advance, apply_choice, apply_text, today};
 use super::{MAX_QUERY, clear, load, open, start_onboarding};
 use crate::telegram::bot::model::{
-    Choice, EditForm, Form, FormAct, ItemDraft, ItemForm, Screen, Step, TimeField,
+    Choice, Form, FormAct, ItemDraft, ItemForm, Screen, Step, TimeField,
 };
 use crate::telegram::bot::onboarding;
 use crate::telegram::bot::settings::{self, ReleaseTrigger};
 use crate::telegram::bot::{Ctx, Fail};
+
+use super::editor;
 
 // ---------------------------------------------------------------------
 // Текст
@@ -28,7 +30,8 @@ pub async fn on_text(ctx: &mut Ctx<'_>, form: Form, text: &str) -> Result<(), Fa
     match form {
         Form::Onboarding { name } => onboarding::on_text(ctx, name, text).await,
         Form::Create(form) => create_text(ctx, form, text).await,
-        Form::Edit(form) => edit_text(ctx, form, text).await,
+        Form::Editor(editor_form) => editor::on_text(ctx, editor_form, text).await,
+        Form::LegacyEdit => legacy_expired(ctx).await,
         Form::DueText {
             item_id,
             version,
@@ -54,6 +57,15 @@ pub async fn on_text(ctx: &mut Ctx<'_>, form: Form, text: &str) -> Result<(), Fa
         Form::Lead => set_lead(ctx, text).await,
         Form::Time { field } => set_time(ctx, field, text).await,
     }
+}
+
+async fn legacy_expired(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
+    clear(ctx).await?;
+    ctx.banner("Ваша правка устарела. Начнём заново?");
+    if ctx.user.is_none() {
+        return start_onboarding(ctx).await;
+    }
+    ctx.present(Screen::Menu).await
 }
 
 async fn rename(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
@@ -229,32 +241,6 @@ async fn create_text(ctx: &mut Ctx<'_>, mut form: ItemForm, text: &str) -> Resul
     }
 }
 
-async fn edit_text(ctx: &mut Ctx<'_>, mut form: EditForm, text: &str) -> Result<(), Fail> {
-    let (item, mut draft) = load_item_draft(ctx, form.item_id).await?;
-    let today = today(ctx);
-    let now_time = ctx.now.with_timezone(&ctx.tz).time();
-    let step = form.step;
-
-    if let Err(message) = apply_text(step, &mut draft, text, today, now_time) {
-        form.error = Some(message);
-        return open(ctx, Form::Edit(form)).await;
-    }
-    apply_patch(ctx, &item, &draft, step).await?;
-
-    match step {
-        Step::NewTag => {
-            form.step = Step::Tags;
-            form.error = None;
-            open(ctx, Form::Edit(form)).await
-        }
-        Step::Subtasks => {
-            form.error = None;
-            open(ctx, Form::Edit(form)).await
-        }
-        _ => finish_edit(ctx, form.back).await,
-    }
-}
-
 async fn due_text(
     ctx: &mut Ctx<'_>,
     item_id: Uuid,
@@ -279,12 +265,6 @@ async fn due_text(
     crate::telegram::bot::card::apply_due(ctx, item_id, version, due, back).await
 }
 
-async fn finish_edit(ctx: &mut Ctx<'_>, back: Screen) -> Result<(), Fail> {
-    clear(ctx).await?;
-    ctx.toast("Сохранено");
-    ctx.present(back).await
-}
-
 pub(super) async fn load_item_draft(
     ctx: &mut Ctx<'_>,
     item_id: Uuid,
@@ -295,29 +275,6 @@ pub(super) async fn load_item_draft(
     Ok((item, draft))
 }
 
-async fn apply_patch(
-    ctx: &mut Ctx<'_>,
-    item: &Item,
-    draft: &ItemDraft,
-    step: Step,
-) -> Result<(), Fail> {
-    let household = ctx.household()?.clone();
-    let actor = ctx.actor()?;
-    let patch = draft.patch_for(step, ctx.tz)?;
-    items::update(
-        &mut *ctx.conn,
-        household.id,
-        &actor,
-        item.id,
-        item.version,
-        patch,
-        &household.timezone,
-        ctx.now,
-    )
-    .await?;
-    Ok(())
-}
-
 // ---------------------------------------------------------------------
 // Кнопки
 // ---------------------------------------------------------------------
@@ -325,13 +282,12 @@ async fn apply_patch(
 /// Обработать кнопку формы.
 pub async fn on_action(ctx: &mut Ctx<'_>, act: FormAct) -> Result<(), Fail> {
     let Some(form) = load(ctx).await? else {
-        ctx.toast("Форма устарела. Начнём заново?");
-        clear(ctx).await?;
-        return ctx.present(Screen::Menu).await;
+        return super::expired(ctx).await;
     };
     match form {
         Form::Create(form) => create_action(ctx, form, act).await,
-        Form::Edit(form) => edit_action(ctx, form, act).await,
+        Form::Editor(editor_form) => editor::on_action(ctx, editor_form, act).await,
+        Form::LegacyEdit => legacy_expired(ctx).await,
         Form::DueText { item_id, back, .. } => {
             clear(ctx).await?;
             ctx.present(Screen::Item {
@@ -409,6 +365,9 @@ async fn create_action(ctx: &mut Ctx<'_>, mut form: ItemForm, act: FormAct) -> R
             advance(&mut form, step);
             open(ctx, Form::Create(form)).await
         }
+        // Кнопки редактора не должны двигать шаг чужого мастера: старый
+        // токен просто перерисовывает текущий экран.
+        FormAct::Back | FormAct::Conflict { .. } => open(ctx, Form::Create(form)).await,
         FormAct::Save | FormAct::SaveAnyway if form.target.is_some() => {
             crate::telegram::bot::capture::save_form(ctx, form).await
         }
@@ -447,63 +406,6 @@ fn switch_list(form: &mut ItemForm, list: &List) {
     form.from_preview = false;
     form.error = None;
     form.duplicate = None;
-}
-
-async fn edit_action(ctx: &mut Ctx<'_>, mut form: EditForm, act: FormAct) -> Result<(), Fail> {
-    match act {
-        FormAct::Cancel | FormAct::Done => {
-            clear(ctx).await?;
-            ctx.present(form.back).await
-        }
-        FormAct::Go(step) => {
-            form.step = step;
-            form.error = None;
-            open(ctx, Form::Edit(form)).await
-        }
-        FormAct::Skip => {
-            // «Убрать» на шаге с необязательным значением.
-            let (item, mut draft) = load_item_draft(ctx, form.item_id).await?;
-            if form.step == Step::Notes {
-                draft.notes = None;
-                apply_patch(ctx, &item, &draft, Step::Notes).await?;
-            }
-            finish_edit(ctx, form.back).await
-        }
-        FormAct::Choose(choice) => {
-            let (item, mut draft) = load_item_draft(ctx, form.item_id).await?;
-            let today = today(ctx);
-            let step = form.step;
-            let choice_for_next = choice.clone();
-            if let Err(message) = apply_choice(&mut draft, choice, today) {
-                form.error = Some(message);
-                return open(ctx, Form::Edit(form)).await;
-            }
-            apply_patch(ctx, &item, &draft, step).await?;
-
-            match (step, choice_for_next) {
-                (Step::Tags | Step::Subtasks | Step::Weekdays, _) => {
-                    form.error = None;
-                    open(ctx, Form::Edit(form)).await
-                }
-                (Step::Recurrence, Choice::Freq(Some(RecurrenceFreq::Weekly))) => {
-                    form.step = Step::Weekdays;
-                    open(ctx, Form::Edit(form)).await
-                }
-                (Step::Recurrence, Choice::Freq(Some(RecurrenceFreq::Monthly))) => {
-                    form.step = Step::MonthRule;
-                    open(ctx, Form::Edit(form)).await
-                }
-                (Step::Recurrence, Choice::Freq(Some(_))) | (Step::MonthRule, _) => {
-                    form.step = Step::Interval;
-                    open(ctx, Form::Edit(form)).await
-                }
-                _ => finish_edit(ctx, form.back).await,
-            }
-        }
-        FormAct::Save | FormAct::SaveAnyway | FormAct::Increase { .. } => {
-            finish_edit(ctx, form.back).await
-        }
-    }
 }
 
 async fn increase(

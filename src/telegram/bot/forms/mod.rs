@@ -15,15 +15,18 @@ use crate::storage::repositories::{households, items, lists};
 use crate::telegram::views::{self, Lookup};
 
 use super::model::{
-    EditForm, FirstContactScreen, Form, ItemDraft, ItemForm, Screen, Step, TimeField,
+    Editor, EditorTarget, FirstContactScreen, Form, ItemDraft, ItemForm, ItemSnapshot, Screen,
+    Step, TimeField,
 };
 use super::{Ctx, Fail};
 
 mod actions;
+mod editor;
 mod state;
 mod view;
 
 pub use actions::{on_action, on_text};
+pub use editor::screen as editor_screen;
 pub use view::view;
 
 pub(super) const MAX_QUANTITY: f64 = 9_999.0;
@@ -56,9 +59,45 @@ async fn clear(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
 async fn load(ctx: &mut Ctx<'_>) -> Result<Option<Form>, Fail> {
     match views::conversation(&mut *ctx.conn, ctx.chat_id, ctx.now).await? {
         Lookup::Active(conversation) if conversation.telegram_user_id == ctx.sender.id => {
-            Ok(serde_json::from_value(conversation.data).ok())
+            Ok(parse(conversation.data))
         }
         _ => Ok(None),
+    }
+}
+
+/// Разобрать состояние формы.
+///
+/// Сохранённый JSON прежней пошаговой правки (`{"form":"edit", …}`) больше не
+/// разбирается в `Editor`: он превращается в [`Form::LegacyEdit`], и бот
+/// сообщает, что правка устарела.
+pub(super) fn parse(data: serde_json::Value) -> Option<Form> {
+    match serde_json::from_value::<Form>(data.clone()) {
+        Ok(form) => Some(form),
+        Err(_) if data.get("form").and_then(|form| form.as_str()) == Some("edit") => {
+            Some(Form::LegacyEdit)
+        }
+        Err(_) => None,
+    }
+}
+
+/// Показать, что активная форма истекла.
+///
+/// У редактора есть кнопка возврата на карточку; остальные формы, как и
+/// раньше, ведут в меню.
+pub(super) async fn expired(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
+    let screen = views::get(&mut *ctx.conn, ctx.chat_id)
+        .await?
+        .and_then(|view| serde_json::from_value::<Screen>(view.state).ok());
+    clear(ctx).await?;
+    if let Some(Screen::Editor { item_id, back }) = screen {
+        ctx.banner("Ваша правка устарела. Начнём заново?");
+        return ctx.present(Screen::Editor { item_id, back }).await;
+    }
+    ctx.banner("Форма устарела. Начнём заново?");
+    if ctx.user.is_none() {
+        start_onboarding(ctx).await
+    } else {
+        ctx.present(Screen::Menu).await
     }
 }
 
@@ -165,26 +204,34 @@ pub async fn quick_add(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
     .await
 }
 
-/// Открыть шаг редактирования существующего элемента.
-pub async fn start_edit(
+/// Открыть единый редактор существующего элемента.
+pub async fn start_editor(
     ctx: &mut Ctx<'_>,
     item_id: Uuid,
-    step: Step,
+    field: Option<Step>,
     back: Screen,
 ) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
-    // Проверяем, что элемент существует и принадлежит household.
-    items::get(&mut *ctx.conn, household_id, item_id).await?;
-    open(
-        ctx,
-        Form::Edit(EditForm {
+    let item = items::get(&mut *ctx.conn, household_id, item_id).await?;
+    let draft = ItemDraft::from_item(&item, ctx.tz);
+    let editor = Editor {
+        target: EditorTarget::Item {
             item_id,
-            step,
+            base: ItemSnapshot::from_item(&item),
             back,
-            error: None,
-        }),
-    )
-    .await
+        },
+        // Поле, открытое прямо из карточки, тоже должно откатываться
+        // «Назад» без изменения элемента.
+        field_backup: field.map(|_| draft.clone()),
+        draft,
+        touched: std::collections::BTreeSet::new(),
+        field,
+        field_back: None,
+        list_id: item.list_id,
+        error: None,
+        conflict: None,
+    };
+    editor::show(ctx, editor).await
 }
 
 /// Начать ввод даты и времени для быстрого срока.

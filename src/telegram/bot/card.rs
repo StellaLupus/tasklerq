@@ -195,12 +195,12 @@ pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui,
         ui = ui.details("Описание", notes.to_owned());
     }
 
-    let edit = |label: &str, step: Step| {
+    let edit = |label: &str, field: Option<Step>| {
         button(
             label,
             Action::Edit {
                 item_id,
-                step,
+                field,
                 back: here.clone(),
             },
         )
@@ -247,24 +247,24 @@ pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui,
 
     if shopping {
         ui = ui
-            .row(vec![main, edit("🔢 Количество", Step::Quantity)])
+            .row(vec![main, edit("🔢 Количество", Some(Step::Quantity))])
             .row(vec![
-                edit("📏 Единица", Step::Unit),
-                edit("📝 Заметка", Step::Notes),
+                edit("📏 Единица", Some(Step::Unit)),
+                edit("📝 Заметка", Some(Step::Notes)),
             ])
-            .row(vec![edit("👤 Исполнитель", Step::Assignee), delete]);
+            .row(vec![edit("👤 Исполнитель", Some(Step::Assignee)), delete]);
     } else {
         ui = ui
-            .row(vec![main, edit("✏️ Изменить", Step::Title)])
-            .row(vec![due_button, edit("🔴 Приоритет", Step::Priority)])
+            .row(vec![main, edit("✏️ Изменить", None)])
+            .row(vec![due_button, edit("🔴 Приоритет", Some(Step::Priority))])
             .row(vec![
-                edit("👤 Исполнитель", Step::Assignee),
-                edit("🏷 Теги", Step::Tags),
+                edit("👤 Исполнитель", Some(Step::Assignee)),
+                edit("🏷 Теги", Some(Step::Tags)),
             ])
             .row(vec![
-                edit("🧩 Подзадачи", Step::Subtasks),
-                edit("🔁 Повторение", Step::Recurrence),
-                edit("📝 Описание", Step::Notes),
+                edit("🧩 Подзадачи", Some(Step::Subtasks)),
+                edit("🔁 Повторение", Some(Step::Recurrence)),
+                edit("📝 Описание", Some(Step::Notes)),
             ])
             .row(vec![delete]);
     }
