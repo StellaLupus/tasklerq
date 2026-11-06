@@ -152,7 +152,7 @@ pub async fn list_view(
             },
         ));
     }
-    footer.push(button(
+    let toggle = button(
         if edit {
             ru::EDIT_FINISH_BUTTON
         } else {
@@ -166,10 +166,17 @@ pub async fn list_view(
                 from_lists,
             },
         },
-    ));
+    );
     let mut nav = vec![button("🔎 Поиск", Action::SearchStart)];
     nav.extend(nav_row(&here(page), list_back(from_lists)));
-    Ok(ui.row(footer).row(nav))
+    if edit {
+        // «✓ Закончить правку» длиннее соседних подписей: в ряду из трёх на
+        // узком Android-экране она обрезается, поэтому занимает свой ряд.
+        Ok(ui.row(footer).row(vec![toggle]).row(nav))
+    } else {
+        footer.push(toggle);
+        Ok(ui.row(footer).row(nav))
+    }
 }
 
 async fn done_items(ctx: &mut Ctx<'_>, list_id: Uuid) -> Result<(List, Vec<Item>), Fail> {

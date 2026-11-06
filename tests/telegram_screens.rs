@@ -7,7 +7,7 @@ use std::sync::Arc;
 use axum::http::{Method, StatusCode};
 use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc};
 use sqlx::PgPool;
-use support::telegram::{Call, FakeTelegram, Harness};
+use support::telegram::{Call, FakeTelegram, Harness, button_rows};
 use support::{TestHousehold, create_item, db, new_item, next_telegram_id};
 use tasklerq::admin;
 use tasklerq::config::TenancyMode;
@@ -602,6 +602,39 @@ async fn shopping_edit_mode_opens_the_card_and_is_kept_on_back() {
     bot.press("Покупки").await;
     bot.assert_screen_contains("Покупки · 1");
     assert!(!bot.screen().contains("правка"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shopping_edit_finish_button_has_its_own_row() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        new_item(household.shopping_list_id, "Молоко"),
+    )
+    .await;
+
+    bot.press("Покупки").await;
+    bot.press("Править").await;
+    bot.assert_screen_contains("Покупки · правка");
+
+    // «✓ Закончить правку» длиннее соседних подписей и в ряду из трёх
+    // обрезается на узком Android-экране, поэтому должна занимать весь ряд.
+    let rows = button_rows(&bot.screen());
+    let finish_row = rows
+        .iter()
+        .find(|row| row.iter().any(|(label, _)| label == "✓ Закончить правку"))
+        .unwrap_or_else(|| panic!("finish button should be present: {rows:?}"));
+    assert_eq!(
+        finish_row.len(),
+        1,
+        "«✓ Закончить правку» должна занимать весь ряд: {rows:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
