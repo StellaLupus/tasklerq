@@ -266,36 +266,33 @@ async fn update_inner(
             "due_at and due_date are mutually exclusive".into(),
         ));
     }
-    let mut due_changed = false;
     match patch.due_at {
         Field::Missing => {}
         Field::Null => {
             due_at = None;
-            due_changed = true;
         }
         Field::Value(value) => {
             due_at = Some(value);
             due_date = None;
-            due_changed = true;
         }
     }
     match patch.due_date {
         Field::Missing => {}
         Field::Null => {
             due_date = None;
-            due_changed = true;
         }
         Field::Value(value) => {
             due_date = Some(value);
             due_at = None;
-            due_changed = true;
         }
     }
+    // Срок изменён, только если новые значения отличаются от текущих. Повтор
+    // того же срока не должен переякоривать серию и терять слот вхождения.
+    let due_changed = due_at != row.due_at || due_date != row.due_date;
 
     let old_recurrence = row.recurrence();
     let mut recurrence = old_recurrence.clone();
     let today = local_today(household_timezone, now)?;
-    let recurrence_patched = matches!(&patch.recurrence, Field::Value(_));
 
     match patch.recurrence {
         Field::Missing => {
@@ -318,15 +315,24 @@ async fn update_inner(
                     "recurrence is only allowed for task lists".into(),
                 ));
             }
-            recurrence = Some(normalize_recurrence(
-                input,
-                household_timezone,
-                due_at,
-                due_date,
-                today,
-            )?);
+            let mut normalized =
+                normalize_recurrence(input, household_timezone, due_at, due_date, today)?;
+            // Повтор правила из ответа API отличается только слотом. Сохраняем
+            // его, чтобы такой `PATCH` оставался no-op.
+            if let Some(old) = &old_recurrence
+                && normalized.same_rule(old)
+            {
+                normalized.occurrence_date = old.occurrence_date;
+            }
+            recurrence = Some(normalized);
         }
     }
+
+    let recurrence_changed = match (&recurrence, &old_recurrence) {
+        (Some(new), Some(old)) => !new.same_rule(old),
+        (None, None) => false,
+        _ => true,
+    };
 
     match due_change {
         DueChange::Reanchor => {
@@ -337,7 +343,7 @@ async fn update_inner(
                 household_timezone,
                 today,
             )?;
-            if (due_changed || recurrence_patched)
+            if (due_changed || recurrence_changed)
                 && let Some(rule) = recurrence.as_mut()
             {
                 rule.occurrence_date = None;

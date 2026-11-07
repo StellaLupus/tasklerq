@@ -5,7 +5,7 @@ mod support;
 use std::collections::HashSet;
 
 use axum::http::{Method, StatusCode};
-use chrono::{Duration, Utc};
+use chrono::{Duration, TimeZone, Utc};
 use serde_json::{Value, json};
 use tasklerq::auth::tokens::hash_token;
 use tasklerq::domain::recurrence::Due;
@@ -1044,7 +1044,7 @@ async fn patch_rule_clears_the_occurrence_slot() {
             "version": moved.version,
             "recurrence": {
                 "freq": "weekly",
-                "byweekday": [2],
+                "byweekday": [3],
                 "anchor_date": slot
             }
         })),
@@ -1055,6 +1055,229 @@ async fn patch_rule_clears_the_occurrence_slot() {
         patched["recurrence"]["occurrence_date"],
         json!(null),
         "patching the rule clears the rescheduled slot"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn patch_repeating_the_current_due_keeps_the_occurrence_slot() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let token =
+        support::issue_token(&db.pool, household.household_id, &["ha:read", "ha:write"]).await;
+    let app = support::app(&db.pool);
+    let anchor = chrono::NaiveDate::from_ymd_opt(2026, 11, 3).expect("date");
+    let slot = chrono::NaiveDate::from_ymd_opt(2026, 11, 10).expect("date");
+    let moved_to = chrono::NaiveDate::from_ymd_opt(2026, 11, 6).expect("date");
+
+    let (status, created) = support::request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/lists/{}/items", household.tasks_list_id),
+        Some(&token),
+        Some(json!({
+            "title": "Проверить почту",
+            "due_date": slot,
+            "recurrence": {
+                "freq": "weekly",
+                "byweekday": [2],
+                "anchor_date": anchor
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create item: {created}");
+    let item_id: Uuid = created["id"]
+        .as_str()
+        .expect("item id")
+        .parse()
+        .expect("uuid");
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let item = items::get(&mut conn, household.household_id, item_id)
+        .await
+        .expect("item");
+    let moved = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        item.id,
+        item.version,
+        Due::AllDay(moved_to),
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("reschedule occurrence");
+    assert_eq!(
+        moved.recurrence.as_ref().expect("rule").occurrence_date,
+        Some(slot)
+    );
+    assert_eq!(moved.recurrence.as_ref().expect("rule").anchor_date, anchor);
+    drop(conn);
+
+    let (status, patched) = support::request(
+        &app,
+        Method::PATCH,
+        &format!("/api/v1/items/{item_id}"),
+        Some(&token),
+        Some(json!({"version": moved.version, "due_date": moved_to})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "patch item: {patched}");
+    assert_eq!(
+        patched["version"],
+        json!(moved.version),
+        "a repeated due must not bump the version"
+    );
+    assert_eq!(patched["due_date"], json!(moved_to));
+    assert_eq!(
+        patched["recurrence"]["occurrence_date"],
+        json!(slot),
+        "a repeated due keeps the rescheduled slot"
+    );
+    assert_eq!(
+        patched["recurrence"]["anchor_date"],
+        json!(anchor),
+        "a repeated due does not move the anchor"
+    );
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let current = items::get(&mut conn, household.household_id, item_id)
+        .await
+        .expect("item");
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        current.id,
+        Some(current.version),
+        "Europe/Moscow",
+        Utc.with_ymd_and_hms(2026, 11, 6, 12, 0, 0)
+            .single()
+            .expect("time"),
+    )
+    .await
+    .expect("complete item");
+    assert_eq!(
+        completed.due_date,
+        Some(chrono::NaiveDate::from_ymd_opt(2026, 11, 17).expect("date"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn patch_repeating_the_current_rule_keeps_the_occurrence_slot() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let token =
+        support::issue_token(&db.pool, household.household_id, &["ha:read", "ha:write"]).await;
+    let app = support::app(&db.pool);
+    let anchor = chrono::NaiveDate::from_ymd_opt(2026, 11, 3).expect("date");
+    let slot = chrono::NaiveDate::from_ymd_opt(2026, 11, 10).expect("date");
+    let moved_to = chrono::NaiveDate::from_ymd_opt(2026, 11, 6).expect("date");
+
+    let (status, created) = support::request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/lists/{}/items", household.tasks_list_id),
+        Some(&token),
+        Some(json!({
+            "title": "Проверить почту",
+            "due_date": slot,
+            "recurrence": {
+                "freq": "weekly",
+                "byweekday": [2],
+                "anchor_date": anchor
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create item: {created}");
+    let item_id: Uuid = created["id"]
+        .as_str()
+        .expect("item id")
+        .parse()
+        .expect("uuid");
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let item = items::get(&mut conn, household.household_id, item_id)
+        .await
+        .expect("item");
+    let moved = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        item.id,
+        item.version,
+        Due::AllDay(moved_to),
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("reschedule occurrence");
+    drop(conn);
+
+    let (status, fetched) = support::request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/items/{item_id}"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(fetched["recurrence"]["occurrence_date"], json!(slot));
+
+    // Клиент возвращает объект `recurrence` из ответа API без изменений, вместе
+    // с полем только для чтения `occurrence_date`.
+    let (status, patched) = support::request(
+        &app,
+        Method::PATCH,
+        &format!("/api/v1/items/{item_id}"),
+        Some(&token),
+        Some(json!({
+            "version": moved.version,
+            "recurrence": fetched["recurrence"].clone()
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "patch item: {patched}");
+    assert_eq!(
+        patched["version"],
+        json!(moved.version),
+        "a repeated rule must not bump the version"
+    );
+    assert_eq!(patched["due_date"], json!(moved_to));
+    assert_eq!(
+        patched["recurrence"]["occurrence_date"],
+        json!(slot),
+        "a repeated rule keeps the rescheduled slot"
+    );
+    assert_eq!(
+        patched["recurrence"]["anchor_date"],
+        json!(anchor),
+        "a repeated rule does not move the anchor"
+    );
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let current = items::get(&mut conn, household.household_id, item_id)
+        .await
+        .expect("item");
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        current.id,
+        Some(current.version),
+        "Europe/Moscow",
+        Utc.with_ymd_and_hms(2026, 11, 6, 12, 0, 0)
+            .single()
+            .expect("time"),
+    )
+    .await
+    .expect("complete item");
+    assert_eq!(
+        completed.due_date,
+        Some(chrono::NaiveDate::from_ymd_opt(2026, 11, 17).expect("date"))
     );
 }
 

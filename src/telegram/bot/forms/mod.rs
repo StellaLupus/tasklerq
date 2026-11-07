@@ -242,6 +242,14 @@ pub async fn start_due_text(
     version: i32,
     back: Screen,
 ) -> Result<(), Fail> {
+    if !super::card::due_editable_item(ctx, item_id).await? {
+        return ctx
+            .present(Screen::Item {
+                item_id,
+                back: Box::new(back),
+            })
+            .await;
+    }
     let household_id = ctx.household()?.id;
     items::get(&mut *ctx.conn, household_id, item_id).await?;
     open(

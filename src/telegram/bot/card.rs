@@ -112,6 +112,17 @@ async fn load(ctx: &mut Ctx<'_>, item_id: Uuid) -> Result<(Item, List), Fail> {
     Ok((item, list))
 }
 
+/// Можно ли менять срок: только у открытой задачи из списка задач.
+fn due_editable(item: &Item, list: &List) -> bool {
+    item.status != ItemStatus::Done && list.kind == ListKind::Tasks
+}
+
+/// Доступен ли ввод срока; для выполненного элемента и покупки — нет.
+pub(super) async fn due_editable_item(ctx: &mut Ctx<'_>, item_id: Uuid) -> Result<bool, Fail> {
+    let (item, list) = load(ctx, item_id).await?;
+    Ok(due_editable(&item, &list))
+}
+
 async fn names(ctx: &mut Ctx<'_>) -> Result<HashMap<Uuid, String>, Fail> {
     let household_id = ctx.household()?.id;
     Ok(users::list_active(&mut *ctx.conn, household_id)
@@ -256,6 +267,9 @@ pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui,
 /// Экран быстрого срока.
 pub async fn due(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui, Fail> {
     let (item, list) = load(ctx, item_id).await?;
+    if !due_editable(&item, &list) {
+        return view(ctx, item_id, back).await;
+    }
     let here = Screen::Due {
         item_id,
         back: Box::new(back.clone()),
@@ -312,15 +326,22 @@ pub async fn set_due(
     choice: QuickDue,
     back: Screen,
 ) -> Result<(), Fail> {
+    let (item, list) = load(ctx, item_id).await?;
+    if !due_editable(&item, &list) {
+        return ctx
+            .present(Screen::Item {
+                item_id,
+                back: Box::new(back),
+            })
+            .await;
+    }
     if choice != QuickDue::None {
-        let (item, _) = load(ctx, item_id).await?;
         let due = quick_due(&item, choice, ctx.now, ctx.tz)?;
         return apply_due(ctx, item_id, version, due, back).await;
     }
 
     let household = ctx.household()?.clone();
     let actor = ctx.actor()?;
-    let (item, _) = load(ctx, item_id).await?;
     let patch = if item.due_at.is_some() {
         ItemPatch {
             due_at: Field::Null,
@@ -356,6 +377,15 @@ pub async fn apply_due(
     due: Due,
     back: Screen,
 ) -> Result<(), Fail> {
+    let (item, list) = load(ctx, item_id).await?;
+    if !due_editable(&item, &list) {
+        return ctx
+            .present(Screen::Item {
+                item_id,
+                back: Box::new(back),
+            })
+            .await;
+    }
     let household = ctx.household()?.clone();
     let actor = ctx.actor()?;
     let saved = items::reschedule_occurrence(

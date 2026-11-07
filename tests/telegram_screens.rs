@@ -17,7 +17,7 @@ use tasklerq::domain::settings::NotificationSettings;
 use tasklerq::jobs::scheduler::Scheduler;
 use tasklerq::storage::repositories::{items, lists};
 use tasklerq::telegram::bot::Bot;
-use tasklerq::telegram::bot::model::{Action, Form, PAGE_SIZE, Screen, Ui};
+use tasklerq::telegram::bot::model::{Action, Form, PAGE_SIZE, QuickDue, Screen, Ui};
 use tasklerq::telegram::callbacks::{self, NewToken, Scope};
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -4536,6 +4536,174 @@ async fn stale_quick_due_shows_the_current_card_and_keeps_the_new_due() {
         serde_json::json!("item"),
         "the actual card is shown after a conflict"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completed_task_ignores_the_due_screen_and_quick_due() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(moscow, today, 12, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut input = new_item(household.tasks_list_id, "Оплатить интернет");
+    input.due_date = Some(today);
+    let task = create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
+
+    bot.press("Задачи").await;
+    bot.press("Оплатить интернет").await;
+    bot.press("Срок").await;
+
+    sqlx::query(
+        "UPDATE items SET status = 'done', completed_at = now(), version = version + 1 WHERE id = $1",
+    )
+    .bind(task.id)
+    .execute(&db.pool)
+    .await
+    .expect("complete the task");
+
+    // Неизвестная команда перерисовывает активный экран со свежей версией.
+    bot.text("/refresh").await;
+    bot.assert_screen_contains("Задачи › Оплатить интернет");
+    assert!(
+        bot.find_button("Завтра").is_none(),
+        "a completed task must not show the due screen:\n{}",
+        bot.screen()
+    );
+    bot.assert_has_button("Вернуть");
+
+    let back = Screen::List {
+        list_id: household.tasks_list_id,
+        page: 0,
+        edit: false,
+        from_lists: false,
+    };
+    let (version, _) = item_state(&db.pool, task.id).await;
+    let token = action_callback(
+        &db.pool,
+        bot.chat,
+        household.household_id,
+        Action::DueSet {
+            item_id: task.id,
+            version,
+            due: QuickDue::Tomorrow,
+            back: back.clone(),
+        },
+    )
+    .await;
+    let (message_id, _) = bot.active();
+    bot.press_data(&token, message_id).await;
+    assert_eq!(
+        item_due(&db.pool, task.id).await,
+        (None, Some(today)),
+        "a quick due must not change a completed task"
+    );
+    bot.assert_screen_contains("Задачи › Оплатить интернет");
+    assert!(
+        !bot.screen().contains("Срок: завтра"),
+        "a quick due must not report a saved due:\n{}",
+        bot.screen()
+    );
+
+    let token = action_callback(
+        &db.pool,
+        bot.chat,
+        household.household_id,
+        Action::DueText {
+            item_id: task.id,
+            version,
+            back,
+        },
+    )
+    .await;
+    let (message_id, _) = bot.active();
+    bot.press_data(&token, message_id).await;
+    bot.assert_screen_contains("Задачи › Оплатить интернет");
+    assert!(
+        !bot.screen().contains("Введите срок"),
+        "a completed task must not open the due form:\n{}",
+        bot.screen()
+    );
+    assert_eq!(
+        item_due(&db.pool, task.id).await,
+        (None, Some(today)),
+        "the due form must not change a completed task"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn purchase_ignores_the_due_screen_and_quick_due() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(moscow, today, 12, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut input = new_item(household.shopping_list_id, "Молоко");
+    input.due_date = Some(today);
+    let purchase = create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        input,
+    )
+    .await;
+
+    let back = Screen::List {
+        list_id: household.shopping_list_id,
+        page: 0,
+        edit: false,
+        from_lists: false,
+    };
+    // Экран срока мог остаться в сохранённом состоянии с прежней версии.
+    let due = Screen::Due {
+        item_id: purchase.id,
+        back: Box::new(back.clone()),
+    };
+    let mut conn = db.pool.acquire().await.expect("connection");
+    tasklerq::telegram::views::set(
+        &mut conn,
+        bot.chat,
+        "due",
+        &serde_json::to_value(&due).expect("screen state"),
+        bot.now,
+    )
+    .await
+    .expect("saved due screen");
+    drop(conn);
+
+    bot.text("/refresh").await;
+    bot.assert_screen_contains("Покупки › Молоко");
+    assert!(
+        bot.find_button("Завтра").is_none(),
+        "a purchase must not show the due screen:\n{}",
+        bot.screen()
+    );
+
+    let (version, _) = item_state(&db.pool, purchase.id).await;
+    let token = action_callback(
+        &db.pool,
+        bot.chat,
+        household.household_id,
+        Action::DueSet {
+            item_id: purchase.id,
+            version,
+            due: QuickDue::Tomorrow,
+            back,
+        },
+    )
+    .await;
+    let (message_id, _) = bot.active();
+    bot.press_data(&token, message_id).await;
+    assert_eq!(
+        item_due(&db.pool, purchase.id).await,
+        (None, Some(today)),
+        "a quick due must not change a purchase"
+    );
+    bot.assert_screen_contains("Покупки › Молоко");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
