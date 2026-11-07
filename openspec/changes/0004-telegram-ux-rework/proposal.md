@@ -66,8 +66,9 @@ RichMessage даёт больше, чем мы используем, и посл
 
 **BREAKING для пользователя бота.** Меняется привычная раскладка, мастера
 создания больше нет, а текст на экране покупок сохраняется без подтверждения.
-HTTP API, Home Assistant и внешний capture не меняются, кроме поля
-`recurrence.occurrence_date` в ответе API (только чтение).
+HTTP API, Home Assistant и внешний capture не меняются, кроме полей
+`recurrence.occurrence_date` и `recurrence.occurrence_time` в ответе API
+(только чтение).
 
 ## Capabilities
 
@@ -106,8 +107,9 @@ HTTP API, Home Assistant и внешний capture не меняются, кро
   - `src/telegram/bot/notify/*` — подписи;
   - `src/storage/repositories/items/*` — перенос вхождения, выборки
     выполнений из `item_events`.
-- **Миграция этапа B:** `items.recurrence_occurrence_date` — исходная дата
-  перенесённого вхождения.
+- **Миграция этапа B:** `items.recurrence_occurrence_date` и
+  `items.recurrence_occurrence_time` — исходная дата перенесённого вхождения и
+  время суток серии.
 - **Миграция этапа C:** части исходного текста дописанного черновика в
   `capture_drafts`.
 - **Состояние экранов.** Старые `Screen::Completed`, `Screen::Add` и шаги
@@ -115,7 +117,7 @@ HTTP API, Home Assistant и внешний capture не меняются, кро
   ошибки и заменяться актуальным экраном.
 - **Документация:** `docs/telegram-ux.md` (принципы §1, разделы 2–4, 7, 11,
   14), `docs/llm-capture.md`, `docs/ha-api.md` и `docs/domain-model.md`
-  (поле `recurrence.occurrence_date`).
+  (поля `recurrence.occurrence_date` и `recurrence.occurrence_time`).
 - **Тесты:** `tests/telegram_screens.rs`, `telegram_flow.rs`,
   `telegram_steps.rs`, `telegram_capture.rs`, `notification_actions.rs`,
   `notification_batch_actions.rs`, `item_lifecycle.rs`, golden-снапшоты.
