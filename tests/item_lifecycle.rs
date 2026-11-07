@@ -2,7 +2,7 @@
 
 mod support;
 
-use chrono::{Datelike, Duration, NaiveDate, SubsecRound, TimeZone, Utc};
+use chrono::{Datelike, Duration, NaiveDate, NaiveTime, SubsecRound, TimeZone, Utc};
 use tasklerq::domain::error::DomainError;
 use tasklerq::domain::models::{
     EventType, Field, ItemPatch, ItemStatus, ListKind, MonthRule, RecurrenceFreq,
@@ -783,6 +783,457 @@ async fn repeated_reschedule_keeps_the_first_slot() {
     .await
     .expect("complete after repeated reschedule");
     assert_eq!(completed.due_date, Some(date(2026, 11, 17)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reschedule_with_a_new_time_keeps_the_series_time() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let original = Utc
+        .with_ymd_and_hms(2026, 11, 10, 6, 0, 0)
+        .single()
+        .expect("time");
+    let moved_to = Utc
+        .with_ymd_and_hms(2026, 11, 12, 9, 0, 0)
+        .single()
+        .expect("time");
+    let mut input = support::new_item(household.tasks_list_id, "Встреча");
+    input.due_at = Some(original);
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Weekly, vec![2]));
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let now = utc(2026, 11, 10, 7);
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let moved = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        created.version,
+        Due::Timed(moved_to),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("reschedule to a new time");
+    assert_eq!(moved.due_at, Some(moved_to));
+    let rule = moved.recurrence.as_ref().expect("rule");
+    assert_eq!(rule.occurrence_date, Some(date(2026, 11, 10)));
+    assert_eq!(
+        rule.occurrence_time,
+        NaiveTime::from_hms_opt(9, 0, 0),
+        "the slot remembers the original local time"
+    );
+
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(moved.version),
+        "Europe/Moscow",
+        utc(2026, 11, 12, 10),
+    )
+    .await
+    .expect("complete the moved occurrence");
+    assert_eq!(
+        completed.due_at,
+        Some(
+            Utc.with_ymd_and_hms(2026, 11, 17, 6, 0, 0)
+                .single()
+                .expect("time")
+        ),
+        "the next occurrence keeps the series time, not the moved time"
+    );
+    assert_eq!(completed.due_date, None);
+    let rule = completed.recurrence.as_ref().expect("rule");
+    assert_eq!(rule.occurrence_date, None);
+    assert_eq!(rule.occurrence_time, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reschedule_to_another_time_on_the_same_day_keeps_the_series_time() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let original = Utc
+        .with_ymd_and_hms(2026, 11, 10, 6, 0, 0)
+        .single()
+        .expect("time");
+    let moved_to = Utc
+        .with_ymd_and_hms(2026, 11, 10, 9, 0, 0)
+        .single()
+        .expect("time");
+    let mut input = support::new_item(household.tasks_list_id, "Встреча");
+    input.due_at = Some(original);
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Weekly, vec![2]));
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let moved = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        created.version,
+        Due::Timed(moved_to),
+        "Europe/Moscow",
+        utc(2026, 11, 10, 7),
+    )
+    .await
+    .expect("reschedule to another time on the same day");
+    let rule = moved.recurrence.as_ref().expect("rule");
+    assert_eq!(rule.occurrence_date, Some(date(2026, 11, 10)));
+    assert_eq!(rule.occurrence_time, NaiveTime::from_hms_opt(9, 0, 0));
+
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(moved.version),
+        "Europe/Moscow",
+        utc(2026, 11, 10, 10),
+    )
+    .await
+    .expect("complete the moved occurrence");
+    assert_eq!(
+        completed.due_at,
+        Some(
+            Utc.with_ymd_and_hms(2026, 11, 17, 6, 0, 0)
+                .single()
+                .expect("time")
+        )
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reschedule_to_an_all_day_due_keeps_the_series_time() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let original = Utc
+        .with_ymd_and_hms(2026, 11, 10, 6, 0, 0)
+        .single()
+        .expect("time");
+    let mut input = support::new_item(household.tasks_list_id, "Встреча");
+    input.due_at = Some(original);
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Weekly, vec![2]));
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let moved = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        created.version,
+        Due::AllDay(date(2026, 11, 12)),
+        "Europe/Moscow",
+        utc(2026, 11, 10, 7),
+    )
+    .await
+    .expect("reschedule to an all-day due");
+    assert_eq!(moved.due_date, Some(date(2026, 11, 12)));
+    assert_eq!(moved.due_at, None);
+    let rule = moved.recurrence.as_ref().expect("rule");
+    assert_eq!(rule.occurrence_date, Some(date(2026, 11, 10)));
+    assert_eq!(rule.occurrence_time, NaiveTime::from_hms_opt(9, 0, 0));
+
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(moved.version),
+        "Europe/Moscow",
+        utc(2026, 11, 12, 10),
+    )
+    .await
+    .expect("complete the all-day moved occurrence");
+    assert_eq!(
+        completed.due_at,
+        Some(
+            Utc.with_ymd_and_hms(2026, 11, 17, 6, 0, 0)
+                .single()
+                .expect("time")
+        ),
+        "the series returns to its timed due"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reschedule_an_all_day_series_to_a_timed_due_keeps_it_all_day() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let mut input = support::new_item(household.tasks_list_id, "Вынести мусор");
+    input.due_date = Some(date(2026, 11, 10));
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Weekly, vec![2]));
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let moved = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        created.version,
+        Due::Timed(
+            Utc.with_ymd_and_hms(2026, 11, 12, 9, 0, 0)
+                .single()
+                .expect("time"),
+        ),
+        "Europe/Moscow",
+        utc(2026, 11, 10, 7),
+    )
+    .await
+    .expect("reschedule an all-day series");
+    let rule = moved.recurrence.as_ref().expect("rule");
+    assert_eq!(rule.occurrence_date, Some(date(2026, 11, 10)));
+    assert_eq!(rule.occurrence_time, None);
+
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(moved.version),
+        "Europe/Moscow",
+        utc(2026, 11, 12, 10),
+    )
+    .await
+    .expect("complete the moved all-day series");
+    assert_eq!(completed.due_date, Some(date(2026, 11, 17)));
+    assert_eq!(completed.due_at, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reschedule_back_to_the_original_time_clears_the_slot() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let original = Utc
+        .with_ymd_and_hms(2026, 11, 10, 6, 0, 0)
+        .single()
+        .expect("time");
+    let moved_to = Utc
+        .with_ymd_and_hms(2026, 11, 12, 9, 0, 0)
+        .single()
+        .expect("time");
+    let mut input = support::new_item(household.tasks_list_id, "Встреча");
+    input.due_at = Some(original);
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Weekly, vec![2]));
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let moved = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        created.version,
+        Due::Timed(moved_to),
+        "Europe/Moscow",
+        utc(2026, 11, 10, 7),
+    )
+    .await
+    .expect("move away from the slot");
+
+    let returned = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        moved.version,
+        Due::Timed(original),
+        "Europe/Moscow",
+        utc(2026, 11, 12, 10),
+    )
+    .await
+    .expect("move back to the original date and time");
+    assert_eq!(returned.due_at, Some(original));
+    let rule = returned.recurrence.as_ref().expect("rule");
+    assert_eq!(rule.occurrence_date, None);
+    assert_eq!(rule.occurrence_time, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_reschedule_keeps_the_series_time() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let original = Utc
+        .with_ymd_and_hms(2026, 11, 10, 6, 0, 0)
+        .single()
+        .expect("time");
+    let mut input = support::new_item(household.tasks_list_id, "Встреча");
+    input.due_at = Some(original);
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Weekly, vec![2]));
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let first = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        created.version,
+        Due::Timed(
+            Utc.with_ymd_and_hms(2026, 11, 12, 9, 0, 0)
+                .single()
+                .expect("time"),
+        ),
+        "Europe/Moscow",
+        utc(2026, 11, 10, 7),
+    )
+    .await
+    .expect("first reschedule");
+
+    let second = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        first.version,
+        Due::Timed(
+            Utc.with_ymd_and_hms(2026, 11, 19, 12, 0, 0)
+                .single()
+                .expect("time"),
+        ),
+        "Europe/Moscow",
+        utc(2026, 11, 12, 10),
+    )
+    .await
+    .expect("second reschedule");
+    let rule = second.recurrence.as_ref().expect("rule");
+    assert_eq!(rule.occurrence_date, Some(date(2026, 11, 10)));
+    assert_eq!(
+        rule.occurrence_time,
+        NaiveTime::from_hms_opt(9, 0, 0),
+        "a repeated reschedule does not change the slot time"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undo_after_reschedule_restores_the_series_time() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let original = Utc
+        .with_ymd_and_hms(2026, 11, 10, 6, 0, 0)
+        .single()
+        .expect("time");
+    let mut input = support::new_item(household.tasks_list_id, "Встреча");
+    input.due_at = Some(original);
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Weekly, vec![2]));
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let first = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        created.version,
+        Due::Timed(
+            Utc.with_ymd_and_hms(2026, 11, 6, 6, 0, 0)
+                .single()
+                .expect("time"),
+        ),
+        "Europe/Moscow",
+        utc(2027, 1, 1, 12),
+    )
+    .await
+    .expect("first reschedule");
+    let second = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        first.version,
+        Due::Timed(
+            Utc.with_ymd_and_hms(2026, 11, 3, 6, 0, 0)
+                .single()
+                .expect("time"),
+        ),
+        "Europe/Moscow",
+        utc(2027, 1, 1, 13),
+    )
+    .await
+    .expect("second reschedule");
+
+    let restored = items::undo_last(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        utc(2027, 1, 1, 13),
+    )
+    .await
+    .expect("undo the second reschedule");
+    assert_eq!(
+        restored.due_at,
+        Some(
+            Utc.with_ymd_and_hms(2026, 11, 6, 6, 0, 0)
+                .single()
+                .expect("time")
+        )
+    );
+    let rule = restored.recurrence.as_ref().expect("rule");
+    assert_eq!(rule.occurrence_date, Some(date(2026, 11, 10)));
+    assert_eq!(rule.occurrence_time, NaiveTime::from_hms_opt(9, 0, 0));
+    assert_eq!(
+        second.due_at,
+        Some(
+            Utc.with_ymd_and_hms(2026, 11, 3, 6, 0, 0)
+                .single()
+                .expect("time")
+        )
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -403,6 +403,81 @@ async fn calendar_shows_a_rescheduled_timed_occurrence() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn calendar_shows_a_rescheduled_occurrence_with_the_series_time() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let mut input = support::new_item(household.tasks_list_id, "Встреча");
+    input.due_at = Some(
+        Utc.with_ymd_and_hms(2026, 11, 10, 6, 0, 0)
+            .single()
+            .expect("time"),
+    );
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Weekly, vec![2]));
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        created.version,
+        Due::Timed(
+            Utc.with_ymd_and_hms(2026, 11, 12, 9, 0, 0)
+                .single()
+                .expect("time"),
+        ),
+        "Europe/Moscow",
+        Utc.with_ymd_and_hms(2026, 11, 10, 7, 0, 0)
+            .single()
+            .expect("fixed moment"),
+    )
+    .await
+    .expect("reschedule timed occurrence");
+
+    let items = items::calendar_items(&mut conn, household.household_id)
+        .await
+        .expect("calendar items");
+    let timezone = parse_timezone("Europe/Moscow").expect("timezone");
+    let mut events = Vec::new();
+    for item in &items {
+        events.extend(
+            calendar::expand_item(item, date(2026, 11, 1), date(2026, 12, 1), timezone)
+                .expect("expand calendar item"),
+        );
+    }
+
+    let starts: Vec<_> = events
+        .iter()
+        .filter(|event| event.item_id == created.id)
+        .map(|event| {
+            serde_json::to_value(&event.start)
+                .expect("serialize")
+                .as_str()
+                .expect("timestamp string")
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        starts,
+        vec![
+            "2026-11-12T09:00:00Z",
+            "2026-11-17T06:00:00Z",
+            "2026-11-24T06:00:00Z"
+        ],
+        "the moved occurrence keeps its new time and later ones use the series time"
+    );
+    assert!(!starts.contains(&"2026-11-10T06:00:00Z".to_owned()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn calendar_http_requires_range_and_serializes_events() {
     let db = support::db().await;
     let household = support::create_household(&db.pool).await;

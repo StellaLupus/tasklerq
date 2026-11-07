@@ -511,6 +511,7 @@ Scope: `ha:write`. Тела нет.
 | `anchor_date` | string | нет | `YYYY-MM-DD`, якорь серии. |
 | `month_rule` | string | да | `anchor_day`/`last_day`; только для `monthly`, иначе `null`. |
 | `occurrence_date` | string | да | `YYYY-MM-DD`, дата правила, которую занимает перенесённое вхождение; `null` — срок стоит на своей дате правила. Только для чтения: `PATCH`/`POST` его не принимают. |
+| `occurrence_time` | string | да | `HH:MM:SS`, локальное время серии в `recurrence.timezone` при заданной `occurrence_date`; `null` — вседневная серия. Только для чтения: `PATCH`/`POST` его не принимают. |
 
 Пример `ItemResponse`:
 
@@ -543,7 +544,8 @@ Scope: `ha:write`. Тела нет.
     "timezone": "Europe/Moscow",
     "anchor_date": "2026-11-05",
     "month_rule": "anchor_day",
-    "occurrence_date": null
+    "occurrence_date": null,
+    "occurrence_time": null
   },
   "created_at": "2026-10-20T09:00:00Z",
   "updated_at": "2026-10-31T09:30:00Z",
@@ -622,9 +624,9 @@ Scope: `ha:write`. `Content-Type: application/json`.
 | `anchor_date` | нет | `YYYY-MM-DD`; по умолчанию `due_date`/дата `due_at` или сегодня в timezone household. |
 | `month_rule` | нет | `anchor_day`/`last_day`; только для `monthly`; по умолчанию `anchor_day`. |
 
-Поле `occurrence_date` в ответе — только для чтения. Во входе `POST`/`PATCH`
-оно не принимается и игнорируется, как другие неизвестные поля: слот
-выставляется только переносом текущего вхождения.
+Поля `occurrence_date` и `occurrence_time` в ответе — только для чтения. Во
+входе `POST`/`PATCH` они не принимаются и игнорируются, как другие неизвестные
+поля: слот выставляется только переносом текущего вхождения.
 
 Если у повторяющейся позиции не задан срок, сервер вычисляет первое вхождение
 (вседневную дату) не раньше сегодня. `last_day` приводит `due_date` к
@@ -674,8 +676,9 @@ Scope: `ha:write`. `Content-Type: application/json`.
   если оба поля присутствуют в JSON, ответ `422`. Чтобы очистить срок,
   передайте `null` только для того поля, которое установлено.
 - При установке одного из сроков второе поле очищается автоматически.
-- `recurrence.occurrence_date` — только для чтения: во входе поле
-  игнорируется, слот выставляется только переносом текущего вхождения.
+- `recurrence.occurrence_date` и `recurrence.occurrence_time` — только для
+  чтения: во входе поля игнорируются, слот выставляется только переносом
+  текущего вхождения.
 - Если позиция лежит в архивном списке, `PATCH` даёт `404`.
 - `complete`, `reopen`, `DELETE` и `undo` архивность списка не проверяют:
   для позиции архивного списка они работают.

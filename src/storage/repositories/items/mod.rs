@@ -14,7 +14,7 @@ pub use read::{all_for_export, calendar_items, get, is_deleted, list_by_list, sn
 pub use stats::{MenuCounts, menu_counts, open_assigned_tasks, open_counts_by_list};
 pub use write::{create, reschedule_occurrence, update};
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use serde_json::json;
 
 use crate::domain::error::DomainError;
@@ -36,6 +36,7 @@ type RecurrenceColumns = (
     Option<NaiveDate>,
     Option<MonthRule>,
     Option<NaiveDate>,
+    Option<NaiveTime>,
 );
 
 fn recurrence_values(recurrence: Option<&Recurrence>) -> RecurrenceColumns {
@@ -49,8 +50,9 @@ fn recurrence_values(recurrence: Option<&Recurrence>) -> RecurrenceColumns {
             Some(rule.anchor_date),
             rule.month_rule,
             rule.occurrence_date,
+            rule.occurrence_time,
         ),
-        None => (None, None, None, None, None, None, None, None),
+        None => (None, None, None, None, None, None, None, None, None),
     }
 }
 

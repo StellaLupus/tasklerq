@@ -457,7 +457,8 @@ fn quick_due(
 /// Вхождение, которое станет сроком после выполнения текущего.
 ///
 /// Совпадает с расчётом `complete`: текущий срок (или первое вхождение серии
-/// без срока) и слот `occurrence_date` перенесённого вхождения.
+/// без срока), слот `occurrence_date` и время серии `occurrence_time`
+/// перенесённого вхождения.
 fn next_occurrence(item: &Item, ctx: &Ctx<'_>) -> Option<String> {
     let rule = item.recurrence.as_ref()?;
     if item.status == ItemStatus::Done {
@@ -711,6 +712,7 @@ mod tests {
             anchor_date: NaiveDate::from_ymd_opt(2026, 11, 5).expect("date"),
             month_rule: Some(MonthRule::AnchorDay),
             occurrence_date: None,
+            occurrence_time: None,
         }
     }
 

@@ -985,6 +985,143 @@ async fn recurrence_occurrence_date_is_read_only() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recurrence_occurrence_time_is_read_only() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let token =
+        support::issue_token(&db.pool, household.household_id, &["ha:read", "ha:write"]).await;
+    let app = support::app(&db.pool);
+
+    let (status, created) = support::request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/lists/{}/items", household.tasks_list_id),
+        Some(&token),
+        Some(json!({
+            "title": "Встреча",
+            "due_at": "2026-11-10T06:00:00Z",
+            "recurrence": {"freq": "weekly", "byweekday": [2]}
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create item: {created}");
+    assert_eq!(created["recurrence"]["occurrence_time"], json!(null));
+    let item_id = created["id"].as_str().expect("item id").to_owned();
+
+    let (status, fetched) = support::request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/items/{item_id}"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        fetched["recurrence"]["occurrence_time"],
+        json!(null),
+        "the response exposes the time slot as null without a reschedule"
+    );
+
+    let (status, patched) = support::request(
+        &app,
+        Method::PATCH,
+        &format!("/api/v1/items/{item_id}"),
+        Some(&token),
+        Some(json!({
+            "version": 1,
+            "recurrence": {
+                "freq": "weekly",
+                "byweekday": [2],
+                "anchor_date": "2026-11-10",
+                "occurrence_time": "12:00:00"
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "patch item: {patched}");
+    assert_eq!(
+        patched["recurrence"]["occurrence_time"],
+        json!(null),
+        "PATCH does not accept the read-only time slot"
+    );
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let item = items::get(
+        &mut conn,
+        household.household_id,
+        item_id.parse().expect("uuid"),
+    )
+    .await
+    .expect("item");
+    let moved_at = Utc
+        .with_ymd_and_hms(2026, 11, 12, 9, 0, 0)
+        .single()
+        .expect("time");
+    let moved = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        item.id,
+        item.version,
+        Due::Timed(moved_at),
+        "Europe/Moscow",
+        Utc.with_ymd_and_hms(2026, 11, 10, 7, 0, 0)
+            .single()
+            .expect("time"),
+    )
+    .await
+    .expect("reschedule occurrence");
+    drop(conn);
+
+    let (status, fetched) = support::request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/items/{item_id}"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        fetched["recurrence"]["occurrence_date"],
+        json!("2026-11-10")
+    );
+    assert_eq!(
+        fetched["recurrence"]["occurrence_time"],
+        json!("09:00:00"),
+        "the response exposes the series time"
+    );
+
+    let (status, patched) = support::request(
+        &app,
+        Method::PATCH,
+        &format!("/api/v1/items/{item_id}"),
+        Some(&token),
+        Some(json!({
+            "version": moved.version,
+            "recurrence": fetched["recurrence"].clone()
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "patch item: {patched}");
+    assert_eq!(
+        patched["version"],
+        json!(moved.version),
+        "a repeated rule must not bump the version"
+    );
+    assert_eq!(
+        patched["recurrence"]["occurrence_date"],
+        json!("2026-11-10")
+    );
+    assert_eq!(
+        patched["recurrence"]["occurrence_time"],
+        json!("09:00:00"),
+        "a repeated rule keeps the series time slot"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn patch_rule_clears_the_occurrence_slot() {
     let db = support::db().await;
     let household = support::create_household(&db.pool).await;

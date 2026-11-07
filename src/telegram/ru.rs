@@ -313,6 +313,11 @@ fn parse_time(token: &str) -> Option<NaiveTime> {
 }
 
 fn parse_date(token: &str, today: NaiveDate) -> Option<NaiveDate> {
+    if let Some(weekday) = weekday_from_short(token) {
+        let current = today.weekday().number_from_monday();
+        let delta = (weekday + 7 - current) % 7;
+        return Some(today + chrono::Duration::days(i64::from(delta)));
+    }
     let parts: Vec<&str> = token.split(['.', '/', '-']).collect();
     match parts.as_slice() {
         [day, month] => {
@@ -325,6 +330,20 @@ fn parse_date(token: &str, today: NaiveDate) -> Option<NaiveDate> {
             }
             NaiveDate::from_ymd_opt(year, month.parse().ok()?, day.parse().ok()?)
         }
+        _ => None,
+    }
+}
+
+/// ISO-номер дня недели по короткому русскому названию.
+fn weekday_from_short(token: &str) -> Option<u32> {
+    match token {
+        "пн" => Some(1),
+        "вт" => Some(2),
+        "ср" => Some(3),
+        "чт" => Some(4),
+        "пт" => Some(5),
+        "сб" => Some(6),
+        "вс" => Some(7),
         _ => None,
     }
 }
@@ -432,6 +451,14 @@ mod tests {
         assert_eq!(
             parse_due("18:30", today),
             Some(ParsedDue { date: None, time })
+        );
+        assert_eq!(
+            parse_due("чт 12:00", today),
+            Some(ParsedDue {
+                date: Some(date(2026, 11, 5)),
+                time: NaiveTime::from_hms_opt(12, 0, 0),
+            }),
+            "a short weekday picks the next such day, including today"
         );
         assert_eq!(parse_due("32.13", today), None);
         assert_eq!(parse_due("когда-нибудь", today), None);

@@ -9,6 +9,7 @@ use crate::domain::error::DomainError;
 use crate::domain::models::{
     Field, Item, ItemPatch, ListKind, MonthRule, Recurrence, RecurrenceFreq,
 };
+use crate::domain::recurrence::rule_changed;
 use crate::domain::validation::validate_new_item;
 use crate::storage::repositories::{items, lists, users};
 use crate::telegram::rich::Button;
@@ -599,11 +600,9 @@ fn current_differs(field: EditorField, current: &ItemSnapshot, base: &ItemSnapsh
         EditorField::Assignee => current.assignee != base.assignee,
         EditorField::Tags => sorted(&current.tags) != sorted(&base.tags),
         EditorField::Subtasks => current.subtasks != base.subtasks,
-        EditorField::Recurrence => match (&current.recurrence, &base.recurrence) {
-            (None, None) => false,
-            (Some(current), Some(base)) => !current.same_rule(base),
-            _ => true,
-        },
+        EditorField::Recurrence => {
+            rule_changed(current.recurrence.as_ref(), base.recurrence.as_ref())
+        }
         EditorField::Notes => current.notes != base.notes,
         EditorField::List => current.list_id != base.list_id,
         EditorField::Quantity => current.quantity != base.quantity,
@@ -691,22 +690,47 @@ async fn save_item(
     base: ItemSnapshot,
 ) -> Result<(), Fail> {
     let back = editor.back();
-    let household_id = ctx.household()?.id;
-    let current = items::get(&mut *ctx.conn, household_id, item_id).await?;
-    let current_snapshot = ItemSnapshot::from_item(&current);
-    let changed = changed_fields(&editor, &base, ctx.tz)?;
-    if changed.is_empty() {
-        super::clear(ctx).await?;
-        return ctx.present(back).await;
-    }
+    let mut retried = false;
+    loop {
+        let household_id = ctx.household()?.id;
+        let current = items::get(&mut *ctx.conn, household_id, item_id).await?;
+        let current_snapshot = ItemSnapshot::from_item(&current);
+        let changed = changed_fields(&editor, &base, ctx.tz)?;
+        if changed.is_empty() {
+            super::clear(ctx).await?;
+            return ctx.present(back).await;
+        }
 
-    let conflicts = conflicts(&editor, &current_snapshot, &base, &changed, ctx.tz)?;
-    if !conflicts.is_empty() {
-        editor.conflict = Some(conflicts);
-        editor.conflict_seen = Some(Box::new(current_snapshot));
-        return show(ctx, editor).await;
+        let conflicts = conflicts(&editor, &current_snapshot, &base, &changed, ctx.tz)?;
+        if !conflicts.is_empty() {
+            editor.conflict = Some(conflicts);
+            editor.conflict_seen = Some(Box::new(current_snapshot));
+            return show(ctx, editor).await;
+        }
+        match write(ctx, &editor, &current, &changed).await? {
+            WriteOutcome::Saved => {
+                super::clear(ctx).await?;
+                ctx.banner("Сохранено");
+                return ctx.present(back).await;
+            }
+            WriteOutcome::Validation => {
+                editor.error = Some("Проверьте введённые значения.".to_owned());
+                return show(ctx, editor).await;
+            }
+            WriteOutcome::Conflict => {
+                // Между чтением и записью элемент изменил другой участник.
+                // Повторяем один раз с новым снимком; если конфликт остался или
+                // всплыл снова, показываем его, не теряя введённые значения.
+                if conflict_action(retried) == ConflictAction::Retry {
+                    retried = true;
+                    continue;
+                }
+                editor.conflict = Some(changed);
+                editor.conflict_seen = Some(Box::new(current_snapshot));
+                return show(ctx, editor).await;
+            }
+        }
     }
-    write(ctx, editor, &current, &changed, back).await
 }
 
 /// Создать элемент из редактора.
@@ -810,14 +834,35 @@ fn created_screen(back: &Screen, list_id: Uuid) -> Screen {
     }
 }
 
-/// Записать изменения и вернуться на `back`.
+/// Результат записи редактором.
+enum WriteOutcome {
+    Saved,
+    Validation,
+    Conflict,
+}
+
+/// Решение по конфликту записи: один повтор, затем экран конфликта.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictAction {
+    Retry,
+    Show,
+}
+
+fn conflict_action(retried: bool) -> ConflictAction {
+    if retried {
+        ConflictAction::Show
+    } else {
+        ConflictAction::Retry
+    }
+}
+
+/// Записать изменения одним `items::update`.
 async fn write(
     ctx: &mut Ctx<'_>,
-    editor: Editor,
+    editor: &Editor,
     current: &Item,
     changed: &BTreeSet<EditorField>,
-    back: Screen,
-) -> Result<(), Fail> {
+) -> Result<WriteOutcome, Fail> {
     let household = ctx.household()?.clone();
     let actor = ctx.actor()?;
     let mut patch = ItemPatch::default();
@@ -843,21 +888,9 @@ async fn write(
     )
     .await;
     match saved {
-        Ok(_) => {
-            super::clear(ctx).await?;
-            ctx.banner("Сохранено");
-            ctx.present(back).await
-        }
-        Err(DomainError::Validation(_)) => {
-            let mut editor = editor;
-            editor.error = Some("Проверьте введённые значения.".to_owned());
-            show(ctx, editor).await
-        }
-        Err(DomainError::Conflict { .. }) => {
-            super::clear(ctx).await?;
-            ctx.banner(super::super::CHANGED_STATE_MESSAGE);
-            ctx.present(back).await
-        }
+        Ok(_) => Ok(WriteOutcome::Saved),
+        Err(DomainError::Validation(_)) => Ok(WriteOutcome::Validation),
+        Err(DomainError::Conflict { .. }) => Ok(WriteOutcome::Conflict),
         Err(error) => Err(error.into()),
     }
 }
@@ -987,7 +1020,22 @@ async fn resolve_conflict(
         editor.conflict_seen = Some(Box::new(current_snapshot));
         return show(ctx, editor).await;
     }
-    write(ctx, editor, &current, &changed, back).await
+    match write(ctx, &editor, &current, &changed).await? {
+        WriteOutcome::Saved => {
+            super::clear(ctx).await?;
+            ctx.banner("Сохранено");
+            ctx.present(back).await
+        }
+        WriteOutcome::Validation => {
+            editor.error = Some("Проверьте введённые значения.".to_owned());
+            show(ctx, editor).await
+        }
+        WriteOutcome::Conflict => {
+            super::clear(ctx).await?;
+            ctx.banner(super::super::CHANGED_STATE_MESSAGE);
+            ctx.present(back).await
+        }
+    }
 }
 
 async fn cancel(ctx: &mut Ctx<'_>, editor: Editor) -> Result<(), Fail> {
@@ -1390,7 +1438,7 @@ async fn increase_duplicate(
 
 #[cfg(test)]
 mod tests {
-    use chrono::NaiveDate;
+    use chrono::{NaiveDate, NaiveTime};
 
     use crate::domain::models::ItemPriority;
 
@@ -1476,9 +1524,11 @@ mod tests {
             anchor_date: NaiveDate::from_ymd_opt(2026, 11, 3).expect("date"),
             month_rule: None,
             occurrence_date: None,
+            occurrence_time: None,
         };
         let mut current = base_rule.clone();
         current.occurrence_date = NaiveDate::from_ymd_opt(2026, 11, 4);
+        current.occurrence_time = NaiveTime::from_hms_opt(9, 0, 0);
         assert!(current.same_rule(&base_rule));
 
         base_rule.interval = 2;
@@ -1496,6 +1546,7 @@ mod tests {
             anchor_date: NaiveDate::from_ymd_opt(2026, 11, 3).expect("date"),
             month_rule: None,
             occurrence_date: Some(NaiveDate::from_ymd_opt(2026, 11, 5).expect("date")),
+            occurrence_time: NaiveTime::from_hms_opt(9, 0, 0),
         };
         let draft = RecurrenceDraft {
             freq: RecurrenceFreq::Weekly,
@@ -1505,6 +1556,12 @@ mod tests {
         };
         assert!(draft_rule_eq(Some(&draft), Some(&rule)));
         assert!(!draft_rule_eq(None, Some(&rule)));
+    }
+
+    #[test]
+    fn a_write_conflict_is_retried_once_then_shown() {
+        assert_eq!(conflict_action(false), ConflictAction::Retry);
+        assert_eq!(conflict_action(true), ConflictAction::Show);
     }
 
     #[test]

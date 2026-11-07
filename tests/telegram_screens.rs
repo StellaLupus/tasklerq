@@ -4330,6 +4330,67 @@ async fn quick_due_text_moves_only_the_recurring_occurrence() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quick_due_date_and_time_keeps_the_recurring_series_time() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 1).expect("date");
+    let now = local_utc(moscow, today, 9, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let first = NaiveDate::from_ymd_opt(2027, 3, 2).expect("date");
+    let mut input = new_item(household.tasks_list_id, "Встреча");
+    input.due_at = Some(local_utc(moscow, first, 9, 0));
+    input.recurrence = Some(support::recurrence(
+        tasklerq::domain::models::RecurrenceFreq::Weekly,
+        vec![2],
+    ));
+    let task = create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
+
+    bot.press("Задачи").await;
+    bot.press("Встреча").await;
+    bot.press("Срок").await;
+    bot.press("Дата и время").await;
+    bot.text("чт 12:00").await;
+
+    bot.assert_screen_contains("Срок: чт, 4 мар, 12:00");
+    let moved = items::get(
+        &mut db.pool.acquire().await.expect("conn"),
+        household.household_id,
+        task.id,
+    )
+    .await
+    .expect("moved occurrence");
+    let rule = moved.recurrence.as_ref().expect("rule");
+    assert_eq!(rule.occurrence_date, Some(first));
+    assert_eq!(
+        rule.occurrence_time,
+        chrono::NaiveTime::from_hms_opt(9, 0, 0),
+        "the slot remembers the series time"
+    );
+
+    bot.press("Выполнено").await;
+    bot.assert_screen_contains("Следующее: вт, 9 мар, 09:00");
+    let completed = items::get(
+        &mut db.pool.acquire().await.expect("conn"),
+        household.household_id,
+        task.id,
+    )
+    .await
+    .expect("completed occurrence");
+    assert_eq!(
+        completed.due_at,
+        Some(local_utc(
+            moscow,
+            NaiveDate::from_ymd_opt(2027, 3, 9).expect("date"),
+            9,
+            0
+        )),
+        "the next occurrence keeps the series time"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn quick_due_week_later_counts_from_due_but_not_before_today() {
     let db = db().await;
     let moscow = chrono_tz::Tz::Europe__Moscow;

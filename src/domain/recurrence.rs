@@ -103,7 +103,13 @@ impl Recurrence {
         let timezone = self.timezone()?;
         let current_date = current.local_date(timezone);
         let completion_date = completed_at.with_timezone(&timezone).date_naive();
-        let local_time = current.local_time(timezone);
+        // Если вхождение перенесено, тип срока и время суток следующих
+        // вхождений задаёт слот: `None` — вседневная серия.
+        let local_time = if self.occurrence_date.is_some() {
+            self.occurrence_time
+        } else {
+            current.local_time(timezone)
+        };
         let mut candidate_date = current_date;
         let mut iterations = 0;
 
@@ -151,7 +157,8 @@ impl Recurrence {
 
     /// Все вхождения серии в интервале `[start, end)`.
     ///
-    /// `current` задаёт тип срока (all-day/timed) и локальное время. Развёртка
+    /// `current` задаёт тип срока (all-day/timed) и локальное время, если слот
+    /// вхождения не задан; иначе тип и время берутся из слота. Развёртка
     /// ограничена [`MAX_CALENDAR_OCCURRENCES`].
     pub fn occurrences_between(
         &self,
@@ -164,7 +171,11 @@ impl Recurrence {
         }
 
         let timezone = self.timezone()?;
-        let local_time = current.local_time(timezone);
+        let local_time = if self.occurrence_date.is_some() {
+            self.occurrence_time
+        } else {
+            current.local_time(timezone)
+        };
         let mut candidate = self.anchor_occurrence();
         let mut iterations = 0;
 
@@ -420,7 +431,17 @@ impl RecurrenceInput {
             anchor_date,
             month_rule,
             occurrence_date: None,
+            occurrence_time: None,
         })
+    }
+}
+
+/// Изменилось ли правило без учёта слота вхождения.
+pub fn rule_changed(a: Option<&Recurrence>, b: Option<&Recurrence>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => !a.same_rule(b),
+        (None, None) => false,
+        _ => true,
     }
 }
 
@@ -523,6 +544,7 @@ mod tests {
             anchor_date: anchor,
             month_rule,
             occurrence_date: None,
+            occurrence_time: None,
         }
     }
 

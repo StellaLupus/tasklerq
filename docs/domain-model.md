@@ -126,6 +126,7 @@ erDiagram
 | `recurrence_anchor_date` | `date` | Исходная дата серии. |
 | `recurrence_month_rule` | `month_rule` | Только для monthly: `anchor_day` (по умолчанию) или `last_day`. |
 | `recurrence_occurrence_date` | `date` | NULL или дата правила, которую занимает перенесённое вхождение. |
+| `recurrence_occurrence_time` | `time` | NULL или локальное время серии в `recurrence_timezone` при заданной дате слота; `NULL` — вседневная серия. |
 | `search_vector` | `tsvector` | Генерируемая колонка. |
 | `created_at`, `updated_at` | `timestamptz` | NOT NULL. |
 | `deleted_at` | `timestamptz` | NULL. |
@@ -151,8 +152,11 @@ CHECK (
       AND recurrence_timezone IS NULL
       AND recurrence_anchor_date IS NULL
       AND recurrence_month_rule IS NULL
-      AND recurrence_occurrence_date IS NULL)
+      AND recurrence_occurrence_date IS NULL
+      AND recurrence_occurrence_time IS NULL)
 )
+CHECK (recurrence_occurrence_time IS NULL
+       OR recurrence_occurrence_date IS NOT NULL)
 CHECK (
   recurrence_freq IS DISTINCT FROM 'weekly'
   OR (recurrence_byweekday IS NOT NULL AND cardinality(recurrence_byweekday) > 0)
@@ -502,6 +506,7 @@ until:     date | null
 timezone:  IANA
 anchor:    date — исходная дата серии
 slot:      date | null — дата правила, которую занимает перенесённое вхождение
+slot_time: time | null — время суток серии при заданной дате слота
 ```
 
 Текущий срок (`due_at`/`due_date`) — ближайшее вхождение. Следующее вхождение
@@ -511,9 +516,18 @@ slot:      date | null — дата правила, которую занима�
 
 **Слот вхождения.** При переносе текущего вхождения в `recurrence_occurrence_date`
 записывается дата правила, которую оно занимало (`coalesce(прежний слот, дата
-текущего срока)`). Повторный перенос слот не меняет; возврат срока на слот
-обнуляет поле. Выполнение, смена срока или правила поле обнуляют. `NULL`
-означает, что срок стоит на своей дате правила.
+текущего срока)`), а в `recurrence_occurrence_time` — время суток серии
+(локальное время текущего срока или `NULL` для вседневного). Повторный перенос
+слот не меняет; возврат срока на исходные дату и время суток обнуляет оба поля.
+Выполнение, смена срока или правила поля обнуляют. `NULL` в дате означает, что
+срок стоит на своей дате правила; `NULL` во времени при заданной дате — что
+серия вседневная. Если слот задан, следующие вхождения после выполнения и в
+календаре получают тип срока и время из слота.
+
+**Сетка от якоря.** Следующая дата daily/monthly/yearly с интервалом больше 1
+считается по сетке от `anchor_date`, а не как «срок + интервал». У строки со
+сроком вне сетки (например, `anchor_date` задан через API) следующий срок может
+сдвинуться к ближайшему вхождению сетки.
 
 ### Алгоритм
 
@@ -531,7 +545,8 @@ slot:      date | null — дата правила, которую занима�
 7. Повторять шаги 2–6, пока вхождение не окажется строго позже максимума из
    текущего срока, слота вхождения и момента завершения (просроченная серия не
    порождает вхождений в прошлом).
-8. Сохранить новый срок; для timed-задачи — в UTC с учётом timezone.
+8. Сохранить новый срок; для timed-задачи — в UTC с учётом timezone. Если
+   слот вхождения задан, тип срока и время суток берутся из слота.
 
 ### Примеры
 
