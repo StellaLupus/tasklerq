@@ -400,6 +400,7 @@ pub(super) async fn insert_snooze(
         item_id: Some(item_id),
         kind: NotificationKind::Snooze,
         occurrence_key: &occurrence_key,
+        origin_key: None,
         scheduled_at: deliver_at,
     };
     if batched {

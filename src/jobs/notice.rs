@@ -10,7 +10,7 @@ use chrono_tz::Tz;
 use sqlx::FromRow;
 use uuid::Uuid;
 
-use super::keys::{all_day_occurrence_key, digest_occurrence_key, occurrence_key};
+use super::keys::{digest_occurrence_key, item_occurrence_key};
 use super::quiet::resolved_timezone;
 use crate::domain::models::ItemStatus;
 use crate::domain::settings::NotificationSettings;
@@ -98,11 +98,7 @@ impl NoticeRow {
 
     /// Ключ текущего вхождения элемента.
     pub(crate) fn current_key(&self) -> Option<String> {
-        match (self.item_due_at, self.item_due_date) {
-            (Some(due_at), None) => Some(occurrence_key(due_at)),
-            (None, Some(due_date)) => Some(all_day_occurrence_key(due_date)),
-            _ => None,
-        }
+        item_occurrence_key(self.item_due_at, self.item_due_date)
     }
 
     /// Задача существует, открыта и имеет название.

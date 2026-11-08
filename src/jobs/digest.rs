@@ -135,6 +135,7 @@ pub async fn plan(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error>
             item_id: None,
             kind: NotificationKind::Digest,
             occurrence_key: &occurrence_key,
+            origin_key: None,
             scheduled_at,
         };
         match notifications::insert(&mut conn, &delivery, now).await {

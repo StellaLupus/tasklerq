@@ -342,7 +342,7 @@ household.
 `{"redacted": true}`.
 
 `notification_deliveries`: `id`, `household_id`, `user_id`, `item_id` (NULL для
-сводки), `occurrence_key`, `kind`, `status`, `scheduled_at`, `deferred`,
+сводки), `occurrence_key`, `origin_key`, `kind`, `status`, `scheduled_at`, `deferred`,
 `outbox_seq`, `batch_id`, `batch_version`, `batch_state`, `batch_snoozed_until`,
 `batched`, `created_at`, `updated_at`; UNIQUE `(user_id, item_id,
 occurrence_key, kind)`. `kind` — `reminder`, `digest`, `assignment` или
@@ -350,10 +350,16 @@ occurrence_key, kind)`. `kind` — `reminder`, `digest`, `assignment` или
 запись, хотя бы раз отложенную тихими часами: перенесённая через полночь
 сводка или вседневное напоминание не отменяются только из-за смены локальной
 даты. `snooze` — отдельная доставка отложенного напоминания, её ключ включает
-время snooze. Отложенное («😴») напоминание отменяется, если к моменту
-доставки у получателя выключены напоминания. `batch_id` связывает доставку со
-сводным сообщением, `batch_version` хранит версию задачи на момент выпуска,
-`batch_state` — итог действия над блоком (`done`/`snoozed`/`missing`),
+время snooze. `origin_key` — вхождение срока, из которого отложили snooze:
+ключ напоминания (`due_at` в UTC или `date:YYYY-MM-DD`), `no-due` у задачи без
+срока или NULL у записи, созданной до миграции 0014; у остальных видов пусто.
+Отложенное («😴») напоминание отменяется, если к моменту
+доставки у получателя выключены напоминания, а также когда `snooze_origin`
+текущего срока не равен `origin_key`; NULL не устаревает. Повторный snooze на
+то же время перепривязывает `pending`- или `cancelled`-запись к текущему
+вхождению и сбрасывает её перенос, батч и `outbox_seq`. `batch_id` связывает
+доставку со сводным сообщением, `batch_version` хранит версию задачи на момент
+выпуска, `batch_state` — итог действия над блоком (`done`/`snoozed`/`missing`),
 `batched` отмечает групповой snooze.
 Для сводок `item_id` равен NULL, поэтому уникальность обеспечивается
 `UNIQUE NULLS NOT DISTINCT` (PostgreSQL 15+). Составные внешние ключи
