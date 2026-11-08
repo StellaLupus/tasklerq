@@ -11,8 +11,9 @@ use support::telegram::{Call, FakeTelegram, Harness, button_rows};
 use support::{TestHousehold, create_item, db, new_item, next_telegram_id};
 use tasklerq::admin;
 use tasklerq::config::TenancyMode;
+use tasklerq::domain::error::DomainError;
 use tasklerq::domain::models::{
-    Actor, ItemPatch, ItemPriority, ItemStatus, ListKind, RecurrenceFreq, UserRole,
+    Actor, Field, ItemPatch, ItemPriority, ItemStatus, ListKind, RecurrenceFreq, UserRole,
 };
 use tasklerq::domain::recurrence::Due;
 use tasklerq::domain::settings::NotificationSettings;
@@ -5293,6 +5294,170 @@ async fn stale_card_without_completion_context_does_not_revert_a_newer_completio
         unchanged.version, completed_again.version,
         "the stale button must not revert Bob's completion"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_journal_card_does_not_revert_an_edit_of_a_task_without_recurrence() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let today = NaiveDate::from_ymd_opt(2026, 11, 6).expect("date");
+    let tomorrow = today + Duration::days(1);
+    let now = local_utc(moscow, today, 12, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut input = new_item(household.tasks_list_id, "Оплатить интернет");
+    input.due_date = Some(today);
+    let task = create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &actor,
+        task.id,
+        Some(task.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("Alice completes");
+    drop(conn);
+
+    // Алиса открывает карточку из журнала: она помнит версию выполнения.
+    bot.press("Задачи").await;
+    bot.press("История").await;
+    bot.press("Оплатить интернет").await;
+    bot.assert_has_button("↩️ Вернуть");
+
+    // Пока карточка открыта, Боб меняет срок задачи.
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let edited = items::update(
+        &mut conn,
+        household.household_id,
+        &actor,
+        task.id,
+        completed.version,
+        ItemPatch {
+            due_date: Field::Value(tomorrow),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        now + Duration::minutes(1),
+    )
+    .await
+    .expect("Bob moves the due date");
+    drop(conn);
+    assert_ne!(edited.version, completed.version);
+
+    bot.press("Вернуть").await;
+
+    let answers = bot.fake.answers();
+    let (_, text, _) = answers.last().expect("an answer to the callback");
+    assert!(
+        text.as_deref()
+            .is_some_and(|text| text.contains("Данные уже изменились")),
+        "a stale journal card must explain the conflict: {answers:?}"
+    );
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let unchanged = items::get(&mut conn, household.household_id, task.id)
+        .await
+        .expect("item");
+    drop(conn);
+    assert_eq!(unchanged.status, ItemStatus::Done);
+    assert_eq!(unchanged.version, edited.version);
+    assert_eq!(
+        unchanged.due_date,
+        Some(tomorrow),
+        "the stale card must not restore the due date from the snapshot"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_recurrence_after_completion_hides_revert_and_rejects_it() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let today = NaiveDate::from_ymd_opt(2026, 11, 6).expect("date");
+    let now = local_utc(moscow, today, 12, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut input = new_item(household.tasks_list_id, "Полить цветы");
+    input.due_date = Some(today);
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Daily, Vec::new()));
+    let task = create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &actor,
+        task.id,
+        Some(task.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("complete");
+    assert_eq!(completed.status, ItemStatus::Open);
+    let completion_id =
+        items::completions::latest_for_item(&mut conn, household.household_id, task.id)
+            .await
+            .expect("latest completion")
+            .expect("a completion is recorded")
+            .completion
+            .event_id;
+    let edited = items::update(
+        &mut conn,
+        household.household_id,
+        &actor,
+        task.id,
+        completed.version,
+        ItemPatch {
+            recurrence: Field::Null,
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        now + Duration::minutes(1),
+    )
+    .await
+    .expect("remove the recurrence");
+    assert_eq!(edited.status, ItemStatus::Open);
+    assert!(edited.recurrence.is_none());
+    drop(conn);
+
+    bot.press("Задачи").await;
+    bot.press("История").await;
+    bot.press("Полить цветы").await;
+    assert!(
+        bot.find_button("↩️ Вернуть").is_none(),
+        "a task reopened by removing its recurrence cannot be reverted:\n{}",
+        bot.screen()
+    );
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let error = items::revert_completion(
+        &mut conn,
+        household.household_id,
+        &actor,
+        task.id,
+        completion_id,
+        now + Duration::minutes(2),
+    )
+    .await
+    .expect_err("the completion is older than the recurrence edit");
+    assert!(
+        matches!(error, DomainError::Conflict { .. }),
+        "expected a conflict, got {error:?}"
+    );
+    let unchanged = items::get(&mut conn, household.household_id, task.id)
+        .await
+        .expect("item");
+    drop(conn);
+    assert_eq!(unchanged.status, ItemStatus::Open);
+    assert_eq!(unchanged.version, edited.version);
+    assert_eq!(unchanged.due_date, edited.due_date);
+    assert_eq!(unchanged.completed_at, edited.completed_at);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

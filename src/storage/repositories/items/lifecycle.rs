@@ -172,10 +172,11 @@ pub async fn reopen(
 
 /// Вернуть в работу выполнение из журнала.
 ///
-/// Возвращается только последнее неотменённое выполнение. У задачи без
-/// повторения это прежний [`reopen`]; у повторяющейся — только пока элемент не
-/// менялся после выполнения, иначе восстановленный срок разошёлся бы с
-/// текущим состоянием серии.
+/// Возвращается только последнее неотменённое выполнение. У выполненной задачи
+/// без повторения это прежний [`reopen`]; в остальных случаях — в том числе
+/// когда повторение сняли после выполнения и задача снова открыта, — только
+/// пока элемент не менялся после выполнения. Иначе восстановленный срок
+/// разошёлся бы с текущим состоянием.
 pub async fn revert_completion(
     conn: &mut PgConnection,
     household_id: Uuid,
@@ -201,17 +202,15 @@ pub async fn revert_completion(
         .get("before")
         .and_then(|before| serde_json::from_value::<Item>(before.clone()).ok());
 
-    if row.recurrence().is_some() {
-        if completion.completion.version_after != Some(row.version) {
-            return Err(DomainError::conflict(
-                "the item changed after the completion",
-            ));
-        }
-        if snapshot.is_none() {
-            return Err(DomainError::conflict(
-                "stored completion snapshot is invalid",
-            ));
-        }
+    if !completions::revertible(&current, Some(&completion.completion)) {
+        return Err(DomainError::conflict(
+            "the item changed after the completion",
+        ));
+    }
+    if row.recurrence().is_some() && snapshot.is_none() {
+        return Err(DomainError::conflict(
+            "stored completion snapshot is invalid",
+        ));
     }
 
     restore_snapshot(

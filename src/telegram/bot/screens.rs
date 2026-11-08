@@ -1,6 +1,6 @@
 //! Сборка экранов: меню, списки, «Мои задачи» и поиск.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::domain::models::{Item, ItemPriority, ItemStatus, List, ListKind};
 use crate::domain::search::SearchFilters;
-use crate::storage::repositories::{drafts, items, lists, users};
+use crate::storage::repositories::{drafts, items, lists};
 use crate::telegram::rich::{Block, Span, button};
 use crate::telegram::ru;
 
@@ -540,21 +540,8 @@ async fn history(ctx: &mut Ctx<'_>, page: u32, back: &Screen) -> Result<Ui, Fail
     let household_id = ctx.household()?.id;
     let journal =
         items::completions::journal_page(&mut *ctx.conn, household_id, ctx.tz, page).await?;
-    let names: HashMap<Uuid, String> = users::list_active(&mut *ctx.conn, household_id)
-        .await?
-        .into_iter()
-        .map(|user| (user.id, user.display_name))
-        .collect();
-    let list_name = match back {
-        Screen::List { list_id, .. } => {
-            match lists::get_visible(&mut *ctx.conn, household_id, *list_id).await {
-                Ok(list) => Some(list.name),
-                Err(crate::domain::error::DomainError::NotFound) => None,
-                Err(error) => return Err(error.into()),
-            }
-        }
-        _ => None,
-    };
+    let names = card::names(ctx).await?;
+    let list_name = card::parent_list_name(ctx, back).await?;
     let screen = Screen::History {
         page: journal.page,
         back: Box::new(back.clone()),

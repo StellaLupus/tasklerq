@@ -159,6 +159,7 @@
 ## 11. Интеграция
 
 - [x] 11.1 Прогнать `make lint && make test` и `openspec validate 0004-telegram-ux-rework --strict`. Проверить: нет предупреждений clippy, тесты и валидация проходят.
+  - Проверено 2026-11-08: `make lint && make test` и `openspec validate 0004-telegram-ux-rework --strict` прошли; clippy без предупреждений.
 - [ ] 11.2 Пройти ручной чек-лист клиентов `docs/telegram-ux.md` §15, обновлённый под новые экраны, на iOS, Android и Desktop. Записать результат с датой.
 
 ## Workflow follow-up

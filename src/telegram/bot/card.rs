@@ -126,7 +126,7 @@ pub(super) async fn due_editable_item(ctx: &mut Ctx<'_>, item_id: Uuid) -> Resul
     Ok(due_editable(&item, &list))
 }
 
-async fn names(ctx: &mut Ctx<'_>) -> Result<HashMap<Uuid, String>, Fail> {
+pub(super) async fn names(ctx: &mut Ctx<'_>) -> Result<HashMap<Uuid, String>, Fail> {
     let household_id = ctx.household()?.id;
     Ok(users::list_active(&mut *ctx.conn, household_id)
         .await?
@@ -146,7 +146,10 @@ fn list_id_in_chain(screen: &Screen) -> Option<Uuid> {
 }
 
 /// Имя списка из цепочки `back` для хлебных крошек.
-async fn parent_list_name(ctx: &mut Ctx<'_>, back: &Screen) -> Result<Option<String>, Fail> {
+pub(super) async fn parent_list_name(
+    ctx: &mut Ctx<'_>,
+    back: &Screen,
+) -> Result<Option<String>, Fail> {
     let Some(list_id) = list_id_in_chain(back) else {
         return Ok(None);
     };
@@ -275,14 +278,16 @@ pub async fn view(
         )
     };
     // Кнопка есть ровно тогда, когда `revert_completion` пройдёт: выполнение
-    // последнее, а повторяющаяся задача не менялась после него.
+    // последнее, а элемент не менялся после него (кроме выполненной задачи без
+    // повторения). Условие общее с доменной проверкой.
     let latest = completions.first();
-    let latest_revertible = latest.is_some_and(|latest| {
-        item.recurrence.is_none() || latest.version_after == Some(item.version)
-    });
-    let revertible = completion_id.map_or(latest_revertible, |id| {
-        latest.is_some_and(|latest| latest.event_id == id) && latest_revertible
-    });
+    let revertible = completion_id.map_or_else(
+        || items::completions::revertible(&item, latest),
+        |id| {
+            latest.is_some_and(|latest| latest.event_id == id)
+                && items::completions::revertible(&item, latest)
+        },
+    );
 
     let edit = button(
         ru::EDIT_BUTTON,
@@ -294,14 +299,8 @@ pub async fn view(
     let main = if done {
         if shopping {
             Some(revert(None))
-        } else if completion_id.is_some() || item.recurrence.is_some() {
-            // Для повторяющейся задачи без контекста условия те же, что у
-            // карточки из журнала: возврат доступен, пока задача не менялась
-            // после последнего выполнения. Задача без повторения возвращается
-            // и без событий — прежним `reopen`.
-            revertible.then(|| revert(completion_id))
         } else {
-            Some(revert(None))
+            revertible.then(|| revert(completion_id))
         }
     } else {
         Some(button(
@@ -733,22 +732,17 @@ pub async fn reopen(
     let actor = ctx.actor()?;
     let (item, list) = load(ctx, item_id).await?;
     let result = if list.kind == ListKind::Tasks {
+        // Кнопка помнит версию элемента на момент отрисовки. Это относится и к
+        // карточкам из журнала и «Выполнено сегодня»: если задачу успели
+        // изменить, возврат по старой кнопке затёр бы правку снимком.
+        if item.version != version {
+            return Err(DomainError::conflict("the item changed after the card was shown").into());
+        }
         let completion_id = match completion_id {
             Some(completion_id) => Some(completion_id),
-            None => {
-                // Карточка без контекста выполнения: кнопка помнит версию
-                // элемента на момент отрисовки. Если задача успела измениться,
-                // последнее выполнение могло стать чужим — возвращать его по
-                // старой кнопке нельзя.
-                if item.version != version {
-                    return Err(
-                        DomainError::conflict("the item changed after the card was shown").into(),
-                    );
-                }
-                items::completions::latest_for_item(&mut *ctx.conn, household_id, item_id)
-                    .await?
-                    .map(|event| event.completion.event_id)
-            }
+            None => items::completions::latest_for_item(&mut *ctx.conn, household_id, item_id)
+                .await?
+                .map(|event| event.completion.event_id),
         };
         match completion_id {
             Some(completion_id) => {

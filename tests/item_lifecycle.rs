@@ -3666,6 +3666,42 @@ async fn journal_hides_completions_of_a_deleted_task() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn journal_skips_purchases() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let mut input = support::new_item(household.shopping_list_id, "Молоко");
+    input.due_date = Some(date(2025, 11, 4));
+    let purchase = support::create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        purchase.id,
+        Some(purchase.version),
+        "Europe/Moscow",
+        utc(2025, 11, 6, 10),
+    )
+    .await
+    .expect("mark the purchase as bought");
+
+    let page = journal(&mut conn, &household, 0).await;
+    assert!(
+        page.entries.is_empty(),
+        "the journal holds task completions only: {page:?}"
+    );
+    assert_eq!(page.pages, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn journal_lists_every_occurrence_of_a_recurring_task() {
     let db = support::db().await;
     let household = support::create_household(&db.pool).await;

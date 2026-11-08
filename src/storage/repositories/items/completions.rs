@@ -11,6 +11,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
+use crate::domain::models::{Item, ItemStatus};
 
 /// Название выполнения, если снимок `payload.before` его не сохранил.
 pub const UNTITLED: &str = "Без названия";
@@ -110,6 +111,19 @@ impl JournalPage {
     pub fn has_next(&self) -> bool {
         self.page + 1 < self.pages
     }
+}
+
+/// Доступен ли возврат выполнения в текущем состоянии элемента.
+///
+/// У выполненной задачи без повторения возврат — прежний `reopen`. В
+/// остальных случаях, в том числе когда повторение сняли после выполнения и
+/// задача снова открыта, элемент не должен меняться после выполнения: иначе
+/// восстановленный из снимка срок затёр бы чужую правку.
+pub fn revertible(item: &Item, completion: Option<&Completion>) -> bool {
+    if item.status == ItemStatus::Done && item.recurrence.is_none() {
+        return true;
+    }
+    completion.is_some_and(|completion| completion.version_after == Some(item.version))
 }
 
 /// Сырая строка выборки: снимок остаётся `jsonb`, чтобы разбирать поля
@@ -267,6 +281,9 @@ async fn selected_for_item(
 
 /// Страница журнала выполнений household.
 ///
+/// Журнал ведётся только по задачам: покупки пишут то же событие `completed`,
+/// но их текущий список — не список задач и в журнал не попадает.
+///
 /// Глубину журнала задаёт срок хранения событий: нижней границы по времени
 /// нет. Плановый день считается в SQL из снимка `before`: `due_at` в поясе
 /// пользователя, иначе `due_date`. Битая дата не роняет запрос — запись уходит
@@ -301,7 +318,9 @@ pub async fn journal_page(
                     END AS planned_day
              FROM item_events e
              JOIN items i ON i.id = e.item_id AND i.household_id = e.household_id
+             JOIN lists l ON l.id = i.list_id AND l.household_id = i.household_id
              WHERE {COMPLETION_SELECTION}
+               AND l.kind = 'tasks'
          ),
          paged AS (
              SELECT *
