@@ -636,7 +636,9 @@ fn batch_entry(row: &BatchDelivery, tz: Tz, now: DateTime<Utc>) -> BatchEntry {
     } else {
         match row.batch_state {
             Some(BatchState::Done) => BatchEntryState::Done,
-            Some(BatchState::Snoozed) if row.snooze_status.as_deref() != Some("cancelled") => {
+            // Записи snooze могло уже не быть (retention удалил `sent` или
+            // `cancelled`): это не отмена, поэтому блок остаётся отложенным.
+            Some(BatchState::Snoozed) if !row.snooze_cancelled => {
                 BatchEntryState::Snoozed(row.batch_snoozed_until.unwrap_or(now))
             }
             Some(BatchState::Snoozed) => task_state(),

@@ -178,9 +178,12 @@ fn last_toast(bot: &Harness) -> Option<String> {
         .and_then(|(_, text, _)| text)
 }
 
-async fn snooze_rows(pool: &PgPool, item_id: Uuid) -> Vec<(String, DateTime<Utc>, String)> {
+async fn snooze_rows(
+    pool: &PgPool,
+    item_id: Uuid,
+) -> Vec<(String, DateTime<Utc>, String, Option<String>)> {
     sqlx::query_as(
-        "SELECT status::text, scheduled_at, occurrence_key
+        "SELECT status::text, scheduled_at, occurrence_key, origin_key
          FROM notification_deliveries
          WHERE item_id = $1 AND kind = 'snooze'
          ORDER BY created_at, id",
@@ -197,34 +200,6 @@ async fn item_status(pool: &PgPool, item_id: Uuid) -> (String, Option<DateTime<U
         .fetch_one(pool)
         .await
         .expect("item state")
-}
-
-async fn snooze_origin_key(pool: &PgPool, item_id: Uuid) -> Option<String> {
-    sqlx::query_scalar(
-        "SELECT origin_key FROM notification_deliveries
-         WHERE item_id = $1 AND kind = 'snooze'
-         ORDER BY created_at, id LIMIT 1",
-    )
-    .bind(item_id)
-    .fetch_one(pool)
-    .await
-    .expect("snooze origin")
-}
-
-async fn snooze_origin_rows(
-    pool: &PgPool,
-    item_id: Uuid,
-) -> Vec<(String, Option<String>, DateTime<Utc>)> {
-    sqlx::query_as(
-        "SELECT status::text, origin_key, scheduled_at
-         FROM notification_deliveries
-         WHERE item_id = $1 AND kind = 'snooze'
-         ORDER BY created_at, id",
-    )
-    .bind(item_id)
-    .fetch_all(pool)
-    .await
-    .expect("snooze rows")
 }
 
 async fn reminder_occurrence_key(pool: &PgPool, item_id: Uuid) -> String {
@@ -774,7 +749,7 @@ async fn snooze_records_the_current_occurrence_as_origin() {
 
     let reminder_key = reminder_occurrence_key(&db.pool, timed.id).await;
     assert_eq!(
-        snooze_origin_key(&db.pool, timed.id).await.as_deref(),
+        snooze_rows(&db.pool, timed.id).await[0].3.as_deref(),
         Some(reminder_key.as_str()),
         "a timed snooze must be bound to the reminder occurrence"
     );
@@ -791,7 +766,7 @@ async fn snooze_records_the_current_occurrence_as_origin() {
     let reminder_key = reminder_occurrence_key(&db.pool, all_day.id).await;
     assert_eq!(reminder_key, format!("date:{day}"));
     assert_eq!(
-        snooze_origin_key(&db.pool, all_day.id).await.as_deref(),
+        snooze_rows(&db.pool, all_day.id).await[0].3.as_deref(),
         Some(reminder_key.as_str()),
         "an all-day snooze must be bound to the reminder occurrence"
     );
@@ -1178,7 +1153,7 @@ async fn repeat_morning_snooze_after_due_change(cancel_before_second: bool) {
 
     if cancel_before_second {
         tick_and_deliver(&mut bot, &db.pool, local_utc(moscow, day, 22, 30)).await;
-        let rows = snooze_origin_rows(&db.pool, item.id).await;
+        let rows = snooze_rows(&db.pool, item.id).await;
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].0, "cancelled", "{rows:?}");
     }
@@ -1192,26 +1167,26 @@ async fn repeat_morning_snooze_after_due_change(cancel_before_second: bool) {
     let second_morning = button_of(&redrawn, "Завтра в 09:00");
     bot.press_data(&second_morning, message_id).await;
 
-    let rows = snooze_origin_rows(&db.pool, item.id).await;
+    let rows = snooze_rows(&db.pool, item.id).await;
     assert_eq!(rows.len(), 1, "one snooze record: {rows:?}");
     assert_eq!(rows[0].0, "pending", "{rows:?}");
     assert_eq!(
-        rows[0].1.as_deref(),
+        rows[0].3.as_deref(),
         Some(new_origin.as_str()),
         "the repeated snooze must bind to the new due"
     );
-    assert_eq!(rows[0].2, next_morning, "{rows:?}");
+    assert_eq!(rows[0].1, next_morning, "{rows:?}");
 
     let before = message_count(&bot, "Позвонить маме");
     tick_and_deliver(&mut bot, &db.pool, next_morning).await;
-    let rows = snooze_origin_rows(&db.pool, item.id).await;
+    let rows = snooze_rows(&db.pool, item.id).await;
     assert_eq!(
         rows.len(),
         1,
         "the old binding must not add a delivery: {rows:?}"
     );
     assert_eq!(rows[0].0, "sent", "{rows:?}");
-    assert_eq!(rows[0].1.as_deref(), Some(new_origin.as_str()));
+    assert_eq!(rows[0].3.as_deref(), Some(new_origin.as_str()));
     assert_eq!(message_count(&bot, "Позвонить маме"), before + 1);
 }
 
@@ -1258,14 +1233,14 @@ async fn a_snooze_token_without_a_version_still_snoozes() {
 
     bot.press_data(&snooze, message_id).await;
     assert_eq!(last_toast(&bot).as_deref(), Some("Отложено"));
-    let rows = snooze_origin_rows(&db.pool, item.id).await;
+    let rows = snooze_rows(&db.pool, item.id).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].0, "pending", "{rows:?}");
     assert!(bot.latest().1.contains("😴 Напомню"), "{}", bot.latest().1);
 
     let reminder_key = reminder_occurrence_key(&db.pool, item.id).await;
     assert_eq!(
-        snooze_origin_key(&db.pool, item.id).await.as_deref(),
+        snooze_rows(&db.pool, item.id).await[0].3.as_deref(),
         Some(reminder_key.as_str())
     );
 }

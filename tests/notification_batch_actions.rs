@@ -325,6 +325,76 @@ async fn complete_all_finishes_a_snoozed_block_and_cancels_its_snooze() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_block_completed_from_the_card_stops_promising_a_cancelled_snooze() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = bot.now.with_timezone(&moscow).date_naive();
+    let morning = local_utc(moscow, day, 8, 0);
+    let due = local_utc(moscow, day, 9, 0);
+    let first = create_task(&db.pool, &household, "Первая", due, None).await;
+    let second = create_task(&db.pool, &household, "Вторая", due, None).await;
+    deferred_reminder(&db.pool, &household, first.id, due, morning).await;
+    deferred_reminder(&db.pool, &household, second.id, due, morning).await;
+
+    tick_and_deliver(&mut bot, &db.pool, morning).await;
+    let (message_id, html) = bot.latest();
+    bot.press_data(&button_of(&html, "На час"), message_id)
+        .await;
+    let (snoozed_item, snoozed_at): (Uuid, DateTime<Utc>) = sqlx::query_as(
+        "SELECT item_id, scheduled_at FROM notification_deliveries
+         WHERE kind = 'snooze' AND status = 'pending'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("snooze delivery");
+    let snoozed = batch_message(&bot, message_id);
+    assert!(snoozed.contains("😴 Напомню в"), "{snoozed}");
+
+    // Задачу без повторения выполнили с карточки, а не из сводного.
+    let mut conn = db.pool.acquire().await.expect("conn");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &Actor::user(household.owner_id, UserRole::Owner),
+        snoozed_item,
+        None,
+        "Europe/Moscow",
+        bot.now,
+    )
+    .await
+    .expect("complete from the card");
+
+    // Тик отменяет snooze выполненной задачи ещё до его срока, но само
+    // сообщение до перерисовки всё ещё обещает напоминание.
+    let stats = tick_and_deliver(&mut bot, &db.pool, morning + Duration::minutes(5)).await;
+    assert!(stats.cancelled >= 1, "{stats:?}");
+    assert_eq!(snooze_rows(&db.pool, snoozed_item).await[0].0, "cancelled");
+    let before = batch_message(&bot, message_id);
+    assert!(before.contains("😴 Напомню в"), "{before}");
+
+    // Перерисовка другим действием — «Выполнено» у второй задачи — не трогает
+    // `batch_state` отложенного блока: его `Done` берётся только из задачи.
+    let done_other = button_of(&before, "Выполнено");
+    bot.press_data(&done_other, message_id).await;
+    let edited = batch_message(&bot, message_id);
+    assert_eq!(block_count(&edited, "✅ Выполнено"), 2, "{edited}");
+    assert!(!edited.contains("😴 Напомню в"), "{edited}");
+
+    // Через час отменённый snooze не приходит.
+    let sent_before = bot.fake.sent().len();
+    let stats = tick_and_deliver(&mut bot, &db.pool, snoozed_at).await;
+    assert_eq!(stats.delivered, 0, "{stats:?}");
+    assert_eq!(
+        bot.fake.sent().len(),
+        sent_before,
+        "a task completed from the card must not remind in an hour"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snooze_all_with_one_remaining_task_sends_an_ordinary_message() {
     let db = support::isolated_db().await;
     let mut bot = onboarded(&db.pool).await;
