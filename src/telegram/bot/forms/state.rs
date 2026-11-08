@@ -263,6 +263,20 @@ mod tests {
     }
 
     #[test]
+    fn a_short_weekday_that_is_today_checks_the_time_like_today_does() {
+        let tuesday = date(2026, 11, 3);
+        let mut draft = ItemDraft::default();
+
+        let error = apply_text(Step::DueText, &mut draft, "вт 9:00", tuesday, noon()).unwrap_err();
+        assert_eq!(error, "Это время сегодня уже прошло.");
+        assert_eq!(draft.date, None, "the past due must not be accepted");
+
+        apply_text(Step::DueText, &mut draft, "вт 13:00", tuesday, noon()).expect("future time");
+        assert_eq!(draft.date, Some(tuesday));
+        assert_eq!(draft.time, chrono::NaiveTime::from_hms_opt(13, 0, 0));
+    }
+
+    #[test]
     fn tag_and_subtask_limits_have_clear_messages() {
         let today = date(2026, 10, 30);
         let mut draft = ItemDraft {

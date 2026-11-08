@@ -653,6 +653,34 @@ fn adopt(base: &mut ItemSnapshot, seen: &ItemSnapshot, field: EditorField) {
     }
 }
 
+/// Подставить в черновик значение поля из снимка, который пользователь видел
+/// на экране конфликта: «Оставить текущий» должен показывать ровно то, что
+/// будет записано.
+fn restore(
+    draft: &mut ItemDraft,
+    list_id: &mut Uuid,
+    seen: &ItemSnapshot,
+    seen_draft: &ItemDraft,
+    field: EditorField,
+) {
+    match field {
+        EditorField::Title => draft.title.clone_from(&seen.title),
+        EditorField::Due => {
+            draft.date = seen_draft.date;
+            draft.time = seen_draft.time;
+        }
+        EditorField::Priority => draft.priority = seen.priority,
+        EditorField::Assignee => draft.assignee = seen.assignee,
+        EditorField::Tags => draft.tags.clone_from(&seen.tags),
+        EditorField::Subtasks => draft.subtasks.clone_from(&seen.subtasks),
+        EditorField::Recurrence => draft.recurrence.clone_from(&seen_draft.recurrence),
+        EditorField::Notes => draft.notes.clone_from(&seen.notes),
+        EditorField::List => *list_id = seen.list_id,
+        EditorField::Quantity => draft.quantity = seen.quantity,
+        EditorField::Unit => draft.unit.clone_from(&seen.unit),
+    }
+}
+
 /// «💾 Сохранить»: создание, слияние правки по `touched` или запись пункта
 /// черновика.
 async fn save(ctx: &mut Ctx<'_>, editor: Editor, allow_duplicate: bool) -> Result<(), Fail> {
@@ -682,7 +710,7 @@ async fn save(ctx: &mut Ctx<'_>, editor: Editor, allow_duplicate: bool) -> Resul
     }
 }
 
-/// Конфликты, затем один `items::update` по `touched`.
+/// Конфликты, затем один `items::update` по `touched` (с повтором при гонке).
 async fn save_item(
     ctx: &mut Ctx<'_>,
     mut editor: Editor,
@@ -690,47 +718,15 @@ async fn save_item(
     base: ItemSnapshot,
 ) -> Result<(), Fail> {
     let back = editor.back();
-    let mut retried = false;
-    loop {
-        let household_id = ctx.household()?.id;
-        let current = items::get(&mut *ctx.conn, household_id, item_id).await?;
-        let current_snapshot = ItemSnapshot::from_item(&current);
-        let changed = changed_fields(&editor, &base, ctx.tz)?;
-        if changed.is_empty() {
-            super::clear(ctx).await?;
-            return ctx.present(back).await;
-        }
-
-        let conflicts = conflicts(&editor, &current_snapshot, &base, &changed, ctx.tz)?;
-        if !conflicts.is_empty() {
-            editor.conflict = Some(conflicts);
-            editor.conflict_seen = Some(Box::new(current_snapshot));
-            return show(ctx, editor).await;
-        }
-        match write(ctx, &editor, &current, &changed).await? {
-            WriteOutcome::Saved => {
-                super::clear(ctx).await?;
-                ctx.banner("Сохранено");
-                return ctx.present(back).await;
-            }
-            WriteOutcome::Validation => {
-                editor.error = Some("Проверьте введённые значения.".to_owned());
-                return show(ctx, editor).await;
-            }
-            WriteOutcome::Conflict => {
-                // Между чтением и записью элемент изменил другой участник.
-                // Повторяем один раз с новым снимком; если конфликт остался или
-                // всплыл снова, показываем его, не теряя введённые значения.
-                if conflict_action(retried) == ConflictAction::Retry {
-                    retried = true;
-                    continue;
-                }
-                editor.conflict = Some(changed);
-                editor.conflict_seen = Some(Box::new(current_snapshot));
-                return show(ctx, editor).await;
-            }
-        }
-    }
+    let timezone = ctx.tz;
+    let attempt = {
+        let mut backend = DbSaveBackend {
+            ctx: &mut *ctx,
+            item_id,
+        };
+        save_with_retry(&mut editor, &base, timezone, &mut backend).await?
+    };
+    finish_save(ctx, editor, back, attempt).await
 }
 
 /// Создать элемент из редактора.
@@ -841,18 +837,125 @@ enum WriteOutcome {
     Conflict,
 }
 
-/// Решение по конфликту записи: один повтор, затем экран конфликта.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConflictAction {
-    Retry,
-    Show,
+/// Итог попытки сохранить редактор.
+enum SaveAttempt {
+    /// Менять нечего.
+    NothingChanged,
+    /// Запись прошла.
+    Saved,
+    /// Домен отверг значения.
+    Validation,
+    /// Показан экран конфликта; `editor` уже содержит поля и снимок.
+    Conflict,
 }
 
-fn conflict_action(retried: bool) -> ConflictAction {
-    if retried {
-        ConflictAction::Show
-    } else {
-        ConflictAction::Retry
+/// Источник данных для записи: чтение свежего элемента и сама запись.
+/// Отдельный тип позволяет проверить повтор конфликта без базы.
+trait SaveBackend {
+    async fn load(&mut self) -> Result<Item, Fail>;
+    async fn write(
+        &mut self,
+        editor: &Editor,
+        changed: &BTreeSet<EditorField>,
+        current: &Item,
+    ) -> Result<WriteOutcome, Fail>;
+}
+
+/// Боевой источник: читает и пишет через `Ctx`.
+struct DbSaveBackend<'a, 'c> {
+    ctx: &'a mut Ctx<'c>,
+    item_id: Uuid,
+}
+
+impl SaveBackend for DbSaveBackend<'_, '_> {
+    async fn load(&mut self) -> Result<Item, Fail> {
+        let household_id = self.ctx.household()?.id;
+        Ok(items::get(&mut *self.ctx.conn, household_id, self.item_id).await?)
+    }
+
+    async fn write(
+        &mut self,
+        editor: &Editor,
+        changed: &BTreeSet<EditorField>,
+        current: &Item,
+    ) -> Result<WriteOutcome, Fail> {
+        write(self.ctx, editor, current, changed).await
+    }
+}
+
+/// Сохранить редактор: конфликты по `touched`, один повтор при гонке записи.
+///
+/// Если после повтора конфликт снова пришёл из-за изменения нетронутых полей,
+/// экран не показываем — повторяем запись по свежей версии, пока не останется
+/// реальных расхождений.
+async fn save_with_retry<B: SaveBackend>(
+    editor: &mut Editor,
+    base: &ItemSnapshot,
+    timezone: chrono_tz::Tz,
+    backend: &mut B,
+) -> Result<SaveAttempt, Fail> {
+    let mut retried = false;
+    loop {
+        let current = backend.load().await?;
+        let current_snapshot = ItemSnapshot::from_item(&current);
+        let changed = changed_fields(editor, base, timezone)?;
+        if changed.is_empty() {
+            return Ok(SaveAttempt::NothingChanged);
+        }
+        let next = conflicts(editor, &current_snapshot, base, &changed, timezone)?;
+        if !next.is_empty() {
+            editor.conflict = Some(next);
+            editor.conflict_seen = Some(Box::new(current_snapshot));
+            return Ok(SaveAttempt::Conflict);
+        }
+        match backend.write(editor, &changed, &current).await? {
+            WriteOutcome::Saved => return Ok(SaveAttempt::Saved),
+            WriteOutcome::Validation => return Ok(SaveAttempt::Validation),
+            WriteOutcome::Conflict => {
+                if !retried {
+                    retried = true;
+                    continue;
+                }
+                // Перечитываем: снимок перед записью мог устареть.
+                let current = backend.load().await?;
+                let fresh = ItemSnapshot::from_item(&current);
+                let changed = changed_fields(editor, base, timezone)?;
+                let fields = conflicts(editor, &fresh, base, &changed, timezone)?;
+                if fields.is_empty() {
+                    // Изменили нетронутое поле: повторяем запись, а не
+                    // показываем пустой экран конфликта.
+                    continue;
+                }
+                editor.conflict = Some(fields);
+                editor.conflict_seen = Some(Box::new(fresh));
+                return Ok(SaveAttempt::Conflict);
+            }
+        }
+    }
+}
+
+/// Показать итог сохранения редактора.
+async fn finish_save(
+    ctx: &mut Ctx<'_>,
+    mut editor: Editor,
+    back: Screen,
+    attempt: SaveAttempt,
+) -> Result<(), Fail> {
+    match attempt {
+        SaveAttempt::NothingChanged => {
+            super::clear(ctx).await?;
+            ctx.present(back).await
+        }
+        SaveAttempt::Saved => {
+            super::clear(ctx).await?;
+            ctx.banner("Сохранено");
+            ctx.present(back).await
+        }
+        SaveAttempt::Validation => {
+            editor.error = Some("Проверьте введённые значения.".to_owned());
+            show(ctx, editor).await
+        }
+        SaveAttempt::Conflict => show(ctx, editor).await,
     }
 }
 
@@ -986,13 +1089,14 @@ async fn resolve_conflict(
         return show(ctx, editor).await;
     };
     let back = editor.back();
-    let household_id = ctx.household()?.id;
-    let current = items::get(&mut *ctx.conn, household_id, item_id).await?;
-    let current_snapshot = ItemSnapshot::from_item(&current);
-    let seen = editor
-        .conflict_seen
-        .take()
-        .unwrap_or_else(|| Box::new(current_snapshot.clone()));
+    let seen = match editor.conflict_seen.take() {
+        Some(seen) => seen,
+        None => {
+            let household_id = ctx.household()?.id;
+            let current = items::get(&mut *ctx.conn, household_id, item_id).await?;
+            Box::new(ItemSnapshot::from_item(&current))
+        }
+    };
     if mine {
         // «Оставить мой» — это база поля из экрана конфликта: элементы,
         // которые другой участник успел изменить, пока экран был открыт,
@@ -1001,41 +1105,31 @@ async fn resolve_conflict(
             adopt(&mut base, seen.as_ref(), *field);
         }
     } else {
+        let seen_draft = ItemDraft::from_snapshot(seen.as_ref(), ctx.tz);
         for field in &resolved {
             editor.touched.remove(field);
+            restore(
+                &mut editor.draft,
+                &mut editor.list_id,
+                seen.as_ref(),
+                &seen_draft,
+                *field,
+            );
         }
     }
     if mine && let EditorTarget::Item { base: stored, .. } = &mut editor.target {
         // Решённые поля остаются в базе и для следующего экрана конфликта.
         **stored = base.clone();
     }
-    let changed = changed_fields(&editor, &base, ctx.tz)?;
-    if changed.is_empty() {
-        super::clear(ctx).await?;
-        return ctx.present(back).await;
-    }
-    let next = conflicts(&editor, &current_snapshot, &base, &changed, ctx.tz)?;
-    if !next.is_empty() {
-        editor.conflict = Some(next);
-        editor.conflict_seen = Some(Box::new(current_snapshot));
-        return show(ctx, editor).await;
-    }
-    match write(ctx, &editor, &current, &changed).await? {
-        WriteOutcome::Saved => {
-            super::clear(ctx).await?;
-            ctx.banner("Сохранено");
-            ctx.present(back).await
-        }
-        WriteOutcome::Validation => {
-            editor.error = Some("Проверьте введённые значения.".to_owned());
-            show(ctx, editor).await
-        }
-        WriteOutcome::Conflict => {
-            super::clear(ctx).await?;
-            ctx.banner(super::super::CHANGED_STATE_MESSAGE);
-            ctx.present(back).await
-        }
-    }
+    let timezone = ctx.tz;
+    let attempt = {
+        let mut backend = DbSaveBackend {
+            ctx: &mut *ctx,
+            item_id,
+        };
+        save_with_retry(&mut editor, &base, timezone, &mut backend).await?
+    };
+    finish_save(ctx, editor, back, attempt).await
 }
 
 async fn cancel(ctx: &mut Ctx<'_>, editor: Editor) -> Result<(), Fail> {
@@ -1440,7 +1534,7 @@ async fn increase_duplicate(
 mod tests {
     use chrono::{NaiveDate, NaiveTime};
 
-    use crate::domain::models::ItemPriority;
+    use crate::domain::models::{ItemPriority, ItemSource, ItemStatus};
 
     use super::*;
     use crate::telegram::bot::model::SubtaskDraft;
@@ -1474,6 +1568,26 @@ mod tests {
                 done: false,
             }],
             ..ItemDraft::default()
+        }
+    }
+
+    fn editor_with(draft: ItemDraft, base: &ItemSnapshot, touched: &[EditorField]) -> Editor {
+        Editor {
+            target: EditorTarget::Item {
+                item_id: Uuid::nil(),
+                base: Box::new(base.clone()),
+                back: Screen::Menu,
+            },
+            draft,
+            touched: touched.iter().copied().collect(),
+            field: None,
+            field_back: None,
+            field_backup: None,
+            list_id: base.list_id,
+            error: None,
+            conflict: None,
+            conflict_seen: None,
+            duplicate: None,
         }
     }
 
@@ -1558,10 +1672,185 @@ mod tests {
         assert!(!draft_rule_eq(None, Some(&rule)));
     }
 
+    fn item(title: &str, notes: Option<&str>) -> Item {
+        Item {
+            id: Uuid::nil(),
+            household_id: Uuid::nil(),
+            list_id: Uuid::nil(),
+            title: title.into(),
+            notes: notes.map(str::to_owned),
+            status: ItemStatus::Open,
+            priority: ItemPriority::Normal,
+            due_at: None,
+            due_date: None,
+            assignee_user_id: None,
+            created_by_user_id: None,
+            source: ItemSource::Telegram,
+            capture_id: None,
+            completed_at: None,
+            completed_by_user_id: None,
+            quantity: None,
+            unit: None,
+            position: 0,
+            version: 1,
+            recurrence: None,
+            created_at: chrono::DateTime::UNIX_EPOCH,
+            updated_at: chrono::DateTime::UNIX_EPOCH,
+            deleted_at: None,
+            tags: Vec::new(),
+            subtasks: Vec::new(),
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeBackend {
+        items: std::collections::VecDeque<Item>,
+        outcomes: std::collections::VecDeque<WriteOutcome>,
+        loads: usize,
+        write_titles: Vec<String>,
+    }
+
+    impl FakeBackend {
+        fn new(items: Vec<Item>, outcomes: Vec<WriteOutcome>) -> Self {
+            Self {
+                items: items.into(),
+                outcomes: outcomes.into(),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl SaveBackend for FakeBackend {
+        async fn load(&mut self) -> Result<Item, Fail> {
+            self.loads += 1;
+            Ok(self.items.pop_front().expect("fake load"))
+        }
+
+        async fn write(
+            &mut self,
+            _editor: &Editor,
+            _changed: &BTreeSet<EditorField>,
+            current: &Item,
+        ) -> Result<WriteOutcome, Fail> {
+            self.write_titles.push(current.title.clone());
+            Ok(self.outcomes.pop_front().expect("fake write outcome"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_conflict_is_retried_and_then_saved() {
+        let base = snapshot();
+        let mut draft = draft();
+        draft.title = "Новое".into();
+        let mut editor = editor_with(draft, &base, &[EditorField::Title]);
+        // Другой участник изменил нетронутое поле: повтор читает свежий
+        // элемент и записывает по новой версии.
+        let mut backend = FakeBackend::new(
+            vec![item("Старое", None), item("Старое", Some("чужая заметка"))],
+            vec![WriteOutcome::Conflict, WriteOutcome::Saved],
+        );
+
+        let attempt = save_with_retry(&mut editor, &base, chrono_tz::UTC, &mut backend)
+            .await
+            .expect("save");
+
+        assert!(matches!(attempt, SaveAttempt::Saved));
+        assert_eq!(backend.loads, 2, "the conflict rereads the element");
+        assert_eq!(
+            backend.write_titles,
+            ["Старое", "Старое"],
+            "the second write uses the freshly read element"
+        );
+        assert!(editor.conflict.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_second_write_conflict_shows_only_real_fields() {
+        let base = snapshot();
+        let mut draft = draft();
+        draft.title = "Новое".into();
+        let mut editor = editor_with(draft, &base, &[EditorField::Title]);
+        let mut backend = FakeBackend::new(
+            vec![
+                item("Старое", None),
+                // Между чтением и записью изменили нетронутую заметку.
+                item("Старое", Some("чужая заметка")),
+                // После второго конфликта свежий снимок: тот же срок/название
+                // уже изменён другим участником.
+                item("Чужое", Some("чужая заметка")),
+            ],
+            vec![WriteOutcome::Conflict, WriteOutcome::Conflict],
+        );
+
+        let attempt = save_with_retry(&mut editor, &base, chrono_tz::UTC, &mut backend)
+            .await
+            .expect("save");
+
+        assert!(matches!(attempt, SaveAttempt::Conflict));
+        assert_eq!(backend.loads, 3, "the second conflict rereads the element");
+        assert_eq!(
+            editor.conflict,
+            Some(BTreeSet::from([EditorField::Title])),
+            "only the field that really differs is shown"
+        );
+        assert_eq!(editor.draft.title, "Новое", "the draft is not cleared");
+        let seen = editor.conflict_seen.as_deref().expect("seen snapshot");
+        assert_eq!(seen.title, "Чужое", "the screen uses the fresh snapshot");
+    }
+
+    #[tokio::test]
+    async fn a_conflict_on_an_untouched_field_retries_instead_of_a_blank_screen() {
+        let base = snapshot();
+        let mut draft = draft();
+        draft.title = "Новое".into();
+        let mut editor = editor_with(draft, &base, &[EditorField::Title]);
+        let mut backend = FakeBackend::new(
+            vec![
+                item("Старое", None),
+                item("Старое", Some("первая заметка")),
+                item("Старое", Some("вторая заметка")),
+                item("Старое", Some("третья заметка")),
+            ],
+            vec![
+                WriteOutcome::Conflict,
+                WriteOutcome::Conflict,
+                WriteOutcome::Saved,
+            ],
+        );
+
+        let attempt = save_with_retry(&mut editor, &base, chrono_tz::UTC, &mut backend)
+            .await
+            .expect("save");
+
+        assert!(matches!(attempt, SaveAttempt::Saved));
+        assert!(editor.conflict.is_none(), "no blank conflict screen");
+        assert_eq!(backend.write_titles.len(), 3, "the write is repeated");
+    }
+
     #[test]
-    fn a_write_conflict_is_retried_once_then_shown() {
-        assert_eq!(conflict_action(false), ConflictAction::Retry);
-        assert_eq!(conflict_action(true), ConflictAction::Show);
+    fn keeping_the_current_due_restores_it_in_the_draft() {
+        let base = snapshot();
+        let mut draft = draft();
+        draft.date = Some(NaiveDate::from_ymd_opt(2026, 11, 19).expect("date"));
+        let mut editor = editor_with(draft, &base, &[EditorField::Due]);
+        let mut seen = base.clone();
+        seen.due_date = Some(NaiveDate::from_ymd_opt(2026, 11, 20).expect("date"));
+        let seen_draft = ItemDraft::from_snapshot(&seen, chrono_tz::UTC);
+
+        editor.touched.remove(&EditorField::Due);
+        restore(
+            &mut editor.draft,
+            &mut editor.list_id,
+            &seen,
+            &seen_draft,
+            EditorField::Due,
+        );
+
+        assert_eq!(
+            editor.draft.date,
+            Some(NaiveDate::from_ymd_opt(2026, 11, 20).expect("date"))
+        );
+        assert_eq!(editor.draft.time, None);
     }
 
     #[test]

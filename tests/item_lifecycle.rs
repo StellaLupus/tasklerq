@@ -614,6 +614,170 @@ async fn reschedule_occurrence_does_not_normalize_last_day() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editing_another_field_keeps_a_last_day_occurrence_moved_forward() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let anchor = date(2026, 1, 31);
+    let mut input = support::new_item(household.tasks_list_id, "Отчёт за месяц");
+    input.due_date = Some(anchor);
+    let mut rule = support::recurrence(RecurrenceFreq::Monthly, Vec::new());
+    rule.month_rule = Some(MonthRule::LastDay);
+    input.recurrence = Some(rule);
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let moved = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        created.version,
+        Due::AllDay(date(2026, 2, 7)),
+        "Europe/Moscow",
+        utc(2026, 2, 7, 12),
+    )
+    .await
+    .expect("move the occurrence forward");
+    assert_eq!(moved.due_date, Some(date(2026, 2, 7)));
+
+    let edited = items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        moved.version,
+        ItemPatch {
+            notes: Field::Value("только заметка".into()),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        utc(2026, 2, 7, 13),
+    )
+    .await
+    .expect("edit another field");
+    assert_eq!(
+        edited.due_date,
+        Some(date(2026, 2, 7)),
+        "editing notes must not normalize the moved due to the month end"
+    );
+    let rule = edited.recurrence.as_ref().expect("rule");
+    assert_eq!(rule.occurrence_date, Some(anchor));
+    assert_eq!(rule.month_rule, Some(MonthRule::LastDay));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editing_another_field_keeps_a_last_day_occurrence_moved_back() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let anchor = date(2026, 1, 31);
+    let mut input = support::new_item(household.tasks_list_id, "Отчёт за месяц");
+    input.due_date = Some(anchor);
+    let mut rule = support::recurrence(RecurrenceFreq::Monthly, Vec::new());
+    rule.month_rule = Some(MonthRule::LastDay);
+    input.recurrence = Some(rule);
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let moved = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        created.version,
+        Due::AllDay(date(2026, 1, 20)),
+        "Europe/Moscow",
+        utc(2026, 1, 20, 12),
+    )
+    .await
+    .expect("move the occurrence back");
+    assert_eq!(moved.due_date, Some(date(2026, 1, 20)));
+
+    let edited = items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        moved.version,
+        ItemPatch {
+            title: Some("Отчёт за январь".into()),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        utc(2026, 1, 20, 13),
+    )
+    .await
+    .expect("edit the title");
+    assert_eq!(
+        edited.due_date,
+        Some(date(2026, 1, 20)),
+        "editing the title must keep the moved due"
+    );
+    assert_eq!(
+        edited.recurrence.as_ref().expect("rule").occurrence_date,
+        Some(anchor)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changing_the_due_of_a_last_day_series_still_normalizes() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let mut input = support::new_item(household.tasks_list_id, "Отчёт за месяц");
+    input.due_date = Some(date(2026, 1, 31));
+    let mut rule = support::recurrence(RecurrenceFreq::Monthly, Vec::new());
+    rule.month_rule = Some(MonthRule::LastDay);
+    input.recurrence = Some(rule);
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let changed = items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        created.version,
+        ItemPatch {
+            due_date: Field::Value(date(2026, 2, 10)),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        utc(2026, 2, 10, 12),
+    )
+    .await
+    .expect("change the due");
+    assert_eq!(
+        changed.due_date,
+        Some(date(2026, 2, 28)),
+        "a real due change is still normalized to the last day"
+    );
+    assert_eq!(
+        changed.recurrence.as_ref().expect("rule").occurrence_date,
+        None
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reschedule_occurrence_earlier_than_its_slot_keeps_the_slot() {
     let db = support::db().await;
     let household = support::create_household(&db.pool).await;
@@ -1763,6 +1927,91 @@ async fn reopen_restores_the_occurrence_slot_from_the_completion_snapshot() {
         repeated.due_date,
         Some(date(2026, 11, 6)),
         "the restored slot prevents the next due date from landing on 10 November"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reopen_restores_the_time_slot_from_the_completion_snapshot() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let slot = date(2026, 11, 10);
+    let series_at = Utc
+        .with_ymd_and_hms(2026, 11, 10, 6, 0, 0)
+        .single()
+        .expect("time");
+    let moved_to = Utc
+        .with_ymd_and_hms(2026, 11, 6, 9, 0, 0)
+        .single()
+        .expect("time");
+    let mut input = support::new_item(household.tasks_list_id, "Встреча");
+    input.due_at = Some(series_at);
+    let mut rule = support::recurrence(RecurrenceFreq::Weekly, vec![2]);
+    rule.until = Some(slot);
+    input.recurrence = Some(rule);
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let now = utc(2026, 11, 6, 12);
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let moved = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        created.version,
+        Due::Timed(moved_to),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("move the last occurrence");
+    let moved_rule = moved.recurrence.as_ref().expect("rule");
+    assert_eq!(moved_rule.occurrence_date, Some(slot));
+    assert_eq!(moved_rule.occurrence_time, NaiveTime::from_hms_opt(9, 0, 0));
+
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(moved.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("complete the last occurrence");
+    assert_eq!(completed.status, ItemStatus::Done);
+    assert_eq!(completed.due_at, Some(moved_to));
+    assert_eq!(
+        completed.recurrence.as_ref().expect("rule").occurrence_time,
+        None,
+        "completion clears the slot"
+    );
+
+    let reopened = items::reopen(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(completed.version),
+        utc(2026, 11, 6, 13),
+    )
+    .await
+    .expect("reopen");
+    assert_eq!(reopened.status, ItemStatus::Open);
+    assert_eq!(reopened.due_at, Some(moved_to));
+    let rule = reopened.recurrence.as_ref().expect("rule");
+    assert_eq!(rule.occurrence_date, Some(slot));
+    assert_eq!(
+        rule.occurrence_time,
+        NaiveTime::from_hms_opt(9, 0, 0),
+        "the series time is restored together with the slot date"
     );
 }
 

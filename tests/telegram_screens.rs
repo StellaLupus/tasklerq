@@ -4354,6 +4354,7 @@ async fn quick_due_date_and_time_keeps_the_recurring_series_time() {
     bot.text("чт 12:00").await;
 
     bot.assert_screen_contains("Срок: чт, 4 мар, 12:00");
+    bot.assert_screen_contains("Следующее: вт, 9 мар, 09:00");
     let moved = items::get(
         &mut db.pool.acquire().await.expect("conn"),
         household.household_id,
@@ -4495,6 +4496,32 @@ async fn quick_due_today_keeps_all_day_and_gives_all_day_to_a_task_without_due()
         );
         bot.press("Назад").await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quick_due_today_with_a_passed_time_marks_the_card_overdue() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(moscow, today, 12, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut input = new_item(household.tasks_list_id, "Утренняя проверка");
+    input.due_at = Some(local_utc(moscow, today, 9, 0));
+    let task = create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
+
+    bot.press("Задачи").await;
+    bot.press("Утренняя проверка").await;
+    bot.press("Срок").await;
+    bot.press("Сегодня").await;
+
+    assert_eq!(
+        item_due(&db.pool, task.id).await,
+        (Some(local_utc(moscow, today, 9, 0)), None),
+        "«Сегодня» keeps the time of day even if it has already passed"
+    );
+    bot.assert_screen_contains("· просрочено");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

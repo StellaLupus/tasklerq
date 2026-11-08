@@ -1196,6 +1196,74 @@ async fn patch_rule_clears_the_occurrence_slot() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn patch_notes_keeps_a_last_day_occurrence_moved_off_the_month_end() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let token =
+        support::issue_token(&db.pool, household.household_id, &["ha:read", "ha:write"]).await;
+    let app = support::app(&db.pool);
+    let anchor = chrono::NaiveDate::from_ymd_opt(2026, 1, 31).expect("date");
+    let moved_to = chrono::NaiveDate::from_ymd_opt(2026, 2, 7).expect("date");
+
+    let (status, created) = support::request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/lists/{}/items", household.tasks_list_id),
+        Some(&token),
+        Some(json!({
+            "title": "Отчёт за месяц",
+            "due_date": anchor,
+            "recurrence": {"freq": "monthly", "month_rule": "last_day"}
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create item: {created}");
+    let item_id: Uuid = created["id"]
+        .as_str()
+        .expect("item id")
+        .parse()
+        .expect("uuid");
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let item = items::get(&mut conn, household.household_id, item_id)
+        .await
+        .expect("item");
+    let moved = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        item.id,
+        item.version,
+        Due::AllDay(moved_to),
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("reschedule occurrence");
+    assert_eq!(moved.due_date, Some(moved_to));
+    drop(conn);
+
+    let (status, patched) = support::request(
+        &app,
+        Method::PATCH,
+        &format!("/api/v1/items/{item_id}"),
+        Some(&token),
+        Some(json!({"version": moved.version, "notes": "только заметка"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "patch notes: {patched}");
+    assert_eq!(
+        patched["due_date"],
+        json!("2026-02-07"),
+        "editing notes must not normalize the moved due to the month end"
+    );
+    assert_eq!(
+        patched["recurrence"]["occurrence_date"],
+        json!("2026-01-31")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn patch_repeating_the_current_due_keeps_the_occurrence_slot() {
     let db = support::db().await;
     let household = support::create_household(&db.pool).await;

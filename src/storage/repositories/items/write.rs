@@ -335,13 +335,21 @@ async fn update_inner(
 
     match due_change {
         DueChange::Reanchor => {
-            (due_at, due_date) = normalize_due_for_recurrence(
-                due_at,
-                due_date,
-                recurrence.as_ref(),
-                household_timezone,
-                today,
-            )?;
+            // Нормализуем срок по правилу, только если он реально менялся или
+            // изменилось само правило. Иначе правка другого поля (например,
+            // заметки) откатывала бы перенос вхождения `last_day`-серии к
+            // последнему дню месяца. Срок без даты по-прежнему заполняется
+            // первым вхождением.
+            let due_missing = due_at.is_none() && due_date.is_none();
+            if due_changed || recurrence_changed || due_missing {
+                (due_at, due_date) = normalize_due_for_recurrence(
+                    due_at,
+                    due_date,
+                    recurrence.as_ref(),
+                    household_timezone,
+                    today,
+                )?;
+            }
             if (due_changed || recurrence_changed)
                 && let Some(rule) = recurrence.as_mut()
             {

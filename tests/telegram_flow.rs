@@ -988,6 +988,79 @@ async fn editor_conflict_offers_both_values_and_both_outcomes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keeping_the_current_due_shows_it_after_a_validation_error() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Срок и исполнитель").await;
+    bot.press("Сохранить").await;
+    let household = test_household(&db.pool, bot.chat).await;
+    let item = task_row(&db.pool, household.household_id, "Срок и исполнитель").await;
+    let member = {
+        let mut conn = db.pool.acquire().await.expect("conn");
+        users::add(
+            &mut conn,
+            household.household_id,
+            UserRole::Member,
+            support::new_member("Борис"),
+            &household.owner(),
+            Utc::now(),
+        )
+        .await
+        .expect("member")
+    };
+    let today = bot.now.with_timezone(&moscow()).date_naive();
+    let tomorrow = today + Duration::days(1);
+    let other_day = today + Duration::days(5);
+
+    bot.press("Срок и исполнитель").await;
+    bot.press("Править").await;
+    bot.press("Срок").await;
+    bot.press("Завтра").await;
+    bot.press("Исполнитель").await;
+    bot.press("Борис").await;
+
+    // Другой участник меняет срок, а выбранный исполнитель исчезает: после
+    // «Оставить текущий» запись упадёт на валидации исполнителя.
+    let mut conn = db.pool.acquire().await.expect("conn");
+    items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        item.id,
+        item.version,
+        ItemPatch {
+            due_date: Field::Value(other_day),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("other due");
+    sqlx::query("UPDATE users SET deleted_at = now() WHERE id = $1")
+        .bind(member.id)
+        .execute(&db.pool)
+        .await
+        .expect("delete member");
+
+    bot.press("Сохранить").await;
+    bot.assert_screen_contains("Конфликт при сохранении");
+    bot.press("Оставить текущий").await;
+
+    bot.assert_screen_contains("Проверьте введённые значения.");
+    let current_due =
+        ru::capitalize(&ru::due_label(None, Some(other_day), moscow(), bot.now).expect("other"));
+    let mine =
+        ru::capitalize(&ru::due_label(None, Some(tomorrow), moscow(), bot.now).expect("mine"));
+    bot.assert_screen_contains(&current_due);
+    assert!(
+        !bot.screen().contains(&mine),
+        "the editor must show the kept current due, not ours:\n{}",
+        bot.screen()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn editor_conflict_rechecks_fields_changed_while_it_is_open() {
     let db = db().await;
     let mut bot = onboarded(&db.pool).await;
