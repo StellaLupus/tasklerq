@@ -1682,3 +1682,585 @@ async fn quick_form_switching_to_shopping_finds_a_duplicate() {
     .expect("items");
     assert_eq!(saved, 1, "the duplicate must not be saved as a second item");
 }
+
+async fn shopping_list_id(pool: &PgPool, telegram_id: i64) -> uuid::Uuid {
+    sqlx::query_scalar(
+        "SELECT l.id FROM lists l
+         JOIN users u ON u.household_id = l.household_id
+         WHERE u.telegram_user_id = $1 AND l.kind = 'shopping' AND l.is_default
+         LIMIT 1",
+    )
+    .bind(telegram_id)
+    .fetch_one(pool)
+    .await
+    .expect("shopping list")
+}
+
+async fn seed_shopping_item(
+    pool: &PgPool,
+    telegram_id: i64,
+    title: &str,
+    quantity: f64,
+    unit: &str,
+) -> uuid::Uuid {
+    let household = household_id(pool, telegram_id).await;
+    let list = shopping_list_id(pool, telegram_id).await;
+    let id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO items (
+             id, household_id, list_id, title, status, priority, source,
+             quantity, unit, position, created_at, updated_at
+         )
+         VALUES ($1, $2, $3, $4, 'open', 'normal', 'telegram', $5, $6, 1, now(), now())",
+    )
+    .bind(id)
+    .bind(household)
+    .bind(list)
+    .bind(title)
+    .bind(quantity)
+    .bind(unit)
+    .execute(pool)
+    .await
+    .expect("seeded shopping item");
+    id
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shopping_text_adds_positions_without_confirmation() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Молоко", "quantity": 2, "unit": "л"},
+            {"target_kind": "shopping", "title": "Хлеб"}
+        ]}))],
+    )
+    .await;
+    let list = shopping_list_id(&db.pool, stand.bot.chat).await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.assert_screen_contains("Покупки · 0");
+
+    stand.bot.text("молоко 2 л и хлеб").await;
+    stand.bot.assert_screen_contains("Добавляю…");
+    assert!(
+        !stand.bot.screen().contains("Разбираю сообщение"),
+        "the shopping list must stay on screen:\n{}",
+        stand.bot.screen()
+    );
+
+    let payload: Value = sqlx::query_scalar(
+        "SELECT payload FROM capture_jobs WHERE chat_id = $1
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(stand.bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("capture job payload");
+    assert_eq!(payload["target"]["list_id"], json!(list));
+    assert_eq!(payload["target"]["direct"], json!(true));
+    assert!(
+        payload.get("default_list_id").is_none(),
+        "a direct job must carry only target: {payload}"
+    );
+
+    assert_eq!(stand.work().await, Pass::Drafted);
+
+    stand
+        .bot
+        .assert_screen_contains("Добавлено: Молоко · 2 л, Хлеб");
+    let state: Value = serde_json::from_str(&stand.view_state().await).expect("view json");
+    assert_eq!(state["t"], json!("list"), "the screen must remain the list");
+
+    let rows: Vec<(String, Option<f64>, Option<String>)> = sqlx::query_as(
+        "SELECT i.title, i.quantity::float8, i.unit
+         FROM items i
+         JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1 AND i.deleted_at IS NULL
+         ORDER BY i.title",
+    )
+    .bind(stand.bot.chat)
+    .fetch_all(&db.pool)
+    .await
+    .expect("items");
+    assert_eq!(
+        rows,
+        vec![
+            ("Молоко".to_owned(), Some(2.0), Some("л".to_owned())),
+            ("Хлеб".to_owned(), Some(1.0), Some("шт".to_owned())),
+        ]
+    );
+
+    let drafts: i64 = sqlx::query_scalar("SELECT count(*) FROM capture_drafts WHERE chat_id = $1")
+        .bind(stand.bot.chat)
+        .fetch_one(&db.pool)
+        .await
+        .expect("drafts");
+    assert_eq!(drafts, 0, "purchases only must not create a draft");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_task_from_the_shopping_screen_waits_in_the_draft() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Молоко"},
+            {"target_kind": "tasks", "title": "Позвонить маме"}
+        ]}))],
+    )
+    .await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("молоко и позвонить маме").await;
+    assert_eq!(stand.work().await, Pass::Drafted);
+
+    // Покупка уже в списке, задача ждёт подтверждения в черновике.
+    let saved: Vec<String> = sqlx::query_scalar(
+        "SELECT i.title FROM items i
+         JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1 AND i.deleted_at IS NULL",
+    )
+    .bind(stand.bot.chat)
+    .fetch_all(&db.pool)
+    .await
+    .expect("items");
+    assert_eq!(saved, vec!["Молоко".to_owned()]);
+
+    stand.bot.assert_screen_contains("Разобрал: 1 позиция");
+    stand.bot.assert_screen_contains("Позвонить маме");
+    stand.bot.assert_has_button("Сохранить всё");
+    stand.bot.assert_screen_contains("Добавлено: Молоко");
+
+    let parsed: Value = sqlx::query_scalar(
+        "SELECT parsed FROM capture_drafts WHERE chat_id = $1
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(stand.bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("draft");
+    assert_eq!(parsed["items"].as_array().expect("items").len(), 1);
+    assert_eq!(parsed["items"][0]["title"], json!("Позвонить маме"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_direct_add_limit_is_ten_parses_per_minute() {
+    let db = db().await;
+    let mut stand = stand(&db.pool, vec![]).await;
+
+    stand.bot.press("Покупки").await;
+    for n in 0..10 {
+        stand.bot.text(&format!("покупка {n}")).await;
+    }
+    assert_eq!(stand.jobs().await, 10);
+
+    stand.bot.text("одиннадцатая покупка").await;
+
+    stand
+        .bot
+        .assert_screen_contains("Слишком много сообщений на разбор");
+    stand.bot.assert_screen_contains("Покупки ·");
+    assert_eq!(
+        stand.jobs().await,
+        10,
+        "the eleventh job must not be queued"
+    );
+    assert_eq!(
+        stand.ai.calls(),
+        0,
+        "the limit must be checked before the LLM"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_direct_result_does_not_replace_a_screen_the_user_left() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Хлеб"}
+        ]}))],
+    )
+    .await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("хлеб").await;
+    stand.bot.press("Назад").await;
+    stand.bot.assert_screen_contains("Покупки · 0");
+
+    assert_eq!(stand.work().await, Pass::Drafted);
+
+    stand
+        .bot
+        .assert_screen_contains("Добавлено в «Покупки»: Хлеб");
+    let state: Value = serde_json::from_str(&stand.view_state().await).expect("view json");
+    assert_eq!(
+        state["t"],
+        json!("menu"),
+        "the user's screen must not be replaced"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_second_position_rolls_back_the_first() {
+    let db = support::isolated_db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Молоко"},
+            {"target_kind": "shopping", "title": "Хлеб"}
+        ]}))],
+    )
+    .await;
+
+    sqlx::query(
+        "CREATE FUNCTION fail_bread() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             IF NEW.title = 'Хлеб' THEN
+                 RAISE EXCEPTION 'boom';
+             END IF;
+             RETURN NEW;
+         END
+         $$",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("function");
+    sqlx::query(
+        "CREATE TRIGGER fail_bread BEFORE INSERT ON items
+         FOR EACH ROW EXECUTE FUNCTION fail_bread()",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("trigger");
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("молоко и хлеб").await;
+
+    let result = stand.worker.run_once(stand.bot.now).await;
+    assert!(
+        result.is_err(),
+        "the second insert must fail the transaction"
+    );
+
+    let saved: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM items i
+         JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1 AND i.deleted_at IS NULL",
+    )
+    .bind(stand.bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("items");
+    assert_eq!(saved, 0, "the first position must be rolled back too");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_direct_parse_keeps_the_shopping_list_with_an_error_banner() {
+    let db = db().await;
+    let mut stand = stand(&db.pool, vec![Err(HaError::Rejected(400))]).await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("молоко и хлеб").await;
+    assert_eq!(stand.work().await, Pass::Dead);
+
+    stand
+        .bot
+        .assert_screen_contains("Не получилось разобрать сообщение");
+    let state: Value = serde_json::from_str(&stand.view_state().await).expect("view json");
+    assert_eq!(state["t"], json!("list"), "the shopping list must stay");
+    assert_eq!(stand.household_items().await, 0, "nothing must be created");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_duplicate_is_not_saved_and_the_banner_offers_a_choice() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Молоко"},
+            {"target_kind": "shopping", "title": "Хлеб"}
+        ]}))],
+    )
+    .await;
+    seed_shopping_item(&db.pool, stand.bot.chat, "Молоко", 2.0, "л").await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.assert_screen_contains("Молоко · 2 л");
+    stand.bot.text("молоко и хлеб").await;
+    assert_eq!(stand.work().await, Pass::Drafted);
+
+    stand.bot.assert_screen_contains("Добавлено: Хлеб");
+    stand.bot.assert_has_button("Увеличить до 3 л");
+    stand.bot.assert_has_button("Добавить отдельно");
+
+    let rows: Vec<(String, Option<f64>, Option<String>)> = sqlx::query_as(
+        "SELECT i.title, i.quantity::float8, i.unit
+         FROM items i
+         JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1 AND i.deleted_at IS NULL
+         ORDER BY i.title",
+    )
+    .bind(stand.bot.chat)
+    .fetch_all(&db.pool)
+    .await
+    .expect("items");
+    assert_eq!(
+        rows,
+        vec![
+            ("Молоко".to_owned(), Some(2.0), Some("л".to_owned())),
+            ("Хлеб".to_owned(), Some(1.0), Some("шт".to_owned())),
+        ],
+        "the duplicate must not be saved without a choice"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn increasing_a_duplicate_updates_the_existing_position() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Молоко"},
+            {"target_kind": "shopping", "title": "Хлеб"}
+        ]}))],
+    )
+    .await;
+    seed_shopping_item(&db.pool, stand.bot.chat, "Молоко", 2.0, "л").await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("молоко и хлеб").await;
+    stand.work().await;
+    stand.bot.press("Увеличить до 3 л").await;
+
+    stand.bot.assert_screen_contains("Добавлено: Молоко · 3 л");
+    let rows: Vec<(String, Option<f64>, Option<String>)> = sqlx::query_as(
+        "SELECT i.title, i.quantity::float8, i.unit
+         FROM items i
+         JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1 AND i.deleted_at IS NULL
+         ORDER BY i.title",
+    )
+    .bind(stand.bot.chat)
+    .fetch_all(&db.pool)
+    .await
+    .expect("items");
+    assert_eq!(
+        rows,
+        vec![
+            ("Молоко".to_owned(), Some(3.0), Some("л".to_owned())),
+            ("Хлеб".to_owned(), Some(1.0), Some("шт".to_owned())),
+        ],
+        "increase must change the existing position, not add another"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adding_a_duplicate_separately_creates_a_second_position() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Молоко"},
+            {"target_kind": "shopping", "title": "Хлеб"}
+        ]}))],
+    )
+    .await;
+    seed_shopping_item(&db.pool, stand.bot.chat, "Молоко", 2.0, "л").await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("молоко и хлеб").await;
+    stand.work().await;
+    stand.bot.press("Добавить отдельно").await;
+
+    stand.bot.assert_screen_contains("Добавлено: Молоко · 1 шт");
+    let rows: Vec<(String, Option<f64>, Option<String>)> = sqlx::query_as(
+        "SELECT i.title, i.quantity::float8, i.unit
+         FROM items i
+         JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1 AND i.deleted_at IS NULL
+         ORDER BY i.title, i.quantity",
+    )
+    .bind(stand.bot.chat)
+    .fetch_all(&db.pool)
+    .await
+    .expect("items");
+    assert_eq!(
+        rows,
+        vec![
+            ("Молоко".to_owned(), Some(1.0), Some("шт".to_owned())),
+            ("Молоко".to_owned(), Some(2.0), Some("л".to_owned())),
+            ("Хлеб".to_owned(), Some(1.0), Some("шт".to_owned())),
+        ],
+        "separate must create a second milk position"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_version_conflict_while_increasing_does_not_crash() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Молоко"},
+            {"target_kind": "shopping", "title": "Хлеб"}
+        ]}))],
+    )
+    .await;
+    let milk = seed_shopping_item(&db.pool, stand.bot.chat, "Молоко", 2.0, "л").await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("молоко и хлеб").await;
+    stand.work().await;
+    sqlx::query("UPDATE items SET version = version + 1 WHERE id = $1")
+        .bind(milk)
+        .execute(&db.pool)
+        .await
+        .expect("bump version");
+
+    stand.bot.press("Увеличить до 3 л").await;
+
+    stand
+        .bot
+        .assert_screen_contains("Позиция изменилась, откройте список");
+    let quantity: f64 = sqlx::query_scalar("SELECT quantity::float8 FROM items WHERE id = $1")
+        .bind(milk)
+        .fetch_one(&db.pool)
+        .await
+        .expect("quantity");
+    assert_eq!(quantity, 2.0, "the stale increase must not be applied");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn several_duplicates_are_offered_one_by_one() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Молоко"},
+            {"target_kind": "shopping", "title": "Хлеб"},
+            {"target_kind": "shopping", "title": "Яйца"}
+        ]}))],
+    )
+    .await;
+    seed_shopping_item(&db.pool, stand.bot.chat, "Молоко", 2.0, "л").await;
+    seed_shopping_item(&db.pool, stand.bot.chat, "Яйца", 10.0, "шт").await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("молоко, хлеб и яйца").await;
+    assert_eq!(stand.work().await, Pass::Drafted);
+
+    stand.bot.assert_screen_contains("Добавлено: Хлеб");
+    stand.bot.assert_screen_contains("Уже в списке: «Молоко»");
+    stand.bot.assert_has_button("Увеличить до 3 л");
+    assert!(
+        stand.bot.find_button("Увеличить до 11 шт").is_none(),
+        "only the first duplicate must be offered:\n{}",
+        stand.bot.screen()
+    );
+
+    stand.bot.press("Увеличить до 3 л").await;
+    stand.bot.assert_screen_contains("Добавлено: Молоко · 3 л");
+    stand.bot.assert_screen_contains("Уже в списке: «Яйца»");
+    stand.bot.assert_has_button("Увеличить до 11 шт");
+
+    stand.bot.press("Увеличить до 11 шт").await;
+    stand.bot.assert_screen_contains("Добавлено: Яйца · 11 шт");
+
+    let rows: Vec<(String, Option<f64>)> = sqlx::query_as(
+        "SELECT i.title, i.quantity::float8
+         FROM items i
+         JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1 AND i.deleted_at IS NULL
+         ORDER BY i.title",
+    )
+    .bind(stand.bot.chat)
+    .fetch_all(&db.pool)
+    .await
+    .expect("items");
+    assert_eq!(
+        rows,
+        vec![
+            ("Молоко".to_owned(), Some(3.0)),
+            ("Хлеб".to_owned(), Some(1.0)),
+            ("Яйца".to_owned(), Some(11.0)),
+        ],
+        "both duplicates must be resolved without losing either"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_duplicate_choice_keeps_the_waiting_draft_card() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Молоко"},
+            {"target_kind": "tasks", "title": "Позвонить маме"}
+        ]}))],
+    )
+    .await;
+    seed_shopping_item(&db.pool, stand.bot.chat, "Молоко", 2.0, "л").await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("молоко и позвонить маме").await;
+    assert_eq!(stand.work().await, Pass::Drafted);
+    stand.bot.assert_screen_contains("Позвонить маме");
+    stand.bot.assert_screen_contains("Уже в списке: «Молоко»");
+
+    stand.bot.press("Увеличить до 3 л").await;
+
+    stand.bot.assert_screen_contains("Добавлено: Молоко · 3 л");
+    stand.bot.assert_screen_contains("Позвонить маме");
+    stand.bot.assert_has_button("Сохранить всё");
+    let state: Value = serde_json::from_str(&stand.view_state().await).expect("view json");
+    assert_eq!(
+        state["t"],
+        json!("draft"),
+        "a duplicate choice must not replace the waiting draft card"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_duplicates_in_one_message_are_merged() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Молоко"},
+            {"target_kind": "shopping", "title": "Молоко"}
+        ]}))],
+    )
+    .await;
+    let milk = seed_shopping_item(&db.pool, stand.bot.chat, "Молоко", 2.0, "л").await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("молоко и молоко").await;
+    assert_eq!(stand.work().await, Pass::Drafted);
+
+    stand.bot.assert_has_button("Увеличить до 4 л");
+    assert!(
+        stand.bot.find_button("Увеличить до 3 л").is_none(),
+        "two mentions of the same item must be one choice:\n{}",
+        stand.bot.screen()
+    );
+    stand.bot.press("Увеличить до 4 л").await;
+
+    let quantity: f64 = sqlx::query_scalar("SELECT quantity::float8 FROM items WHERE id = $1")
+        .bind(milk)
+        .fetch_one(&db.pool)
+        .await
+        .expect("quantity");
+    assert_eq!(quantity, 4.0);
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM items i
+         JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1 AND i.title = 'Молоко' AND i.deleted_at IS NULL",
+    )
+    .bind(stand.bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("count");
+    assert_eq!(count, 1);
+}

@@ -275,6 +275,15 @@ pub fn quantity_label(quantity: f64, unit: Option<&str>) -> String {
     }
 }
 
+/// Позиция списка: название и количество через точку.
+pub fn position_label(title: &str, quantity: Option<f64>, unit: Option<&str>) -> String {
+    let mut label = title.to_owned();
+    if let Some(quantity) = quantity {
+        label.push_str(&format!(" · {}", quantity_label(quantity, unit)));
+    }
+    label
+}
+
 /// Результат разбора срока, введённого пользователем.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParsedDue {

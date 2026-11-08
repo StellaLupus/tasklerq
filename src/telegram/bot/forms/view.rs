@@ -7,7 +7,6 @@ use crate::telegram::rich::{Button, button};
 use crate::telegram::ru;
 use crate::telegram::views::{self, Lookup};
 
-use super::MAX_QUANTITY;
 use crate::telegram::bot::card::priority_label;
 use crate::telegram::bot::model::{
     Action, Choice, Form, FormAct, ItemDraft, Screen, Step, TimeField, Ui,
@@ -336,29 +335,23 @@ pub(super) fn duplicate_view(
         clip(&duplicate.title, 60)
     ));
 
-    let same_unit = draft.unit.as_deref().or(Some("шт")).map(str::to_lowercase)
-        == duplicate.unit.as_deref().map(str::to_lowercase);
     let mut row = Vec::new();
-    if let (Some(quantity), true) = (duplicate.quantity, same_unit) {
-        let total = quantity + draft.quantity.unwrap_or(1.0);
-        if total <= MAX_QUANTITY {
-            row.push(button(
-                format!(
-                    "➕ Увеличить до {}",
-                    ru::quantity_label(total, duplicate.unit.as_deref())
-                ),
-                Action::Form {
-                    act: FormAct::Increase {
-                        item_id: duplicate.item_id,
-                        quantity: total,
-                        version: duplicate.version,
-                    },
+    if let Some(total) =
+        duplicate.increase_total(draft.quantity.unwrap_or(1.0), draft.unit.as_deref())
+    {
+        row.push(button(
+            duplicate.increase_label(total),
+            Action::Form {
+                act: FormAct::Increase {
+                    item_id: duplicate.item_id,
+                    quantity: total,
+                    version: duplicate.version,
                 },
-            ));
-        }
+            },
+        ));
     }
     row.push(button(
-        "📄 Добавить отдельно",
+        duplicate.separate_label(),
         Action::Form {
             act: FormAct::SaveAnyway,
         },

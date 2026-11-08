@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use tokio::sync::{Notify, watch};
 
 use crate::capture::breaker::CircuitBreaker;
@@ -22,17 +22,21 @@ use crate::capture::draft::{self, NewCapture};
 use crate::capture::llm::{self, Failure as LlmFailure};
 use crate::capture::prompt::PROMPT_VERSION;
 use crate::capture::schema::{ParseError, ParsedResponse};
+use crate::capture::validate::validate_item;
 use crate::domain::error::DomainError;
-use crate::domain::models::{CaptureMode, Household, ListKind, User};
+use crate::domain::models::{Actor, CaptureMode, Household, Item, ItemSource, ListKind, User};
+use crate::domain::validation::validate_new_item;
 use crate::home_assistant::{AiTask, MAX_GENERATE_TIMEOUT};
 use crate::metrics;
 use crate::security_audit::{Audit, LlmValidation};
 use crate::storage::repositories::capture_jobs::{self, Failure, Job};
 use crate::storage::repositories::llm_runs::{self, FAILURE, NewRun, SUCCESS};
-use crate::storage::repositories::{households, users};
+use crate::storage::repositories::{households, items, users};
+use crate::telegram::ru;
 
-use super::bot::model::Screen;
-use super::bot::{Bot, Recipient, into_sqlx};
+use super::bot::model::{Duplicate, DuplicateChoice, Screen, duplicate_notice};
+use super::bot::{Banner, Bot, Recipient, into_sqlx};
+use super::views;
 
 /// Попыток на задание: повторяются только сбои на стороне HA и сети.
 pub const MAX_ATTEMPTS: u32 = 3;
@@ -155,6 +159,60 @@ fn apply_default_list(
 /// Сравнение названий списков без регистра и «ё».
 fn fold(value: &str) -> String {
     value.trim().to_lowercase().replace('ё', "е")
+}
+
+/// Совпадают ли единицы измерения для слияния дубликатов.
+fn same_unit(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => fold(left) == fold(right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// Позиция в баннере: название и количество, как в списке.
+fn position_label(item: &Item) -> String {
+    ru::position_label(&item.title, item.quantity, item.unit.as_deref())
+}
+
+/// Текст баннера после прямого добавления.
+fn result_banner(
+    target_name: &str,
+    added: &[String],
+    duplicates: &[DuplicateChoice],
+    on_list: bool,
+    has_draft: bool,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if !added.is_empty() {
+        if on_list || has_draft {
+            parts.push(format!("Добавлено: {}", added.join(", ")));
+        } else {
+            parts.push(format!("Добавлено в «{target_name}»: {}", added.join(", ")));
+        }
+    }
+    if let Some(notice) = duplicate_notice(duplicates) {
+        parts.push(notice);
+    }
+    if parts.is_empty() {
+        if has_draft {
+            None
+        } else {
+            Some("Не нашёл в сообщении покупок.".to_owned())
+        }
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+/// Активный экран чата, если его состояние читается.
+async fn active_screen(
+    conn: &mut PgConnection,
+    chat_id: i64,
+) -> Result<Option<Screen>, sqlx::Error> {
+    Ok(views::get(conn, chat_id)
+        .await?
+        .and_then(|view| serde_json::from_value::<Screen>(view.state).ok()))
 }
 
 impl CaptureWorker {
@@ -294,6 +352,17 @@ impl CaptureWorker {
                         now,
                     )
                     .await
+                } else if let Some(target) =
+                    job.target()
+                        .filter(|target| target.direct)
+                        .filter(|target| {
+                            prepared.context.lists.iter().any(|list| {
+                                list.id == target.list_id && list.kind == ListKind::Shopping
+                            })
+                        })
+                {
+                    self.finish_direct(&job, &prepared, &text, parsed, target.list_id, now, run)
+                        .await
                 } else {
                     self.finish(&job, &prepared, &text, parsed, now, run).await
                 }
@@ -473,6 +542,175 @@ impl CaptureWorker {
         Ok(Pass::Drafted)
     }
 
+    /// Сохранить прямое добавление: покупки в целевой список, остальное в
+    /// черновик, всё одной транзакцией.
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_direct(
+        &self,
+        job: &Job,
+        prepared: &Prepared,
+        text: &str,
+        parsed: ParsedResponse,
+        target_list_id: uuid::Uuid,
+        now: DateTime<Utc>,
+        run: NewRun,
+    ) -> Result<Pass, sqlx::Error> {
+        let context = &prepared.context;
+        let target_name = context
+            .lists
+            .iter()
+            .find(|list| list.id == target_list_id)
+            .map(|list| list.name.clone())
+            .unwrap_or_default();
+
+        let ParsedResponse {
+            items: parsed_items,
+            clarifications,
+        } = parsed;
+        let mut direct = Vec::new();
+        let mut draft_items = Vec::new();
+        for mut item in parsed_items {
+            if item.target_kind == ListKind::Shopping {
+                // Экран задаёт целевой список: разбор не должен уводить
+                // покупку в другой список.
+                item.target_list = Some(target_name.clone());
+                direct.push(item);
+            } else {
+                draft_items.push(item);
+            }
+        }
+
+        let mut tx = self.pool.begin().await?;
+        llm_runs::record(&mut tx, run, now).await?;
+        let actor = Actor::user(prepared.user.id, prepared.user.role);
+        let timezone = context.timezone.name();
+        let today = context.today();
+        let mut existing = items::list_by_list(&mut tx, job.household_id, target_list_id)
+            .await
+            .map_err(into_sqlx)?;
+
+        let mut created: Vec<Item> = Vec::new();
+        let mut duplicates: Vec<DuplicateChoice> = Vec::new();
+        for raw in direct {
+            let checked = validate_item(context, ItemSource::Telegram, raw.clone());
+            let Some(mut new_item) = checked.item else {
+                // Невалидную покупку не теряем: её можно поправить в черновике.
+                draft_items.push(raw);
+                continue;
+            };
+            // Имя списка могло совпасть с другим: экран задаёт идентификатор.
+            new_item.list_id = target_list_id;
+            if let Some(existing_item) = Duplicate::find(&existing, &new_item.title) {
+                let quantity = new_item.quantity.unwrap_or(1.0);
+                let unit = new_item.unit.clone();
+                let effective_unit = unit.as_deref().or(existing_item.unit.as_deref());
+                if let Some(pending) = duplicates.iter_mut().find(|pending| {
+                    pending.existing.item_id == existing_item.item_id
+                        && same_unit(
+                            pending.unit.as_deref().or(pending.existing.unit.as_deref()),
+                            effective_unit,
+                        )
+                }) {
+                    pending.quantity += quantity;
+                } else {
+                    duplicates.push(DuplicateChoice {
+                        existing: existing_item,
+                        title: new_item.title.clone(),
+                        quantity,
+                        unit,
+                    });
+                }
+                continue;
+            }
+            let assignee = new_item.assignee_user_id;
+            let validated = validate_new_item(ListKind::Shopping, timezone, new_item, today)
+                .map_err(into_sqlx)?;
+            let item = items::create(
+                &mut tx,
+                job.household_id,
+                &actor,
+                target_list_id,
+                validated,
+                assignee,
+                now,
+            )
+            .await
+            .map_err(into_sqlx)?;
+            existing.push(item.clone());
+            created.push(item);
+        }
+
+        let draft = if draft_items.is_empty() {
+            None
+        } else {
+            let draft = draft::create(
+                &mut tx,
+                NewCapture {
+                    id: None,
+                    household_id: job.household_id,
+                    user_id: Some(prepared.user.id),
+                    chat_id: Some(job.chat_id),
+                    source: job.source,
+                    mode: CaptureMode::Draft,
+                    idempotency_key: None,
+                    request_hash: None,
+                    raw_text: text.to_owned(),
+                    parsed: ParsedResponse {
+                        items: draft_items,
+                        clarifications,
+                    },
+                    fallback: false,
+                    prompt_version: Some(PROMPT_VERSION.to_owned()),
+                },
+                now,
+            )
+            .await
+            .map_err(into_sqlx)?;
+            Some(draft)
+        };
+
+        capture_jobs::complete(&mut tx, job.id, draft.as_ref().map(|draft| draft.id), now).await?;
+
+        let active = active_screen(&mut tx, job.chat_id).await?;
+        let added: Vec<String> = created.iter().map(position_label).collect();
+        let buttons = duplicates
+            .split_first()
+            .map(|(first, rest)| first.buttons(target_list_id, rest.to_vec()))
+            .unwrap_or_default();
+        let on_list = matches!(
+            &active,
+            Some(Screen::List { list_id, .. }) if *list_id == target_list_id
+        );
+        let text = result_banner(&target_name, &added, &duplicates, on_list, draft.is_some());
+        let banner = text.map(|text| {
+            if buttons.is_empty() {
+                Banner::text(text)
+            } else {
+                Banner::with_buttons(text, buttons)
+            }
+        });
+
+        let screen = if let Some(draft) = &draft {
+            Screen::Draft { draft_id: draft.id }
+        } else {
+            active.unwrap_or(Screen::Menu)
+        };
+
+        self.bot
+            .present_to(
+                &mut tx,
+                now,
+                prepared.recipient(job.chat_id),
+                screen,
+                banner,
+            )
+            .await?;
+        tx.commit().await?;
+        self.wake_outbox.notify_one();
+        metrics::capture("telegram", "added");
+        Ok(Pass::Drafted)
+    }
+
     /// Записать неудачу; когда повтор не нужен, показать редактор с
     /// исходным текстом, чтобы пользователь не потерял сообщение.
     async fn fail(
@@ -506,6 +744,34 @@ impl CaptureWorker {
                     error = issue.code,
                     "capture job finished without a draft"
                 );
+                if let Some(target) = job.target().filter(|target| target.direct)
+                    && let Some(Screen::List {
+                        list_id,
+                        page,
+                        edit,
+                        from_lists,
+                    }) = active_screen(&mut tx, job.chat_id).await?
+                    && list_id == target.list_id
+                {
+                    self.bot
+                        .present_to(
+                            &mut tx,
+                            now,
+                            prepared.recipient(job.chat_id),
+                            Screen::List {
+                                list_id,
+                                page,
+                                edit,
+                                from_lists,
+                            },
+                            Some(Banner::text(issue.message)),
+                        )
+                        .await?;
+                    tx.commit().await?;
+                    self.wake_outbox.notify_one();
+                    metrics::capture("telegram", "failed");
+                    return Ok(Pass::Dead);
+                }
                 self.bot
                     .present_quick_add(
                         &mut tx,

@@ -2,18 +2,27 @@
 
 use uuid::Uuid;
 
-use crate::domain::models::{Item, ItemStatus, List, ListKind};
+use crate::domain::models::{Field, Item, ItemPatch, ItemStatus, List, ListKind};
+use crate::domain::validation::validate_new_item;
 use crate::storage::repositories::{items, lists};
 use crate::telegram::rich::button;
 use crate::telegram::ru;
+use crate::telegram::views;
 
 use super::card::{self, UndoOutcome};
-use super::model::{Action, PAGE_SIZE, Screen, Ui, screen_heading};
+use super::model::{
+    Action, DuplicateChoice, ItemDraft, PAGE_SIZE, Screen, Ui, duplicate_notice, screen_heading,
+};
 use super::screens::{back_button, clip, list_back, nav_row};
 use super::{Ctx, Fail};
 
 /// Подтверждение нужно, если выполненных позиций больше этого числа.
 const CONFIRM_ABOVE: usize = 5;
+
+/// Название и количество позиции — так же, как строка списка без отметки.
+fn position_label(item: &Item) -> String {
+    ru::position_label(&clip(&item.title, 36), item.quantity, item.unit.as_deref())
+}
 
 fn item_label(item: &Item) -> String {
     let mark = if item.status == ItemStatus::Done {
@@ -21,14 +30,7 @@ fn item_label(item: &Item) -> String {
     } else {
         "☐"
     };
-    let mut label = format!("{mark} {}", clip(&item.title, 36));
-    if let Some(quantity) = item.quantity {
-        label.push_str(&format!(
-            " · {}",
-            ru::quantity_label(quantity, item.unit.as_deref())
-        ));
-    }
-    label
+    format!("{mark} {}", position_label(item))
 }
 
 /// Список покупок или чек-лист.
@@ -375,4 +377,133 @@ pub async fn clear_undo(
         Screen::Menu
     };
     ctx.present(target).await
+}
+
+/// Перерисовать список покупок после выбора по дубликату. Если пользователь
+/// уже не в этом списке, экран не заменяется: баннер ставится на текущий.
+async fn present_after_duplicate(ctx: &mut Ctx<'_>, list_id: Uuid) -> Result<(), Fail> {
+    let current = views::get(&mut *ctx.conn, ctx.chat_id)
+        .await?
+        .and_then(|view| serde_json::from_value::<Screen>(view.state).ok());
+    let screen = match current {
+        Some(Screen::List {
+            list_id: current_id,
+            page,
+            edit,
+            from_lists,
+        }) if current_id == list_id => Screen::List {
+            list_id,
+            page,
+            edit,
+            from_lists,
+        },
+        _ => return ctx.refresh().await,
+    };
+    ctx.present(screen).await
+}
+
+/// Показать результат выбора и, если остались дубликаты, следующий выбор.
+async fn show_duplicate_result(
+    ctx: &mut Ctx<'_>,
+    list_id: Uuid,
+    label: &str,
+    rest: &[DuplicateChoice],
+) -> Result<(), Fail> {
+    match rest.split_first() {
+        Some((next, tail)) => {
+            let mut text = format!("Добавлено: {label}.");
+            if let Some(notice) = duplicate_notice(rest) {
+                text.push(' ');
+                text.push_str(&notice);
+            }
+            ctx.banner_with(text, next.buttons(list_id, tail.to_vec()));
+        }
+        None => ctx.banner(format!("Добавлено: {label}")),
+    }
+    present_after_duplicate(ctx, list_id).await
+}
+
+/// «➕ Увеличить»: обновить существующую позицию до суммы.
+pub async fn duplicate_increase(
+    ctx: &mut Ctx<'_>,
+    item_id: Uuid,
+    version: i32,
+    quantity: f64,
+    rest: Vec<DuplicateChoice>,
+) -> Result<(), Fail> {
+    let household = ctx.household()?.clone();
+    let actor = ctx.actor()?;
+    let patch = ItemPatch {
+        quantity: Field::Value(quantity),
+        ..ItemPatch::default()
+    };
+    match items::update(
+        &mut *ctx.conn,
+        household.id,
+        &actor,
+        item_id,
+        version,
+        patch,
+        &household.timezone,
+        ctx.now,
+    )
+    .await
+    {
+        Ok(item) => {
+            let label = position_label(&item);
+            show_duplicate_result(ctx, item.list_id, &label, &rest).await
+        }
+        Err(crate::domain::error::DomainError::Conflict { .. })
+        | Err(crate::domain::error::DomainError::NotFound) => {
+            if let Some((next, tail)) = rest.split_first()
+                && let Ok(current) = items::get(&mut *ctx.conn, household.id, item_id).await
+            {
+                let mut text = "Позиция изменилась, откройте список.".to_owned();
+                if let Some(notice) = duplicate_notice(&rest) {
+                    text.push(' ');
+                    text.push_str(&notice);
+                }
+                ctx.banner_with(text, next.buttons(current.list_id, tail.to_vec()));
+                return present_after_duplicate(ctx, current.list_id).await;
+            }
+            ctx.banner("Позиция изменилась, откройте список");
+            ctx.refresh().await
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// «📄 Добавить отдельно»: создать вторую позицию с тем же названием.
+pub async fn duplicate_separate(
+    ctx: &mut Ctx<'_>,
+    list_id: Uuid,
+    title: String,
+    quantity: f64,
+    unit: Option<String>,
+    rest: Vec<DuplicateChoice>,
+) -> Result<(), Fail> {
+    let household = ctx.household()?.clone();
+    let actor = ctx.actor()?;
+    let list = lists::get_visible(&mut *ctx.conn, household.id, list_id).await?;
+    let draft = ItemDraft {
+        title,
+        quantity: Some(quantity),
+        unit,
+        ..ItemDraft::default()
+    };
+    let new_item = draft.to_new_item(list.id, ctx.tz, list.kind)?;
+    let today = ctx.now.with_timezone(&ctx.tz).date_naive();
+    let validated = validate_new_item(list.kind, ctx.tz.name(), new_item, today)?;
+    let item = items::create(
+        &mut *ctx.conn,
+        household.id,
+        &actor,
+        list.id,
+        validated,
+        None,
+        ctx.now,
+    )
+    .await?;
+    let label = position_label(&item);
+    show_duplicate_result(ctx, list.id, &label, &rest).await
 }

@@ -440,7 +440,7 @@ impl Bot {
         now: DateTime<Utc>,
         to: Recipient<'_>,
         screen: Screen,
-        banner: Option<String>,
+        banner: Option<Banner>,
     ) -> Result<(), sqlx::Error> {
         let mut ctx = self.context(conn, now, to, banner);
         match ctx.present(screen).await {
@@ -464,7 +464,7 @@ impl Bot {
         text: &str,
         banner: Option<String>,
     ) -> Result<(), sqlx::Error> {
-        let mut ctx = self.context(conn, now, to, banner);
+        let mut ctx = self.context(conn, now, to, banner.map(Banner::text));
         match forms::quick_add(&mut ctx, text).await {
             Ok(()) => Ok(()),
             Err(Fail::Infra(error)) => Err(error),
@@ -480,7 +480,7 @@ impl Bot {
         conn: &'a mut PgConnection,
         now: DateTime<Utc>,
         to: Recipient<'_>,
-        banner: Option<String>,
+        banner: Option<Banner>,
     ) -> Ctx<'a> {
         let Recipient {
             user,
@@ -501,7 +501,7 @@ impl Bot {
             household: Some(household.clone()),
             tz: display_timezone(Some(user), Some(household)),
             toast: None,
-            banner: banner.map(Banner::text),
+            banner,
             placement: Placement::Visible,
             llm_capture: self.llm_capture,
             tenancy: self.tenancy,
@@ -709,7 +709,12 @@ async fn on_text(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
             forms::expired(ctx).await
         }
         routing::TextRoute::TaskList { list_id, .. } => parse_text(ctx, text, Some(list_id)).await,
-        routing::TextRoute::ShoppingList { .. }
+        routing::TextRoute::ShoppingList {
+            list_id,
+            direct: true,
+            ..
+        } => parse_shopping_text(ctx, text, list_id).await,
+        routing::TextRoute::ShoppingList { direct: false, .. }
         | routing::TextRoute::Menu
         | routing::TextRoute::General => parse_text(ctx, text, None).await,
     }
@@ -733,6 +738,21 @@ async fn parse_text(
         capture::intake(ctx, text, default_list_id).await
     } else {
         forms::quick_add_in_list(ctx, text, default_list_id).await
+    }
+}
+
+/// Текст на экране покупок: прямое добавление в этот список.
+///
+/// Без LLM (пункт 8.4) пока работает прежняя быстрая форма.
+async fn parse_shopping_text(
+    ctx: &mut Ctx<'_>,
+    text: &str,
+    list_id: uuid::Uuid,
+) -> Result<(), Fail> {
+    if ctx.llm_capture {
+        capture::intake_direct(ctx, text, list_id).await
+    } else {
+        forms::quick_add_in_list(ctx, text, None).await
     }
 }
 
@@ -995,6 +1015,19 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
             item_ids,
             from_lists,
         } => shopping::clear_undo(ctx, list_id, &item_ids, from_lists).await,
+        Action::DuplicateIncrease {
+            item_id,
+            version,
+            quantity,
+            rest,
+        } => shopping::duplicate_increase(ctx, item_id, version, quantity, rest).await,
+        Action::DuplicateSeparate {
+            list_id,
+            title,
+            quantity,
+            unit,
+            rest,
+        } => shopping::duplicate_separate(ctx, list_id, title, quantity, unit, rest).await,
 
         Action::SearchStart => forms::start_search(ctx).await,
         Action::RenameStart => forms::start_rename(ctx).await,

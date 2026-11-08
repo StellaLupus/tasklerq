@@ -23,12 +23,14 @@ pub enum TextRoute {
     EditorBlocked,
     /// Поиск или результаты поиска: текст — новый запрос.
     Search,
-    /// Список покупок: пока общий разбор, в 8.1 — прямое добавление.
+    /// Список покупок или чек-лист: текст уходит в разбор с этим списком.
     ShoppingList {
         /// Список, в который будут добавлены позиции.
         list_id: uuid::Uuid,
         /// Название списка для подсказки.
         list_name: String,
+        /// Прямое добавление без черновика (только для покупок).
+        direct: bool,
     },
     /// Список задач: разбор с этим списком по умолчанию.
     TaskList {
@@ -71,6 +73,7 @@ impl TextRoute {
                 Some(list) => Self::ShoppingList {
                     list_id: list.id,
                     list_name: list.name.clone(),
+                    direct: list.kind == ListKind::Shopping,
                 },
                 None => Self::General,
             },
@@ -478,6 +481,29 @@ mod tests {
         assert_eq!(
             TextRoute::classify(&screen, Some(&form), None),
             TextRoute::EditorBlocked
+        );
+    }
+
+    #[test]
+    fn a_checklist_list_is_not_direct_but_keeps_its_hint() {
+        let checklist = list(ListKind::Checklist, "Дача");
+        let screen = Screen::List {
+            list_id: checklist.id,
+            page: 0,
+            edit: false,
+            from_lists: false,
+        };
+        assert_eq!(
+            TextRoute::classify(&screen, None, Some(&checklist)),
+            TextRoute::ShoppingList {
+                list_id: checklist.id,
+                list_name: "Дача".to_owned(),
+                direct: false,
+            }
+        );
+        assert_eq!(
+            TextRoute::classify(&screen, None, Some(&checklist)).hint(true),
+            Some(ru::list_hint("Дача"))
         );
     }
 }

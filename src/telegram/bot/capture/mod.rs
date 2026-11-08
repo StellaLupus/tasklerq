@@ -42,6 +42,42 @@ pub async fn intake(
     text: &str,
     default_list_id: Option<Uuid>,
 ) -> Result<(), Fail> {
+    if !accept(ctx, text).await? {
+        return Ok(());
+    }
+    let user_id = ctx.user()?.id;
+    let household_id = ctx.household()?.id;
+    let job = match default_list_id {
+        Some(list_id) => {
+            NewJob::telegram_text_in_list(household_id, user_id, ctx.chat_id, text, list_id)
+        }
+        None => NewJob::telegram_text(household_id, user_id, ctx.chat_id, text),
+    };
+    let job_id = capture_jobs::enqueue(&mut *ctx.conn, job, ctx.now).await?;
+    ctx.present(Screen::Processing {
+        job_id: Some(job_id),
+    })
+    .await
+}
+
+/// Принять текст на прямое добавление покупок в список с активного экрана.
+///
+/// Лимиты те же, что у обычного разбора. Экран списка остаётся на месте и
+/// получает баннер «Добавляю…»: карточки ожидания здесь нет.
+pub async fn intake_direct(ctx: &mut Ctx<'_>, text: &str, list_id: Uuid) -> Result<(), Fail> {
+    if !accept(ctx, text).await? {
+        return Ok(());
+    }
+    let user_id = ctx.user()?.id;
+    let household_id = ctx.household()?.id;
+    let job = NewJob::telegram_text_direct(household_id, user_id, ctx.chat_id, text, list_id);
+    capture_jobs::enqueue(&mut *ctx.conn, job, ctx.now).await?;
+    ctx.banner("Добавляю…");
+    ctx.refresh().await
+}
+
+/// Проверить длину и частоту. Отказ показывается баннером на активном экране.
+async fn accept(ctx: &mut Ctx<'_>, text: &str) -> Result<bool, Fail> {
     let user_id = ctx.user()?.id;
     let household_id = ctx.household()?.id;
     if text.chars().count() > MAX_TEXT {
@@ -49,7 +85,8 @@ pub async fn intake(
             "Сообщение слишком длинное: не больше {MAX_TEXT} символов. \
              Сократите его или разделите на части."
         ));
-        return ctx.refresh().await;
+        ctx.refresh().await?;
+        return Ok(false);
     }
 
     let recent = capture_jobs::count_recent_for_user(
@@ -64,20 +101,10 @@ pub async fn intake(
             "Слишком много сообщений на разбор: не больше {PARSES_PER_MINUTE} в минуту. \
              Подождите немного и отправьте снова."
         ));
-        return ctx.refresh().await;
+        ctx.refresh().await?;
+        return Ok(false);
     }
-
-    let job = match default_list_id {
-        Some(list_id) => {
-            NewJob::telegram_text_in_list(household_id, user_id, ctx.chat_id, text, list_id)
-        }
-        None => NewJob::telegram_text(household_id, user_id, ctx.chat_id, text),
-    };
-    let job_id = capture_jobs::enqueue(&mut *ctx.conn, job, ctx.now).await?;
-    ctx.present(Screen::Processing {
-        job_id: Some(job_id),
-    })
-    .await
+    Ok(true)
 }
 
 /// Экран ожидания разбора.

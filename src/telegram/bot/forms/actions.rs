@@ -2,7 +2,7 @@
 
 use uuid::Uuid;
 
-use crate::domain::models::{Item, ItemStatus, List};
+use crate::domain::models::{Item, List};
 use crate::domain::recurrence::Due;
 use crate::domain::settings::{NotificationSettingsUpdate, ProfileUpdate, parse_hhmm};
 use crate::storage::repositories::{items, members, users};
@@ -284,15 +284,7 @@ pub(super) async fn find_duplicate(
     title: &str,
 ) -> Result<Option<crate::telegram::bot::model::Duplicate>, Fail> {
     let existing = items::list_by_list(&mut *ctx.conn, list.household_id, list.id).await?;
-    let wanted = title.trim().to_lowercase();
-    Ok(existing
-        .into_iter()
-        .find(|item| item.status == ItemStatus::Open && item.title.trim().to_lowercase() == wanted)
-        .map(|item| crate::telegram::bot::model::Duplicate {
-            item_id: item.id,
-            title: item.title,
-            quantity: item.quantity,
-            unit: item.unit,
-            version: item.version,
-        }))
+    Ok(crate::telegram::bot::model::Duplicate::find(
+        &existing, title,
+    ))
 }
