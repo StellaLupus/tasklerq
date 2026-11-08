@@ -5116,7 +5116,7 @@ async fn card_shows_the_completion_block_with_plan_fact_actor_and_deviation() {
     bot.press("Полить цветы · Мария").await;
     bot.assert_screen_contains("Выполнения");
     bot.assert_screen_contains("<blockquote expandable>");
-    bot.assert_screen_contains("вт, 4 ноя → чт, 6 ноя, 13:47 · Мария · +2 дня");
+    bot.assert_screen_contains("вт, 4 ноя → чт, 6 ноя, 13:47 · Мария · +2\u{a0}дня");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

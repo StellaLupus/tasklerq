@@ -188,6 +188,9 @@ pub fn fixed_date_label(date: NaiveDate, today: NaiveDate) -> String {
 /// Срок со временем: раньше в тот же день или опоздание меньше часа — без
 /// пометки, от часа до суток — целые часы вниз, от суток — целые дни вниз.
 /// `None` — выполнение в срок или в тот же день раньше срока.
+///
+/// Число и единица разделены неразрывным пробелом: иначе клиент переносит
+/// «+2» и «дня» на разные строки свёрнутой цитаты.
 pub fn completion_deviation(
     due_at: Option<DateTime<Utc>>,
     due_date: Option<NaiveDate>,
@@ -205,18 +208,26 @@ pub fn completion_deviation(
             return None;
         }
         if late < chrono::Duration::days(1) {
-            return Some(format!("+{} ч", late.num_hours()));
+            return Some(format!("+{}{NBSP}ч", late.num_hours()));
         }
-        return Some(format!("+{}", days(late.num_days())));
+        return Some(late_days(late.num_days()));
     }
 
     let planned = due_date?;
     let actual = completed_at.with_timezone(&timezone).date_naive();
     match (actual - planned).num_days() {
-        late if late > 0 => Some(format!("+{}", days(late))),
+        late if late > 0 => Some(late_days(late)),
         late if late < 0 => Some("раньше".to_owned()),
         _ => None,
     }
+}
+
+/// Неразрывный пробел между числом и единицей в отклонении.
+const NBSP: char = '\u{a0}';
+
+/// «+2 дня» с неразрывным пробелом.
+fn late_days(n: i64) -> String {
+    format!("+{n}{NBSP}{}", plural(n, "день", "дня", "дней"))
 }
 
 /// Счётчик выполненных сегодня в шапке списка задач.
@@ -601,23 +612,23 @@ mod tests {
         // Срок 4 ноября, факт 6 ноября: местная дата позже на два дня.
         assert_eq!(
             completion_deviation(None, Some(date(2026, 11, 4)), completed, tz).as_deref(),
-            Some("+2 дня")
+            Some("+2\u{a0}дня")
         );
         assert_eq!(
             completion_deviation(None, Some(date(2026, 11, 5)), completed, tz).as_deref(),
-            Some("+1 день")
+            Some("+1\u{a0}день")
         );
         assert_eq!(
             completion_deviation(None, Some(date(2026, 11, 1)), completed, tz).as_deref(),
-            Some("+5 дней")
+            Some("+5\u{a0}дней")
         );
         assert_eq!(
             completion_deviation(None, Some(date(2026, 10, 27)), completed, tz).as_deref(),
-            Some("+10 дней")
+            Some("+10\u{a0}дней")
         );
         assert_eq!(
             completion_deviation(None, Some(date(2026, 10, 16)), completed, tz).as_deref(),
-            Some("+21 день")
+            Some("+21\u{a0}день")
         );
         assert_eq!(
             completion_deviation(None, Some(date(2026, 11, 6)), completed, tz),
@@ -658,30 +669,30 @@ mod tests {
         );
         assert_eq!(
             completion_deviation(Some(due), None, at(6, 11, 47), tz).as_deref(),
-            Some("+1 ч"),
+            Some("+1\u{a0}ч"),
             "exactly one hour late"
         );
         assert_eq!(
             completion_deviation(Some(due), None, at(7, 10, 46), tz).as_deref(),
-            Some("+23 ч"),
+            Some("+23\u{a0}ч"),
             "23 hours 59 minutes late"
         );
         assert_eq!(
             completion_deviation(Some(due), None, at(7, 10, 47), tz).as_deref(),
-            Some("+1 день"),
+            Some("+1\u{a0}день"),
             "exactly 24 hours late"
         );
         assert_eq!(
             completion_deviation(Some(due), None, at(8, 10, 47), tz).as_deref(),
-            Some("+2 дня")
+            Some("+2\u{a0}дня")
         );
         assert_eq!(
             completion_deviation(Some(due), None, at(10, 10, 47), tz).as_deref(),
-            Some("+4 дня")
+            Some("+4\u{a0}дня")
         );
         assert_eq!(
             completion_deviation(Some(due), None, at(21, 10, 47), tz).as_deref(),
-            Some("+15 дней")
+            Some("+15\u{a0}дней")
         );
     }
 
