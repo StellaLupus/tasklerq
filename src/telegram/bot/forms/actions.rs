@@ -10,7 +10,7 @@ use crate::telegram::ru;
 use crate::telegram::views::{self};
 
 use super::state::{apply_text, today};
-use super::{MAX_QUERY, clear, load, start_onboarding};
+use super::{clear, load, start_onboarding};
 use crate::telegram::bot::model::{Form, FormAct, ItemDraft, Screen, Step, TimeField};
 use crate::telegram::bot::onboarding;
 use crate::telegram::bot::settings::{self, ReleaseTrigger};
@@ -33,21 +33,7 @@ pub async fn on_text(ctx: &mut Ctx<'_>, form: Form, text: &str) -> Result<(), Fa
             version,
             back,
         } => due_text(ctx, item_id, version, back, text).await,
-        Form::Search => {
-            if text.chars().count() > MAX_QUERY {
-                ctx.banner(format!(
-                    "Запрос слишком длинный: не больше {MAX_QUERY} символов."
-                ));
-                return ctx.present(Screen::Form).await;
-            }
-            clear(ctx).await?;
-            ctx.present(Screen::Results {
-                query: text.to_owned(),
-                status: crate::telegram::bot::model::StatusFilter::Open,
-                page: 0,
-            })
-            .await
-        }
+        Form::Search => super::search(ctx, text, Screen::Form).await,
         Form::Rename => rename(ctx, text).await,
         Form::DeleteHousehold => delete_household(ctx, text).await,
         Form::Lead => set_lead(ctx, text).await,

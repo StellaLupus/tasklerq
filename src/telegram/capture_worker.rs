@@ -23,7 +23,7 @@ use crate::capture::llm::{self, Failure as LlmFailure};
 use crate::capture::prompt::PROMPT_VERSION;
 use crate::capture::schema::{ParseError, ParsedResponse};
 use crate::domain::error::DomainError;
-use crate::domain::models::{CaptureMode, Household, User};
+use crate::domain::models::{CaptureMode, Household, ListKind, User};
 use crate::home_assistant::{AiTask, MAX_GENERATE_TIMEOUT};
 use crate::metrics;
 use crate::security_audit::{Audit, LlmValidation};
@@ -104,6 +104,57 @@ impl Prepared {
             chat_id,
         }
     }
+}
+
+/// Подставить список задач с активного экрана в пункты без указанного списка.
+///
+/// Промпт требует заполнять `target_list` всегда, поэтому модель подставляет
+/// туда общий список задач, даже если пользователь список не называл. Такой
+/// автоподбор узнаём по совпадению с текущим списком по умолчанию; если же
+/// пользователь явно назвал этот список в тексте, оставляем его. Покупки и
+/// явно выбранные другие списки не трогаются. Если список с экрана уже удалён
+/// или заархивирован, работает обычный выбор по умолчанию.
+fn apply_default_list(
+    job: &Job,
+    context: &CaptureContext,
+    text: &str,
+    parsed: &mut ParsedResponse,
+) {
+    let Some(list_id) = job.default_list_id() else {
+        return;
+    };
+    let Some(list) = context
+        .lists
+        .iter()
+        .find(|list| list.id == list_id && list.kind == ListKind::Tasks)
+    else {
+        return;
+    };
+    let fallback = context
+        .default_list(ListKind::Tasks)
+        .map(|list| fold(&list.name));
+    let text = fold(text);
+    for item in &mut parsed.items {
+        if item.target_kind != ListKind::Tasks {
+            continue;
+        }
+        match item.target_list.as_deref() {
+            Some(target) if !target.trim().is_empty() => {
+                let target = fold(target);
+                let autofilled = fallback.as_deref() == Some(target.as_str());
+                let named_by_user = text.contains(&target);
+                if autofilled && !named_by_user {
+                    item.target_list = Some(list.name.clone());
+                }
+            }
+            _ => item.target_list = Some(list.name.clone()),
+        }
+    }
+}
+
+/// Сравнение названий списков без регистра и «ё».
+fn fold(value: &str) -> String {
+    value.trim().to_lowercase().replace('ё', "е")
 }
 
 impl CaptureWorker {
@@ -380,6 +431,8 @@ impl CaptureWorker {
         now: DateTime<Utc>,
         run: NewRun,
     ) -> Result<Pass, sqlx::Error> {
+        let mut parsed = parsed;
+        apply_default_list(job, &prepared.context, text, &mut parsed);
         let mut tx = self.pool.begin().await?;
         llm_runs::record(&mut tx, run, now).await?;
         let created = draft::create(

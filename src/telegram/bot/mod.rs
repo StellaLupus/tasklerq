@@ -12,6 +12,7 @@ mod forms;
 pub mod model;
 pub mod notify;
 mod onboarding;
+mod routing;
 mod screens;
 mod settings;
 mod shopping;
@@ -684,24 +685,54 @@ async fn on_text(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
     match views::conversation(&mut *ctx.conn, ctx.chat_id, ctx.now).await? {
         Lookup::Active(conversation) if conversation.telegram_user_id == ctx.sender.id => {
             match forms::parse(conversation.data) {
-                Some(form) => forms::on_text(ctx, form, text).await,
+                Some(form) => return forms::on_text(ctx, form, text).await,
                 None => {
                     views::clear_conversation(&mut *ctx.conn, ctx.chat_id).await?;
-                    ctx.present(Screen::Menu).await
+                    return ctx.present(Screen::Menu).await;
                 }
             }
         }
-        Lookup::Expired(_) => forms::expired(ctx).await,
-        _ => {
-            if ctx.user.is_none() {
-                return forms::start_onboarding(ctx).await;
-            }
-            if ctx.llm_capture {
-                capture::intake(ctx, text).await
-            } else {
-                forms::quick_add(ctx, text).await
-            }
+        Lookup::Expired(_) => return forms::expired(ctx).await,
+        _ => {}
+    }
+
+    if ctx.user.is_none() {
+        return forms::start_onboarding(ctx).await;
+    }
+
+    let screen = active_screen(ctx).await?;
+    let route = routing::route(ctx, &screen).await?;
+    match route {
+        routing::TextRoute::Search => forms::search(ctx, text, screen).await,
+        // Формы уже нет: экран редактора остался от истёкшей правки.
+        routing::TextRoute::EditorBlocked | routing::TextRoute::EditorField => {
+            forms::expired(ctx).await
         }
+        routing::TextRoute::TaskList { list_id, .. } => parse_text(ctx, text, Some(list_id)).await,
+        routing::TextRoute::ShoppingList { .. }
+        | routing::TextRoute::Menu
+        | routing::TextRoute::General => parse_text(ctx, text, None).await,
+    }
+}
+
+/// Активный экран чата; без сохранённого состояния — меню.
+async fn active_screen(ctx: &mut Ctx<'_>) -> Result<Screen, Fail> {
+    Ok(views::get(&mut *ctx.conn, ctx.chat_id)
+        .await?
+        .and_then(|view| serde_json::from_value::<Screen>(view.state).ok())
+        .unwrap_or(Screen::Menu))
+}
+
+/// Разбор текста или быстрая форма, если разбор выключен.
+async fn parse_text(
+    ctx: &mut Ctx<'_>,
+    text: &str,
+    default_list_id: Option<uuid::Uuid>,
+) -> Result<(), Fail> {
+    if ctx.llm_capture {
+        capture::intake(ctx, text, default_list_id).await
+    } else {
+        forms::quick_add_in_list(ctx, text, default_list_id).await
     }
 }
 

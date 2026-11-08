@@ -37,7 +37,11 @@ pub const MAX_TEXT: usize = 2_000;
 pub const PARSES_PER_MINUTE: i64 = 10;
 
 /// Принять свободный текст на разбор.
-pub async fn intake(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
+pub async fn intake(
+    ctx: &mut Ctx<'_>,
+    text: &str,
+    default_list_id: Option<Uuid>,
+) -> Result<(), Fail> {
     let user_id = ctx.user()?.id;
     let household_id = ctx.household()?.id;
     if text.chars().count() > MAX_TEXT {
@@ -63,12 +67,13 @@ pub async fn intake(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
         return ctx.refresh().await;
     }
 
-    let job_id = capture_jobs::enqueue(
-        &mut *ctx.conn,
-        NewJob::telegram_text(household_id, user_id, ctx.chat_id, text),
-        ctx.now,
-    )
-    .await?;
+    let job = match default_list_id {
+        Some(list_id) => {
+            NewJob::telegram_text_in_list(household_id, user_id, ctx.chat_id, text, list_id)
+        }
+        None => NewJob::telegram_text(household_id, user_id, ctx.chat_id, text),
+    };
+    let job_id = capture_jobs::enqueue(&mut *ctx.conn, job, ctx.now).await?;
     ctx.present(Screen::Processing {
         job_id: Some(job_id),
     })

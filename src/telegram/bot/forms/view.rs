@@ -78,10 +78,7 @@ pub async fn view(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
             .heading("Введите срок")
             .text(ru::DUE_HINT)
             .row(vec![cancel_button()])),
-        Form::Search => Ok(Ui::new()
-            .heading("Что ищем?")
-            .text("Отправьте слово или фразу из названия, описания, тега или подзадачи.")
-            .row(vec![cancel_button()])),
+        Form::Search => Ok(Ui::new().heading("Что ищем?").row(vec![cancel_button()])),
         Form::Rename => Ok(Ui::new()
             .heading("Как вас называть?")
             .text("Отправьте новое имя (до 64 символов).")

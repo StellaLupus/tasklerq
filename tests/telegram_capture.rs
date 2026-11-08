@@ -293,6 +293,118 @@ async fn text_is_queued_and_the_card_replaces_the_waiting_screen() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn text_on_a_tasks_list_defaults_capture_to_that_list() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "tasks", "title": "Покрасить забор", "target_list": "Задачи"}
+        ]}))],
+    )
+    .await;
+    let dacha = add_tasks_list(&db.pool, stand.bot.chat, "Дача").await;
+
+    stand.bot.text("/start").await;
+    stand.bot.press("Все списки").await;
+    stand.bot.press("Дача").await;
+    stand.bot.assert_screen_contains("Дача · 0");
+    stand
+        .bot
+        .assert_screen_contains("Напишите — добавлю в «Дача»");
+
+    stand.bot.text("покрасить забор").await;
+    let payload: Value = sqlx::query_scalar(
+        "SELECT payload FROM capture_jobs WHERE chat_id = $1
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(stand.bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("capture job payload");
+    assert_eq!(
+        payload["default_list_id"],
+        json!(dacha),
+        "the list screen must become the capture default"
+    );
+
+    assert_eq!(stand.work().await, Pass::Drafted);
+    stand.bot.assert_screen_contains("Список: Дача");
+
+    stand.bot.press("Сохранить всё").await;
+    let saved: uuid::Uuid = sqlx::query_scalar(
+        "SELECT i.list_id FROM items i
+         JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1 AND i.title = 'Покрасить забор'",
+    )
+    .bind(stand.bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("saved task");
+    assert_eq!(saved, dacha);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn text_on_a_tasks_list_keeps_an_explicitly_named_other_list() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "tasks", "title": "Покрасить забор", "target_list": "Работа"}
+        ]}))],
+    )
+    .await;
+    let dacha = add_tasks_list(&db.pool, stand.bot.chat, "Дача").await;
+    let work = add_tasks_list(&db.pool, stand.bot.chat, "Работа").await;
+
+    stand.bot.text("/start").await;
+    stand.bot.press("Все списки").await;
+    stand.bot.press("Дача").await;
+    stand.bot.assert_screen_contains("Дача · 0");
+
+    stand.bot.text("покрасить забор").await;
+    let payload: Value = sqlx::query_scalar(
+        "SELECT payload FROM capture_jobs WHERE chat_id = $1
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(stand.bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("capture job payload");
+    assert_eq!(payload["default_list_id"], json!(dacha));
+
+    assert_eq!(stand.work().await, Pass::Drafted);
+    stand.bot.assert_screen_contains("Список: Работа");
+    assert_ne!(work, dacha);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn text_does_not_replace_an_open_editor() {
+    let db = db().await;
+    let mut stand = stand(&db.pool, vec![]).await;
+
+    stand.bot.press("Добавить").await;
+    stand.bot.text("Задача в редакторе").await;
+    stand.bot.assert_has_button("💾 Сохранить");
+    let jobs_before = stand.jobs().await;
+    let calls_before = stand.ai.calls();
+
+    stand.bot.text("покрасить забор").await;
+    stand
+        .bot
+        .assert_screen_contains("Сначала сохраните или отмените правку");
+    stand
+        .bot
+        .assert_screen_contains("Название: Задача в редакторе");
+    stand.bot.assert_has_button("💾 Сохранить");
+    assert_eq!(
+        stand.jobs().await,
+        jobs_before,
+        "text must not enqueue a capture job while the editor is open"
+    );
+    assert_eq!(stand.ai.calls(), calls_before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn save_all_creates_every_item_and_undo_removes_them() {
     let db = db().await;
     let mut stand = stand(&db.pool, vec![Ok(two_items())]).await;
@@ -1382,21 +1494,26 @@ async fn menu_create_opens_the_editor_with_the_list_switch() {
 }
 
 async fn add_second_tasks_list(pool: &sqlx::PgPool, telegram_id: i64) -> uuid::Uuid {
+    add_tasks_list(pool, telegram_id, "Работа").await
+}
+
+async fn add_tasks_list(pool: &sqlx::PgPool, telegram_id: i64, name: &str) -> uuid::Uuid {
     let household = household_id(pool, telegram_id).await;
-    let second = uuid::Uuid::now_v7();
+    let list = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO lists (
              id, household_id, kind, name, is_default, is_archived, position,
              created_at, updated_at
          )
-         VALUES ($1, $2, 'tasks', 'Работа', false, false, 10, now(), now())",
+         VALUES ($1, $2, 'tasks', $3, false, false, 10, now(), now())",
     )
-    .bind(second)
+    .bind(list)
     .bind(household)
+    .bind(name)
     .execute(pool)
     .await
     .expect("second tasks list");
-    second
+    list
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

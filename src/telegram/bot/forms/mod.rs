@@ -168,6 +168,16 @@ pub async fn start_new_editor(
 
 /// Свободный текст без формы: редактор нового элемента с готовым названием.
 pub async fn quick_add(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
+    quick_add_in_list(ctx, text, None).await
+}
+
+/// Свободный текст без формы: редактор нового элемента в выбранном списке.
+/// Исчезнувший список заменяется обычным списком задач по умолчанию.
+pub async fn quick_add_in_list(
+    ctx: &mut Ctx<'_>,
+    text: &str,
+    list_id: Option<Uuid>,
+) -> Result<(), Fail> {
     let cleaned = sanitize(text);
     let text = cleaned.trim();
     let household_id = ctx.household()?.id;
@@ -177,16 +187,16 @@ pub async fn quick_add(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
         ));
         return ctx.present(Screen::Menu).await;
     }
-    let all = lists::list(&mut *ctx.conn, household_id).await?;
-    let list = all
-        .iter()
-        .filter(|list| list.kind == ListKind::Tasks && !list.is_archived)
-        .find(|list| list.is_default)
-        .or_else(|| {
-            all.iter()
-                .find(|list| list.kind == ListKind::Tasks && !list.is_archived)
-        })
-        .ok_or_else(|| Fail::User("Нет списка задач для сохранения.".into()))?;
+    let list = match list_id {
+        Some(list_id) => match lists::get_visible(&mut *ctx.conn, household_id, list_id).await {
+            Ok(list) if list.kind == ListKind::Tasks => list,
+            Ok(_) | Err(crate::domain::error::DomainError::NotFound) => {
+                default_tasks_list(ctx).await?
+            }
+            Err(error) => return Err(error.into()),
+        },
+        None => default_tasks_list(ctx).await?,
+    };
 
     let editor = Editor {
         target: EditorTarget::New {
@@ -208,6 +218,38 @@ pub async fn quick_add(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
         duplicate: None,
     };
     editor::show(ctx, editor).await
+}
+
+async fn default_tasks_list(ctx: &mut Ctx<'_>) -> Result<List, Fail> {
+    let household_id = ctx.household()?.id;
+    let all = lists::list(&mut *ctx.conn, household_id).await?;
+    all.iter()
+        .filter(|list| list.kind == ListKind::Tasks && !list.is_archived)
+        .find(|list| list.is_default)
+        .or_else(|| {
+            all.iter()
+                .find(|list| list.kind == ListKind::Tasks && !list.is_archived)
+        })
+        .cloned()
+        .ok_or_else(|| Fail::User("Нет списка задач для сохранения.".into()))
+}
+
+/// Показать результаты нового поиска. `on_error` — экран, на котором остаётся
+/// пользователь, если запрос слишком длинный.
+pub async fn search(ctx: &mut Ctx<'_>, text: &str, on_error: Screen) -> Result<(), Fail> {
+    if text.chars().count() > MAX_QUERY {
+        ctx.banner(format!(
+            "Запрос слишком длинный: не больше {MAX_QUERY} символов."
+        ));
+        return ctx.present(on_error).await;
+    }
+    clear(ctx).await?;
+    ctx.present(Screen::Results {
+        query: text.to_owned(),
+        status: super::model::StatusFilter::Open,
+        page: 0,
+    })
+    .await
 }
 
 /// Открыть единый редактор существующего элемента.

@@ -1271,11 +1271,11 @@ async fn field_value(
 /// Обработать текст в открытом поле редактора.
 pub(super) async fn on_text(ctx: &mut Ctx<'_>, mut editor: Editor, text: &str) -> Result<(), Fail> {
     let Some(step) = editor.field else {
-        ctx.banner("Сначала сохраните или отмените правку.");
+        ctx.banner(ru::EDITOR_DIRTY);
         return show(ctx, editor).await;
     };
     if !step.expects_text() {
-        ctx.banner("Сначала сохраните или отмените правку.");
+        ctx.banner(ru::EDITOR_DIRTY);
         return show(ctx, editor).await;
     }
 

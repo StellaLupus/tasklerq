@@ -1480,10 +1480,11 @@ async fn search_and_my_tasks() {
     bot.assert_screen_contains("Покупки");
     bot.assert_screen_contains("Задачи");
 
-    bot.text("несуществующее").await; // не форма: превращается в черновик
-    bot.press("Отмена").await;
+    // На экране результатов текст запускает новый поиск, а не разбор.
+    bot.text("несуществующее").await;
+    bot.assert_screen_contains("Ничего не нашлось");
 
-    bot.press("Поиск").await;
+    bot.press("Изменить запрос").await;
     bot.text("zzzz").await;
     bot.assert_screen_contains("Ничего не нашлось");
 
@@ -1492,6 +1493,51 @@ async fn search_and_my_tasks() {
     bot.assert_screen_contains("Мои задачи · 1");
     bot.assert_screen_contains("Моя задача");
     assert!(!bot.screen().contains("Купить молоко домой"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn text_on_search_results_runs_a_new_search_instead_of_capture() {
+    let db = db().await;
+    let mut bot = onboarded_with_llm(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        new_item(household.shopping_list_id, "Хлеб"),
+    )
+    .await;
+
+    bot.press("Поиск").await;
+    bot.assert_screen_contains("Напишите запрос");
+    bot.text("молоко").await;
+    bot.assert_screen_contains("Ничего не нашлось");
+    bot.assert_screen_contains("Напишите запрос");
+
+    bot.text("хлеб").await;
+    bot.assert_screen_contains("Найдено 1 результат");
+    bot.assert_screen_contains("Хлеб");
+
+    let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM capture_jobs WHERE chat_id = $1")
+        .bind(bot.chat)
+        .fetch_one(&db.pool)
+        .await
+        .expect("capture jobs");
+    assert_eq!(
+        jobs, 0,
+        "text on the results screen must not enqueue a capture job"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shopping_list_screen_hints_that_text_adds_positions() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+
+    bot.press("Покупки").await;
+    bot.assert_screen_contains("Напишите — добавлю в «Покупки»");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

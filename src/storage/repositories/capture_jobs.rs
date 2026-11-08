@@ -52,6 +52,19 @@ impl NewJob {
             payload: json!({"text": text}),
         }
     }
+
+    /// Задание на разбор текста со списком задач по умолчанию.
+    pub fn telegram_text_in_list(
+        household_id: Uuid,
+        user_id: Uuid,
+        chat_id: i64,
+        text: &str,
+        list_id: Uuid,
+    ) -> Self {
+        let mut job = Self::telegram_text(household_id, user_id, chat_id, text);
+        job.payload = json!({"text": text, "default_list_id": list_id});
+        job
+    }
 }
 
 /// Захваченное задание.
@@ -83,6 +96,14 @@ impl Job {
         } else {
             None
         }
+    }
+
+    /// Список задач по умолчанию, выбранный активным экраном. Старые задания
+    /// без поля возвращают `None`.
+    pub fn default_list_id(&self) -> Option<Uuid> {
+        self.payload
+            .get("default_list_id")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
     }
 }
 
