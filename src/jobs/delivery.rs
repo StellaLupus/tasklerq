@@ -130,6 +130,10 @@ async fn pending_rows(pool: &PgPool, scope: DeliveryScope) -> Result<Vec<NoticeR
 }
 
 /// Отменить `pending`-доставки вида, вхождение которых больше не актуально.
+///
+/// Кандидаты выбираются без блокировки, но каждая запись перечитывается под
+/// `FOR UPDATE SKIP LOCKED` и проверяется заново: тик не отменит snooze, который
+/// конкурентная транзакция только что перепривязала к новому вхождению.
 pub(crate) async fn cancel_stale(
     pool: &PgPool,
     now: DateTime<Utc>,
@@ -142,7 +146,7 @@ pub(crate) async fn cancel_stale(
         if !row.is_stale(now) {
             continue;
         }
-        match cancel_delivery(pool, row.id, now).await {
+        match cancel_stale_row(pool, row.id, now).await {
             Ok(rows) => cancelled += rows,
             Err(error) => tracing::error!(
                 delivery_id = %row.id,
@@ -152,6 +156,30 @@ pub(crate) async fn cancel_stale(
             ),
         }
     }
+    Ok(cancelled)
+}
+
+/// Перечитать кандидатку под блокировкой и отменить её по свежему снимку.
+///
+/// `0` — строку держит другая транзакция (или она уже не `pending`): запись
+/// пропускается до следующего тика.
+async fn cancel_stale_row(pool: &PgPool, id: Uuid, now: DateTime<Utc>) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let sql = format!(
+        "SELECT {NOTICE_ROW_COLUMNS}
+         {NOTICE_ROW_FROM}
+         WHERE d.id = $1 AND d.status = 'pending'
+         FOR UPDATE OF d SKIP LOCKED"
+    );
+    let row: Option<NoticeRow> = sqlx::query_as(&sql)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let cancelled = match row {
+        Some(row) if cancel_if_stale(&mut tx, &row, now).await? => 1,
+        _ => 0,
+    };
+    tx.commit().await?;
     Ok(cancelled)
 }
 
@@ -330,12 +358,6 @@ async fn render(
 /// Ключ `dedupe_key` outbox для доставки.
 fn delivery_dedupe_key(id: Uuid, kind: NotificationKind) -> String {
     format!("notification:{}:{id}", kind.as_str())
-}
-
-/// Отменить `pending`-доставку через пул.
-async fn cancel_delivery(pool: &PgPool, id: Uuid, now: DateTime<Utc>) -> Result<u64, sqlx::Error> {
-    let mut conn = pool.acquire().await?;
-    mark_cancelled(&mut conn, id, now).await
 }
 
 /// Пометить `pending`-доставку отменённой в текущей транзакции.

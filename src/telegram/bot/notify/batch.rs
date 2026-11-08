@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::models::ItemStatus;
+use crate::jobs::keys::snooze_origin;
 use crate::storage::repositories::items;
 use crate::storage::repositories::notifications::{
     self, BatchDelivery, BatchState, NotificationKind,
@@ -138,6 +139,7 @@ pub fn batch_ui(
                             Action::BatchSnooze {
                                 batch_id,
                                 item_id: entry.item_id,
+                                version: Some(entry.version),
                             },
                         ),
                         open,
@@ -266,11 +268,12 @@ pub async fn batch_snooze(
     message_id: i64,
     batch_id: Uuid,
     item_id: Uuid,
+    version: Option<i32>,
 ) -> Result<(), Fail> {
     if !actionable(ctx, message_id, batch_id, item_id).await? {
         return Ok(());
     }
-    if snooze_batch_item(ctx, batch_id, item_id, false).await? {
+    if snooze_batch_item(ctx, batch_id, item_id, version, false).await? {
         ctx.toast("Отложено");
     }
     render_batch(ctx, message_id, batch_id).await
@@ -397,7 +400,7 @@ pub async fn batch_snooze_all(
         if batch_entry(row, ctx.tz, ctx.now).state != BatchEntryState::Open {
             continue;
         }
-        if snooze_batch_item(ctx, batch_id, item_id, true).await? {
+        if snooze_batch_item(ctx, batch_id, item_id, None, true).await? {
             snoozed += 1;
         }
     }
@@ -471,6 +474,7 @@ async fn snooze_batch_item(
     ctx: &mut Ctx<'_>,
     batch_id: Uuid,
     item_id: Uuid,
+    version: Option<i32>,
     batched: bool,
 ) -> Result<bool, Fail> {
     let household_id = ctx.household()?.id;
@@ -488,9 +492,14 @@ async fn snooze_batch_item(
         ctx.toast("Задача уже выполнена");
         return Ok(false);
     }
+    if version.is_some_and(|version| version != item.version) {
+        ctx.toast("Задача уже изменилась");
+        return Ok(false);
+    }
 
     let deliver_at = snooze_time(SnoozeUntil::OneHour, ctx.tz, ctx.now)?;
-    insert_snooze(ctx, item_id, deliver_at, batched).await?;
+    let origin_key = snooze_origin(item.due_at, item.due_date);
+    insert_snooze(ctx, item_id, &origin_key, deliver_at, batched).await?;
     set_batch_snoozed(ctx, batch_id, item_id, deliver_at).await?;
     Ok(true)
 }
@@ -611,6 +620,15 @@ fn batch_entry(row: &BatchDelivery, tz: Tz, now: DateTime<Utc>) -> BatchEntry {
     // исключение: оно остаётся актуальным, поэтому блок показывает задачу и
     // работает так же, как одиночное уведомление о назначении.
     let list_archived = !is_assignment(kind) && row.list_archived == Some(true);
+    // Блок без собственного итога или с отменённым snooze показывает текущее
+    // состояние задачи: отменённое «Напомню в …» больше ничего не обещает.
+    let task_state = || {
+        if row.item_status != Some(ItemStatus::Open) {
+            BatchEntryState::Done
+        } else {
+            BatchEntryState::Open
+        }
+    };
     let state = if missing {
         BatchEntryState::Missing
     } else if list_archived {
@@ -618,17 +636,14 @@ fn batch_entry(row: &BatchDelivery, tz: Tz, now: DateTime<Utc>) -> BatchEntry {
     } else {
         match row.batch_state {
             Some(BatchState::Done) => BatchEntryState::Done,
-            Some(BatchState::Snoozed) => {
+            // Записи snooze могло уже не быть (retention удалил `sent` или
+            // `cancelled`): это не отмена, поэтому блок остаётся отложенным.
+            Some(BatchState::Snoozed) if !row.snooze_cancelled => {
                 BatchEntryState::Snoozed(row.batch_snoozed_until.unwrap_or(now))
             }
+            Some(BatchState::Snoozed) => task_state(),
             Some(BatchState::Missing) => BatchEntryState::Missing,
-            None => {
-                if row.item_status != Some(ItemStatus::Open) {
-                    BatchEntryState::Done
-                } else {
-                    BatchEntryState::Open
-                }
-            }
+            None => task_state(),
         }
     };
     let list = row.list_name.clone().unwrap_or_default();

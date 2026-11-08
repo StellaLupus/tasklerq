@@ -9,7 +9,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use serde_json::json;
-use sqlx::PgPool;
+use sqlx::{Acquire, PgPool};
 use support::telegram::Harness;
 use support::{TestDb, TestHousehold, new_member, next_telegram_id};
 use tasklerq::domain::models::{
@@ -18,6 +18,7 @@ use tasklerq::domain::models::{
 };
 use tasklerq::domain::recurrence::Due;
 use tasklerq::jobs::scheduler::{Scheduler, all_day_occurrence_key, occurrence_key};
+use tasklerq::storage::repositories::notifications::{self, NewDelivery, NotificationKind};
 use tasklerq::storage::repositories::{items, users};
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -452,6 +453,53 @@ async fn insert_delivery(
     .execute(pool)
     .await
     .map(|_| id)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_snooze_with_origin(
+    pool: &PgPool,
+    household_id: Uuid,
+    user_id: Uuid,
+    item_id: Uuid,
+    key: &str,
+    origin_key: Option<&str>,
+    scheduled_at: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    let delivery = NewDelivery {
+        household_id,
+        user_id,
+        item_id: Some(item_id),
+        kind: NotificationKind::Snooze,
+        occurrence_key: key,
+        origin_key,
+        scheduled_at,
+    };
+    notifications::insert(&mut conn, &delivery, scheduled_at).await
+}
+
+async fn snooze_delivery(
+    pool: &PgPool,
+    item_id: Uuid,
+    key: &str,
+) -> (
+    String,
+    Option<String>,
+    DateTime<Utc>,
+    bool,
+    bool,
+    Option<i64>,
+) {
+    sqlx::query_as(
+        "SELECT status::text, origin_key, scheduled_at, deferred, batched, outbox_seq
+         FROM notification_deliveries
+         WHERE item_id = $1 AND occurrence_key = $2 AND kind = 'snooze'",
+    )
+    .bind(item_id)
+    .bind(key)
+    .fetch_one(pool)
+    .await
+    .expect("snooze delivery")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1195,6 +1243,103 @@ async fn changing_due_at_cancels_pending_delivery_for_the_old_due() {
     let rows = delivery_rows(&db.pool, item.id).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].0, "cancelled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_stale_skips_a_locked_delivery_until_the_lock_is_released() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let due = rounded_now() + Duration::hours(3);
+    let now = due - Duration::minutes(15);
+    let unlocked = create_task(
+        &db,
+        &household,
+        "Отменится сразу",
+        Some(due),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let locked = create_task(
+        &db,
+        &household,
+        "Ждёт блокировку",
+        Some(due),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let unlocked_delivery = insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        Some(unlocked.id),
+        &occurrence_key(due),
+        "pending",
+        now,
+    )
+    .await
+    .expect("unlocked delivery");
+    let locked_delivery = insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        Some(locked.id),
+        &occurrence_key(due),
+        "pending",
+        now,
+    )
+    .await
+    .expect("locked delivery");
+
+    // Оба срока сдвинуты: записи устарели.
+    sqlx::query("UPDATE items SET due_at = due_at + interval '2 hours' WHERE id = $1 OR id = $2")
+        .bind(unlocked.id)
+        .bind(locked.id)
+        .execute(&db.pool)
+        .await
+        .expect("move due");
+
+    let mut lock_conn = db.pool.acquire().await.expect("lock connection");
+    let mut lock_tx = lock_conn.begin().await.expect("lock transaction");
+    sqlx::query("SELECT id FROM notification_deliveries WHERE id = $1 FOR UPDATE")
+        .bind(locked_delivery)
+        .fetch_one(&mut *lock_tx)
+        .await
+        .expect("row lock");
+
+    let stats = scheduler(&db.pool).tick(now).await.expect("locked tick");
+    assert_eq!(stats.cancelled, 1, "{stats:?}");
+    let unlocked_status: String =
+        sqlx::query_scalar("SELECT status::text FROM notification_deliveries WHERE id = $1")
+            .bind(unlocked_delivery)
+            .fetch_one(&db.pool)
+            .await
+            .expect("unlocked status");
+    let locked_status: String =
+        sqlx::query_scalar("SELECT status::text FROM notification_deliveries WHERE id = $1")
+            .bind(locked_delivery)
+            .fetch_one(&db.pool)
+            .await
+            .expect("locked status");
+    assert_eq!(unlocked_status, "cancelled");
+    assert_eq!(
+        locked_status, "pending",
+        "a row held by another transaction must be skipped"
+    );
+
+    lock_tx.rollback().await.expect("release lock");
+    drop(lock_conn);
+
+    let stats = scheduler(&db.pool).tick(now).await.expect("release tick");
+    assert_eq!(stats.cancelled, 1, "{stats:?}");
+    let locked_status: String =
+        sqlx::query_scalar("SELECT status::text FROM notification_deliveries WHERE id = $1")
+            .bind(locked_delivery)
+            .fetch_one(&db.pool)
+            .await
+            .expect("locked status after release");
+    assert_eq!(locked_status, "cancelled");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4102,4 +4247,337 @@ async fn reminder_and_digest_escape_a_script_title() {
         );
         assert!(html.contains("&amp;"), "{html}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snooze_with_a_changed_origin_rebinds_pending_and_cancelled_deliveries() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(
+        &db,
+        &household,
+        "Позвонить в поликлинику",
+        Some(due),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let first_at = rounded_now() + Duration::hours(1);
+    let new_at = rounded_now() + Duration::hours(2);
+
+    for (index, status) in ["pending", "cancelled"].into_iter().enumerate() {
+        let key = notifications::snooze_key(first_at + Duration::hours(index as i64));
+        let inserted = insert_snooze_with_origin(
+            &db.pool,
+            household.household_id,
+            household.owner_id,
+            item.id,
+            &key,
+            Some("date:2026-11-09"),
+            first_at,
+        )
+        .await
+        .expect("initial snooze");
+        assert_eq!(inserted, 1);
+
+        let seq = insert_outbox(&db.pool, chat, &format!("snooze-origin-{index}")).await;
+        sqlx::query(
+            "UPDATE notification_deliveries
+             SET status = $2::notification_status,
+                 deferred = true, batched = true, outbox_seq = $3
+             WHERE item_id = $1 AND occurrence_key = $4",
+        )
+        .bind(item.id)
+        .bind(status)
+        .bind(seq)
+        .bind(&key)
+        .execute(&db.pool)
+        .await
+        .expect("prepare delivery");
+
+        let rebound = insert_snooze_with_origin(
+            &db.pool,
+            household.household_id,
+            household.owner_id,
+            item.id,
+            &key,
+            Some("date:2026-11-10"),
+            new_at,
+        )
+        .await
+        .expect("re-snooze with a new origin");
+        assert_eq!(rebound, 1, "{status} delivery must be rebound");
+
+        let (status, origin, scheduled, deferred, batched, outbox_seq) =
+            snooze_delivery(&db.pool, item.id, &key).await;
+        assert_eq!(status, "pending");
+        assert_eq!(origin.as_deref(), Some("date:2026-11-10"));
+        assert_eq!(scheduled, new_at);
+        assert!(!deferred, "rebinding must reset the quiet-hours flag");
+        assert!(!batched, "rebinding must reset the batched flag");
+        assert_eq!(outbox_seq, None, "rebinding must reset the outbox link");
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM notification_deliveries
+             WHERE item_id = $1 AND occurrence_key = $2 AND kind = 'snooze'",
+        )
+        .bind(item.id)
+        .bind(&key)
+        .fetch_one(&db.pool)
+        .await
+        .expect("snooze count");
+        assert_eq!(count, 1, "rebinding must update the same row");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snooze_with_the_same_origin_changes_nothing() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(
+        &db,
+        &household,
+        "Позвонить в поликлинику",
+        Some(due),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let first_at = rounded_now() + Duration::hours(1);
+    let key = notifications::snooze_key(first_at);
+    let origin = "date:2026-11-09";
+
+    assert_eq!(
+        insert_snooze_with_origin(
+            &db.pool,
+            household.household_id,
+            household.owner_id,
+            item.id,
+            &key,
+            Some(origin),
+            first_at,
+        )
+        .await
+        .expect("initial snooze"),
+        1
+    );
+
+    assert_eq!(
+        insert_snooze_with_origin(
+            &db.pool,
+            household.household_id,
+            household.owner_id,
+            item.id,
+            &key,
+            Some(origin),
+            first_at + Duration::hours(1),
+        )
+        .await
+        .expect("same snooze"),
+        0,
+        "the same pending delivery must not be touched"
+    );
+
+    let (status, stored_origin, scheduled, _, _, _) =
+        snooze_delivery(&db.pool, item.id, &key).await;
+    assert_eq!(status, "pending");
+    assert_eq!(stored_origin.as_deref(), Some(origin));
+    assert_eq!(scheduled, first_at);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snooze_with_a_changed_origin_does_not_touch_a_sent_delivery() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(
+        &db,
+        &household,
+        "Позвонить в поликлинику",
+        Some(due),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let first_at = rounded_now() + Duration::hours(1);
+    let key = notifications::snooze_key(first_at);
+    let origin = "date:2026-11-09";
+
+    assert_eq!(
+        insert_snooze_with_origin(
+            &db.pool,
+            household.household_id,
+            household.owner_id,
+            item.id,
+            &key,
+            Some(origin),
+            first_at,
+        )
+        .await
+        .expect("initial snooze"),
+        1
+    );
+    sqlx::query(
+        "UPDATE notification_deliveries
+         SET status = 'sent' WHERE item_id = $1 AND occurrence_key = $2",
+    )
+    .bind(item.id)
+    .bind(&key)
+    .execute(&db.pool)
+    .await
+    .expect("mark sent");
+
+    assert_eq!(
+        insert_snooze_with_origin(
+            &db.pool,
+            household.household_id,
+            household.owner_id,
+            item.id,
+            &key,
+            Some("date:2026-11-10"),
+            first_at + Duration::hours(1),
+        )
+        .await
+        .expect("re-snooze after delivery"),
+        0,
+        "a delivered snooze must not be rebound"
+    );
+
+    let (status, stored_origin, scheduled, _, _, _) =
+        snooze_delivery(&db.pool, item.id, &key).await;
+    assert_eq!(status, "sent");
+    assert_eq!(stored_origin.as_deref(), Some(origin));
+    assert_eq!(scheduled, first_at);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snooze_with_an_origin_rebinds_a_legacy_pending_delivery() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(
+        &db,
+        &household,
+        "Позвонить в поликлинику",
+        Some(due),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let first_at = rounded_now() + Duration::hours(1);
+    let key = notifications::snooze_key(first_at);
+
+    // Запись до миграции: привязки ещё нет.
+    assert_eq!(
+        insert_snooze_with_origin(
+            &db.pool,
+            household.household_id,
+            household.owner_id,
+            item.id,
+            &key,
+            None,
+            first_at,
+        )
+        .await
+        .expect("legacy snooze"),
+        1
+    );
+
+    let new_at = first_at + Duration::hours(1);
+    let origin = "date:2026-11-10";
+    assert_eq!(
+        insert_snooze_with_origin(
+            &db.pool,
+            household.household_id,
+            household.owner_id,
+            item.id,
+            &key,
+            Some(origin),
+            new_at,
+        )
+        .await
+        .expect("snooze after migration"),
+        1,
+        "a legacy pending delivery must be rebound to the new origin"
+    );
+
+    let (status, stored_origin, scheduled, deferred, batched, outbox_seq) =
+        snooze_delivery(&db.pool, item.id, &key).await;
+    assert_eq!(status, "pending");
+    assert_eq!(stored_origin.as_deref(), Some(origin));
+    assert_eq!(scheduled, new_at);
+    assert!(!deferred);
+    assert!(!batched);
+    assert_eq!(outbox_seq, None);
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM notification_deliveries
+         WHERE item_id = $1 AND occurrence_key = $2 AND kind = 'snooze'",
+    )
+    .bind(item.id)
+    .bind(&key)
+    .fetch_one(&db.pool)
+    .await
+    .expect("snooze count");
+    assert_eq!(count, 1, "rebinding must update the same row");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snooze_without_an_origin_rebinds_a_delivery_with_an_origin() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(
+        &db,
+        &household,
+        "Позвонить в поликлинику",
+        Some(due),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let first_at = rounded_now() + Duration::hours(1);
+    let key = notifications::snooze_key(first_at);
+    let origin = "date:2026-11-09";
+
+    assert_eq!(
+        insert_snooze_with_origin(
+            &db.pool,
+            household.household_id,
+            household.owner_id,
+            item.id,
+            &key,
+            Some(origin),
+            first_at,
+        )
+        .await
+        .expect("initial snooze"),
+        1
+    );
+
+    let new_at = first_at + Duration::hours(1);
+    assert_eq!(
+        insert_snooze_with_origin(
+            &db.pool,
+            household.household_id,
+            household.owner_id,
+            item.id,
+            &key,
+            None,
+            new_at,
+        )
+        .await
+        .expect("re-snooze without an origin"),
+        1,
+        "the origin must be cleared when the new delivery has none"
+    );
+
+    let (status, stored_origin, scheduled, _, _, _) =
+        snooze_delivery(&db.pool, item.id, &key).await;
+    assert_eq!(status, "pending");
+    assert_eq!(stored_origin, None);
+    assert_eq!(scheduled, new_at);
 }

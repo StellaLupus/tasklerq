@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::models::{Item, ItemStatus, List};
 use crate::domain::recurrence::resolve_local;
+use crate::jobs::keys::snooze_origin;
 use crate::storage::repositories::notifications::{self, NewDelivery, NotificationKind};
 use crate::storage::repositories::{items, lists};
 use crate::telegram::callbacks::Scope;
@@ -86,6 +87,7 @@ pub fn reminder_ui(
                 Action::Snooze {
                     item_id: item.id,
                     until: SnoozeUntil::OneHour,
+                    version: Some(item.version),
                 },
             ),
         ])
@@ -95,6 +97,7 @@ pub fn reminder_ui(
                 Action::Snooze {
                     item_id: item.id,
                     until: SnoozeUntil::TomorrowMorning,
+                    version: Some(item.version),
                 },
             ),
             button("📋 Открыть", Action::NoticeOpen { item_id: item.id }),
@@ -390,6 +393,7 @@ pub(super) fn snooze_time(
 pub(super) async fn insert_snooze(
     ctx: &mut Ctx<'_>,
     item_id: Uuid,
+    origin_key: &str,
     deliver_at: DateTime<Utc>,
     batched: bool,
 ) -> Result<(), Fail> {
@@ -400,6 +404,7 @@ pub(super) async fn insert_snooze(
         item_id: Some(item_id),
         kind: NotificationKind::Snooze,
         occurrence_key: &occurrence_key,
+        origin_key: Some(origin_key),
         scheduled_at: deliver_at,
     };
     if batched {
@@ -416,6 +421,7 @@ pub async fn snooze(
     message_id: i64,
     item_id: Uuid,
     until: SnoozeUntil,
+    version: Option<i32>,
 ) -> Result<(), Fail> {
     let Some((item, _)) = load(ctx, item_id).await? else {
         ctx.toast("Задача больше недоступна");
@@ -425,9 +431,14 @@ pub async fn snooze(
         ctx.toast("Задача уже выполнена");
         return show_current(ctx, message_id, item_id).await;
     }
+    if version.is_some_and(|version| version != item.version) {
+        ctx.toast("Задача уже изменилась");
+        return show_current(ctx, message_id, item_id).await;
+    }
 
     let deliver_at = snooze_time(until, ctx.tz, ctx.now)?;
-    insert_snooze(ctx, item_id, deliver_at, false).await?;
+    let origin_key = snooze_origin(item.due_at, item.due_date);
+    insert_snooze(ctx, item_id, &origin_key, deliver_at, false).await?;
 
     let local = deliver_at.with_timezone(&ctx.tz);
     ctx.toast("Отложено");

@@ -314,6 +314,7 @@ async fn insert_reminder(
         item_id: Some(candidate.item_id),
         kind: NotificationKind::Reminder,
         occurrence_key: key,
+        origin_key: None,
         scheduled_at,
     };
     notifications::insert(conn, &delivery, now).await

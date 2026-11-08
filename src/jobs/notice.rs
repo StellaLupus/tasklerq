@@ -10,7 +10,7 @@ use chrono_tz::Tz;
 use sqlx::FromRow;
 use uuid::Uuid;
 
-use super::keys::{all_day_occurrence_key, digest_occurrence_key, occurrence_key};
+use super::keys::{digest_occurrence_key, item_occurrence_key, snooze_origin};
 use super::quiet::resolved_timezone;
 use crate::domain::models::ItemStatus;
 use crate::domain::settings::NotificationSettings;
@@ -18,7 +18,7 @@ use crate::storage::repositories::notifications::NotificationKind;
 
 /// Колонки записи доставки и связанных строк для [`NoticeRow`].
 pub(crate) const NOTICE_ROW_COLUMNS: &str = "d.id, d.household_id, d.user_id, d.kind,
-        d.occurrence_key, d.scheduled_at, d.deferred, d.created_at,
+        d.occurrence_key, d.origin_key, d.scheduled_at, d.deferred, d.created_at,
         i.id AS item_id, i.title AS item_title, i.status AS item_status,
         i.deleted_at AS item_deleted_at, i.due_at AS item_due_at,
         i.due_date AS item_due_date,
@@ -47,6 +47,7 @@ pub(crate) struct NoticeRow {
     pub user_id: Uuid,
     pub kind: NotificationKind,
     pub occurrence_key: String,
+    pub origin_key: Option<String>,
     pub scheduled_at: DateTime<Utc>,
     pub deferred: bool,
     pub created_at: DateTime<Utc>,
@@ -98,11 +99,7 @@ impl NoticeRow {
 
     /// Ключ текущего вхождения элемента.
     pub(crate) fn current_key(&self) -> Option<String> {
-        match (self.item_due_at, self.item_due_date) {
-            (Some(due_at), None) => Some(occurrence_key(due_at)),
-            (None, Some(due_date)) => Some(all_day_occurrence_key(due_date)),
-            _ => None,
-        }
+        item_occurrence_key(self.item_due_at, self.item_due_date)
     }
 
     /// Задача существует, открыта и имеет название.
@@ -166,13 +163,18 @@ impl NoticeRow {
 
     /// Запись больше не должна быть доставлена.
     ///
-    /// `Snooze` не сверяется с текущим `occurrence_key`: его ключ — время
-    /// отложенной доставки. Он отменяется только вместе с задачей, списком,
-    /// household, получателем или выключенными напоминаниями.
+    /// Напоминание сверяется с текущим вхождением срока ([`current_key`]) и
+    /// окном вседневной доставки. Snooze сверяется только со своим
+    /// `origin_key`: он устаревает, когда [`snooze_origin`] по текущему сроку
+    /// задачи даёт другое значение. Запись snooze без привязки (до миграции)
+    /// по этой проверке не устаревает. Поэтому смена локальной даты и тихие
+    /// часы snooze не отменяют.
     ///
     /// Назначение не зависит от напоминаний и архива списка: задача остаётся
     /// открытой и всё ещё назначена получателю. Список при этом должен
     /// существовать, иначе карточку не из чего собрать.
+    ///
+    /// [`current_key`]: NoticeRow::current_key
     pub(crate) fn is_stale(&self, now: DateTime<Utc>) -> bool {
         if !self.recipient_alive() {
             return true;
@@ -199,7 +201,9 @@ impl NoticeRow {
             return true;
         }
         if self.is_snooze() {
-            return false;
+            return self.origin_key.as_deref().is_some_and(|origin_key| {
+                origin_key != snooze_origin(self.item_due_at, self.item_due_date)
+            });
         }
         !self.item_valid()
             || !self.recipient_selected()

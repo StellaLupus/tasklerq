@@ -79,6 +79,8 @@ pub struct NewDelivery<'a> {
     pub kind: NotificationKind,
     /// Ключ вхождения: срок, дата сводки или id события назначения.
     pub occurrence_key: &'a str,
+    /// Вхождение срока, из которого отложено snooze; у остальных видов пусто.
+    pub origin_key: Option<&'a str>,
     /// Момент, начиная с которого запись можно доставлять.
     pub scheduled_at: DateTime<Utc>,
 }
@@ -119,31 +121,36 @@ async fn insert_with_flags(
 ) -> Result<u64, sqlx::Error> {
     Ok(sqlx::query(
         "INSERT INTO notification_deliveries (
-             id, household_id, user_id, item_id, occurrence_key, kind,
+             id, household_id, user_id, item_id, occurrence_key, origin_key, kind,
              status, scheduled_at, deferred, batched, created_at, updated_at
          )
-         SELECT $1, $2, $3, $4, $5, $6, 'pending', $7, false, $8, $9, $9
+         SELECT $1, $2, $3, $4, $5, $6, $7, 'pending', $8, false, $9, $10, $10
          WHERE NOT EXISTS (
              SELECT 1 FROM notification_deliveries d
              WHERE d.user_id = $3 AND d.item_id IS NOT DISTINCT FROM $4
-               AND d.occurrence_key = $5 AND d.kind = $6
+               AND d.occurrence_key = $5 AND d.kind = $7
+               AND d.origin_key IS NOT DISTINCT FROM $6
                AND d.status IN ('pending', 'sent')
          )
          ON CONFLICT ON CONSTRAINT notification_deliveries_key_unique
          DO UPDATE SET
              status = 'pending',
+             origin_key = EXCLUDED.origin_key,
              scheduled_at = EXCLUDED.scheduled_at,
              deferred = EXCLUDED.deferred,
              batched = EXCLUDED.batched,
              outbox_seq = NULL,
              updated_at = EXCLUDED.updated_at
-         WHERE notification_deliveries.status = 'cancelled'",
+         WHERE notification_deliveries.status = 'cancelled'
+            OR (notification_deliveries.status = 'pending'
+                AND notification_deliveries.origin_key IS DISTINCT FROM EXCLUDED.origin_key)",
     )
     .bind(Uuid::now_v7())
     .bind(delivery.household_id)
     .bind(delivery.user_id)
     .bind(delivery.item_id)
     .bind(delivery.occurrence_key)
+    .bind(delivery.origin_key)
     .bind(delivery.kind)
     .bind(delivery.scheduled_at)
     .bind(batched)
@@ -260,6 +267,12 @@ pub struct BatchDelivery {
     pub batch_state: Option<BatchState>,
     /// Время нового snooze.
     pub batch_snoozed_until: Option<DateTime<Utc>>,
+    /// Snooze-доставка блока отменена.
+    ///
+    /// Отсутствие записи (retention мог удалить её как `sent`, так и
+    /// `cancelled`, пока батч ещё жив) означает «не отменена»: блок остаётся
+    /// отложенным.
+    pub snooze_cancelled: bool,
     /// Момент выпуска.
     pub scheduled_at: DateTime<Utc>,
     /// Название задачи.
@@ -290,6 +303,15 @@ pub async fn batch_deliveries(
     sqlx::query_as(
         "SELECT d.id, d.item_id, d.kind AS kind, d.batch_version,
                 d.batch_state, d.batch_snoozed_until, d.scheduled_at,
+                EXISTS (SELECT 1
+                        FROM notification_deliveries s
+                        WHERE s.user_id = d.user_id
+                          AND s.item_id = d.item_id
+                          AND s.kind = 'snooze'
+                          AND d.batch_snoozed_until IS NOT NULL
+                          AND s.occurrence_key = 'snooze:'
+                              || floor(extract(epoch FROM d.batch_snoozed_until))::bigint
+                          AND s.status = 'cancelled') AS snooze_cancelled,
                 i.title, i.status AS item_status,
                 i.deleted_at AS item_deleted_at, i.version AS item_version,
                 i.due_at, i.due_date,
@@ -388,6 +410,7 @@ pub async fn notify_assignment(
         item_id: Some(notice.item_id),
         kind: NotificationKind::Assignment,
         occurrence_key: &occurrence_key,
+        origin_key: None,
         scheduled_at: now,
     };
     Ok(insert(conn, &delivery, now).await?)

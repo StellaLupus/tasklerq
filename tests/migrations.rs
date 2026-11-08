@@ -247,6 +247,70 @@ async fn capture_draft_parts_migration_adds_the_parts_column_and_keeps_old_rows(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snooze_origin_migration_keeps_existing_snooze_unbound() {
+    let db = support::empty_db().await;
+    let dir = std::env::temp_dir().join(format!(
+        "tasklerq-migrations-0014-{}",
+        Uuid::now_v7().simple()
+    ));
+    std::fs::create_dir_all(&dir).expect("temporary migration directory");
+    copy_migrations_through(13, &dir);
+
+    let before = Migrator::new(dir.as_path())
+        .await
+        .expect("a migrator through 0013 should resolve");
+    before
+        .run(&db.pool)
+        .await
+        .context("migrations through 0013 should apply")
+        .expect("migrations through 0013");
+
+    let household = support::create_household(&db.pool).await;
+    let item = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        support::new_item(household.tasks_list_id, "Отложенная задача"),
+    )
+    .await;
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO notification_deliveries (
+             id, household_id, user_id, item_id, occurrence_key, kind,
+             status, scheduled_at, created_at, updated_at
+         )
+         VALUES ($1, $2, $3, $4, 'snooze:1800000000', 'snooze',
+                 'pending', now(), now(), now())",
+    )
+    .bind(id)
+    .bind(household.household_id)
+    .bind(household.owner_id)
+    .bind(item.id)
+    .execute(&db.pool)
+    .await
+    .expect("pending snooze before the migration");
+
+    MIGRATOR
+        .run(&db.pool)
+        .await
+        .expect("0014 must apply over an existing pending snooze");
+
+    let origin: Option<String> =
+        sqlx::query_scalar("SELECT origin_key FROM notification_deliveries WHERE id = $1")
+            .bind(id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("snooze after the migration");
+    assert_eq!(
+        origin, None,
+        "a snooze created before the migration must stay unbound"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_migration_reports_its_version_rolls_back_and_blocks_readiness() {
     let db = support::empty_db().await;
     let dir = std::env::temp_dir().join(format!("tasklerq-migrations-{}", Uuid::now_v7().simple()));
