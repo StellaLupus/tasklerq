@@ -88,6 +88,37 @@ pub fn weekday_short(iso: u32) -> &'static str {
         .unwrap_or("")
 }
 
+/// Полное название дня недели с заглавной буквы (ISO 1..=7).
+pub fn weekday_long(iso: u32) -> &'static str {
+    [
+        "Понедельник",
+        "Вторник",
+        "Среда",
+        "Четверг",
+        "Пятница",
+        "Суббота",
+        "Воскресенье",
+    ]
+    .get(usize::try_from(iso).unwrap_or(1).saturating_sub(1))
+    .copied()
+    .unwrap_or("")
+}
+
+/// Заголовок группы журнала: «Вторник, 4 ноя»; будущий день — с «(впереди)».
+pub fn planned_day_label(date: NaiveDate, today: NaiveDate) -> String {
+    let label = format!(
+        "{}, {} {}",
+        weekday_long(date.weekday().number_from_monday()),
+        date.day(),
+        month_short(date.month())
+    );
+    if date > today {
+        format!("{label} (впереди)")
+    } else {
+        label
+    }
+}
+
 /// Подпись срока без времени.
 pub const ALL_DAY: &str = "весь день";
 
@@ -130,6 +161,73 @@ pub fn due_label(
         ));
     }
     due_date.map(|date| date_label(date, today))
+}
+
+/// Дата без относительных слов: «вт, 4 ноя», а в другом году — «5 янв 2027».
+pub fn fixed_date_label(date: NaiveDate, today: NaiveDate) -> String {
+    if date.year() == today.year() {
+        format!(
+            "{}, {} {}",
+            weekday_short(date.weekday().number_from_monday()),
+            date.day(),
+            month_short(date.month())
+        )
+    } else {
+        format!(
+            "{} {} {}",
+            date.day(),
+            month_short(date.month()),
+            date.year()
+        )
+    }
+}
+
+/// Отклонение факта выполнения от плана: «+2 дня», «+3 ч», «раньше».
+///
+/// Срок без времени сравнивается по местным датам: тот же день — без пометки.
+/// Срок со временем: раньше в тот же день или опоздание меньше часа — без
+/// пометки, от часа до суток — целые часы вниз, от суток — целые дни вниз.
+/// `None` — выполнение в срок или в тот же день раньше срока.
+///
+/// Число и единица разделены неразрывным пробелом: иначе клиент переносит
+/// «+2» и «дня» на разные строки свёрнутой цитаты.
+pub fn completion_deviation(
+    due_at: Option<DateTime<Utc>>,
+    due_date: Option<NaiveDate>,
+    completed_at: DateTime<Utc>,
+    timezone: Tz,
+) -> Option<String> {
+    if let Some(due_at) = due_at {
+        let planned = due_at.with_timezone(&timezone);
+        let actual = completed_at.with_timezone(&timezone);
+        if completed_at < due_at {
+            return (actual.date_naive() < planned.date_naive()).then(|| "раньше".to_owned());
+        }
+        let late = completed_at - due_at;
+        if late < chrono::Duration::hours(1) {
+            return None;
+        }
+        if late < chrono::Duration::days(1) {
+            return Some(format!("+{}{NBSP}ч", late.num_hours()));
+        }
+        return Some(late_days(late.num_days()));
+    }
+
+    let planned = due_date?;
+    let actual = completed_at.with_timezone(&timezone).date_naive();
+    match (actual - planned).num_days() {
+        late if late > 0 => Some(late_days(late)),
+        late if late < 0 => Some("раньше".to_owned()),
+        _ => None,
+    }
+}
+
+/// Неразрывный пробел между числом и единицей в отклонении.
+const NBSP: char = '\u{a0}';
+
+/// «+2 дня» с неразрывным пробелом.
+fn late_days(n: i64) -> String {
+    format!("+{n}{NBSP}{}", plural(n, "день", "дня", "дней"))
 }
 
 /// Счётчик выполненных сегодня в шапке списка задач.
@@ -496,6 +594,106 @@ mod tests {
         assert_eq!(parse_due("когда-нибудь", today), None);
         assert_eq!(parse_due("25:99", today), None);
         assert_eq!(parse_due("", today), None);
+    }
+
+    #[test]
+    fn fixed_dates_have_no_relative_words() {
+        let today = date(2025, 11, 6);
+        assert_eq!(fixed_date_label(date(2025, 11, 4), today), "вт, 4 ноя");
+        assert_eq!(fixed_date_label(today, today), "чт, 6 ноя");
+        assert_eq!(fixed_date_label(date(2027, 1, 5), today), "5 янв 2027");
+    }
+
+    #[test]
+    fn deviation_of_an_all_day_due_counts_local_days() {
+        let tz: Tz = "Europe/Moscow".parse().expect("tz");
+        let completed = Utc.with_ymd_and_hms(2026, 11, 6, 10, 47, 0).unwrap();
+
+        // Срок 4 ноября, факт 6 ноября: местная дата позже на два дня.
+        assert_eq!(
+            completion_deviation(None, Some(date(2026, 11, 4)), completed, tz).as_deref(),
+            Some("+2\u{a0}дня")
+        );
+        assert_eq!(
+            completion_deviation(None, Some(date(2026, 11, 5)), completed, tz).as_deref(),
+            Some("+1\u{a0}день")
+        );
+        assert_eq!(
+            completion_deviation(None, Some(date(2026, 11, 1)), completed, tz).as_deref(),
+            Some("+5\u{a0}дней")
+        );
+        assert_eq!(
+            completion_deviation(None, Some(date(2026, 10, 27)), completed, tz).as_deref(),
+            Some("+10\u{a0}дней")
+        );
+        assert_eq!(
+            completion_deviation(None, Some(date(2026, 10, 16)), completed, tz).as_deref(),
+            Some("+21\u{a0}день")
+        );
+        assert_eq!(
+            completion_deviation(None, Some(date(2026, 11, 6)), completed, tz),
+            None,
+            "the same local day is on time"
+        );
+        assert_eq!(
+            completion_deviation(None, Some(date(2026, 11, 7)), completed, tz).as_deref(),
+            Some("раньше")
+        );
+        assert_eq!(completion_deviation(None, None, completed, tz), None);
+    }
+
+    #[test]
+    fn deviation_of_a_timed_due_uses_hours_then_days() {
+        let tz: Tz = "Europe/Moscow".parse().expect("tz");
+        // Плановый срок: 6 ноября 13:47 по Москве.
+        let due = Utc.with_ymd_and_hms(2026, 11, 6, 10, 47, 0).unwrap();
+        let at = |day: u32, hour: u32, minute: u32| {
+            Utc.with_ymd_and_hms(2026, 11, day, hour, minute, 0)
+                .unwrap()
+        };
+
+        assert_eq!(
+            completion_deviation(Some(due), None, at(4, 10, 47), tz).as_deref(),
+            Some("раньше"),
+            "a whole day earlier"
+        );
+        assert_eq!(
+            completion_deviation(Some(due), None, at(6, 9, 0), tz),
+            None,
+            "earlier on the same day is not marked"
+        );
+        assert_eq!(
+            completion_deviation(Some(due), None, at(6, 10, 46), tz),
+            None,
+            "less than an hour late is not marked"
+        );
+        assert_eq!(
+            completion_deviation(Some(due), None, at(6, 11, 47), tz).as_deref(),
+            Some("+1\u{a0}ч"),
+            "exactly one hour late"
+        );
+        assert_eq!(
+            completion_deviation(Some(due), None, at(7, 10, 46), tz).as_deref(),
+            Some("+23\u{a0}ч"),
+            "23 hours 59 minutes late"
+        );
+        assert_eq!(
+            completion_deviation(Some(due), None, at(7, 10, 47), tz).as_deref(),
+            Some("+1\u{a0}день"),
+            "exactly 24 hours late"
+        );
+        assert_eq!(
+            completion_deviation(Some(due), None, at(8, 10, 47), tz).as_deref(),
+            Some("+2\u{a0}дня")
+        );
+        assert_eq!(
+            completion_deviation(Some(due), None, at(10, 10, 47), tz).as_deref(),
+            Some("+4\u{a0}дня")
+        );
+        assert_eq!(
+            completion_deviation(Some(due), None, at(21, 10, 47), tz).as_deref(),
+            Some("+15\u{a0}дней")
+        );
     }
 
     #[test]

@@ -23,6 +23,9 @@ use super::model::{
 use super::screens::{clip, nav_row};
 use super::{Ctx, Fail};
 
+/// Сколько последних выполнений показывает карточка.
+const RECENT_COMPLETIONS: usize = 5;
+
 /// Название приоритета с маркером, понятным без цвета.
 pub fn priority_label(priority: ItemPriority) -> &'static str {
     match priority {
@@ -123,7 +126,7 @@ pub(super) async fn due_editable_item(ctx: &mut Ctx<'_>, item_id: Uuid) -> Resul
     Ok(due_editable(&item, &list))
 }
 
-async fn names(ctx: &mut Ctx<'_>) -> Result<HashMap<Uuid, String>, Fail> {
+pub(super) async fn names(ctx: &mut Ctx<'_>) -> Result<HashMap<Uuid, String>, Fail> {
     let household_id = ctx.household()?.id;
     Ok(users::list_active(&mut *ctx.conn, household_id)
         .await?
@@ -132,18 +135,62 @@ async fn names(ctx: &mut Ctx<'_>) -> Result<HashMap<Uuid, String>, Fail> {
         .collect())
 }
 
+/// Список в цепочке `back`: карточка из журнала тоже должна называть
+/// настоящий список, а не служебное «Список».
+fn list_id_in_chain(screen: &Screen) -> Option<Uuid> {
+    match screen {
+        Screen::List { list_id, .. } => Some(*list_id),
+        Screen::History { back, .. } => list_id_in_chain(back),
+        _ => None,
+    }
+}
+
+/// Имя списка из цепочки `back` для хлебных крошек.
+pub(super) async fn parent_list_name(
+    ctx: &mut Ctx<'_>,
+    back: &Screen,
+) -> Result<Option<String>, Fail> {
+    let Some(list_id) = list_id_in_chain(back) else {
+        return Ok(None);
+    };
+    let household_id = ctx.household()?.id;
+    match lists::get_visible(&mut *ctx.conn, household_id, list_id).await {
+        Ok(list) => Ok(Some(list.name)),
+        Err(DomainError::NotFound) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Карточка элемента.
-pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui, Fail> {
+pub async fn view(
+    ctx: &mut Ctx<'_>,
+    item_id: Uuid,
+    back: &Screen,
+    completion_id: Option<Uuid>,
+) -> Result<Ui, Fail> {
     let (item, list) = load(ctx, item_id).await?;
     let names = names(ctx).await?;
+    let shopping = list.kind != ListKind::Tasks;
+    let completions = if shopping {
+        Vec::new()
+    } else {
+        let household_id = ctx.household()?.id;
+        items::completions::recent_for_item(
+            &mut *ctx.conn,
+            household_id,
+            item_id,
+            RECENT_COMPLETIONS,
+        )
+        .await?
+    };
     let here = Screen::Item {
         item_id,
         back: Box::new(back.clone()),
+        completion_id,
     };
-    let shopping = list.kind != ListKind::Tasks;
     let done = item.status == ItemStatus::Done;
-    let parent = matches!(back, Screen::List { .. }).then_some(list.name.as_str());
-    let mut ui = screen_heading(&here, &item.title, parent);
+    let parent = parent_list_name(ctx, back).await?;
+    let mut ui = screen_heading(&here, &item.title, parent.as_deref());
     if done {
         ui = ui.text("✅ Выполнено");
     }
@@ -208,6 +255,39 @@ pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui,
     {
         ui = ui.quote(notes.to_owned());
     }
+    if !completions.is_empty() {
+        let lines: Vec<String> = completions
+            .iter()
+            .map(|completion| completion_line(completion, &names, ctx.tz, ctx.now))
+            .collect();
+        ui = ui.bold("Выполнения").collapsed_quote(lines.join("\n"));
+    }
+
+    // Для задачи возврат ведёт туда, откуда открыли карточку (журнал, список
+    // или «Выполнено сегодня»); у покупки остаётся прежнее поведение.
+    let origin = if shopping { here.clone() } else { back.clone() };
+    let revert = |completion_id: Option<Uuid>| {
+        button(
+            "↩️ Вернуть",
+            Action::Reopen {
+                item_id,
+                version: item.version,
+                back: origin.clone(),
+                completion_id,
+            },
+        )
+    };
+    // Кнопка есть ровно тогда, когда `revert_completion` пройдёт: выполнение
+    // последнее, а элемент не менялся после него (кроме выполненной задачи без
+    // повторения). Условие общее с доменной проверкой.
+    let latest = completions.first();
+    let revertible = completion_id.map_or_else(
+        || items::completions::revertible(&item, latest),
+        |id| {
+            latest.is_some_and(|latest| latest.event_id == id)
+                && items::completions::revertible(&item, latest)
+        },
+    );
 
     let edit = button(
         ru::EDIT_BUTTON,
@@ -217,16 +297,13 @@ pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui,
         },
     );
     let main = if done {
-        button(
-            "↩️ Вернуть",
-            Action::Reopen {
-                item_id,
-                version: item.version,
-                back: here.clone(),
-            },
-        )
+        if shopping {
+            Some(revert(None))
+        } else {
+            revertible.then(|| revert(completion_id))
+        }
     } else {
-        button(
+        Some(button(
             if shopping {
                 ru::BOUGHT_BUTTON
             } else {
@@ -237,8 +314,9 @@ pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui,
                 version: item.version,
                 back: back.clone(),
             },
-        )
+        ))
     };
+    let extra_revert = (!done && revertible).then(|| revert(completion_id));
     let delete = button(
         "🗑 Удалить",
         Action::DeleteAsk {
@@ -256,19 +334,66 @@ pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui,
         },
     );
 
-    if shopping || done {
-        ui = ui.row(vec![main, edit]).row(vec![delete]);
+    if done || shopping {
+        let mut row: Vec<_> = main.into_iter().collect();
+        row.push(edit);
+        ui = ui.row(row).row(vec![delete]);
     } else {
-        ui = ui.row(vec![main, due_button]).row(vec![edit, delete]);
+        let mut row: Vec<_> = main.into_iter().collect();
+        row.push(due_button);
+        ui = ui.row(row).row(vec![edit, delete]);
+        if let Some(revert) = extra_revert {
+            ui = ui.row(vec![revert]);
+        }
     }
     Ok(ui.row(nav_row(&here, back.clone())))
+}
+
+/// Строка выполнения: план → факт, исполнитель и отклонение от плана.
+fn completion_line(
+    completion: &items::completions::Completion,
+    names: &HashMap<Uuid, String>,
+    tz: Tz,
+    now: DateTime<Utc>,
+) -> String {
+    let today = now.with_timezone(&tz).date_naive();
+    let plan = match (completion.due_at, completion.due_date) {
+        (Some(at), _) => {
+            let local = at.with_timezone(&tz);
+            format!(
+                "{}, {}",
+                ru::fixed_date_label(local.date_naive(), today),
+                local.format("%H:%M")
+            )
+        }
+        (None, Some(date)) => ru::fixed_date_label(date, today),
+        (None, None) => "без срока".to_owned(),
+    };
+    let actual = completion.completed_at.with_timezone(&tz);
+    let mut line = format!(
+        "{plan} → {}, {}",
+        ru::fixed_date_label(actual.date_naive(), today),
+        actual.format("%H:%M")
+    );
+    if let Some(name) = completion.actor_user_id.and_then(|id| names.get(&id)) {
+        line.push_str(&format!(" · {name}"));
+    }
+    if let Some(deviation) = ru::completion_deviation(
+        completion.due_at,
+        completion.due_date,
+        completion.completed_at,
+        tz,
+    ) {
+        line.push_str(&format!(" · {deviation}"));
+    }
+    line
 }
 
 /// Экран быстрого срока.
 pub async fn due(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui, Fail> {
     let (item, list) = load(ctx, item_id).await?;
     if !due_editable(&item, &list) {
-        return view(ctx, item_id, back).await;
+        return view(ctx, item_id, back, None).await;
     }
     let here = Screen::Due {
         item_id,
@@ -314,6 +439,7 @@ pub async fn due(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui, 
     let card = Screen::Item {
         item_id,
         back: Box::new(back.clone()),
+        completion_id: None,
     };
     Ok(ui.row(nav_row(&here, card)))
 }
@@ -332,6 +458,7 @@ pub async fn set_due(
             .present(Screen::Item {
                 item_id,
                 back: Box::new(back),
+                completion_id: None,
             })
             .await;
     }
@@ -383,6 +510,7 @@ pub async fn apply_due(
             .present(Screen::Item {
                 item_id,
                 back: Box::new(back),
+                completion_id: None,
             })
             .await;
     }
@@ -422,6 +550,7 @@ async fn finish_due(
     ctx.present(Screen::Item {
         item_id,
         back: Box::new(back),
+        completion_id: None,
     })
     .await
 }
@@ -495,17 +624,7 @@ pub async fn deleted(
     title: &str,
     back: &Screen,
 ) -> Result<Ui, Fail> {
-    let parent = match back {
-        Screen::List { list_id, .. } => {
-            let household_id = ctx.household()?.id;
-            match lists::get_visible(&mut *ctx.conn, household_id, *list_id).await {
-                Ok(list) => Some(list.name),
-                Err(DomainError::NotFound) => None,
-                Err(error) => return Err(error.into()),
-            }
-        }
-        _ => None,
-    };
+    let parent = parent_list_name(ctx, back).await?;
     let screen = Screen::Deleted {
         item_id,
         title: title.to_owned(),
@@ -525,13 +644,17 @@ pub async fn deleted(
 
 /// Подтверждение удаления.
 pub async fn confirm_delete(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui, Fail> {
-    let (item, list) = load(ctx, item_id).await?;
+    let (item, _) = load(ctx, item_id).await?;
     let screen = Screen::ConfirmDelete {
         item_id,
         back: Box::new(back.clone()),
     };
-    let parent = matches!(back, Screen::List { .. }).then_some(list.name.as_str());
-    let mut ui = screen_heading(&screen, &format!("Удалить «{}»?", item.title), parent);
+    let parent = parent_list_name(ctx, back).await?;
+    let mut ui = screen_heading(
+        &screen,
+        &format!("Удалить «{}»?", item.title),
+        parent.as_deref(),
+    );
     if item.recurrence.is_some() {
         ui = ui.text("Будет удалена вся серия повторений.");
     }
@@ -547,6 +670,7 @@ pub async fn confirm_delete(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> 
         Screen::Item {
             item_id,
             back: Box::new(back.clone()),
+            completion_id: None,
         },
     ));
     Ok(ui.row(row))
@@ -601,19 +725,63 @@ pub async fn reopen(
     ctx: &mut Ctx<'_>,
     item_id: Uuid,
     version: i32,
+    completion_id: Option<Uuid>,
     back: Screen,
 ) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
     let actor = ctx.actor()?;
-    items::reopen(
-        &mut *ctx.conn,
-        household_id,
-        &actor,
-        item_id,
-        Some(version),
-        ctx.now,
-    )
-    .await?;
+    let (item, list) = load(ctx, item_id).await?;
+    let result = if list.kind == ListKind::Tasks {
+        // Кнопка помнит версию элемента на момент отрисовки. Это относится и к
+        // карточкам из журнала и «Выполнено сегодня»: если задачу успели
+        // изменить, возврат по старой кнопке затёр бы правку снимком.
+        if item.version != version {
+            return Err(DomainError::conflict("the item changed after the card was shown").into());
+        }
+        let completion_id = match completion_id {
+            Some(completion_id) => Some(completion_id),
+            None => items::completions::latest_for_item(&mut *ctx.conn, household_id, item_id)
+                .await?
+                .map(|event| event.completion.event_id),
+        };
+        match completion_id {
+            Some(completion_id) => {
+                items::revert_completion(
+                    &mut *ctx.conn,
+                    household_id,
+                    &actor,
+                    item_id,
+                    completion_id,
+                    ctx.now,
+                )
+                .await
+            }
+            // Выполнения нет: старые данные за сроком хранения событий.
+            None => {
+                items::reopen(
+                    &mut *ctx.conn,
+                    household_id,
+                    &actor,
+                    item_id,
+                    Some(version),
+                    ctx.now,
+                )
+                .await
+            }
+        }
+    } else {
+        // Покупки возвращаются прежним путём.
+        items::reopen(
+            &mut *ctx.conn,
+            household_id,
+            &actor,
+            item_id,
+            Some(version),
+            ctx.now,
+        )
+        .await
+    };
+    result?;
     ctx.toast("Возвращено в работу");
     ctx.present(back).await
 }

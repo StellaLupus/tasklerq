@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use sqlx::PgConnection;
 use uuid::Uuid;
 
+use super::completions;
 use super::row::{hydrate_one, load_item, load_item_any, row_by_id};
 use super::{
     UNDO_WINDOW_EXPIRED, UNDO_WINDOW_MINUTES, local_today, recurrence_values, version_conflict,
@@ -156,22 +157,107 @@ pub async fn reopen(
             serde_json::from_value::<Item>(event.payload.get("before")?.clone()).ok()
         });
 
-    let (due_at, due_date, completed_at, completed_by_user_id) = match &previous {
-        Some(previous) => (
-            previous.due_at,
-            previous.due_date,
-            previous.completed_at,
-            previous.completed_by_user_id,
+    restore_snapshot(
+        conn,
+        household_id,
+        actor,
+        item_id,
+        &current,
+        previous.as_ref(),
+        None,
+        now,
+    )
+    .await
+}
+
+/// Вернуть в работу выполнение из журнала.
+///
+/// Возвращается только последнее неотменённое выполнение. У выполненной задачи
+/// без повторения это прежний [`reopen`]; в остальных случаях — в том числе
+/// когда повторение сняли после выполнения и задача снова открыта, — только
+/// пока элемент не менялся после выполнения. Иначе восстановленный срок
+/// разошёлся бы с текущим состоянием.
+pub async fn revert_completion(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    actor: &Actor,
+    item_id: Uuid,
+    completion_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<Item, DomainError> {
+    let row = row_by_id(conn, household_id, item_id, false, true).await?;
+    let current = hydrate_one(conn, row.clone()).await?;
+
+    let completion = completions::latest_for_item(conn, household_id, item_id)
+        .await?
+        .ok_or_else(|| DomainError::conflict("there is no completion to revert"))?;
+    if completion.completion.event_id != completion_id {
+        return Err(DomainError::conflict(
+            "only the latest completion can be reverted",
+        ));
+    }
+
+    let snapshot = completion
+        .payload
+        .get("before")
+        .and_then(|before| serde_json::from_value::<Item>(before.clone()).ok());
+
+    if !completions::revertible(&current, Some(&completion.completion)) {
+        return Err(DomainError::conflict(
+            "the item changed after the completion",
+        ));
+    }
+    if row.recurrence().is_some() && snapshot.is_none() {
+        return Err(DomainError::conflict(
+            "stored completion snapshot is invalid",
+        ));
+    }
+
+    restore_snapshot(
+        conn,
+        household_id,
+        actor,
+        item_id,
+        &current,
+        snapshot.as_ref(),
+        Some(completion_id),
+        now,
+    )
+    .await
+}
+
+/// Восстановить элемент из снимка события и записать `reopened`.
+///
+/// Общий шаг [`reopen`] и [`revert_completion`]: срок и исполнитель берутся из
+/// снимка `before`, слот вхождения — только если правило не менялось. `undo_of`
+/// связывает возврат с отменённым выполнением.
+#[allow(clippy::too_many_arguments)]
+async fn restore_snapshot(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    actor: &Actor,
+    item_id: Uuid,
+    current: &Item,
+    snapshot: Option<&Item>,
+    undo_of: Option<Uuid>,
+    now: DateTime<Utc>,
+) -> Result<Item, DomainError> {
+    let (due_at, due_date, completed_at, completed_by_user_id) = match snapshot {
+        Some(before) => (
+            before.due_at,
+            before.due_date,
+            before.completed_at,
+            before.completed_by_user_id,
         ),
-        None => (row.due_at, row.due_date, None, None),
+        None => (current.due_at, current.due_date, None, None),
     };
     // Слот относится к конкретному правилу. Если после выполнения правило
     // сняли или изменили, старый слот к новому правилу не подходит — иначе
     // `items_recurrence_shape` отвергнет строку без правила, а `next_after`
     // посчитает следующее вхождение от чужой даты.
     let (occurrence_date, occurrence_time) = match (
-        row.recurrence(),
-        previous.as_ref().and_then(|item| item.recurrence.as_ref()),
+        current.recurrence.as_ref(),
+        snapshot.and_then(|item| item.recurrence.as_ref()),
     ) {
         (Some(current_rule), Some(previous_rule)) if current_rule.same_rule(previous_rule) => {
             (previous_rule.occurrence_date, previous_rule.occurrence_time)
@@ -207,7 +293,7 @@ pub async fn reopen(
         actor,
         EventType::Reopened,
         json!({"before": current, "after": updated}),
-        None,
+        undo_of,
         now,
     )
     .await?;

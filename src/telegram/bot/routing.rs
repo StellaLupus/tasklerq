@@ -96,6 +96,7 @@ impl TextRoute {
             | Screen::ConfirmLeave
             | Screen::InviteCreated { .. }
             | Screen::Mine { .. }
+            | Screen::History { .. }
             | Screen::Settings
             | Screen::Profile
             | Screen::Danger
@@ -285,6 +286,7 @@ mod tests {
                 Screen::Item {
                     item_id: Uuid::nil(),
                     back: back.clone(),
+                    completion_id: None,
                 },
                 None,
                 None,
@@ -387,6 +389,14 @@ mod tests {
             ),
             (Screen::Mine { page: 0 }, None, None),
             (
+                Screen::History {
+                    page: 0,
+                    back: Box::new(Screen::Menu),
+                },
+                None,
+                None,
+            ),
+            (
                 Screen::Results {
                     query: String::new(),
                     status: StatusFilter::Open,
@@ -473,6 +483,7 @@ mod tests {
                 | Screen::ConfirmLeave
                 | Screen::InviteCreated { .. }
                 | Screen::Mine { .. }
+                | Screen::History { .. }
                 | Screen::Settings
                 | Screen::Profile
                 | Screen::Danger

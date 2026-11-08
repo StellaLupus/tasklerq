@@ -357,6 +357,7 @@ pub(super) async fn open(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> R
     ctx.present(Screen::Item {
         item_id,
         back: Box::new(Screen::Menu),
+        completion_id: None,
     })
     .await
 }

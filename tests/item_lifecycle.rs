@@ -8,7 +8,7 @@ use tasklerq::domain::models::{
     EventType, Field, ItemPatch, ItemStatus, ListKind, MonthRule, RecurrenceFreq,
 };
 use tasklerq::domain::recurrence::Due;
-use tasklerq::storage::repositories::{items, lists};
+use tasklerq::storage::repositories::{events, items, lists};
 
 fn date(year: i32, month: u32, day: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(year, month, day).expect("valid date")
@@ -3503,4 +3503,934 @@ async fn reopen_after_the_last_occurrence_keeps_the_earlier_completion() {
         "reopen hides only the last completion, not the earlier one"
     );
     assert_eq!(listed[0].completed_at, now);
+}
+
+fn moscow() -> chrono_tz::Tz {
+    "Europe/Moscow".parse().expect("timezone")
+}
+
+/// Одна страница журнала выполнений household.
+async fn journal(
+    conn: &mut sqlx::PgConnection,
+    household: &support::TestHousehold,
+    page: u32,
+) -> items::completions::JournalPage {
+    items::completions::journal_page(conn, household.household_id, moscow(), page)
+        .await
+        .expect("journal page")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn journal_keeps_the_title_and_plan_from_the_moment_of_completion() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let due = date(2025, 11, 4);
+    let mut input = support::new_item(household.tasks_list_id, "Полить цветы");
+    input.due_date = Some(due);
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(created.version),
+        "Europe/Moscow",
+        utc(2025, 11, 6, 10),
+    )
+    .await
+    .expect("complete");
+    items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        completed.version,
+        ItemPatch {
+            title: Some("Полить цветы на балконе".into()),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        utc(2025, 11, 6, 11),
+    )
+    .await
+    .expect("rename after completion");
+
+    let page = journal(&mut conn, &household, 0).await;
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(
+        page.entries[0].completion.title, "Полить цветы",
+        "a later rename must not change the recorded completion"
+    );
+    assert_eq!(page.entries[0].planned_day, Some(due));
+    assert_eq!(page.entries[0].completion.due_date, Some(due));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn journal_hides_an_undone_completion() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let mut input = support::new_item(household.tasks_list_id, "Вынести мусор");
+    input.due_date = Some(date(2025, 11, 4));
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+    let now = Utc::now().trunc_subsecs(6);
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(created.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("complete");
+    items::undo_last(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        now + Duration::seconds(1),
+    )
+    .await
+    .expect("undo");
+
+    let page = journal(&mut conn, &household, 0).await;
+    assert!(
+        page.entries.is_empty(),
+        "an undone completion must not appear in the journal"
+    );
+    assert_eq!(page.pages, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn journal_hides_completions_of_a_deleted_task() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let mut input = support::new_item(household.tasks_list_id, "Вынести мусор");
+    input.due_date = Some(date(2025, 11, 4));
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+    let now = utc(2025, 11, 6, 10);
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(created.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("complete");
+    items::soft_delete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        now + Duration::seconds(1),
+    )
+    .await
+    .expect("delete");
+
+    let page = journal(&mut conn, &household, 0).await;
+    assert!(
+        page.entries.is_empty(),
+        "a deleted task must not keep its completions in the journal"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn journal_skips_purchases() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let mut input = support::new_item(household.shopping_list_id, "Молоко");
+    input.due_date = Some(date(2025, 11, 4));
+    let purchase = support::create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        purchase.id,
+        Some(purchase.version),
+        "Europe/Moscow",
+        utc(2025, 11, 6, 10),
+    )
+    .await
+    .expect("mark the purchase as bought");
+
+    let page = journal(&mut conn, &household, 0).await;
+    assert!(
+        page.entries.is_empty(),
+        "the journal holds task completions only: {page:?}"
+    );
+    assert_eq!(page.pages, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn journal_lists_every_occurrence_of_a_recurring_task() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let first_due = date(2025, 11, 1);
+    let second_due = date(2025, 11, 4);
+    let mut input = support::new_item(household.tasks_list_id, "Полить цветы");
+    input.due_date = Some(first_due);
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Daily, Vec::new()));
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let first = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(created.version),
+        "Europe/Moscow",
+        utc(2025, 11, 1, 9),
+    )
+    .await
+    .expect("complete the first occurrence");
+    let moved = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        first.version,
+        Due::AllDay(second_due),
+        "Europe/Moscow",
+        utc(2025, 11, 2, 9),
+    )
+    .await
+    .expect("move to the second occurrence");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(moved.version),
+        "Europe/Moscow",
+        utc(2025, 11, 4, 9),
+    )
+    .await
+    .expect("complete the second occurrence");
+
+    let page = journal(&mut conn, &household, 0).await;
+    assert_eq!(page.entries.len(), 2, "one record per occurrence");
+    let days: Vec<_> = page.entries.iter().map(|entry| entry.planned_day).collect();
+    assert_eq!(
+        days,
+        vec![Some(second_due), Some(first_due)],
+        "planned days come from each completion snapshot, latest first"
+    );
+    let due_dates: Vec<_> = page
+        .entries
+        .iter()
+        .map(|entry| entry.completion.due_date)
+        .collect();
+    assert_eq!(due_dates, vec![Some(second_due), Some(first_due)]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn journal_pages_do_not_overlap_and_put_no_due_last() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    for (index, due) in [Some(date(2025, 11, 5)); 3].into_iter().enumerate() {
+        let title = format!("План 5-{}", index + 1);
+        let mut input = support::new_item(household.tasks_list_id, &title);
+        input.due_date = due;
+        let item = support::create_item(
+            &db.pool,
+            &household,
+            household.tasks_list_id,
+            &household.owner(),
+            input,
+        )
+        .await;
+        items::complete(
+            &mut conn,
+            household.household_id,
+            &household.owner(),
+            item.id,
+            Some(item.version),
+            "Europe/Moscow",
+            utc(2025, 11, 6, 8 + index as u32),
+        )
+        .await
+        .expect("complete");
+    }
+    for (index, due) in [Some(date(2025, 11, 4)); 2].into_iter().enumerate() {
+        let title = format!("План 4-{}", index + 1);
+        let mut input = support::new_item(household.tasks_list_id, &title);
+        input.due_date = due;
+        let item = support::create_item(
+            &db.pool,
+            &household,
+            household.tasks_list_id,
+            &household.owner(),
+            input,
+        )
+        .await;
+        items::complete(
+            &mut conn,
+            household.household_id,
+            &household.owner(),
+            item.id,
+            Some(item.version),
+            "Europe/Moscow",
+            utc(2025, 11, 6, 11 + index as u32),
+        )
+        .await
+        .expect("complete");
+    }
+    let mut input = support::new_item(household.tasks_list_id, "План 3");
+    input.due_date = Some(date(2025, 11, 3));
+    let item = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        item.id,
+        Some(item.version),
+        "Europe/Moscow",
+        utc(2025, 11, 6, 13),
+    )
+    .await
+    .expect("complete");
+    for index in 0..5 {
+        let title = format!("Без срока {}", index + 1);
+        let item = support::create_item(
+            &db.pool,
+            &household,
+            household.tasks_list_id,
+            &household.owner(),
+            support::new_item(household.tasks_list_id, &title),
+        )
+        .await;
+        items::complete(
+            &mut conn,
+            household.household_id,
+            &household.owner(),
+            item.id,
+            Some(item.version),
+            "Europe/Moscow",
+            utc(2025, 11, 6, 14 + index),
+        )
+        .await
+        .expect("complete");
+    }
+
+    let first = journal(&mut conn, &household, 0).await;
+    assert_eq!(first.page, 0);
+    assert_eq!(first.pages, 2);
+    assert!(first.has_next());
+    assert_eq!(first.entries.len(), 8);
+    let titles: Vec<_> = first.entries[..3]
+        .iter()
+        .map(|entry| entry.completion.title.as_str())
+        .collect();
+    assert_eq!(
+        titles,
+        vec!["План 5-3", "План 5-2", "План 5-1"],
+        "inside one planned day newer completions come first"
+    );
+    assert_eq!(first.entries[3].planned_day, Some(date(2025, 11, 4)));
+    assert_eq!(first.entries[5].planned_day, Some(date(2025, 11, 3)));
+    assert_eq!(first.entries[7].planned_day, None);
+
+    let second = journal(&mut conn, &household, 1).await;
+    assert_eq!(second.page, 1);
+    assert_eq!(second.pages, 2);
+    assert!(!second.has_next());
+    assert_eq!(second.entries.len(), 3);
+
+    let clamped = journal(&mut conn, &household, 99).await;
+    assert_eq!(clamped.page, 1, "a stale page opens the last page");
+    assert_eq!(clamped.entries.len(), 3);
+
+    let mut ids: Vec<_> = first
+        .entries
+        .iter()
+        .chain(second.entries.iter())
+        .map(|entry| entry.completion.event_id)
+        .collect();
+    let total = ids.len();
+    assert_eq!(total, 11);
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), total, "pages must not overlap");
+
+    let days: Vec<_> = first
+        .entries
+        .iter()
+        .chain(second.entries.iter())
+        .map(|entry| entry.planned_day)
+        .collect();
+    let first_no_due = days
+        .iter()
+        .position(Option::is_none)
+        .expect("no-due records are present");
+    assert!(
+        days[first_no_due..].iter().all(Option::is_none),
+        "no-due records come after all planned days"
+    );
+    assert_eq!(days.iter().filter(|day| day.is_none()).count(), 5);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn journal_planned_day_uses_the_users_timezone_for_a_timed_due() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let mut input = support::new_item(household.tasks_list_id, "Созвон");
+    input.due_at = Some(utc(2025, 11, 5, 22));
+    let item = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        item.id,
+        Some(item.version),
+        "Europe/Moscow",
+        utc(2025, 11, 6, 10),
+    )
+    .await
+    .expect("complete");
+
+    let moscow = journal(&mut conn, &household, 0).await;
+    assert_eq!(
+        moscow.entries[0].planned_day,
+        Some(date(2025, 11, 6)),
+        "22:00 UTC is already 1:00 of the next day in Moscow"
+    );
+
+    let new_york: chrono_tz::Tz = "America/New_York".parse().expect("timezone");
+    let new_york = items::completions::journal_page(&mut conn, household.household_id, new_york, 0)
+        .await
+        .expect("journal in another timezone");
+    assert_eq!(
+        new_york.entries[0].planned_day,
+        Some(date(2025, 11, 5)),
+        "the same instant is still the previous day in New York"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revert_completion_restores_the_last_occurrence_of_a_recurring_task() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let start = date(2026, 11, 4);
+    let mut input = support::new_item(household.tasks_list_id, "Полить цветы");
+    input.due_date = Some(start);
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Daily, Vec::new()));
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(created.version),
+        "Europe/Moscow",
+        utc(2026, 11, 4, 12),
+    )
+    .await
+    .expect("complete");
+    assert_eq!(completed.status, ItemStatus::Open);
+    assert_eq!(completed.due_date, Some(start + Duration::days(1)));
+    let completion_id =
+        items::completions::latest_for_item(&mut conn, household.household_id, created.id)
+            .await
+            .expect("latest completion")
+            .expect("a completion is recorded")
+            .completion
+            .event_id;
+
+    let reverted = items::revert_completion(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        completion_id,
+        utc(2026, 11, 4, 13),
+    )
+    .await
+    .expect("revert the latest completion");
+    assert_eq!(reverted.status, ItemStatus::Open);
+    assert_eq!(reverted.due_date, Some(start));
+    assert_eq!(reverted.version, completed.version + 1);
+    assert!(
+        items::completions::latest_for_item(&mut conn, household.household_id, created.id)
+            .await
+            .expect("journal")
+            .is_none(),
+        "the reverted completion must disappear from the journal"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revert_completion_rejects_an_older_occurrence() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let start = date(2026, 11, 4);
+    let mut input = support::new_item(household.tasks_list_id, "Полить цветы");
+    input.due_date = Some(start);
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Daily, Vec::new()));
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let first = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(created.version),
+        "Europe/Moscow",
+        utc(2026, 11, 4, 12),
+    )
+    .await
+    .expect("first completion");
+    let second = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(first.version),
+        "Europe/Moscow",
+        utc(2026, 11, 5, 12),
+    )
+    .await
+    .expect("second completion");
+    assert_eq!(second.due_date, Some(start + Duration::days(2)));
+
+    let listed =
+        items::completions::recent_for_item(&mut conn, household.household_id, created.id, 10)
+            .await
+            .expect("completions");
+    assert_eq!(listed.len(), 2);
+    let older = listed[1].event_id;
+
+    let error = items::revert_completion(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        older,
+        utc(2026, 11, 5, 13),
+    )
+    .await
+    .expect_err("only the latest completion can be reverted");
+    assert!(
+        matches!(error, DomainError::Conflict { .. }),
+        "expected a conflict, got {error:?}"
+    );
+
+    let unchanged = items::get(&mut conn, household.household_id, created.id)
+        .await
+        .expect("item");
+    assert_eq!(unchanged.due_date, second.due_date);
+    assert_eq!(unchanged.version, second.version);
+    assert_eq!(
+        items::completions::recent_for_item(&mut conn, household.household_id, created.id, 10,)
+            .await
+            .expect("completions")
+            .len(),
+        2,
+        "a rejected revert leaves the journal untouched"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revert_completion_restores_a_moved_occurrence_slot() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let slot = date(2026, 11, 10);
+    let series_at = Utc
+        .with_ymd_and_hms(2026, 11, 10, 6, 0, 0)
+        .single()
+        .expect("time");
+    let moved_to = Utc
+        .with_ymd_and_hms(2026, 11, 6, 9, 0, 0)
+        .single()
+        .expect("time");
+    let mut input = support::new_item(household.tasks_list_id, "Встреча");
+    input.due_at = Some(series_at);
+    let mut rule = support::recurrence(RecurrenceFreq::Weekly, vec![2]);
+    rule.until = Some(slot);
+    input.recurrence = Some(rule);
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let moved = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        created.version,
+        Due::Timed(moved_to),
+        "Europe/Moscow",
+        utc(2026, 11, 6, 12),
+    )
+    .await
+    .expect("move the occurrence");
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(moved.version),
+        "Europe/Moscow",
+        utc(2026, 11, 6, 12),
+    )
+    .await
+    .expect("complete");
+    assert_eq!(completed.status, ItemStatus::Done);
+    let completion_id =
+        items::completions::latest_for_item(&mut conn, household.household_id, created.id)
+            .await
+            .expect("latest completion")
+            .expect("a completion is recorded")
+            .completion
+            .event_id;
+
+    let reverted = items::revert_completion(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        completion_id,
+        utc(2026, 11, 6, 13),
+    )
+    .await
+    .expect("revert");
+    assert_eq!(reverted.status, ItemStatus::Open);
+    assert_eq!(reverted.due_at, Some(moved_to));
+    let rule = reverted.recurrence.as_ref().expect("rule");
+    assert_eq!(rule.occurrence_date, Some(slot));
+    assert_eq!(
+        rule.occurrence_time,
+        NaiveTime::from_hms_opt(9, 0, 0),
+        "the moved occurrence slot and its series time are restored"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revert_completion_is_unavailable_after_the_task_changed() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let start = date(2026, 11, 4);
+    let mut input = support::new_item(household.tasks_list_id, "Полить цветы");
+    input.due_date = Some(start);
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Daily, Vec::new()));
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(created.version),
+        "Europe/Moscow",
+        utc(2026, 11, 4, 12),
+    )
+    .await
+    .expect("complete");
+    let completion_id =
+        items::completions::latest_for_item(&mut conn, household.household_id, created.id)
+            .await
+            .expect("latest completion")
+            .expect("a completion is recorded")
+            .completion
+            .event_id;
+    let edited = items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        completed.version,
+        ItemPatch {
+            title: Some("Полить цветы на балконе".into()),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        utc(2026, 11, 4, 13),
+    )
+    .await
+    .expect("edit after completion");
+
+    let error = items::revert_completion(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        completion_id,
+        utc(2026, 11, 4, 14),
+    )
+    .await
+    .expect_err("a changed recurring task cannot be reverted");
+    assert!(
+        matches!(error, DomainError::Conflict { .. }),
+        "expected a conflict, got {error:?}"
+    );
+
+    let unchanged = items::get(&mut conn, household.household_id, created.id)
+        .await
+        .expect("item");
+    assert_eq!(unchanged.title, "Полить цветы на балконе");
+    assert_eq!(unchanged.version, edited.version);
+    assert_eq!(unchanged.due_date, edited.due_date);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revert_completion_reopens_a_task_without_recurrence() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let due = date(2026, 11, 4);
+    let mut input = support::new_item(household.tasks_list_id, "Оплатить интернет");
+    input.due_date = Some(due);
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(created.version),
+        "Europe/Moscow",
+        utc(2026, 11, 4, 12),
+    )
+    .await
+    .expect("complete");
+    assert_eq!(completed.status, ItemStatus::Done);
+    let completion_id =
+        items::completions::latest_for_item(&mut conn, household.household_id, created.id)
+            .await
+            .expect("latest completion")
+            .expect("a completion is recorded")
+            .completion
+            .event_id;
+
+    let reverted = items::revert_completion(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        completion_id,
+        utc(2026, 11, 4, 13),
+    )
+    .await
+    .expect("revert");
+    assert_eq!(reverted.status, ItemStatus::Open);
+    assert_eq!(reverted.due_date, Some(due));
+    assert_eq!(reverted.completed_at, None);
+    assert!(
+        items::completions::latest_for_item(&mut conn, household.household_id, created.id)
+            .await
+            .expect("journal")
+            .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revert_completion_records_reopened_undo_of() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let due = date(2026, 11, 4);
+    let mut input = support::new_item(household.tasks_list_id, "Оплатить интернет");
+    input.due_date = Some(due);
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(created.version),
+        "Europe/Moscow",
+        utc(2026, 11, 4, 12),
+    )
+    .await
+    .expect("complete");
+    let completion_id =
+        items::completions::latest_for_item(&mut conn, household.household_id, created.id)
+            .await
+            .expect("latest completion")
+            .expect("a completion is recorded")
+            .completion
+            .event_id;
+
+    items::revert_completion(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        completion_id,
+        utc(2026, 11, 4, 13),
+    )
+    .await
+    .expect("revert");
+
+    let events = events::for_item(&mut conn, household.household_id, created.id)
+        .await
+        .expect("events");
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == EventType::Reopened
+                && event.undo_of == Some(completion_id)),
+        "the revert must compensate the completion through undo_of: {events:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn journal_tolerates_a_broken_due_snapshot() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let mut input = support::new_item(household.tasks_list_id, "Полить цветы");
+    input.due_date = Some(date(2025, 11, 4));
+    let item = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        item.id,
+        Some(item.version),
+        "Europe/Moscow",
+        utc(2025, 11, 6, 10),
+    )
+    .await
+    .expect("complete");
+
+    let event_id = journal(&mut conn, &household, 0).await.entries[0]
+        .completion
+        .event_id;
+    sqlx::query(
+        "UPDATE item_events
+         SET payload = jsonb_set(
+             jsonb_set(payload, '{before,due_at}', '\"не дата\"'::jsonb),
+             '{before,due_date}', '\"infinity\"'::jsonb
+         )
+         WHERE id = $1",
+    )
+    .bind(event_id)
+    .execute(&mut *conn)
+    .await
+    .expect("break the due snapshot");
+
+    let page = journal(&mut conn, &household, 0).await;
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(
+        page.entries[0].planned_day, None,
+        "a broken or infinite due goes to the no-due group instead of failing the query"
+    );
 }
