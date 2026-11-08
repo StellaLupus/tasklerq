@@ -18,7 +18,7 @@ use crate::domain::validation::validate_new_item;
 use crate::storage::repositories::capture_jobs::{self, NewJob};
 use crate::storage::repositories::drafts::DRAFT_TTL_MINUTES;
 use crate::storage::repositories::{items, lists};
-use crate::telegram::rich::{Span, button};
+use crate::telegram::rich::{Block, Span, button, inline_char_len, inline_len};
 use crate::telegram::ru;
 use crate::telegram::views;
 
@@ -352,15 +352,92 @@ fn closed(title: &str, hint: &str, screen: &Screen) -> Ui {
         .row(nav_row(screen, Screen::Menu))
 }
 
+/// Лимит длины HTML карточки: запас под лимит сообщения Telegram.
+const MAX_CARD_HTML_CHARS: usize = 4_096;
+
+/// Разметка одной свёрнутой цитаты вместе с переводом строки.
+const QUOTE_MARKUP: usize = "<blockquote expandable></blockquote>\n".len();
+
+/// Части исходного текста для цитат карточки: каждая часть отдельно, а у
+/// старого черновика без `raw_parts` — одна цитата из `raw_text`.
+///
+/// `available` — сколько символов HTML осталось после остальных блоков
+/// карточки. Если все части помещаются, они показываются целиком; иначе делят
+/// остаток поровну и обрезаются с многоточием.
+fn card_quotes(view: &DraftView, available: usize) -> Vec<String> {
+    let parts = if view.draft.raw_parts.is_empty() {
+        if view.draft.raw_text.is_empty() {
+            Vec::new()
+        } else {
+            vec![view.draft.raw_text.clone()]
+        }
+    } else {
+        view.draft.raw_parts.clone()
+    };
+    if parts.is_empty() {
+        return Vec::new();
+    }
+
+    let overhead = parts.len().saturating_mul(QUOTE_MARKUP);
+    let budget = available.saturating_sub(overhead);
+    let total: usize = parts.iter().map(|part| inline_len(part)).sum();
+    if total <= budget {
+        return parts;
+    }
+
+    let mut remaining = budget;
+    let count = parts.len();
+    parts
+        .iter()
+        .enumerate()
+        .map(|(index, part)| {
+            let share = remaining / (count - index);
+            let clipped = clip_quote(part, share);
+            remaining = remaining.saturating_sub(inline_len(&clipped));
+            clipped
+        })
+        .collect()
+}
+
+/// Длина экрана в HTML без учёта цитат.
+fn rendered_len(ui: &Ui) -> usize {
+    let token = format!("t:{}", "0".repeat(16));
+    let tokens = vec![token; ui.button_count()];
+    crate::telegram::rich::render(ui, &tokens)
+        .html
+        .chars()
+        .count()
+}
+
+/// Обрезать часть цитаты до бюджета экранированных символов.
+fn clip_quote(text: &str, budget: usize) -> String {
+    if inline_len(text) <= budget {
+        return text.to_owned();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    // Место под многоточие: обрезка должна быть видна.
+    let reserve = usize::from(budget > 0);
+    for ch in text.chars() {
+        let length = inline_char_len(ch);
+        if used + length + reserve > budget {
+            break;
+        }
+        used += length;
+        out.push(ch);
+    }
+    if !out.is_empty() {
+        out.push('…');
+    }
+    out
+}
+
 fn card(ctx: &Ctx<'_>, view: &DraftView) -> Ui {
     let draft_id = view.draft.id;
     let items = &view.validated.items;
     let total = items.len();
 
     let mut ui = Ui::new();
-    if !view.draft.raw_text.is_empty() {
-        ui = ui.quote(&view.draft.raw_text);
-    }
     ui = ui.heading(if total == 0 {
         "Черновик пуст".to_owned()
     } else {
@@ -428,7 +505,22 @@ fn card(ctx: &Ctx<'_>, view: &DraftView) -> Ui {
         buttons.push(button("✅ Сохранить всё", Action::DraftSave { draft_id }));
     }
     buttons.push(button("✖️ Отмена", Action::DraftCancel { draft_id }));
-    ui.row(buttons)
+    ui = ui.row(buttons);
+
+    let banner = ctx
+        .banner
+        .as_ref()
+        .map_or(0, |banner| banner.html_len() + 1);
+    let room = MAX_CARD_HTML_CHARS.saturating_sub(rendered_len(&ui).saturating_add(banner));
+    let quotes: Vec<Block<Action>> = card_quotes(view, room)
+        .into_iter()
+        .filter(|quote| !quote.is_empty())
+        .map(Block::Quote)
+        .collect();
+    if !quotes.is_empty() {
+        ui.blocks.splice(0..0, quotes);
+    }
+    ui
 }
 
 fn details(ctx: &Ctx<'_>, view: &DraftView, draft_item: &DraftItem, item: &NewItem) -> Vec<String> {

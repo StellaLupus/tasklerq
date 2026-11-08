@@ -158,6 +158,15 @@ impl Banner {
     fn prepend_to(self, ui: &mut Ui) {
         ui.blocks.splice(0..0, self.blocks());
     }
+
+    /// Сколько символов HTML займёт баннер над экраном.
+    pub(crate) fn html_len(&self) -> usize {
+        let mut ui = Ui::new();
+        self.clone().prepend_to(&mut ui);
+        let token = format!("t:{}", "0".repeat(16));
+        let tokens = vec![token; ui.button_count()];
+        rich::render(&ui, &tokens).html.chars().count()
+    }
 }
 
 /// Состояние контекста на начало шага: нужно, чтобы вернуть его при откате.

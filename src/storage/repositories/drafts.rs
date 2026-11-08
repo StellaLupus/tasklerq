@@ -245,6 +245,44 @@ pub async fn pending_telegram_for_update(
     Ok(row)
 }
 
+/// Ожидающий черновик Telegram для возврата из главного меню.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingTelegram {
+    /// Черновик.
+    pub draft_id: Uuid,
+    /// Сколько пунктов в нём осталось.
+    pub items: i64,
+}
+
+/// Самый свежий ожидающий черновик Telegram этого чата и пользователя.
+///
+/// Читается при каждой отрисовке меню, поэтому истёкший черновик строку не
+/// показывает. Блокировка строки здесь не нужна: меню только читает.
+pub async fn latest_pending_telegram(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    chat_id: i64,
+    user_id: Option<Uuid>,
+    now: DateTime<Utc>,
+) -> Result<Option<PendingTelegram>, DomainError> {
+    let row = sqlx::query_as::<_, (Uuid, i64)>(
+        "SELECT id, COALESCE(jsonb_array_length(parsed->'items'), 0)::bigint
+         FROM capture_drafts
+         WHERE household_id = $1 AND chat_id = $2
+           AND user_id IS NOT DISTINCT FROM $3
+           AND source = 'telegram' AND status = 'pending' AND expires_at > $4
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1",
+    )
+    .bind(household_id)
+    .bind(chat_id)
+    .bind(user_id)
+    .bind(now)
+    .fetch_optional(conn)
+    .await?;
+    Ok(row.map(|(draft_id, items)| PendingTelegram { draft_id, items }))
+}
+
 /// Заменить содержимое ожидающего черновика после дописывания разбора.
 pub async fn append(
     conn: &mut PgConnection,

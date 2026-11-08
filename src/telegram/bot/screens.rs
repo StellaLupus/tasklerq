@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::domain::models::{Item, ItemPriority, ItemStatus, List, ListKind};
 use crate::domain::search::SearchFilters;
-use crate::storage::repositories::{items, lists};
+use crate::storage::repositories::{drafts, items, lists};
 use crate::telegram::rich::{Block, Span, button};
 use crate::telegram::ru;
 
@@ -178,6 +178,28 @@ async fn menu(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
         Span::text(" · Выполнено: "),
         Span::bold(counts.done_today.to_string()),
     ]);
+
+    if let Some(pending) = drafts::latest_pending_telegram(
+        &mut *ctx.conn,
+        household.id,
+        ctx.chat_id,
+        Some(user_id),
+        ctx.now,
+    )
+    .await?
+    {
+        ui = ui
+            .text(format!(
+                "📝 Ждёт подтверждения: {}",
+                ru::points(pending.items)
+            ))
+            .row(vec![go(
+                "Открыть",
+                Screen::Draft {
+                    draft_id: pending.draft_id,
+                },
+            )]);
+    }
 
     let tasks_target = tasks_list
         .map(|list_id| Screen::List {

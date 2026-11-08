@@ -520,17 +520,41 @@ impl CaptureWorker {
         .await
         .map_err(into_sqlx)?;
         capture_jobs::complete(&mut tx, job.id, Some(created.id), now).await?;
-        self.bot
-            .present_to(
-                &mut tx,
-                now,
-                prepared.recipient(job.chat_id),
-                Screen::Draft {
-                    draft_id: created.id,
-                },
-                None,
-            )
-            .await?;
+        let draft = Screen::Draft {
+            draft_id: created.id,
+        };
+        let active = active_screen(&mut tx, job.chat_id).await?;
+        let on_own_screen = match &active {
+            Some(Screen::Processing {
+                job_id: Some(job_id),
+            }) => *job_id == job.id,
+            Some(Screen::Draft { draft_id }) => *draft_id == created.id,
+            _ => false,
+        };
+        if on_own_screen {
+            self.bot
+                .present_to(&mut tx, now, prepared.recipient(job.chat_id), draft, None)
+                .await?;
+        } else if let Some(screen) = active {
+            let banner = Banner::with_buttons(
+                "Черновик готов",
+                vec![button("Открыть", Action::Go { to: draft })],
+            );
+            self.bot
+                .present_to(
+                    &mut tx,
+                    now,
+                    prepared.recipient(job.chat_id),
+                    screen,
+                    Some(banner),
+                )
+                .await?;
+        } else {
+            // Активного экрана нет: показывать баннер не на чем.
+            self.bot
+                .present_to(&mut tx, now, prepared.recipient(job.chat_id), draft, None)
+                .await?;
+        }
         tx.commit().await?;
         self.wake_outbox.notify_one();
         metrics::capture("telegram", "drafted");
@@ -906,6 +930,29 @@ impl CaptureWorker {
                                 edit,
                                 from_lists,
                             },
+                            Some(Banner::text(issue.message)),
+                        )
+                        .await?;
+                    tx.commit().await?;
+                    self.wake_outbox.notify_one();
+                    metrics::capture("telegram", "failed");
+                    return Ok(Pass::Dead);
+                }
+                // Чужой активный экран не вытесняется: ошибка видна баннером
+                // на нём. Исключение — статус этого же разбора: его место
+                // занимает редактор с исходным текстом.
+                let active = active_screen(&mut tx, job.chat_id).await?;
+                let on_own_processing = matches!(
+                    &active,
+                    Some(Screen::Processing { job_id: Some(job_id) }) if *job_id == job.id
+                );
+                if let Some(screen) = active.filter(|_| !on_own_processing) {
+                    self.bot
+                        .present_to(
+                            &mut tx,
+                            now,
+                            prepared.recipient(job.chat_id),
+                            screen,
                             Some(Banner::text(issue.message)),
                         )
                         .await?;

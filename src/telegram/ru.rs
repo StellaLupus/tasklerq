@@ -34,6 +34,11 @@ pub fn positions(n: i64) -> String {
     format!("{n} {}", plural(n, "позиция", "позиции", "позиций"))
 }
 
+/// «5 пунктов» черновика.
+pub fn points(n: i64) -> String {
+    format!("{n} {}", plural(n, "пункт", "пункта", "пунктов"))
+}
+
 /// «5 просроченных».
 pub fn overdue(n: i64) -> String {
     format!(
@@ -415,6 +420,10 @@ mod tests {
         assert_eq!(purchases(3), "3 покупки");
         assert_eq!(purchases(7), "7 покупок");
         assert_eq!(positions(2), "2 позиции");
+        assert_eq!(points(1), "1 пункт");
+        assert_eq!(points(2), "2 пункта");
+        assert_eq!(points(5), "5 пунктов");
+        assert_eq!(points(21), "21 пункт");
     }
 
     #[test]
