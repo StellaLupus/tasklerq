@@ -1035,6 +1035,9 @@ pub enum Action {
         item_id: Uuid,
         /// Вариант.
         until: SnoozeUntil,
+        /// Версия на момент выпуска; старый токен без поля её не проверяет.
+        #[serde(default)]
+        version: Option<i32>,
     },
     /// Завершить задачу из уведомления.
     NoticeComplete {
@@ -1075,6 +1078,9 @@ pub enum Action {
         batch_id: Uuid,
         /// Элемент.
         item_id: Uuid,
+        /// Версия на момент выпуска; старый токен без поля её не проверяет.
+        #[serde(default)]
+        version: Option<i32>,
     },
     /// Открыть задачу из блока сводного сообщения.
     BatchOpen {
@@ -1218,6 +1224,7 @@ impl Action {
             | Self::NoticeComplete { version, .. }
             | Self::BatchComplete { version, .. }
             | Self::DuplicateIncrease { version, .. } => Some(*version),
+            Self::Snooze { version, .. } | Self::BatchSnooze { version, .. } => *version,
             Self::Form {
                 act: FormAct::Increase { version, .. },
             } => Some(*version),
@@ -1792,6 +1799,62 @@ mod tests {
                 back: Screen::Menu,
             }
         );
+    }
+
+    #[test]
+    fn snooze_actions_accept_old_tokens_without_a_version() {
+        let snooze: Action = serde_json::from_value(json!({
+            "a": "snooze",
+            "item_id": Uuid::nil(),
+            "until": "one_hour",
+        }))
+        .expect("old snooze token");
+        assert_eq!(
+            snooze,
+            Action::Snooze {
+                item_id: Uuid::nil(),
+                until: SnoozeUntil::OneHour,
+                version: None,
+            }
+        );
+        assert_eq!(snooze.version(), None);
+
+        let batch: Action = serde_json::from_value(json!({
+            "a": "batch_snooze",
+            "batch_id": Uuid::nil(),
+            "item_id": Uuid::nil(),
+        }))
+        .expect("old batch snooze token");
+        assert_eq!(
+            batch,
+            Action::BatchSnooze {
+                batch_id: Uuid::nil(),
+                item_id: Uuid::nil(),
+                version: None,
+            }
+        );
+        assert_eq!(batch.version(), None);
+    }
+
+    #[test]
+    fn snooze_actions_carry_the_rendered_version() {
+        let snooze = Action::Snooze {
+            item_id: Uuid::nil(),
+            until: SnoozeUntil::TomorrowMorning,
+            version: Some(7),
+        };
+        let payload = serde_json::to_value(&snooze).expect("snooze payload");
+        assert_eq!(payload["version"], json!(7));
+        assert_eq!(snooze.version(), Some(7));
+
+        let batch = Action::BatchSnooze {
+            batch_id: Uuid::nil(),
+            item_id: Uuid::nil(),
+            version: Some(9),
+        };
+        let payload = serde_json::to_value(&batch).expect("batch snooze payload");
+        assert_eq!(payload["version"], json!(9));
+        assert_eq!(batch.version(), Some(9));
     }
 
     #[test]

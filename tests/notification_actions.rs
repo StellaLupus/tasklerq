@@ -996,6 +996,109 @@ async fn snooze_until_morning_survives_midnight_at_the_same_due() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snooze_until_morning_survives_midnight_for_an_all_day_task() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    set_timezone(&db.pool, bot.chat, "Europe/Moscow").await;
+    set_notifications(
+        &db.pool,
+        bot.chat,
+        json!({
+            "digest_enabled": false,
+            "quiet_hours_enabled": false,
+            "all_day_time": "21:00"
+        }),
+    )
+    .await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = bot.now.with_timezone(&moscow).date_naive();
+    bot.set_now(local_utc(moscow, day, 21, 0));
+    let item = create_all_day_task(&db.pool, &household, "Вынести мусор", day).await;
+
+    tick_and_deliver(&mut bot, &db.pool, local_utc(moscow, day, 21, 0)).await;
+    let (message_id, html) = bot.latest();
+    let tomorrow = button_of(&html, "Завтра в 09:00");
+    bot.press_data(&tomorrow, message_id).await;
+
+    let next_morning = local_utc(moscow, day + Duration::days(1), 9, 0);
+    let rows = snooze_rows(&db.pool, item.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].1, next_morning);
+
+    // Полночь меняет локальную дату, но не вхождение вседневного срока.
+    tick_and_deliver(
+        &mut bot,
+        &db.pool,
+        local_utc(moscow, day + Duration::days(1), 0, 1),
+    )
+    .await;
+    assert_eq!(snooze_rows(&db.pool, item.id).await[0].0, "pending");
+    assert_eq!(message_count(&bot, "Вынести мусор"), 1);
+
+    tick_and_deliver(&mut bot, &db.pool, next_morning).await;
+    let rows = snooze_rows(&db.pool, item.id).await;
+    assert_eq!(rows[0].0, "sent", "{rows:?}");
+    assert_eq!(message_count(&bot, "Вынести мусор"), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snooze_in_a_stale_reminder_only_redraws_and_then_works() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(&db.pool, &household, "Позвонить маме", due, None).await;
+
+    tick_and_deliver(&mut bot, &db.pool, due - Duration::minutes(15)).await;
+    let (message_id, html) = bot.latest();
+    let stale = button_of(&html, "на час");
+    sqlx::query(
+        "UPDATE items SET title = 'Позвонить маме (новая)', version = version + 1 WHERE id = $1",
+    )
+    .bind(item.id)
+    .execute(&db.pool)
+    .await
+    .expect("external change");
+
+    bot.press_data(&stale, message_id).await;
+    assert_eq!(last_toast(&bot).as_deref(), Some("Задача уже изменилась"));
+    assert!(
+        snooze_rows(&db.pool, item.id).await.is_empty(),
+        "a stale reminder must not create a snooze"
+    );
+    let (_, edited) = bot.latest();
+    assert!(edited.contains("Позвонить маме (новая)"), "{edited}");
+    assert!(!edited.contains("😴 Напомню"), "{edited}");
+
+    // Новая версия кнопки откладывает напоминание на час.
+    let next = button_of(&edited, "на час");
+    let pressed_at = bot.now;
+    bot.press_data(&next, message_id).await;
+    let rows = snooze_rows(&db.pool, item.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "pending");
+    assert!(
+        (rows[0].1 - (pressed_at + Duration::hours(1)))
+            .num_seconds()
+            .abs()
+            <= 5,
+        "snooze at {}, expected {}",
+        rows[0].1,
+        pressed_at + Duration::hours(1)
+    );
+    let stored_due: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT due_at FROM items WHERE id = $1")
+            .bind(item.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("due");
+    assert_eq!(stored_due, Some(due), "snooze must not move the due date");
+    assert!(bot.latest().1.contains("😴 Напомню"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_snooze_without_origin_is_delivered_after_the_due_changed() {
     let db = isolated_db().await;
     let mut bot = onboarded(&db.pool).await;

@@ -139,6 +139,7 @@ pub fn batch_ui(
                             Action::BatchSnooze {
                                 batch_id,
                                 item_id: entry.item_id,
+                                version: Some(entry.version),
                             },
                         ),
                         open,
@@ -267,11 +268,12 @@ pub async fn batch_snooze(
     message_id: i64,
     batch_id: Uuid,
     item_id: Uuid,
+    version: Option<i32>,
 ) -> Result<(), Fail> {
     if !actionable(ctx, message_id, batch_id, item_id).await? {
         return Ok(());
     }
-    if snooze_batch_item(ctx, batch_id, item_id, false).await? {
+    if snooze_batch_item(ctx, batch_id, item_id, version, false).await? {
         ctx.toast("Отложено");
     }
     render_batch(ctx, message_id, batch_id).await
@@ -398,7 +400,7 @@ pub async fn batch_snooze_all(
         if batch_entry(row, ctx.tz, ctx.now).state != BatchEntryState::Open {
             continue;
         }
-        if snooze_batch_item(ctx, batch_id, item_id, true).await? {
+        if snooze_batch_item(ctx, batch_id, item_id, None, true).await? {
             snoozed += 1;
         }
     }
@@ -472,6 +474,7 @@ async fn snooze_batch_item(
     ctx: &mut Ctx<'_>,
     batch_id: Uuid,
     item_id: Uuid,
+    version: Option<i32>,
     batched: bool,
 ) -> Result<bool, Fail> {
     let household_id = ctx.household()?.id;
@@ -487,6 +490,10 @@ async fn snooze_batch_item(
     if item.status == ItemStatus::Done {
         set_batch_done(ctx, batch_id, item_id).await?;
         ctx.toast("Задача уже выполнена");
+        return Ok(false);
+    }
+    if version.is_some_and(|version| version != item.version) {
+        ctx.toast("Задача уже изменилась");
         return Ok(false);
     }
 

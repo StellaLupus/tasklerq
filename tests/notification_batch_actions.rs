@@ -804,6 +804,49 @@ async fn complete_all_keeps_done_missing_and_archived_blocks_unchanged() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_block_snooze_only_redraws_the_batch() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = bot.now.with_timezone(&moscow).date_naive();
+    let morning = local_utc(moscow, day, 8, 0);
+    let due = local_utc(moscow, day, 9, 0);
+    let first = create_task(&db.pool, &household, "Первая", due, None).await;
+    let second = create_task(&db.pool, &household, "Вторая", due, None).await;
+    deferred_reminder(&db.pool, &household, first.id, due, morning).await;
+    deferred_reminder(&db.pool, &household, second.id, due, morning).await;
+
+    tick_and_deliver(&mut bot, &db.pool, morning).await;
+    let (message_id, html) = bot.latest();
+    let stale = button_of(&html, "На час");
+    sqlx::query("UPDATE items SET title = 'Первая (новая)', version = version + 1 WHERE id = $1")
+        .bind(first.id)
+        .execute(&db.pool)
+        .await
+        .expect("external change");
+
+    bot.press_data(&stale, message_id).await;
+    let toast = bot
+        .fake
+        .answers()
+        .last()
+        .expect("callback answer")
+        .1
+        .clone();
+    assert_eq!(toast.as_deref(), Some("Задача уже изменилась"));
+    assert!(
+        snooze_rows(&db.pool, first.id).await.is_empty(),
+        "a stale block must not create a snooze"
+    );
+    let (_, edited) = bot.latest();
+    assert!(edited.contains("Первая (новая)"), "{edited}");
+    assert!(!edited.contains("😴 Напомню в"), "{edited}");
+    assert_eq!(block_count(&edited, "😴 На час"), 2, "{edited}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn assignment_from_an_archived_list_keeps_its_actions_in_a_block() {
     let db = support::isolated_db().await;
     let mut bot = onboarded(&db.pool).await;
@@ -914,4 +957,23 @@ async fn snooze_all_of_an_assignment_without_due_records_the_no_due_origin() {
     .await
     .expect("snooze origin");
     assert_eq!(origin.as_deref(), Some("no-due"));
+
+    // Через час отложенное напоминание о задаче без срока доставляется.
+    let snoozed_at: DateTime<Utc> = sqlx::query_scalar(
+        "SELECT scheduled_at FROM notification_deliveries
+         WHERE item_id = $1 AND kind = 'snooze'",
+    )
+    .bind(no_due.id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("snooze time");
+    assert_eq!(
+        tick_and_deliver(&mut bot, &db.pool, snoozed_at)
+            .await
+            .delivered,
+        1
+    );
+    let rows = snooze_rows(&db.pool, no_due.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "sent", "{rows:?}");
 }

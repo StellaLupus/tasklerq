@@ -87,6 +87,7 @@ pub fn reminder_ui(
                 Action::Snooze {
                     item_id: item.id,
                     until: SnoozeUntil::OneHour,
+                    version: Some(item.version),
                 },
             ),
         ])
@@ -96,6 +97,7 @@ pub fn reminder_ui(
                 Action::Snooze {
                     item_id: item.id,
                     until: SnoozeUntil::TomorrowMorning,
+                    version: Some(item.version),
                 },
             ),
             button("📋 Открыть", Action::NoticeOpen { item_id: item.id }),
@@ -419,6 +421,7 @@ pub async fn snooze(
     message_id: i64,
     item_id: Uuid,
     until: SnoozeUntil,
+    version: Option<i32>,
 ) -> Result<(), Fail> {
     let Some((item, _)) = load(ctx, item_id).await? else {
         ctx.toast("Задача больше недоступна");
@@ -426,6 +429,10 @@ pub async fn snooze(
     };
     if item.status == ItemStatus::Done {
         ctx.toast("Задача уже выполнена");
+        return show_current(ctx, message_id, item_id).await;
+    }
+    if version.is_some_and(|version| version != item.version) {
+        ctx.toast("Задача уже изменилась");
         return show_current(ctx, message_id, item_id).await;
     }
 

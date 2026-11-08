@@ -1077,7 +1077,11 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
         Action::LeaveAsk => settings::leave_ask(ctx).await,
         Action::Leave => settings::leave(ctx).await,
 
-        Action::Snooze { item_id, until } => notify::snooze(ctx, message_id, item_id, until).await,
+        Action::Snooze {
+            item_id,
+            until,
+            version,
+        } => notify::snooze(ctx, message_id, item_id, until, version).await,
         Action::NoticeComplete { item_id, version } => {
             notify::complete(ctx, message_id, item_id, version).await
         }
@@ -1092,9 +1096,11 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
             item_id,
             version,
         } => notify::batch_complete(ctx, message_id, batch_id, item_id, version).await,
-        Action::BatchSnooze { batch_id, item_id } => {
-            notify::batch_snooze(ctx, message_id, batch_id, item_id).await
-        }
+        Action::BatchSnooze {
+            batch_id,
+            item_id,
+            version,
+        } => notify::batch_snooze(ctx, message_id, batch_id, item_id, version).await,
         Action::BatchOpen { batch_id, item_id } => {
             notify::batch_open(ctx, message_id, batch_id, item_id).await
         }
