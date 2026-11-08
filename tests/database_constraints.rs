@@ -106,6 +106,41 @@ async fn item_checks_reject_invalid_rows() {
     .expect_err("monthly recurrence needs month_rule");
     assert_eq!(error_code(&monthly_without_rule).as_deref(), Some("23514"));
 
+    let slot_without_rule = sqlx::query(
+        "INSERT INTO items (
+             id, household_id, list_id, title, status, priority, source, position, version,
+             recurrence_occurrence_date
+         )
+         VALUES ($1, $2, $3, 'slot', 'open', 'normal', 'api', 0, 1, '2026-11-10')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(household.household_id)
+    .bind(household.tasks_list_id)
+    .execute(&mut *conn)
+    .await
+    .expect_err("an occurrence slot needs a recurrence rule");
+    assert_eq!(error_code(&slot_without_rule).as_deref(), Some("23514"));
+
+    let time_without_slot_date = sqlx::query(
+        "INSERT INTO items (
+             id, household_id, list_id, title, status, priority, source, position, version,
+             recurrence_freq, recurrence_interval, recurrence_byweekday,
+             recurrence_timezone, recurrence_anchor_date, recurrence_occurrence_time
+         )
+         VALUES ($1, $2, $3, 'time slot', 'open', 'normal', 'api', 0, 1,
+                 'weekly', 1, ARRAY[2]::smallint[], 'Europe/Moscow', '2026-11-10', '09:00')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(household.household_id)
+    .bind(household.tasks_list_id)
+    .execute(&mut *conn)
+    .await
+    .expect_err("an occurrence time needs a slot date");
+    assert_eq!(
+        error_code(&time_without_slot_date).as_deref(),
+        Some("23514")
+    );
+
     insert_minimal_item(
         &mut conn,
         household.household_id,

@@ -12,7 +12,7 @@ use sqlx::PgConnection;
 use support::telegram::{FakeTelegram, Harness};
 use support::{db, next_telegram_id};
 use tasklerq::security_audit::Audit;
-use tasklerq::telegram::bot::model::{Form, Step};
+use tasklerq::telegram::bot::model::Form;
 use tasklerq::telegram::bot::{Bot, Outcome};
 use tasklerq::telegram::queue::{self, Failure};
 use tasklerq::telegram::update::{self, Classified};
@@ -1152,9 +1152,11 @@ async fn three_deferred_form_answers_run_in_update_id_order() {
         fake.clone(),
     );
     bot.text("/menu").await;
+    bot.press("Задачи").await;
     bot.press("Добавить").await;
-    bot.press("Покупку").await;
-    bot.assert_screen_contains("Что купить?");
+    bot.text("План").await;
+    bot.press("Подзадачи").await;
+    bot.assert_screen_contains("Подзадачи");
     let active_id = bot.active().0;
 
     let worker = worker_with_limit(&db.pool, chat, Arc::new(Bot::new("tasklerqbot")), fake, 3);
@@ -1171,7 +1173,7 @@ async fn three_deferred_form_answers_run_in_update_id_order() {
     }
 
     let mut ids = Vec::new();
-    for text in ["Молоко", "2", "л"] {
+    for text in ["Первая", "Вторая", "Третья"] {
         let update = bot.text_update(&name, text);
         ids.push(enqueue_at(&db.pool, &update, t0).await);
     }
@@ -1198,13 +1200,17 @@ async fn three_deferred_form_answers_run_in_update_id_order() {
         .fetch_one(&db.pool)
         .await
         .expect("form state");
-    let Ok(Form::Create(form)) = serde_json::from_value::<Form>(data) else {
-        panic!("the shopping form should still be open");
+    let Ok(Form::Editor(editor)) = serde_json::from_value::<Form>(data) else {
+        panic!("the editor should still be open");
     };
-    assert_eq!(form.step, Step::Preview);
-    assert_eq!(form.draft.title, "Молоко");
-    assert_eq!(form.draft.quantity, Some(2.0));
-    assert_eq!(form.draft.unit.as_deref(), Some("л"));
+    assert_eq!(editor.draft.title, "План");
+    let subtasks: Vec<&str> = editor
+        .draft
+        .subtasks
+        .iter()
+        .map(|subtask| subtask.title.as_str())
+        .collect();
+    assert_eq!(subtasks, ["Первая", "Вторая", "Третья"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

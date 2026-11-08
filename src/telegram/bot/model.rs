@@ -4,7 +4,9 @@
 //! (по нему перерисовывается устаревшее сообщение), действие — в
 //! `callback_tokens` рядом с токеном кнопки.
 
-use chrono::{NaiveDate, NaiveTime};
+use std::collections::BTreeSet;
+
+use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -78,8 +80,6 @@ pub enum Screen {
     Welcome,
     /// Информационный экран первого контакта без формы онбординга.
     FirstContact(FirstContactScreen),
-    /// Выбор: добавить задачу или покупку.
-    Add,
     /// Все списки.
     Lists,
     /// Список задач или покупок.
@@ -102,6 +102,21 @@ pub enum Screen {
         /// Элемент.
         item_id: Uuid,
         /// Куда ведёт «Назад».
+        back: Box<Screen>,
+    },
+    /// Быстрый выбор срока в карточке задачи.
+    Due {
+        /// Элемент.
+        item_id: Uuid,
+        /// Экран за карточкой: туда ведёт «Назад» и туда же возвращает
+        /// сохранение срока.
+        back: Box<Screen>,
+    },
+    /// Единый редактор элемента или открытый экран его поля.
+    Editor {
+        /// Элемент; у создания его ещё нет.
+        item_id: Option<Uuid>,
+        /// Куда ведёт «✖ Отмена» и куда возвращает сохранение.
         back: Box<Screen>,
     },
     /// Результат удаления с кнопкой отмены.
@@ -238,8 +253,7 @@ impl Screen {
     pub fn depth(&self) -> usize {
         match self {
             Self::Menu | Self::Welcome | Self::FirstContact(_) => 1,
-            Self::Add
-            | Self::Lists
+            Self::Lists
             | Self::Mine { .. }
             | Self::Results { .. }
             | Self::Settings
@@ -253,6 +267,8 @@ impl Screen {
             Self::Item { back, .. }
             | Self::Deleted { back, .. }
             | Self::ConfirmDelete { back, .. } => back.depth() + 1,
+            Self::Editor { back, .. } => back.depth() + 1,
+            Self::Due { back, .. } => back.depth() + 2,
             Self::ConfirmClear {
                 from_lists: true, ..
             }
@@ -280,10 +296,11 @@ impl Screen {
             Self::Menu => "Меню",
             Self::Welcome => "Пространство создано",
             Self::FirstContact(_) => "Первый контакт",
-            Self::Add => "Что добавить?",
             Self::Lists => "Все списки",
             Self::List { .. } => "Список",
             Self::Item { .. } => "Карточка",
+            Self::Due { .. } => "Срок",
+            Self::Editor { .. } => "Редактор",
             Self::Deleted { .. } => "Удалено",
             Self::ConfirmDelete { .. } => "Удаление",
             Self::ConfirmClear { .. } => "Очистка",
@@ -316,8 +333,7 @@ impl Screen {
     fn parents(&self) -> Vec<&'static str> {
         match self {
             Self::Menu | Self::Welcome | Self::FirstContact(_) => Vec::new(),
-            Self::Add
-            | Self::Lists
+            Self::Lists
             | Self::Mine { .. }
             | Self::Results { .. }
             | Self::Settings
@@ -333,6 +349,17 @@ impl Screen {
             | Self::ConfirmDelete { back, .. } => {
                 let mut parents = back.parents();
                 parents.push(back.crumb());
+                parents
+            }
+            Self::Editor { back, .. } => {
+                let mut parents = back.parents();
+                parents.push(back.crumb());
+                parents
+            }
+            Self::Due { back, .. } => {
+                let mut parents = back.parents();
+                parents.push(back.crumb());
+                parents.push("Карточка");
                 parents
             }
             Self::ConfirmClear {
@@ -361,18 +388,41 @@ impl Screen {
     }
 
     /// Хлебные крошки экрана: имена родителей и `title` через « › », не
-    /// длиннее 60 символов. `parent` подменяет имя непосредственного родителя,
-    /// если оно зависит от данных (например, имя списка).
+    /// длиннее 60 символов. `parent` подменяет имя списка-родителя, если оно
+    /// зависит от данных.
     pub fn trail(&self, title: &str, parent: Option<&str>) -> String {
+        self.trail_with_names(title, parent, None, None)
+    }
+
+    /// Крошки по фактической цепочке `back` с настоящими именами: вместо
+    /// служебного «Список» подставляется имя списка, вместо «Карточка» —
+    /// название элемента, а `extra` добавляет служебный экран между последним
+    /// родителем и заголовком (например, «Редактор»).
+    pub fn trail_with_names(
+        &self,
+        title: &str,
+        list_name: Option<&str>,
+        card_title: Option<&str>,
+        extra: Option<&str>,
+    ) -> String {
         let deep = self.depth() > 2;
         let mut parts: Vec<String> = if deep {
             self.parents().into_iter().map(str::to_owned).collect()
         } else {
             Vec::new()
         };
-        if deep && let Some(parent) = parent {
-            parts.pop();
-            parts.push(parent.to_owned());
+        for part in &mut parts {
+            let replacement = match part.as_str() {
+                "Список" => list_name,
+                "Карточка" => card_title,
+                _ => None,
+            };
+            if let Some(replacement) = replacement {
+                *part = replacement.to_owned();
+            }
+        }
+        if deep && let Some(extra) = extra {
+            parts.push(extra.to_owned());
         }
         parts.push(title.to_owned());
         clip_trail(parts.join(" › "))
@@ -383,7 +433,19 @@ impl Screen {
 /// текст показывается отдельным абзацем: получатель и действие должны
 /// оставаться видимыми.
 pub fn screen_heading(screen: &Screen, title: &str, parent: Option<&str>) -> Ui {
-    let trail = screen.trail(title, parent);
+    screen_heading_names(screen, title, parent, None, None)
+}
+
+/// Заголовок экрана с крошками по цепочке `back` и настоящими именами
+/// списка и карточки.
+pub fn screen_heading_names(
+    screen: &Screen,
+    title: &str,
+    list_name: Option<&str>,
+    card_title: Option<&str>,
+    extra: Option<&str>,
+) -> Ui {
+    let trail = screen.trail_with_names(title, list_name, card_title, extra);
     let mut ui = Ui::new().heading(trail.clone());
     if !trail.contains(title) {
         ui = ui.text(title.to_owned());
@@ -438,8 +500,6 @@ pub enum Step {
     Unit,
     /// Заметка.
     Notes,
-    /// Предпросмотр.
-    Preview,
 }
 
 impl Step {
@@ -457,6 +517,167 @@ impl Step {
                 | Self::Notes
         )
     }
+}
+
+/// Поле редактора, которое пользователь уже менял.
+///
+/// Связанные экраны одного поля (`Due` и `DueText`, `Recurrence`, `Weekdays`,
+/// `MonthRule` и `Interval`) дают одно и то же значение, поэтому в `touched`
+/// попадает именно поле, а не открытый экран.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditorField {
+    /// Название.
+    Title,
+    /// Срок.
+    Due,
+    /// Приоритет.
+    Priority,
+    /// Исполнитель.
+    Assignee,
+    /// Теги.
+    Tags,
+    /// Подзадачи.
+    Subtasks,
+    /// Повторение.
+    Recurrence,
+    /// Описание или заметка.
+    Notes,
+    /// Список.
+    List,
+    /// Количество.
+    Quantity,
+    /// Единица измерения.
+    Unit,
+}
+
+impl EditorField {
+    /// Поле, к которому относится открытый экран шага.
+    pub const fn from_step(step: Step) -> Option<Self> {
+        match step {
+            Step::Title => Some(Self::Title),
+            Step::Due | Step::DueText => Some(Self::Due),
+            Step::Priority => Some(Self::Priority),
+            Step::Assignee => Some(Self::Assignee),
+            Step::Tags | Step::NewTag => Some(Self::Tags),
+            Step::Subtasks => Some(Self::Subtasks),
+            Step::Recurrence | Step::Weekdays | Step::MonthRule | Step::Interval => {
+                Some(Self::Recurrence)
+            }
+            Step::Notes => Some(Self::Notes),
+            Step::List => Some(Self::List),
+            Step::Quantity => Some(Self::Quantity),
+            Step::Unit => Some(Self::Unit),
+        }
+    }
+
+    /// Шаг, который строит патч только для этого поля.
+    pub const fn step(self) -> Step {
+        match self {
+            Self::Title => Step::Title,
+            Self::Due => Step::Due,
+            Self::Priority => Step::Priority,
+            Self::Assignee => Step::Assignee,
+            Self::Tags => Step::Tags,
+            Self::Subtasks => Step::Subtasks,
+            Self::Recurrence => Step::Recurrence,
+            Self::Notes => Step::Notes,
+            Self::List => Step::List,
+            Self::Quantity => Step::Quantity,
+            Self::Unit => Step::Unit,
+        }
+    }
+}
+
+/// Снимок значений элемента при открытии редактора.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ItemSnapshot {
+    /// Список.
+    pub list_id: Uuid,
+    /// Название.
+    pub title: String,
+    /// Описание.
+    pub notes: Option<String>,
+    /// Срок со временем.
+    pub due_at: Option<DateTime<Utc>>,
+    /// Вседневный срок.
+    pub due_date: Option<NaiveDate>,
+    /// Приоритет.
+    pub priority: ItemPriority,
+    /// Исполнитель.
+    pub assignee: Option<Uuid>,
+    /// Теги.
+    pub tags: Vec<String>,
+    /// Подзадачи.
+    pub subtasks: Vec<SubtaskDraft>,
+    /// Правило повторения.
+    pub recurrence: Option<Recurrence>,
+    /// Количество.
+    pub quantity: Option<f64>,
+    /// Единица измерения.
+    pub unit: Option<String>,
+}
+
+impl ItemSnapshot {
+    /// Снять значения с сохранённого элемента.
+    pub fn from_item(item: &Item) -> Self {
+        Self {
+            list_id: item.list_id,
+            title: item.title.clone(),
+            notes: item.notes.clone(),
+            due_at: item.due_at,
+            due_date: item.due_date,
+            priority: item.priority,
+            assignee: item.assignee_user_id,
+            tags: item.tags.iter().map(|tag| tag.name.clone()).collect(),
+            subtasks: item
+                .subtasks
+                .iter()
+                .map(|subtask| SubtaskDraft {
+                    title: subtask.title.clone(),
+                    done: subtask.status == ItemStatus::Done,
+                })
+                .collect(),
+            recurrence: item.recurrence.clone(),
+            quantity: item.quantity,
+            unit: item.unit.clone(),
+        }
+    }
+}
+
+/// Что правит единый редактор.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "target", rename_all = "snake_case")]
+pub enum EditorTarget {
+    /// Новый элемент: поля ещё не записаны.
+    New {
+        /// Вид списка на момент открытия.
+        kind: ListKind,
+        /// Куда вернуться после сохранения или отмены.
+        back: Screen,
+    },
+    /// Существующий элемент.
+    Item {
+        /// Элемент.
+        item_id: Uuid,
+        /// Значения полей при открытии редактора.
+        base: Box<ItemSnapshot>,
+        /// Куда вернуться после сохранения или отмены.
+        back: Screen,
+    },
+    /// Пункт черновика LLM: правится в черновике, а не в элементе.
+    DraftItem {
+        /// Черновик.
+        draft_id: Uuid,
+        /// Номер элемента с нуля.
+        index: usize,
+        /// Вид списка пункта на момент открытия.
+        kind: ListKind,
+        /// У пункта не было выбранного списка: перед сохранением его нужно
+        /// выбрать.
+        #[serde(default)]
+        list_missing: bool,
+    },
 }
 
 /// Выбор на кнопке внутри формы.
@@ -503,10 +724,15 @@ pub enum FormAct {
     Choose(Choice),
     /// Перейти к шагу.
     Go(Step),
-    /// Пропустить шаг.
-    Skip,
     /// Закончить многошаговый выбор (теги, подзадачи, дни).
     Done,
+    /// Вернуться в редактор с экрана поля без изменения поля.
+    Back,
+    /// Разрешить конфликт сохранения: «Оставить мой» или «Оставить текущий».
+    Conflict {
+        /// Оставить значения из редактора.
+        mine: bool,
+    },
     /// Сохранить.
     Save,
     /// Сохранить, даже если такая позиция уже есть.
@@ -522,6 +748,20 @@ pub enum FormAct {
     },
     /// Отменить форму.
     Cancel,
+}
+
+/// Быстрый срок на экране карточки.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuickDue {
+    /// Сегодняшняя дата.
+    Today,
+    /// Завтрашняя дата.
+    Tomorrow,
+    /// Дата текущего срока не раньше сегодня плюс неделя.
+    WeekLater,
+    /// Снять срок.
+    None,
 }
 
 /// Действие кнопки.
@@ -579,20 +819,41 @@ pub enum Action {
         /// Куда вернуться.
         back: Screen,
     },
-    /// Начать создание элемента.
+    /// Начать создание элемента через редактор.
     Add {
-        /// Список; без значения бот предложит выбрать.
+        /// Список; без значения бот возьмёт список по умолчанию.
         list_id: Option<Uuid>,
         /// Вид списка для выбора.
         kind: ListKind,
+        /// Экран, откуда начали создание.
+        #[serde(default)]
+        back: Option<Screen>,
     },
-    /// Открыть шаг редактирования существующего элемента.
+    /// Открыть единый редактор существующего элемента.
     Edit {
         /// Элемент.
         item_id: Uuid,
-        /// Шаг.
-        step: Step,
-        /// Куда вернуться.
+        /// Куда вернуться после сохранения или отмены.
+        back: Screen,
+    },
+    /// Выбрать быстрый срок в карточке.
+    DueSet {
+        /// Элемент.
+        item_id: Uuid,
+        /// Версия, которую видел пользователь.
+        version: i32,
+        /// Выбранный срок.
+        due: QuickDue,
+        /// Экран за карточкой.
+        back: Screen,
+    },
+    /// Ввести дату и время текстом из быстрого срока.
+    DueText {
+        /// Элемент.
+        item_id: Uuid,
+        /// Версия, которую видел пользователь.
+        version: i32,
+        /// Экран за карточкой.
         back: Screen,
     },
     /// Действие внутри формы элемента.
@@ -806,7 +1067,7 @@ pub enum Action {
         /// Какой день выбрать.
         choice: DueChoice,
     },
-    /// Открыть форму правки сразу на шаге срока.
+    /// Открыть редактор правки сразу на поле срока.
     DraftEditDue {
         /// Черновик.
         draft_id: Uuid,
@@ -886,6 +1147,8 @@ impl Action {
         match self {
             Self::Complete { version, .. }
             | Self::Reopen { version, .. }
+            | Self::DueSet { version, .. }
+            | Self::DueText { version, .. }
             | Self::NoticeComplete { version, .. }
             | Self::BatchComplete { version, .. } => Some(*version),
             Self::Form {
@@ -948,7 +1211,12 @@ pub struct ItemDraft {
 impl ItemDraft {
     /// Черновик по существующему элементу.
     pub fn from_item(item: &Item, timezone: Tz) -> Self {
-        let (date, time) = match (item.due_at, item.due_date) {
+        Self::from_snapshot(&ItemSnapshot::from_item(item), timezone)
+    }
+
+    /// Черновик по снимку значений элемента.
+    pub fn from_snapshot(snapshot: &ItemSnapshot, timezone: Tz) -> Self {
+        let (date, time) = match (snapshot.due_at, snapshot.due_date) {
             (Some(at), _) => {
                 let local = at.with_timezone(&timezone);
                 (Some(local.date_naive()), Some(local.time()))
@@ -956,24 +1224,17 @@ impl ItemDraft {
             (None, date) => (date, None),
         };
         Self {
-            title: item.title.clone(),
-            notes: item.notes.clone(),
+            title: snapshot.title.clone(),
+            notes: snapshot.notes.clone(),
             date,
             time,
-            priority: item.priority,
-            assignee: item.assignee_user_id,
-            tags: item.tags.iter().map(|tag| tag.name.clone()).collect(),
-            subtasks: item
-                .subtasks
-                .iter()
-                .map(|subtask| SubtaskDraft {
-                    title: subtask.title.clone(),
-                    done: subtask.status == ItemStatus::Done,
-                })
-                .collect(),
-            recurrence: item.recurrence.as_ref().map(RecurrenceDraft::from_rule),
-            quantity: item.quantity,
-            unit: item.unit.clone(),
+            priority: snapshot.priority,
+            assignee: snapshot.assignee,
+            tags: snapshot.tags.clone(),
+            subtasks: snapshot.subtasks.clone(),
+            recurrence: snapshot.recurrence.as_ref().map(RecurrenceDraft::from_rule),
+            quantity: snapshot.quantity,
+            unit: snapshot.unit.clone(),
         }
     }
 
@@ -1068,7 +1329,7 @@ impl ItemDraft {
             Step::Quantity => patch.quantity = self.quantity.map_or(Field::Null, Field::Value),
             Step::Unit => patch.unit = self.unit.clone().map_or(Field::Null, Field::Value),
             Step::Notes => patch.notes = self.notes.clone().map_or(Field::Null, Field::Value),
-            Step::List | Step::Preview => {}
+            Step::List => {}
         }
         Ok(patch)
     }
@@ -1110,10 +1371,22 @@ pub enum Form {
         /// Название household после первого шага.
         name: Option<String>,
     },
-    /// Создание элемента.
-    Create(ItemForm),
-    /// Редактирование поля существующего элемента.
-    Edit(EditForm),
+    /// Единый редактор существующего элемента или пункта черновика.
+    Editor(Editor),
+    /// Прежняя пошаговая форма или правка поля. В базе не создаётся; так
+    /// читается сохранённый JSON `{"form":"create", …}` или
+    /// `{"form":"edit", …}` и трактуется как истёкшая правка.
+    #[serde(rename = "legacy_edit")]
+    LegacyEdit,
+    /// Ввод даты и времени для быстрого срока в карточке.
+    DueText {
+        /// Элемент.
+        item_id: Uuid,
+        /// Версия, которую видел пользователь.
+        version: i32,
+        /// Экран за карточкой.
+        back: Screen,
+    },
     /// Ожидание поискового запроса.
     Search,
     /// Новое имя пользователя.
@@ -1127,41 +1400,6 @@ pub enum Form {
         /// Какое время редактируется.
         field: TimeField,
     },
-}
-
-/// Создание элемента.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ItemForm {
-    /// Список, если уже выбран.
-    pub list_id: Option<Uuid>,
-    /// Вид списка.
-    pub kind: ListKind,
-    /// Текущий шаг.
-    pub step: Step,
-    /// Заполненные поля.
-    pub draft: ItemDraft,
-    /// После шага вернуться к предпросмотру.
-    pub from_preview: bool,
-    /// Последняя ошибка ввода.
-    pub error: Option<String>,
-    /// Найденная такая же позиция списка покупок.
-    #[serde(default)]
-    pub duplicate: Option<Duplicate>,
-    /// Форма правит элемент черновика capture, а не создаёт новый.
-    #[serde(default)]
-    pub target: Option<DraftTarget>,
-    /// Быстрая форма: список и его тип можно сменить прямо из предпросмотра.
-    #[serde(default)]
-    pub quick: bool,
-}
-
-/// Элемент черновика capture, который правит форма.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DraftTarget {
-    /// Черновик.
-    pub draft_id: Uuid,
-    /// Номер элемента с нуля.
-    pub index: usize,
 }
 
 /// Позиция, которая уже есть в списке.
@@ -1179,17 +1417,40 @@ pub struct Duplicate {
     pub version: i32,
 }
 
-/// Редактирование поля существующего элемента.
+/// Единый редактор существующего элемента.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EditForm {
-    /// Элемент.
-    pub item_id: Uuid,
-    /// Шаг.
-    pub step: Step,
-    /// Куда вернуться по завершении.
-    pub back: Screen,
+pub struct Editor {
+    /// Что правим.
+    pub target: EditorTarget,
+    /// Текущие значения полей.
+    pub draft: ItemDraft,
+    /// Поля, которые пользователь менял.
+    pub touched: BTreeSet<EditorField>,
+    /// Открытый экран поля; `None` — сам редактор.
+    pub field: Option<Step>,
+    /// Родительский экран поля, если открыт его подэкран (например,
+    /// «Другой интервал» из повторения).
+    #[serde(default)]
+    pub field_back: Option<Step>,
+    /// Снимок черновика на момент открытия поля: «Назад» без изменения поля
+    /// возвращает его.
+    #[serde(default)]
+    pub field_backup: Option<ItemDraft>,
+    /// Список, выбранный в редакторе.
+    pub list_id: Uuid,
     /// Последняя ошибка ввода.
     pub error: Option<String>,
+    /// Поля, по которым при сохранении обнаружен конфликт.
+    #[serde(default)]
+    pub conflict: Option<BTreeSet<EditorField>>,
+    /// Снимок текущего значения, показанный на экране конфликта: «Оставить
+    /// мой» сравнивает поля с ним, а не с более поздней правкой другого
+    /// участника.
+    #[serde(default)]
+    pub conflict_seen: Option<Box<ItemSnapshot>>,
+    /// Такая же позиция, найденная при сохранении покупки.
+    #[serde(default)]
+    pub duplicate: Option<Duplicate>,
 }
 
 impl Form {
@@ -1197,8 +1458,9 @@ impl Form {
     pub fn kind_name(&self) -> &'static str {
         match self {
             Self::Onboarding { .. } => "onboarding",
-            Self::Create(_) => "create",
-            Self::Edit(_) => "edit",
+            Self::Editor(_) => "editor",
+            Self::LegacyEdit => "legacy_edit",
+            Self::DueText { .. } => "due_text",
             Self::Search => "search",
             Self::Rename => "rename",
             Self::DeleteHousehold => "delete_household",
@@ -1213,6 +1475,42 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn old_edit_callback_with_field_is_read() {
+        let action: Action = serde_json::from_value(json!({
+            "a": "edit",
+            "item_id": Uuid::nil(),
+            "field": "due",
+            "back": {"t": "menu"},
+        }))
+        .expect("old edit token");
+        assert_eq!(
+            action,
+            Action::Edit {
+                item_id: Uuid::nil(),
+                back: Screen::Menu,
+            }
+        );
+    }
+
+    #[test]
+    fn old_new_target_with_list_id_is_read() {
+        let target: EditorTarget = serde_json::from_value(json!({
+            "target": "new",
+            "list_id": Uuid::nil(),
+            "kind": "tasks",
+            "back": {"t": "menu"},
+        }))
+        .expect("old new target");
+        assert_eq!(
+            target,
+            EditorTarget::New {
+                kind: ListKind::Tasks,
+                back: Screen::Menu,
+            }
+        );
+    }
 
     #[test]
     fn first_contact_screen_cannot_represent_onboarding() {
@@ -1392,6 +1690,10 @@ mod tests {
         };
         let screens = vec![
             Screen::Item {
+                item_id: Uuid::nil(),
+                back: Box::new(list.clone()),
+            },
+            Screen::Due {
                 item_id: Uuid::nil(),
                 back: Box::new(list.clone()),
             },

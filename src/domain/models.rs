@@ -1,6 +1,6 @@
 //! Доменные типы Tasklerq.
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
@@ -333,6 +333,14 @@ pub struct Recurrence {
     pub anchor_date: NaiveDate,
     /// Правило месячного повторения.
     pub month_rule: Option<MonthRule>,
+    /// Дата правила, которую занимает перенесённое вхождение; `None` — срок
+    /// стоит на своей дате правила.
+    #[serde(default)]
+    pub occurrence_date: Option<NaiveDate>,
+    /// Локальное время серии при заданной дате слота; `None` — вседневная
+    /// серия.
+    #[serde(default)]
+    pub occurrence_time: Option<NaiveTime>,
 }
 
 /// Входные данные правила повторения до валидации.

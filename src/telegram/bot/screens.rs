@@ -24,7 +24,6 @@ pub async fn build(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
         Screen::Menu => menu(ctx).await,
         Screen::Welcome => Ok(welcome()),
         Screen::FirstContact(contact) => Ok(super::onboarding::first_contact(contact)),
-        Screen::Add => Ok(add_choice()),
         Screen::Lists => lists_screen(ctx).await,
         Screen::List {
             list_id,
@@ -33,6 +32,8 @@ pub async fn build(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
             from_lists,
         } => list(ctx, *list_id, *page, *edit, *from_lists).await,
         Screen::Item { item_id, back } => card::view(ctx, *item_id, back).await,
+        Screen::Editor { item_id, back } => forms::editor_screen(ctx, *item_id, back).await,
+        Screen::Due { item_id, back } => card::due(ctx, *item_id, back).await,
         Screen::Deleted {
             item_id,
             title,
@@ -179,7 +180,14 @@ async fn menu(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
 
     ui = ui
         .row(vec![
-            go("➕ Добавить", Screen::Add),
+            button(
+                "➕ Добавить",
+                Action::Add {
+                    list_id: None,
+                    kind: ListKind::Tasks,
+                    back: None,
+                },
+            ),
             go(&format!("🛒 Покупки · {shopping_count}"), shopping_target),
         ])
         .row(vec![
@@ -208,28 +216,6 @@ fn welcome() -> Ui {
             go("📋 Открыть меню", Screen::Menu),
             go("👥 Пригласить семью", Screen::Invites),
         ])
-}
-
-fn add_choice() -> Ui {
-    Ui::new()
-        .heading("Что добавить?")
-        .row(vec![
-            button(
-                "📝 Задачу",
-                Action::Add {
-                    list_id: None,
-                    kind: ListKind::Tasks,
-                },
-            ),
-            button(
-                "🛒 Покупку",
-                Action::Add {
-                    list_id: None,
-                    kind: ListKind::Shopping,
-                },
-            ),
-        ])
-        .row(nav_row(&Screen::Add, Screen::Menu))
 }
 
 async fn lists_screen(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
@@ -465,6 +451,7 @@ async fn tasks_list(
         Action::Add {
             list_id: Some(list.id),
             kind: ListKind::Tasks,
+            back: Some(current.clone()),
         },
     )];
     row.extend(nav_row(&current, list_back(from_lists)));

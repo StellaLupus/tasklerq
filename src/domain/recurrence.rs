@@ -51,6 +51,17 @@ impl Due {
 }
 
 impl Recurrence {
+    /// Совпадает ли правило с другим, если не учитывать слот вхождения.
+    pub fn same_rule(&self, other: &Self) -> bool {
+        self.freq == other.freq
+            && self.interval == other.interval
+            && self.byweekday == other.byweekday
+            && self.until == other.until
+            && self.timezone == other.timezone
+            && self.anchor_date == other.anchor_date
+            && self.month_rule == other.month_rule
+    }
+
     /// Разобрать IANA timezone правила.
     pub fn timezone(&self) -> Result<Tz, DomainError> {
         parse_timezone(&self.timezone)
@@ -92,7 +103,13 @@ impl Recurrence {
         let timezone = self.timezone()?;
         let current_date = current.local_date(timezone);
         let completion_date = completed_at.with_timezone(&timezone).date_naive();
-        let local_time = current.local_time(timezone);
+        // Если вхождение перенесено, тип срока и время суток следующих
+        // вхождений задаёт слот: `None` — вседневная серия.
+        let local_time = if self.occurrence_date.is_some() {
+            self.occurrence_time
+        } else {
+            current.local_time(timezone)
+        };
         let mut candidate_date = current_date;
         let mut iterations = 0;
 
@@ -112,6 +129,9 @@ impl Recurrence {
             };
 
             let after_current = candidate_date > current_date;
+            let after_slot = self
+                .occurrence_date
+                .is_none_or(|slot| candidate_date > slot);
             let after_completion = candidate_date > completion_date;
             let timed_after_completion = match next {
                 Due::Timed(at) => at > completed_at,
@@ -122,7 +142,7 @@ impl Recurrence {
                 _ => after_current,
             };
 
-            if timed_after_current && timed_after_completion {
+            if timed_after_current && after_slot && timed_after_completion {
                 return Ok(Some(next));
             }
 
@@ -137,7 +157,8 @@ impl Recurrence {
 
     /// Все вхождения серии в интервале `[start, end)`.
     ///
-    /// `current` задаёт тип срока (all-day/timed) и локальное время. Развёртка
+    /// `current` задаёт тип срока (all-day/timed) и локальное время, если слот
+    /// вхождения не задан; иначе тип и время берутся из слота. Развёртка
     /// ограничена [`MAX_CALENDAR_OCCURRENCES`].
     pub fn occurrences_between(
         &self,
@@ -150,7 +171,11 @@ impl Recurrence {
         }
 
         let timezone = self.timezone()?;
-        let local_time = current.local_time(timezone);
+        let local_time = if self.occurrence_date.is_some() {
+            self.occurrence_time
+        } else {
+            current.local_time(timezone)
+        };
         let mut candidate = self.anchor_occurrence();
         let mut iterations = 0;
 
@@ -216,7 +241,17 @@ impl Recurrence {
     fn next_date(&self, date: NaiveDate) -> Option<NaiveDate> {
         match self.freq {
             RecurrenceFreq::Daily => {
-                date.checked_add_days(chrono::Days::new(u64::try_from(self.interval).unwrap_or(0)))
+                if date < self.anchor_date {
+                    return Some(self.anchor_date);
+                }
+                let step = i64::from(self.interval.max(1));
+                let remainder = (date - self.anchor_date).num_days().rem_euclid(step);
+                let days = if remainder == 0 {
+                    step
+                } else {
+                    step - remainder
+                };
+                date.checked_add_days(chrono::Days::new(u64::try_from(days).unwrap_or(0)))
             }
             RecurrenceFreq::Weekly => self.next_weekly_date(date),
             RecurrenceFreq::Monthly => self.next_monthly_date(date),
@@ -246,21 +281,26 @@ impl Recurrence {
     }
 
     fn next_monthly_date(&self, date: NaiveDate) -> Option<NaiveDate> {
-        let step = i32::from(self.interval);
-        let mut year = date.year();
-        let mut month = date.month();
+        let step = i32::from(self.interval.max(1));
+        let base_month = date_index(self.anchor_date);
+        let mut month = date_index(date).max(base_month);
+        let offset = month - base_month;
+        let remainder = offset % step;
+        if remainder != 0 {
+            month += step - remainder;
+        }
 
         for _ in 0..MAX_ITERATIONS {
-            let (next_year, next_month) = add_months(year, month, step);
-            year = next_year;
-            month = next_month;
+            let year = month.div_euclid(12);
+            let month_of_year = (month.rem_euclid(12) + 1) as u32;
 
             let candidate = match self.month_rule.unwrap_or(MonthRule::AnchorDay) {
-                MonthRule::LastDay => last_day_of_month(year, month),
+                MonthRule::LastDay => last_day_of_month(year, month_of_year),
                 MonthRule::AnchorDay => {
                     let Some(candidate) =
-                        NaiveDate::from_ymd_opt(year, month, self.anchor_date.day())
+                        NaiveDate::from_ymd_opt(year, month_of_year, self.anchor_date.day())
                     else {
+                        month = month.checked_add(step)?;
                         continue;
                     };
                     candidate
@@ -270,23 +310,31 @@ impl Recurrence {
             if candidate > date {
                 return Some(candidate);
             }
+
+            month = month.checked_add(step)?;
         }
 
         None
     }
 
     fn next_yearly_date(&self, date: NaiveDate) -> Option<NaiveDate> {
-        let step = i32::from(self.interval);
-        let mut year = date.year();
+        let step = i32::from(self.interval.max(1));
+        let base_year = self.anchor_date.year();
+        let mut year = date.year().max(base_year);
+        let offset = year - base_year;
+        let remainder = offset % step;
+        if remainder != 0 {
+            year += step - remainder;
+        }
 
         for _ in 0..MAX_ITERATIONS {
-            year = year.checked_add(step)?;
             if let Some(candidate) =
                 NaiveDate::from_ymd_opt(year, self.anchor_date.month(), self.anchor_date.day())
                 && candidate > date
             {
                 return Some(candidate);
             }
+            year = year.checked_add(step)?;
         }
 
         None
@@ -382,7 +430,18 @@ impl RecurrenceInput {
             timezone,
             anchor_date,
             month_rule,
+            occurrence_date: None,
+            occurrence_time: None,
         })
+    }
+}
+
+/// Изменилось ли правило без учёта слота вхождения.
+pub fn rule_changed(a: Option<&Recurrence>, b: Option<&Recurrence>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => !a.same_rule(b),
+        (None, None) => false,
+        _ => true,
     }
 }
 
@@ -427,10 +486,9 @@ pub(super) fn last_day_of_month(year: i32, month: u32) -> NaiveDate {
         .expect("valid calendar month")
 }
 
-/// Прибавить месяцы к году/месяцу.
-fn add_months(year: i32, month: u32, delta: i32) -> (i32, u32) {
-    let total = year * 12 + i32::try_from(month).unwrap_or(1) - 1 + delta;
-    (total.div_euclid(12), (total.rem_euclid(12) + 1) as u32)
+/// Номер месяца от условного нуля для арифметики интервалов.
+fn date_index(date: NaiveDate) -> i32 {
+    date.year() * 12 + i32::try_from(date.month()).unwrap_or(1) - 1
 }
 
 /// Перевести локальные дату и время в UTC.
@@ -485,6 +543,8 @@ mod tests {
             timezone: timezone.to_owned(),
             anchor_date: anchor,
             month_rule,
+            occurrence_date: None,
+            occurrence_time: None,
         }
     }
 
@@ -648,6 +708,132 @@ mod tests {
             .expect("next")
             .expect("occurrence");
         assert_eq!(next, Due::AllDay(date(2026, 11, 4)));
+    }
+
+    #[test]
+    fn daily_interval_skips_to_the_next_grid_date() {
+        let mut rule = rule(
+            RecurrenceFreq::Daily,
+            date(2026, 11, 1),
+            "Europe/Moscow",
+            None,
+        );
+        rule.interval = 3;
+
+        let next = rule
+            .next_after(
+                Due::AllDay(date(2026, 11, 2)),
+                Utc.with_ymd_and_hms(2026, 11, 2, 12, 0, 0)
+                    .single()
+                    .expect("fixed moment"),
+            )
+            .expect("next")
+            .expect("occurrence");
+        assert_eq!(next, Due::AllDay(date(2026, 11, 4)));
+    }
+
+    #[test]
+    fn daily_date_before_anchor_starts_at_the_anchor() {
+        let rule = rule(
+            RecurrenceFreq::Daily,
+            date(2026, 11, 10),
+            "Europe/Moscow",
+            None,
+        );
+
+        let next = rule
+            .next_after(
+                Due::AllDay(date(2026, 11, 6)),
+                Utc.with_ymd_and_hms(2026, 11, 6, 12, 0, 0)
+                    .single()
+                    .expect("fixed moment"),
+            )
+            .expect("next")
+            .expect("occurrence");
+        assert_eq!(next, Due::AllDay(date(2026, 11, 10)));
+    }
+
+    #[test]
+    fn monthly_interval_skips_months_off_the_anchor_grid() {
+        let mut rule = rule(
+            RecurrenceFreq::Monthly,
+            date(2026, 1, 15),
+            "Europe/Moscow",
+            Some(MonthRule::AnchorDay),
+        );
+        rule.interval = 2;
+
+        let next = rule
+            .next_after(
+                Due::AllDay(date(2026, 2, 15)),
+                Utc.with_ymd_and_hms(2026, 2, 15, 12, 0, 0)
+                    .single()
+                    .expect("fixed moment"),
+            )
+            .expect("next")
+            .expect("occurrence");
+        assert_eq!(next, Due::AllDay(date(2026, 3, 15)));
+    }
+
+    #[test]
+    fn yearly_interval_skips_years_off_the_anchor_grid() {
+        let mut rule = rule(
+            RecurrenceFreq::Yearly,
+            date(2026, 3, 10),
+            "Europe/Moscow",
+            None,
+        );
+        rule.interval = 2;
+
+        let next = rule
+            .next_after(
+                Due::AllDay(date(2027, 3, 10)),
+                Utc.with_ymd_and_hms(2027, 3, 10, 12, 0, 0)
+                    .single()
+                    .expect("fixed moment"),
+            )
+            .expect("next")
+            .expect("occurrence");
+        assert_eq!(next, Due::AllDay(date(2028, 3, 10)));
+    }
+
+    #[test]
+    fn next_after_skips_the_occurrence_slot() {
+        let mut rule = rule(
+            RecurrenceFreq::Weekly,
+            date(2026, 11, 3),
+            "Europe/Moscow",
+            None,
+        );
+        rule.byweekday = vec![2];
+        rule.occurrence_date = Some(date(2026, 11, 10));
+
+        let next = rule
+            .next_after(
+                Due::AllDay(date(2026, 11, 6)),
+                Utc.with_ymd_and_hms(2026, 11, 6, 12, 0, 0)
+                    .single()
+                    .expect("fixed moment"),
+            )
+            .expect("next")
+            .expect("occurrence");
+        assert_eq!(next, Due::AllDay(date(2026, 11, 17)));
+    }
+
+    #[test]
+    fn recurrence_json_without_occurrence_date_reads_as_none() {
+        let rule: Recurrence = serde_json::from_value(serde_json::json!({
+            "freq": "weekly",
+            "interval": 1,
+            "byweekday": [2],
+            "until": null,
+            "timezone": "Europe/Moscow",
+            "anchor_date": "2026-11-03",
+            "month_rule": null
+        }))
+        .expect("old snapshot parses");
+
+        assert_eq!(rule.occurrence_date, None);
     }
 
     #[test]

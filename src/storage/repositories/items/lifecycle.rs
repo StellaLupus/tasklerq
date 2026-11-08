@@ -49,8 +49,10 @@ pub async fn complete(
             Due::Timed(at) => at > now,
             Due::AllDay(date) => date > today,
         };
-        if row.completed_at.is_some() && future {
-            // Повторный вызов после переноса срока — идемпотентен.
+        if version.is_none() && row.completed_at.is_some() && future {
+            // Повторный вызов без версии после переноса срока идемпотентен.
+            // С версией повтор отсекает проверка выше, а новое нажатие после
+            // переноса на будущую дату должно записать выполнение.
             return Ok(current);
         }
 
@@ -63,7 +65,10 @@ pub async fn complete(
                 sqlx::query(
                     "UPDATE items
                      SET status = 'open', completed_at = $3, completed_by_user_id = $4,
-                         due_at = $5, due_date = $6, version = version + 1, updated_at = $3
+                         due_at = $5, due_date = $6,
+                         recurrence_occurrence_date = NULL,
+                         recurrence_occurrence_time = NULL,
+                         version = version + 1, updated_at = $3
                      WHERE id = $1 AND household_id = $2",
                 )
                 .bind(item_id)
@@ -79,6 +84,8 @@ pub async fn complete(
                 sqlx::query(
                     "UPDATE items
                      SET status = 'done', completed_at = $3, completed_by_user_id = $4,
+                         recurrence_occurrence_date = NULL,
+                         recurrence_occurrence_time = NULL,
                          version = version + 1, updated_at = $3
                      WHERE id = $1 AND household_id = $2",
                 )
@@ -149,7 +156,7 @@ pub async fn reopen(
             serde_json::from_value::<Item>(event.payload.get("before")?.clone()).ok()
         });
 
-    let (due_at, due_date, completed_at, completed_by_user_id) = match previous {
+    let (due_at, due_date, completed_at, completed_by_user_id) = match &previous {
         Some(previous) => (
             previous.due_at,
             previous.due_date,
@@ -158,11 +165,26 @@ pub async fn reopen(
         ),
         None => (row.due_at, row.due_date, None, None),
     };
+    // Слот относится к конкретному правилу. Если после выполнения правило
+    // сняли или изменили, старый слот к новому правилу не подходит — иначе
+    // `items_recurrence_shape` отвергнет строку без правила, а `next_after`
+    // посчитает следующее вхождение от чужой даты.
+    let (occurrence_date, occurrence_time) = match (
+        row.recurrence(),
+        previous.as_ref().and_then(|item| item.recurrence.as_ref()),
+    ) {
+        (Some(current_rule), Some(previous_rule)) if current_rule.same_rule(previous_rule) => {
+            (previous_rule.occurrence_date, previous_rule.occurrence_time)
+        }
+        _ => (None, None),
+    };
 
     sqlx::query(
         "UPDATE items
          SET status = 'open', due_at = $3, due_date = $4, completed_at = $5,
-             completed_by_user_id = $6, version = version + 1, updated_at = $7
+             completed_by_user_id = $6, recurrence_occurrence_date = $7,
+             recurrence_occurrence_time = $8,
+             version = version + 1, updated_at = $9
          WHERE id = $1 AND household_id = $2",
     )
     .bind(item_id)
@@ -171,6 +193,8 @@ pub async fn reopen(
     .bind(due_date)
     .bind(completed_at)
     .bind(completed_by_user_id)
+    .bind(occurrence_date)
+    .bind(occurrence_time)
     .bind(now)
     .execute(&mut *conn)
     .await?;
@@ -324,6 +348,8 @@ pub async fn undo_last(
         recurrence_timezone,
         recurrence_anchor_date,
         recurrence_month_rule,
+        recurrence_occurrence_date,
+        recurrence_occurrence_time,
     ) = recurrence_values(before.recurrence.as_ref());
 
     sqlx::query(
@@ -336,8 +362,9 @@ pub async fn undo_last(
              recurrence_freq = $19, recurrence_interval = $20,
              recurrence_byweekday = $21, recurrence_until = $22,
              recurrence_timezone = $23, recurrence_anchor_date = $24,
-             recurrence_month_rule = $25, deleted_at = $26,
-             version = $27, updated_at = $28
+             recurrence_month_rule = $25, recurrence_occurrence_date = $26,
+             recurrence_occurrence_time = $27,
+             deleted_at = $28, version = $29, updated_at = $30
          WHERE id = $1 AND household_id = $2",
     )
     .bind(item_id)
@@ -365,6 +392,8 @@ pub async fn undo_last(
     .bind(recurrence_timezone)
     .bind(recurrence_anchor_date)
     .bind(recurrence_month_rule)
+    .bind(recurrence_occurrence_date)
+    .bind(recurrence_occurrence_time)
     .bind(before.deleted_at)
     .bind(current.version + 1)
     .bind(now)

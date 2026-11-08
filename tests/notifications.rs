@@ -10,13 +10,15 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use serde_json::json;
 use sqlx::PgPool;
-use support::{TestDb, TestHousehold};
+use support::telegram::Harness;
+use support::{TestDb, TestHousehold, new_member, next_telegram_id};
 use tasklerq::domain::models::{
     Actor, ActorType, Field, Item, ItemPatch, ItemPriority, ItemSource, RecurrenceFreq,
-    RecurrenceInput,
+    RecurrenceInput, UserRole,
 };
+use tasklerq::domain::recurrence::Due;
 use tasklerq::jobs::scheduler::{Scheduler, all_day_occurrence_key, occurrence_key};
-use tasklerq::storage::repositories::items;
+use tasklerq::storage::repositories::{items, users};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
@@ -1196,6 +1198,80 @@ async fn changing_due_at_cancels_pending_delivery_for_the_old_due() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rescheduling_an_occurrence_moves_the_pending_reminder() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(
+        &db,
+        &household,
+        "Перенести встречу",
+        Some(due),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let now = due - Duration::minutes(15);
+    insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        Some(item.id),
+        &occurrence_key(due),
+        "pending",
+        now,
+    )
+    .await
+    .expect("old due delivery");
+
+    let new_due = due + Duration::hours(2);
+    let mut conn = db.pool.acquire().await.expect("connection");
+    items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        item.id,
+        item.version,
+        Due::Timed(new_due),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("reschedule occurrence");
+    drop(conn);
+
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let stats = scheduler(&db.pool).tick(now).await.expect("moved tick");
+    assert_eq!(stats.cancelled, 1);
+    assert_eq!(stats.delivered, 0);
+    assert!(messages(&db.pool, chat).await.is_empty());
+    let rows = delivery_rows(&db.pool, item.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "cancelled");
+    assert_eq!(rows[0].1, occurrence_key(due));
+
+    let moved_at = new_due - Duration::minutes(15);
+    let stats = scheduler(&db.pool)
+        .tick(moved_at)
+        .await
+        .expect("new due tick");
+    assert_eq!(stats.planned, 1);
+    assert_eq!(stats.delivered, 1);
+    let sent = messages(&db.pool, chat).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let rows = delivery_rows(&db.pool, item.id).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(
+        rows.iter()
+            .any(|row| { row.0 == "cancelled" && row.1 == occurrence_key(due) })
+    );
+    assert!(
+        rows.iter()
+            .any(|row| { row.0 == "sent" && row.1 == occurrence_key(new_due) })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lead_time_of_one_hour_shifts_the_delivery_moment() {
     let db = support::isolated_db().await;
     let household = household_without_digest(&db).await;
@@ -2183,6 +2259,55 @@ async fn archived_list_tasks_get_no_reminders_and_no_digest() {
     let sent = messages(&db.pool, chat).await;
     assert_eq!(sent.len(), 1, "{sent:?}");
     assert!(!sent[0].contains("Задача в архиве"), "{sent:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_assignment_with_other_fields_notifies_once() {
+    let db = support::db().await;
+    let mut bot = Harness::new(&db.pool, next_telegram_id()).named("Alice");
+    bot.text("/start").await;
+    bot.text("Семья").await;
+    bot.press("Москва").await;
+    bot.press("меню").await;
+    bot.text("Одно уведомление").await;
+    bot.press("Сохранить").await;
+
+    let (household_id, item_id): (Uuid, Uuid) = sqlx::query_as(
+        "SELECT i.household_id, i.id FROM items i
+         JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1 AND i.deleted_at IS NULL",
+    )
+    .bind(bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("item");
+
+    let member = new_member("Борис");
+    let member = {
+        let mut conn = db.pool.acquire().await.expect("conn");
+        users::add(
+            &mut conn,
+            household_id,
+            UserRole::Member,
+            member,
+            &Actor::system(ActorType::System),
+            Utc::now(),
+        )
+        .await
+        .expect("member")
+    };
+
+    bot.press("Одно уведомление").await;
+    bot.press("Править").await;
+    bot.press("Срок").await;
+    bot.press("Завтра").await;
+    bot.press("Исполнитель").await;
+    bot.press("Борис").await;
+    bot.press("Сохранить").await;
+
+    let rows = assignment_rows(&db.pool, item_id, member.id).await;
+    assert_eq!(rows.len(), 1, "one save must notify once: {rows:?}");
+    assert_eq!(rows[0].0, "pending");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

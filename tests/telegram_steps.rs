@@ -2,7 +2,7 @@
 
 mod support;
 
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use serde_json::json;
 use sqlx::PgConnection;
 use support::telegram::Harness;
@@ -166,7 +166,6 @@ async fn a_form_step_answer_is_deleted_and_the_next_step_is_shown() {
     bot.press("Москва").await;
     bot.press("меню").await;
     bot.press("Добавить").await;
-    bot.press("Задачу").await;
     bot.assert_screen_contains("Как назвать задачу?");
 
     let update = bot.text_update("Ann", "Позвонить маме");
@@ -187,8 +186,8 @@ async fn a_form_step_answer_is_deleted_and_the_next_step_is_shown() {
     .await
     .expect("delete row");
     assert_eq!(deleted, 1, "the form answer must be deleted");
-    bot.assert_screen_contains("Когда сделать?");
     bot.assert_screen_contains("Название: Позвонить маме");
+    bot.assert_has_button("💾 Сохранить");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -200,22 +199,21 @@ async fn the_second_text_step_value_is_visible_and_escaped_on_the_next_step() {
     bot.press("Москва").await;
     bot.press("меню").await;
     bot.press("Добавить").await;
-    bot.press("Задачу").await;
     bot.assert_screen_contains("Как назвать задачу?");
-    // На первом шаге ничего не принято: сводки нет.
+    // На первом шаге название ещё не принято.
     assert!(
-        !bot.screen().contains("Название:"),
-        "the first step should not show a summary:\n{}",
+        bot.screen().contains("Название: (без названия)"),
+        "the title field should show an empty draft:\n{}",
         bot.screen()
     );
 
     bot.text("Позвонить <маме> & папе").await;
-    bot.assert_screen_contains("Когда сделать?");
     bot.assert_screen_contains("Название: Позвонить &lt;маме&gt; &amp; папе");
+    bot.assert_screen_contains("Список: Задачи");
 
+    bot.press("Срок").await;
     bot.press("Дата и время").await;
     bot.text("завтра 18:30").await;
-    bot.assert_screen_contains("Какой приоритет?");
     bot.assert_screen_contains("Срок: Завтра, 18:30");
     bot.assert_screen_contains("Название: Позвонить &lt;маме&gt; &amp; папе");
 }
@@ -293,6 +291,162 @@ async fn stand_household(pool: &sqlx::PgPool, chat: i64) -> support::TestHouseho
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn old_step_edit_json_is_reported_as_an_expired_edit() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+
+    sqlx::query(
+        "INSERT INTO conversation_states (
+             chat_id, telegram_user_id, kind, data, expires_at
+         )
+         VALUES ($1, $1, 'edit', $2, $3)",
+    )
+    .bind(bot.chat)
+    .bind(json!({
+        "form": "edit",
+        "item_id": uuid::Uuid::nil(),
+        "step": "title",
+        "back": {"t": "menu"},
+    }))
+    .bind(bot.now + Duration::minutes(15))
+    .execute(&db.pool)
+    .await
+    .expect("legacy edit state");
+
+    bot.text("Не должно упасть").await;
+    bot.assert_screen_contains("правка устарела");
+    assert!(
+        bot.fake.answers().iter().all(|(_, _, alert)| !alert),
+        "a legacy edit must not raise an alert: {:?}",
+        bot.fake.answers()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn old_create_json_is_reported_as_an_expired_edit() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+
+    sqlx::query(
+        "INSERT INTO conversation_states (
+             chat_id, telegram_user_id, kind, data, expires_at
+         )
+         VALUES ($1, $1, 'create', $2, $3)",
+    )
+    .bind(bot.chat)
+    .bind(json!({
+        "form": "create",
+        "list_id": uuid::Uuid::nil(),
+        "kind": "tasks",
+        "step": "title",
+        "draft": {"title": "Старая форма"},
+    }))
+    .bind(bot.now + Duration::minutes(15))
+    .execute(&db.pool)
+    .await
+    .expect("legacy create state");
+
+    bot.text("Не должно упасть").await;
+    bot.assert_screen_contains("правка устарела");
+    assert!(
+        bot.fake.answers().iter().all(|(_, _, alert)| !alert),
+        "a legacy create must not raise an alert: {:?}",
+        bot.fake.answers()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn damaged_state_of_another_form_is_not_an_expired_edit() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+
+    sqlx::query(
+        "INSERT INTO conversation_states (
+             chat_id, telegram_user_id, kind, data, expires_at
+         )
+         VALUES ($1, $1, 'due_text', $2, $3)",
+    )
+    .bind(bot.chat)
+    .bind(json!({"form": "due_text"}))
+    .bind(bot.now + Duration::minutes(15))
+    .execute(&db.pool)
+    .await
+    .expect("damaged due text state");
+
+    bot.text("Не должно упасть").await;
+    bot.assert_screen_contains("Семья");
+    assert!(
+        !bot.screen().contains("правка устарела"),
+        "another form's damaged state must not look like an expired edit:\n{}",
+        bot.screen()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_expires_after_fifteen_minutes() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Истекающая правка").await;
+    bot.press("Сохранить").await;
+    bot.press("Истекающая правка").await;
+    bot.press("Править").await;
+    bot.assert_has_button("💾 Сохранить");
+
+    bot.advance(Duration::minutes(16));
+    bot.text("Поздний ответ").await;
+    bot.assert_screen_contains("Правка устарела");
+    bot.assert_screen_contains("Задачи › Карточка › Правка устарела");
+    bot.assert_has_button("Открыть карточку");
+    let conversations: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM conversation_states WHERE chat_id = $1")
+            .bind(bot.chat)
+            .fetch_one(&db.pool)
+            .await
+            .expect("conversations");
+    assert_eq!(conversations, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_editor_expiry_does_not_promise_a_card() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.press("Добавить").await;
+    bot.assert_screen_contains("Как назвать задачу?");
+
+    bot.advance(Duration::minutes(16));
+    bot.text("Позднее название").await;
+
+    bot.assert_screen_contains("Правка устарела");
+    bot.assert_has_button("В меню");
+    assert!(
+        bot.find_button("Открыть карточку").is_none(),
+        "a new element has no card to open:\n{}",
+        bot.screen()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_editor_expiry_from_a_list_offers_the_list() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.press("Задачи").await;
+    bot.press("Добавить").await;
+    bot.assert_screen_contains("Как назвать задачу?");
+
+    bot.advance(Duration::minutes(16));
+    bot.text("Позднее название").await;
+
+    bot.assert_screen_contains("Правка устарела");
+    bot.assert_screen_contains("Задачи › Правка устарела");
+    bot.assert_has_button("К списку");
+    assert!(
+        bot.find_button("Открыть карточку").is_none(),
+        "a new element has no card to open:\n{}",
+        bot.screen()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn edit_form_summary_shows_the_shopping_quantity() {
     let db = db().await;
     let mut bot = onboarded(&db.pool).await;
@@ -312,6 +466,7 @@ async fn edit_form_summary_shows_the_shopping_quantity() {
     bot.press("Покупки").await;
     bot.press("Править").await;
     bot.press("Молоко").await;
+    bot.press("Править").await;
     bot.press("Количество").await;
 
     bot.assert_screen_contains("Сколько?");
@@ -344,6 +499,7 @@ async fn edit_form_summary_shows_a_unit_without_quantity() {
     bot.press("Покупки").await;
     bot.press("Править").await;
     bot.press("Хлеб").await;
+    bot.press("Править").await;
     bot.press("Единица").await;
 
     bot.assert_screen_contains("В чём измерять?");
@@ -357,14 +513,17 @@ async fn create_shopping_preview_keeps_the_chosen_quantity_and_unit() {
     let mut bot = onboarded(&db.pool).await;
 
     bot.press("Добавить").await;
-    bot.press("Покупку").await;
     bot.text("Молоко").await;
+    bot.press("Список").await;
+    bot.press("Покупки").await;
+    bot.press("Количество").await;
     bot.press("2").await;
-    bot.assert_screen_contains("Количество: 2");
+    bot.assert_screen_contains("Количество: 2 шт");
+    bot.press("Единица").await;
     bot.press("л").await;
 
-    // Выбор единицы сразу открывает предпросмотр: проверяется он, а не
-    // сводка шага.
-    bot.assert_screen_contains("Проверьте и сохраните");
+    // Выбор единицы возвращает в редактор, где видно итоговое количество.
+    bot.assert_screen_contains("Название: Молоко");
     bot.assert_screen_contains("Количество: 2 л");
+    bot.assert_screen_contains("Список: Покупки");
 }

@@ -1,6 +1,6 @@
 //! Строка `items` и сборка `Item` с тегами и подзадачами.
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use sqlx::{FromRow, PgConnection};
 use uuid::Uuid;
 
@@ -17,7 +17,8 @@ pub(super) const ITEM_COLUMNS: &str = "i.id, i.household_id, i.list_id, i.title,
     i.completed_by_user_id, i.quantity::float8 AS quantity, i.unit, i.position, \
     i.version, i.recurrence_freq, i.recurrence_interval, i.recurrence_byweekday, \
     i.recurrence_until, i.recurrence_timezone, i.recurrence_anchor_date, \
-    i.recurrence_month_rule, i.created_at, i.updated_at, i.deleted_at";
+    i.recurrence_month_rule, i.recurrence_occurrence_date, \
+    i.recurrence_occurrence_time, i.created_at, i.updated_at, i.deleted_at";
 
 #[derive(Debug, Clone, FromRow)]
 pub(super) struct ItemRow {
@@ -47,6 +48,8 @@ pub(super) struct ItemRow {
     pub(super) recurrence_timezone: Option<String>,
     pub(super) recurrence_anchor_date: Option<NaiveDate>,
     pub(super) recurrence_month_rule: Option<MonthRule>,
+    pub(super) recurrence_occurrence_date: Option<NaiveDate>,
+    pub(super) recurrence_occurrence_time: Option<NaiveTime>,
     pub(super) created_at: DateTime<Utc>,
     pub(super) updated_at: DateTime<Utc>,
     pub(super) deleted_at: Option<DateTime<Utc>>,
@@ -64,6 +67,8 @@ impl ItemRow {
             timezone: self.recurrence_timezone.clone().unwrap_or_default(),
             anchor_date,
             month_rule: self.recurrence_month_rule,
+            occurrence_date: self.recurrence_occurrence_date,
+            occurrence_time: self.recurrence_occurrence_time,
         })
     }
 

@@ -34,10 +34,14 @@ use super::outbox::{self, Outgoing, Placement};
 use super::rich::{self, Block, Button, Span};
 use super::update::{Incoming, Sender};
 use super::views::{self, Lookup};
-use model::{Action, Form, Screen, Ui};
+use model::{Action, Screen, Ui};
 
 /// Часовой пояс, если ни у пользователя, ни у household его нет.
 const FALLBACK_TIMEZONE: &str = "Europe/Moscow";
+
+/// Ответ на устаревшую версию элемента: показывается актуальное состояние.
+pub(super) const CHANGED_STATE_MESSAGE: &str =
+    "Данные уже изменились. Показываю актуальное состояние.";
 
 /// Ответ на нажатие кнопки.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,9 +110,7 @@ impl From<DomainError> for Fail {
             }
             DomainError::NotFound => Self::User("Не нашёл это — возможно, оно уже удалено.".into()),
             DomainError::Forbidden(_) => Self::User("Недостаточно прав для этого действия.".into()),
-            DomainError::Conflict { .. } => {
-                Self::User("Данные уже изменились. Показываю актуальное состояние.".into())
-            }
+            DomainError::Conflict { .. } => Self::User(CHANGED_STATE_MESSAGE.into()),
         }
     }
 }
@@ -450,8 +452,8 @@ impl Bot {
         }
     }
 
-    /// Открыть ручную форму с исходным текстом: так заканчивается разбор,
-    /// который не удался или недоступен. Форма ставится в `outbox` в
+    /// Открыть редактор нового элемента с исходным текстом: так заканчивается
+    /// разбор, который не удался или недоступен. Редактор ставится в `outbox` в
     /// транзакции вызывающего.
     pub async fn present_quick_add(
         &self,
@@ -681,19 +683,15 @@ async fn on_text(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
 
     match views::conversation(&mut *ctx.conn, ctx.chat_id, ctx.now).await? {
         Lookup::Active(conversation) if conversation.telegram_user_id == ctx.sender.id => {
-            match serde_json::from_value::<Form>(conversation.data) {
-                Ok(form) => forms::on_text(ctx, form, text).await,
-                Err(_) => {
+            match forms::parse(conversation.data) {
+                Some(form) => forms::on_text(ctx, form, text).await,
+                None => {
                     views::clear_conversation(&mut *ctx.conn, ctx.chat_id).await?;
                     ctx.present(Screen::Menu).await
                 }
             }
         }
-        Lookup::Expired(_) => {
-            views::clear_conversation(&mut *ctx.conn, ctx.chat_id).await?;
-            ctx.banner("Форма устарела. Начнём заново?");
-            ctx.menu_or_onboarding().await
-        }
+        Lookup::Expired(_) => forms::expired(ctx).await,
         _ => {
             if ctx.user.is_none() {
                 return forms::start_onboarding(ctx).await;
@@ -822,7 +820,7 @@ async fn on_command(ctx: &mut Ctx<'_>, command: &str, argument: &str) -> Result<
 }
 
 const HELP: &str = "Я помогаю вести задачи и покупки всей семьёй.\n\n\
-Напишите, что нужно сделать: с включённым разбором я разделю текст на задачи и покупки и покажу черновик, а без разбора открою форму с этим текстом в названии.\n\n\
+Напишите, что нужно сделать: с включённым разбором я разделю текст на задачи и покупки и покажу черновик, а без разбора или когда разбор не удался открою редактор с этим текстом в названии.\n\n\
 По экранам можно ходить кнопками «⬅️ Назад» и «🏠 Меню»; хлебные крошки в заголовке показывают путь.\n\n\
 Ваши сообщения я удаляю из чата после обработки, а /start или /menu возвращают меню вниз чата.\n\n\
 /menu — главное меню\n\
@@ -934,12 +932,23 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
         Action::DeleteDo { item_id, back } => card::delete_do(ctx, item_id, back).await,
         Action::DeleteUndo { item_id, back } => card::delete_undo(ctx, item_id, back).await,
 
-        Action::Add { list_id, kind } => forms::start_create(ctx, list_id, kind).await,
-        Action::Edit {
-            item_id,
-            step,
+        Action::Add {
+            list_id,
+            kind,
             back,
-        } => forms::start_edit(ctx, item_id, step, back).await,
+        } => forms::start_new_editor(ctx, list_id, kind, back).await,
+        Action::Edit { item_id, back } => forms::start_editor(ctx, item_id, back).await,
+        Action::DueSet {
+            item_id,
+            version,
+            due,
+            back,
+        } => card::set_due(ctx, item_id, version, due, back).await,
+        Action::DueText {
+            item_id,
+            version,
+            back,
+        } => forms::start_due_text(ctx, item_id, version, back).await,
         Action::Form { act } => forms::on_action(ctx, act).await,
 
         Action::ClearAsk {

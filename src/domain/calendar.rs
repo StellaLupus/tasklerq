@@ -92,6 +92,36 @@ pub fn expand_item(
     };
 
     let occurrences = recurrence.occurrences_between(current, start, end)?;
+
+    // Перенесённое вхождение — исключение из правила. Показываем его на новом
+    // сроке, а вхождения правила не позже слота и нового срока не дублируем.
+    // Без слота срок стоит на своей дате правила, и обычная серия выводится
+    // целиком.
+    let current_date = current.local_date(timezone);
+    let occurrences = if recurrence.occurrence_date.is_none()
+        && recurrence
+            .occurrences_between(current, current_date, current_date + Duration::days(1))?
+            .contains(&current)
+    {
+        occurrences
+    } else {
+        let cutoff = recurrence
+            .occurrence_date
+            .map_or(current_date, |slot| current_date.max(slot));
+        let mut occurrences: Vec<_> = occurrences
+            .into_iter()
+            .filter(|occurrence| occurrence.local_date(timezone) > cutoff)
+            .collect();
+        if current_date >= start && current_date < end {
+            occurrences.push(current);
+        }
+        occurrences.sort_by_key(|occurrence| match *occurrence {
+            Due::AllDay(date) => (date, false, None),
+            Due::Timed(at) => (at.with_timezone(&timezone).date_naive(), true, Some(at)),
+        });
+        occurrences
+    };
+
     if occurrences.len() > MAX_CALENDAR_OCCURRENCES {
         return Err(DomainError::Validation(format!(
             "calendar interval produces more than {MAX_CALENDAR_OCCURRENCES} occurrences"

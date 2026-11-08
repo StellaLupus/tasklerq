@@ -6,7 +6,7 @@
 
 ## 2. Ключ исходного вхождения в записи доставки
 
-- [ ] 2.1 Добавить `migrations/0012_snooze_origin.sql` с `ALTER TABLE notification_deliveries ADD COLUMN origin_key text;` и с комментарием о том, что `NULL` у snooze означает запись до миграции (design, решения 1 и 5). Проверить: `tests/migrations.rs` проходит на чистой базе, и новый тест применяет 0012 поверх существующей pending-записи snooze, после чего у неё `origin_key IS NULL`.
+- [ ] 2.1 Добавить миграцию `snooze_origin` со следующим свободным номером (на 2026-11-06 — `0012`, design, решение 5) с `ALTER TABLE notification_deliveries ADD COLUMN origin_key text;` и с комментарием о том, что `NULL` у snooze означает запись до миграции (design, решения 1 и 5). Проверить: `tests/migrations.rs` проходит на чистой базе, и новый тест применяет миграцию поверх существующей pending-записи snooze, после чего у неё `origin_key IS NULL`.
 - [ ] 2.2 Добавить в `src/jobs/keys.rs` функцию `item_occurrence_key(due_at, due_date) -> Option<String>` и перевести на неё `NoticeRow::current_key()` (design, решение 3). Проверить юнит-тестами в `keys.rs`: timed-срок даёт тот же ключ, что `occurrence_key()`, вседневный — `date:YYYY-MM-DD`, ни одного или оба срока — `None`.
 - [ ] 2.3 Добавить `origin_key: Option<&str>` в `NewDelivery` и записывать его в `insert_with_flags()` (`src/storage/repositories/notifications.rs`). Все существующие вызовы передают `None`. Обновить описание `notification_deliveries` в `docs/domain-model.md`: колонка `origin_key` и новое правило отмены snooze. Проверить: `cargo build` и существующие тесты `tests/notifications.rs` проходят.
 
@@ -29,5 +29,4 @@
 ## Workflow follow-up
 
 - Открыть PR `fix/0005-snooze-follows-due` → `main`, после мержа задеплоить на NAS.
-- После мержа сдвинуть номер миграции этапа C в `0004-telegram-ux-rework` (`tasks.md` 9.1, `design.md` Migration Plan) с `0012` на `0013`.
 - Архивировать изменение после ревью и деплоя.

@@ -1,10 +1,9 @@
-//! Пошаговые формы: создание и редактирование элементов, поиск и ввод
-//! значений настроек.
+//! Формы бота: единый редактор элемента, поиск и ввод значений настроек.
 //!
 //! Состояние формы лежит в `conversation_states` (одна форма на чат, 15
-//! минут). Создание копит поля в черновике и сохраняет их одной операцией;
-//! редактирование применяет каждое изменение к элементу сразу, поэтому
-//! черновик там — это текущее состояние элемента.
+//! минут). Редактор копит поля в черновике и сохраняет их одной операцией:
+//! для нового элемента создаёт его, для существующего применяет изменения, для
+//! пункта черновика LLM переписывает сам пункт.
 
 use uuid::Uuid;
 
@@ -15,15 +14,18 @@ use crate::storage::repositories::{households, items, lists};
 use crate::telegram::views::{self, Lookup};
 
 use super::model::{
-    EditForm, FirstContactScreen, Form, ItemDraft, ItemForm, Screen, Step, TimeField,
+    Editor, EditorTarget, FirstContactScreen, Form, ItemDraft, ItemSnapshot, Screen, Step,
+    TimeField,
 };
 use super::{Ctx, Fail};
 
 mod actions;
+mod editor;
 mod state;
 mod view;
 
 pub use actions::{on_action, on_text};
+pub use editor::screen as editor_screen;
 pub use view::view;
 
 pub(super) const MAX_QUANTITY: f64 = 9_999.0;
@@ -56,9 +58,50 @@ async fn clear(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
 async fn load(ctx: &mut Ctx<'_>) -> Result<Option<Form>, Fail> {
     match views::conversation(&mut *ctx.conn, ctx.chat_id, ctx.now).await? {
         Lookup::Active(conversation) if conversation.telegram_user_id == ctx.sender.id => {
-            Ok(serde_json::from_value(conversation.data).ok())
+            Ok(parse(conversation.data))
         }
         _ => Ok(None),
+    }
+}
+
+/// Разобрать состояние формы.
+///
+/// Сохранённый JSON прежних форм (`{"form":"create", …}`, `{"form":"edit", …}`)
+/// больше не разбирается в `Editor`: он превращается в [`Form::LegacyEdit`], и
+/// бот сообщает, что правка устарела.
+pub(super) fn parse(data: serde_json::Value) -> Option<Form> {
+    match serde_json::from_value::<Form>(data.clone()) {
+        Ok(form) => Some(form),
+        Err(_)
+            if matches!(
+                data.get("form").and_then(|form| form.as_str()),
+                Some("create" | "edit")
+            ) =>
+        {
+            Some(Form::LegacyEdit)
+        }
+        Err(_) => None,
+    }
+}
+
+/// Показать, что активная форма истекла.
+///
+/// У редактора есть кнопка возврата на карточку; остальные формы, как и
+/// раньше, ведут в меню.
+pub(super) async fn expired(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
+    let screen = views::get(&mut *ctx.conn, ctx.chat_id)
+        .await?
+        .and_then(|view| serde_json::from_value::<Screen>(view.state).ok());
+    clear(ctx).await?;
+    if let Some(Screen::Editor { item_id, back }) = screen {
+        ctx.banner("Ваша правка устарела. Начнём заново?");
+        return ctx.present(Screen::Editor { item_id, back }).await;
+    }
+    ctx.banner("Форма устарела. Начнём заново?");
+    if ctx.user.is_none() {
+        start_onboarding(ctx).await
+    } else {
+        ctx.present(Screen::Menu).await
     }
 }
 
@@ -76,54 +119,54 @@ async fn open(ctx: &mut Ctx<'_>, form: Form) -> Result<(), Fail> {
 // Входы в формы
 // ---------------------------------------------------------------------
 
-/// Открыть готовую форму создания (правка элемента черновика capture).
-pub async fn open_create(ctx: &mut Ctx<'_>, form: ItemForm) -> Result<(), Fail> {
-    open(ctx, Form::Create(form)).await
+/// Открыть единый редактор, уже собранный вызывающей стороной.
+pub async fn open_editor(ctx: &mut Ctx<'_>, editor: Editor) -> Result<(), Fail> {
+    editor::show(ctx, editor).await
 }
 
-/// Начать создание элемента.
-pub async fn start_create(
+/// Начать создание элемента через единый редактор.
+///
+/// Из списка тип и список уже известны; из меню берётся список по умолчанию
+/// (или первый список этого типа). Поле «Название» открывается сразу.
+pub async fn start_new_editor(
     ctx: &mut Ctx<'_>,
     list_id: Option<Uuid>,
     kind: ListKind,
+    back: Option<Screen>,
 ) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
-    let (list_id, kind) = match list_id {
-        Some(list_id) => {
-            let list = lists::get_visible(&mut *ctx.conn, household_id, list_id).await?;
-            (Some(list.id), list.kind)
-        }
+    let list = match list_id {
+        Some(list_id) => lists::get_visible(&mut *ctx.conn, household_id, list_id).await?,
         None => {
             let candidates = lists_of_kind(ctx, kind).await?;
-            match candidates.as_slice() {
-                [only] => (Some(only.id), kind),
-                _ => (None, kind),
-            }
+            candidates
+                .iter()
+                .find(|list| list.is_default)
+                .or_else(|| candidates.first())
+                .cloned()
+                .ok_or_else(|| Fail::User("Нет списка для сохранения.".into()))?
         }
     };
-    let step = if list_id.is_some() {
-        Step::Title
-    } else {
-        Step::List
+    let editor = Editor {
+        target: EditorTarget::New {
+            kind: list.kind,
+            back: back.unwrap_or(Screen::Menu),
+        },
+        draft: ItemDraft::default(),
+        touched: std::collections::BTreeSet::new(),
+        field: Some(Step::Title),
+        field_back: None,
+        field_backup: None,
+        list_id: list.id,
+        error: None,
+        conflict: None,
+        conflict_seen: None,
+        duplicate: None,
     };
-    open(
-        ctx,
-        Form::Create(ItemForm {
-            list_id,
-            kind,
-            step,
-            draft: ItemDraft::default(),
-            from_preview: false,
-            error: None,
-            duplicate: None,
-            target: None,
-            quick: false,
-        }),
-    )
-    .await
+    editor::show(ctx, editor).await
 }
 
-/// Свободный текст без формы: черновик с готовым названием.
+/// Свободный текст без формы: редактор нового элемента с готовым названием.
 pub async fn quick_add(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
     let cleaned = sanitize(text);
     let text = cleaned.trim();
@@ -145,44 +188,77 @@ pub async fn quick_add(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
         })
         .ok_or_else(|| Fail::User("Нет списка задач для сохранения.".into()))?;
 
-    open(
-        ctx,
-        Form::Create(ItemForm {
-            list_id: Some(list.id),
-            kind: ListKind::Tasks,
-            step: Step::Preview,
-            draft: ItemDraft {
-                title: text.to_owned(),
-                ..ItemDraft::default()
-            },
-            from_preview: false,
-            error: None,
-            duplicate: None,
-            target: None,
-            quick: true,
-        }),
-    )
-    .await
+    let editor = Editor {
+        target: EditorTarget::New {
+            kind: list.kind,
+            back: Screen::Menu,
+        },
+        draft: ItemDraft {
+            title: text.to_owned(),
+            ..ItemDraft::default()
+        },
+        touched: std::collections::BTreeSet::new(),
+        field: None,
+        field_back: None,
+        field_backup: None,
+        list_id: list.id,
+        error: None,
+        conflict: None,
+        conflict_seen: None,
+        duplicate: None,
+    };
+    editor::show(ctx, editor).await
 }
 
-/// Открыть шаг редактирования существующего элемента.
-pub async fn start_edit(
+/// Открыть единый редактор существующего элемента.
+pub async fn start_editor(ctx: &mut Ctx<'_>, item_id: Uuid, back: Screen) -> Result<(), Fail> {
+    let household_id = ctx.household()?.id;
+    let item = items::get(&mut *ctx.conn, household_id, item_id).await?;
+    let draft = ItemDraft::from_item(&item, ctx.tz);
+    let editor = Editor {
+        target: EditorTarget::Item {
+            item_id,
+            base: Box::new(ItemSnapshot::from_item(&item)),
+            back,
+        },
+        draft,
+        touched: std::collections::BTreeSet::new(),
+        field: None,
+        field_back: None,
+        field_backup: None,
+        list_id: item.list_id,
+        error: None,
+        conflict: None,
+        conflict_seen: None,
+        duplicate: None,
+    };
+    editor::show(ctx, editor).await
+}
+
+/// Начать ввод даты и времени для быстрого срока.
+pub async fn start_due_text(
     ctx: &mut Ctx<'_>,
     item_id: Uuid,
-    step: Step,
+    version: i32,
     back: Screen,
 ) -> Result<(), Fail> {
+    if !super::card::due_editable_item(ctx, item_id).await? {
+        return ctx
+            .present(Screen::Item {
+                item_id,
+                back: Box::new(back),
+            })
+            .await;
+    }
     let household_id = ctx.household()?.id;
-    // Проверяем, что элемент существует и принадлежит household.
     items::get(&mut *ctx.conn, household_id, item_id).await?;
     open(
         ctx,
-        Form::Edit(EditForm {
+        Form::DueText {
             item_id,
-            step,
+            version,
             back,
-            error: None,
-        }),
+        },
     )
     .await
 }

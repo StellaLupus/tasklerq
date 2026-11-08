@@ -11,13 +11,22 @@ use crate::domain::error::DomainError;
 use crate::domain::models::{
     Actor, EventType, Field, Item, ItemPatch, ItemStatus, ListKind, SubtaskInput,
 };
-use crate::domain::recurrence::parse_timezone;
+use crate::domain::recurrence::{Due, parse_timezone, resolve_local, rule_changed};
 use crate::domain::validation::{
     MAX_NOTES, MAX_TITLE, ValidatedItem, normalize_due_for_recurrence, normalize_recurrence,
     normalize_subtasks, normalize_tags, normalize_text, normalize_text_allow_empty, normalize_unit,
     validate_quantity,
 };
 use crate::storage::repositories::{active_member, events, lists, notifications, subtasks, tags};
+
+/// Как внутренний `update` относится к серии при смене срока.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DueChange {
+    /// Срок сдвигает якорь серии (обычный `update`).
+    Reanchor,
+    /// Срок меняется без переякорения (перенос текущего вхождения).
+    KeepSeries,
+}
 
 /// Создать элемент.
 pub async fn create(
@@ -63,6 +72,8 @@ pub async fn create(
         recurrence_timezone,
         recurrence_anchor_date,
         recurrence_month_rule,
+        recurrence_occurrence_date,
+        recurrence_occurrence_time,
     ) = recurrence_values(recurrence.as_ref());
 
     let item_id = Uuid::now_v7();
@@ -72,11 +83,12 @@ pub async fn create(
              assignee_user_id, created_by_user_id, source, quantity, unit, position,
              recurrence_freq, recurrence_interval, recurrence_byweekday, recurrence_until,
              recurrence_timezone, recurrence_anchor_date, recurrence_month_rule,
-             created_at, updated_at
+             recurrence_occurrence_date, recurrence_occurrence_time, created_at, updated_at
          )
          VALUES (
              $1, $2, $3, $4, $5, 'open', $6, $7, $8, $9, $10, $11,
-             $12::float8::numeric, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $22
+             $12::float8::numeric, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
+             $23, $24, $24
          )",
     )
     .bind(item_id)
@@ -100,6 +112,8 @@ pub async fn create(
     .bind(recurrence_timezone)
     .bind(recurrence_anchor_date)
     .bind(recurrence_month_rule)
+    .bind(recurrence_occurrence_date)
+    .bind(recurrence_occurrence_time)
     .bind(now)
     .execute(&mut *conn)
     .await?;
@@ -148,6 +162,68 @@ pub async fn update(
     household_timezone: &str,
     now: DateTime<Utc>,
 ) -> Result<Item, DomainError> {
+    update_inner(
+        conn,
+        household_id,
+        actor,
+        item_id,
+        version,
+        patch,
+        household_timezone,
+        now,
+        DueChange::Reanchor,
+    )
+    .await
+}
+
+/// Перенести срок текущего вхождения, не меняя якорь серии.
+#[allow(clippy::too_many_arguments)]
+pub async fn reschedule_occurrence(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    actor: &Actor,
+    item_id: Uuid,
+    version: i32,
+    due: Due,
+    household_timezone: &str,
+    now: DateTime<Utc>,
+) -> Result<Item, DomainError> {
+    let patch = match due {
+        Due::Timed(at) => ItemPatch {
+            due_at: Field::Value(at),
+            ..ItemPatch::default()
+        },
+        Due::AllDay(date) => ItemPatch {
+            due_date: Field::Value(date),
+            ..ItemPatch::default()
+        },
+    };
+    update_inner(
+        conn,
+        household_id,
+        actor,
+        item_id,
+        version,
+        patch,
+        household_timezone,
+        now,
+        DueChange::KeepSeries,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn update_inner(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    actor: &Actor,
+    item_id: Uuid,
+    version: i32,
+    patch: ItemPatch,
+    household_timezone: &str,
+    now: DateTime<Utc>,
+    due_change: DueChange,
+) -> Result<Item, DomainError> {
     let row = row_by_id(conn, household_id, item_id, false, true).await?;
     let current = hydrate_one(conn, row.clone()).await?;
     if row.version != version {
@@ -192,31 +268,29 @@ pub async fn update(
             "due_at and due_date are mutually exclusive".into(),
         ));
     }
-    let mut due_changed = false;
     match patch.due_at {
         Field::Missing => {}
         Field::Null => {
             due_at = None;
-            due_changed = true;
         }
         Field::Value(value) => {
             due_at = Some(value);
             due_date = None;
-            due_changed = true;
         }
     }
     match patch.due_date {
         Field::Missing => {}
         Field::Null => {
             due_date = None;
-            due_changed = true;
         }
         Field::Value(value) => {
             due_date = Some(value);
             due_at = None;
-            due_changed = true;
         }
     }
+    // Срок изменён, только если новые значения отличаются от текущих. Повтор
+    // того же срока не должен переякоривать серию и терять слот вхождения.
+    let due_changed = due_at != row.due_at || due_date != row.due_date;
 
     let old_recurrence = row.recurrence();
     let mut recurrence = old_recurrence.clone();
@@ -224,7 +298,10 @@ pub async fn update(
 
     match patch.recurrence {
         Field::Missing => {
-            if due_changed && let Some(rule) = recurrence.as_mut() {
+            if due_change == DueChange::Reanchor
+                && due_changed
+                && let Some(rule) = recurrence.as_mut()
+            {
                 if let Some(at) = due_at {
                     let timezone = parse_timezone(&rule.timezone)?;
                     rule.anchor_date = at.with_timezone(&timezone).date_naive();
@@ -240,23 +317,94 @@ pub async fn update(
                     "recurrence is only allowed for task lists".into(),
                 ));
             }
-            recurrence = Some(normalize_recurrence(
-                input,
-                household_timezone,
-                due_at,
-                due_date,
-                today,
-            )?);
+            let mut normalized =
+                normalize_recurrence(input, household_timezone, due_at, due_date, today)?;
+            // Повтор правила из ответа API отличается только слотом. Сохраняем
+            // его, чтобы такой `PATCH` оставался no-op.
+            if let Some(old) = &old_recurrence
+                && normalized.same_rule(old)
+            {
+                normalized.occurrence_date = old.occurrence_date;
+                normalized.occurrence_time = old.occurrence_time;
+            }
+            recurrence = Some(normalized);
         }
     }
 
-    (due_at, due_date) = normalize_due_for_recurrence(
-        due_at,
-        due_date,
-        recurrence.as_ref(),
-        household_timezone,
-        today,
-    )?;
+    let recurrence_changed = rule_changed(recurrence.as_ref(), old_recurrence.as_ref());
+
+    match due_change {
+        DueChange::Reanchor => {
+            // Нормализуем срок по правилу, только если он реально менялся или
+            // изменилось само правило. Иначе правка другого поля (например,
+            // заметки) откатывала бы перенос вхождения `last_day`-серии к
+            // последнему дню месяца. Срок без даты по-прежнему заполняется
+            // первым вхождением.
+            let due_missing = due_at.is_none() && due_date.is_none();
+            if due_changed || recurrence_changed || due_missing {
+                (due_at, due_date) = normalize_due_for_recurrence(
+                    due_at,
+                    due_date,
+                    recurrence.as_ref(),
+                    household_timezone,
+                    today,
+                )?;
+            }
+            if (due_changed || recurrence_changed)
+                && let Some(rule) = recurrence.as_mut()
+            {
+                rule.occurrence_date = None;
+                rule.occurrence_time = None;
+            }
+        }
+        DueChange::KeepSeries => {
+            if let Some(rule) = recurrence.as_mut() {
+                let timezone = parse_timezone(&rule.timezone)?;
+                let new_due = match (due_at, due_date) {
+                    (Some(at), None) => Some(Due::Timed(at)),
+                    (None, Some(date)) => Some(Due::AllDay(date)),
+                    _ => None,
+                };
+                if let Some(new_due) = new_due {
+                    // Слот хранит исходный срок вхождения: дату правила и время
+                    // суток серии. При первом переносе он берётся из текущего
+                    // срока, при повторном — не меняется.
+                    let current_due = row.due();
+                    let slot_date = rule
+                        .occurrence_date
+                        .or_else(|| current_due.map(|due| due.local_date(timezone)));
+                    let slot_time = if rule.occurrence_date.is_some() {
+                        rule.occurrence_time
+                    } else {
+                        current_due.and_then(|due| due.local_time(timezone))
+                    };
+                    let slot_due = match slot_date {
+                        Some(date) => match slot_time {
+                            Some(time) => Due::Timed(resolve_local(timezone, date, time)?),
+                            None => Due::AllDay(date),
+                        },
+                        None => new_due,
+                    };
+                    let same = match (new_due, slot_due) {
+                        (Due::AllDay(new), Due::AllDay(slot)) => new == slot,
+                        (Due::Timed(new), Due::Timed(slot)) => {
+                            let new = new.with_timezone(&timezone);
+                            let slot = slot.with_timezone(&timezone);
+                            new.date_naive() == slot.date_naive() && new.time() == slot.time()
+                        }
+                        _ => false,
+                    };
+                    if same {
+                        rule.occurrence_date = None;
+                        rule.occurrence_time = None;
+                    } else {
+                        rule.occurrence_date = Some(slot_due.local_date(timezone));
+                        rule.occurrence_time = slot_due.local_time(timezone);
+                    }
+                }
+            }
+        }
+    }
 
     let (quantity, unit) = if target_list.kind == ListKind::Tasks {
         (None, None)
@@ -306,6 +454,8 @@ pub async fn update(
         recurrence_timezone,
         recurrence_anchor_date,
         recurrence_month_rule,
+        recurrence_occurrence_date,
+        recurrence_occurrence_time,
     ) = recurrence_values(recurrence.as_ref());
 
     let tags_unchanged = tag_names
@@ -349,8 +499,9 @@ pub async fn update(
              recurrence_freq = $12, recurrence_interval = $13,
              recurrence_byweekday = $14, recurrence_until = $15,
              recurrence_timezone = $16, recurrence_anchor_date = $17,
-             recurrence_month_rule = $18,
-             version = version + 1, updated_at = $19
+             recurrence_month_rule = $18, recurrence_occurrence_date = $19,
+             recurrence_occurrence_time = $20,
+             version = version + 1, updated_at = $21
          WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL",
     )
     .bind(item_id)
@@ -371,6 +522,8 @@ pub async fn update(
     .bind(recurrence_timezone)
     .bind(recurrence_anchor_date)
     .bind(recurrence_month_rule)
+    .bind(recurrence_occurrence_date)
+    .bind(recurrence_occurrence_time)
     .bind(now)
     .execute(&mut *conn)
     .await?;
@@ -379,7 +532,7 @@ pub async fn update(
     subtasks::replace(conn, item_id, &subtask_inputs, now).await?;
 
     let updated = load_item(conn, household_id, item_id).await?;
-    let event_type = if recurrence != old_recurrence {
+    let event_type = if recurrence_changed {
         EventType::RecurrenceChanged
     } else if assignee_user_id != row.assignee_user_id {
         if assignee_user_id.is_some() {
