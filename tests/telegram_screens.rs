@@ -11,7 +11,9 @@ use support::telegram::{Call, FakeTelegram, Harness, button_rows};
 use support::{TestHousehold, create_item, db, new_item, next_telegram_id};
 use tasklerq::admin;
 use tasklerq::config::TenancyMode;
-use tasklerq::domain::models::{Actor, ItemPriority, ListKind, RecurrenceFreq, UserRole};
+use tasklerq::domain::models::{
+    Actor, ItemPatch, ItemPriority, ItemStatus, ListKind, RecurrenceFreq, UserRole,
+};
 use tasklerq::domain::recurrence::Due;
 use tasklerq::domain::settings::NotificationSettings;
 use tasklerq::jobs::scheduler::Scheduler;
@@ -5200,6 +5202,267 @@ async fn done_today_row_of_a_recurring_task_opens_the_card_with_revert() {
     assert!(
         !bot.screen().contains("Выполнено сегодня"),
         "the reverted completion must leave the done-today section:\n{}",
+        bot.screen()
+    );
+}
+
+/// Открыть выполненную задачу из поиска: это карточка без контекста выполнения.
+async fn open_done_task_from_search(bot: &mut Harness, query: &str, title: &str) {
+    bot.press("Поиск").await;
+    bot.text(query).await;
+    bot.press("Выполненные").await;
+    bot.press(title).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_card_without_completion_context_does_not_revert_a_newer_completion() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let today = NaiveDate::from_ymd_opt(2026, 11, 6).expect("date");
+    let now = local_utc(moscow, today, 12, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut input = new_item(household.tasks_list_id, "Оплатить интернет");
+    input.due_date = Some(today);
+    let task = create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let first = items::complete(
+        &mut conn,
+        household.household_id,
+        &actor,
+        task.id,
+        Some(task.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("Alice completes");
+    drop(conn);
+
+    // Алиса держит карточку без контекста выполнения: кнопка помнит версию 2.
+    open_done_task_from_search(&mut bot, "Оплатить", "Оплатить интернет").await;
+    bot.assert_has_button("↩️ Вернуть");
+
+    // Пока карточка открыта, Боб возвращает задачу и выполняет её снова.
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let reopened = items::reopen(
+        &mut conn,
+        household.household_id,
+        &actor,
+        task.id,
+        None,
+        now + Duration::minutes(1),
+    )
+    .await
+    .expect("Bob reopens");
+    let completed_again = items::complete(
+        &mut conn,
+        household.household_id,
+        &actor,
+        task.id,
+        Some(reopened.version),
+        "Europe/Moscow",
+        now + Duration::minutes(2),
+    )
+    .await
+    .expect("Bob completes");
+    drop(conn);
+    assert_ne!(
+        completed_again.version, first.version,
+        "the stale card must carry an older version"
+    );
+
+    bot.press("Вернуть").await;
+
+    let answers = bot.fake.answers();
+    let (_, text, _) = answers.last().expect("an answer to the callback");
+    assert!(
+        text.as_deref()
+            .is_some_and(|text| text.contains("Данные уже изменились")),
+        "a race must be explained to the user: {answers:?}"
+    );
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let unchanged = items::get(&mut conn, household.household_id, task.id)
+        .await
+        .expect("item");
+    drop(conn);
+    assert_eq!(unchanged.status, ItemStatus::Done);
+    assert_eq!(
+        unchanged.version, completed_again.version,
+        "the stale button must not revert Bob's completion"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completed_task_without_recurrence_from_search_offers_revert() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let today = NaiveDate::from_ymd_opt(2026, 11, 6).expect("date");
+    let now = local_utc(moscow, today, 12, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut input = new_item(household.tasks_list_id, "Вынести мусор");
+    input.due_date = Some(today);
+    let task = create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &actor,
+        task.id,
+        Some(task.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("complete");
+    drop(conn);
+
+    open_done_task_from_search(&mut bot, "Вынести", "Вынести мусор").await;
+    bot.assert_has_button("↩️ Вернуть");
+    bot.press("Вернуть").await;
+
+    assert_eq!(
+        item_due(&db.pool, task.id).await,
+        (None, Some(today)),
+        "revert restores the planned due date"
+    );
+    assert_eq!(
+        item_state(&db.pool, task.id).await,
+        (task.version + 2, "open".into()),
+        "a completed task without recurrence reopens"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reopen_without_completion_events_falls_back_to_plain_reopen() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let today = NaiveDate::from_ymd_opt(2026, 11, 6).expect("date");
+    let now = local_utc(moscow, today, 12, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut input = new_item(household.tasks_list_id, "Оплатить интернет");
+    input.due_date = Some(today);
+    let task = create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &actor,
+        task.id,
+        Some(task.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("complete");
+    // События за сроком хранения: выполнения в журнале уже нет.
+    sqlx::query("DELETE FROM item_events WHERE item_id = $1")
+        .bind(task.id)
+        .execute(&mut *conn)
+        .await
+        .expect("purge the events");
+    drop(conn);
+
+    open_done_task_from_search(&mut bot, "Оплатить", "Оплатить интернет").await;
+    bot.assert_has_button("↩️ Вернуть");
+    bot.press("Вернуть").await;
+
+    assert_eq!(
+        item_state(&db.pool, task.id).await,
+        (task.version + 2, "open".into()),
+        "without completion events the old reopen path still works"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completed_recurring_task_without_context_offers_revert_until_edited() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let today = NaiveDate::from_ymd_opt(2026, 11, 6).expect("date");
+    let now = local_utc(moscow, today, 12, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut input = new_item(household.tasks_list_id, "Полить цветы");
+    input.due_date = Some(today);
+    let mut rule = support::recurrence(RecurrenceFreq::Daily, Vec::new());
+    rule.until = Some(today);
+    input.recurrence = Some(rule);
+    let task = create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &actor,
+        task.id,
+        Some(task.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("complete the last occurrence");
+    assert_eq!(completed.status, ItemStatus::Done);
+    drop(conn);
+
+    open_done_task_from_search(&mut bot, "Полить", "Полить цветы").await;
+    bot.assert_has_button("↩️ Вернуть");
+    bot.press("Вернуть").await;
+    assert_eq!(
+        item_state(&db.pool, task.id).await,
+        (completed.version + 1, "open".into()),
+        "the last occurrence can be reverted"
+    );
+    assert_eq!(
+        item_due(&db.pool, task.id).await,
+        (None, Some(today)),
+        "revert restores the planned due date"
+    );
+
+    // Снова выполняем и правим задачу после выполнения: возврат больше не
+    // проходит, поэтому кнопки нет.
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let done_again = items::complete(
+        &mut conn,
+        household.household_id,
+        &actor,
+        task.id,
+        Some(completed.version + 1),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("complete again");
+    items::update(
+        &mut conn,
+        household.household_id,
+        &actor,
+        task.id,
+        done_again.version,
+        ItemPatch {
+            title: Some("Полить цветы на балконе".into()),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("edit after completion");
+    drop(conn);
+
+    bot.press("Выполненные").await;
+    bot.press("Полить цветы").await;
+    assert!(
+        bot.find_button("↩️ Вернуть").is_none(),
+        "a changed recurring task cannot be reverted:\n{}",
         bot.screen()
     );
 }

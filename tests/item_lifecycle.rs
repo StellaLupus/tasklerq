@@ -8,7 +8,7 @@ use tasklerq::domain::models::{
     EventType, Field, ItemPatch, ItemStatus, ListKind, MonthRule, RecurrenceFreq,
 };
 use tasklerq::domain::recurrence::Due;
-use tasklerq::storage::repositories::{items, lists};
+use tasklerq::storage::repositories::{events, items, lists};
 
 fn date(year: i32, month: u32, day: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(year, month, day).expect("valid date")
@@ -4286,6 +4286,65 @@ async fn revert_completion_reopens_a_task_without_recurrence() {
             .await
             .expect("journal")
             .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revert_completion_records_reopened_undo_of() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let due = date(2026, 11, 4);
+    let mut input = support::new_item(household.tasks_list_id, "Оплатить интернет");
+    input.due_date = Some(due);
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(created.version),
+        "Europe/Moscow",
+        utc(2026, 11, 4, 12),
+    )
+    .await
+    .expect("complete");
+    let completion_id =
+        items::completions::latest_for_item(&mut conn, household.household_id, created.id)
+            .await
+            .expect("latest completion")
+            .expect("a completion is recorded")
+            .completion
+            .event_id;
+
+    items::revert_completion(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        completion_id,
+        utc(2026, 11, 4, 13),
+    )
+    .await
+    .expect("revert");
+
+    let events = events::for_item(&mut conn, household.household_id, created.id)
+        .await
+        .expect("events");
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == EventType::Reopened
+                && event.undo_of == Some(completion_id)),
+        "the revert must compensate the completion through undo_of: {events:?}"
     );
 }
 

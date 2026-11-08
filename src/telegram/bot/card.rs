@@ -276,11 +276,12 @@ pub async fn view(
     };
     // Кнопка есть ровно тогда, когда `revert_completion` пройдёт: выполнение
     // последнее, а повторяющаяся задача не менялась после него.
-    let revertible = completion_id.is_some_and(|id| {
-        completions.first().is_some_and(|latest| {
-            latest.event_id == id
-                && (item.recurrence.is_none() || latest.version_after == Some(item.version))
-        })
+    let latest = completions.first();
+    let latest_revertible = latest.is_some_and(|latest| {
+        item.recurrence.is_none() || latest.version_after == Some(item.version)
+    });
+    let revertible = completion_id.map_or(latest_revertible, |id| {
+        latest.is_some_and(|latest| latest.event_id == id) && latest_revertible
     });
 
     let edit = button(
@@ -293,7 +294,11 @@ pub async fn view(
     let main = if done {
         if shopping {
             Some(revert(None))
-        } else if completion_id.is_some() {
+        } else if completion_id.is_some() || item.recurrence.is_some() {
+            // Для повторяющейся задачи без контекста условия те же, что у
+            // карточки из журнала: возврат доступен, пока задача не менялась
+            // после последнего выполнения. Задача без повторения возвращается
+            // и без событий — прежним `reopen`.
             revertible.then(|| revert(completion_id))
         } else {
             Some(revert(None))
@@ -726,13 +731,24 @@ pub async fn reopen(
 ) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
     let actor = ctx.actor()?;
-    let (_, list) = load(ctx, item_id).await?;
+    let (item, list) = load(ctx, item_id).await?;
     let result = if list.kind == ListKind::Tasks {
         let completion_id = match completion_id {
             Some(completion_id) => Some(completion_id),
-            None => items::completions::latest_for_item(&mut *ctx.conn, household_id, item_id)
-                .await?
-                .map(|event| event.completion.event_id),
+            None => {
+                // Карточка без контекста выполнения: кнопка помнит версию
+                // элемента на момент отрисовки. Если задача успела измениться,
+                // последнее выполнение могло стать чужим — возвращать его по
+                // старой кнопке нельзя.
+                if item.version != version {
+                    return Err(
+                        DomainError::conflict("the item changed after the card was shown").into(),
+                    );
+                }
+                items::completions::latest_for_item(&mut *ctx.conn, household_id, item_id)
+                    .await?
+                    .map(|event| event.completion.event_id)
+            }
         };
         match completion_id {
             Some(completion_id) => {

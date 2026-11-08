@@ -85,13 +85,6 @@ pub struct CompletionEvent {
     pub payload: Value,
 }
 
-impl CompletionEvent {
-    /// Версия элемента сразу после выполнения.
-    pub fn version_after(&self) -> Option<i32> {
-        self.completion.version_after
-    }
-}
-
 /// Запись журнала: выполнение и вычисленный плановый день.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalEntry {
@@ -219,24 +212,11 @@ pub async fn recent_for_item(
     item_id: Uuid,
     limit: usize,
 ) -> Result<Vec<Completion>, DomainError> {
-    let sql = format!(
-        "SELECT e.id, e.item_id, e.actor_user_id, e.created_at, e.payload,
-                i.list_id AS current_list_id
-         FROM item_events e
-         JOIN items i ON i.id = e.item_id AND i.household_id = e.household_id
-         WHERE {COMPLETION_SELECTION}
-           AND e.item_id = $2
-         ORDER BY e.created_at DESC, e.id DESC
-         LIMIT $3"
-    );
-    let rows = sqlx::query_as::<_, CompletionRow>(&sql)
-        .bind(household_id)
-        .bind(item_id)
-        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-        .fetch_all(conn)
-        .await?;
-
-    Ok(rows.into_iter().map(Completion::from).collect())
+    Ok(selected_for_item(conn, household_id, item_id, limit)
+        .await?
+        .into_iter()
+        .map(|event| event.completion)
+        .collect())
 }
 
 /// Последнее неотменённое выполнение элемента вместе со снимком события.
@@ -248,6 +228,22 @@ pub async fn latest_for_item(
     household_id: Uuid,
     item_id: Uuid,
 ) -> Result<Option<CompletionEvent>, DomainError> {
+    Ok(selected_for_item(conn, household_id, item_id, 1)
+        .await?
+        .into_iter()
+        .next())
+}
+
+/// Выполнения элемента, начиная с поздних, не больше `limit` штук.
+///
+/// Одна выборка для блока «Выполнения» и возврата последнего выполнения:
+/// различается только `LIMIT`.
+async fn selected_for_item(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    item_id: Uuid,
+    limit: usize,
+) -> Result<Vec<CompletionEvent>, DomainError> {
     let sql = format!(
         "SELECT e.id, e.item_id, e.actor_user_id, e.created_at, e.payload,
                 i.list_id AS current_list_id
@@ -256,21 +252,17 @@ pub async fn latest_for_item(
          WHERE {COMPLETION_SELECTION}
            AND e.item_id = $2
          ORDER BY e.created_at DESC, e.id DESC
-         LIMIT 1"
+         LIMIT $3"
     );
-    let row = sqlx::query_as::<_, CompletionRow>(&sql)
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let rows = sqlx::query_as::<_, CompletionRow>(&sql)
         .bind(household_id)
         .bind(item_id)
-        .fetch_optional(conn)
+        .bind(limit)
+        .fetch_all(conn)
         .await?;
 
-    Ok(row.map(|row| {
-        let payload = row.payload.clone();
-        CompletionEvent {
-            completion: Completion::from(row),
-            payload,
-        }
-    }))
+    Ok(rows.into_iter().map(CompletionEvent::from).collect())
 }
 
 /// Страница журнала выполнений household.
@@ -375,6 +367,16 @@ impl From<CompletionRow> for Completion {
             completed_at: row.created_at,
             actor_user_id: row.actor_user_id,
             version_after,
+        }
+    }
+}
+
+impl From<CompletionRow> for CompletionEvent {
+    fn from(row: CompletionRow) -> Self {
+        let payload = row.payload.clone();
+        Self {
+            completion: Completion::from(row),
+            payload,
         }
     }
 }

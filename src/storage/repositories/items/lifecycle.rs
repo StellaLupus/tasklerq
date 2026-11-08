@@ -157,63 +157,17 @@ pub async fn reopen(
             serde_json::from_value::<Item>(event.payload.get("before")?.clone()).ok()
         });
 
-    let (due_at, due_date, completed_at, completed_by_user_id) = match &previous {
-        Some(previous) => (
-            previous.due_at,
-            previous.due_date,
-            previous.completed_at,
-            previous.completed_by_user_id,
-        ),
-        None => (row.due_at, row.due_date, None, None),
-    };
-    // Слот относится к конкретному правилу. Если после выполнения правило
-    // сняли или изменили, старый слот к новому правилу не подходит — иначе
-    // `items_recurrence_shape` отвергнет строку без правила, а `next_after`
-    // посчитает следующее вхождение от чужой даты.
-    let (occurrence_date, occurrence_time) = match (
-        row.recurrence(),
-        previous.as_ref().and_then(|item| item.recurrence.as_ref()),
-    ) {
-        (Some(current_rule), Some(previous_rule)) if current_rule.same_rule(previous_rule) => {
-            (previous_rule.occurrence_date, previous_rule.occurrence_time)
-        }
-        _ => (None, None),
-    };
-
-    sqlx::query(
-        "UPDATE items
-         SET status = 'open', due_at = $3, due_date = $4, completed_at = $5,
-             completed_by_user_id = $6, recurrence_occurrence_date = $7,
-             recurrence_occurrence_time = $8,
-             version = version + 1, updated_at = $9
-         WHERE id = $1 AND household_id = $2",
-    )
-    .bind(item_id)
-    .bind(household_id)
-    .bind(due_at)
-    .bind(due_date)
-    .bind(completed_at)
-    .bind(completed_by_user_id)
-    .bind(occurrence_date)
-    .bind(occurrence_time)
-    .bind(now)
-    .execute(&mut *conn)
-    .await?;
-
-    let updated = load_item(conn, household_id, item_id).await?;
-    events::insert(
+    restore_snapshot(
         conn,
         household_id,
-        item_id,
         actor,
-        EventType::Reopened,
-        json!({"before": current, "after": updated}),
+        item_id,
+        &current,
+        previous.as_ref(),
         None,
         now,
     )
-    .await?;
-
-    Ok(updated)
+    .await
 }
 
 /// Вернуть в работу выполнение из журнала.
@@ -248,7 +202,7 @@ pub async fn revert_completion(
         .and_then(|before| serde_json::from_value::<Item>(before.clone()).ok());
 
     if row.recurrence().is_some() {
-        if completion.version_after() != Some(row.version) {
+        if completion.completion.version_after != Some(row.version) {
             return Err(DomainError::conflict(
                 "the item changed after the completion",
             ));
@@ -260,20 +214,51 @@ pub async fn revert_completion(
         }
     }
 
-    let (due_at, due_date, completed_at, completed_by_user_id) = match &snapshot {
+    restore_snapshot(
+        conn,
+        household_id,
+        actor,
+        item_id,
+        &current,
+        snapshot.as_ref(),
+        Some(completion_id),
+        now,
+    )
+    .await
+}
+
+/// Восстановить элемент из снимка события и записать `reopened`.
+///
+/// Общий шаг [`reopen`] и [`revert_completion`]: срок и исполнитель берутся из
+/// снимка `before`, слот вхождения — только если правило не менялось. `undo_of`
+/// связывает возврат с отменённым выполнением.
+#[allow(clippy::too_many_arguments)]
+async fn restore_snapshot(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    actor: &Actor,
+    item_id: Uuid,
+    current: &Item,
+    snapshot: Option<&Item>,
+    undo_of: Option<Uuid>,
+    now: DateTime<Utc>,
+) -> Result<Item, DomainError> {
+    let (due_at, due_date, completed_at, completed_by_user_id) = match snapshot {
         Some(before) => (
             before.due_at,
             before.due_date,
             before.completed_at,
             before.completed_by_user_id,
         ),
-        None => (row.due_at, row.due_date, None, None),
+        None => (current.due_at, current.due_date, None, None),
     };
-    // Слот относится к конкретному правилу: восстановить его можно, только
-    // если правило не менялось (см. `reopen`).
+    // Слот относится к конкретному правилу. Если после выполнения правило
+    // сняли или изменили, старый слот к новому правилу не подходит — иначе
+    // `items_recurrence_shape` отвергнет строку без правила, а `next_after`
+    // посчитает следующее вхождение от чужой даты.
     let (occurrence_date, occurrence_time) = match (
-        row.recurrence(),
-        snapshot.as_ref().and_then(|item| item.recurrence.as_ref()),
+        current.recurrence.as_ref(),
+        snapshot.and_then(|item| item.recurrence.as_ref()),
     ) {
         (Some(current_rule), Some(previous_rule)) if current_rule.same_rule(previous_rule) => {
             (previous_rule.occurrence_date, previous_rule.occurrence_time)
@@ -309,7 +294,7 @@ pub async fn revert_completion(
         actor,
         EventType::Reopened,
         json!({"before": current, "after": updated}),
-        Some(completion_id),
+        undo_of,
         now,
     )
     .await?;
