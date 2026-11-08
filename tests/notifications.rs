@@ -9,7 +9,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use serde_json::json;
-use sqlx::PgPool;
+use sqlx::{Acquire, PgPool};
 use support::telegram::Harness;
 use support::{TestDb, TestHousehold, new_member, next_telegram_id};
 use tasklerq::domain::models::{
@@ -1243,6 +1243,103 @@ async fn changing_due_at_cancels_pending_delivery_for_the_old_due() {
     let rows = delivery_rows(&db.pool, item.id).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].0, "cancelled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_stale_skips_a_locked_delivery_until_the_lock_is_released() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let due = rounded_now() + Duration::hours(3);
+    let now = due - Duration::minutes(15);
+    let unlocked = create_task(
+        &db,
+        &household,
+        "Отменится сразу",
+        Some(due),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let locked = create_task(
+        &db,
+        &household,
+        "Ждёт блокировку",
+        Some(due),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let unlocked_delivery = insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        Some(unlocked.id),
+        &occurrence_key(due),
+        "pending",
+        now,
+    )
+    .await
+    .expect("unlocked delivery");
+    let locked_delivery = insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        Some(locked.id),
+        &occurrence_key(due),
+        "pending",
+        now,
+    )
+    .await
+    .expect("locked delivery");
+
+    // Оба срока сдвинуты: записи устарели.
+    sqlx::query("UPDATE items SET due_at = due_at + interval '2 hours' WHERE id = $1 OR id = $2")
+        .bind(unlocked.id)
+        .bind(locked.id)
+        .execute(&db.pool)
+        .await
+        .expect("move due");
+
+    let mut lock_conn = db.pool.acquire().await.expect("lock connection");
+    let mut lock_tx = lock_conn.begin().await.expect("lock transaction");
+    sqlx::query("SELECT id FROM notification_deliveries WHERE id = $1 FOR UPDATE")
+        .bind(locked_delivery)
+        .fetch_one(&mut *lock_tx)
+        .await
+        .expect("row lock");
+
+    let stats = scheduler(&db.pool).tick(now).await.expect("locked tick");
+    assert_eq!(stats.cancelled, 1, "{stats:?}");
+    let unlocked_status: String =
+        sqlx::query_scalar("SELECT status::text FROM notification_deliveries WHERE id = $1")
+            .bind(unlocked_delivery)
+            .fetch_one(&db.pool)
+            .await
+            .expect("unlocked status");
+    let locked_status: String =
+        sqlx::query_scalar("SELECT status::text FROM notification_deliveries WHERE id = $1")
+            .bind(locked_delivery)
+            .fetch_one(&db.pool)
+            .await
+            .expect("locked status");
+    assert_eq!(unlocked_status, "cancelled");
+    assert_eq!(
+        locked_status, "pending",
+        "a row held by another transaction must be skipped"
+    );
+
+    lock_tx.rollback().await.expect("release lock");
+    drop(lock_conn);
+
+    let stats = scheduler(&db.pool).tick(now).await.expect("release tick");
+    assert_eq!(stats.cancelled, 1, "{stats:?}");
+    let locked_status: String =
+        sqlx::query_scalar("SELECT status::text FROM notification_deliveries WHERE id = $1")
+            .bind(locked_delivery)
+            .fetch_one(&db.pool)
+            .await
+            .expect("locked status after release");
+    assert_eq!(locked_status, "cancelled");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

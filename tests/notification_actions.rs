@@ -211,6 +211,22 @@ async fn snooze_origin_key(pool: &PgPool, item_id: Uuid) -> Option<String> {
     .expect("snooze origin")
 }
 
+async fn snooze_origin_rows(
+    pool: &PgPool,
+    item_id: Uuid,
+) -> Vec<(String, Option<String>, DateTime<Utc>)> {
+    sqlx::query_as(
+        "SELECT status::text, origin_key, scheduled_at
+         FROM notification_deliveries
+         WHERE item_id = $1 AND kind = 'snooze'
+         ORDER BY created_at, id",
+    )
+    .bind(item_id)
+    .fetch_all(pool)
+    .await
+    .expect("snooze rows")
+}
+
 async fn reminder_occurrence_key(pool: &PgPool, item_id: Uuid) -> String {
     sqlx::query_scalar(
         "SELECT occurrence_key FROM notification_deliveries
@@ -1122,4 +1138,134 @@ async fn a_snooze_without_origin_is_delivered_after_the_due_changed() {
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].0, "sent", "{rows:?}");
     assert_eq!(message_count(&bot, "Позвонить маме"), 1);
+}
+
+/// Пользователь дважды нажимает «Завтра в 09:00» после переноса срока.
+///
+/// Второе нажатие идёт через соседнюю кнопку старой версии: она только
+/// перерисовывает напоминание. `cancel_before_second` — тик уже отменил первую
+/// запись snooze до второго нажатия.
+async fn repeat_morning_snooze_after_due_change(cancel_before_second: bool) {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = bot.now.with_timezone(&moscow).date_naive();
+    bot.set_now(local_utc(moscow, day, 20, 0));
+    let due = local_utc(moscow, day, 22, 0);
+    let item = create_task(&db.pool, &household, "Позвонить маме", due, None).await;
+
+    tick_and_deliver(&mut bot, &db.pool, local_utc(moscow, day, 21, 45)).await;
+    let (message_id, html) = bot.latest();
+    let tomorrow = button_of(&html, "Завтра в 09:00");
+    let other_snooze = button_of(&html, "на час");
+    bot.press_data(&tomorrow, message_id).await;
+
+    let next_morning = local_utc(moscow, day + Duration::days(1), 9, 0);
+    let first = snooze_rows(&db.pool, item.id).await;
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert_eq!(first[0].1, next_morning);
+
+    let new_due = local_utc(moscow, day + Duration::days(1), 12, 0);
+    sqlx::query("UPDATE items SET due_at = $2, version = version + 1 WHERE id = $1")
+        .bind(item.id)
+        .bind(new_due)
+        .execute(&db.pool)
+        .await
+        .expect("move due");
+    let new_origin = tasklerq::jobs::scheduler::occurrence_key(new_due);
+
+    if cancel_before_second {
+        tick_and_deliver(&mut bot, &db.pool, local_utc(moscow, day, 22, 30)).await;
+        let rows = snooze_origin_rows(&db.pool, item.id).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, "cancelled", "{rows:?}");
+    }
+
+    bot.press_data(&other_snooze, message_id).await;
+    assert_eq!(last_toast(&bot).as_deref(), Some("Задача уже изменилась"));
+    let (_, redrawn) = bot.latest();
+    assert!(redrawn.contains("Позвонить маме"), "{redrawn}");
+    assert!(!redrawn.contains("😴 Напомню"), "{redrawn}");
+
+    let second_morning = button_of(&redrawn, "Завтра в 09:00");
+    bot.press_data(&second_morning, message_id).await;
+
+    let rows = snooze_origin_rows(&db.pool, item.id).await;
+    assert_eq!(rows.len(), 1, "one snooze record: {rows:?}");
+    assert_eq!(rows[0].0, "pending", "{rows:?}");
+    assert_eq!(
+        rows[0].1.as_deref(),
+        Some(new_origin.as_str()),
+        "the repeated snooze must bind to the new due"
+    );
+    assert_eq!(rows[0].2, next_morning, "{rows:?}");
+
+    let before = message_count(&bot, "Позвонить маме");
+    tick_and_deliver(&mut bot, &db.pool, next_morning).await;
+    let rows = snooze_origin_rows(&db.pool, item.id).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the old binding must not add a delivery: {rows:?}"
+    );
+    assert_eq!(rows[0].0, "sent", "{rows:?}");
+    assert_eq!(rows[0].1.as_deref(), Some(new_origin.as_str()));
+    assert_eq!(message_count(&bot, "Позвонить маме"), before + 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_morning_snooze_after_due_change_before_the_cancel_tick() {
+    repeat_morning_snooze_after_due_change(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_morning_snooze_after_due_change_after_the_cancel_tick() {
+    repeat_morning_snooze_after_due_change(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_snooze_token_without_a_version_still_snoozes() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(&db.pool, &household, "Позвонить маме", due, None).await;
+
+    tick_and_deliver(&mut bot, &db.pool, due - Duration::minutes(15)).await;
+    let (message_id, html) = bot.latest();
+    let snooze = button_of(&html, "на час");
+
+    sqlx::query(
+        "UPDATE items SET title = 'Позвонить маме (новая)', version = version + 1 WHERE id = $1",
+    )
+    .bind(item.id)
+    .execute(&db.pool)
+    .await
+    .expect("external change");
+    // Токен, выпущенный до деплоя: в payload нет версии, как и в старой схеме.
+    sqlx::query(
+        "UPDATE callback_tokens
+         SET payload = payload - 'version', version = NULL
+         WHERE action = 'snooze' AND payload->>'item_id' = $1 AND consumed_at IS NULL",
+    )
+    .bind(item.id.to_string())
+    .execute(&db.pool)
+    .await
+    .expect("legacy token");
+
+    bot.press_data(&snooze, message_id).await;
+    assert_eq!(last_toast(&bot).as_deref(), Some("Отложено"));
+    let rows = snooze_origin_rows(&db.pool, item.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "pending", "{rows:?}");
+    assert!(bot.latest().1.contains("😴 Напомню"), "{}", bot.latest().1);
+
+    let reminder_key = reminder_occurrence_key(&db.pool, item.id).await;
+    assert_eq!(
+        snooze_origin_key(&db.pool, item.id).await.as_deref(),
+        Some(reminder_key.as_str())
+    );
 }

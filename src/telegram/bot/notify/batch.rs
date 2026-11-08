@@ -620,6 +620,15 @@ fn batch_entry(row: &BatchDelivery, tz: Tz, now: DateTime<Utc>) -> BatchEntry {
     // исключение: оно остаётся актуальным, поэтому блок показывает задачу и
     // работает так же, как одиночное уведомление о назначении.
     let list_archived = !is_assignment(kind) && row.list_archived == Some(true);
+    // Блок без собственного итога или с отменённым snooze показывает текущее
+    // состояние задачи: отменённое «Напомню в …» больше ничего не обещает.
+    let task_state = || {
+        if row.item_status != Some(ItemStatus::Open) {
+            BatchEntryState::Done
+        } else {
+            BatchEntryState::Open
+        }
+    };
     let state = if missing {
         BatchEntryState::Missing
     } else if list_archived {
@@ -627,17 +636,12 @@ fn batch_entry(row: &BatchDelivery, tz: Tz, now: DateTime<Utc>) -> BatchEntry {
     } else {
         match row.batch_state {
             Some(BatchState::Done) => BatchEntryState::Done,
-            Some(BatchState::Snoozed) => {
+            Some(BatchState::Snoozed) if row.snooze_status.as_deref() != Some("cancelled") => {
                 BatchEntryState::Snoozed(row.batch_snoozed_until.unwrap_or(now))
             }
+            Some(BatchState::Snoozed) => task_state(),
             Some(BatchState::Missing) => BatchEntryState::Missing,
-            None => {
-                if row.item_status != Some(ItemStatus::Open) {
-                    BatchEntryState::Done
-                } else {
-                    BatchEntryState::Open
-                }
-            }
+            None => task_state(),
         }
     };
     let list = row.list_name.clone().unwrap_or_default();

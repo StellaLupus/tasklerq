@@ -267,6 +267,8 @@ pub struct BatchDelivery {
     pub batch_state: Option<BatchState>,
     /// Время нового snooze.
     pub batch_snoozed_until: Option<DateTime<Utc>>,
+    /// Статус snooze-доставки блока; `None` — запись не найдена.
+    pub snooze_status: Option<String>,
     /// Момент выпуска.
     pub scheduled_at: DateTime<Utc>,
     /// Название задачи.
@@ -297,6 +299,16 @@ pub async fn batch_deliveries(
     sqlx::query_as(
         "SELECT d.id, d.item_id, d.kind AS kind, d.batch_version,
                 d.batch_state, d.batch_snoozed_until, d.scheduled_at,
+                (SELECT s.status::text
+                 FROM notification_deliveries s
+                 WHERE s.user_id = d.user_id
+                   AND s.item_id = d.item_id
+                   AND s.kind = 'snooze'
+                   AND d.batch_snoozed_until IS NOT NULL
+                   AND s.occurrence_key = 'snooze:'
+                       || floor(extract(epoch FROM d.batch_snoozed_until))::bigint
+                 ORDER BY s.created_at DESC, s.id DESC
+                 LIMIT 1) AS snooze_status,
                 i.title, i.status AS item_status,
                 i.deleted_at AS item_deleted_at, i.version AS item_version,
                 i.due_at, i.due_date,
