@@ -844,6 +844,48 @@ async fn retention_worker_survives_a_failed_and_a_panicked_run() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_purges_the_original_text_and_its_parts_with_the_draft() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO capture_drafts (
+             id, household_id, source, mode, raw_text, raw_parts, status,
+             created_at, expires_at
+         )
+         VALUES ($1, $2, 'telegram', 'draft', 'купить хлеб\nкупить молоко',
+                 ARRAY['купить хлеб', 'купить молоко'], 'pending', $3, $3)",
+    )
+    .bind(id)
+    .bind(household.household_id)
+    .bind(now - Duration::days(31))
+    .execute(&db.pool)
+    .await
+    .expect("old draft with parts");
+
+    let config = RetentionConfig {
+        drafts_days: 30,
+        ..config()
+    };
+    let stats = retention::run(&db.pool, &config, now)
+        .await
+        .expect("retention");
+    assert_eq!(stats.purged_drafts, 1);
+
+    let left: Option<(String, Vec<String>)> =
+        sqlx::query_as("SELECT raw_text, raw_parts FROM capture_drafts WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&db.pool)
+            .await
+            .expect("draft lookup");
+    assert!(
+        left.is_none(),
+        "raw_text and raw_parts are purged with the draft after 30 days"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retention_keeps_audit_events_for_the_configured_minimum() {
     use tasklerq::domain::identity::AuditEventType;
     use tasklerq::domain::models::{Actor, ActorType};

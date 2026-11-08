@@ -2466,3 +2466,35 @@ async fn undo_skips_a_position_deleted_by_hand() {
         vec![("Молоко".to_owned(), true), ("Хлеб".to_owned(), true)]
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_text_appends_to_the_waiting_draft_from_the_worker() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![
+            Ok(json!({"items": [{"target_kind": "shopping", "title": "Хлеб"}]})),
+            Ok(json!({"items": [{"target_kind": "shopping", "title": "Молоко"}]})),
+        ],
+    )
+    .await;
+
+    stand.capture("купить хлеб").await;
+    stand.capture("купить молоко").await;
+
+    let drafts: Vec<(uuid::Uuid, String, Vec<String>)> = sqlx::query_as(
+        "SELECT id, raw_text, raw_parts FROM capture_drafts
+         WHERE chat_id = $1 AND status = 'pending'
+         ORDER BY created_at",
+    )
+    .bind(stand.bot.chat)
+    .fetch_all(&db.pool)
+    .await
+    .expect("drafts");
+    assert_eq!(drafts.len(), 1, "both texts share the waiting draft");
+    assert_eq!(drafts[0].1, "купить хлеб\nкупить молоко");
+    assert_eq!(
+        drafts[0].2,
+        vec!["купить хлеб".to_owned(), "купить молоко".to_owned()]
+    );
+}

@@ -15,8 +15,8 @@ use crate::domain::models::{CaptureMode, CaptureSource, DraftStatus};
 pub const DRAFT_TTL_MINUTES: i64 = 15;
 
 const COLUMNS: &str = "id, household_id, user_id, chat_id, source, mode, idempotency_key, \
-    request_hash, raw_text, parsed, status, fallback, prompt_version, telegram_message_id, \
-    created_at, expires_at, applied_at";
+    request_hash, raw_text, raw_parts, parsed, status, fallback, prompt_version, \
+    telegram_message_id, created_at, expires_at, applied_at";
 
 /// Строка `capture_drafts`.
 #[derive(Debug, Clone, FromRow)]
@@ -37,8 +37,10 @@ pub struct Draft {
     pub idempotency_key: Option<String>,
     /// Хеш тела запроса для сравнения повторов.
     pub request_hash: Option<String>,
-    /// Исходный текст.
+    /// Исходный текст: склейка частей через перевод строки.
     pub raw_text: String,
+    /// Части исходного текста по порядку отправки.
+    pub raw_parts: Vec<String>,
     /// Структура черновика.
     pub parsed: Option<Value>,
     /// Статус.
@@ -85,6 +87,8 @@ pub struct NewDraft {
     pub request_hash: Option<String>,
     /// Исходный текст, уже очищенный от управляющих символов.
     pub raw_text: String,
+    /// Части исходного текста, уже очищенные от управляющих символов.
+    pub raw_parts: Vec<String>,
     /// Структура черновика.
     pub parsed: Value,
     /// Черновик собран без LLM.
@@ -124,10 +128,10 @@ async fn insert_with_status(
     let row = sqlx::query_as::<_, Draft>(&format!(
         "INSERT INTO capture_drafts (
              id, household_id, user_id, chat_id, source, mode, idempotency_key,
-             request_hash, raw_text, parsed, status, fallback, prompt_version,
+             request_hash, raw_text, raw_parts, parsed, status, fallback, prompt_version,
              created_at, expires_at, applied_at
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
          RETURNING {COLUMNS}"
     ))
     .bind(draft.id)
@@ -139,6 +143,7 @@ async fn insert_with_status(
     .bind(draft.idempotency_key)
     .bind(draft.request_hash)
     .bind(draft.raw_text)
+    .bind(draft.raw_parts)
     .bind(draft.parsed)
     .bind(status)
     .bind(draft.fallback)
@@ -187,6 +192,83 @@ async fn fetch(
     .fetch_optional(conn)
     .await?
     .ok_or(DomainError::NotFound)
+}
+
+/// Класс advisory-блокировки черновиков Telegram в двухкомпонентном
+/// пространстве ключей.
+///
+/// Свой класс не пересекается ни с однокомпонентными ключами
+/// (`lock_telegram_user`, доставка), ни с классом создания household; объект —
+/// хеш чата.
+const DRAFT_LOCK_CLASS: i32 = 0x4452_4146; // "DRAF"
+
+/// Сериализовать выбор и создание ожидающего черновика одного чата.
+///
+/// Блокировка транзакционная: без неё два одновременно завершившихся разбора
+/// не видят незакоммиченный черновик друг друга и создают два новых.
+pub async fn lock_chat(conn: &mut PgConnection, chat_id: i64) -> Result<(), DomainError> {
+    let object = (chat_id ^ (chat_id >> 32)) as i32;
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        .bind(DRAFT_LOCK_CLASS)
+        .bind(object)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Последний ожидающий черновик Telegram этого чата и пользователя под
+/// `FOR UPDATE`.
+///
+/// Истёкший по `expires_at`, но ещё `pending` черновик ожидающим не считается.
+pub async fn pending_telegram_for_update(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    chat_id: i64,
+    user_id: Option<Uuid>,
+    now: DateTime<Utc>,
+) -> Result<Option<Draft>, DomainError> {
+    let row = sqlx::query_as::<_, Draft>(&format!(
+        "SELECT {COLUMNS} FROM capture_drafts
+         WHERE household_id = $1 AND chat_id = $2
+           AND user_id IS NOT DISTINCT FROM $3
+           AND source = 'telegram' AND status = 'pending' AND expires_at > $4
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1
+         FOR UPDATE"
+    ))
+    .bind(household_id)
+    .bind(chat_id)
+    .bind(user_id)
+    .bind(now)
+    .fetch_optional(conn)
+    .await?;
+    Ok(row)
+}
+
+/// Заменить содержимое ожидающего черновика после дописывания разбора.
+pub async fn append(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    draft_id: Uuid,
+    parsed: &Value,
+    raw_text: &str,
+    raw_parts: &[String],
+    expires_at: DateTime<Utc>,
+) -> Result<(), DomainError> {
+    sqlx::query(
+        "UPDATE capture_drafts
+         SET parsed = $3, raw_text = $4, raw_parts = $5, expires_at = $6
+         WHERE id = $1 AND household_id = $2 AND status = 'pending'",
+    )
+    .bind(draft_id)
+    .bind(household_id)
+    .bind(parsed)
+    .bind(raw_text)
+    .bind(raw_parts)
+    .bind(expires_at)
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 /// Заменить структуру ожидающего черновика.

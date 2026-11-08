@@ -161,6 +161,8 @@ async fn run_in_tx(
     )
     .await?;
 
+    // Исходный текст живёт в строке черновика: `raw_text` и `raw_parts`
+    // очищаются вместе с ней по `RETENTION_DRAFTS_DAYS`.
     let purged_drafts = delete_before(
         &mut *conn,
         "DELETE FROM capture_drafts WHERE created_at < $1",

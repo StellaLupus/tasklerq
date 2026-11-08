@@ -499,7 +499,7 @@ impl CaptureWorker {
         apply_default_list(job, &prepared.context, text, &mut parsed);
         let mut tx = self.pool.begin().await?;
         llm_runs::record(&mut tx, run, now).await?;
-        let created = draft::create(
+        let created = draft::append_or_create(
             &mut tx,
             NewCapture {
                 id: None,
@@ -638,7 +638,7 @@ impl CaptureWorker {
         let draft = if draft_items.is_empty() {
             None
         } else {
-            let draft = draft::create(
+            let draft = draft::append_or_create(
                 &mut tx,
                 NewCapture {
                     id: None,

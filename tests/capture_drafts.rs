@@ -4,7 +4,7 @@
 mod support;
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use sqlx::PgPool;
+use sqlx::{Acquire, PgPool};
 use tasklerq::capture::draft::{self, DraftError, DueChoice, ItemEdit, NewCapture};
 use tasklerq::capture::schema::{ParsedResponse, RawItem};
 use tasklerq::capture::validate::ASSIGNEE_AMBIGUOUS;
@@ -45,6 +45,32 @@ fn capture(household: &TestHousehold, items: Vec<RawItem>) -> NewCapture {
         idempotency_key: None,
         request_hash: None,
         raw_text: "завтра позвонить маме и купить молоко".to_owned(),
+        parsed: ParsedResponse {
+            items,
+            clarifications: Vec::new(),
+        },
+        fallback: false,
+        prompt_version: Some("capture-v1".into()),
+    }
+}
+
+fn telegram_capture(
+    household: &TestHousehold,
+    chat_id: i64,
+    user_id: Uuid,
+    raw_text: &str,
+    items: Vec<RawItem>,
+) -> NewCapture {
+    NewCapture {
+        id: None,
+        household_id: household.household_id,
+        user_id: Some(user_id),
+        chat_id: Some(chat_id),
+        source: CaptureSource::Telegram,
+        mode: CaptureMode::Draft,
+        idempotency_key: None,
+        request_hash: None,
+        raw_text: raw_text.to_owned(),
         parsed: ParsedResponse {
             items,
             clarifications: Vec::new(),
@@ -980,4 +1006,532 @@ async fn date_answer_keeps_the_time_and_reports_it_when_it_has_passed() {
             .iter()
             .any(|error| error.code == "time_past")
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_telegram_parse_appends_to_the_pending_draft() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let chat = 4_100_001_i64;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let first = {
+        let mut tx = conn.begin().await.expect("transaction");
+        let draft = draft::append_or_create(
+            &mut tx,
+            telegram_capture(
+                &household,
+                chat,
+                household.owner_id,
+                "купить хлеб",
+                vec![raw("Хлеб", ListKind::Shopping)],
+            ),
+            now,
+        )
+        .await
+        .expect("first draft");
+        tx.commit().await.expect("commit");
+        draft
+    };
+    let second = {
+        let mut tx = conn.begin().await.expect("transaction");
+        let draft = draft::append_or_create(
+            &mut tx,
+            telegram_capture(
+                &household,
+                chat,
+                household.owner_id,
+                "купить молоко",
+                vec![raw("Молоко", ListKind::Shopping)],
+            ),
+            now + Duration::minutes(1),
+        )
+        .await
+        .expect("appended draft");
+        tx.commit().await.expect("commit");
+        draft
+    };
+
+    assert_eq!(second.id, first.id, "the same draft waits for confirmation");
+    let stored = drafts::get(&mut conn, household.household_id, first.id)
+        .await
+        .expect("draft");
+    assert_eq!(
+        stored.raw_parts,
+        vec!["купить хлеб".to_owned(), "купить молоко".to_owned()]
+    );
+    assert_eq!(stored.raw_text, "купить хлеб\nкупить молоко");
+
+    let view = draft::view(
+        &mut conn,
+        household.household_id,
+        first.id,
+        now + Duration::minutes(1),
+    )
+    .await
+    .expect("view");
+    let titles: Vec<&str> = view
+        .validated
+        .items
+        .iter()
+        .map(|item| item.title.as_str())
+        .collect();
+    assert_eq!(titles, vec!["Хлеб", "Молоко"]);
+
+    let confirmed = draft::confirm(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        first.id,
+        now + Duration::minutes(2),
+    )
+    .await
+    .expect("confirm");
+    assert_eq!(confirmed.items.len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_draft_over_twenty_items_or_two_thousand_chars_starts_a_new_one() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let chat = 4_100_002_i64;
+    let many: Vec<RawItem> = (0..19)
+        .map(|n| raw(&format!("Дело {n}"), ListKind::Tasks))
+        .collect();
+    let first = {
+        let mut tx = conn.begin().await.expect("transaction");
+        let draft = draft::append_or_create(
+            &mut tx,
+            telegram_capture(&household, chat, household.owner_id, "девятнадцать", many),
+            now,
+        )
+        .await
+        .expect("first draft");
+        tx.commit().await.expect("commit");
+        draft
+    };
+    let extra: Vec<RawItem> = (0..3)
+        .map(|n| raw(&format!("Новое {n}"), ListKind::Tasks))
+        .collect();
+    let second = {
+        let mut tx = conn.begin().await.expect("transaction");
+        let draft = draft::append_or_create(
+            &mut tx,
+            telegram_capture(&household, chat, household.owner_id, "ещё три", extra),
+            now + Duration::minutes(1),
+        )
+        .await
+        .expect("second draft");
+        tx.commit().await.expect("commit");
+        draft
+    };
+    assert_ne!(second.id, first.id, "the item limit starts a new draft");
+    let old = drafts::get(&mut conn, household.household_id, first.id)
+        .await
+        .expect("old draft");
+    assert_eq!(old.status, DraftStatus::Pending);
+    let old_view = draft::view(
+        &mut conn,
+        household.household_id,
+        first.id,
+        now + Duration::minutes(1),
+    )
+    .await
+    .expect("old view");
+    assert_eq!(old_view.validated.items.len(), 19);
+    let new_view = draft::view(
+        &mut conn,
+        household.household_id,
+        second.id,
+        now + Duration::minutes(1),
+    )
+    .await
+    .expect("new view");
+    assert_eq!(new_view.validated.items.len(), 3);
+
+    // Текст длиннее 2000 символов по сумме частей — тоже новый черновик.
+    let chat = 4_100_003_i64;
+    let long = "а".repeat(1995);
+    let text_first = {
+        let mut tx = conn.begin().await.expect("transaction");
+        let draft = draft::append_or_create(
+            &mut tx,
+            telegram_capture(
+                &household,
+                chat,
+                household.owner_id,
+                &long,
+                vec![raw("Длинная", ListKind::Tasks)],
+            ),
+            now,
+        )
+        .await
+        .expect("long draft");
+        tx.commit().await.expect("commit");
+        draft
+    };
+    let text_second = {
+        let mut tx = conn.begin().await.expect("transaction");
+        let draft = draft::append_or_create(
+            &mut tx,
+            telegram_capture(
+                &household,
+                chat,
+                household.owner_id,
+                &"б".repeat(5),
+                vec![raw("Короткая", ListKind::Tasks)],
+            ),
+            now + Duration::minutes(1),
+        )
+        .await
+        .expect("text limit draft");
+        tx.commit().await.expect("commit");
+        draft
+    };
+    assert_ne!(
+        text_second.id, text_first.id,
+        "the character limit starts a new draft"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_telegram_parses_finishing_together_share_one_draft() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let chat = 4_100_004_i64;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
+    let mut tasks = Vec::new();
+    for (index, title) in ["Первый", "Второй"].into_iter().enumerate() {
+        let pool = db.pool.clone();
+        let barrier = barrier.clone();
+        let capture = telegram_capture(
+            &household,
+            chat,
+            household.owner_id,
+            title,
+            vec![raw(title, ListKind::Tasks)],
+        );
+        tasks.push(tokio::spawn(async move {
+            let mut conn = pool.acquire().await.expect("connection");
+            let mut tx = conn.begin().await.expect("transaction");
+            barrier.wait().await;
+            let draft =
+                draft::append_or_create(&mut tx, capture, now + Duration::seconds(index as i64))
+                    .await
+                    .expect("draft");
+            tx.commit().await.expect("commit");
+            draft.id
+        }));
+    }
+    let mut ids = Vec::new();
+    for task in tasks {
+        ids.push(task.await.expect("task"));
+    }
+
+    assert_eq!(ids[0], ids[1], "both parses land in the same draft");
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM capture_drafts
+         WHERE household_id = $1 AND chat_id = $2 AND status = 'pending'",
+    )
+    .bind(household.household_id)
+    .bind(chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("pending drafts");
+    assert_eq!(pending, 1, "the race must not create two drafts");
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let view = draft::view(
+        &mut conn,
+        household.household_id,
+        ids[0],
+        now + Duration::seconds(2),
+    )
+    .await
+    .expect("view");
+    let mut titles: Vec<&str> = view
+        .validated
+        .items
+        .iter()
+        .map(|item| item.title.as_str())
+        .collect();
+    titles.sort_unstable();
+    assert_eq!(titles, vec!["Второй", "Первый"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn appending_extends_the_draft_for_fifteen_minutes() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let chat = 4_100_005_i64;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let first = {
+        let mut tx = conn.begin().await.expect("transaction");
+        let draft = draft::append_or_create(
+            &mut tx,
+            telegram_capture(
+                &household,
+                chat,
+                household.owner_id,
+                "первое",
+                vec![raw("Первое", ListKind::Tasks)],
+            ),
+            now,
+        )
+        .await
+        .expect("first");
+        tx.commit().await.expect("commit");
+        draft
+    };
+    let first_ttl = first.expires_at - now;
+    assert!(
+        (first_ttl - Duration::minutes(15)).num_milliseconds().abs() < 1000,
+        "the first draft lives fifteen minutes: {first_ttl}"
+    );
+
+    let appended_at = now + Duration::minutes(14);
+    let second = {
+        let mut tx = conn.begin().await.expect("transaction");
+        let draft = draft::append_or_create(
+            &mut tx,
+            telegram_capture(
+                &household,
+                chat,
+                household.owner_id,
+                "второе",
+                vec![raw("Второе", ListKind::Tasks)],
+            ),
+            appended_at,
+        )
+        .await
+        .expect("second");
+        tx.commit().await.expect("commit");
+        draft
+    };
+    assert_eq!(second.id, first.id);
+    let appended_ttl = second.expires_at - appended_at;
+    assert!(
+        (appended_ttl - Duration::minutes(15))
+            .num_milliseconds()
+            .abs()
+            < 1000,
+        "appending extends the draft for fifteen minutes: {appended_ttl}"
+    );
+
+    let view = draft::view(
+        &mut conn,
+        household.household_id,
+        first.id,
+        now + Duration::minutes(28),
+    )
+    .await
+    .expect("view");
+    assert!(view.is_open(now + Duration::minutes(28)));
+    assert!(!view.is_open(now + Duration::minutes(29)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pending_draft_of_another_chat_or_user_is_not_appended() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let chat = 4_100_006_i64;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let first = {
+        let mut tx = conn.begin().await.expect("transaction");
+        let draft = draft::append_or_create(
+            &mut tx,
+            telegram_capture(
+                &household,
+                chat,
+                household.owner_id,
+                "первое",
+                vec![raw("Первое", ListKind::Tasks)],
+            ),
+            now,
+        )
+        .await
+        .expect("first");
+        tx.commit().await.expect("commit");
+        draft
+    };
+
+    let other_chat = {
+        let mut tx = conn.begin().await.expect("transaction");
+        let draft = draft::append_or_create(
+            &mut tx,
+            telegram_capture(
+                &household,
+                chat + 1,
+                household.owner_id,
+                "другой чат",
+                vec![raw("Другой чат", ListKind::Tasks)],
+            ),
+            now,
+        )
+        .await
+        .expect("other chat");
+        tx.commit().await.expect("commit");
+        draft
+    };
+    assert_ne!(other_chat.id, first.id);
+
+    let other_user = {
+        let mut tx = conn.begin().await.expect("transaction");
+        let draft = draft::append_or_create(
+            &mut tx,
+            telegram_capture(
+                &household,
+                chat,
+                household.member_id,
+                "другой пользователь",
+                vec![raw("Другой пользователь", ListKind::Tasks)],
+            ),
+            now,
+        )
+        .await
+        .expect("other user");
+        tx.commit().await.expect("commit");
+        draft
+    };
+    assert_ne!(other_user.id, first.id);
+
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM capture_drafts
+         WHERE household_id = $1 AND status = 'pending'",
+    )
+    .bind(household.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("pending drafts");
+    assert_eq!(pending, 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_old_draft_without_parts_appends_its_raw_text_as_the_first_part() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let chat = 4_100_007_i64;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let id = draft::create(
+        &mut conn,
+        telegram_capture(
+            &household,
+            chat,
+            household.owner_id,
+            "старый текст",
+            vec![raw("Старое", ListKind::Tasks)],
+        ),
+        now,
+    )
+    .await
+    .expect("old draft")
+    .id;
+    sqlx::query("UPDATE capture_drafts SET raw_parts = '{}' WHERE id = $1")
+        .bind(id)
+        .execute(&mut *conn)
+        .await
+        .expect("clear parts like an old row");
+
+    let appended = {
+        let mut tx = conn.begin().await.expect("transaction");
+        let draft = draft::append_or_create(
+            &mut tx,
+            telegram_capture(
+                &household,
+                chat,
+                household.owner_id,
+                "новый текст",
+                vec![raw("Новое", ListKind::Tasks)],
+            ),
+            now + Duration::minutes(1),
+        )
+        .await
+        .expect("append");
+        tx.commit().await.expect("commit");
+        draft
+    };
+
+    assert_eq!(appended.id, id);
+    let stored = drafts::get(&mut conn, household.household_id, id)
+        .await
+        .expect("draft");
+    assert_eq!(
+        stored.raw_parts,
+        vec!["старый текст".to_owned(), "новый текст".to_owned()]
+    );
+    assert_eq!(stored.raw_text, "старый текст\nновый текст");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invalid_appended_item_does_not_break_the_existing_draft() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let chat = 4_100_008_i64;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let first = {
+        let mut tx = conn.begin().await.expect("transaction");
+        let draft = draft::append_or_create(
+            &mut tx,
+            telegram_capture(
+                &household,
+                chat,
+                household.owner_id,
+                "купить хлеб",
+                vec![raw("Хлеб", ListKind::Shopping)],
+            ),
+            now,
+        )
+        .await
+        .expect("first");
+        tx.commit().await.expect("commit");
+        draft
+    };
+
+    let mut broken = raw("Просроченная", ListKind::Tasks);
+    broken.due_date = Some(date_in_days(now, -3));
+    let second = {
+        let mut tx = conn.begin().await.expect("transaction");
+        let draft = draft::append_or_create(
+            &mut tx,
+            telegram_capture(
+                &household,
+                chat,
+                household.owner_id,
+                "просроченная задача",
+                vec![broken],
+            ),
+            now + Duration::minutes(1),
+        )
+        .await
+        .expect("append");
+        tx.commit().await.expect("commit");
+        draft
+    };
+    assert_eq!(second.id, first.id);
+
+    let view = draft::view(
+        &mut conn,
+        household.household_id,
+        first.id,
+        now + Duration::minutes(1),
+    )
+    .await
+    .expect("view");
+    assert_eq!(view.validated.items.len(), 2);
+    assert!(view.validated.items[0].is_valid());
+    assert_eq!(view.validated.items[1].errors[0].code, "date_past");
 }
