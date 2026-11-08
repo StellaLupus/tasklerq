@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use sqlx::PgConnection;
 use uuid::Uuid;
 
+use super::completions;
 use super::row::{hydrate_one, load_item, load_item_any, row_by_id};
 use super::{
     UNDO_WINDOW_EXPIRED, UNDO_WINDOW_MINUTES, local_today, recurrence_values, version_conflict,
@@ -208,6 +209,107 @@ pub async fn reopen(
         EventType::Reopened,
         json!({"before": current, "after": updated}),
         None,
+        now,
+    )
+    .await?;
+
+    Ok(updated)
+}
+
+/// Вернуть в работу выполнение из журнала.
+///
+/// Возвращается только последнее неотменённое выполнение. У задачи без
+/// повторения это прежний [`reopen`]; у повторяющейся — только пока элемент не
+/// менялся после выполнения, иначе восстановленный срок разошёлся бы с
+/// текущим состоянием серии.
+pub async fn revert_completion(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    actor: &Actor,
+    item_id: Uuid,
+    completion_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<Item, DomainError> {
+    let row = row_by_id(conn, household_id, item_id, false, true).await?;
+    let current = hydrate_one(conn, row.clone()).await?;
+
+    let completion = completions::latest_for_item(conn, household_id, item_id)
+        .await?
+        .ok_or_else(|| DomainError::conflict("there is no completion to revert"))?;
+    if completion.completion.event_id != completion_id {
+        return Err(DomainError::conflict(
+            "only the latest completion can be reverted",
+        ));
+    }
+
+    let snapshot = completion
+        .payload
+        .get("before")
+        .and_then(|before| serde_json::from_value::<Item>(before.clone()).ok());
+
+    if row.recurrence().is_some() {
+        if completion.version_after() != Some(row.version) {
+            return Err(DomainError::conflict(
+                "the item changed after the completion",
+            ));
+        }
+        if snapshot.is_none() {
+            return Err(DomainError::conflict(
+                "stored completion snapshot is invalid",
+            ));
+        }
+    }
+
+    let (due_at, due_date, completed_at, completed_by_user_id) = match &snapshot {
+        Some(before) => (
+            before.due_at,
+            before.due_date,
+            before.completed_at,
+            before.completed_by_user_id,
+        ),
+        None => (row.due_at, row.due_date, None, None),
+    };
+    // Слот относится к конкретному правилу: восстановить его можно, только
+    // если правило не менялось (см. `reopen`).
+    let (occurrence_date, occurrence_time) = match (
+        row.recurrence(),
+        snapshot.as_ref().and_then(|item| item.recurrence.as_ref()),
+    ) {
+        (Some(current_rule), Some(previous_rule)) if current_rule.same_rule(previous_rule) => {
+            (previous_rule.occurrence_date, previous_rule.occurrence_time)
+        }
+        _ => (None, None),
+    };
+
+    sqlx::query(
+        "UPDATE items
+         SET status = 'open', due_at = $3, due_date = $4, completed_at = $5,
+             completed_by_user_id = $6, recurrence_occurrence_date = $7,
+             recurrence_occurrence_time = $8,
+             version = version + 1, updated_at = $9
+         WHERE id = $1 AND household_id = $2",
+    )
+    .bind(item_id)
+    .bind(household_id)
+    .bind(due_at)
+    .bind(due_date)
+    .bind(completed_at)
+    .bind(completed_by_user_id)
+    .bind(occurrence_date)
+    .bind(occurrence_time)
+    .bind(now)
+    .execute(&mut *conn)
+    .await?;
+
+    let updated = load_item(conn, household_id, item_id).await?;
+    events::insert(
+        conn,
+        household_id,
+        item_id,
+        actor,
+        EventType::Reopened,
+        json!({"before": current, "after": updated}),
+        Some(completion_id),
         now,
     )
     .await?;

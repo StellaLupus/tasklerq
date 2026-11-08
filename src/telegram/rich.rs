@@ -68,6 +68,8 @@ pub enum Block<A> {
     },
     /// Цитата пользовательского текста.
     Quote(String),
+    /// Цитата, свёрнутая при любой длине: одной строки тоже.
+    CollapsedQuote(String),
     /// Ряд кнопок.
     Buttons(Vec<Button<A>>),
 }
@@ -135,6 +137,12 @@ impl<A> View<A> {
     /// Добавить цитату пользовательского текста.
     pub fn quote(mut self, text: impl Into<String>) -> Self {
         self.blocks.push(Block::Quote(text.into()));
+        self
+    }
+
+    /// Добавить цитату, которая всегда свёрнута, даже если в ней одна строка.
+    pub fn collapsed_quote(mut self, text: impl Into<String>) -> Self {
+        self.blocks.push(Block::CollapsedQuote(text.into()));
         self
     }
 
@@ -262,6 +270,12 @@ pub fn render<A>(view: &View<A>, tokens: &[String]) -> RichMessage {
                     "<blockquote>"
                 };
                 lines.push(format!("{open}{}</blockquote>", escape_inline(text)));
+            }
+            Block::CollapsedQuote(text) => {
+                lines.push(format!(
+                    "<blockquote expandable>{}</blockquote>",
+                    escape_inline(text)
+                ));
             }
             Block::Buttons(buttons) => {
                 for chunk in buttons.chunks(MAX_BUTTONS_PER_ROW) {
@@ -406,6 +420,21 @@ mod tests {
         assert!(
             !html.starts_with("<blockquote expandable>"),
             "a trailing newline must not count as a fourth line: {html}"
+        );
+    }
+
+    #[test]
+    fn a_collapsed_quote_is_expandable_even_on_one_line() {
+        let view = View::<()>::new().collapsed_quote("Выполнения\nвт, 4 ноя");
+        assert_eq!(
+            render(&view, &[]).html,
+            "<blockquote expandable>Выполнения<br/>вт, 4 ноя</blockquote>"
+        );
+
+        let short = View::<()>::new().collapsed_quote("строка");
+        assert_eq!(
+            render(&short, &[]).html,
+            "<blockquote expandable>строка</blockquote>"
         );
     }
 

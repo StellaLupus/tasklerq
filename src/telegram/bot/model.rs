@@ -107,6 +107,10 @@ pub enum Screen {
         item_id: Uuid,
         /// Куда ведёт «Назад».
         back: Box<Screen>,
+        /// Выполнение, из записи журнала которого открыта карточка. Старое
+        /// состояние без поля читается как карточка без контекста.
+        #[serde(default)]
+        completion_id: Option<Uuid>,
     },
     /// Быстрый выбор срока в карточке задачи.
     Due {
@@ -804,6 +808,10 @@ pub enum Action {
         version: i32,
         /// Куда вернуться.
         back: Screen,
+        /// Выполнение, которое возвращается. Без значения возвращается
+        /// последнее выполнение элемента, а если его нет — прежний `reopen`.
+        #[serde(default)]
+        completion_id: Option<Uuid>,
     },
     /// Отменить последнее действие над элементом.
     Undo {
@@ -1833,6 +1841,7 @@ mod tests {
         let card = Screen::Item {
             item_id: Uuid::nil(),
             back: Box::new(list.clone()),
+            completion_id: None,
         };
         assert_eq!(card.depth(), 3);
         assert_eq!(
@@ -1881,11 +1890,47 @@ mod tests {
         let card = Screen::Item {
             item_id: Uuid::nil(),
             back: Box::new(list),
+            completion_id: None,
         };
         assert_eq!(card.depth(), 4);
         assert_eq!(
             card.trail("Оплатить интернет", Some("Задачи")),
             "Все списки › Задачи › Оплатить интернет"
+        );
+    }
+
+    #[test]
+    fn old_item_json_without_completion_is_read_as_a_plain_card() {
+        let screen: Screen = serde_json::from_value(json!({
+            "t": "item",
+            "item_id": Uuid::nil(),
+            "back": {"t": "menu"},
+        }))
+        .expect("legacy item screen");
+        assert_eq!(
+            screen,
+            Screen::Item {
+                item_id: Uuid::nil(),
+                back: Box::new(Screen::Menu),
+                completion_id: None,
+            }
+        );
+
+        let action: Action = serde_json::from_value(json!({
+            "a": "reopen",
+            "item_id": Uuid::nil(),
+            "version": 1,
+            "back": {"t": "menu"},
+        }))
+        .expect("legacy reopen action");
+        assert_eq!(
+            action,
+            Action::Reopen {
+                item_id: Uuid::nil(),
+                version: 1,
+                back: Screen::Menu,
+                completion_id: None,
+            }
         );
     }
 
@@ -1984,6 +2029,7 @@ mod tests {
             Screen::Item {
                 item_id: Uuid::nil(),
                 back: Box::new(list.clone()),
+                completion_id: None,
             },
             Screen::Due {
                 item_id: Uuid::nil(),

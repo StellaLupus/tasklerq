@@ -119,6 +119,7 @@ pub async fn list_view(
                 to: Screen::Item {
                     item_id: item.id,
                     back: Box::new(here(page)),
+                    completion_id: None,
                 },
             }
         } else {
@@ -132,6 +133,7 @@ pub async fn list_view(
                     item_id: item.id,
                     version: item.version,
                     back: here(page),
+                    completion_id: None,
                 },
             }
         };

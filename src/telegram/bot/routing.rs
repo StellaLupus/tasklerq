@@ -286,6 +286,7 @@ mod tests {
                 Screen::Item {
                     item_id: Uuid::nil(),
                     back: back.clone(),
+                    completion_id: None,
                 },
                 None,
                 None,

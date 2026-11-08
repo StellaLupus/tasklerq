@@ -253,6 +253,7 @@ pub async fn on_action(ctx: &mut Ctx<'_>, act: FormAct) -> Result<(), Fail> {
             ctx.present(Screen::Item {
                 item_id,
                 back: Box::new(back),
+                completion_id: None,
             })
             .await
         }

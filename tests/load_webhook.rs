@@ -323,6 +323,7 @@ async fn issue_callbacks(
             serde_json::to_value(Action::Go {
                 to: Screen::Item {
                     item_id,
+                    completion_id: None,
                     back: Box::new(Screen::List {
                         list_id: household.tasks_list_id,
                         page: 0,

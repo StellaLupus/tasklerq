@@ -289,6 +289,7 @@ pub async fn start_due_text(
             .present(Screen::Item {
                 item_id,
                 back: Box::new(back),
+                completion_id: None,
             })
             .await;
     }

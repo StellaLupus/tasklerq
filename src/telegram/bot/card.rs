@@ -23,6 +23,9 @@ use super::model::{
 use super::screens::{clip, nav_row};
 use super::{Ctx, Fail};
 
+/// Сколько последних выполнений показывает карточка.
+const RECENT_COMPLETIONS: usize = 5;
+
 /// Название приоритета с маркером, понятным без цвета.
 pub fn priority_label(priority: ItemPriority) -> &'static str {
     match priority {
@@ -156,14 +159,32 @@ async fn parent_list_name(ctx: &mut Ctx<'_>, back: &Screen) -> Result<Option<Str
 }
 
 /// Карточка элемента.
-pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui, Fail> {
+pub async fn view(
+    ctx: &mut Ctx<'_>,
+    item_id: Uuid,
+    back: &Screen,
+    completion_id: Option<Uuid>,
+) -> Result<Ui, Fail> {
     let (item, list) = load(ctx, item_id).await?;
     let names = names(ctx).await?;
+    let shopping = list.kind != ListKind::Tasks;
+    let completions = if shopping {
+        Vec::new()
+    } else {
+        let household_id = ctx.household()?.id;
+        items::completions::recent_for_item(
+            &mut *ctx.conn,
+            household_id,
+            item_id,
+            RECENT_COMPLETIONS,
+        )
+        .await?
+    };
     let here = Screen::Item {
         item_id,
         back: Box::new(back.clone()),
+        completion_id,
     };
-    let shopping = list.kind != ListKind::Tasks;
     let done = item.status == ItemStatus::Done;
     let parent = parent_list_name(ctx, back).await?;
     let mut ui = screen_heading(&here, &item.title, parent.as_deref());
@@ -231,6 +252,36 @@ pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui,
     {
         ui = ui.quote(notes.to_owned());
     }
+    if !completions.is_empty() {
+        let lines: Vec<String> = completions
+            .iter()
+            .map(|completion| completion_line(completion, &names, ctx.tz, ctx.now))
+            .collect();
+        ui = ui.bold("Выполнения").collapsed_quote(lines.join("\n"));
+    }
+
+    // Для задачи возврат ведёт туда, откуда открыли карточку (журнал, список
+    // или «Выполнено сегодня»); у покупки остаётся прежнее поведение.
+    let origin = if shopping { here.clone() } else { back.clone() };
+    let revert = |completion_id: Option<Uuid>| {
+        button(
+            "↩️ Вернуть",
+            Action::Reopen {
+                item_id,
+                version: item.version,
+                back: origin.clone(),
+                completion_id,
+            },
+        )
+    };
+    // Кнопка есть ровно тогда, когда `revert_completion` пройдёт: выполнение
+    // последнее, а повторяющаяся задача не менялась после него.
+    let revertible = completion_id.is_some_and(|id| {
+        completions.first().is_some_and(|latest| {
+            latest.event_id == id
+                && (item.recurrence.is_none() || latest.version_after == Some(item.version))
+        })
+    });
 
     let edit = button(
         ru::EDIT_BUTTON,
@@ -240,16 +291,15 @@ pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui,
         },
     );
     let main = if done {
-        button(
-            "↩️ Вернуть",
-            Action::Reopen {
-                item_id,
-                version: item.version,
-                back: here.clone(),
-            },
-        )
+        if shopping {
+            Some(revert(None))
+        } else if completion_id.is_some() {
+            revertible.then(|| revert(completion_id))
+        } else {
+            Some(revert(None))
+        }
     } else {
-        button(
+        Some(button(
             if shopping {
                 ru::BOUGHT_BUTTON
             } else {
@@ -260,8 +310,9 @@ pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui,
                 version: item.version,
                 back: back.clone(),
             },
-        )
+        ))
     };
+    let extra_revert = (!done && revertible).then(|| revert(completion_id));
     let delete = button(
         "🗑 Удалить",
         Action::DeleteAsk {
@@ -279,19 +330,66 @@ pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui,
         },
     );
 
-    if shopping || done {
-        ui = ui.row(vec![main, edit]).row(vec![delete]);
+    if done || shopping {
+        let mut row: Vec<_> = main.into_iter().collect();
+        row.push(edit);
+        ui = ui.row(row).row(vec![delete]);
     } else {
-        ui = ui.row(vec![main, due_button]).row(vec![edit, delete]);
+        let mut row: Vec<_> = main.into_iter().collect();
+        row.push(due_button);
+        ui = ui.row(row).row(vec![edit, delete]);
+        if let Some(revert) = extra_revert {
+            ui = ui.row(vec![revert]);
+        }
     }
     Ok(ui.row(nav_row(&here, back.clone())))
+}
+
+/// Строка выполнения: план → факт, исполнитель и отклонение от плана.
+fn completion_line(
+    completion: &items::completions::Completion,
+    names: &HashMap<Uuid, String>,
+    tz: Tz,
+    now: DateTime<Utc>,
+) -> String {
+    let today = now.with_timezone(&tz).date_naive();
+    let plan = match (completion.due_at, completion.due_date) {
+        (Some(at), _) => {
+            let local = at.with_timezone(&tz);
+            format!(
+                "{}, {}",
+                ru::fixed_date_label(local.date_naive(), today),
+                local.format("%H:%M")
+            )
+        }
+        (None, Some(date)) => ru::fixed_date_label(date, today),
+        (None, None) => "без срока".to_owned(),
+    };
+    let actual = completion.completed_at.with_timezone(&tz);
+    let mut line = format!(
+        "{plan} → {}, {}",
+        ru::fixed_date_label(actual.date_naive(), today),
+        actual.format("%H:%M")
+    );
+    if let Some(name) = completion.actor_user_id.and_then(|id| names.get(&id)) {
+        line.push_str(&format!(" · {name}"));
+    }
+    if let Some(deviation) = ru::completion_deviation(
+        completion.due_at,
+        completion.due_date,
+        completion.completed_at,
+        tz,
+    ) {
+        line.push_str(&format!(" · {deviation}"));
+    }
+    line
 }
 
 /// Экран быстрого срока.
 pub async fn due(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui, Fail> {
     let (item, list) = load(ctx, item_id).await?;
     if !due_editable(&item, &list) {
-        return view(ctx, item_id, back).await;
+        return view(ctx, item_id, back, None).await;
     }
     let here = Screen::Due {
         item_id,
@@ -337,6 +435,7 @@ pub async fn due(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui, 
     let card = Screen::Item {
         item_id,
         back: Box::new(back.clone()),
+        completion_id: None,
     };
     Ok(ui.row(nav_row(&here, card)))
 }
@@ -355,6 +454,7 @@ pub async fn set_due(
             .present(Screen::Item {
                 item_id,
                 back: Box::new(back),
+                completion_id: None,
             })
             .await;
     }
@@ -406,6 +506,7 @@ pub async fn apply_due(
             .present(Screen::Item {
                 item_id,
                 back: Box::new(back),
+                completion_id: None,
             })
             .await;
     }
@@ -445,6 +546,7 @@ async fn finish_due(
     ctx.present(Screen::Item {
         item_id,
         back: Box::new(back),
+        completion_id: None,
     })
     .await
 }
@@ -564,6 +666,7 @@ pub async fn confirm_delete(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> 
         Screen::Item {
             item_id,
             back: Box::new(back.clone()),
+            completion_id: None,
         },
     ));
     Ok(ui.row(row))
@@ -618,19 +721,57 @@ pub async fn reopen(
     ctx: &mut Ctx<'_>,
     item_id: Uuid,
     version: i32,
+    completion_id: Option<Uuid>,
     back: Screen,
 ) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
     let actor = ctx.actor()?;
-    items::reopen(
-        &mut *ctx.conn,
-        household_id,
-        &actor,
-        item_id,
-        Some(version),
-        ctx.now,
-    )
-    .await?;
+    let (_, list) = load(ctx, item_id).await?;
+    let result = if list.kind == ListKind::Tasks {
+        let completion_id = match completion_id {
+            Some(completion_id) => Some(completion_id),
+            None => items::completions::latest_for_item(&mut *ctx.conn, household_id, item_id)
+                .await?
+                .map(|event| event.completion.event_id),
+        };
+        match completion_id {
+            Some(completion_id) => {
+                items::revert_completion(
+                    &mut *ctx.conn,
+                    household_id,
+                    &actor,
+                    item_id,
+                    completion_id,
+                    ctx.now,
+                )
+                .await
+            }
+            // Выполнения нет: старые данные за сроком хранения событий.
+            None => {
+                items::reopen(
+                    &mut *ctx.conn,
+                    household_id,
+                    &actor,
+                    item_id,
+                    Some(version),
+                    ctx.now,
+                )
+                .await
+            }
+        }
+    } else {
+        // Покупки возвращаются прежним путём.
+        items::reopen(
+            &mut *ctx.conn,
+            household_id,
+            &actor,
+            item_id,
+            Some(version),
+            ctx.now,
+        )
+        .await
+    };
+    result?;
     ctx.toast("Возвращено в работу");
     ctx.present(back).await
 }

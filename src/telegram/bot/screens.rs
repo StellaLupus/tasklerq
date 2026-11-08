@@ -31,7 +31,11 @@ pub async fn build(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
             edit,
             from_lists,
         } => list(ctx, *list_id, *page, *edit, *from_lists).await,
-        Screen::Item { item_id, back } => card::view(ctx, *item_id, back).await,
+        Screen::Item {
+            item_id,
+            back,
+            completion_id,
+        } => card::view(ctx, *item_id, back, *completion_id).await,
         Screen::Editor { item_id, back } => forms::editor_screen(ctx, *item_id, back).await,
         Screen::Due { item_id, back } => card::due(ctx, *item_id, back).await,
         Screen::Deleted {
@@ -470,6 +474,7 @@ async fn tasks_list(
                 Screen::Item {
                     item_id: item.id,
                     back: Box::new(here(page)),
+                    completion_id: None,
                 },
             )]);
         }
@@ -523,6 +528,7 @@ fn done_today_section(
             Screen::Item {
                 item_id: completion.item_id,
                 back: Box::new(back.clone()),
+                completion_id: Some(completion.event_id),
             },
         )]);
     }
@@ -581,6 +587,7 @@ async fn history(ctx: &mut Ctx<'_>, page: u32, back: &Screen) -> Result<Ui, Fail
             Screen::Item {
                 item_id: entry.completion.item_id,
                 back: Box::new(screen.clone()),
+                completion_id: Some(entry.completion.event_id),
             },
         )]);
     }
@@ -631,6 +638,7 @@ async fn mine(ctx: &mut Ctx<'_>, page: u32) -> Result<Ui, Fail> {
             Screen::Item {
                 item_id: item.id,
                 back: Box::new(here(page)),
+                completion_id: None,
             },
         )]);
     }
@@ -726,6 +734,7 @@ async fn results(
             Screen::Item {
                 item_id: hit.item.id,
                 back: Box::new(here(page)),
+                completion_id: None,
             },
         )]);
     }

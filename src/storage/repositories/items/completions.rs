@@ -72,6 +72,24 @@ pub struct Completion {
     pub completed_at: DateTime<Utc>,
     /// Кто выполнил.
     pub actor_user_id: Option<Uuid>,
+    /// Версия элемента сразу после выполнения.
+    pub version_after: Option<i32>,
+}
+
+/// Выполнение вместе с сырым снимком события.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionEvent {
+    /// Запись выполнения.
+    pub completion: Completion,
+    /// Снимок события `completed`: `before` и `after`.
+    pub payload: Value,
+}
+
+impl CompletionEvent {
+    /// Версия элемента сразу после выполнения.
+    pub fn version_after(&self) -> Option<i32> {
+        self.completion.version_after
+    }
 }
 
 /// Запись журнала: выполнение и вычисленный плановый день.
@@ -191,6 +209,70 @@ pub async fn for_household_since(
     Ok(rows.into_iter().map(Completion::from).collect())
 }
 
+/// Последние выполнения элемента, начиная с поздних.
+///
+/// Правило отбора то же, что у журнала и раздела «Выполнено сегодня». Индекс
+/// `(item_id, created_at)` отсекает хвост.
+pub async fn recent_for_item(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    item_id: Uuid,
+    limit: usize,
+) -> Result<Vec<Completion>, DomainError> {
+    let sql = format!(
+        "SELECT e.id, e.item_id, e.actor_user_id, e.created_at, e.payload,
+                i.list_id AS current_list_id
+         FROM item_events e
+         JOIN items i ON i.id = e.item_id AND i.household_id = e.household_id
+         WHERE {COMPLETION_SELECTION}
+           AND e.item_id = $2
+         ORDER BY e.created_at DESC, e.id DESC
+         LIMIT $3"
+    );
+    let rows = sqlx::query_as::<_, CompletionRow>(&sql)
+        .bind(household_id)
+        .bind(item_id)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(conn)
+        .await?;
+
+    Ok(rows.into_iter().map(Completion::from).collect())
+}
+
+/// Последнее неотменённое выполнение элемента вместе со снимком события.
+///
+/// Нужно возврату выполнения: проверить, что оно последнее, и восстановить
+/// состояние из `payload.before`.
+pub async fn latest_for_item(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    item_id: Uuid,
+) -> Result<Option<CompletionEvent>, DomainError> {
+    let sql = format!(
+        "SELECT e.id, e.item_id, e.actor_user_id, e.created_at, e.payload,
+                i.list_id AS current_list_id
+         FROM item_events e
+         JOIN items i ON i.id = e.item_id AND i.household_id = e.household_id
+         WHERE {COMPLETION_SELECTION}
+           AND e.item_id = $2
+         ORDER BY e.created_at DESC, e.id DESC
+         LIMIT 1"
+    );
+    let row = sqlx::query_as::<_, CompletionRow>(&sql)
+        .bind(household_id)
+        .bind(item_id)
+        .fetch_optional(conn)
+        .await?;
+
+    Ok(row.map(|row| {
+        let payload = row.payload.clone();
+        CompletionEvent {
+            completion: Completion::from(row),
+            payload,
+        }
+    }))
+}
+
 /// Страница журнала выполнений household.
 ///
 /// Глубину журнала задаёт срок хранения событий: нижней границы по времени
@@ -276,6 +358,12 @@ impl From<CompletionRow> for Completion {
         let due_at = field(before, "due_at");
         let due_date = field(before, "due_date");
         let list_id = field(before, "list_id").unwrap_or(row.current_list_id);
+        let version_after = row
+            .payload
+            .get("after")
+            .and_then(|after| after.get("version"))
+            .and_then(Value::as_i64)
+            .and_then(|version| i32::try_from(version).ok());
 
         Self {
             event_id: row.id,
@@ -286,6 +374,7 @@ impl From<CompletionRow> for Completion {
             due_date,
             completed_at: row.created_at,
             actor_user_id: row.actor_user_id,
+            version_after,
         }
     }
 }

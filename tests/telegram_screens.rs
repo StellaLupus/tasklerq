@@ -5083,6 +5083,128 @@ async fn history_entry_opens_the_card_and_back_returns_to_the_same_page() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn card_shows_the_completion_block_with_plan_fact_actor_and_deviation() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let today = NaiveDate::from_ymd_opt(2025, 11, 6).expect("date");
+    let now = local_utc(moscow, today, 13, 47);
+    let mut bot = onboarded_at(&db.pool, "Мария", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut input = new_item(household.tasks_list_id, "Полить цветы");
+    input.due_date = Some(NaiveDate::from_ymd_opt(2025, 11, 4).expect("date"));
+    let item = create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &actor,
+        item.id,
+        Some(item.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("complete");
+    drop(conn);
+
+    bot.press("Задачи").await;
+    bot.press("История").await;
+    bot.press("Полить цветы · Мария").await;
+    bot.assert_screen_contains("Выполнения");
+    bot.assert_screen_contains("<blockquote expandable>");
+    bot.assert_screen_contains("вт, 4 ноя → чт, 6 ноя, 13:47 · Мария · +2 дня");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_entry_offers_revert_only_for_the_latest_completion() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let today = NaiveDate::from_ymd_opt(2026, 11, 6).expect("date");
+    let now = local_utc(moscow, today, 12, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut input = new_item(household.tasks_list_id, "Полить цветы");
+    input.due_date = Some(NaiveDate::from_ymd_opt(2026, 11, 4).expect("date"));
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Daily, Vec::new()));
+    let item = create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let first = items::complete(
+        &mut conn,
+        household.household_id,
+        &actor,
+        item.id,
+        Some(item.version),
+        "Europe/Moscow",
+        local_utc(moscow, NaiveDate::from_ymd_opt(2026, 11, 4).unwrap(), 12, 0),
+    )
+    .await
+    .expect("first completion");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &actor,
+        item.id,
+        Some(first.version),
+        "Europe/Moscow",
+        local_utc(moscow, NaiveDate::from_ymd_opt(2026, 11, 5).unwrap(), 12, 0),
+    )
+    .await
+    .expect("second completion");
+    drop(conn);
+
+    bot.press("Задачи").await;
+    bot.press("История").await;
+    // Новое выполнение — 5 ноября, оно первое в журнале.
+    bot.press("Полить цветы").await;
+    bot.assert_has_button("↩️ Вернуть");
+    bot.press("Назад").await;
+    bot.assert_screen_contains("История");
+
+    bot.press_after("Среда, 4 ноя", "Полить цветы").await;
+    assert!(
+        bot.find_button("↩️ Вернуть").is_none(),
+        "an older completion must not be revertible:\n{}",
+        bot.screen()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_today_row_of_a_recurring_task_opens_the_card_with_revert() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let today = NaiveDate::from_ymd_opt(2026, 11, 6).expect("date");
+    let now = local_utc(moscow, today, 12, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut input = new_item(household.tasks_list_id, "Полить цветы");
+    input.due_date = Some(today);
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Daily, Vec::new()));
+    let item = create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
+
+    bot.press("Задачи").await;
+    bot.press("Полить цветы").await;
+    bot.press("Выполнено").await;
+    bot.assert_screen_contains("Выполнено сегодня");
+    bot.press("✅ Полить цветы").await;
+    bot.assert_has_button("↩️ Вернуть");
+    bot.press("Вернуть").await;
+
+    assert_eq!(
+        item_due(&db.pool, item.id).await,
+        (None, Some(today)),
+        "revert restores the planned due date"
+    );
+    assert!(
+        !bot.screen().contains("Выполнено сегодня"),
+        "the reverted completion must leave the done-today section:\n{}",
+        bot.screen()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_list_from_all_lists_keeps_actions_and_navigation_on_separate_rows() {
     let db = db().await;
     let mut bot = onboarded_named(&db.pool, "Alice").await;
