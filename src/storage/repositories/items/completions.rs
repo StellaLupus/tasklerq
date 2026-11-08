@@ -15,6 +15,44 @@ use crate::domain::error::DomainError;
 /// Название выполнения, если снимок `payload.before` его не сохранил.
 pub const UNTITLED: &str = "Без названия";
 
+/// Размер страницы журнала выполнений.
+pub const JOURNAL_PAGE_SIZE: usize = 8;
+
+/// Общее условие отбора выполнения для журнала и раздела «Выполнено сегодня».
+///
+/// Подставляется как фрагмент `WHERE` с `$1` — household. Список
+/// `item_events` уже алиасирован как `e`, элемент — как `i`.
+const COMPLETION_SELECTION: &str = "\
+    e.household_id = $1
+    AND e.event_type = 'completed'
+    AND e.undo_of IS NULL
+    AND i.deleted_at IS NULL
+    AND NOT EXISTS (
+        SELECT 1 FROM item_events undo WHERE undo.undo_of = e.id
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM item_events r
+        WHERE r.household_id = e.household_id
+          AND r.item_id = e.item_id
+          AND r.event_type = 'reopened'
+          AND r.undo_of IS NULL
+          AND (r.created_at, r.id) > (e.created_at, e.id)
+          AND NOT EXISTS (
+              SELECT 1 FROM item_events u WHERE u.undo_of = r.id
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM item_events c
+              WHERE c.household_id = e.household_id
+                AND c.item_id = e.item_id
+                AND c.event_type = 'completed'
+                AND c.undo_of IS NULL
+                AND (c.created_at, c.id) > (e.created_at, e.id)
+                AND (c.created_at, c.id) < (r.created_at, r.id)
+          )
+    )";
+
 /// Запись выполнения.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completion {
@@ -36,6 +74,33 @@ pub struct Completion {
     pub actor_user_id: Option<Uuid>,
 }
 
+/// Запись журнала: выполнение и вычисленный плановый день.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalEntry {
+    /// Выполнение.
+    pub completion: Completion,
+    /// Плановый день срока в поясе пользователя; `None` — «Без срока».
+    pub planned_day: Option<NaiveDate>,
+}
+
+/// Страница журнала выполнений household.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalPage {
+    /// Записи страницы.
+    pub entries: Vec<JournalEntry>,
+    /// Номер страницы с нуля после ограничения последней.
+    pub page: u32,
+    /// Всего страниц, минимум одна.
+    pub pages: u32,
+}
+
+impl JournalPage {
+    /// Есть ли следующая страница.
+    pub fn has_next(&self) -> bool {
+        self.page + 1 < self.pages
+    }
+}
+
 /// Сырая строка выборки: снимок остаётся `jsonb`, чтобы разбирать поля
 /// по отдельности и терпимо.
 #[derive(sqlx::FromRow)]
@@ -46,6 +111,19 @@ struct CompletionRow {
     created_at: DateTime<Utc>,
     payload: Value,
     current_list_id: Uuid,
+}
+
+/// Сырая строка журнала: выполнение и плановый день из SQL.
+#[derive(sqlx::FromRow)]
+struct JournalRow {
+    id: Uuid,
+    item_id: Uuid,
+    actor_user_id: Option<Uuid>,
+    created_at: DateTime<Utc>,
+    payload: Value,
+    current_list_id: Uuid,
+    planned_day: Option<NaiveDate>,
+    total: i64,
 }
 
 /// Начало текущего дня в часовом поясе пользователя.
@@ -95,49 +173,95 @@ pub async fn for_household_since(
     household_id: Uuid,
     since: DateTime<Utc>,
 ) -> Result<Vec<Completion>, DomainError> {
-    let rows = sqlx::query_as::<_, CompletionRow>(
+    let sql = format!(
         "SELECT e.id, e.item_id, e.actor_user_id, e.created_at, e.payload,
                 i.list_id AS current_list_id
          FROM item_events e
          JOIN items i ON i.id = e.item_id AND i.household_id = e.household_id
-         WHERE e.household_id = $1
-           AND e.event_type = 'completed'
-           AND e.undo_of IS NULL
+         WHERE {COMPLETION_SELECTION}
            AND e.created_at >= $2
-           AND i.deleted_at IS NULL
-           AND NOT EXISTS (
-               SELECT 1 FROM item_events undo WHERE undo.undo_of = e.id
-           )
-           AND NOT EXISTS (
-               SELECT 1
-               FROM item_events r
-               WHERE r.household_id = e.household_id
-                 AND r.item_id = e.item_id
-                 AND r.event_type = 'reopened'
-                 AND r.undo_of IS NULL
-                 AND (r.created_at, r.id) > (e.created_at, e.id)
-                 AND NOT EXISTS (
-                     SELECT 1 FROM item_events u WHERE u.undo_of = r.id
-                 )
-                 AND NOT EXISTS (
-                     SELECT 1
-                     FROM item_events c
-                     WHERE c.household_id = e.household_id
-                       AND c.item_id = e.item_id
-                       AND c.event_type = 'completed'
-                       AND c.undo_of IS NULL
-                       AND (c.created_at, c.id) > (e.created_at, e.id)
-                       AND (c.created_at, c.id) < (r.created_at, r.id)
-                 )
-           )
-         ORDER BY e.created_at DESC, e.id DESC",
-    )
-    .bind(household_id)
-    .bind(since)
-    .fetch_all(conn)
-    .await?;
+         ORDER BY e.created_at DESC, e.id DESC"
+    );
+    let rows = sqlx::query_as::<_, CompletionRow>(&sql)
+        .bind(household_id)
+        .bind(since)
+        .fetch_all(conn)
+        .await?;
 
     Ok(rows.into_iter().map(Completion::from).collect())
+}
+
+/// Страница журнала выполнений household.
+///
+/// Глубину журнала задаёт срок хранения событий: нижней границы по времени
+/// нет. Плановый день считается в SQL из снимка `before`: `due_at` в поясе
+/// пользователя, иначе `due_date`. Битая дата не роняет запрос — запись уходит
+/// в «Без срока».
+///
+/// Порядок: плановый день от поздних к ранним, внутри дня факт выполнения по
+/// убыванию и `id`, затем все записи без срока по тому же правилу.
+pub async fn journal_page(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    timezone: Tz,
+    page: u32,
+) -> Result<JournalPage, DomainError> {
+    // Один запрос и один снимок: `count(*) OVER ()` считает все отобранные
+    // записи, а OFFSET ограничивается последней страницей прямо в SQL. Иначе
+    // между отдельными count и страницей новое выполнение развело бы `pages`
+    // и содержимое.
+    let sql = format!(
+        "WITH selected AS (
+             SELECT e.id, e.item_id, e.actor_user_id, e.created_at, e.payload,
+                    i.list_id AS current_list_id,
+                    count(*) OVER () AS total,
+                    CASE
+                        WHEN btrim(lower(e.payload->'before'->>'due_at'))
+                                 NOT IN ('infinity', '-infinity')
+                         AND pg_input_is_valid(e.payload->'before'->>'due_at', 'timestamptz')
+                            THEN ((e.payload->'before'->>'due_at')::timestamptz AT TIME ZONE $2)::date
+                        WHEN btrim(lower(e.payload->'before'->>'due_date'))
+                                 NOT IN ('infinity', '-infinity')
+                         AND pg_input_is_valid(e.payload->'before'->>'due_date', 'date')
+                            THEN (e.payload->'before'->>'due_date')::date
+                    END AS planned_day
+             FROM item_events e
+             JOIN items i ON i.id = e.item_id AND i.household_id = e.household_id
+             WHERE {COMPLETION_SELECTION}
+         ),
+         paged AS (
+             SELECT *
+             FROM selected
+             ORDER BY planned_day DESC NULLS LAST, created_at DESC, id DESC
+             LIMIT $3
+             OFFSET LEAST(
+                 $4,
+                 GREATEST((SELECT total FROM selected LIMIT 1) - 1, 0) / $3 * $3
+             )
+         )
+         SELECT * FROM paged"
+    );
+    let rows = sqlx::query_as::<_, JournalRow>(&sql)
+        .bind(household_id)
+        .bind(timezone.name())
+        .bind(i64::try_from(JOURNAL_PAGE_SIZE).unwrap_or(i64::MAX))
+        .bind(
+            i64::try_from(usize::try_from(page).unwrap_or(usize::MAX) * JOURNAL_PAGE_SIZE)
+                .unwrap_or(i64::MAX),
+        )
+        .fetch_all(&mut *conn)
+        .await?;
+
+    let total = rows.first().map_or(0, |row| row.total);
+    let total = usize::try_from(total).unwrap_or(usize::MAX);
+    let pages = total.div_ceil(JOURNAL_PAGE_SIZE).max(1);
+    let page = usize::try_from(page).unwrap_or(0).min(pages - 1);
+
+    Ok(JournalPage {
+        entries: rows.into_iter().map(JournalEntry::from).collect(),
+        page: u32::try_from(page).unwrap_or(0),
+        pages: u32::try_from(pages).unwrap_or(u32::MAX),
+    })
 }
 
 impl From<CompletionRow> for Completion {
@@ -162,6 +286,24 @@ impl From<CompletionRow> for Completion {
             due_date,
             completed_at: row.created_at,
             actor_user_id: row.actor_user_id,
+        }
+    }
+}
+
+impl From<JournalRow> for JournalEntry {
+    fn from(row: JournalRow) -> Self {
+        let planned_day = row.planned_day;
+        let completion = Completion::from(CompletionRow {
+            id: row.id,
+            item_id: row.item_id,
+            actor_user_id: row.actor_user_id,
+            created_at: row.created_at,
+            payload: row.payload,
+            current_list_id: row.current_list_id,
+        });
+        Self {
+            completion,
+            planned_day,
         }
     }
 }

@@ -132,6 +132,29 @@ async fn names(ctx: &mut Ctx<'_>) -> Result<HashMap<Uuid, String>, Fail> {
         .collect())
 }
 
+/// Список в цепочке `back`: карточка из журнала тоже должна называть
+/// настоящий список, а не служебное «Список».
+fn list_id_in_chain(screen: &Screen) -> Option<Uuid> {
+    match screen {
+        Screen::List { list_id, .. } => Some(*list_id),
+        Screen::History { back, .. } => list_id_in_chain(back),
+        _ => None,
+    }
+}
+
+/// Имя списка из цепочки `back` для хлебных крошек.
+async fn parent_list_name(ctx: &mut Ctx<'_>, back: &Screen) -> Result<Option<String>, Fail> {
+    let Some(list_id) = list_id_in_chain(back) else {
+        return Ok(None);
+    };
+    let household_id = ctx.household()?.id;
+    match lists::get_visible(&mut *ctx.conn, household_id, list_id).await {
+        Ok(list) => Ok(Some(list.name)),
+        Err(DomainError::NotFound) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Карточка элемента.
 pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui, Fail> {
     let (item, list) = load(ctx, item_id).await?;
@@ -142,8 +165,8 @@ pub async fn view(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui,
     };
     let shopping = list.kind != ListKind::Tasks;
     let done = item.status == ItemStatus::Done;
-    let parent = matches!(back, Screen::List { .. }).then_some(list.name.as_str());
-    let mut ui = screen_heading(&here, &item.title, parent);
+    let parent = parent_list_name(ctx, back).await?;
+    let mut ui = screen_heading(&here, &item.title, parent.as_deref());
     if done {
         ui = ui.text("✅ Выполнено");
     }
@@ -495,17 +518,7 @@ pub async fn deleted(
     title: &str,
     back: &Screen,
 ) -> Result<Ui, Fail> {
-    let parent = match back {
-        Screen::List { list_id, .. } => {
-            let household_id = ctx.household()?.id;
-            match lists::get_visible(&mut *ctx.conn, household_id, *list_id).await {
-                Ok(list) => Some(list.name),
-                Err(DomainError::NotFound) => None,
-                Err(error) => return Err(error.into()),
-            }
-        }
-        _ => None,
-    };
+    let parent = parent_list_name(ctx, back).await?;
     let screen = Screen::Deleted {
         item_id,
         title: title.to_owned(),
@@ -525,13 +538,17 @@ pub async fn deleted(
 
 /// Подтверждение удаления.
 pub async fn confirm_delete(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui, Fail> {
-    let (item, list) = load(ctx, item_id).await?;
+    let (item, _) = load(ctx, item_id).await?;
     let screen = Screen::ConfirmDelete {
         item_id,
         back: Box::new(back.clone()),
     };
-    let parent = matches!(back, Screen::List { .. }).then_some(list.name.as_str());
-    let mut ui = screen_heading(&screen, &format!("Удалить «{}»?", item.title), parent);
+    let parent = parent_list_name(ctx, back).await?;
+    let mut ui = screen_heading(
+        &screen,
+        &format!("Удалить «{}»?", item.title),
+        parent.as_deref(),
+    );
     if item.recurrence.is_some() {
         ui = ui.text("Будет удалена вся серия повторений.");
     }

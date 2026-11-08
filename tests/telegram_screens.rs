@@ -4947,3 +4947,188 @@ async fn quick_due_text_rejects_an_invalid_date_and_keeps_the_form() {
         "the same form accepts a valid date afterwards"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_groups_completions_by_planned_day() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let today = NaiveDate::from_ymd_opt(2025, 11, 6).expect("date");
+    let now = local_utc(moscow, today, 12, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let due = NaiveDate::from_ymd_opt(2025, 11, 4).expect("date");
+    let mut input = new_item(household.tasks_list_id, "Полить цветы");
+    input.due_date = Some(due);
+    let item = create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &actor,
+        item.id,
+        Some(item.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("complete");
+    drop(conn);
+
+    bot.press("Задачи").await;
+    bot.assert_has_button("📜 История");
+    bot.press("История").await;
+    bot.assert_screen_contains("Вторник, 4 ноя");
+    bot.assert_has_button("Полить цветы · Alice");
+    bot.assert_has_button("⬅️ Назад");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_marks_a_planned_day_ahead() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let today = NaiveDate::from_ymd_opt(2024, 11, 6).expect("date");
+    let now = local_utc(moscow, today, 12, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let due = NaiveDate::from_ymd_opt(2024, 11, 8).expect("date");
+    let mut input = new_item(household.tasks_list_id, "Сдать отчёт");
+    input.due_date = Some(due);
+    let item = create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &actor,
+        item.id,
+        Some(item.version),
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("complete early");
+    drop(conn);
+
+    bot.press("Задачи").await;
+    bot.press("История").await;
+    bot.assert_screen_contains("Пятница, 8 ноя (впереди)");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_button_is_only_on_the_task_list_and_empty_journal_is_explained() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+
+    bot.press("Задачи").await;
+    bot.assert_has_button("📜 История");
+    bot.press("История").await;
+    bot.assert_screen_contains("Пока нет выполнений.");
+    bot.press("Назад").await;
+    bot.assert_screen_contains("Задачи");
+    bot.press("Назад").await;
+
+    bot.press("Покупки").await;
+    assert!(
+        bot.find_button("История").is_none(),
+        "the shopping list must not offer the completion journal:\n{}",
+        bot.screen()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_entry_opens_the_card_and_back_returns_to_the_same_page() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let today = NaiveDate::from_ymd_opt(2025, 11, 6).expect("date");
+    let now = local_utc(moscow, today, 12, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut conn = db.pool.acquire().await.expect("connection");
+    for index in 0..9 {
+        let mut input = new_item(household.tasks_list_id, &format!("Задача {index}"));
+        input.due_date = Some(NaiveDate::from_ymd_opt(2025, 11, 4).expect("date"));
+        let item = create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
+        items::complete(
+            &mut conn,
+            household.household_id,
+            &actor,
+            item.id,
+            Some(item.version),
+            "Europe/Moscow",
+            now + Duration::minutes(index),
+        )
+        .await
+        .expect("complete");
+    }
+    drop(conn);
+
+    bot.press("Задачи").await;
+    bot.press("История").await;
+    bot.assert_screen_contains("Страница 1 из 2");
+    bot.press("→").await;
+    bot.assert_screen_contains("Страница 2 из 2");
+    bot.assert_screen_contains("Вторник, 4 ноя");
+    bot.press("Задача 0").await;
+    bot.assert_screen_contains("Задачи › История › Задача 0");
+    assert!(
+        !bot.screen().contains("Список ›"),
+        "the card opened from the journal must name the real list:\n{}",
+        bot.screen()
+    );
+    bot.press("Назад").await;
+    bot.assert_screen_contains("Страница 2 из 2");
+    bot.assert_has_button("Задача 0 · Alice");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_list_from_all_lists_keeps_actions_and_navigation_on_separate_rows() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+    lists::create(
+        &mut conn,
+        household.household_id,
+        ListKind::Checklist,
+        "Дача",
+        Utc::now(),
+    )
+    .await
+    .expect("extra list");
+    drop(conn);
+
+    // Третий список включает «Все списки», у такого списка есть «🏠 Меню».
+    bot.text("/start").await;
+    bot.press("Все списки").await;
+    bot.press("Задачи").await;
+    bot.assert_screen_contains("Все списки › Задачи · 0");
+
+    let rows = button_rows(&bot.screen());
+    let actions = rows
+        .iter()
+        .find(|row| row.iter().any(|(label, _)| label.contains("Добавить")))
+        .expect("action row");
+    assert_eq!(actions.len(), 2, "actions stay in one row: {rows:?}");
+    assert!(
+        actions.iter().any(|(label, _)| label.contains("История")),
+        "the journal button stays next to «Добавить»: {rows:?}"
+    );
+
+    let navigation = rows
+        .iter()
+        .find(|row| row.iter().any(|(label, _)| label.contains("Назад")))
+        .expect("navigation row");
+    assert_eq!(navigation.len(), 2, "navigation has its own row: {rows:?}");
+    assert!(
+        navigation.iter().any(|(label, _)| label.contains("Меню")),
+        "a list opened from «Все списки» still offers «🏠 Меню»: {rows:?}"
+    );
+    assert!(
+        !navigation
+            .iter()
+            .any(|(label, _)| label.contains("Добавить") || label.contains("История")),
+        "navigation must not share the action row: {rows:?}"
+    );
+}

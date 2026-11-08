@@ -88,6 +88,37 @@ pub fn weekday_short(iso: u32) -> &'static str {
         .unwrap_or("")
 }
 
+/// Полное название дня недели с заглавной буквы (ISO 1..=7).
+pub fn weekday_long(iso: u32) -> &'static str {
+    [
+        "Понедельник",
+        "Вторник",
+        "Среда",
+        "Четверг",
+        "Пятница",
+        "Суббота",
+        "Воскресенье",
+    ]
+    .get(usize::try_from(iso).unwrap_or(1).saturating_sub(1))
+    .copied()
+    .unwrap_or("")
+}
+
+/// Заголовок группы журнала: «Вторник, 4 ноя»; будущий день — с «(впереди)».
+pub fn planned_day_label(date: NaiveDate, today: NaiveDate) -> String {
+    let label = format!(
+        "{}, {} {}",
+        weekday_long(date.weekday().number_from_monday()),
+        date.day(),
+        month_short(date.month())
+    );
+    if date > today {
+        format!("{label} (впереди)")
+    } else {
+        label
+    }
+}
+
 /// Подпись срока без времени.
 pub const ALL_DAY: &str = "весь день";
 

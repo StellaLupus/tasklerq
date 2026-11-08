@@ -188,6 +188,13 @@ pub enum Screen {
         /// Страница.
         page: u32,
     },
+    /// Журнал выполнений household, открытый из списка задач.
+    History {
+        /// Страница с нуля.
+        page: u32,
+        /// Список задач, из которого открыт журнал: туда ведёт «Назад».
+        back: Box<Screen>,
+    },
     /// Результаты поиска.
     Results {
         /// Запрос.
@@ -269,6 +276,7 @@ impl Screen {
             } => 3,
             Self::List { .. } => 2,
             Self::Item { back, .. }
+            | Self::History { back, .. }
             | Self::Deleted { back, .. }
             | Self::ConfirmDelete { back, .. } => back.depth() + 1,
             Self::Editor { back, .. } => back.depth() + 1,
@@ -315,6 +323,7 @@ impl Screen {
             Self::ConfirmLeave => "Выход",
             Self::InviteCreated { .. } => "Приглашение создано",
             Self::Mine { .. } => "Мои задачи",
+            Self::History { .. } => "История",
             Self::Results { .. } => "Поиск",
             Self::Settings => "Настройки",
             Self::Profile => "Профиль",
@@ -349,6 +358,7 @@ impl Screen {
             } => vec!["Все списки"],
             Self::List { .. } => Vec::new(),
             Self::Item { back, .. }
+            | Self::History { back, .. }
             | Self::Deleted { back, .. }
             | Self::ConfirmDelete { back, .. } => {
                 let mut parents = back.parents();

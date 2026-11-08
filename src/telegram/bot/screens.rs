@@ -1,6 +1,6 @@
 //! Сборка экранов: меню, списки, «Мои задачи» и поиск.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
@@ -8,11 +8,11 @@ use uuid::Uuid;
 
 use crate::domain::models::{Item, ItemPriority, ItemStatus, List, ListKind};
 use crate::domain::search::SearchFilters;
-use crate::storage::repositories::{drafts, items, lists};
+use crate::storage::repositories::{drafts, items, lists, users};
 use crate::telegram::rich::{Block, Span, button};
 use crate::telegram::ru;
 
-use super::model::{Action, PAGE_SIZE, Screen, StatusFilter, Ui};
+use super::model::{Action, PAGE_SIZE, Screen, StatusFilter, Ui, screen_heading_names};
 use super::{Ctx, Fail, card, forms, settings};
 
 /// Собрать экран.
@@ -41,6 +41,7 @@ pub async fn build(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
         } => card::deleted(ctx, *item_id, title, back).await,
         Screen::ConfirmDelete { item_id, back } => card::confirm_delete(ctx, *item_id, back).await,
         Screen::Mine { page } => mine(ctx, *page).await,
+        Screen::History { page, back } => history(ctx, *page, back).await,
         Screen::Results {
             query,
             status,
@@ -486,16 +487,26 @@ async fn tasks_list(
     }
     let current = here(page);
     let ui = pager(ui, page, pages, here);
-    let mut row = vec![button(
-        "➕ Добавить",
-        Action::Add {
-            list_id: Some(list.id),
-            kind: ListKind::Tasks,
-            back: Some(current.clone()),
-        },
-    )];
-    row.extend(nav_row(&current, list_back(from_lists)));
-    Ok(ui.row(row))
+    let actions = vec![
+        button(
+            "➕ Добавить",
+            Action::Add {
+                list_id: Some(list.id),
+                kind: ListKind::Tasks,
+                back: Some(current.clone()),
+            },
+        ),
+        go(
+            "📜 История",
+            Screen::History {
+                page: 0,
+                back: Box::new(current.clone()),
+            },
+        ),
+    ];
+    Ok(ui
+        .row(actions)
+        .row(nav_row(&current, list_back(from_lists))))
 }
 
 /// Последний раздел списка задач: выполнения этого списка с начала дня.
@@ -516,6 +527,72 @@ fn done_today_section(
         )]);
     }
     ui
+}
+
+/// Журнал выполнений household: группы по плановому дню, от поздних к ранним.
+async fn history(ctx: &mut Ctx<'_>, page: u32, back: &Screen) -> Result<Ui, Fail> {
+    let household_id = ctx.household()?.id;
+    let journal =
+        items::completions::journal_page(&mut *ctx.conn, household_id, ctx.tz, page).await?;
+    let names: HashMap<Uuid, String> = users::list_active(&mut *ctx.conn, household_id)
+        .await?
+        .into_iter()
+        .map(|user| (user.id, user.display_name))
+        .collect();
+    let list_name = match back {
+        Screen::List { list_id, .. } => {
+            match lists::get_visible(&mut *ctx.conn, household_id, *list_id).await {
+                Ok(list) => Some(list.name),
+                Err(crate::domain::error::DomainError::NotFound) => None,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        _ => None,
+    };
+    let screen = Screen::History {
+        page: journal.page,
+        back: Box::new(back.clone()),
+    };
+    let mut ui = screen_heading_names(&screen, "История", list_name.as_deref(), None, None);
+    if journal.entries.is_empty() {
+        return Ok(ui
+            .text("Пока нет выполнений.")
+            .row(nav_row(&screen, back.clone())));
+    }
+
+    let today = ctx.now.with_timezone(&ctx.tz).date_naive();
+    let mut current: Option<Option<chrono::NaiveDate>> = None;
+    for entry in &journal.entries {
+        let day = entry.planned_day;
+        if current != Some(day) {
+            let title = day.map_or_else(
+                || "Без срока".to_owned(),
+                |day| ru::planned_day_label(day, today),
+            );
+            ui = ui.bold(title);
+            current = Some(day);
+        }
+        let mut label = clip(&entry.completion.title, 40);
+        if let Some(name) = entry.completion.actor_user_id.and_then(|id| names.get(&id)) {
+            label.push_str(&format!(" · {name}"));
+        }
+        ui = ui.row(vec![go(
+            &label,
+            Screen::Item {
+                item_id: entry.completion.item_id,
+                back: Box::new(screen.clone()),
+            },
+        )]);
+    }
+
+    let here = |page: usize| Screen::History {
+        page: u32::try_from(page).unwrap_or(0),
+        back: Box::new(back.clone()),
+    };
+    let page = usize::try_from(journal.page).unwrap_or(0);
+    let pages = usize::try_from(journal.pages).unwrap_or(1);
+    let ui = pager(ui, page, pages, here);
+    Ok(ui.row(nav_row(&screen, back.clone())))
 }
 
 async fn mine(ctx: &mut Ctx<'_>, page: u32) -> Result<Ui, Fail> {
