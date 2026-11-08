@@ -1538,6 +1538,20 @@ async fn shopping_list_screen_hints_that_text_adds_positions() {
 
     bot.press("Покупки").await;
     bot.assert_screen_contains("Напишите — добавлю в «Покупки»");
+    bot.assert_screen_contains("(через запятую или с новой строки)");
+
+    // Подсказка не врёт: без разбора текст делится на позиции, а не открывает
+    // редактор задачи.
+    bot.text("молоко, хлеб").await;
+    bot.assert_screen_contains("Добавлено без разбора");
+    bot.assert_screen_contains("молоко · 1 шт");
+    bot.assert_screen_contains("хлеб · 1 шт");
+    bot.assert_screen_contains("Покупки · 2");
+    assert!(
+        !bot.screen().contains("Название:"),
+        "text on the shopping screen must not open the editor:\n{}",
+        bot.screen()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

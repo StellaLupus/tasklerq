@@ -1665,6 +1665,9 @@ async fn quick_form_switching_to_shopping_finds_a_duplicate() {
     stand.bot.press("Сохранить").await;
     stand.bot.assert_screen_contains("Покупки · 1");
 
+    // Возвращаемся в меню: на экране покупок без разбора текст сразу делится
+    // на позиции, а не открывает редактор.
+    stand.bot.press("Назад").await;
     stand.bot.text("Молоко").await;
     stand.bot.press("Список").await;
     stand.bot.press("Покупки").await;
@@ -1957,7 +1960,7 @@ async fn a_failed_second_position_rolls_back_the_first() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_failed_direct_parse_keeps_the_shopping_list_with_an_error_banner() {
+async fn a_failed_direct_parse_adds_the_positions_without_parsing() {
     let db = db().await;
     let mut stand = stand(&db.pool, vec![Err(HaError::Rejected(400))]).await;
 
@@ -1965,12 +1968,22 @@ async fn a_failed_direct_parse_keeps_the_shopping_list_with_an_error_banner() {
     stand.bot.text("молоко и хлеб").await;
     assert_eq!(stand.work().await, Pass::Dead);
 
-    stand
-        .bot
-        .assert_screen_contains("Не получилось разобрать сообщение");
+    // Недеградируемая ошибка на экране покупок: текст делится без разбора,
+    // а не показывается баннер ошибки.
+    stand.bot.assert_screen_contains("Добавлено без разбора");
+    stand.bot.assert_has_button("Отменить");
     let state: Value = serde_json::from_str(&stand.view_state().await).expect("view json");
     assert_eq!(state["t"], json!("list"), "the shopping list must stay");
-    assert_eq!(stand.household_items().await, 0, "nothing must be created");
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT i.title FROM items i
+         JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1 AND i.deleted_at IS NULL",
+    )
+    .bind(stand.bot.chat)
+    .fetch_all(&db.pool)
+    .await
+    .expect("items");
+    assert_eq!(rows, vec!["молоко и хлеб".to_owned()]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1994,6 +2007,7 @@ async fn a_duplicate_is_not_saved_and_the_banner_offers_a_choice() {
     stand.bot.assert_screen_contains("Добавлено: Хлеб");
     stand.bot.assert_has_button("Увеличить до 3 л");
     stand.bot.assert_has_button("Добавить отдельно");
+    stand.bot.assert_has_button("Отменить");
 
     let rows: Vec<(String, Option<f64>, Option<String>)> = sqlx::query_as(
         "SELECT i.title, i.quantity::float8, i.unit
@@ -2263,4 +2277,192 @@ async fn repeated_duplicates_in_one_message_are_merged() {
     .await
     .expect("count");
     assert_eq!(count, 1);
+}
+
+async fn deleted_titles(pool: &PgPool, telegram_id: i64) -> Vec<(String, bool)> {
+    sqlx::query_as(
+        "SELECT i.title, i.deleted_at IS NOT NULL
+         FROM items i
+         JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1
+         ORDER BY i.title",
+    )
+    .bind(telegram_id)
+    .fetch_all(pool)
+    .await
+    .expect("items")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_direct_add_can_be_undone_within_ten_minutes() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Молоко", "quantity": 2, "unit": "л"},
+            {"target_kind": "shopping", "title": "Хлеб"}
+        ]}))],
+    )
+    .await;
+    seed_shopping_item(&db.pool, stand.bot.chat, "Сахар", 1.0, "шт").await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("молоко 2 л и хлеб").await;
+    assert_eq!(stand.work().await, Pass::Drafted);
+    stand
+        .bot
+        .assert_screen_contains("Добавлено: Молоко · 2 л, Хлеб");
+    stand.bot.assert_has_button("Отменить");
+
+    stand.bot.press("Отменить").await;
+
+    stand.bot.assert_screen_contains("Добавление отменено");
+    assert_eq!(
+        deleted_titles(&db.pool, stand.bot.chat).await,
+        vec![
+            ("Молоко".to_owned(), true),
+            ("Сахар".to_owned(), false),
+            ("Хлеб".to_owned(), true),
+        ],
+        "only the added positions are removed"
+    );
+    let state: Value = serde_json::from_str(&stand.view_state().await).expect("view json");
+    assert_eq!(state["t"], json!("list"), "the list must stay on screen");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undo_after_ten_minutes_keeps_the_positions() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Молоко", "quantity": 2, "unit": "л"},
+            {"target_kind": "shopping", "title": "Хлеб"}
+        ]}))],
+    )
+    .await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("молоко 2 л и хлеб").await;
+    assert_eq!(stand.work().await, Pass::Drafted);
+
+    stand.bot.advance(Duration::minutes(11));
+    stand.bot.press("Отменить").await;
+
+    stand.bot.assert_screen_contains("Время отмены истекло");
+    assert_eq!(
+        deleted_titles(&db.pool, stand.bot.chat).await,
+        vec![("Молоко".to_owned(), false), ("Хлеб".to_owned(), false)],
+        "an expired undo must not delete anything"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replayed_undo_token_is_not_applied_twice() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Хлеб"}
+        ]}))],
+    )
+    .await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("хлеб").await;
+    assert_eq!(stand.work().await, Pass::Drafted);
+
+    let data = stand.bot.find_button("Отменить").expect("undo button");
+    let (message_id, _) = stand.bot.active();
+    stand.bot.press_data(&data, message_id).await;
+    stand.bot.assert_screen_contains("Добавление отменено");
+    stand.bot.press_data(&data, message_id).await;
+
+    assert!(
+        stand
+            .bot
+            .fake
+            .answers()
+            .iter()
+            .any(|(_, text, _)| text.as_deref() == Some("Это действие уже выполнено.")),
+        "a one-shot token must report a replay"
+    );
+    assert_eq!(
+        deleted_titles(&db.pool, stand.bot.chat).await,
+        vec![("Хлеб".to_owned(), true)],
+        "the replay must not resurrect the position"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stranger_cannot_undo_someone_elses_addition() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Хлеб"}
+        ]}))],
+    )
+    .await;
+    let mut other = Harness::sharing(
+        &db.pool,
+        support::next_telegram_id(),
+        stand.bot.fake.clone(),
+    )
+    .named("Mallory");
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("хлеб").await;
+    assert_eq!(stand.work().await, Pass::Drafted);
+
+    let data = stand.bot.find_button("Отменить").expect("undo button");
+    let (message_id, _) = stand.bot.active();
+    other.press_data(&data, message_id).await;
+
+    assert!(
+        other.fake.answers().iter().any(|(_, text, alert)| *alert
+            && text.as_deref() == Some("Эта кнопка предназначена другому пользователю.")),
+        "a foreign token must be rejected"
+    );
+    assert_eq!(
+        deleted_titles(&db.pool, stand.bot.chat).await,
+        vec![("Хлеб".to_owned(), false)],
+        "a stranger must not delete the author's positions"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undo_skips_a_position_deleted_by_hand() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Молоко", "quantity": 2, "unit": "л"},
+            {"target_kind": "shopping", "title": "Хлеб"}
+        ]}))],
+    )
+    .await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("молоко 2 л и хлеб").await;
+    assert_eq!(stand.work().await, Pass::Drafted);
+
+    sqlx::query(
+        "UPDATE items i SET deleted_at = now()
+         FROM users u
+         WHERE i.household_id = u.household_id AND u.telegram_user_id = $1
+           AND i.title = 'Молоко'",
+    )
+    .bind(stand.bot.chat)
+    .execute(&db.pool)
+    .await
+    .expect("delete milk by hand");
+
+    stand.bot.press("Отменить").await;
+
+    stand.bot.assert_screen_contains("Добавление отменено");
+    assert_eq!(
+        deleted_titles(&db.pool, stand.bot.chat).await,
+        vec![("Молоко".to_owned(), true), ("Хлеб".to_owned(), true)]
+    );
 }

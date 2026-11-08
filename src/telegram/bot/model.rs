@@ -906,6 +906,11 @@ pub enum Action {
         #[serde(default)]
         rest: Vec<DuplicateChoice>,
     },
+    /// Отменить прямое добавление покупок: мягко удалить созданные позиции.
+    AddedUndo {
+        /// Позиции, созданные этим добавлением.
+        item_ids: Vec<Uuid>,
+    },
     /// Добавить найденный дубликат отдельной позицией.
     DuplicateSeparate {
         /// Список.
@@ -1537,6 +1542,16 @@ impl DuplicateChoice {
             },
         ));
         buttons
+    }
+}
+
+/// Совпадают ли единицы измерения для слияния дубликатов.
+pub fn same_unit(left: Option<&str>, right: Option<&str>) -> bool {
+    let fold = |value: &str| value.trim().to_lowercase().replace('ё', "е");
+    match (left, right) {
+        (Some(left), Some(right)) => fold(left) == fold(right),
+        (None, None) => true,
+        _ => false,
     }
 }
 

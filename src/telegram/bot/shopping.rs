@@ -2,7 +2,7 @@
 
 use uuid::Uuid;
 
-use crate::domain::models::{Field, Item, ItemPatch, ItemStatus, List, ListKind};
+use crate::domain::models::{Actor, Field, Item, ItemPatch, ItemStatus, List, ListKind};
 use crate::domain::validation::validate_new_item;
 use crate::storage::repositories::{items, lists};
 use crate::telegram::rich::button;
@@ -506,4 +506,95 @@ pub async fn duplicate_separate(
     .await?;
     let label = position_label(&item);
     show_duplicate_result(ctx, list.id, &label, &rest).await
+}
+
+/// Может ли актор отменить это добавление: автор или владелец household.
+fn may_undo(actor: &Actor, author: Option<Uuid>) -> bool {
+    actor.user_id.is_none() || actor.is_owner() || author.is_none() || author == actor.user_id
+}
+
+/// Перерисовать список после отмены добавления. Пропавший список оставляет
+/// текущий экран.
+async fn present_after_undo(ctx: &mut Ctx<'_>, list_id: Option<Uuid>) -> Result<(), Fail> {
+    let Some(list_id) = list_id else {
+        return ctx.refresh().await;
+    };
+    let household_id = ctx.household()?.id;
+    let list = match lists::get_visible(&mut *ctx.conn, household_id, list_id).await {
+        Ok(list) => list,
+        Err(crate::domain::error::DomainError::NotFound) => return ctx.refresh().await,
+        Err(error) => return Err(error.into()),
+    };
+    let current = views::get(&mut *ctx.conn, ctx.chat_id)
+        .await?
+        .and_then(|view| serde_json::from_value::<Screen>(view.state).ok());
+    let screen = match current {
+        Some(Screen::List {
+            list_id: current_id,
+            page,
+            edit,
+            from_lists,
+        }) if current_id == list.id => Screen::List {
+            list_id: list.id,
+            page,
+            edit,
+            from_lists,
+        },
+        _ => Screen::List {
+            list_id: list.id,
+            page: 0,
+            edit: false,
+            from_lists: false,
+        },
+    };
+    ctx.present(screen).await
+}
+
+/// «↩️ Отменить» в баннере прямого добавления: мягко удалить созданные
+/// позиции, если с их создания прошло не больше 10 минут.
+///
+/// Окно считается от `created_at` позиции, а не от нажатия. Уже удалённые
+/// позиции пропускаются: их нечего отменять. Чужое добавление отменяет только
+/// автор или владелец household.
+pub async fn added_undo(ctx: &mut Ctx<'_>, item_ids: &[Uuid]) -> Result<(), Fail> {
+    let household_id = ctx.household()?.id;
+    let actor = ctx.actor()?;
+
+    let mut alive = Vec::new();
+    let mut list_id = None;
+    for item_id in item_ids {
+        match items::get(&mut *ctx.conn, household_id, *item_id).await {
+            Ok(item) => {
+                list_id.get_or_insert(item.list_id);
+                alive.push(item);
+            }
+            Err(crate::domain::error::DomainError::NotFound) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    if alive
+        .iter()
+        .any(|item| !may_undo(&actor, item.created_by_user_id))
+    {
+        ctx.banner("Отменить добавление может только автор или владелец.");
+        return present_after_undo(ctx, list_id).await;
+    }
+
+    if alive.is_empty() {
+        ctx.banner("Добавление уже отменено");
+        return present_after_undo(ctx, list_id).await;
+    }
+
+    let window = chrono::Duration::minutes(items::UNDO_WINDOW_MINUTES);
+    if alive.iter().any(|item| ctx.now - item.created_at > window) {
+        ctx.banner("Время отмены истекло");
+        return present_after_undo(ctx, list_id).await;
+    }
+
+    for item in &alive {
+        items::soft_delete(&mut *ctx.conn, household_id, &actor, item.id, ctx.now).await?;
+    }
+    ctx.banner("Добавление отменено");
+    present_after_undo(ctx, list_id).await
 }

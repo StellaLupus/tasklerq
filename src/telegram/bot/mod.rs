@@ -6,7 +6,7 @@
 //! быстрый ответ на callback (`answerCallbackQuery`) возвращается наружу и
 //! отправляется после коммита.
 
-mod capture;
+pub(crate) mod capture;
 mod card;
 mod forms;
 pub mod model;
@@ -743,7 +743,7 @@ async fn parse_text(
 
 /// Текст на экране покупок: прямое добавление в этот список.
 ///
-/// Без LLM (пункт 8.4) пока работает прежняя быстрая форма.
+/// Без LLM текст делится по запятым и переводам строк без задания разбора.
 async fn parse_shopping_text(
     ctx: &mut Ctx<'_>,
     text: &str,
@@ -752,7 +752,7 @@ async fn parse_shopping_text(
     if ctx.llm_capture {
         capture::intake_direct(ctx, text, list_id).await
     } else {
-        forms::quick_add_in_list(ctx, text, None).await
+        capture::intake_split(ctx, text, list_id).await
     }
 }
 
@@ -1021,6 +1021,7 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
             quantity,
             rest,
         } => shopping::duplicate_increase(ctx, item_id, version, quantity, rest).await,
+        Action::AddedUndo { item_ids } => shopping::added_undo(ctx, &item_ids).await,
         Action::DuplicateSeparate {
             list_id,
             title,

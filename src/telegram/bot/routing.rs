@@ -121,6 +121,11 @@ impl TextRoute {
                 .to_owned(),
             ),
             Self::Search => Some(ru::SEARCH_HINT.to_owned()),
+            Self::ShoppingList {
+                list_name,
+                direct: true,
+                ..
+            } if !llm_capture => Some(ru::split_list_hint(list_name)),
             Self::ShoppingList { list_name, .. } | Self::TaskList { list_name, .. } => {
                 Some(ru::list_hint(list_name))
             }
@@ -408,7 +413,13 @@ mod tests {
                     .to_owned(),
                 ),
                 Screen::Results { .. } => Some(ru::SEARCH_HINT.to_owned()),
-                Screen::List { .. } => list.as_ref().map(|list| ru::list_hint(&list.name)),
+                Screen::List { .. } => list.as_ref().map(|list| {
+                    if !llm_capture && list.kind == ListKind::Shopping {
+                        ru::split_list_hint(&list.name)
+                    } else {
+                        ru::list_hint(&list.name)
+                    }
+                }),
                 Screen::Form => match form.as_ref() {
                     Some(Form::Search) => Some(ru::SEARCH_HINT.to_owned()),
                     _ => None,
