@@ -2,7 +2,7 @@
 
 use uuid::Uuid;
 
-use crate::domain::models::{Item, ItemStatus, List};
+use crate::domain::models::{Item, List};
 use crate::domain::recurrence::Due;
 use crate::domain::settings::{NotificationSettingsUpdate, ProfileUpdate, parse_hhmm};
 use crate::storage::repositories::{items, members, users};
@@ -10,7 +10,7 @@ use crate::telegram::ru;
 use crate::telegram::views::{self};
 
 use super::state::{apply_text, today};
-use super::{MAX_QUERY, clear, load, start_onboarding};
+use super::{clear, load, start_onboarding};
 use crate::telegram::bot::model::{Form, FormAct, ItemDraft, Screen, Step, TimeField};
 use crate::telegram::bot::onboarding;
 use crate::telegram::bot::settings::{self, ReleaseTrigger};
@@ -33,21 +33,7 @@ pub async fn on_text(ctx: &mut Ctx<'_>, form: Form, text: &str) -> Result<(), Fa
             version,
             back,
         } => due_text(ctx, item_id, version, back, text).await,
-        Form::Search => {
-            if text.chars().count() > MAX_QUERY {
-                ctx.banner(format!(
-                    "Запрос слишком длинный: не больше {MAX_QUERY} символов."
-                ));
-                return ctx.present(Screen::Form).await;
-            }
-            clear(ctx).await?;
-            ctx.present(Screen::Results {
-                query: text.to_owned(),
-                status: crate::telegram::bot::model::StatusFilter::Open,
-                page: 0,
-            })
-            .await
-        }
+        Form::Search => super::search(ctx, text, Screen::Form).await,
         Form::Rename => rename(ctx, text).await,
         Form::DeleteHousehold => delete_household(ctx, text).await,
         Form::Lead => set_lead(ctx, text).await,
@@ -298,15 +284,7 @@ pub(super) async fn find_duplicate(
     title: &str,
 ) -> Result<Option<crate::telegram::bot::model::Duplicate>, Fail> {
     let existing = items::list_by_list(&mut *ctx.conn, list.household_id, list.id).await?;
-    let wanted = title.trim().to_lowercase();
-    Ok(existing
-        .into_iter()
-        .find(|item| item.status == ItemStatus::Open && item.title.trim().to_lowercase() == wanted)
-        .map(|item| crate::telegram::bot::model::Duplicate {
-            item_id: item.id,
-            title: item.title,
-            quantity: item.quantity,
-            unit: item.unit,
-            version: item.version,
-        }))
+    Ok(crate::telegram::bot::model::Duplicate::find(
+        &existing, title,
+    ))
 }

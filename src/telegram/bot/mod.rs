@@ -6,12 +6,13 @@
 //! быстрый ответ на callback (`answerCallbackQuery`) возвращается наружу и
 //! отправляется после коммита.
 
-mod capture;
+pub(crate) mod capture;
 mod card;
 mod forms;
 pub mod model;
 pub mod notify;
 mod onboarding;
+mod routing;
 mod screens;
 mod settings;
 mod shopping;
@@ -123,8 +124,8 @@ impl From<DomainError> for Fail {
 pub struct Banner {
     /// Текст сообщения.
     pub text: String,
-    /// Кнопки под сообщением.
-    pub buttons: Vec<Button<Action>>,
+    /// Ряды кнопок под сообщением.
+    pub rows: Vec<Vec<Button<Action>>>,
 }
 
 impl Banner {
@@ -132,30 +133,42 @@ impl Banner {
     pub fn text(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
-            buttons: Vec::new(),
+            rows: Vec::new(),
         }
     }
 
-    /// Баннер с кнопками.
+    /// Баннер с кнопками в одном ряду.
     pub fn with_buttons(text: impl Into<String>, buttons: Vec<Button<Action>>) -> Self {
+        Self::with_button_rows(text, vec![buttons])
+    }
+
+    /// Баннер с явными рядами кнопок: «Открыть» можно вынести последним рядом.
+    pub fn with_button_rows(text: impl Into<String>, rows: Vec<Vec<Button<Action>>>) -> Self {
         Self {
             text: text.into(),
-            buttons,
+            rows: rows.into_iter().filter(|row| !row.is_empty()).collect(),
         }
     }
 
-    /// Блоки баннера: жирный абзац и, если кнопки есть, их ряд.
+    /// Блоки баннера: жирный абзац и, если кнопки есть, их ряды.
     fn blocks(self) -> Vec<Block<Action>> {
         let mut blocks = vec![Block::Paragraph(vec![Span::bold(self.text)])];
-        if !self.buttons.is_empty() {
-            blocks.push(Block::Buttons(self.buttons));
-        }
+        blocks.extend(self.rows.into_iter().map(Block::Buttons));
         blocks
     }
 
     /// Поставить баннер первым блоком экрана.
     fn prepend_to(self, ui: &mut Ui) {
         ui.blocks.splice(0..0, self.blocks());
+    }
+
+    /// Сколько символов HTML займёт баннер над экраном.
+    pub(crate) fn html_len(&self) -> usize {
+        let mut ui = Ui::new();
+        self.clone().prepend_to(&mut ui);
+        let token = format!("t:{}", "0".repeat(16));
+        let tokens = vec![token; ui.button_count()];
+        rich::render(&ui, &tokens).html.chars().count()
     }
 }
 
@@ -247,6 +260,11 @@ impl Ctx<'_> {
     /// Баннер с кнопками над экраном.
     pub fn banner_with(&mut self, text: impl Into<String>, buttons: Vec<Button<Action>>) {
         self.banner = Some(Banner::with_buttons(text, buttons));
+    }
+
+    /// Баннер с явными рядами кнопок над экраном.
+    pub fn banner_rows(&mut self, text: impl Into<String>, rows: Vec<Vec<Button<Action>>>) {
+        self.banner = Some(Banner::with_button_rows(text, rows));
     }
 
     /// Показать экран: собрать, выпустить токены и поставить в outbox.
@@ -439,7 +457,7 @@ impl Bot {
         now: DateTime<Utc>,
         to: Recipient<'_>,
         screen: Screen,
-        banner: Option<String>,
+        banner: Option<Banner>,
     ) -> Result<(), sqlx::Error> {
         let mut ctx = self.context(conn, now, to, banner);
         match ctx.present(screen).await {
@@ -463,7 +481,7 @@ impl Bot {
         text: &str,
         banner: Option<String>,
     ) -> Result<(), sqlx::Error> {
-        let mut ctx = self.context(conn, now, to, banner);
+        let mut ctx = self.context(conn, now, to, banner.map(Banner::text));
         match forms::quick_add(&mut ctx, text).await {
             Ok(()) => Ok(()),
             Err(Fail::Infra(error)) => Err(error),
@@ -479,7 +497,7 @@ impl Bot {
         conn: &'a mut PgConnection,
         now: DateTime<Utc>,
         to: Recipient<'_>,
-        banner: Option<String>,
+        banner: Option<Banner>,
     ) -> Ctx<'a> {
         let Recipient {
             user,
@@ -500,7 +518,7 @@ impl Bot {
             household: Some(household.clone()),
             tz: display_timezone(Some(user), Some(household)),
             toast: None,
-            banner: banner.map(Banner::text),
+            banner,
             placement: Placement::Visible,
             llm_capture: self.llm_capture,
             tenancy: self.tenancy,
@@ -684,24 +702,74 @@ async fn on_text(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
     match views::conversation(&mut *ctx.conn, ctx.chat_id, ctx.now).await? {
         Lookup::Active(conversation) if conversation.telegram_user_id == ctx.sender.id => {
             match forms::parse(conversation.data) {
-                Some(form) => forms::on_text(ctx, form, text).await,
+                Some(form) => return forms::on_text(ctx, form, text).await,
                 None => {
                     views::clear_conversation(&mut *ctx.conn, ctx.chat_id).await?;
-                    ctx.present(Screen::Menu).await
+                    return ctx.present(Screen::Menu).await;
                 }
             }
         }
-        Lookup::Expired(_) => forms::expired(ctx).await,
-        _ => {
-            if ctx.user.is_none() {
-                return forms::start_onboarding(ctx).await;
-            }
-            if ctx.llm_capture {
-                capture::intake(ctx, text).await
-            } else {
-                forms::quick_add(ctx, text).await
-            }
+        Lookup::Expired(_) => return forms::expired(ctx).await,
+        _ => {}
+    }
+
+    if ctx.user.is_none() {
+        return forms::start_onboarding(ctx).await;
+    }
+
+    let screen = active_screen(ctx).await?;
+    let route = routing::route(ctx, &screen).await?;
+    match route {
+        routing::TextRoute::Search => forms::search(ctx, text, screen).await,
+        // Формы уже нет: экран редактора остался от истёкшей правки.
+        routing::TextRoute::EditorBlocked | routing::TextRoute::EditorField => {
+            forms::expired(ctx).await
         }
+        routing::TextRoute::TaskList { list_id, .. } => parse_text(ctx, text, Some(list_id)).await,
+        routing::TextRoute::ShoppingList {
+            list_id,
+            direct: true,
+            ..
+        } => parse_shopping_text(ctx, text, list_id).await,
+        routing::TextRoute::ShoppingList { direct: false, .. }
+        | routing::TextRoute::Menu
+        | routing::TextRoute::General => parse_text(ctx, text, None).await,
+    }
+}
+
+/// Активный экран чата; без сохранённого состояния — меню.
+async fn active_screen(ctx: &mut Ctx<'_>) -> Result<Screen, Fail> {
+    Ok(views::get(&mut *ctx.conn, ctx.chat_id)
+        .await?
+        .and_then(|view| serde_json::from_value::<Screen>(view.state).ok())
+        .unwrap_or(Screen::Menu))
+}
+
+/// Разбор текста или быстрая форма, если разбор выключен.
+async fn parse_text(
+    ctx: &mut Ctx<'_>,
+    text: &str,
+    default_list_id: Option<uuid::Uuid>,
+) -> Result<(), Fail> {
+    if ctx.llm_capture {
+        capture::intake(ctx, text, default_list_id).await
+    } else {
+        forms::quick_add_in_list(ctx, text, default_list_id).await
+    }
+}
+
+/// Текст на экране покупок: прямое добавление в этот список.
+///
+/// Без LLM текст делится по запятым и переводам строк без задания разбора.
+async fn parse_shopping_text(
+    ctx: &mut Ctx<'_>,
+    text: &str,
+    list_id: uuid::Uuid,
+) -> Result<(), Fail> {
+    if ctx.llm_capture {
+        capture::intake_direct(ctx, text, list_id).await
+    } else {
+        capture::intake_split(ctx, text, list_id).await
     }
 }
 
@@ -964,6 +1032,28 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
             item_ids,
             from_lists,
         } => shopping::clear_undo(ctx, list_id, &item_ids, from_lists).await,
+        Action::DuplicateIncrease {
+            item_id,
+            version,
+            quantity,
+            rest,
+            draft_id,
+        } => shopping::duplicate_increase(ctx, item_id, version, quantity, rest, draft_id).await,
+        Action::AddedUndo { item_ids } => shopping::added_undo(ctx, &item_ids).await,
+        Action::ManualEntry { text } => {
+            views::clear_conversation(&mut *ctx.conn, ctx.chat_id).await?;
+            forms::quick_add(ctx, &text).await
+        }
+        Action::DuplicateSeparate {
+            list_id,
+            title,
+            quantity,
+            unit,
+            rest,
+            draft_id,
+        } => {
+            shopping::duplicate_separate(ctx, list_id, title, quantity, unit, rest, draft_id).await
+        }
 
         Action::SearchStart => forms::start_search(ctx).await,
         Action::RenameStart => forms::start_rename(ctx).await,

@@ -9,21 +9,25 @@
 use uuid::Uuid;
 
 use crate::capture::draft::{self, DraftError, DraftView, DueChoice};
-use crate::capture::schema::{RawItem, RawRecurrence};
+use crate::capture::schema::{MAX_ITEMS, RawItem, RawRecurrence};
 use crate::capture::validate::{DraftItem, parse_date, parse_time};
 use crate::domain::models::{
     DraftStatus, ItemPriority, ListKind, MonthRule, NewItem, RecurrenceFreq,
 };
+use crate::domain::validation::validate_new_item;
 use crate::storage::repositories::capture_jobs::{self, NewJob};
 use crate::storage::repositories::drafts::DRAFT_TTL_MINUTES;
 use crate::storage::repositories::{items, lists};
-use crate::telegram::rich::{Span, button};
+use crate::telegram::rich::{Block, Span, button, inline_char_len, inline_len};
 use crate::telegram::ru;
+use crate::telegram::views;
 
 use super::card::{describe_recurrence_draft, priority_label};
 use super::forms;
 use super::model::{
-    Action, Editor, EditorTarget, ItemDraft, RecurrenceDraft, Screen, Step, SubtaskDraft, Ui,
+    Action, DuplicateChoice, Editor, EditorTarget, ItemDraft, RecurrenceDraft, Screen, Step,
+    SubtaskDraft, Ui, addition_rows, duplicate_notice, list_screen, merge_duplicate_choice,
+    plan_additions,
 };
 use super::screens::nav_row;
 use super::{Ctx, Fail};
@@ -37,17 +41,53 @@ pub const MAX_TEXT: usize = 2_000;
 pub const PARSES_PER_MINUTE: i64 = 10;
 
 /// Принять свободный текст на разбор.
-pub async fn intake(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
+pub async fn intake(
+    ctx: &mut Ctx<'_>,
+    text: &str,
+    default_list_id: Option<Uuid>,
+) -> Result<(), Fail> {
+    if !accept(ctx, text).await? {
+        return Ok(());
+    }
     let user_id = ctx.user()?.id;
     let household_id = ctx.household()?.id;
-    if text.chars().count() > MAX_TEXT {
-        ctx.banner(format!(
-            "Сообщение слишком длинное: не больше {MAX_TEXT} символов. \
-             Сократите его или разделите на части."
-        ));
-        return ctx.refresh().await;
+    let job = match default_list_id {
+        Some(list_id) => {
+            NewJob::telegram_text_in_list(household_id, user_id, ctx.chat_id, text, list_id)
+        }
+        None => NewJob::telegram_text(household_id, user_id, ctx.chat_id, text),
+    };
+    let job_id = capture_jobs::enqueue(&mut *ctx.conn, job, ctx.now).await?;
+    ctx.present(Screen::Processing {
+        job_id: Some(job_id),
+    })
+    .await
+}
+
+/// Принять текст на прямое добавление покупок в список с активного экрана.
+///
+/// Лимиты те же, что у обычного разбора. Экран списка остаётся на месте и
+/// получает баннер «Добавляю…»: карточки ожидания здесь нет.
+pub async fn intake_direct(ctx: &mut Ctx<'_>, text: &str, list_id: Uuid) -> Result<(), Fail> {
+    if !accept(ctx, text).await? {
+        return Ok(());
+    }
+    let user_id = ctx.user()?.id;
+    let household_id = ctx.household()?.id;
+    let job = NewJob::telegram_text_direct(household_id, user_id, ctx.chat_id, text, list_id);
+    capture_jobs::enqueue(&mut *ctx.conn, job, ctx.now).await?;
+    ctx.banner("Добавляю…");
+    ctx.refresh().await
+}
+
+/// Проверить длину и частоту. Отказ показывается баннером на активном экране.
+async fn accept(ctx: &mut Ctx<'_>, text: &str) -> Result<bool, Fail> {
+    if !accept_length(ctx, text).await? {
+        return Ok(false);
     }
 
+    let user_id = ctx.user()?.id;
+    let household_id = ctx.household()?.id;
     let recent = capture_jobs::count_recent_for_user(
         &mut *ctx.conn,
         household_id,
@@ -60,19 +100,166 @@ pub async fn intake(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
             "Слишком много сообщений на разбор: не больше {PARSES_PER_MINUTE} в минуту. \
              Подождите немного и отправьте снова."
         ));
+        ctx.refresh().await?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Проверить только длину: деление без разбора не вызывает LLM, поэтому
+/// частота разборов его не ограничивает.
+async fn accept_length(ctx: &mut Ctx<'_>, text: &str) -> Result<bool, Fail> {
+    if text.chars().count() > MAX_TEXT {
+        ctx.banner(format!(
+            "Сообщение слишком длинное: не больше {MAX_TEXT} символов. \
+             Сократите его или разделите на части."
+        ));
+        ctx.refresh().await?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Части текста без разбора: по запятым и переводам строк, без пустых.
+pub(crate) fn split_titles(text: &str) -> Vec<String> {
+    text.split([',', '\n'])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Текст баннера после добавления без разбора. `skipped` — части, которые не
+/// прошли проверку домена: их нужно назвать, а не терять молча.
+pub(crate) fn split_banner(
+    target_name: &str,
+    added: &[String],
+    duplicates: &[DuplicateChoice],
+    skipped: &[String],
+    on_list: bool,
+) -> String {
+    let mut text = if added.is_empty() {
+        if duplicates.is_empty() && skipped.is_empty() {
+            "Не нашёл в сообщении покупок.".to_owned()
+        } else {
+            String::new()
+        }
+    } else if on_list {
+        format!(
+            "Добавлено без разбора (количество не распознаётся): {}",
+            added.join(", ")
+        )
+    } else {
+        format!(
+            "Добавлено в «{target_name}» без разбора (количество не распознаётся): {}",
+            added.join(", ")
+        )
+    };
+    if let Some(notice) = duplicate_notice(duplicates) {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(&notice);
+    }
+    if !skipped.is_empty() {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(&format!(
+            "Не добавлено (слишком длинное название): {}",
+            skipped.join(", ")
+        ));
+    }
+    text
+}
+
+/// Добавить покупки без разбора на экране списка: текст делится по запятым и
+/// переводам строк, каждая часть становится позицией с количеством 1.
+pub async fn intake_split(ctx: &mut Ctx<'_>, text: &str, list_id: Uuid) -> Result<(), Fail> {
+    if !accept_length(ctx, text).await? {
+        return Ok(());
+    }
+    let household_id = ctx.household()?.id;
+    let actor = ctx.actor()?;
+    let list = lists::get_visible(&mut *ctx.conn, household_id, list_id).await?;
+    if list.kind != ListKind::Shopping {
+        return forms::quick_add_in_list(ctx, text, Some(list_id)).await;
+    }
+
+    let parts = split_titles(text);
+    if parts.len() > MAX_ITEMS {
+        ctx.banner(format!(
+            "Слишком много позиций: не больше {MAX_ITEMS} за раз. Разделите текст"
+        ));
         return ctx.refresh().await;
     }
 
-    let job_id = capture_jobs::enqueue(
-        &mut *ctx.conn,
-        NewJob::telegram_text(household_id, user_id, ctx.chat_id, text),
-        ctx.now,
-    )
-    .await?;
-    ctx.present(Screen::Processing {
-        job_id: Some(job_id),
-    })
-    .await
+    let timezone = ctx.tz.name().to_owned();
+    let today = ctx.now.with_timezone(&ctx.tz).date_naive();
+    let mut existing = items::list_by_list(&mut *ctx.conn, household_id, list.id).await?;
+    let mut new_items = Vec::new();
+    for title in parts {
+        let draft = ItemDraft {
+            title,
+            quantity: Some(1.0),
+            ..ItemDraft::default()
+        };
+        let mut new_item = draft.to_new_item(list.id, ctx.tz, list.kind)?;
+        // Экран задаёт целевой список: деление не уводит покупку в другой.
+        new_item.list_id = list.id;
+        new_items.push(new_item);
+    }
+
+    let mut created = Vec::new();
+    let mut duplicates: Vec<DuplicateChoice> = Vec::new();
+    let mut skipped = Vec::new();
+    for new_item in new_items {
+        let (to_create, found) = plan_additions(&existing, vec![new_item]);
+        for choice in found {
+            merge_duplicate_choice(&mut duplicates, choice);
+        }
+        for new_item in to_create {
+            let assignee = new_item.assignee_user_id;
+            let title = new_item.title.clone();
+            let validated = match validate_new_item(ListKind::Shopping, &timezone, new_item, today)
+            {
+                Ok(validated) => validated,
+                // Слишком длинную часть не теряем из-за остальных: покажем её
+                // в баннере.
+                Err(crate::domain::error::DomainError::Validation(_)) => {
+                    skipped.push(title);
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let item = items::create(
+                &mut *ctx.conn,
+                household_id,
+                &actor,
+                list.id,
+                validated,
+                assignee,
+                ctx.now,
+            )
+            .await?;
+            existing.push(item.clone());
+            created.push(item);
+        }
+    }
+
+    let titles: Vec<String> = created.iter().map(|item| item.title.clone()).collect();
+    let rows = addition_rows(&duplicates, list.id, &created, None);
+    let banner = split_banner(&list.name, &titles, &duplicates, &skipped, true);
+    if rows.is_empty() {
+        ctx.banner(banner);
+    } else {
+        ctx.banner_rows(banner, rows);
+    }
+
+    let current = views::get(&mut *ctx.conn, ctx.chat_id)
+        .await?
+        .and_then(|view| serde_json::from_value::<Screen>(view.state).ok());
+    ctx.present(list_screen(current.as_ref(), list.id)).await
 }
 
 /// Экран ожидания разбора.
@@ -150,15 +337,92 @@ fn closed(title: &str, hint: &str, screen: &Screen) -> Ui {
         .row(nav_row(screen, Screen::Menu))
 }
 
+/// Лимит длины HTML карточки: запас под лимит сообщения Telegram.
+const MAX_CARD_HTML_CHARS: usize = 4_096;
+
+/// Разметка одной свёрнутой цитаты вместе с переводом строки.
+const QUOTE_MARKUP: usize = "<blockquote expandable></blockquote>\n".len();
+
+/// Части исходного текста для цитат карточки: каждая часть отдельно, а у
+/// старого черновика без `raw_parts` — одна цитата из `raw_text`.
+///
+/// `available` — сколько символов HTML осталось после остальных блоков
+/// карточки. Если все части помещаются, они показываются целиком; иначе делят
+/// остаток поровну и обрезаются с многоточием.
+fn card_quotes(view: &DraftView, available: usize) -> Vec<String> {
+    let parts = if view.draft.raw_parts.is_empty() {
+        if view.draft.raw_text.is_empty() {
+            Vec::new()
+        } else {
+            vec![view.draft.raw_text.clone()]
+        }
+    } else {
+        view.draft.raw_parts.clone()
+    };
+    if parts.is_empty() {
+        return Vec::new();
+    }
+
+    let overhead = parts.len().saturating_mul(QUOTE_MARKUP);
+    let budget = available.saturating_sub(overhead);
+    let total: usize = parts.iter().map(|part| inline_len(part)).sum();
+    if total <= budget {
+        return parts;
+    }
+
+    let mut remaining = budget;
+    let count = parts.len();
+    parts
+        .iter()
+        .enumerate()
+        .map(|(index, part)| {
+            let share = remaining / (count - index);
+            let clipped = clip_quote(part, share);
+            remaining = remaining.saturating_sub(inline_len(&clipped));
+            clipped
+        })
+        .collect()
+}
+
+/// Длина экрана в HTML без учёта цитат.
+fn rendered_len(ui: &Ui) -> usize {
+    let token = format!("t:{}", "0".repeat(16));
+    let tokens = vec![token; ui.button_count()];
+    crate::telegram::rich::render(ui, &tokens)
+        .html
+        .chars()
+        .count()
+}
+
+/// Обрезать часть цитаты до бюджета экранированных символов.
+fn clip_quote(text: &str, budget: usize) -> String {
+    if inline_len(text) <= budget {
+        return text.to_owned();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    // Место под многоточие: обрезка должна быть видна.
+    let reserve = usize::from(budget > 0);
+    for ch in text.chars() {
+        let length = inline_char_len(ch);
+        if used + length + reserve > budget {
+            break;
+        }
+        used += length;
+        out.push(ch);
+    }
+    if !out.is_empty() {
+        out.push('…');
+    }
+    out
+}
+
 fn card(ctx: &Ctx<'_>, view: &DraftView) -> Ui {
     let draft_id = view.draft.id;
     let items = &view.validated.items;
     let total = items.len();
 
     let mut ui = Ui::new();
-    if !view.draft.raw_text.is_empty() {
-        ui = ui.quote(&view.draft.raw_text);
-    }
     ui = ui.heading(if total == 0 {
         "Черновик пуст".to_owned()
     } else {
@@ -226,7 +490,22 @@ fn card(ctx: &Ctx<'_>, view: &DraftView) -> Ui {
         buttons.push(button("✅ Сохранить всё", Action::DraftSave { draft_id }));
     }
     buttons.push(button("✖️ Отмена", Action::DraftCancel { draft_id }));
-    ui.row(buttons)
+    ui = ui.row(buttons);
+
+    let banner = ctx
+        .banner
+        .as_ref()
+        .map_or(0, |banner| banner.html_len() + 1);
+    let room = MAX_CARD_HTML_CHARS.saturating_sub(rendered_len(&ui).saturating_add(banner));
+    let quotes: Vec<Block<Action>> = card_quotes(view, room)
+        .into_iter()
+        .filter(|quote| !quote.is_empty())
+        .map(Block::Quote)
+        .collect();
+    if !quotes.is_empty() {
+        ui.blocks.splice(0..0, quotes);
+    }
+    ui
 }
 
 fn details(ctx: &Ctx<'_>, view: &DraftView, draft_item: &DraftItem, item: &NewItem) -> Vec<String> {

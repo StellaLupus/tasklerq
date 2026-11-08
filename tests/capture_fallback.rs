@@ -1076,3 +1076,220 @@ async fn a_hanging_llm_is_recorded_as_a_breaker_failure() {
     assert_eq!(run_status, "failure");
     assert_eq!(error_code.as_deref(), Some("timeout"));
 }
+
+/// Telegram: текст на экране покупок без разбора делится на позиции.
+mod telegram_split {
+    use super::*;
+
+    use chrono::Duration;
+    use tasklerq::telegram::bot::Bot;
+    use tasklerq::telegram::capture_worker::{
+        CaptureWorker, DEFAULT_DAILY_QUOTA, MAX_ATTEMPTS, Pass,
+    };
+    use tokio::sync::Notify;
+
+    use support::telegram::{FakeTelegram, Harness};
+
+    struct Stand {
+        bot: Harness,
+        worker: CaptureWorker,
+        ai: Arc<StubAi>,
+    }
+
+    async fn stand(
+        pool: &PgPool,
+        answers: Vec<Result<Value, HaError>>,
+        llm_capture: bool,
+    ) -> Stand {
+        let id = support::next_telegram_id();
+        let handler = Bot::new("tasklerqbot")
+            .with_llm_capture(llm_capture)
+            .with_tenancy(tasklerq::config::TenancyMode::Multi);
+        let ai = StubAi::new(answers);
+        let mut bot =
+            Harness::with_handler(pool, id, Arc::new(handler.clone()), FakeTelegram::new());
+        bot.text("/start").await;
+        bot.text("Семья").await;
+        bot.press("Москва").await;
+        bot.press("меню").await;
+
+        let worker = CaptureWorker::new(
+            pool.clone(),
+            ai.clone(),
+            handler,
+            Arc::new(Notify::new()),
+            Audit::new(pool.clone()),
+        )
+        .only_chat(id)
+        .with_quota(DEFAULT_DAILY_QUOTA);
+        Stand { bot, worker, ai }
+    }
+
+    impl Stand {
+        async fn work(&mut self) -> Pass {
+            let pass = self
+                .worker
+                .run_once(self.bot.now)
+                .await
+                .expect("worker pass");
+            self.bot.deliver().await;
+            pass
+        }
+
+        async fn rows(&self) -> Vec<(String, f64)> {
+            sqlx::query_as(
+                "SELECT i.title, i.quantity::float8
+                 FROM items i
+                 JOIN users u ON u.household_id = i.household_id
+                 WHERE u.telegram_user_id = $1 AND i.deleted_at IS NULL
+                 ORDER BY i.title",
+            )
+            .bind(self.bot.chat)
+            .fetch_all(&self.bot.pool)
+            .await
+            .expect("items")
+        }
+
+        async fn jobs(&self) -> i64 {
+            sqlx::query_scalar("SELECT count(*) FROM capture_jobs WHERE chat_id = $1")
+                .bind(self.bot.chat)
+                .fetch_one(&self.bot.pool)
+                .await
+                .expect("jobs")
+        }
+    }
+
+    async fn shopping_list_id(pool: &PgPool, telegram_id: i64) -> Uuid {
+        sqlx::query_scalar(
+            "SELECT l.id FROM lists l
+             JOIN users u ON u.household_id = l.household_id
+             WHERE u.telegram_user_id = $1 AND l.kind = 'shopping' AND l.is_default
+             LIMIT 1",
+        )
+        .bind(telegram_id)
+        .fetch_one(pool)
+        .await
+        .expect("shopping list")
+    }
+
+    async fn household_id(pool: &PgPool, telegram_id: i64) -> Uuid {
+        sqlx::query_scalar("SELECT household_id FROM users WHERE telegram_user_id = $1")
+            .bind(telegram_id)
+            .fetch_one(pool)
+            .await
+            .expect("household")
+    }
+
+    async fn seed_shopping_item(
+        pool: &PgPool,
+        telegram_id: i64,
+        title: &str,
+        quantity: f64,
+        unit: &str,
+    ) {
+        let household = household_id(pool, telegram_id).await;
+        let list = shopping_list_id(pool, telegram_id).await;
+        sqlx::query(
+            "INSERT INTO items (
+                 id, household_id, list_id, title, status, priority, source,
+                 quantity, unit, position, created_at, updated_at
+             )
+             VALUES ($1, $2, $3, $4, 'open', 'normal', 'telegram', $5, $6, 1, now(), now())",
+        )
+        .bind(Uuid::now_v7())
+        .bind(household)
+        .bind(list)
+        .bind(title)
+        .bind(quantity)
+        .bind(unit)
+        .execute(pool)
+        .await
+        .expect("seeded item");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_disabled_llm_splits_the_text_into_unit_positions() {
+        let db = db().await;
+        let mut stand = stand(&db.pool, vec![], false).await;
+
+        stand.bot.press("Покупки").await;
+        stand.bot.text("молоко, хлеб").await;
+
+        stand.bot.assert_screen_contains(
+            "Добавлено без разбора (количество не распознаётся): молоко, хлеб",
+        );
+        stand.bot.assert_has_button("Отменить");
+        assert_eq!(
+            stand.rows().await,
+            vec![("молоко".to_owned(), 1.0), ("хлеб".to_owned(), 1.0)]
+        );
+        assert_eq!(stand.jobs().await, 0, "no parse job is queued");
+        assert_eq!(stand.ai.calls(), 0, "the LLM must not be called");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unavailable_home_assistant_falls_back_to_splitting() {
+        let db = db().await;
+        let answers = (0..MAX_ATTEMPTS)
+            .map(|_| Err(HaError::Unreachable))
+            .collect();
+        let mut stand = stand(&db.pool, answers, true).await;
+
+        stand.bot.press("Покупки").await;
+        stand.bot.text("молоко, хлеб").await;
+
+        let mut last = Pass::Idle;
+        for _ in 0..MAX_ATTEMPTS {
+            stand.bot.advance(Duration::minutes(5));
+            last = stand.work().await;
+        }
+        assert_eq!(last, Pass::Dead, "all attempts are exhausted");
+
+        stand
+            .bot
+            .assert_screen_contains("Добавлено без разбора (количество не распознаётся)");
+        stand.bot.assert_has_button("Отменить");
+        assert_eq!(
+            stand.rows().await,
+            vec![("молоко".to_owned(), 1.0), ("хлеб".to_owned(), 1.0)],
+            "a failed parse adds the positions without the LLM"
+        );
+        assert_eq!(stand.ai.calls(), MAX_ATTEMPTS as usize);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn newlines_empty_parts_and_repeated_commas_are_ignored() {
+        let db = db().await;
+        let mut stand = stand(&db.pool, vec![], false).await;
+
+        stand.bot.press("Покупки").await;
+        stand.bot.text("молоко,\n\n, хлеб\n,,").await;
+
+        assert_eq!(
+            stand.rows().await,
+            vec![("молоко".to_owned(), 1.0), ("хлеб".to_owned(), 1.0)],
+            "empty parts must not create positions"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_duplicate_rule_applies_to_split_positions() {
+        let db = db().await;
+        let mut stand = stand(&db.pool, vec![], false).await;
+        seed_shopping_item(&db.pool, stand.bot.chat, "Молоко", 2.0, "л").await;
+
+        stand.bot.press("Покупки").await;
+        stand.bot.text("молоко, хлеб").await;
+
+        stand.bot.assert_screen_contains("Добавлено без разбора");
+        stand.bot.assert_screen_contains("Уже в списке: «молоко»");
+        stand.bot.assert_has_button("Увеличить");
+        stand.bot.assert_has_button("Добавить отдельно");
+        stand.bot.assert_has_button("Отменить");
+        assert_eq!(
+            stand.rows().await,
+            vec![("Молоко".to_owned(), 2.0), ("хлеб".to_owned(), 1.0)],
+            "the duplicate must not be saved without a choice"
+        );
+    }
+}

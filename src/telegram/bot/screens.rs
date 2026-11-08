@@ -8,8 +8,8 @@ use uuid::Uuid;
 
 use crate::domain::models::{Item, ItemPriority, ItemStatus, List, ListKind};
 use crate::domain::search::SearchFilters;
-use crate::storage::repositories::{items, lists};
-use crate::telegram::rich::{Span, button};
+use crate::storage::repositories::{drafts, items, lists};
+use crate::telegram::rich::{Block, Span, button};
 use crate::telegram::ru;
 
 use super::model::{Action, PAGE_SIZE, Screen, StatusFilter, Ui};
@@ -17,7 +17,7 @@ use super::{Ctx, Fail, card, forms, settings};
 
 /// Собрать экран.
 pub async fn build(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
-    match screen {
+    let mut ui = match screen {
         Screen::Form => forms::view(ctx).await,
         Screen::Processing { job_id } => super::capture::processing(ctx, *job_id).await,
         Screen::Draft { draft_id } => super::capture::view(ctx, *draft_id).await,
@@ -71,7 +71,33 @@ pub async fn build(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
         | Screen::ConfirmRevokeToken { .. }
         | Screen::ConfirmLeave
         | Screen::InviteCreated { .. } => settings::view(ctx, screen).await,
+    }?;
+    // Маршрут нужен только экранам, у которых есть подсказка ввода: так
+    // построение остальных экранов не делает лишних запросов.
+    let hint = match screen {
+        Screen::Menu | Screen::Form | Screen::List { .. } | Screen::Results { .. } => {
+            super::routing::route(ctx, screen)
+                .await?
+                .hint(ctx.llm_capture)
+        }
+        _ => None,
+    };
+    if let Some(hint) = hint {
+        ui = with_hint(ui, hint);
     }
+    Ok(ui)
+}
+
+/// Вставить подсказку ввода перед первым рядом кнопок.
+fn with_hint(mut ui: Ui, hint: String) -> Ui {
+    let at = ui
+        .blocks
+        .iter()
+        .position(|block| matches!(block, Block::Buttons(_)))
+        .unwrap_or(ui.blocks.len());
+    ui.blocks
+        .insert(at, Block::Paragraph(vec![Span::Text(hint)]));
+    ui
 }
 
 fn go(label: &str, to: Screen) -> crate::telegram::rich::Button<Action> {
@@ -144,22 +170,36 @@ async fn menu(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
     let tasks_count = open_in(tasks_list, counts.open_tasks);
     let shopping_count = open_in(shopping_list, counts.open_shopping);
 
-    let hint = if ctx.llm_capture {
-        ru::MENU_HINT
-    } else {
-        ru::MENU_HINT_NO_LLM
-    };
-    let mut ui = Ui::new()
-        .heading(household.name)
-        .spans(vec![
-            Span::text("Просрочено: "),
-            Span::bold(counts.overdue_tasks.to_string()),
-            Span::text(" · На сегодня: "),
-            Span::bold(counts.due_today_tasks.to_string()),
-            Span::text(" · Выполнено: "),
-            Span::bold(counts.done_today.to_string()),
-        ])
-        .text(hint);
+    let mut ui = Ui::new().heading(household.name).spans(vec![
+        Span::text("Просрочено: "),
+        Span::bold(counts.overdue_tasks.to_string()),
+        Span::text(" · На сегодня: "),
+        Span::bold(counts.due_today_tasks.to_string()),
+        Span::text(" · Выполнено: "),
+        Span::bold(counts.done_today.to_string()),
+    ]);
+
+    if let Some(pending) = drafts::latest_pending_telegram(
+        &mut *ctx.conn,
+        household.id,
+        ctx.chat_id,
+        Some(user_id),
+        ctx.now,
+    )
+    .await?
+    {
+        ui = ui
+            .text(format!(
+                "📝 Ждёт подтверждения: {}",
+                ru::points(pending.items)
+            ))
+            .row(vec![go(
+                "Открыть",
+                Screen::Draft {
+                    draft_id: pending.draft_id,
+                },
+            )]);
+    }
 
     let tasks_target = tasks_list
         .map(|list_id| Screen::List {

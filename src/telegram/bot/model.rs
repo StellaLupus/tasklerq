@@ -19,13 +19,17 @@ use crate::domain::models::{
     RecurrenceFreq, RecurrenceInput, SubtaskInput,
 };
 use crate::domain::recurrence::resolve_local;
-use crate::telegram::rich::View;
+use crate::telegram::rich::{Button, View, button};
+use crate::telegram::ru;
 
 /// Экран бота с кнопками-действиями.
 pub type Ui = View<Action>;
 
 /// Размер страницы списков и результатов.
 pub const PAGE_SIZE: usize = 8;
+
+/// Максимальное количество позиции.
+pub const MAX_QUANTITY: f64 = 9_999.0;
 
 /// Информационный экран первого контакта без формы онбординга.
 ///
@@ -890,6 +894,50 @@ pub enum Action {
         #[serde(default)]
         from_lists: bool,
     },
+    /// Увеличить найденный при прямом добавлении дубликат до суммы.
+    DuplicateIncrease {
+        /// Существующая позиция.
+        item_id: Uuid,
+        /// Версия, которую видел пользователь.
+        version: i32,
+        /// Новое количество.
+        quantity: f64,
+        /// Остальные дубликаты, которые ещё ждут выбора.
+        #[serde(default)]
+        rest: Vec<DuplicateChoice>,
+        /// Ожидающий черновик этого же добавления: кнопка «Открыть» в
+        /// следующем баннере.
+        #[serde(default)]
+        draft_id: Option<Uuid>,
+    },
+    /// Отменить прямое добавление покупок: мягко удалить созданные позиции.
+    AddedUndo {
+        /// Позиции, созданные этим добавлением.
+        item_ids: Vec<Uuid>,
+    },
+    /// Открыть ручной редактор с исходным текстом из баннера ошибки разбора.
+    ManualEntry {
+        /// Исходный текст сообщения (не длиннее 2000 символов).
+        text: String,
+    },
+    /// Добавить найденный дубликат отдельной позицией.
+    DuplicateSeparate {
+        /// Список.
+        list_id: Uuid,
+        /// Название.
+        title: String,
+        /// Количество.
+        quantity: f64,
+        /// Единица.
+        unit: Option<String>,
+        /// Остальные дубликаты, которые ещё ждут выбора.
+        #[serde(default)]
+        rest: Vec<DuplicateChoice>,
+        /// Ожидающий черновик этого же добавления: кнопка «Открыть» в
+        /// следующем баннере.
+        #[serde(default)]
+        draft_id: Option<Uuid>,
+    },
     /// Начать ввод поискового запроса.
     SearchStart,
     /// Открыть форму переименования профиля.
@@ -1150,7 +1198,8 @@ impl Action {
             | Self::DueSet { version, .. }
             | Self::DueText { version, .. }
             | Self::NoticeComplete { version, .. }
-            | Self::BatchComplete { version, .. } => Some(*version),
+            | Self::BatchComplete { version, .. }
+            | Self::DuplicateIncrease { version, .. } => Some(*version),
             Self::Form {
                 act: FormAct::Increase { version, .. },
             } => Some(*version),
@@ -1415,6 +1464,239 @@ pub struct Duplicate {
     pub unit: Option<String>,
     /// Версия.
     pub version: i32,
+}
+
+impl Duplicate {
+    /// Найти открытую позицию с тем же названием: правило редактора покупки.
+    pub fn find<'a>(items: impl IntoIterator<Item = &'a Item>, title: &str) -> Option<Self> {
+        let wanted = title.trim().to_lowercase();
+        items
+            .into_iter()
+            .find(|item| {
+                item.status == ItemStatus::Open && item.title.trim().to_lowercase() == wanted
+            })
+            .map(|item| Self {
+                item_id: item.id,
+                title: item.title.clone(),
+                quantity: item.quantity,
+                unit: item.unit.clone(),
+                version: item.version,
+            })
+    }
+
+    /// Количество после «Увеличить»: сумма при совпадающей единице и лимите.
+    pub fn increase_total(&self, quantity: f64, unit: Option<&str>) -> Option<f64> {
+        let existing = self.quantity?;
+        let same_unit = unit.or(Some("шт")).map(str::to_lowercase)
+            == self.unit.as_deref().map(str::to_lowercase);
+        if !same_unit {
+            return None;
+        }
+        let total = existing + quantity;
+        (total <= MAX_QUANTITY).then_some(total)
+    }
+
+    /// Подпись кнопки «Увеличить».
+    pub fn increase_label(&self, total: f64) -> String {
+        format!(
+            "➕ Увеличить до {}",
+            ru::quantity_label(total, self.unit.as_deref())
+        )
+    }
+
+    /// Подпись кнопки «Добавить отдельно».
+    pub fn separate_label(&self) -> &'static str {
+        "📄 Добавить отдельно"
+    }
+}
+
+/// Дубликат, который не сохраняется до выбора пользователя.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DuplicateChoice {
+    /// Существующая открытая позиция.
+    pub existing: Duplicate,
+    /// Название из разбора.
+    pub title: String,
+    /// Количество из разбора.
+    pub quantity: f64,
+    /// Единица из разбора; `None` — при отдельном добавлении возьмётся «шт».
+    pub unit: Option<String>,
+}
+
+impl DuplicateChoice {
+    /// Количество после «Увеличить» для этого выбора.
+    pub fn increase_total(&self) -> Option<f64> {
+        let unit = self.unit.as_deref().or(self.existing.unit.as_deref());
+        self.existing.increase_total(self.quantity, unit)
+    }
+
+    /// Кнопки выбора для одного дубликата; остальные переносятся в действии.
+    pub fn buttons(
+        &self,
+        list_id: Uuid,
+        rest: Vec<Self>,
+        draft_id: Option<Uuid>,
+    ) -> Vec<Button<Action>> {
+        let mut buttons = Vec::new();
+        if let Some(total) = self.increase_total() {
+            buttons.push(button(
+                self.existing.increase_label(total),
+                Action::DuplicateIncrease {
+                    item_id: self.existing.item_id,
+                    version: self.existing.version,
+                    quantity: total,
+                    rest: rest.clone(),
+                    draft_id,
+                },
+            ));
+        }
+        buttons.push(button(
+            self.existing.separate_label(),
+            Action::DuplicateSeparate {
+                list_id,
+                title: self.title.clone(),
+                quantity: self.quantity,
+                unit: self.unit.clone(),
+                rest,
+                draft_id,
+            },
+        ));
+        buttons
+    }
+}
+
+/// Разделить новые позиции на создаваемые и дубликаты уже существующих.
+///
+/// Дубликатом считается открытая позиция с тем же названием: количество
+/// суммируется, если совпадает единица. Позиции этого пакета между собой не
+/// сравниваются: вызывающая сторона добавляет созданные позиции в `existing`
+/// перед следующей проверкой, как и раньше.
+pub fn plan_additions(
+    existing: &[Item],
+    new_items: Vec<NewItem>,
+) -> (Vec<NewItem>, Vec<DuplicateChoice>) {
+    let mut to_create: Vec<NewItem> = Vec::new();
+    let mut duplicates: Vec<DuplicateChoice> = Vec::new();
+    for new_item in new_items {
+        if let Some(existing_item) = Duplicate::find(existing, &new_item.title) {
+            add_duplicate(&mut duplicates, existing_item, &new_item);
+        } else {
+            to_create.push(new_item);
+        }
+    }
+    (to_create, duplicates)
+}
+
+/// Слить выбор дубликата в накопленный список по тому же названию и единице.
+pub fn merge_duplicate_choice(duplicates: &mut Vec<DuplicateChoice>, choice: DuplicateChoice) {
+    let effective_unit = choice.unit.as_deref().or(choice.existing.unit.as_deref());
+    if let Some(pending) = duplicates.iter_mut().find(|pending| {
+        pending.existing.item_id == choice.existing.item_id
+            && same_unit(
+                pending.unit.as_deref().or(pending.existing.unit.as_deref()),
+                effective_unit,
+            )
+    }) {
+        pending.quantity += choice.quantity;
+    } else {
+        duplicates.push(choice);
+    }
+}
+
+/// Слить ещё одну позицию в выбор дубликата с тем же названием и единицей.
+fn add_duplicate(duplicates: &mut Vec<DuplicateChoice>, existing: Duplicate, new_item: &NewItem) {
+    merge_duplicate_choice(
+        duplicates,
+        DuplicateChoice {
+            existing,
+            title: new_item.title.clone(),
+            quantity: new_item.quantity.unwrap_or(1.0),
+            unit: new_item.unit.clone(),
+        },
+    );
+}
+
+/// Ряды кнопок баннера прямого добавления: дубликаты и отмена созданных
+/// позиций, а «Открыть» — отдельным последним рядом, чтобы кнопки не
+/// обрезались по ширине.
+pub fn addition_rows(
+    duplicates: &[DuplicateChoice],
+    list_id: Uuid,
+    created: &[Item],
+    draft_id: Option<Uuid>,
+) -> Vec<Vec<Button<Action>>> {
+    let mut rows = Vec::new();
+    let mut row = duplicates
+        .split_first()
+        .map(|(first, rest)| first.buttons(list_id, rest.to_vec(), draft_id))
+        .unwrap_or_default();
+    if !created.is_empty() {
+        row.push(button(
+            "↩️ Отменить",
+            Action::AddedUndo {
+                item_ids: created.iter().map(|item| item.id).collect(),
+            },
+        ));
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    if let Some(draft_id) = draft_id {
+        rows.push(vec![button(
+            "Открыть",
+            Action::Go {
+                to: Screen::Draft { draft_id },
+            },
+        )]);
+    }
+    rows
+}
+
+/// Экран списка по текущему экрану: тот же список сохраняет страницу и режим,
+/// иначе открывается первая страница обычного списка.
+pub fn list_screen(current: Option<&Screen>, list_id: Uuid) -> Screen {
+    if let Some(Screen::List {
+        list_id: current_id,
+        page,
+        edit,
+        from_lists,
+    }) = current
+        && *current_id == list_id
+    {
+        return Screen::List {
+            list_id,
+            page: *page,
+            edit: *edit,
+            from_lists: *from_lists,
+        };
+    }
+    Screen::List {
+        list_id,
+        page: 0,
+        edit: false,
+        from_lists: false,
+    }
+}
+
+/// Совпадают ли единицы измерения для слияния дубликатов.
+pub fn same_unit(left: Option<&str>, right: Option<&str>) -> bool {
+    let fold = |value: &str| value.trim().to_lowercase().replace('ё', "е");
+    match (left, right) {
+        (Some(left), Some(right)) => fold(left) == fold(right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// Сообщение о дубликатах, которые ещё ждут выбора.
+pub fn duplicate_notice(duplicates: &[DuplicateChoice]) -> Option<String> {
+    let next = duplicates.first()?;
+    let more = duplicates.len().saturating_sub(1);
+    if more == 0 {
+        Some(format!("Уже в списке: «{}».", next.title))
+    } else {
+        Some(format!("Уже в списке: «{}» (и ещё {more}).", next.title))
+    }
 }
 
 /// Единый редактор существующего элемента.

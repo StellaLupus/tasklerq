@@ -19,7 +19,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use super::context::CaptureContext;
-use super::schema::{MAX_CLARIFICATIONS, ParsedResponse, RawItem, RawRecurrence};
+use super::schema::{MAX_CLARIFICATIONS, MAX_ITEMS, ParsedResponse, RawItem, RawRecurrence};
 use super::validate::{DraftItem, ValidatedDraft, validate_items};
 use crate::domain::error::DomainError;
 use crate::domain::models::{
@@ -28,6 +28,10 @@ use crate::domain::models::{
 use crate::domain::validation::{sanitize, validate_new_item};
 use crate::storage::repositories::drafts::{self, Draft, NewDraft};
 use crate::storage::repositories::{capture_requests, households, items, lists, users};
+
+/// Максимум символов в склейке исходного текста черновика: то же ограничение,
+/// что у `capture_drafts_raw_text_len`.
+pub const MAX_RAW_TEXT_CHARS: usize = 2000;
 
 /// Источник элементов, созданных из capture с данным источником.
 pub fn item_source(source: CaptureSource) -> ItemSource {
@@ -341,6 +345,14 @@ pub async fn create_with_responder(
 /// [`create_with_responder`] и [`apply_auto`].
 fn new_draft(capture: NewCapture) -> NewDraft {
     let stored = Stored::from_parsed(capture.parsed);
+    let raw_text = sanitize(&capture.raw_text);
+    // У нового черновика Telegram исходное сообщение — первая часть; внешний
+    // capture частей не ведёт.
+    let raw_parts = if capture.source == CaptureSource::Telegram {
+        vec![raw_text.clone()]
+    } else {
+        Vec::new()
+    };
     NewDraft {
         id: capture.id.unwrap_or_else(Uuid::now_v7),
         household_id: capture.household_id,
@@ -350,11 +362,113 @@ fn new_draft(capture: NewCapture) -> NewDraft {
         mode: capture.mode,
         idempotency_key: capture.idempotency_key,
         request_hash: capture.request_hash,
-        raw_text: sanitize(&capture.raw_text),
+        raw_text,
+        raw_parts,
         parsed: stored.to_value(),
         fallback: capture.fallback,
         prompt_version: capture.prompt_version,
     }
+}
+
+/// Сохранить разбор из Telegram: дописать в ожидающий черновик того же чата и
+/// пользователя, если пределы позволяют, иначе создать новый.
+///
+/// Вызывающая сторона передаёт соединение уже открытой транзакции: выбор,
+/// дописывание и запись задания должны быть атомарны. Транзакционная
+/// advisory-блокировка чата сериализует два одновременно завершившихся
+/// разбора: второй видит черновик первого, а не создаёт второй рядом.
+pub async fn append_or_create(
+    conn: &mut PgConnection,
+    capture: NewCapture,
+    now: DateTime<Utc>,
+) -> Result<Draft, DomainError> {
+    let Some(chat_id) = capture
+        .chat_id
+        .filter(|_| capture.source == CaptureSource::Telegram)
+    else {
+        return create(conn, capture, now).await;
+    };
+
+    drafts::lock_chat(conn, chat_id).await?;
+    let pending = drafts::pending_telegram_for_update(
+        conn,
+        capture.household_id,
+        chat_id,
+        capture.user_id,
+        now,
+    )
+    .await?;
+    if let Some(draft) = pending
+        && let Some(appended) = try_append(conn, draft, &capture, now).await?
+    {
+        return Ok(appended);
+    }
+    create(conn, capture, now).await
+}
+
+/// Дописать разбор в ожидающий черновик, если сумма укладывается в пределы.
+///
+/// `None` — пределы не позволяют, вызывающая сторона создаёт новый черновик.
+async fn try_append(
+    conn: &mut PgConnection,
+    draft: Draft,
+    capture: &NewCapture,
+    now: DateTime<Utc>,
+) -> Result<Option<Draft>, DomainError> {
+    let Ok(mut stored) = Stored::read(&draft) else {
+        // Повреждённый `parsed` не должен терять новый разбор: начинаем заново.
+        tracing::warn!(
+            draft_id = %draft.id,
+            "draft content is corrupted; creating a new draft"
+        );
+        return Ok(None);
+    };
+    let mut added = Stored::from_parsed(capture.parsed.clone());
+    if stored.items.len() + added.items.len() > MAX_ITEMS {
+        return Ok(None);
+    }
+
+    let mut parts = if draft.raw_parts.is_empty() {
+        if draft.raw_text.is_empty() {
+            Vec::new()
+        } else {
+            vec![draft.raw_text.clone()]
+        }
+    } else {
+        draft.raw_parts.clone()
+    };
+    parts.push(sanitize(&capture.raw_text));
+    let raw_text = parts.join("\n");
+    if raw_text.chars().count() > MAX_RAW_TEXT_CHARS {
+        return Ok(None);
+    }
+
+    stored.items.append(&mut added.items);
+    // Вопросы при дописывании копятся: сверх потолка новые отбрасываются.
+    let capacity = MAX_CLARIFICATIONS.saturating_sub(stored.clarifications.len());
+    stored
+        .clarifications
+        .extend(added.clarifications.into_iter().take(capacity));
+    let parsed = stored.to_value();
+    let expires_at = now + chrono::Duration::minutes(drafts::DRAFT_TTL_MINUTES);
+    drafts::append(
+        conn,
+        draft.household_id,
+        draft.id,
+        &parsed,
+        &raw_text,
+        &parts,
+        expires_at,
+    )
+    .await?;
+
+    Ok(Some(Draft {
+        parsed: Some(parsed),
+        raw_text,
+        raw_parts: parts,
+        expires_at,
+        ..draft
+    }))
 }
 
 /// Черновик с проверенными элементами; чужой черновик — `NotFound`.

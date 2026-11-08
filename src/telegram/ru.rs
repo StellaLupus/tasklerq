@@ -34,6 +34,11 @@ pub fn positions(n: i64) -> String {
     format!("{n} {}", plural(n, "позиция", "позиции", "позиций"))
 }
 
+/// «5 пунктов» черновика.
+pub fn points(n: i64) -> String {
+    format!("{n} {}", plural(n, "пункт", "пункта", "пунктов"))
+}
+
 /// «5 просроченных».
 pub fn overdue(n: i64) -> String {
     format!(
@@ -182,6 +187,19 @@ pub const MENU_HINT: &str = "Напишите задачу или покупку
 /// Подсказка свободного текста в меню без разбора: текст сразу становится
 /// названием задачи.
 pub const MENU_HINT_NO_LLM: &str = "Напишите название задачи — открою редактор задачи.";
+/// Подсказка свободного текста на экране поиска и результатов.
+pub const SEARCH_HINT: &str = "Напишите запрос";
+/// Баннер, когда редактор открыт, но ни одно поле не ждёт текста.
+pub const EDITOR_DIRTY: &str = "Сначала сохраните или отмените правку.";
+/// Подсказка свободного текста в списке: текст добавит позиции в этот список.
+pub fn list_hint(name: &str) -> String {
+    format!("Напишите — добавлю в «{name}»")
+}
+/// Подсказка свободного текста на экране покупок без разбора: текст делится
+/// на позиции по запятым и переводам строк.
+pub fn split_list_hint(name: &str) -> String {
+    format!("Напишите — добавлю в «{name}» (через запятую или с новой строки)")
+}
 /// Раздел выполненных сегодня задач в списке.
 pub const DONE_TODAY_TITLE: &str = "Выполнено сегодня";
 /// Кнопка включения режима правки списка покупок.
@@ -265,6 +283,15 @@ pub fn quantity_label(quantity: f64, unit: Option<&str>) -> String {
         Some(unit) => format!("{number} {unit}"),
         None => number,
     }
+}
+
+/// Позиция списка: название и количество через точку.
+pub fn position_label(title: &str, quantity: Option<f64>, unit: Option<&str>) -> String {
+    let mut label = title.to_owned();
+    if let Some(quantity) = quantity {
+        label.push_str(&format!(" · {}", quantity_label(quantity, unit)));
+    }
+    label
 }
 
 /// Результат разбора срока, введённого пользователем.
@@ -393,6 +420,10 @@ mod tests {
         assert_eq!(purchases(3), "3 покупки");
         assert_eq!(purchases(7), "7 покупок");
         assert_eq!(positions(2), "2 позиции");
+        assert_eq!(points(1), "1 пункт");
+        assert_eq!(points(2), "2 пункта");
+        assert_eq!(points(5), "5 пунктов");
+        assert_eq!(points(21), "21 пункт");
     }
 
     #[test]

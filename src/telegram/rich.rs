@@ -193,6 +193,26 @@ fn escape_inline(text: &str) -> String {
     escape(text).replace('\t', " ").replace('\n', "<br/>")
 }
 
+/// Длина текста после [`escape_inline`].
+///
+/// Перевод строки разворачивается в `<br/>`, поэтому бюджеты экранов должны
+/// считать его пятью символами, а не одним.
+pub(crate) fn inline_len(text: &str) -> usize {
+    text.chars().map(inline_char_len).sum()
+}
+
+/// Длина одного символа после [`escape_inline`].
+pub(crate) fn inline_char_len(ch: char) -> usize {
+    match ch {
+        '&' => 5,
+        '<' | '>' => 4,
+        '"' => 6,
+        '\n' => 5,
+        ch if ch.is_control() && ch != '\t' => 0,
+        _ => 1,
+    }
+}
+
 fn render_span(span: &Span) -> String {
     match span {
         Span::Text(text) => escape_inline(text),
@@ -333,6 +353,18 @@ mod tests {
     fn empty_rows_are_skipped() {
         let view: View<()> = View::new().row(Vec::new()).text("x");
         assert_eq!(view.blocks.len(), 1);
+    }
+
+    #[test]
+    fn inline_length_matches_the_rendered_text() {
+        for text in ["a\nb", "a\tb", "<&>\"", "a\rb\u{7}"] {
+            assert_eq!(
+                inline_len(text),
+                escape_inline(text).chars().count(),
+                "{text:?}"
+            );
+        }
+        assert_eq!(inline_char_len('\n'), "<br/>".len());
     }
 
     #[test]

@@ -175,6 +175,78 @@ async fn screen_visibility_migration_applies_over_existing_rows() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capture_draft_parts_migration_adds_the_parts_column_and_keeps_old_rows() {
+    let db = support::empty_db().await;
+    let dir = std::env::temp_dir().join(format!(
+        "tasklerq-migrations-0012-{}",
+        Uuid::now_v7().simple()
+    ));
+    std::fs::create_dir_all(&dir).expect("temporary migration directory");
+    copy_migrations_through(12, &dir);
+
+    let before = Migrator::new(dir.as_path())
+        .await
+        .expect("a migrator through 0012 should resolve");
+    before
+        .run(&db.pool)
+        .await
+        .context("migrations through 0012 should apply")
+        .expect("migrations through 0012");
+
+    let household = support::create_household(&db.pool).await;
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO capture_drafts (
+             id, household_id, source, mode, raw_text, status, created_at, expires_at
+         )
+         VALUES ($1, $2, 'telegram', 'draft', 'старый текст', 'pending', now(), now())",
+    )
+    .bind(id)
+    .bind(household.household_id)
+    .execute(&db.pool)
+    .await
+    .expect("draft before the migration");
+
+    MIGRATOR
+        .run(&db.pool)
+        .await
+        .expect("0013 must apply over existing rows");
+
+    let column: Option<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT data_type, udt_name, is_nullable, column_default
+         FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'capture_drafts'
+           AND column_name = 'raw_parts'",
+    )
+    .fetch_optional(&db.pool)
+    .await
+    .expect("column lookup");
+    let (data_type, udt_name, is_nullable, default) =
+        column.expect("raw_parts must exist on a clean database");
+    assert_eq!(data_type, "ARRAY");
+    assert_eq!(udt_name, "_text");
+    assert_eq!(is_nullable, "NO");
+    assert!(
+        default.as_deref().unwrap_or_default().contains("'{}'"),
+        "the default must be an empty array: {default:?}"
+    );
+
+    let raw_parts: Vec<String> =
+        sqlx::query_scalar("SELECT raw_parts FROM capture_drafts WHERE id = $1")
+            .bind(id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("old row after the migration");
+    assert!(
+        raw_parts.is_empty(),
+        "existing rows get an empty array, not a backfill: {raw_parts:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_migration_reports_its_version_rolls_back_and_blocks_readiness() {
     let db = support::empty_db().await;
     let dir = std::env::temp_dir().join(format!("tasklerq-migrations-{}", Uuid::now_v7().simple()));

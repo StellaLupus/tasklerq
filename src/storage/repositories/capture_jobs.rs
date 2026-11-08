@@ -7,6 +7,7 @@
 //! обработки: у завершённого и мёртвого заданий payload затирается.
 
 use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{FromRow, PgConnection};
 use uuid::Uuid;
@@ -52,6 +53,46 @@ impl NewJob {
             payload: json!({"text": text}),
         }
     }
+
+    /// Задание на разбор текста со списком задач по умолчанию.
+    pub fn telegram_text_in_list(
+        household_id: Uuid,
+        user_id: Uuid,
+        chat_id: i64,
+        text: &str,
+        list_id: Uuid,
+    ) -> Self {
+        let mut job = Self::telegram_text(household_id, user_id, chat_id, text);
+        job.payload = json!({"text": text, "default_list_id": list_id});
+        job
+    }
+
+    /// Задание на прямое добавление покупок в список с активного экрана.
+    pub fn telegram_text_direct(
+        household_id: Uuid,
+        user_id: Uuid,
+        chat_id: i64,
+        text: &str,
+        list_id: Uuid,
+    ) -> Self {
+        let mut job = Self::telegram_text(household_id, user_id, chat_id, text);
+        job.payload = json!({
+            "text": text,
+            "target": {"list_id": list_id, "direct": true}
+        });
+        job
+    }
+}
+
+/// Целевой список задания, если он задан экраном.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Target {
+    /// Список, в который нужно добавить позиции.
+    pub list_id: Uuid,
+    /// Прямое добавление покупок без черновика. Старые задания без поля
+    /// читаются как обычный разбор.
+    #[serde(default)]
+    pub direct: bool,
 }
 
 /// Захваченное задание.
@@ -83,6 +124,22 @@ impl Job {
         } else {
             None
         }
+    }
+
+    /// Список задач по умолчанию, выбранный активным экраном. Старые задания
+    /// без поля возвращают `None`.
+    pub fn default_list_id(&self) -> Option<Uuid> {
+        self.payload
+            .get("default_list_id")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+    }
+
+    /// Целевой список и режим прямого добавления. Старые задания без поля
+    /// возвращают `None` и разбираются как раньше.
+    pub fn target(&self) -> Option<Target> {
+        self.payload
+            .get("target")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
     }
 }
 
@@ -292,9 +349,58 @@ pub async fn purge(conn: &mut PgConnection, cutoff: DateTime<Utc>) -> Result<u64
 mod tests {
     use super::*;
 
+    fn job(payload: Value) -> Job {
+        Job {
+            id: Uuid::nil(),
+            household_id: Uuid::nil(),
+            user_id: None,
+            chat_id: 0,
+            source: CaptureSource::Telegram,
+            input_kind: INPUT_TEXT.to_owned(),
+            payload,
+            attempts: 1,
+        }
+    }
+
     #[test]
     fn backoff_doubles_and_is_capped() {
         let seconds: Vec<i64> = (1..=8).map(|n| backoff(n).num_seconds()).collect();
         assert_eq!(seconds, [2, 4, 8, 16, 32, 60, 60, 60]);
+    }
+
+    #[test]
+    fn a_job_without_target_is_read_as_a_plain_capture() {
+        let job = job(json!({"text": "купить хлеб"}));
+        assert_eq!(job.target(), None);
+        assert_eq!(job.text(), Some("купить хлеб"));
+    }
+
+    #[test]
+    fn a_direct_job_carries_the_target_list() {
+        let list_id = Uuid::now_v7();
+        let job = job(json!({
+            "text": "купить хлеб",
+            "target": {"list_id": list_id, "direct": true}
+        }));
+        assert_eq!(
+            job.target(),
+            Some(Target {
+                list_id,
+                direct: true
+            })
+        );
+    }
+
+    #[test]
+    fn a_target_without_direct_is_not_direct() {
+        let list_id = Uuid::now_v7();
+        let job = job(json!({"text": "купить хлеб", "target": {"list_id": list_id}}));
+        assert_eq!(
+            job.target(),
+            Some(Target {
+                list_id,
+                direct: false
+            })
+        );
     }
 }

@@ -118,6 +118,28 @@ async fn answer_callback_and_delete_send_expected_payloads() {
 }
 
 #[tokio::test]
+async fn answer_callback_without_text_omits_the_field() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/bot{TOKEN}/answerCallbackQuery")))
+        .and(body_json(json!({
+            "callback_query_id": "cb1", "show_alert": false
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true, "result": true})))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let api = client(&server);
+    api.answer_callback_query("cb1", None, false)
+        .await
+        .expect("answered without text");
+    api.answer_callback_query("cb1", Some(""), false)
+        .await
+        .expect("answered with empty text");
+}
+
+#[tokio::test]
 async fn webhook_is_registered_with_secret_and_inspected() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
