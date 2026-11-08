@@ -23,13 +23,17 @@ pub enum TextRoute {
     EditorBlocked,
     /// Поиск или результаты поиска: текст — новый запрос.
     Search,
-    /// Список покупок или чек-лист: текст уходит в разбор с этим списком.
+    /// Список покупок или чек-лист.
+    ///
+    /// Покупки (`direct: true`) добавляются сразу в этот список, с ним же
+    /// уходит разбор. Чек-лист (`direct: false`) уходит в общий разбор без
+    /// целевого списка, поэтому его подсказка — как у остальных общих экранов.
     ShoppingList {
-        /// Список, в который будут добавлены позиции.
+        /// Список покупок, в который будут добавлены позиции.
         list_id: uuid::Uuid,
-        /// Название списка для подсказки.
+        /// Название списка для подсказки покупок.
         list_name: String,
-        /// Прямое добавление без черновика (только для покупок).
+        /// Прямое добавление в список покупок; у чек-листа — `false`.
         direct: bool,
     },
     /// Список задач: разбор с этим списком по умолчанию.
@@ -126,9 +130,22 @@ impl TextRoute {
                 direct: true,
                 ..
             } if !llm_capture => Some(ru::split_list_hint(list_name)),
-            Self::ShoppingList { list_name, .. } | Self::TaskList { list_name, .. } => {
-                Some(ru::list_hint(list_name))
+            Self::ShoppingList {
+                list_name,
+                direct: true,
+                ..
             }
+            | Self::TaskList { list_name, .. } => Some(ru::list_hint(list_name)),
+            // Чек-лист уходит в общий разбор: подсказка та же, что в меню, и
+            // не называет список, чтобы не обещать целевой список.
+            Self::ShoppingList { direct: false, .. } => Some(
+                if llm_capture {
+                    ru::MENU_HINT
+                } else {
+                    ru::MENU_HINT_NO_LLM
+                }
+                .to_owned(),
+            ),
             Self::EditorField | Self::EditorBlocked | Self::General => None,
         }
     }
@@ -213,6 +230,7 @@ mod tests {
     fn screens() -> Vec<(Screen, Option<Form>, Option<List>)> {
         let tasks = list(ListKind::Tasks, "Дача");
         let shopping = list(ListKind::Shopping, "Покупки");
+        let checklist = list(ListKind::Checklist, "Сборы");
         let back = Box::new(Screen::Menu);
         vec![
             (Screen::Menu, None, None),
@@ -242,6 +260,16 @@ mod tests {
                 },
                 None,
                 Some(shopping),
+            ),
+            (
+                Screen::List {
+                    list_id: checklist.id,
+                    page: 0,
+                    edit: false,
+                    from_lists: false,
+                },
+                None,
+                Some(checklist),
             ),
             (
                 Screen::List {
@@ -413,12 +441,17 @@ mod tests {
                     .to_owned(),
                 ),
                 Screen::Results { .. } => Some(ru::SEARCH_HINT.to_owned()),
-                Screen::List { .. } => list.as_ref().map(|list| {
-                    if !llm_capture && list.kind == ListKind::Shopping {
-                        ru::split_list_hint(&list.name)
+                Screen::List { .. } => list.as_ref().map(|list| match list.kind {
+                    ListKind::Shopping if !llm_capture => ru::split_list_hint(&list.name),
+                    ListKind::Shopping | ListKind::Tasks => ru::list_hint(&list.name),
+                    // Чек-лист уходит в общий разбор, поэтому обещает то же,
+                    // что остальные экраны с общим разбором.
+                    ListKind::Checklist => if llm_capture {
+                        ru::MENU_HINT
                     } else {
-                        ru::list_hint(&list.name)
+                        ru::MENU_HINT_NO_LLM
                     }
+                    .to_owned(),
                 }),
                 Screen::Form => match form.as_ref() {
                     Some(Form::Search) => Some(ru::SEARCH_HINT.to_owned()),
@@ -496,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn a_checklist_list_is_not_direct_but_keeps_its_hint() {
+    fn a_checklist_list_is_not_direct_and_uses_the_general_hint() {
         let checklist = list(ListKind::Checklist, "Дача");
         let screen = Screen::List {
             list_id: checklist.id,
@@ -504,17 +537,23 @@ mod tests {
             edit: false,
             from_lists: false,
         };
+        let route = TextRoute::classify(&screen, None, Some(&checklist));
         assert_eq!(
-            TextRoute::classify(&screen, None, Some(&checklist)),
+            route,
             TextRoute::ShoppingList {
                 list_id: checklist.id,
                 list_name: "Дача".to_owned(),
                 direct: false,
             }
         );
-        assert_eq!(
-            TextRoute::classify(&screen, None, Some(&checklist)).hint(true),
-            Some(ru::list_hint("Дача"))
-        );
+        assert_eq!(route.hint(true), Some(ru::MENU_HINT.to_owned()));
+        assert_eq!(route.hint(false), Some(ru::MENU_HINT_NO_LLM.to_owned()));
+        for llm_capture in [true, false] {
+            let hint = route.hint(llm_capture).expect("checklist hint");
+            assert!(
+                !hint.contains("Дача"),
+                "the checklist hint must not name the list: {hint}"
+            );
+        }
     }
 }

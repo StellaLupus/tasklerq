@@ -170,17 +170,19 @@ fn position_label(item: &Item) -> String {
     ru::position_label(&item.title, item.quantity, item.unit.as_deref())
 }
 
-/// Текст баннера после прямого добавления.
+/// Текст баннера после прямого добавления. `draft_banner` — карточка не
+/// заменяет текущий экран и приглашение открыть её идёт баннером.
 fn result_banner(
     target_name: &str,
     added: &[String],
     duplicates: &[DuplicateChoice],
     on_list: bool,
     has_draft: bool,
+    draft_banner: bool,
 ) -> Option<String> {
     let mut parts = Vec::new();
     if !added.is_empty() {
-        if on_list || has_draft {
+        if on_list {
             parts.push(format!("Добавлено: {}", added.join(", ")));
         } else {
             parts.push(format!("Добавлено в «{target_name}»: {}", added.join(", ")));
@@ -188,6 +190,9 @@ fn result_banner(
     }
     if let Some(notice) = duplicate_notice(duplicates) {
         parts.push(notice);
+    }
+    if draft_banner {
+        parts.push("Черновик готов".to_owned());
     }
     if parts.is_empty() {
         if has_draft {
@@ -208,6 +213,20 @@ async fn active_screen(
     Ok(views::get(conn, chat_id)
         .await?
         .and_then(|view| serde_json::from_value::<Screen>(view.state).ok()))
+}
+
+/// Активный экран принадлежит этому результату: статус этого задания или
+/// карточка этого же черновика. Только на нём карточка заменяет экран.
+fn on_own_screen(active: &Option<Screen>, job_id: uuid::Uuid, draft_id: uuid::Uuid) -> bool {
+    match active {
+        Some(Screen::Processing {
+            job_id: Some(active_job),
+        }) => *active_job == job_id,
+        Some(Screen::Draft {
+            draft_id: active_draft,
+        }) => *active_draft == draft_id,
+        _ => false,
+    }
 }
 
 impl CaptureWorker {
@@ -524,14 +543,7 @@ impl CaptureWorker {
             draft_id: created.id,
         };
         let active = active_screen(&mut tx, job.chat_id).await?;
-        let on_own_screen = match &active {
-            Some(Screen::Processing {
-                job_id: Some(job_id),
-            }) => *job_id == job.id,
-            Some(Screen::Draft { draft_id }) => *draft_id == created.id,
-            _ => false,
-        };
-        if on_own_screen {
+        if on_own_screen(&active, job.id, created.id) {
             self.bot
                 .present_to(&mut tx, now, prepared.recipient(job.chat_id), draft, None)
                 .await?;
@@ -692,6 +704,18 @@ impl CaptureWorker {
 
         let active = active_screen(&mut tx, job.chat_id).await?;
         let added: Vec<String> = created.iter().map(position_label).collect();
+        let on_list = matches!(
+            &active,
+            Some(Screen::List { list_id, .. }) if *list_id == target_list_id
+        );
+        // Карточка заменяет экран только на собственном статусе задания или
+        // карточке этого же черновика; без экрана — тоже карточка. На списке
+        // покупок и на чужом экране остаётся текущий экран с баннером.
+        let show_card = draft
+            .as_ref()
+            .is_some_and(|draft| active.is_none() || on_own_screen(&active, job.id, draft.id));
+        let draft_banner = draft.is_some() && !show_card;
+
         let mut buttons = duplicates
             .split_first()
             .map(|(first, rest)| first.buttons(target_list_id, rest.to_vec()))
@@ -704,11 +728,22 @@ impl CaptureWorker {
                 },
             ));
         }
-        let on_list = matches!(
-            &active,
-            Some(Screen::List { list_id, .. }) if *list_id == target_list_id
+        if draft_banner && let Some(draft) = &draft {
+            buttons.push(button(
+                "Открыть",
+                Action::Go {
+                    to: Screen::Draft { draft_id: draft.id },
+                },
+            ));
+        }
+        let text = result_banner(
+            &target_name,
+            &added,
+            &duplicates,
+            on_list,
+            draft.is_some(),
+            draft_banner,
         );
-        let text = result_banner(&target_name, &added, &duplicates, on_list, draft.is_some());
         let banner = text.map(|text| {
             if buttons.is_empty() {
                 Banner::text(text)
@@ -717,10 +752,9 @@ impl CaptureWorker {
             }
         });
 
-        let screen = if let Some(draft) = &draft {
-            Screen::Draft { draft_id: draft.id }
-        } else {
-            active.unwrap_or(Screen::Menu)
+        let screen = match &draft {
+            Some(draft) if show_card => Screen::Draft { draft_id: draft.id },
+            _ => active.unwrap_or(Screen::Menu),
         };
 
         self.bot

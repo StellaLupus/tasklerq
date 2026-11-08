@@ -1555,6 +1555,36 @@ async fn shopping_list_screen_hints_that_text_adds_positions() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checklist_screen_uses_the_general_hint_without_the_list_name() {
+    let db = db().await;
+    let mut bot = onboarded_with_llm(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+    lists::create(
+        &mut conn,
+        household.household_id,
+        ListKind::Checklist,
+        "Дача",
+        Utc::now(),
+    )
+    .await
+    .expect("checklist list");
+    drop(conn);
+
+    // Третий список включает «Все списки» в меню.
+    bot.text("/start").await;
+    bot.press("Все списки").await;
+    bot.press("Дача").await;
+
+    bot.assert_screen_contains("Напишите задачу или покупку — я разберу.");
+    assert!(
+        !bot.screen().contains("добавлю в «Дача»"),
+        "the checklist hint must not name the list:\n{}",
+        bot.screen()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn settings_profile_timezone_and_notifications() {
     let db = db().await;
     let mut bot = onboarded_named(&db.pool, "Alice").await;
