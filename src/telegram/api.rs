@@ -350,17 +350,18 @@ impl TelegramApi for HttpTelegramApi {
         text: Option<&str>,
         show_alert: bool,
     ) -> Result<(), TelegramError> {
-        self.call::<Value>(
-            "answerCallbackQuery",
-            &json!({
-                "callback_query_id": callback_query_id,
-                "text": text,
-                "show_alert": show_alert,
-            }),
-            None,
-        )
-        .await
-        .map(|_| ())
+        let mut body = json!({
+            "callback_query_id": callback_query_id,
+            "show_alert": show_alert,
+        });
+        // `text: null` Android-клиент показывает строкой «null», а пустой текст
+        // показывать не нужно: поле добавляется только для непустого ответа.
+        if let Some(text) = text.filter(|text| !text.is_empty()) {
+            body["text"] = json!(text);
+        }
+        self.call::<Value>("answerCallbackQuery", &body, None)
+            .await
+            .map(|_| ())
     }
 
     async fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<(), TelegramError> {
