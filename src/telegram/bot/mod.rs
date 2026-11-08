@@ -124,8 +124,8 @@ impl From<DomainError> for Fail {
 pub struct Banner {
     /// Текст сообщения.
     pub text: String,
-    /// Кнопки под сообщением.
-    pub buttons: Vec<Button<Action>>,
+    /// Ряды кнопок под сообщением.
+    pub rows: Vec<Vec<Button<Action>>>,
 }
 
 impl Banner {
@@ -133,24 +133,27 @@ impl Banner {
     pub fn text(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
-            buttons: Vec::new(),
+            rows: Vec::new(),
         }
     }
 
-    /// Баннер с кнопками.
+    /// Баннер с кнопками в одном ряду.
     pub fn with_buttons(text: impl Into<String>, buttons: Vec<Button<Action>>) -> Self {
+        Self::with_button_rows(text, vec![buttons])
+    }
+
+    /// Баннер с явными рядами кнопок: «Открыть» можно вынести последним рядом.
+    pub fn with_button_rows(text: impl Into<String>, rows: Vec<Vec<Button<Action>>>) -> Self {
         Self {
             text: text.into(),
-            buttons,
+            rows: rows.into_iter().filter(|row| !row.is_empty()).collect(),
         }
     }
 
-    /// Блоки баннера: жирный абзац и, если кнопки есть, их ряд.
+    /// Блоки баннера: жирный абзац и, если кнопки есть, их ряды.
     fn blocks(self) -> Vec<Block<Action>> {
         let mut blocks = vec![Block::Paragraph(vec![Span::bold(self.text)])];
-        if !self.buttons.is_empty() {
-            blocks.push(Block::Buttons(self.buttons));
-        }
+        blocks.extend(self.rows.into_iter().map(Block::Buttons));
         blocks
     }
 
@@ -257,6 +260,11 @@ impl Ctx<'_> {
     /// Баннер с кнопками над экраном.
     pub fn banner_with(&mut self, text: impl Into<String>, buttons: Vec<Button<Action>>) {
         self.banner = Some(Banner::with_buttons(text, buttons));
+    }
+
+    /// Баннер с явными рядами кнопок над экраном.
+    pub fn banner_rows(&mut self, text: impl Into<String>, rows: Vec<Vec<Button<Action>>>) {
+        self.banner = Some(Banner::with_button_rows(text, rows));
     }
 
     /// Показать экран: собрать, выпустить токены и поставить в outbox.
@@ -1029,15 +1037,23 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
             version,
             quantity,
             rest,
-        } => shopping::duplicate_increase(ctx, item_id, version, quantity, rest).await,
+            draft_id,
+        } => shopping::duplicate_increase(ctx, item_id, version, quantity, rest, draft_id).await,
         Action::AddedUndo { item_ids } => shopping::added_undo(ctx, &item_ids).await,
+        Action::ManualEntry { text } => {
+            views::clear_conversation(&mut *ctx.conn, ctx.chat_id).await?;
+            forms::quick_add(ctx, &text).await
+        }
         Action::DuplicateSeparate {
             list_id,
             title,
             quantity,
             unit,
             rest,
-        } => shopping::duplicate_separate(ctx, list_id, title, quantity, unit, rest).await,
+            draft_id,
+        } => {
+            shopping::duplicate_separate(ctx, list_id, title, quantity, unit, rest, draft_id).await
+        }
 
         Action::SearchStart => forms::start_search(ctx).await,
         Action::RenameStart => forms::start_rename(ctx).await,

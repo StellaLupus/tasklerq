@@ -9,7 +9,7 @@
 use uuid::Uuid;
 
 use crate::capture::draft::{self, DraftError, DraftView, DueChoice};
-use crate::capture::schema::{RawItem, RawRecurrence};
+use crate::capture::schema::{MAX_ITEMS, RawItem, RawRecurrence};
 use crate::capture::validate::{DraftItem, parse_date, parse_time};
 use crate::domain::models::{
     DraftStatus, ItemPriority, ListKind, MonthRule, NewItem, RecurrenceFreq,
@@ -25,8 +25,9 @@ use crate::telegram::views;
 use super::card::{describe_recurrence_draft, priority_label};
 use super::forms;
 use super::model::{
-    Action, Duplicate, DuplicateChoice, Editor, EditorTarget, ItemDraft, RecurrenceDraft, Screen,
-    Step, SubtaskDraft, Ui, duplicate_notice, same_unit,
+    Action, DuplicateChoice, Editor, EditorTarget, ItemDraft, RecurrenceDraft, Screen, Step,
+    SubtaskDraft, Ui, addition_rows, duplicate_notice, list_screen, merge_duplicate_choice,
+    plan_additions,
 };
 use super::screens::nav_row;
 use super::{Ctx, Fail};
@@ -128,15 +129,17 @@ pub(crate) fn split_titles(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Текст баннера после добавления без разбора.
+/// Текст баннера после добавления без разбора. `skipped` — части, которые не
+/// прошли проверку домена: их нужно назвать, а не терять молча.
 pub(crate) fn split_banner(
     target_name: &str,
     added: &[String],
     duplicates: &[DuplicateChoice],
+    skipped: &[String],
     on_list: bool,
 ) -> String {
     let mut text = if added.is_empty() {
-        if duplicates.is_empty() {
+        if duplicates.is_empty() && skipped.is_empty() {
             "Не нашёл в сообщении покупок.".to_owned()
         } else {
             String::new()
@@ -158,6 +161,15 @@ pub(crate) fn split_banner(
         }
         text.push_str(&notice);
     }
+    if !skipped.is_empty() {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(&format!(
+            "Не добавлено (слишком длинное название): {}",
+            skipped.join(", ")
+        ));
+    }
     text
 }
 
@@ -174,12 +186,19 @@ pub async fn intake_split(ctx: &mut Ctx<'_>, text: &str, list_id: Uuid) -> Resul
         return forms::quick_add_in_list(ctx, text, Some(list_id)).await;
     }
 
+    let parts = split_titles(text);
+    if parts.len() > MAX_ITEMS {
+        ctx.banner(format!(
+            "Слишком много позиций: не больше {MAX_ITEMS} за раз. Разделите текст"
+        ));
+        return ctx.refresh().await;
+    }
+
     let timezone = ctx.tz.name().to_owned();
     let today = ctx.now.with_timezone(&ctx.tz).date_naive();
     let mut existing = items::list_by_list(&mut *ctx.conn, household_id, list.id).await?;
-    let mut created = Vec::new();
-    let mut duplicates: Vec<DuplicateChoice> = Vec::new();
-    for title in split_titles(text) {
+    let mut new_items = Vec::new();
+    for title in parts {
         let draft = ItemDraft {
             title,
             quantity: Some(1.0),
@@ -188,93 +207,59 @@ pub async fn intake_split(ctx: &mut Ctx<'_>, text: &str, list_id: Uuid) -> Resul
         let mut new_item = draft.to_new_item(list.id, ctx.tz, list.kind)?;
         // Экран задаёт целевой список: деление не уводит покупку в другой.
         new_item.list_id = list.id;
-        if let Some(existing_item) = Duplicate::find(&existing, &new_item.title) {
-            let quantity = new_item.quantity.unwrap_or(1.0);
-            let unit = new_item.unit.clone();
-            let effective_unit = unit.as_deref().or(existing_item.unit.as_deref());
-            if let Some(pending) = duplicates.iter_mut().find(|pending| {
-                pending.existing.item_id == existing_item.item_id
-                    && same_unit(
-                        pending.unit.as_deref().or(pending.existing.unit.as_deref()),
-                        effective_unit,
-                    )
-            }) {
-                pending.quantity += quantity;
-            } else {
-                duplicates.push(DuplicateChoice {
-                    existing: existing_item,
-                    title: new_item.title.clone(),
-                    quantity,
-                    unit,
-                });
-            }
-            continue;
+        new_items.push(new_item);
+    }
+
+    let mut created = Vec::new();
+    let mut duplicates: Vec<DuplicateChoice> = Vec::new();
+    let mut skipped = Vec::new();
+    for new_item in new_items {
+        let (to_create, found) = plan_additions(&existing, vec![new_item]);
+        for choice in found {
+            merge_duplicate_choice(&mut duplicates, choice);
         }
-        let assignee = new_item.assignee_user_id;
-        let validated = match validate_new_item(ListKind::Shopping, &timezone, new_item, today) {
-            Ok(validated) => validated,
-            // Слишком длинную часть не теряем из-за остальных: её можно
-            // добавить вручную.
-            Err(crate::domain::error::DomainError::Validation(_)) => continue,
-            Err(error) => return Err(error.into()),
-        };
-        let item = items::create(
-            &mut *ctx.conn,
-            household_id,
-            &actor,
-            list.id,
-            validated,
-            assignee,
-            ctx.now,
-        )
-        .await?;
-        existing.push(item.clone());
-        created.push(item);
+        for new_item in to_create {
+            let assignee = new_item.assignee_user_id;
+            let title = new_item.title.clone();
+            let validated = match validate_new_item(ListKind::Shopping, &timezone, new_item, today)
+            {
+                Ok(validated) => validated,
+                // Слишком длинную часть не теряем из-за остальных: покажем её
+                // в баннере.
+                Err(crate::domain::error::DomainError::Validation(_)) => {
+                    skipped.push(title);
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let item = items::create(
+                &mut *ctx.conn,
+                household_id,
+                &actor,
+                list.id,
+                validated,
+                assignee,
+                ctx.now,
+            )
+            .await?;
+            existing.push(item.clone());
+            created.push(item);
+        }
     }
 
     let titles: Vec<String> = created.iter().map(|item| item.title.clone()).collect();
-    let mut buttons = duplicates
-        .split_first()
-        .map(|(first, rest)| first.buttons(list.id, rest.to_vec()))
-        .unwrap_or_default();
-    if !created.is_empty() {
-        buttons.push(button(
-            "↩️ Отменить",
-            Action::AddedUndo {
-                item_ids: created.iter().map(|item| item.id).collect(),
-            },
-        ));
-    }
-    let banner = split_banner(&list.name, &titles, &duplicates, true);
-    if buttons.is_empty() {
+    let rows = addition_rows(&duplicates, list.id, &created, None);
+    let banner = split_banner(&list.name, &titles, &duplicates, &skipped, true);
+    if rows.is_empty() {
         ctx.banner(banner);
     } else {
-        ctx.banner_with(banner, buttons);
+        ctx.banner_rows(banner, rows);
     }
 
     let current = views::get(&mut *ctx.conn, ctx.chat_id)
         .await?
         .and_then(|view| serde_json::from_value::<Screen>(view.state).ok());
-    let screen = match current {
-        Some(Screen::List {
-            list_id: current_id,
-            page,
-            edit,
-            from_lists,
-        }) if current_id == list.id => Screen::List {
-            list_id: list.id,
-            page,
-            edit,
-            from_lists,
-        },
-        _ => Screen::List {
-            list_id: list.id,
-            page: 0,
-            edit: false,
-            from_lists: false,
-        },
-    };
-    ctx.present(screen).await
+    ctx.present(list_screen(current.as_ref(), list.id)).await
 }
 
 /// Экран ожидания разбора.

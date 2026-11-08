@@ -2,7 +2,7 @@
 
 use uuid::Uuid;
 
-use crate::domain::models::{Actor, Field, Item, ItemPatch, ItemStatus, List, ListKind};
+use crate::domain::models::{Field, Item, ItemPatch, ItemStatus, List, ListKind};
 use crate::domain::validation::validate_new_item;
 use crate::storage::repositories::{items, lists};
 use crate::telegram::rich::button;
@@ -11,7 +11,8 @@ use crate::telegram::views;
 
 use super::card::{self, UndoOutcome};
 use super::model::{
-    Action, DuplicateChoice, ItemDraft, PAGE_SIZE, Screen, Ui, duplicate_notice, screen_heading,
+    Action, DuplicateChoice, ItemDraft, PAGE_SIZE, Screen, Ui, addition_rows, duplicate_notice,
+    list_screen, screen_heading,
 };
 use super::screens::{back_button, clip, list_back, nav_row};
 use super::{Ctx, Fail};
@@ -408,17 +409,24 @@ async fn show_duplicate_result(
     list_id: Uuid,
     label: &str,
     rest: &[DuplicateChoice],
+    draft_id: Option<Uuid>,
 ) -> Result<(), Fail> {
-    match rest.split_first() {
-        Some((next, tail)) => {
+    let text = match rest.split_first() {
+        Some(_) => {
             let mut text = format!("Добавлено: {label}.");
             if let Some(notice) = duplicate_notice(rest) {
                 text.push(' ');
                 text.push_str(&notice);
             }
-            ctx.banner_with(text, next.buttons(list_id, tail.to_vec()));
+            text
         }
-        None => ctx.banner(format!("Добавлено: {label}")),
+        None => format!("Добавлено: {label}"),
+    };
+    let rows = addition_rows(rest, list_id, &[], draft_id);
+    if rows.is_empty() {
+        ctx.banner(text);
+    } else {
+        ctx.banner_rows(text, rows);
     }
     present_after_duplicate(ctx, list_id).await
 }
@@ -430,6 +438,7 @@ pub async fn duplicate_increase(
     version: i32,
     quantity: f64,
     rest: Vec<DuplicateChoice>,
+    draft_id: Option<Uuid>,
 ) -> Result<(), Fail> {
     let household = ctx.household()?.clone();
     let actor = ctx.actor()?;
@@ -451,22 +460,31 @@ pub async fn duplicate_increase(
     {
         Ok(item) => {
             let label = position_label(&item);
-            show_duplicate_result(ctx, item.list_id, &label, &rest).await
+            show_duplicate_result(ctx, item.list_id, &label, &rest, draft_id).await
         }
         Err(crate::domain::error::DomainError::Conflict { .. })
         | Err(crate::domain::error::DomainError::NotFound) => {
-            if let Some((next, tail)) = rest.split_first()
-                && let Ok(current) = items::get(&mut *ctx.conn, household.id, item_id).await
-            {
+            if let Ok(current) = items::get(&mut *ctx.conn, household.id, item_id).await {
                 let mut text = "Позиция изменилась, откройте список.".to_owned();
                 if let Some(notice) = duplicate_notice(&rest) {
                     text.push(' ');
                     text.push_str(&notice);
                 }
-                ctx.banner_with(text, next.buttons(current.list_id, tail.to_vec()));
+                let rows = addition_rows(&rest, current.list_id, &[], draft_id);
+                if rows.is_empty() {
+                    ctx.banner(text);
+                } else {
+                    ctx.banner_rows(text, rows);
+                }
                 return present_after_duplicate(ctx, current.list_id).await;
             }
-            ctx.banner("Позиция изменилась, откройте список");
+            let text = "Позиция изменилась, откройте список";
+            let rows = addition_rows(&[], Uuid::nil(), &[], draft_id);
+            if rows.is_empty() {
+                ctx.banner(text);
+            } else {
+                ctx.banner_rows(text, rows);
+            }
             ctx.refresh().await
         }
         Err(error) => Err(error.into()),
@@ -481,6 +499,7 @@ pub async fn duplicate_separate(
     quantity: f64,
     unit: Option<String>,
     rest: Vec<DuplicateChoice>,
+    draft_id: Option<Uuid>,
 ) -> Result<(), Fail> {
     let household = ctx.household()?.clone();
     let actor = ctx.actor()?;
@@ -505,12 +524,7 @@ pub async fn duplicate_separate(
     )
     .await?;
     let label = position_label(&item);
-    show_duplicate_result(ctx, list.id, &label, &rest).await
-}
-
-/// Может ли актор отменить это добавление: автор или владелец household.
-fn may_undo(actor: &Actor, author: Option<Uuid>) -> bool {
-    actor.user_id.is_none() || actor.is_owner() || author.is_none() || author == actor.user_id
+    show_duplicate_result(ctx, list.id, &label, &rest, draft_id).await
 }
 
 /// Перерисовать список после отмены добавления. Пропавший список оставляет
@@ -528,26 +542,7 @@ async fn present_after_undo(ctx: &mut Ctx<'_>, list_id: Option<Uuid>) -> Result<
     let current = views::get(&mut *ctx.conn, ctx.chat_id)
         .await?
         .and_then(|view| serde_json::from_value::<Screen>(view.state).ok());
-    let screen = match current {
-        Some(Screen::List {
-            list_id: current_id,
-            page,
-            edit,
-            from_lists,
-        }) if current_id == list.id => Screen::List {
-            list_id: list.id,
-            page,
-            edit,
-            from_lists,
-        },
-        _ => Screen::List {
-            list_id: list.id,
-            page: 0,
-            edit: false,
-            from_lists: false,
-        },
-    };
-    ctx.present(screen).await
+    ctx.present(list_screen(current.as_ref(), list.id)).await
 }
 
 /// «↩️ Отменить» в баннере прямого добавления: мягко удалить созданные
@@ -571,14 +566,6 @@ pub async fn added_undo(ctx: &mut Ctx<'_>, item_ids: &[Uuid]) -> Result<(), Fail
             Err(crate::domain::error::DomainError::NotFound) => {}
             Err(error) => return Err(error.into()),
         }
-    }
-
-    if alive
-        .iter()
-        .any(|item| !may_undo(&actor, item.created_by_user_id))
-    {
-        ctx.banner("Отменить добавление может только автор или владелец.");
-        return present_after_undo(ctx, list_id).await;
     }
 
     if alive.is_empty() {

@@ -12,13 +12,14 @@ use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use tasklerq::capture::breaker::CircuitBreaker;
 use tasklerq::home_assistant::{AiTask, GenerateData, HaError};
 use tasklerq::security_audit::Audit;
 use tasklerq::telegram::bot::Bot;
 use tasklerq::telegram::capture_worker::{CaptureWorker, DEFAULT_DAILY_QUOTA, MAX_ATTEMPTS, Pass};
 use tokio::sync::Notify;
 
-use support::telegram::{FakeTelegram, Harness};
+use support::telegram::{FakeTelegram, Harness, button_rows};
 use support::{db, next_telegram_id};
 
 /// Подмена Home Assistant: отдаёт заготовленные ответы по очереди.
@@ -108,6 +109,24 @@ async fn stand_with(
     quota: u32,
     llm_capture: bool,
 ) -> Stand {
+    stand_full(pool, answers, quota, llm_capture, None).await
+}
+
+async fn stand_with_breaker(
+    pool: &PgPool,
+    answers: Vec<Result<Value, HaError>>,
+    breaker: Arc<CircuitBreaker>,
+) -> Stand {
+    stand_full(pool, answers, DEFAULT_DAILY_QUOTA, true, Some(breaker)).await
+}
+
+async fn stand_full(
+    pool: &PgPool,
+    answers: Vec<Result<Value, HaError>>,
+    quota: u32,
+    llm_capture: bool,
+    breaker: Option<Arc<CircuitBreaker>>,
+) -> Stand {
     let id = next_telegram_id();
     let handler = Bot::new("tasklerqbot")
         .with_llm_capture(llm_capture)
@@ -119,7 +138,7 @@ async fn stand_with(
     bot.press("Москва").await;
     bot.press("меню").await;
 
-    let worker = CaptureWorker::new(
+    let mut worker = CaptureWorker::new(
         pool.clone(),
         ai.clone(),
         handler,
@@ -128,6 +147,9 @@ async fn stand_with(
     )
     .only_chat(id)
     .with_quota(quota);
+    if let Some(breaker) = breaker {
+        worker = worker.with_breaker(breaker);
+    }
     Stand { bot, worker, ai }
 }
 
@@ -341,6 +363,107 @@ async fn text_on_a_tasks_list_defaults_capture_to_that_list() {
     .await
     .expect("saved task");
     assert_eq!(saved, dacha);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ordinary_word_tasks_does_not_select_the_default_list_on_another_list() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "tasks", "title": "Полить цветы", "target_list": "Задачи"}
+        ]}))],
+    )
+    .await;
+    let dacha = add_tasks_list(&db.pool, stand.bot.chat, "Дача").await;
+
+    stand.bot.text("/start").await;
+    stand.bot.press("Все списки").await;
+    stand.bot.press("Дача").await;
+    stand.bot.assert_screen_contains("Дача · 0");
+
+    stand.bot.text("добавить задачи на выходные").await;
+    assert_eq!(stand.work().await, Pass::Drafted);
+
+    stand.bot.assert_screen_contains("Список: Дача");
+    stand.bot.press("Сохранить всё").await;
+    let saved: uuid::Uuid = sqlx::query_scalar(
+        "SELECT i.list_id FROM items i
+         JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1 AND i.title = 'Полить цветы'",
+    )
+    .bind(stand.bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("saved task");
+    assert_eq!(
+        saved, dacha,
+        "the word «задачи» in its ordinary meaning must not pick the default list"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_explicit_list_selection_keeps_the_default_list() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "tasks", "title": "Полить цветы", "target_list": "Задачи"}
+        ]}))],
+    )
+    .await;
+    let dacha = add_tasks_list(&db.pool, stand.bot.chat, "Дача").await;
+
+    stand.bot.text("/start").await;
+    stand.bot.press("Все списки").await;
+    stand.bot.press("Дача").await;
+
+    stand.bot.text("полить цветы в задачи").await;
+    assert_eq!(stand.work().await, Pass::Drafted);
+
+    stand.bot.assert_screen_contains("Список: Задачи");
+    stand.bot.press("Сохранить всё").await;
+    let saved: uuid::Uuid = sqlx::query_scalar(
+        "SELECT i.list_id FROM items i
+         JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1 AND i.title = 'Полить цветы'",
+    )
+    .bind(stand.bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("saved task");
+    assert_ne!(saved, dacha);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_short_text_with_a_multiword_default_list_does_not_panic() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "tasks", "title": "Полить", "target_list": "Домашние дела"}
+        ]}))],
+    )
+    .await;
+    add_tasks_list(&db.pool, stand.bot.chat, "Дача").await;
+    let household = household_id(&db.pool, stand.bot.chat).await;
+    sqlx::query(
+        "UPDATE lists SET name = 'Домашние дела'
+         WHERE household_id = $1 AND kind = 'tasks' AND is_default",
+    )
+    .bind(household)
+    .execute(&db.pool)
+    .await
+    .expect("rename default list");
+
+    stand.bot.text("/start").await;
+    stand.bot.press("Все списки").await;
+    stand.bot.press("Дача").await;
+
+    stand.bot.text("полить").await;
+    assert_eq!(stand.work().await, Pass::Drafted);
+
+    stand.bot.assert_screen_contains("Список: Дача");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1135,6 +1258,102 @@ async fn disabled_llm_opens_the_manual_form_without_queueing() {
     stand.bot.assert_screen_contains("купить хлеб");
     assert_eq!(stand.jobs().await, 0);
     assert_eq!(stand.ai.calls(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_without_llm_reports_parts_that_failed_validation() {
+    let db = db().await;
+    let mut stand = stand_with(&db.pool, vec![], DEFAULT_DAILY_QUOTA, false).await;
+    let long = "я".repeat(201);
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text(&format!("хлеб, {long}")).await;
+
+    stand.bot.assert_screen_contains("Добавлено без разбора");
+    stand
+        .bot
+        .assert_screen_contains("Не добавлено (слишком длинное название)");
+    let items: Vec<String> = sqlx::query_scalar(
+        "SELECT i.title FROM items i
+         JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1 AND i.deleted_at IS NULL",
+    )
+    .bind(stand.bot.chat)
+    .fetch_all(&db.pool)
+    .await
+    .expect("items");
+    assert_eq!(items, vec!["хлеб".to_owned()]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_without_llm_reports_when_every_part_failed_validation() {
+    let db = db().await;
+    let mut stand = stand_with(&db.pool, vec![], DEFAULT_DAILY_QUOTA, false).await;
+    let long = "я".repeat(201);
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text(&long).await;
+
+    stand
+        .bot
+        .assert_screen_contains("Не добавлено (слишком длинное название)");
+    assert!(
+        !stand.bot.screen().contains("Не нашёл в сообщении покупок"),
+        "skipped parts must not read as an empty message:\n{}",
+        stand.bot.screen()
+    );
+    assert_eq!(stand.household_items().await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_without_llm_is_limited_to_twenty_positions() {
+    let db = db().await;
+    let mut stand = stand_with(&db.pool, vec![], DEFAULT_DAILY_QUOTA, false).await;
+    let text: Vec<String> = (0..21).map(|number| format!("покупка {number}")).collect();
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text(&text.join(", ")).await;
+
+    stand
+        .bot
+        .assert_screen_contains("Слишком много позиций: не больше 20 за раз. Разделите текст");
+    assert_eq!(
+        stand.household_items().await,
+        0,
+        "nothing may be created over the limit"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_without_llm_checks_the_text_length() {
+    let db = db().await;
+    let mut stand = stand_with(&db.pool, vec![], DEFAULT_DAILY_QUOTA, false).await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text(&"я".repeat(2_001)).await;
+
+    stand
+        .bot
+        .assert_screen_contains("Сообщение слишком длинное");
+    assert_eq!(stand.household_items().await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_without_llm_is_not_limited_by_the_parse_rate() {
+    let db = db().await;
+    let mut stand = stand_with(&db.pool, vec![], DEFAULT_DAILY_QUOTA, false).await;
+
+    stand.bot.press("Покупки").await;
+    for number in 1..=11 {
+        stand.bot.text(&format!("покупка {number}")).await;
+    }
+
+    assert!(
+        !stand.bot.screen().contains("Слишком много сообщений"),
+        "splitting must not be limited by the parse rate:\n{}",
+        stand.bot.screen()
+    );
+    assert_eq!(stand.household_items().await, 11);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2048,6 +2267,114 @@ async fn a_direct_result_does_not_replace_a_screen_the_user_left() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_direct_result_updates_the_card_of_the_same_draft() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![
+            Ok(json!({"items": [{"target_kind": "tasks", "title": "Позвонить маме"}]})),
+            Ok(json!({"items": [
+                {"target_kind": "shopping", "title": "Молоко"},
+                {"target_kind": "tasks", "title": "Полить цветы"}
+            ]})),
+        ],
+    )
+    .await;
+
+    stand.capture("позвонить маме").await;
+    stand.bot.text("/start").await;
+    stand.bot.press("Покупки").await;
+    stand.bot.text("молоко и полить цветы").await;
+    stand.bot.press("Назад").await;
+    stand.bot.press("Открыть").await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&stand.view_state().await).expect("view json")["t"],
+        json!("draft")
+    );
+
+    assert_eq!(stand.work().await, Pass::Drafted);
+
+    let state: Value = serde_json::from_str(&stand.view_state().await).expect("view json");
+    assert_eq!(state["t"], json!("draft"), "the draft card must stay open");
+    stand.bot.assert_screen_contains("Полить цветы");
+    assert!(
+        !stand.bot.screen().contains("Черновик готов"),
+        "the card of the same draft must be updated without a banner:\n{}",
+        stand.bot.screen()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_direct_result_replaces_its_own_processing_screen_with_the_card() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Молоко"},
+            {"target_kind": "tasks", "title": "Позвонить маме"}
+        ]}))],
+    )
+    .await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("молоко и позвонить маме").await;
+    let job_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM capture_jobs WHERE chat_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(stand.bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("job");
+    sqlx::query("UPDATE telegram_views SET state = $2 WHERE chat_id = $1")
+        .bind(stand.bot.chat)
+        .bind(json!({"t": "processing", "job_id": job_id}))
+        .execute(&db.pool)
+        .await
+        .expect("processing view");
+
+    assert_eq!(stand.work().await, Pass::Drafted);
+
+    let state: Value = serde_json::from_str(&stand.view_state().await).expect("view json");
+    assert_eq!(
+        state["t"],
+        json!("draft"),
+        "the own processing screen must be replaced by the card"
+    );
+    stand.bot.assert_screen_contains("Позвонить маме");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_direct_result_does_not_replace_another_list() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Молоко"},
+            {"target_kind": "tasks", "title": "Позвонить маме"}
+        ]}))],
+    )
+    .await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("молоко и позвонить маме").await;
+    stand.bot.press("Назад").await;
+    stand.bot.press("Задачи").await;
+    let before: Value = serde_json::from_str(&stand.view_state().await).expect("view json");
+    assert_eq!(before["t"], json!("list"));
+
+    assert_eq!(stand.work().await, Pass::Drafted);
+
+    let state: Value = serde_json::from_str(&stand.view_state().await).expect("view json");
+    assert_eq!(state["t"], json!("list"), "the task list must stay");
+    assert_eq!(state["list_id"], before["list_id"]);
+    stand
+        .bot
+        .assert_screen_contains("Добавлено в «Покупки»: Молоко");
+    stand.bot.assert_screen_contains("Черновик готов");
+    stand.bot.assert_has_button("Открыть");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_second_position_rolls_back_the_first() {
     let db = support::isolated_db().await;
     let mut stand = stand(
@@ -2129,6 +2456,90 @@ async fn a_failed_direct_parse_adds_the_positions_without_parsing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_direct_job_with_an_exhausted_quota_splits_the_text() {
+    let db = db().await;
+    let mut stand = stand_with_quota(&db.pool, vec![], 0).await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("молоко, хлеб").await;
+    assert_eq!(stand.work().await, Pass::Dead);
+
+    stand.bot.assert_screen_contains("Добавлено без разбора");
+    assert_eq!(stand.ai.calls(), 0, "the quota must block the LLM");
+    assert_eq!(stand.household_items().await, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_direct_job_with_an_open_circuit_splits_the_text() {
+    let db = db().await;
+    let breaker = Arc::new(CircuitBreaker::new(
+        1,
+        Duration::minutes(5),
+        Duration::minutes(2),
+    ));
+    let mut stand = stand_with_breaker(&db.pool, vec![], breaker.clone()).await;
+    breaker.record_failure(stand.bot.now);
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("молоко, хлеб").await;
+    assert_eq!(stand.work().await, Pass::Dead);
+
+    stand.bot.assert_screen_contains("Добавлено без разбора");
+    assert_eq!(stand.ai.calls(), 0, "the open circuit must block the LLM");
+    assert_eq!(stand.household_items().await, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn too_many_items_on_a_direct_job_is_not_split_by_commas() {
+    let db = db().await;
+    let mut stand = stand(&db.pool, vec![Ok(too_many_items())]).await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("молоко, хлеб, яйца").await;
+    assert_eq!(stand.work().await, Pass::Dead);
+
+    stand.bot.assert_screen_contains("Разделите его на части");
+    assert_eq!(
+        stand.household_items().await,
+        0,
+        "the text must not be split when the LLM asked to split it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_direct_split_is_limited_to_twenty_positions() {
+    let db = db().await;
+    let mut stand = stand(&db.pool, vec![Err(HaError::Rejected(400))]).await;
+    let text: Vec<String> = (0..21).map(|number| format!("покупка {number}")).collect();
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text(&text.join(", ")).await;
+    assert_eq!(stand.work().await, Pass::Dead);
+
+    stand
+        .bot
+        .assert_screen_contains("Слишком много позиций: не больше 20 за раз. Разделите текст");
+    assert_eq!(stand.household_items().await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_direct_split_reports_skipped_parts() {
+    let db = db().await;
+    let mut stand = stand(&db.pool, vec![Err(HaError::Rejected(400))]).await;
+    let long = "я".repeat(201);
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text(&format!("хлеб, {long}")).await;
+    assert_eq!(stand.work().await, Pass::Dead);
+
+    stand.bot.assert_screen_contains("Добавлено без разбора");
+    stand
+        .bot
+        .assert_screen_contains("Не добавлено (слишком длинное название)");
+    assert_eq!(stand.household_items().await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_duplicate_is_not_saved_and_the_banner_offers_a_choice() {
     let db = db().await;
     let mut stand = stand(
@@ -2169,6 +2580,44 @@ async fn a_duplicate_is_not_saved_and_the_banner_offers_a_choice() {
             ("Хлеб".to_owned(), Some(1.0), Some("шт".to_owned())),
         ],
         "the duplicate must not be saved without a choice"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_new_positions_are_offered_as_a_duplicate() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Хлеб"},
+            {"target_kind": "shopping", "title": "Хлеб", "quantity": 2}
+        ]}))],
+    )
+    .await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("хлеб и ещё хлеб").await;
+    assert_eq!(stand.work().await, Pass::Drafted);
+
+    stand.bot.assert_screen_contains("Добавлено: Хлеб");
+    stand.bot.assert_screen_contains("Уже в списке: «Хлеб»");
+    stand.bot.assert_has_button("Увеличить до 3 шт");
+    stand.bot.assert_has_button("Добавить отдельно");
+
+    let rows: Vec<(String, Option<f64>)> = sqlx::query_as(
+        "SELECT i.title, i.quantity::float8
+         FROM items i
+         JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1 AND i.deleted_at IS NULL",
+    )
+    .bind(stand.bot.chat)
+    .fetch_all(&db.pool)
+    .await
+    .expect("items");
+    assert_eq!(
+        rows,
+        vec![("Хлеб".to_owned(), Some(1.0))],
+        "the second mention must wait for the duplicate choice, not merge silently"
     );
 }
 
@@ -2289,6 +2738,38 @@ async fn a_version_conflict_while_increasing_does_not_crash() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_version_conflict_keeps_the_waiting_draft_open_button() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Молоко"},
+            {"target_kind": "tasks", "title": "Позвонить маме"}
+        ]}))],
+    )
+    .await;
+    let milk = seed_shopping_item(&db.pool, stand.bot.chat, "Молоко", 2.0, "л").await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("молоко и позвонить маме").await;
+    assert_eq!(stand.work().await, Pass::Drafted);
+    sqlx::query("UPDATE items SET version = version + 1 WHERE id = $1")
+        .bind(milk)
+        .execute(&db.pool)
+        .await
+        .expect("bump version");
+
+    stand.bot.press("Увеличить до 3 л").await;
+
+    stand
+        .bot
+        .assert_screen_contains("Позиция изменилась, откройте список");
+    stand.bot.assert_has_button("Открыть");
+    stand.bot.press("Открыть").await;
+    stand.bot.assert_screen_contains("Позвонить маме");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn several_duplicates_are_offered_one_by_one() {
     let db = db().await;
     let mut stand = stand(
@@ -2383,6 +2864,93 @@ async fn a_duplicate_choice_keeps_the_waiting_draft_available() {
     stand.bot.press("Открыть").await;
     stand.bot.assert_screen_contains("Позвонить маме");
     stand.bot.assert_has_button("Сохранить всё");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_increase_keeps_the_waiting_draft_open_button() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Молоко"},
+            {"target_kind": "tasks", "title": "Позвонить маме"}
+        ]}))],
+    )
+    .await;
+    seed_shopping_item(&db.pool, stand.bot.chat, "Молоко", 2.0, "л").await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("молоко и позвонить маме").await;
+    assert_eq!(stand.work().await, Pass::Drafted);
+    stand.bot.assert_screen_contains("Черновик готов");
+
+    stand.bot.press("Увеличить до 3 л").await;
+
+    stand.bot.assert_screen_contains("Добавлено: Молоко · 3 л");
+    stand.bot.assert_has_button("Открыть");
+    stand.bot.press("Открыть").await;
+    stand.bot.assert_screen_contains("Позвонить маме");
+    stand.bot.assert_has_button("Сохранить всё");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_separate_duplicate_keeps_the_waiting_draft_open_button() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Молоко"},
+            {"target_kind": "tasks", "title": "Позвонить маме"}
+        ]}))],
+    )
+    .await;
+    seed_shopping_item(&db.pool, stand.bot.chat, "Молоко", 2.0, "л").await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("молоко и позвонить маме").await;
+    assert_eq!(stand.work().await, Pass::Drafted);
+    stand.bot.assert_screen_contains("Черновик готов");
+
+    stand.bot.press("Добавить отдельно").await;
+
+    stand.bot.assert_screen_contains("Добавлено: Молоко · 1 шт");
+    stand.bot.assert_has_button("Открыть");
+    stand.bot.press("Открыть").await;
+    stand.bot.assert_screen_contains("Позвонить маме");
+    stand.bot.assert_has_button("Сохранить всё");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_open_button_has_its_own_banner_row() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Молоко"},
+            {"target_kind": "shopping", "title": "Яйца"},
+            {"target_kind": "tasks", "title": "Позвонить маме"}
+        ]}))],
+    )
+    .await;
+    seed_shopping_item(&db.pool, stand.bot.chat, "Молоко", 2.0, "л").await;
+    seed_shopping_item(&db.pool, stand.bot.chat, "Яйца", 10.0, "шт").await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("молоко, яйца и позвонить маме").await;
+    assert_eq!(stand.work().await, Pass::Drafted);
+
+    let rows = button_rows(&stand.bot.screen());
+    let open = rows
+        .iter()
+        .find(|row| row.iter().any(|(label, _)| label == "Открыть"))
+        .expect("open button row");
+    assert_eq!(
+        open.iter()
+            .map(|(label, _)| label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Открыть"],
+        "«Открыть» must be a separate row: {rows:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2646,6 +3214,97 @@ async fn a_second_text_appends_to_the_waiting_draft_from_the_worker() {
         drafts[0].2,
         vec!["купить хлеб".to_owned(), "купить молоко".to_owned()]
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expired_pending_draft_is_not_appended_to() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![
+            Ok(json!({"items": [{"target_kind": "shopping", "title": "Хлеб"}]})),
+            Ok(json!({"items": [{"target_kind": "shopping", "title": "Молоко"}]})),
+        ],
+    )
+    .await;
+
+    stand.capture("купить хлеб").await;
+    let old: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM capture_drafts WHERE chat_id = $1 AND status = 'pending'",
+    )
+    .bind(stand.bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("old draft");
+    // Граница строгая: черновик с expires_at == now уже не ожидающий.
+    sqlx::query("UPDATE capture_drafts SET expires_at = $2 WHERE id = $1")
+        .bind(old)
+        .bind(stand.bot.now)
+        .execute(&db.pool)
+        .await
+        .expect("expire draft");
+
+    stand.capture("купить молоко").await;
+
+    let drafts: Vec<(uuid::Uuid, String, Vec<String>)> = sqlx::query_as(
+        "SELECT id, raw_text, raw_parts FROM capture_drafts
+         WHERE chat_id = $1 AND status = 'pending'
+         ORDER BY created_at",
+    )
+    .bind(stand.bot.chat)
+    .fetch_all(&db.pool)
+    .await
+    .expect("drafts");
+    assert_eq!(drafts.len(), 2, "the new parse must create another draft");
+    let old_row = drafts
+        .iter()
+        .find(|(id, _, _)| *id == old)
+        .expect("expired draft");
+    assert_eq!(old_row.1, "купить хлеб");
+    assert_eq!(old_row.2, vec!["купить хлеб".to_owned()]);
+    let new_row = drafts
+        .iter()
+        .find(|(id, _, _)| *id != old)
+        .expect("new draft");
+    assert_eq!(new_row.2, vec!["купить молоко".to_owned()]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn appended_clarifications_stop_at_the_limit() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![
+            Ok(json!({
+                "items": [{"target_kind": "shopping", "title": "Хлеб"}],
+                "clarifications": ["Первый?", "Второй?", "Третий?"]
+            })),
+            Ok(json!({
+                "items": [{"target_kind": "shopping", "title": "Молоко"}],
+                "clarifications": ["Четвёртый?", "Пятый?", "Шестой?"]
+            })),
+        ],
+    )
+    .await;
+
+    stand.capture("купить хлеб").await;
+    stand.capture("купить молоко").await;
+
+    let clarifications: Value = sqlx::query_scalar(
+        "SELECT parsed->'clarifications' FROM capture_drafts
+         WHERE chat_id = $1 AND status = 'pending'",
+    )
+    .bind(stand.bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("clarifications");
+    let clarifications = clarifications.as_array().expect("array");
+    assert_eq!(
+        clarifications.len(),
+        3,
+        "new questions over the limit must be dropped: {clarifications:?}"
+    );
+    assert_eq!(clarifications[0], json!("Первый?"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2974,6 +3633,67 @@ async fn a_parse_error_after_leaving_the_screen_stays_a_banner() {
         "the manual editor must not replace the list:\n{}",
         stand.bot.screen()
     );
+    stand.bot.assert_has_button("Ввести вручную");
+
+    stand.bot.press("Ввести вручную").await;
+    stand.bot.assert_screen_contains("Название: позвонить маме");
+    let state: Value = serde_json::from_str(&stand.view_state().await).expect("view json");
+    assert_eq!(
+        state["t"],
+        json!("editor"),
+        "the manual entry button must open the editor with the source text"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_manual_entry_token_is_one_shot() {
+    let db = db().await;
+    let mut stand = stand(&db.pool, vec![Err(HaError::Rejected(400))]).await;
+
+    stand.bot.text("позвонить маме").await;
+    stand.bot.press("Назад").await;
+    stand.bot.press("Задачи").await;
+    assert_eq!(stand.work().await, Pass::Dead);
+
+    let data = stand
+        .bot
+        .find_button("Ввести вручную")
+        .expect("manual entry button");
+    let (message_id, _) = stand.bot.active();
+    stand.bot.press_data(&data, message_id).await;
+    stand.bot.assert_screen_contains("Название: позвонить маме");
+
+    stand.bot.press_data(&data, message_id).await;
+    assert!(
+        stand
+            .bot
+            .fake
+            .answers()
+            .iter()
+            .any(|(_, text, _)| text.as_deref() == Some("Это действие уже выполнено.")),
+        "a replayed manual entry token must report a replay"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_direct_no_items_error_keeps_the_source_text_in_a_button() {
+    let db = db().await;
+    let mut stand = stand(&db.pool, vec![Ok(json!({"items": []}))]).await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("молоко").await;
+    assert_eq!(stand.work().await, Pass::Dead);
+
+    let state: Value = serde_json::from_str(&stand.view_state().await).expect("view json");
+    assert_eq!(state["t"], json!("list"), "the shopping list must stay");
+    stand.bot.assert_screen_contains("Не нашёл в сообщении");
+    stand.bot.assert_has_button("Ввести вручную");
+
+    stand.bot.press("Ввести вручную").await;
+    stand.bot.assert_screen_contains("Название: молоко");
+    // Прямое добавление не открывает редактор покупки в деградации, поэтому
+    // кнопка ведёт в общий ручной редактор задачи.
+    stand.bot.assert_screen_contains("Список: Задачи");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3115,6 +3835,33 @@ async fn the_menu_shows_the_waiting_draft_and_opens_it() {
         "a saved draft must leave the menu:\n{}",
         stand.bot.screen()
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_corrupted_draft_content_does_not_break_the_menu() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(
+            json!({"items": [{"target_kind": "shopping", "title": "Хлеб"}]}),
+        )],
+    )
+    .await;
+
+    stand.capture("купить хлеб").await;
+    sqlx::query("UPDATE capture_drafts SET parsed = $2 WHERE chat_id = $1")
+        .bind(stand.bot.chat)
+        .bind(json!({"items": {"not": "an array"}}))
+        .execute(&db.pool)
+        .await
+        .expect("corrupt parsed");
+
+    stand.bot.text("/start").await;
+
+    stand
+        .bot
+        .assert_screen_contains("📝 Ждёт подтверждения: 0 пунктов");
+    stand.bot.assert_has_button("Открыть");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

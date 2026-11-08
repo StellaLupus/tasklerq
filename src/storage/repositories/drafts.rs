@@ -266,7 +266,11 @@ pub async fn latest_pending_telegram(
     now: DateTime<Utc>,
 ) -> Result<Option<PendingTelegram>, DomainError> {
     let row = sqlx::query_as::<_, (Uuid, i64)>(
-        "SELECT id, COALESCE(jsonb_array_length(parsed->'items'), 0)::bigint
+        "SELECT id,
+                CASE WHEN jsonb_typeof(parsed->'items') = 'array'
+                     THEN jsonb_array_length(parsed->'items')
+                     ELSE 0
+                END::bigint
          FROM capture_drafts
          WHERE household_id = $1 AND chat_id = $2
            AND user_id IS NOT DISTINCT FROM $3

@@ -417,6 +417,10 @@ async fn try_append(
 ) -> Result<Option<Draft>, DomainError> {
     let Ok(mut stored) = Stored::read(&draft) else {
         // Повреждённый `parsed` не должен терять новый разбор: начинаем заново.
+        tracing::warn!(
+            draft_id = %draft.id,
+            "draft content is corrupted; creating a new draft"
+        );
         return Ok(None);
     };
     let mut added = Stored::from_parsed(capture.parsed.clone());
@@ -440,7 +444,11 @@ async fn try_append(
     }
 
     stored.items.append(&mut added.items);
-    stored.clarifications.append(&mut added.clarifications);
+    // Вопросы при дописывании копятся: сверх потолка новые отбрасываются.
+    let capacity = MAX_CLARIFICATIONS.saturating_sub(stored.clarifications.len());
+    stored
+        .clarifications
+        .extend(added.clarifications.into_iter().take(capacity));
     let parsed = stored.to_value();
     let expires_at = now + chrono::Duration::minutes(drafts::DRAFT_TTL_MINUTES);
     drafts::append(

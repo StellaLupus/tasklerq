@@ -21,7 +21,7 @@ use crate::capture::context::CaptureContext;
 use crate::capture::draft::{self, NewCapture};
 use crate::capture::llm::{self, Failure as LlmFailure};
 use crate::capture::prompt::PROMPT_VERSION;
-use crate::capture::schema::{ParseError, ParsedResponse};
+use crate::capture::schema::{MAX_ITEMS, ParseError, ParsedResponse};
 use crate::capture::validate::validate_item;
 use crate::domain::error::DomainError;
 use crate::domain::models::{Actor, CaptureMode, Household, Item, ItemSource, ListKind, User};
@@ -36,7 +36,8 @@ use crate::telegram::ru;
 
 use super::bot::capture::{split_banner, split_titles};
 use super::bot::model::{
-    Action, Duplicate, DuplicateChoice, ItemDraft, Screen, duplicate_notice, same_unit,
+    Action, DuplicateChoice, ItemDraft, Screen, addition_rows, duplicate_notice,
+    merge_duplicate_choice, plan_additions,
 };
 use super::bot::{Banner, Bot, Recipient, into_sqlx};
 use super::views;
@@ -150,7 +151,7 @@ fn apply_default_list(
             Some(target) if !target.trim().is_empty() => {
                 let target = fold(target);
                 let autofilled = fallback.as_deref() == Some(target.as_str());
-                let named_by_user = text.contains(&target);
+                let named_by_user = names_list(&text, &target);
                 if autofilled && !named_by_user {
                     item.target_list = Some(list.name.clone());
                 }
@@ -165,20 +166,64 @@ fn fold(value: &str) -> String {
     value.trim().to_lowercase().replace('ё', "е")
 }
 
+/// Слова текста без пунктуации: название списка ищется по границам слов.
+fn words(value: &str) -> Vec<String> {
+    value
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '-')
+        .filter(|word| !word.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Пользователь назвал список явно: «в X», «в список X» или «list X».
+///
+/// Одного совпадения слова мало: «добавить задачи на выходные» — это обычное
+/// значение слова «задачи», а не выбор списка «Задачи». Поэтому названием
+/// списка считается только слово (или последовательность слов) после явной
+/// конструкции выбора.
+fn names_list(text: &str, name: &str) -> bool {
+    let text = words(text);
+    let name = words(name);
+    if name.is_empty() || text.len() < name.len() {
+        return false;
+    }
+    (0..=text.len() - name.len()).any(|start| {
+        if text[start..start + name.len()] != name[..] {
+            return false;
+        }
+        let before = &text[..start];
+        match before.last().map(String::as_str) {
+            Some("в" | "list") => true,
+            Some("список") => before.len() >= 2 && before[before.len() - 2] == "в",
+            _ => false,
+        }
+    })
+}
+
 /// Позиция в баннере: название и количество, как в списке.
 fn position_label(item: &Item) -> String {
     ru::position_label(&item.title, item.quantity, item.unit.as_deref())
 }
 
-/// Текст баннера после прямого добавления. `draft_banner` — карточка не
-/// заменяет текущий экран и приглашение открыть её идёт баннером.
+/// Что показывает результат прямого добавления: карточку, баннер с
+/// черновиком или баннер без него.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectResult {
+    /// Черновик открывается карточкой.
+    Card,
+    /// Экран остаётся, а баннер приглашает открыть черновик.
+    DraftBanner,
+    /// Черновика нет, экран остаётся с баннером добавления.
+    PlainBanner,
+}
+
+/// Текст баннера после прямого добавления.
 fn result_banner(
     target_name: &str,
     added: &[String],
     duplicates: &[DuplicateChoice],
     on_list: bool,
-    has_draft: bool,
-    draft_banner: bool,
+    result: DirectResult,
 ) -> Option<String> {
     let mut parts = Vec::new();
     if !added.is_empty() {
@@ -191,11 +236,11 @@ fn result_banner(
     if let Some(notice) = duplicate_notice(duplicates) {
         parts.push(notice);
     }
-    if draft_banner {
+    if result == DirectResult::DraftBanner {
         parts.push("Черновик готов".to_owned());
     }
     if parts.is_empty() {
-        if has_draft {
+        if result == DirectResult::Card {
             None
         } else {
             Some("Не нашёл в сообщении покупок.".to_owned())
@@ -620,8 +665,7 @@ impl CaptureWorker {
             .await
             .map_err(into_sqlx)?;
 
-        let mut created: Vec<Item> = Vec::new();
-        let mut duplicates: Vec<DuplicateChoice> = Vec::new();
+        let mut new_items = Vec::new();
         for raw in direct {
             let checked = validate_item(context, ItemSource::Telegram, raw.clone());
             let Some(mut new_item) = checked.item else {
@@ -631,44 +675,36 @@ impl CaptureWorker {
             };
             // Имя списка могло совпасть с другим: экран задаёт идентификатор.
             new_item.list_id = target_list_id;
-            if let Some(existing_item) = Duplicate::find(&existing, &new_item.title) {
-                let quantity = new_item.quantity.unwrap_or(1.0);
-                let unit = new_item.unit.clone();
-                let effective_unit = unit.as_deref().or(existing_item.unit.as_deref());
-                if let Some(pending) = duplicates.iter_mut().find(|pending| {
-                    pending.existing.item_id == existing_item.item_id
-                        && same_unit(
-                            pending.unit.as_deref().or(pending.existing.unit.as_deref()),
-                            effective_unit,
-                        )
-                }) {
-                    pending.quantity += quantity;
-                } else {
-                    duplicates.push(DuplicateChoice {
-                        existing: existing_item,
-                        title: new_item.title.clone(),
-                        quantity,
-                        unit,
-                    });
-                }
-                continue;
+            new_items.push(new_item);
+        }
+
+        let mut created: Vec<Item> = Vec::new();
+        let mut duplicates: Vec<DuplicateChoice> = Vec::new();
+        for new_item in new_items {
+            // Созданная позиция сразу становится существующей: повтор в том же
+            // сообщении предлагается как дубликат, а не сохраняется молча.
+            let (to_create, found) = plan_additions(&existing, vec![new_item]);
+            for choice in found {
+                merge_duplicate_choice(&mut duplicates, choice);
             }
-            let assignee = new_item.assignee_user_id;
-            let validated = validate_new_item(ListKind::Shopping, timezone, new_item, today)
+            for new_item in to_create {
+                let assignee = new_item.assignee_user_id;
+                let validated = validate_new_item(ListKind::Shopping, timezone, new_item, today)
+                    .map_err(into_sqlx)?;
+                let item = items::create(
+                    &mut tx,
+                    job.household_id,
+                    &actor,
+                    target_list_id,
+                    validated,
+                    assignee,
+                    now,
+                )
+                .await
                 .map_err(into_sqlx)?;
-            let item = items::create(
-                &mut tx,
-                job.household_id,
-                &actor,
-                target_list_id,
-                validated,
-                assignee,
-                now,
-            )
-            .await
-            .map_err(into_sqlx)?;
-            existing.push(item.clone());
-            created.push(item);
+                existing.push(item.clone());
+                created.push(item);
+            }
         }
 
         let draft = if draft_items.is_empty() {
@@ -714,41 +750,23 @@ impl CaptureWorker {
         let show_card = draft
             .as_ref()
             .is_some_and(|draft| active.is_none() || on_own_screen(&active, job.id, draft.id));
-        let draft_banner = draft.is_some() && !show_card;
 
-        let mut buttons = duplicates
-            .split_first()
-            .map(|(first, rest)| first.buttons(target_list_id, rest.to_vec()))
-            .unwrap_or_default();
-        if !created.is_empty() {
-            buttons.push(button(
-                "↩️ Отменить",
-                Action::AddedUndo {
-                    item_ids: created.iter().map(|item| item.id).collect(),
-                },
-            ));
-        }
-        if draft_banner && let Some(draft) = &draft {
-            buttons.push(button(
-                "Открыть",
-                Action::Go {
-                    to: Screen::Draft { draft_id: draft.id },
-                },
-            ));
-        }
-        let text = result_banner(
-            &target_name,
-            &added,
-            &duplicates,
-            on_list,
-            draft.is_some(),
-            draft_banner,
-        );
+        let result = match (&draft, show_card) {
+            (_, true) => DirectResult::Card,
+            (Some(_), false) => DirectResult::DraftBanner,
+            (None, false) => DirectResult::PlainBanner,
+        };
+        let open_draft = draft
+            .as_ref()
+            .filter(|_| result == DirectResult::DraftBanner)
+            .map(|draft| draft.id);
+        let rows = addition_rows(&duplicates, target_list_id, &created, open_draft);
+        let text = result_banner(&target_name, &added, &duplicates, on_list, result);
         let banner = text.map(|text| {
-            if buttons.is_empty() {
+            if rows.is_empty() {
                 Banner::text(text)
             } else {
-                Banner::with_buttons(text, buttons)
+                Banner::with_button_rows(text, rows)
             }
         });
 
@@ -796,13 +814,30 @@ impl CaptureWorker {
         let actor = Actor::user(prepared.user.id, prepared.user.role);
         let timezone = context.timezone.name();
         let today = context.today();
+        let active = active_screen(&mut *tx, job.chat_id).await?;
+
+        let parts = split_titles(text);
+        if parts.len() > MAX_ITEMS {
+            self.bot
+                .present_to(
+                    &mut *tx,
+                    now,
+                    prepared.recipient(job.chat_id),
+                    active.unwrap_or(Screen::Menu),
+                    Some(Banner::text(format!(
+                        "Слишком много позиций: не больше {MAX_ITEMS} за раз. \
+                         Разделите текст"
+                    ))),
+                )
+                .await?;
+            return Ok(true);
+        }
+
         let mut existing = items::list_by_list(&mut *tx, job.household_id, target_list_id)
             .await
             .map_err(into_sqlx)?;
-
-        let mut created: Vec<Item> = Vec::new();
-        let mut duplicates: Vec<DuplicateChoice> = Vec::new();
-        for title in split_titles(text) {
+        let mut new_items = Vec::new();
+        for title in parts {
             let draft = ItemDraft {
                 title,
                 quantity: Some(1.0),
@@ -812,73 +847,58 @@ impl CaptureWorker {
                 .to_new_item(target_list_id, context.timezone, ListKind::Shopping)
                 .map_err(into_sqlx)?;
             new_item.list_id = target_list_id;
-            if let Some(existing_item) = Duplicate::find(&existing, &new_item.title) {
-                let quantity = new_item.quantity.unwrap_or(1.0);
-                let unit = new_item.unit.clone();
-                let effective_unit = unit.as_deref().or(existing_item.unit.as_deref());
-                if let Some(pending) = duplicates.iter_mut().find(|pending| {
-                    pending.existing.item_id == existing_item.item_id
-                        && same_unit(
-                            pending.unit.as_deref().or(pending.existing.unit.as_deref()),
-                            effective_unit,
-                        )
-                }) {
-                    pending.quantity += quantity;
-                } else {
-                    duplicates.push(DuplicateChoice {
-                        existing: existing_item,
-                        title: new_item.title.clone(),
-                        quantity,
-                        unit,
-                    });
-                }
-                continue;
-            }
-            let assignee = new_item.assignee_user_id;
-            let validated = match validate_new_item(ListKind::Shopping, timezone, new_item, today) {
-                Ok(validated) => validated,
-                // Слишком длинную часть не теряем из-за остальных.
-                Err(DomainError::Validation(_)) => continue,
-                Err(error) => return Err(into_sqlx(error)),
-            };
-            let item = items::create(
-                &mut *tx,
-                job.household_id,
-                &actor,
-                target_list_id,
-                validated,
-                assignee,
-                now,
-            )
-            .await
-            .map_err(into_sqlx)?;
-            existing.push(item.clone());
-            created.push(item);
+            new_items.push(new_item);
         }
 
-        let active = active_screen(&mut *tx, job.chat_id).await?;
-        let titles: Vec<String> = created.iter().map(|item| item.title.clone()).collect();
-        let mut buttons = duplicates
-            .split_first()
-            .map(|(first, rest)| first.buttons(target_list_id, rest.to_vec()))
-            .unwrap_or_default();
-        if !created.is_empty() {
-            buttons.push(button(
-                "↩️ Отменить",
-                Action::AddedUndo {
-                    item_ids: created.iter().map(|item| item.id).collect(),
-                },
-            ));
+        let mut created: Vec<Item> = Vec::new();
+        let mut duplicates: Vec<DuplicateChoice> = Vec::new();
+        let mut skipped = Vec::new();
+        for new_item in new_items {
+            let (to_create, found) = plan_additions(&existing, vec![new_item]);
+            for choice in found {
+                merge_duplicate_choice(&mut duplicates, choice);
+            }
+            for new_item in to_create {
+                let assignee = new_item.assignee_user_id;
+                let title = new_item.title.clone();
+                let validated =
+                    match validate_new_item(ListKind::Shopping, timezone, new_item, today) {
+                        Ok(validated) => validated,
+                        // Слишком длинную часть не теряем из-за остальных:
+                        // покажем её в баннере.
+                        Err(DomainError::Validation(_)) => {
+                            skipped.push(title);
+                            continue;
+                        }
+                        Err(error) => return Err(into_sqlx(error)),
+                    };
+                let item = items::create(
+                    &mut *tx,
+                    job.household_id,
+                    &actor,
+                    target_list_id,
+                    validated,
+                    assignee,
+                    now,
+                )
+                .await
+                .map_err(into_sqlx)?;
+                existing.push(item.clone());
+                created.push(item);
+            }
         }
+
+        let titles: Vec<String> = created.iter().map(|item| item.title.clone()).collect();
+        let rows = addition_rows(&duplicates, target_list_id, &created, None);
         let on_list = matches!(
             &active,
             Some(Screen::List { list_id, .. }) if *list_id == target_list_id
         );
-        let text = split_banner(&target_name, &titles, &duplicates, on_list);
-        let banner = if buttons.is_empty() {
+        let text = split_banner(&target_name, &titles, &duplicates, &skipped, on_list);
+        let banner = if rows.is_empty() {
             Banner::text(text)
         } else {
-            Banner::with_buttons(text, buttons)
+            Banner::with_button_rows(text, rows)
         };
         let screen = active.unwrap_or(Screen::Menu);
         self.bot
@@ -944,50 +964,32 @@ impl CaptureWorker {
                     metrics::capture("telegram", "added");
                     return Ok(Pass::Dead);
                 }
-                if let Some(target) = job.target().filter(|target| target.direct)
-                    && let Some(Screen::List {
-                        list_id,
-                        page,
-                        edit,
-                        from_lists,
-                    }) = active_screen(&mut tx, job.chat_id).await?
-                    && list_id == target.list_id
-                {
-                    self.bot
-                        .present_to(
-                            &mut tx,
-                            now,
-                            prepared.recipient(job.chat_id),
-                            Screen::List {
-                                list_id,
-                                page,
-                                edit,
-                                from_lists,
-                            },
-                            Some(Banner::text(issue.message)),
-                        )
-                        .await?;
-                    tx.commit().await?;
-                    self.wake_outbox.notify_one();
-                    metrics::capture("telegram", "failed");
-                    return Ok(Pass::Dead);
-                }
                 // Чужой активный экран не вытесняется: ошибка видна баннером
-                // на нём. Исключение — статус этого же разбора: его место
-                // занимает редактор с исходным текстом.
+                // на нём, а исходный текст остаётся в кнопке ручного ввода.
+                // Исключение — статус этого же разбора: его место занимает
+                // редактор с исходным текстом.
                 let active = active_screen(&mut tx, job.chat_id).await?;
                 let on_own_processing = matches!(
                     &active,
                     Some(Screen::Processing { job_id: Some(job_id) }) if *job_id == job.id
                 );
                 if let Some(screen) = active.filter(|_| !on_own_processing) {
+                    let banner = Banner::with_buttons(
+                        issue.message,
+                        vec![button(
+                            "✍️ Ввести вручную",
+                            Action::ManualEntry {
+                                text: issue.text.to_owned(),
+                            },
+                        )],
+                    );
                     self.bot
                         .present_to(
                             &mut tx,
                             now,
                             prepared.recipient(job.chat_id),
                             screen,
-                            Some(Banner::text(issue.message)),
+                            Some(banner),
                         )
                         .await?;
                     tx.commit().await?;
