@@ -28,15 +28,11 @@ pub fn item_occurrence_key(
 }
 
 /// Привязка snooze к текущему вхождению срока; без срока — [`NO_DUE_ORIGIN`].
-// Подключается к insert_snooze() и check старения в пункте 3.1; добавлена
-// отдельным пунктом 2.2, чтобы вычислитель был один.
-#[allow(dead_code)]
 pub fn snooze_origin(due_at: Option<DateTime<Utc>>, due_date: Option<NaiveDate>) -> String {
     item_occurrence_key(due_at, due_date).unwrap_or_else(|| NO_DUE_ORIGIN.to_owned())
 }
 
 /// Привязка snooze задачи без срока: отдельное вхождение, отличимое от `NULL`.
-#[allow(dead_code)]
 pub const NO_DUE_ORIGIN: &str = "no-due";
 
 /// Ключ вхождения утренней сводки: локальная дата получателя.

@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::models::{Item, ItemStatus, List};
 use crate::domain::recurrence::resolve_local;
+use crate::jobs::keys::snooze_origin;
 use crate::storage::repositories::notifications::{self, NewDelivery, NotificationKind};
 use crate::storage::repositories::{items, lists};
 use crate::telegram::callbacks::Scope;
@@ -390,6 +391,7 @@ pub(super) fn snooze_time(
 pub(super) async fn insert_snooze(
     ctx: &mut Ctx<'_>,
     item_id: Uuid,
+    origin_key: &str,
     deliver_at: DateTime<Utc>,
     batched: bool,
 ) -> Result<(), Fail> {
@@ -400,7 +402,7 @@ pub(super) async fn insert_snooze(
         item_id: Some(item_id),
         kind: NotificationKind::Snooze,
         occurrence_key: &occurrence_key,
-        origin_key: None,
+        origin_key: Some(origin_key),
         scheduled_at: deliver_at,
     };
     if batched {
@@ -428,7 +430,8 @@ pub async fn snooze(
     }
 
     let deliver_at = snooze_time(until, ctx.tz, ctx.now)?;
-    insert_snooze(ctx, item_id, deliver_at, false).await?;
+    let origin_key = snooze_origin(item.due_at, item.due_date);
+    insert_snooze(ctx, item_id, &origin_key, deliver_at, false).await?;
 
     let local = deliver_at.with_timezone(&ctx.tz);
     ctx.toast("Отложено");

@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::models::ItemStatus;
+use crate::jobs::keys::snooze_origin;
 use crate::storage::repositories::items;
 use crate::storage::repositories::notifications::{
     self, BatchDelivery, BatchState, NotificationKind,
@@ -490,7 +491,8 @@ async fn snooze_batch_item(
     }
 
     let deliver_at = snooze_time(SnoozeUntil::OneHour, ctx.tz, ctx.now)?;
-    insert_snooze(ctx, item_id, deliver_at, batched).await?;
+    let origin_key = snooze_origin(item.due_at, item.due_date);
+    insert_snooze(ctx, item_id, &origin_key, deliver_at, batched).await?;
     set_batch_snoozed(ctx, batch_id, item_id, deliver_at).await?;
     Ok(true)
 }

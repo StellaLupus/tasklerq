@@ -854,3 +854,64 @@ async fn assignment_from_an_archived_list_keeps_its_actions_in_a_block() {
     bot.press_data(&opens[0], message_id).await;
     bot.assert_screen_contains("Вторая");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snooze_all_of_an_assignment_without_due_records_the_no_due_origin() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = bot.now.with_timezone(&moscow).date_naive();
+    let morning = local_utc(moscow, day, 8, 0);
+    let due = local_utc(moscow, day, 9, 0);
+
+    let mut new = support::new_item(household.tasks_list_id, "Без срока");
+    new.assignee_user_id = Some(household.owner_id);
+    let no_due = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        new,
+    )
+    .await;
+    let timed = create_task(&db.pool, &household, "Со сроком", due, None).await;
+    insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        no_due.id,
+        "assignment",
+        "assignment:no-due:0",
+        morning,
+        true,
+    )
+    .await;
+    insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        timed.id,
+        "assignment",
+        "assignment:no-due:1",
+        morning,
+        true,
+    )
+    .await;
+
+    tick_and_deliver(&mut bot, &db.pool, morning).await;
+    let (message_id, html) = bot.latest();
+    let snooze_all = button_of(&html, "Отложить все на час");
+    bot.press_data(&snooze_all, message_id).await;
+
+    let origin: Option<String> = sqlx::query_scalar(
+        "SELECT origin_key FROM notification_deliveries
+         WHERE item_id = $1 AND kind = 'snooze'",
+    )
+    .bind(no_due.id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("snooze origin");
+    assert_eq!(origin.as_deref(), Some("no-due"));
+}
