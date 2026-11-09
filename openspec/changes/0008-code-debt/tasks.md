@@ -28,7 +28,7 @@
 
 ## 5. Итоговая проверка
 
-- [ ] 5.1 Прогнать `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` и `cargo test`, все должны пройти. Затем `openspec validate 0008-code-debt --strict` должен пройти без ошибок.
+- [x] 5.1 Прогнать `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` и `cargo test`, все должны пройти. Затем `openspec validate 0008-code-debt --strict` должен пройти без ошибок.
 
 ## Workflow follow-up
 
