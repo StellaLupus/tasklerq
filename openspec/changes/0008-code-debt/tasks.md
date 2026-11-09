@@ -8,7 +8,7 @@
 
 ## 2. Код
 
-- [ ] 2.1 Вынести общую функцию добавления частей из `finish_direct_split` (`src/telegram/capture_worker.rs`) и `intake_split` (`src/telegram/bot/capture/mod.rs`) (design, решение 1). Проверить: `tests/telegram_capture.rs`, `tests/capture_fallback.rs` и тесты экрана покупок проходят без изменений.
+- [x] 2.1 Вынести общую функцию добавления частей из `finish_direct_split` (`src/telegram/capture_worker.rs`) и `intake_split` (`src/telegram/bot/capture/mod.rs`) (design, решение 1). Проверить: `tests/telegram_capture.rs`, `tests/capture_fallback.rs` и тесты экрана покупок проходят без изменений.
 - [ ] 2.2 Ввести `MAX_INPUT_QUANTITY` в `src/domain/validation.rs` и использовать её вместо `MAX_QUANTITY` в `src/telegram/bot/model.rs` и `src/capture/validate.rs` (design, решение 2). Проверить: `cargo test` проходит, `grep -rn "9_999.0" src` находит одно определение.
 - [ ] 2.3 Заменить `expect` в `src/jobs/batch.rs` на `let … else` при проверке вида и сохранить `scope` в `BatchCandidate` (design, решение 3). Проверить: `cargo test --test notification_batches` проходит, `grep -n "expect(" src/jobs/batch.rs` пуст.
 - [ ] 2.4 Исправить комментарий поля `idempotency_key` в `CaptureRequest` (`src/http/api/capture/mod.rs`): при расхождении заголовка и поля ответ `422`, как в `idempotency.rs`. Миграцию `0007` не трогать. Удалить `JournalPage::has_next` (`src/storage/repositories/items/completions.rs`) и его вызовы в `tests/item_lifecycle.rs`. Проверить: `cargo test --test item_lifecycle` проходит.

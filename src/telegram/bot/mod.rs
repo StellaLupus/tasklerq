@@ -6,6 +6,7 @@
 //! быстрый ответ на callback (`answerCallbackQuery`) возвращается наружу и
 //! отправляется после коммита.
 
+pub(crate) mod additions;
 pub(crate) mod capture;
 mod card;
 mod forms;
