@@ -1,6 +1,7 @@
 //! Применение миграций базы данных.
 
 use std::collections::HashSet;
+use std::sync::LazyLock;
 
 use sqlx::PgPool;
 use sqlx::migrate::{MigrateError, Migrator};
@@ -12,11 +13,41 @@ use sqlx::migrate::{MigrateError, Migrator};
 /// `sqlx-core::migrate::migrator`, `sqlx-postgres::migrate::lock`). Не
 /// отключаем блокировку и не добавляем свою: параллельные `serve` и
 /// `tasklerq migrate` сериализуются на одной базе.
-pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+///
+/// `ignore_missing` включён, чтобы образ стартовал на базе, где применена
+/// миграция, которой в этом образе нет: откат тегом на более старый образ
+/// после аддитивной миграции.
+pub static MIGRATOR: LazyLock<Migrator> = LazyLock::new(|| {
+    let mut migrator = sqlx::migrate!("./migrations");
+    migrator.set_ignore_missing(true);
+    migrator
+});
 
 /// Применить все ожидающие миграции под advisory lock.
+///
+/// Версии из `_sqlx_migrations`, которых нет в бинарнике, не считаются
+/// ошибкой: они перечисляются в одном предупреждении, чтобы оператор видел,
+/// что база новее образа.
 pub async fn run(pool: &PgPool) -> Result<(), MigrateError> {
-    MIGRATOR.run(pool).await
+    MIGRATOR.run(pool).await?;
+
+    let applied: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(pool)
+            .await
+            .map_err(MigrateError::Execute)?;
+    let unknown: Vec<i64> = applied
+        .into_iter()
+        .filter(|version| !MIGRATOR.version_exists(*version))
+        .collect();
+    if !unknown.is_empty() {
+        tracing::warn!(
+            unknown_versions = ?unknown,
+            "database has migrations unknown to this image"
+        );
+    }
+
+    Ok(())
 }
 
 /// Все встроенные миграции применены успешно.

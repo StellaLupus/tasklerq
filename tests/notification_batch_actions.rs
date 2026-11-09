@@ -1074,6 +1074,11 @@ async fn cancelled_snooze_block_opens_with_the_current_version_and_snoozes_again
     let moscow = chrono_tz::Europe::Moscow;
     let day = bot.now.with_timezone(&moscow).date_naive();
     let morning = local_utc(moscow, day, 8, 0);
+    // Нажатия кнопок обрабатываются по часам стенда (`bot.now`), а не по
+    // времени тика. Ставим часы на утро сценария: днём утро и новый срок уже
+    // в прошлом, и оба snooze получают одинаковое время «сейчас + час»,
+    // сливаясь в одну запись. Так сценарий одинаков в любое время суток.
+    bot.set_now(morning);
     let due = local_utc(moscow, day, 9, 0);
     let first = create_task(&db.pool, &household, "Первая", due, None).await;
     let second = create_task(&db.pool, &household, "Вторая", due, None).await;
@@ -1153,6 +1158,11 @@ async fn snooze_all_takes_a_block_whose_snooze_was_cancelled() {
     let moscow = chrono_tz::Europe::Moscow;
     let day = bot.now.with_timezone(&moscow).date_naive();
     let morning = local_utc(moscow, day, 8, 0);
+    // Нажатия кнопок обрабатываются по часам стенда (`bot.now`), а не по
+    // времени тика. Ставим часы на утро сценария: днём утро и новый срок уже
+    // в прошлом, и оба snooze получают одинаковое время «сейчас + час»,
+    // сливаясь в одну запись. Так сценарий одинаков в любое время суток.
+    bot.set_now(morning);
     let due = local_utc(moscow, day, 9, 0);
     let first = create_task(&db.pool, &household, "Первая", due, None).await;
     let second = create_task(&db.pool, &household, "Вторая", due, None).await;

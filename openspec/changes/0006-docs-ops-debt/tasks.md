@@ -6,8 +6,8 @@
 
 ## 2. Откат на образ без новых миграций
 
-- [ ] 2.1 В `src/storage/migrations.rs` сделать `MIGRATOR` типом `LazyLock<Migrator>` с `set_ignore_missing(true)` и перенести на него doc-комментарий про advisory lock (design, решение 1). Проверить: `cargo test --test migrations` и `cargo test --test health` проходят без изменений тестов.
-- [ ] 2.2 В `run()` после успешного применения отбирать версии `_sqlx_migrations`, для которых `!MIGRATOR.version_exists(v)`, и при непустом списке писать одно `tracing::warn!` с полем `unknown_versions` (design, решение 2). Проверить новым тестом в `tests/migrations.rs` по образцу CLI-теста (стр. ~394–447):
+- [x] 2.1 В `src/storage/migrations.rs` сделать `MIGRATOR` типом `LazyLock<Migrator>` с `set_ignore_missing(true)` и перенести на него doc-комментарий про advisory lock (design, решение 1). Проверить: `cargo test --test migrations` и `cargo test --test health` проходят без изменений тестов.
+- [x] 2.2 В `run()` после успешного применения отбирать версии `_sqlx_migrations`, для которых `!MIGRATOR.version_exists(v)`, и при непустом списке писать одно `tracing::warn!` с полем `unknown_versions` (design, решение 2). Проверить новым тестом в `tests/migrations.rs` по образцу CLI-теста (стр. ~394–447):
   1. `support::create_database`, затем `migrations::run`.
   2. Вставить в `_sqlx_migrations` запись `(99999999999999, 'future', true, '\x00', 0)` со всеми NOT NULL-колонками.
   3. Запустить бинарник `migrate` с `RUST_LOG=warn`.
@@ -26,6 +26,7 @@
 ## 4. Итоговая проверка
 
 - [ ] 4.1 Прогнать `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` и `cargo test`, все должны пройти. Затем `openspec validate 0006-docs-ops-debt --strict` должен пройти без ошибок.
+  - Заметка исполнителя: тесты notification_batch_actions::cancelled_snooze_block_opens_with_the_current_version_and_snoozes_again и ::snooze_all_takes_a_block_whose_snooze_was_cancelled падали днём (время сценария от фиксированных часов дня); исправлено в рамках 0006, чтобы cargo test был зелёным.
 
 ## Workflow follow-up
 
