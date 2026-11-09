@@ -445,3 +445,86 @@ async fn cli_migrate_applies_to_a_fresh_database_and_a_repeat_is_a_noop() {
     );
     pool.close().await;
 }
+
+/// Образ без новой миграции стартует на базе, где она уже применена.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_migrate_warns_about_migrations_missing_from_the_image() {
+    let name = format!("migrate_future_{}", Uuid::now_v7().simple());
+    support::create_database(&name).await;
+    let url = support::database_url_for(&name).await;
+
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .expect("the new database should accept connections");
+    migrations::run(&pool)
+        .await
+        .expect("the first migration run should succeed");
+
+    // На базе без версий, которых нет в образе, предупреждения быть не должно.
+    let clean = bin()
+        .env("DATABASE_URL", &url)
+        .env("RUST_LOG", "warn")
+        .arg("migrate")
+        .output()
+        .await
+        .expect("the migrate CLI should run");
+    assert!(
+        clean.status.success(),
+        "the CLI must run on a clean schema: {}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+    let clean_stdout = String::from_utf8_lossy(&clean.stdout);
+    assert!(
+        !clean_stdout.contains("unknown_versions"),
+        "a schema with only embedded migrations must not warn: {clean_stdout}"
+    );
+
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations
+             (version, description, success, checksum, execution_time)
+         VALUES (99999999999999, 'future', true, '\\x00', 0)",
+    )
+    .execute(&pool)
+    .await
+    .expect("a migration unknown to the image should be recorded");
+
+    let output = bin()
+        .env("DATABASE_URL", &url)
+        .env("RUST_LOG", "warn")
+        .arg("migrate")
+        .output()
+        .await
+        .expect("the migrate CLI should run");
+
+    assert!(
+        output.status.success(),
+        "the CLI must not fail on a newer schema: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|line| { line.contains("unknown_versions") && line.contains("99999999999999") }),
+        "the run must warn about migrations unknown to the image on one line: {stdout}"
+    );
+    let recorded: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM _sqlx_migrations WHERE version = 99999999999999
+         )",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the unknown migration should still be recorded");
+    assert!(
+        recorded,
+        "the data written by a newer image must stay in the database"
+    );
+    assert!(
+        migrations::all_applied(&pool).await.expect("applied check"),
+        "readiness must ignore migrations that are missing from the image"
+    );
+    pool.close().await;
+}

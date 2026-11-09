@@ -2,30 +2,33 @@
 
 ## 1. CI
 
-- [ ] 1.1 В `.github/workflows/ci.yml` заменить в job `audit` шаг `rustsec/audit-check` на `cargo install cargo-audit --locked` и `cargo audit --ignore RUSTSEC-2023-0071`, сохранить комментарий про `rsa`, права job сузить до `contents: read` (design, решение 4). Проверить: CI на PR зелёный, а после мержа зелёный и на `main` (сейчас там падает с «Resource not accessible by integration»).
+- [x] 1.1 В `.github/workflows/ci.yml` заменить в job `audit` шаг `rustsec/audit-check` на `cargo install cargo-audit --locked` и `cargo audit --ignore RUSTSEC-2023-0071`, сохранить комментарий про `rsa`, права job сузить до `contents: read` (design, решение 4). Проверить: CI на PR зелёный, а после мержа зелёный и на `main` (сейчас там падает с «Resource not accessible by integration»).
 
 ## 2. Откат на образ без новых миграций
 
-- [ ] 2.1 В `src/storage/migrations.rs` сделать `MIGRATOR` типом `LazyLock<Migrator>` с `set_ignore_missing(true)` и перенести на него doc-комментарий про advisory lock (design, решение 1). Проверить: `cargo test --test migrations` и `cargo test --test health` проходят без изменений тестов.
-- [ ] 2.2 В `run()` после успешного применения отбирать версии `_sqlx_migrations`, для которых `!MIGRATOR.version_exists(v)`, и при непустом списке писать одно `tracing::warn!` с полем `unknown_versions` (design, решение 2). Проверить новым тестом в `tests/migrations.rs` по образцу CLI-теста (стр. ~394–447):
+- [x] 2.1 В `src/storage/migrations.rs` сделать `MIGRATOR` типом `LazyLock<Migrator>` с `set_ignore_missing(true)` и перенести на него doc-комментарий про advisory lock (design, решение 1). Проверить: `cargo test --test migrations` и `cargo test --test health` проходят без изменений тестов.
+- [x] 2.2 В `run()` после успешного применения отбирать версии `_sqlx_migrations`, для которых `!MIGRATOR.version_exists(v)`, и при непустом списке писать одно `tracing::warn!` с полем `unknown_versions` (design, решение 2). Проверить новым тестом в `tests/migrations.rs` по образцу CLI-теста (стр. ~394–447):
   1. `support::create_database`, затем `migrations::run`.
   2. Вставить в `_sqlx_migrations` запись `(99999999999999, 'future', true, '\x00', 0)` со всеми NOT NULL-колонками.
   3. Запустить бинарник `migrate` с `RUST_LOG=warn`.
   4. Убедиться: код выхода 0, в stdout есть `unknown_versions` и `99999999999999`, `all_applied()` возвращает `true`.
-- [ ] 2.3 Переписать в `docs/deployment.md` абзац «Откат тегом не проходит через миграции» в §12 и «Ограничение отката по тегу» в §16.10. Новый текст:
+- [x] 2.3 Переписать в `docs/deployment.md` абзац «Откат тегом не проходит через миграции» в §12 и «Ограничение отката по тегу» в §16.10. Новый текст:
   - откат тегом работает, если целевой образ содержит это изменение, и в логе будет предупреждение `unknown_versions`;
   - для v0.1.0 и других образов без него ограничение остаётся, нужен restore;
   - для отката на образ без миграции 0012 (собранный с прежним кодом) сначала выполнить `UPDATE items SET recurrence_occurrence_date = NULL, recurrence_occurrence_time = NULL` (из design 0004, Risks).
+  - Заметка исполнителя: формулировки уточнены по ревью (образы после v0.1.0 и признак `unknown_versions`, warn и выше в §20, порядок сброса слота — в §16.10).
 
   Раздел «Переход на v0.1.0» не менять. В §20 убрать «уровень журнала задаётся `RUST_LOG=tasklerq=debug`»: тест фильтрует строки по маркерам уровня warn (`tests/load_webhook.rs`). Проверить чтением: нет утверждения, что старый образ всегда падает на применённой миграции, и нет обещания отката тегом на v0.1.0.
 
 ## 3. Документация после 0005
 
-- [ ] 3.1 В `docs/telegram-ux.md`, в разделе сводного сообщения, заменить «„Отложить все на час“ берёт только блоки без своего snooze» на: «„Отложить все на час“ пропускает блоки, отложенные „На час“, пока их snooze не отменён; блок с отменённым snooze снова открыт с обычными кнопками и попадает в групповой snooze». В разделе напоминания (около строк 1076–1094) добавить абзац: любой snooze («Отложить на час», «Завтра в 09:00», «На час» в блоке) отменяется, когда вхождение срока, из которого его отложили, перестало быть текущим (перенос, снятие или назначение срока, следующее вхождение повторяющейся задачи); если новый срок впереди, по нему приходит обычное напоминание. Проверить по `openspec/specs/notifications-reminders/spec.md` («Snooze следует за сроком задачи»): формулировки не противоречат.
+- [x] 3.1 В `docs/telegram-ux.md`, в разделе сводного сообщения, заменить «„Отложить все на час“ берёт только блоки без своего snooze» на: «„Отложить все на час“ пропускает блоки, отложенные „На час“, пока их snooze не отменён; блок с отменённым snooze снова открыт с обычными кнопками и попадает в групповой snooze». В разделе напоминания (около строк 1076–1094) добавить абзац: любой snooze («Отложить на час», «Завтра в 09:00», «На час» в блоке) отменяется, когда вхождение срока, из которого его отложили, перестало быть текущим (перенос, снятие или назначение срока, следующее вхождение повторяющейся задачи); если новый срок впереди, по нему приходит обычное напоминание. Проверить по `openspec/specs/notifications-reminders/spec.md` («Snooze следует за сроком задачи»): формулировки не противоречат.
+  - Заметка исполнителя: формулировки уточнены по ревью (snooze отменяется после выполнения, когда срок перешёл на следующее вхождение; смена локальной даты и тихие часы его не отменяют).
 
 ## 4. Итоговая проверка
 
-- [ ] 4.1 Прогнать `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` и `cargo test`, все должны пройти. Затем `openspec validate 0006-docs-ops-debt --strict` должен пройти без ошибок.
+- [x] 4.1 Прогнать `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` и `cargo test`, все должны пройти. Затем `openspec validate 0006-docs-ops-debt --strict` должен пройти без ошибок.
+  - Заметка исполнителя: тесты notification_batch_actions::cancelled_snooze_block_opens_with_the_current_version_and_snoozes_again и ::snooze_all_takes_a_block_whose_snooze_was_cancelled падали днём (время сценария от фиксированных часов дня); исправлено в рамках 0006, чтобы cargo test был зелёным.
 
 ## Workflow follow-up
 
