@@ -29,6 +29,7 @@
 //! активный участник household с включёнными напоминаниями. Ошибка БД на одной
 //! записи логируется и не прерывает обработку остальных.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
@@ -48,7 +49,7 @@ use crate::storage::repositories::notifications::{
 };
 use crate::telegram::bot::notify;
 
-pub use super::keys::{all_day_occurrence_key, occurrence_key};
+pub use super::keys::{all_day_occurrence_key, occurrence_key, snooze_origin};
 
 /// Интервал планировщика.
 pub const TICK_INTERVAL: StdDuration = StdDuration::from_secs(30);
@@ -80,39 +81,124 @@ impl Scheduler {
     }
 
     /// Один тик на момент `now`.
+    ///
+    /// Каждый шаг выполняется отдельно: ошибка одного пишется с названием
+    /// шага и не отменяет остальные. `Err` возвращается, если упал хотя бы
+    /// один шаг, — ошибкой последнего из них.
     pub async fn tick(&self, now: DateTime<Utc>) -> Result<TickStats, sqlx::Error> {
-        let cancelled = delivery::cancel_stale(&self.pool, now, DeliveryScope::Reminder).await?
-            + delivery::cancel_stale(&self.pool, now, DeliveryScope::Digest).await?
-            + delivery::cancel_stale(&self.pool, now, DeliveryScope::Assignment).await?;
-        let planned =
-            plan_reminders(&self.pool, now).await? + digest::plan(&self.pool, now).await?;
+        let mut stats = TickStats::default();
+        let mut last_error = None;
+        // Пересчёт времени не меняет `TickStats`: раньше его результат тоже
+        // не учитывался.
+        let mut rescheduled = 0;
+
+        step(
+            "cancel_stale reminders",
+            delivery::cancel_stale(&self.pool, now, DeliveryScope::Reminder),
+            &mut stats.cancelled,
+            &mut last_error,
+        )
+        .await;
+        step(
+            "cancel_stale digests",
+            delivery::cancel_stale(&self.pool, now, DeliveryScope::Digest),
+            &mut stats.cancelled,
+            &mut last_error,
+        )
+        .await;
+        step(
+            "cancel_stale assignments",
+            delivery::cancel_stale(&self.pool, now, DeliveryScope::Assignment),
+            &mut stats.cancelled,
+            &mut last_error,
+        )
+        .await;
+        step(
+            "plan reminders",
+            plan_reminders(&self.pool, now),
+            &mut stats.planned,
+            &mut last_error,
+        )
+        .await;
+        step(
+            "plan digest",
+            digest::plan(&self.pool, now),
+            &mut stats.planned,
+            &mut last_error,
+        )
+        .await;
 
         // Настройки читаются на каждом тике: новое время сводки, lead time,
         // пояс или границы тихих часов применяются без перезапуска. Время
         // считается идемпотентно, поэтому повторный тик не сбрасывает уже
         // отложенную запись обратно в прошлое.
-        delivery::reschedule_pending(&self.pool, now, DeliveryScope::Reminder, reminder_intended)
-            .await?;
-        digest::reschedule(&self.pool, now).await?;
-        assignment::reschedule(&self.pool, now).await?;
+        step(
+            "reschedule reminders",
+            delivery::reschedule_pending(
+                &self.pool,
+                now,
+                DeliveryScope::Reminder,
+                reminder_intended,
+            ),
+            &mut rescheduled,
+            &mut last_error,
+        )
+        .await;
+        step(
+            "reschedule digest",
+            digest::reschedule(&self.pool, now),
+            &mut rescheduled,
+            &mut last_error,
+        )
+        .await;
+        step(
+            "reschedule assignments",
+            assignment::reschedule(&self.pool, now),
+            &mut rescheduled,
+            &mut last_error,
+        )
+        .await;
 
         // Сначала собираем отложенные тихими часами уведомления в одно
         // сообщение; одиночные и неотложенные записи затем уходят обычным
         // путём. Сводка в батч не входит и доставляется отдельно.
-        let delivered = batch::deliver_batches(&self.pool, now).await?
-            + delivery::deliver_due(&self.pool, now, DeliveryScope::Reminder).await?
-            + delivery::deliver_due(&self.pool, now, DeliveryScope::Digest).await?
-            + delivery::deliver_due(&self.pool, now, DeliveryScope::Assignment).await?;
+        step(
+            "deliver batches",
+            batch::deliver_batches(&self.pool, now),
+            &mut stats.delivered,
+            &mut last_error,
+        )
+        .await;
+        step(
+            "deliver reminders",
+            delivery::deliver_due(&self.pool, now, DeliveryScope::Reminder),
+            &mut stats.delivered,
+            &mut last_error,
+        )
+        .await;
+        step(
+            "deliver digests",
+            delivery::deliver_due(&self.pool, now, DeliveryScope::Digest),
+            &mut stats.delivered,
+            &mut last_error,
+        )
+        .await;
+        step(
+            "deliver assignments",
+            delivery::deliver_due(&self.pool, now, DeliveryScope::Assignment),
+            &mut stats.delivered,
+            &mut last_error,
+        )
+        .await;
 
-        if delivered > 0 {
+        if stats.delivered > 0 {
             self.wake_outbox.notify_one();
         }
 
-        Ok(TickStats {
-            planned,
-            delivered,
-            cancelled,
-        })
+        match last_error {
+            Some(error) => Err(error),
+            None => Ok(stats),
+        }
     }
 
     /// Цикл до сигнала остановки.
@@ -132,6 +218,25 @@ impl Scheduler {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Выполнить один шаг тика.
+///
+/// Ошибка пишется в лог с названием шага и запоминается как последняя, но не
+/// прерывает остальные шаги.
+async fn step(
+    name: &'static str,
+    future: impl Future<Output = Result<u64, sqlx::Error>>,
+    total: &mut u64,
+    last_error: &mut Option<sqlx::Error>,
+) {
+    match future.await {
+        Ok(rows) => *total += rows,
+        Err(error) => {
+            tracing::error!(step = name, %error, "notification scheduler step failed");
+            *last_error = Some(error);
         }
     }
 }

@@ -1090,7 +1090,7 @@ async fn snooze_in_a_stale_reminder_only_redraws_and_then_works() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_snooze_without_origin_is_delivered_after_the_due_changed() {
+async fn a_snooze_without_origin_is_cancelled_after_the_due_changed() {
     let db = isolated_db().await;
     let mut bot = onboarded(&db.pool).await;
     quiet_off(&db.pool, bot.chat).await;
@@ -1098,7 +1098,8 @@ async fn a_snooze_without_origin_is_delivered_after_the_due_changed() {
     let due = rounded_now() + Duration::hours(3);
     let item = create_task(&db.pool, &household, "Позвонить маме", due, None).await;
     let deliver_at = rounded_now() + Duration::hours(1);
-    // Запись до миграции: привязки нет, поэтому смена срока её не отменяет.
+    // Snooze без привязки не совпадает ни с одним вхождением срока, поэтому
+    // устаревает на ближайшем тике.
     insert_snooze_delivery(&db.pool, &household, item.id, None, deliver_at).await;
     sqlx::query("UPDATE items SET due_at = $2, version = version + 1 WHERE id = $1")
         .bind(item.id)
@@ -1111,8 +1112,12 @@ async fn a_snooze_without_origin_is_delivered_after_the_due_changed() {
 
     let rows = snooze_rows(&db.pool, item.id).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0].0, "sent", "{rows:?}");
-    assert_eq!(message_count(&bot, "Позвонить маме"), 1);
+    assert_eq!(rows[0].0, "cancelled", "{rows:?}");
+    assert_eq!(
+        message_count(&bot, "Позвонить маме"),
+        0,
+        "an unbound snooze must not be delivered"
+    );
 }
 
 /// Пользователь дважды нажимает «Завтра в 09:00» после переноса срока.

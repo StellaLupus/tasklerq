@@ -927,11 +927,19 @@ pub enum Action {
         /// следующем баннере.
         #[serde(default)]
         draft_id: Option<Uuid>,
+        /// Позиции, созданные этим добавлением: «↩️ Отменить» в следующем
+        /// баннере. Старый токен без поля читается пустым.
+        #[serde(default)]
+        created_ids: Vec<Uuid>,
     },
     /// Отменить прямое добавление покупок: мягко удалить созданные позиции.
     AddedUndo {
         /// Позиции, созданные этим добавлением.
         item_ids: Vec<Uuid>,
+        /// Ожидающий черновик этого же добавления: кнопка «Открыть» в
+        /// баннере. Старый токен без поля читается как `None`.
+        #[serde(default)]
+        draft_id: Option<Uuid>,
     },
     /// Открыть ручной редактор с исходным текстом из баннера ошибки разбора.
     ManualEntry {
@@ -955,6 +963,10 @@ pub enum Action {
         /// следующем баннере.
         #[serde(default)]
         draft_id: Option<Uuid>,
+        /// Позиции, созданные этим добавлением: «↩️ Отменить» в следующем
+        /// баннере. Старый токен без поля читается пустым.
+        #[serde(default)]
+        created_ids: Vec<Uuid>,
     },
     /// Начать ввод поискового запроса.
     SearchStart,
@@ -1561,6 +1573,7 @@ impl DuplicateChoice {
         list_id: Uuid,
         rest: Vec<Self>,
         draft_id: Option<Uuid>,
+        created_ids: &[Uuid],
     ) -> Vec<Button<Action>> {
         let mut buttons = Vec::new();
         if let Some(total) = self.increase_total() {
@@ -1572,6 +1585,7 @@ impl DuplicateChoice {
                     quantity: total,
                     rest: rest.clone(),
                     draft_id,
+                    created_ids: created_ids.to_vec(),
                 },
             ));
         }
@@ -1584,6 +1598,7 @@ impl DuplicateChoice {
                 unit: self.unit.clone(),
                 rest,
                 draft_id,
+                created_ids: created_ids.to_vec(),
             },
         ));
         buttons
@@ -1647,19 +1662,20 @@ fn add_duplicate(duplicates: &mut Vec<DuplicateChoice>, existing: Duplicate, new
 pub fn addition_rows(
     duplicates: &[DuplicateChoice],
     list_id: Uuid,
-    created: &[Item],
+    created_ids: &[Uuid],
     draft_id: Option<Uuid>,
 ) -> Vec<Vec<Button<Action>>> {
     let mut rows = Vec::new();
     let mut row = duplicates
         .split_first()
-        .map(|(first, rest)| first.buttons(list_id, rest.to_vec(), draft_id))
+        .map(|(first, rest)| first.buttons(list_id, rest.to_vec(), draft_id, created_ids))
         .unwrap_or_default();
-    if !created.is_empty() {
+    if !created_ids.is_empty() {
         row.push(button(
             "↩️ Отменить",
             Action::AddedUndo {
-                item_ids: created.iter().map(|item| item.id).collect(),
+                item_ids: created_ids.to_vec(),
+                draft_id,
             },
         ));
     }
@@ -1834,6 +1850,61 @@ mod tests {
             }
         );
         assert_eq!(batch.version(), None);
+    }
+
+    #[test]
+    fn old_addition_undo_and_duplicate_tokens_are_read() {
+        let undo: Action = serde_json::from_value(json!({
+            "a": "added_undo",
+            "item_ids": [Uuid::nil()],
+        }))
+        .expect("old added undo token");
+        assert_eq!(
+            undo,
+            Action::AddedUndo {
+                item_ids: vec![Uuid::nil()],
+                draft_id: None,
+            }
+        );
+
+        let increase: Action = serde_json::from_value(json!({
+            "a": "duplicate_increase",
+            "item_id": Uuid::nil(),
+            "version": 3,
+            "quantity": 2.0,
+        }))
+        .expect("old duplicate increase token");
+        assert_eq!(
+            increase,
+            Action::DuplicateIncrease {
+                item_id: Uuid::nil(),
+                version: 3,
+                quantity: 2.0,
+                rest: Vec::new(),
+                draft_id: None,
+                created_ids: Vec::new(),
+            }
+        );
+
+        let separate: Action = serde_json::from_value(json!({
+            "a": "duplicate_separate",
+            "list_id": Uuid::nil(),
+            "title": "Хлеб",
+            "quantity": 1.0,
+        }))
+        .expect("old duplicate separate token");
+        assert_eq!(
+            separate,
+            Action::DuplicateSeparate {
+                list_id: Uuid::nil(),
+                title: "Хлеб".to_owned(),
+                quantity: 1.0,
+                unit: None,
+                rest: Vec::new(),
+                draft_id: None,
+                created_ids: Vec::new(),
+            }
+        );
     }
 
     #[test]

@@ -166,9 +166,8 @@ impl NoticeRow {
     /// Напоминание сверяется с текущим вхождением срока ([`current_key`]) и
     /// окном вседневной доставки. Snooze сверяется только со своим
     /// `origin_key`: он устаревает, когда [`snooze_origin`] по текущему сроку
-    /// задачи даёт другое значение. Запись snooze без привязки (до миграции)
-    /// по этой проверке не устаревает. Поэтому смена локальной даты и тихие
-    /// часы snooze не отменяют.
+    /// задачи даёт другое значение, в том числе когда привязки нет. Поэтому
+    /// смена локальной даты и тихие часы snooze не отменяют.
     ///
     /// Назначение не зависит от напоминаний и архива списка: задача остаётся
     /// открытой и всё ещё назначена получателю. Список при этом должен
@@ -201,9 +200,8 @@ impl NoticeRow {
             return true;
         }
         if self.is_snooze() {
-            return self.origin_key.as_deref().is_some_and(|origin_key| {
-                origin_key != snooze_origin(self.item_due_at, self.item_due_date)
-            });
+            return self.origin_key.as_deref()
+                != Some(snooze_origin(self.item_due_at, self.item_due_date).as_str());
         }
         !self.item_valid()
             || !self.recipient_selected()

@@ -4680,6 +4680,50 @@ async fn quick_due_none_is_hidden_for_recurring_and_clears_an_ordinary_due() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quick_due_none_on_a_task_without_a_due_shows_the_card_without_a_banner() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(moscow, today, 12, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let task = create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, "Без срока"),
+    )
+    .await;
+
+    bot.press("Задачи").await;
+    bot.press("Без срока").await;
+    bot.press("Срок").await;
+    bot.press("Без срока").await;
+
+    assert!(
+        !bot.screen().contains("Срок снят"),
+        "a task that never had a due date must not get the «Срок снят» banner:\n{}",
+        bot.screen()
+    );
+    assert_eq!(
+        saved_screen(&db.pool, bot.chat).await["t"],
+        serde_json::json!("item"),
+        "the card must be shown"
+    );
+    let version: i32 = sqlx::query_scalar("SELECT version FROM items WHERE id = $1")
+        .bind(task.id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("version");
+    assert_eq!(
+        version, task.version,
+        "«Без срока» on an undated task must not save anything"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_quick_due_shows_the_current_card_and_keeps_the_new_due() {
     let db = db().await;
     let moscow = chrono_tz::Tz::Europe__Moscow;

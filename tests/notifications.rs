@@ -593,6 +593,79 @@ async fn repeated_ticks_do_not_send_the_same_reminder_twice() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_digest_step_does_not_stop_reminder_delivery() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    // Сводка должна планироваться именно в этом тике, поэтому её время уже
+    // наступило. Тихие часы выключены: иначе сводка переносится на утро.
+    for user_id in [household.owner_id, household.member_id] {
+        set_notifications(
+            &db.pool,
+            user_id,
+            json!({
+                "digest_enabled": true,
+                "digest_time": "00:00",
+                "quiet_hours_enabled": false
+            }),
+        )
+        .await;
+    }
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(
+        &db,
+        &household,
+        "Позвонить в поликлинику",
+        Some(due),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+
+    // DDL на `notification_deliveries` ломает вставку любой сводки; база
+    // отдельная, потому что в общей он задел бы параллельные тики.
+    sqlx::query(
+        "CREATE FUNCTION fail_digest() RETURNS trigger AS $$
+         BEGIN
+             RAISE EXCEPTION 'forced digest failure';
+         END $$ LANGUAGE plpgsql",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("function");
+    sqlx::query(
+        "CREATE TRIGGER fail_digest BEFORE INSERT ON notification_deliveries
+         FOR EACH ROW WHEN (NEW.kind = 'digest') EXECUTE FUNCTION fail_digest()",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("trigger");
+
+    let result = scheduler(&db.pool).tick(due - Duration::minutes(15)).await;
+
+    sqlx::query("DROP TRIGGER fail_digest ON notification_deliveries")
+        .execute(&db.pool)
+        .await
+        .expect("drop trigger");
+    sqlx::query("DROP FUNCTION fail_digest()")
+        .execute(&db.pool)
+        .await
+        .expect("drop function");
+
+    assert!(
+        result.is_err(),
+        "a failed digest step must be reported by the tick"
+    );
+    let sent = messages(&db.pool, chat).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(sent[0].contains("Позвонить в поликлинику"), "{sent:?}");
+    let rows = delivery_rows(&db.pool, item.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "sent");
+    assert!(rows[0].2.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restart_does_not_duplicate_and_next_occurrence_gets_its_own_delivery() {
     let db = support::isolated_db().await;
     let household = household_without_digest(&db).await;

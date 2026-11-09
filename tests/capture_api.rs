@@ -560,6 +560,35 @@ async fn invalid_request_fields_are_rejected_before_the_llm() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_text_without_printable_characters_is_rejected_before_the_llm() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(two_purchases())]);
+    let app = app(&db.pool, ai.clone(), config());
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(body("\u{7}\u{8}", "ha_voice", "auto")),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{json}");
+    assert_error_envelope(&json, "validation_error");
+    assert_eq!(ai.calls(), 0, "the LLM must not be called for empty text");
+    assert_eq!(item_count(&db.pool, household.household_id).await, 0);
+    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM llm_runs WHERE household_id = $1")
+        .bind(household.household_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("llm runs");
+    assert_eq!(runs, 0, "no LLM run must be recorded");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_missing_or_wrong_content_type_is_rejected_before_the_llm() {
     let db = db().await;
     let household = support::create_household(&db.pool).await;

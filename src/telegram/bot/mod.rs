@@ -459,13 +459,21 @@ impl Bot {
         screen: Screen,
         banner: Option<Banner>,
     ) -> Result<(), sqlx::Error> {
-        let mut ctx = self.context(conn, now, to, banner);
+        let mut ctx = self.context(conn, now, to, banner.clone());
         match ctx.present(screen).await {
             Ok(()) => Ok(()),
             Err(Fail::Infra(error)) => Err(error),
-            Err(Fail::User(_)) => {
-                tracing::debug!("screen could not be presented to the user");
-                Ok(())
+            Err(Fail::User(reason)) => {
+                tracing::debug!(%reason, "screen could not be presented to the user");
+                let mut ctx = self.context(conn, now, to, banner);
+                match ctx.present(Screen::Menu).await {
+                    Ok(()) => Ok(()),
+                    Err(Fail::Infra(error)) => Err(error),
+                    Err(Fail::User(reason)) => {
+                        tracing::debug!(%reason, "menu could not be presented to the user");
+                        Ok(())
+                    }
+                }
             }
         }
     }
@@ -1039,8 +1047,22 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
             quantity,
             rest,
             draft_id,
-        } => shopping::duplicate_increase(ctx, item_id, version, quantity, rest, draft_id).await,
-        Action::AddedUndo { item_ids } => shopping::added_undo(ctx, &item_ids).await,
+            created_ids,
+        } => {
+            shopping::duplicate_increase(
+                ctx,
+                item_id,
+                version,
+                quantity,
+                rest,
+                draft_id,
+                created_ids,
+            )
+            .await
+        }
+        Action::AddedUndo { item_ids, draft_id } => {
+            shopping::added_undo(ctx, &item_ids, draft_id).await
+        }
         Action::ManualEntry { text } => {
             views::clear_conversation(&mut *ctx.conn, ctx.chat_id).await?;
             forms::quick_add(ctx, &text).await
@@ -1052,8 +1074,19 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
             unit,
             rest,
             draft_id,
+            created_ids,
         } => {
-            shopping::duplicate_separate(ctx, list_id, title, quantity, unit, rest, draft_id).await
+            shopping::duplicate_separate(
+                ctx,
+                list_id,
+                title,
+                quantity,
+                unit,
+                rest,
+                draft_id,
+                created_ids,
+            )
+            .await
         }
 
         Action::SearchStart => forms::start_search(ctx).await,

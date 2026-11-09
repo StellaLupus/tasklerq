@@ -82,6 +82,7 @@ pub async fn plan(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error>
 
     let mut conn = pool.acquire().await?;
     let mut planned = 0;
+    let mut last_error = None;
     for candidate in candidates {
         let settings = NotificationSettings::from_settings(&candidate.settings);
         if !settings.digest_enabled {
@@ -140,15 +141,24 @@ pub async fn plan(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error>
         };
         match notifications::insert(&mut conn, &delivery, now).await {
             Ok(rows) => planned += rows,
-            Err(error) => tracing::error!(
-                user_id = %candidate.user_id,
-                %error,
-                "failed to plan digest delivery"
-            ),
+            Err(error) => {
+                tracing::error!(
+                    user_id = %candidate.user_id,
+                    %error,
+                    "failed to plan digest delivery"
+                );
+                // Остальные получатели всё равно планируются: ошибка одной
+                // записи не должна отменять шаг целиком, но шаг обязан
+                // сообщить о сбое вызывающему.
+                last_error = Some(error);
+            }
         }
     }
 
-    Ok(planned)
+    match last_error {
+        Some(error) => Err(error),
+        None => Ok(planned),
+    }
 }
 
 /// Пересчитать время ещё не доставленных сводок по текущим настройкам.
