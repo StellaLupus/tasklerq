@@ -41,14 +41,13 @@ impl Rig {
 
     async fn screen_with(&self, html: &str, placement: Placement) -> i64 {
         let mut conn = self.pool.acquire().await.expect("conn");
-        outbox::enqueue(
+        outbox::enqueue_screen(
             &mut conn,
             self.chat,
-            &Outgoing::Screen {
-                html: html.into(),
-                placement,
-            },
-            None,
+            "menu",
+            &serde_json::json!({}),
+            html.into(),
+            placement,
             self.now,
         )
         .await
