@@ -215,11 +215,7 @@ pub async fn intake_split(ctx: &mut Ctx<'_>, text: &str, list_id: Uuid) -> Resul
     let created_ids: Vec<Uuid> = added.created.iter().map(|item| item.id).collect();
     let rows = addition_rows(&added.duplicates, list.id, &created_ids, None);
     let banner = split_banner(&list.name, &titles, &added.duplicates, &added.skipped, true);
-    if rows.is_empty() {
-        ctx.banner(banner);
-    } else {
-        ctx.banner_rows(banner, rows);
-    }
+    ctx.banner_rows(banner, rows);
 
     let current = views::get(&mut *ctx.conn, ctx.chat_id)
         .await?

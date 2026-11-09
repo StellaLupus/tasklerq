@@ -18,12 +18,11 @@ use crate::domain::models::{
 };
 use crate::domain::recurrence::resolve_local;
 use crate::domain::validation::{
-    MAX_NOTES, MAX_SUBTASKS, MAX_TAG, MAX_TAGS, MAX_TITLE, MAX_UNIT, normalize_due_for_recurrence,
-    normalize_recurrence, sanitize, validate_new_item, validate_quantity,
+    MAX_INPUT_QUANTITY, MAX_NOTES, MAX_SUBTASKS, MAX_TAG, MAX_TAGS, MAX_TITLE, MAX_UNIT,
+    normalize_due_for_recurrence, normalize_recurrence, sanitize, validate_new_item,
+    validate_quantity,
 };
 
-/// Максимальное количество позиции.
-const MAX_QUANTITY: f64 = 9_999.0;
 /// Максимум интервала повторения.
 const MAX_INTERVAL: i64 = 365;
 /// Горизонт сроков и окончания серии, месяцы.
@@ -258,7 +257,7 @@ fn validate_item_in(
     let subtasks = clean_subtasks(&raw.subtasks, &mut errors);
 
     let quantity = raw.quantity.and_then(|quantity| {
-        if !(quantity.is_finite() && quantity > 0.0 && quantity <= MAX_QUANTITY) {
+        if !(quantity.is_finite() && quantity > 0.0 && quantity <= MAX_INPUT_QUANTITY) {
             fail(
                 &mut errors,
                 "quantity",

@@ -3872,7 +3872,6 @@ async fn journal_pages_do_not_overlap_and_put_no_due_last() {
     let first = journal(&mut conn, &household, 0).await;
     assert_eq!(first.page, 0);
     assert_eq!(first.pages, 2);
-    assert!(first.has_next());
     assert_eq!(first.entries.len(), 8);
     let titles: Vec<_> = first.entries[..3]
         .iter()
@@ -3890,7 +3889,6 @@ async fn journal_pages_do_not_overlap_and_put_no_due_last() {
     let second = journal(&mut conn, &household, 1).await;
     assert_eq!(second.page, 1);
     assert_eq!(second.pages, 2);
-    assert!(!second.has_next());
     assert_eq!(second.entries.len(), 3);
 
     let clamped = journal(&mut conn, &household, 99).await;

@@ -9,9 +9,11 @@
 ## 2. Код
 
 - [x] 2.1 Вынести общую функцию добавления частей из `finish_direct_split` (`src/telegram/capture_worker.rs`) и `intake_split` (`src/telegram/bot/capture/mod.rs`) (design, решение 1). Проверить: `tests/telegram_capture.rs`, `tests/capture_fallback.rs` и тесты экрана покупок проходят без изменений.
-- [ ] 2.2 Ввести `MAX_INPUT_QUANTITY` в `src/domain/validation.rs` и использовать её вместо `MAX_QUANTITY` в `src/telegram/bot/model.rs` и `src/capture/validate.rs` (design, решение 2). Проверить: `cargo test` проходит, `grep -rn "9_999.0" src` находит одно определение.
-- [ ] 2.3 Заменить `expect` в `src/jobs/batch.rs` на `let … else` при проверке вида и сохранить `scope` в `BatchCandidate` (design, решение 3). Проверить: `cargo test --test notification_batches` проходит, `grep -n "expect(" src/jobs/batch.rs` пуст.
-- [ ] 2.4 Исправить комментарий поля `idempotency_key` в `CaptureRequest` (`src/http/api/capture/mod.rs`): при расхождении заголовка и поля ответ `422`, как в `idempotency.rs`. Миграцию `0007` не трогать. Удалить `JournalPage::has_next` (`src/storage/repositories/items/completions.rs`) и его вызовы в `tests/item_lifecycle.rs`. Проверить: `cargo test --test item_lifecycle` проходит.
+- [x] 2.2 Ввести `MAX_INPUT_QUANTITY` в `src/domain/validation.rs` и использовать её вместо `MAX_QUANTITY` в `src/telegram/bot/model.rs` и `src/capture/validate.rs` (design, решение 2). Проверить: `cargo test` проходит, `grep -rn "9_999.0" src` находит одно определение.
+- [x] 2.3 Заменить `expect` в `src/jobs/batch.rs` на `let … else` при проверке вида и сохранить `scope` в `BatchCandidate` (design, решение 3). Проверить: `cargo test --test notification_batches` проходит, `grep -n "expect(" src/jobs/batch.rs` пуст.
+- [x] 2.4 Исправить комментарий поля `idempotency_key` в `CaptureRequest` (`src/http/api/capture/mod.rs`): при расхождении заголовка и поля ответ `422`, как в `idempotency.rs`. Миграцию `0007` не трогать. Удалить `JournalPage::has_next` (`src/storage/repositories/items/completions.rs`) и его вызовы в `tests/item_lifecycle.rs`. Проверить: `cargo test --test item_lifecycle` проходит.
+- [x] 2.5 Убрать ветки `if rows.is_empty()` при сборке баннера прямого добавления (`Banner::with_button_rows` уже отбрасывает пустые ряды) в `shopping.rs`, `capture_worker.rs`, `bot/capture/mod.rs` и строить ряд «Открыть» черновика без `addition_rows(&[], Uuid::nil(), …)`. Проверить: тесты прямого добавления и отмены проходят без изменений, `grep -n "Uuid::nil()" src/telegram/bot/shopping.rs` пуст.
+- [x] 2.6 Показ карточки `Screen::Item { item_id, back, completion_id: None }` в `set_due`, `apply_due` и `finish_due` (`src/telegram/bot/card.rs`) — одной функцией вместо четырёх копий. Проверить: тесты карточки и сроков проходят без изменений.
 
 ## 3. Недостающие тесты
 

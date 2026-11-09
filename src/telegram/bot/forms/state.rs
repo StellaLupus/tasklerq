@@ -7,7 +7,7 @@ use crate::domain::validation::{
 };
 use crate::telegram::ru;
 
-use super::MAX_QUANTITY;
+use super::MAX_INPUT_QUANTITY;
 use crate::telegram::bot::Ctx;
 use crate::telegram::bot::model::{Choice, ItemDraft, RecurrenceDraft, Step, SubtaskDraft};
 
@@ -165,9 +165,9 @@ pub(super) fn apply_text(
         }
         Step::Quantity => {
             let quantity = ru::parse_number(text)
-                .filter(|value| *value <= MAX_QUANTITY)
+                .filter(|value| *value <= MAX_INPUT_QUANTITY)
                 .ok_or_else(|| {
-                    format!("Количество — число больше 0 и не больше {MAX_QUANTITY}.")
+                    format!("Количество — число больше 0 и не больше {MAX_INPUT_QUANTITY}.")
                 })?;
             draft.quantity = Some(quantity);
         }

@@ -106,13 +106,6 @@ pub struct JournalPage {
     pub pages: u32,
 }
 
-impl JournalPage {
-    /// Есть ли следующая страница.
-    pub fn has_next(&self) -> bool {
-        self.page + 1 < self.pages
-    }
-}
-
 /// Доступен ли возврат выполнения в текущем состоянии элемента.
 ///
 /// У выполненной задачи без повторения возврат — прежний `reopen`. В

@@ -19,6 +19,7 @@ use crate::domain::models::{
     RecurrenceFreq, RecurrenceInput, SubtaskInput,
 };
 use crate::domain::recurrence::resolve_local;
+use crate::domain::validation::MAX_INPUT_QUANTITY;
 use crate::telegram::rich::{Button, View, button};
 use crate::telegram::ru;
 
@@ -27,9 +28,6 @@ pub type Ui = View<Action>;
 
 /// Размер страницы списков и результатов.
 pub const PAGE_SIZE: usize = 8;
-
-/// Максимальное количество позиции.
-pub const MAX_QUANTITY: f64 = 9_999.0;
 
 /// Информационный экран первого контакта без формы онбординга.
 ///
@@ -1530,7 +1528,7 @@ impl Duplicate {
             return None;
         }
         let total = existing + quantity;
-        (total <= MAX_QUANTITY).then_some(total)
+        (total <= MAX_INPUT_QUANTITY).then_some(total)
     }
 
     /// Подпись кнопки «Увеличить».
@@ -1656,6 +1654,46 @@ fn add_duplicate(duplicates: &mut Vec<DuplicateChoice>, existing: Duplicate, new
     );
 }
 
+/// Кнопка «Отменить» созданные позиции, если они есть.
+fn undo_button(created_ids: &[Uuid], draft_id: Option<Uuid>) -> Option<Button<Action>> {
+    (!created_ids.is_empty()).then(|| {
+        button(
+            "↩️ Отменить",
+            Action::AddedUndo {
+                item_ids: created_ids.to_vec(),
+                draft_id,
+            },
+        )
+    })
+}
+
+/// Ряд «Открыть» ожидающего черновика.
+fn draft_row(draft_id: Uuid) -> Vec<Button<Action>> {
+    vec![button(
+        "Открыть",
+        Action::Go {
+            to: Screen::Draft { draft_id },
+        },
+    )]
+}
+
+/// Ряды баннера прямого добавления без дубликатов: отмена созданных позиций и
+/// «Открыть» ожидающего черновика. Списка здесь нет, поэтому фиктивный
+/// `list_id` не нужен.
+pub(super) fn status_rows(
+    created_ids: &[Uuid],
+    draft_id: Option<Uuid>,
+) -> Vec<Vec<Button<Action>>> {
+    let mut rows = Vec::new();
+    if let Some(button) = undo_button(created_ids, draft_id) {
+        rows.push(vec![button]);
+    }
+    if let Some(draft_id) = draft_id {
+        rows.push(draft_row(draft_id));
+    }
+    rows
+}
+
 /// Ряды кнопок баннера прямого добавления: дубликаты и отмена созданных
 /// позиций, а «Открыть» — отдельным последним рядом, чтобы кнопки не
 /// обрезались по ширине.
@@ -1670,25 +1708,14 @@ pub fn addition_rows(
         .split_first()
         .map(|(first, rest)| first.buttons(list_id, rest.to_vec(), draft_id, created_ids))
         .unwrap_or_default();
-    if !created_ids.is_empty() {
-        row.push(button(
-            "↩️ Отменить",
-            Action::AddedUndo {
-                item_ids: created_ids.to_vec(),
-                draft_id,
-            },
-        ));
+    if let Some(button) = undo_button(created_ids, draft_id) {
+        row.push(button);
     }
     if !row.is_empty() {
         rows.push(row);
     }
     if let Some(draft_id) = draft_id {
-        rows.push(vec![button(
-            "Открыть",
-            Action::Go {
-                to: Screen::Draft { draft_id },
-            },
-        )]);
+        rows.push(draft_row(draft_id));
     }
     rows
 }

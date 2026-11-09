@@ -12,7 +12,7 @@ use crate::telegram::views;
 use super::card::{self, UndoOutcome};
 use super::model::{
     Action, DuplicateChoice, ItemDraft, PAGE_SIZE, Screen, Ui, addition_rows, duplicate_notice,
-    screen_heading,
+    screen_heading, status_rows,
 };
 use super::screens::{back_button, clip, list_back, nav_row};
 use super::{Ctx, Fail};
@@ -426,11 +426,7 @@ async fn show_duplicate_result(
         None => format!("Добавлено: {label}"),
     };
     let rows = addition_rows(rest, list_id, created_ids, draft_id);
-    if rows.is_empty() {
-        ctx.banner(text);
-    } else {
-        ctx.banner_rows(text, rows);
-    }
+    ctx.banner_rows(text, rows);
     present_after_duplicate(ctx, list_id).await
 }
 
@@ -475,20 +471,12 @@ pub async fn duplicate_increase(
                     text.push_str(&notice);
                 }
                 let rows = addition_rows(&rest, current.list_id, &created_ids, draft_id);
-                if rows.is_empty() {
-                    ctx.banner(text);
-                } else {
-                    ctx.banner_rows(text, rows);
-                }
+                ctx.banner_rows(text, rows);
                 return present_after_duplicate(ctx, current.list_id).await;
             }
             let text = "Позиция изменилась, откройте список";
-            let rows = addition_rows(&[], Uuid::nil(), &created_ids, draft_id);
-            if rows.is_empty() {
-                ctx.banner(text);
-            } else {
-                ctx.banner_rows(text, rows);
-            }
+            let rows = status_rows(&created_ids, draft_id);
+            ctx.banner_rows(text, rows);
             ctx.refresh().await
         }
         Err(error) => Err(error.into()),
@@ -550,12 +538,8 @@ async fn present_after_undo(ctx: &mut Ctx<'_>, list_id: Option<Uuid>) -> Result<
 
 /// Баннер отмены с кнопкой «Открыть» ожидающего черновика.
 fn undo_banner(ctx: &mut Ctx<'_>, text: &str, draft_id: Option<Uuid>) {
-    let rows = addition_rows(&[], Uuid::nil(), &[], draft_id);
-    if rows.is_empty() {
-        ctx.banner(text);
-    } else {
-        ctx.banner_rows(text, rows);
-    }
+    let rows = status_rows(&[], draft_id);
+    ctx.banner_rows(text, rows);
 }
 
 /// «↩️ Отменить» в баннере прямого добавления: мягко удалить созданные

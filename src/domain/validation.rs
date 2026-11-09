@@ -225,6 +225,13 @@ pub fn normalize_subtasks(subtasks: Vec<SubtaskInput>) -> Result<Vec<SubtaskInpu
         .collect()
 }
 
+/// Максимальное количество при вводе пользователем: целое до 9999.
+///
+/// Доменная проверка [`validate_quantity`] допускает более широкий предел
+/// `9999.999`: там есть дробная часть, и предел защищает хранение. Ввод в боте и
+/// capture ограничен целым числом, поэтому константа общая для обоих слоёв.
+pub const MAX_INPUT_QUANTITY: f64 = 9_999.0;
+
 /// Проверить количество.
 pub fn validate_quantity(quantity: Option<f64>) -> Result<f64, DomainError> {
     let quantity = quantity.unwrap_or(1.0);

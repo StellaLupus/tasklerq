@@ -764,13 +764,7 @@ impl CaptureWorker {
         let created_ids: Vec<uuid::Uuid> = created.iter().map(|item| item.id).collect();
         let rows = addition_rows(&duplicates, target_list_id, &created_ids, open_draft);
         let text = result_banner(&target_name, &added, &duplicates, on_list, result);
-        let banner = text.map(|text| {
-            if rows.is_empty() {
-                Banner::text(text)
-            } else {
-                Banner::with_button_rows(text, rows)
-            }
-        });
+        let banner = text.map(|text| Banner::with_button_rows(text, rows));
 
         let screen = match &draft {
             Some(draft) if show_card => Screen::Draft { draft_id: draft.id },
@@ -864,11 +858,7 @@ impl CaptureWorker {
             &added.skipped,
             on_list,
         );
-        let banner = if rows.is_empty() {
-            Banner::text(text)
-        } else {
-            Banner::with_button_rows(text, rows)
-        };
+        let banner = Banner::with_button_rows(text, rows);
         let screen = active.unwrap_or(Screen::Menu);
         self.bot
             .present_to(
