@@ -74,5 +74,6 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - run: cargo install cargo-audit --locked
-      # rsa попадает в lock только как неиспользуемая опция sqlx-mysql.
-      - run: cargo audit --ignore RUSTSEC-2023-0071
+      # rsa и libsqlite3-sys попадают в lock только как неиспользуемые опции
+      # sqlx-mysql и sqlx-sqlite (обоснование в .cargo/audit.toml).
+      - run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0459
