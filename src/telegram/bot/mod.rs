@@ -286,15 +286,15 @@ impl Ctx<'_> {
             .and_then(|key| key.as_str())
             .unwrap_or("screen")
             .to_owned();
-        views::set(&mut *self.conn, self.chat_id, &key, &state, self.now).await?;
-        outbox::enqueue(
+        // Экран ставится в очередь раньше записи `telegram_views`: этот
+        // порядок блокировок общий с воркером доставки, иначе возможен клинч.
+        outbox::enqueue_screen(
             &mut *self.conn,
             self.chat_id,
-            &Outgoing::Screen {
-                html,
-                placement: self.placement,
-            },
-            None,
+            &key,
+            &state,
+            html,
+            self.placement,
             self.now,
         )
         .await?;

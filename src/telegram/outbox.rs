@@ -187,6 +187,10 @@ impl Outgoing {
 /// нужно только актуальное состояние. Он наследует самый сильный `placement`
 /// вытесненных экранов, чтобы `/start` (`fresh`) не потерялся, если до доставки
 /// пришёл другой экран.
+///
+/// Экран вместе с записью `telegram_views` ставьте через [`enqueue_screen`]:
+/// он держит общий с воркером доставки порядок блокировок `outbox` →
+/// `telegram_views`.
 pub async fn enqueue(
     conn: &mut PgConnection,
     chat_id: i64,
@@ -216,6 +220,11 @@ pub async fn enqueue_at(
         // Блокировка и вытеснение — один запрос: воркер не может доставить
         // строку между чтением `placement` и её вытеснением, иначе новый
         // экран унаследовал бы режим уже доставленного.
+        //
+        // Строки `outbox` берутся раньше записи `telegram_views`: воркер
+        // доставки тоже сначала блокирует строку `outbox`, а затем пишет
+        // `telegram_views`. Обратный порядок замыкал клинч; экраны ставятся
+        // через [`enqueue_screen`], который держит этот порядок.
         //
         // Вытесняемая строка с неизвестным `placement` тоже уходит в
         // `skipped`: в выборе режима она не участвует и в dead-letter не
@@ -266,6 +275,33 @@ pub async fn enqueue_at(
     .fetch_optional(conn)
     .await?;
 
+    Ok(seq)
+}
+
+/// Поставить экран в очередь и сохранить его состояние для перерисовки.
+///
+/// Обе записи должны идти в одной транзакции вызывающего. Порядок блокировок
+/// важен: сначала строки `outbox` (вытеснение ожидающих экранов), затем
+/// `telegram_views`. Воркер доставки блокирует строку `outbox` и только потом
+/// пишет `telegram_views`; обратный порядок замыкал клинч между воркерами.
+pub async fn enqueue_screen(
+    conn: &mut PgConnection,
+    chat_id: i64,
+    view_key: &str,
+    state: &Value,
+    html: String,
+    placement: Placement,
+    now: DateTime<Utc>,
+) -> Result<Option<i64>, sqlx::Error> {
+    let seq = enqueue(
+        conn,
+        chat_id,
+        &Outgoing::Screen { html, placement },
+        None,
+        now,
+    )
+    .await?;
+    views::set(conn, chat_id, view_key, state, now).await?;
     Ok(seq)
 }
 
