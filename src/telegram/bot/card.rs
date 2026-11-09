@@ -444,6 +444,16 @@ pub async fn due(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui, 
     Ok(ui.row(nav_row(&here, card)))
 }
 
+/// Показать карточку элемента без отметки выполнения.
+async fn present_item(ctx: &mut Ctx<'_>, item_id: Uuid, back: Screen) -> Result<(), Fail> {
+    ctx.present(Screen::Item {
+        item_id,
+        back: Box::new(back),
+        completion_id: None,
+    })
+    .await
+}
+
 /// Сохранить выбранный быстрый срок и вернуться в карточку.
 pub async fn set_due(
     ctx: &mut Ctx<'_>,
@@ -454,13 +464,7 @@ pub async fn set_due(
 ) -> Result<(), Fail> {
     let (item, list) = load(ctx, item_id).await?;
     if !due_editable(&item, &list) {
-        return ctx
-            .present(Screen::Item {
-                item_id,
-                back: Box::new(back),
-                completion_id: None,
-            })
-            .await;
+        return present_item(ctx, item_id, back).await;
     }
     if choice != QuickDue::None {
         let due = quick_due(&item, choice, ctx.now, ctx.tz)?;
@@ -468,13 +472,7 @@ pub async fn set_due(
     }
 
     if item.due_at.is_none() && item.due_date.is_none() {
-        return ctx
-            .present(Screen::Item {
-                item_id,
-                back: Box::new(back),
-                completion_id: None,
-            })
-            .await;
+        return present_item(ctx, item_id, back).await;
     }
 
     let household = ctx.household()?.clone();
@@ -514,13 +512,7 @@ pub async fn apply_due(
 ) -> Result<(), Fail> {
     let (item, list) = load(ctx, item_id).await?;
     if !due_editable(&item, &list) {
-        return ctx
-            .present(Screen::Item {
-                item_id,
-                back: Box::new(back),
-                completion_id: None,
-            })
-            .await;
+        return present_item(ctx, item_id, back).await;
     }
     let household = ctx.household()?.clone();
     let actor = ctx.actor()?;
@@ -555,12 +547,7 @@ async fn finish_due(
         }
         Err(error) => return Err(error.into()),
     }
-    ctx.present(Screen::Item {
-        item_id,
-        back: Box::new(back),
-        completion_id: None,
-    })
-    .await
+    present_item(ctx, item_id, back).await
 }
 
 /// Срок по кнопке быстрого выбора. Время суток и вседневность сохраняются.

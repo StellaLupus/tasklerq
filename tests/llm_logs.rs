@@ -7,8 +7,8 @@
 
 mod support;
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
 
 use async_trait::async_trait;
@@ -19,6 +19,7 @@ use tasklerq::telegram::bot::Bot;
 use tasklerq::telegram::capture_worker::{CaptureWorker, Pass};
 use tokio::sync::Notify;
 
+use support::logs::LogBuffer;
 use support::telegram::{FakeTelegram, Harness};
 use support::{db, next_telegram_id};
 
@@ -40,31 +41,6 @@ impl AiTask for FailingAi {
     ) -> Result<Value, HaError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Err(HaError::BadResponse)
-    }
-}
-
-/// Писатель журнала в память.
-#[derive(Clone, Default)]
-struct LogBuffer(Arc<Mutex<Vec<u8>>>);
-
-struct LogWriter(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for LogWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().expect("lock").extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
-    type Writer = LogWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        LogWriter(self.0.clone())
     }
 }
 
@@ -112,8 +88,7 @@ fn llm_logs_do_not_contain_the_source_text() {
         });
     });
 
-    let captured = logs.0.lock().expect("lock").clone();
-    let captured = String::from_utf8(captured).expect("utf8");
+    let captured = logs.contents();
     assert!(
         captured.contains("llm capture request failed"),
         "the failure must be logged:\n{captured}"

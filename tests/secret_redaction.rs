@@ -8,7 +8,7 @@ mod support;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
@@ -16,6 +16,7 @@ use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::json;
+use support::logs::LogBuffer;
 use tasklerq::config::{Config, SecretString};
 use tasklerq::home_assistant::{AiTask, GenerateData, HttpAiTask};
 use tasklerq::http::router::{AppState, build_router};
@@ -41,39 +42,6 @@ const SECRETS: [&str; 6] = [
     DB_PASSWORD,
     API_TOKEN,
 ];
-
-/// Писатель журнала в память.
-#[derive(Clone, Default)]
-struct LogBuffer(Arc<Mutex<Vec<u8>>>);
-
-impl LogBuffer {
-    fn contents(&self) -> String {
-        let bytes = self.0.lock().expect("log buffer lock").clone();
-        String::from_utf8(bytes).expect("logs are UTF-8")
-    }
-}
-
-impl std::io::Write for LogBuffer {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0
-            .lock()
-            .expect("log buffer lock")
-            .extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for LogBuffer {
-    type Writer = Self;
-
-    fn make_writer(&'writer self) -> Self::Writer {
-        self.clone()
-    }
-}
 
 fn assert_no_secret(rendered: &str, context: &str) {
     for secret in SECRETS {

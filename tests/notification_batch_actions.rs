@@ -566,22 +566,31 @@ async fn snooze_in_a_block_creates_one_delivery_and_an_ordinary_reminder_later()
     let pressed_at = bot.now;
 
     bot.press_data(&snooze, message_id).await;
+    let after_press = bot.now;
     let (_, edited) = bot.latest();
-    let expected = (pressed_at + Duration::hours(1))
+
+    let rows = snooze_rows(&db.pool, first.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "pending");
+    let snoozed_at = rows[0].1;
+
+    // `Harness::tick` двигает часы стенда при каждом `enqueue`/`pump`, поэтому
+    // обработчик видит `now` где-то между `pressed_at` и `after_press`, а не
+    // ровно время чтения `bot.now` до нажатия. Snooze — это `now + 1 ч`; время
+    // в ответе берём из самой записи, а запись проверяем интервалом.
+    let lower = pressed_at.timestamp() + Duration::hours(1).num_seconds();
+    let upper = after_press.timestamp() + Duration::hours(1).num_seconds();
+    assert!(
+        (lower..=upper).contains(&snoozed_at.timestamp()),
+        "snooze at {snoozed_at} must be within [{lower}, {upper}]"
+    );
+    let expected = snoozed_at
         .with_timezone(&moscow)
         .format("%H:%M")
         .to_string();
     assert!(
         edited.contains(&format!("😴 Напомню в {expected}")),
         "{edited}"
-    );
-    let rows = snooze_rows(&db.pool, first.id).await;
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0].0, "pending");
-    let snoozed_at = rows[0].1;
-    assert_eq!(
-        snoozed_at.timestamp(),
-        (pressed_at + Duration::hours(1)).timestamp()
     );
 
     // Повторное нажатие той же кнопки не создаёт вторую доставку.

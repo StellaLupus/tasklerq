@@ -28,7 +28,7 @@ pub use actions::{on_action, on_text};
 pub use editor::screen as editor_screen;
 pub use view::view;
 
-pub(super) use super::model::MAX_QUANTITY;
+pub(super) use crate::domain::validation::MAX_INPUT_QUANTITY;
 pub(super) const MAX_QUERY: usize = 100;
 
 // ---------------------------------------------------------------------

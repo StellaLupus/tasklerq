@@ -34,10 +34,11 @@ use crate::storage::repositories::llm_runs::{self, FAILURE, NewRun, SUCCESS};
 use crate::storage::repositories::{households, items, users};
 use crate::telegram::ru;
 
+use super::bot::additions::add_parts;
 use super::bot::capture::{split_banner, split_titles};
 use super::bot::model::{
-    Action, DuplicateChoice, ItemDraft, Screen, addition_rows, duplicate_notice,
-    merge_duplicate_choice, plan_additions,
+    Action, DuplicateChoice, Screen, addition_rows, duplicate_notice, merge_duplicate_choice,
+    plan_additions,
 };
 use super::bot::{Banner, Bot, Recipient, into_sqlx};
 use super::views;
@@ -763,13 +764,7 @@ impl CaptureWorker {
         let created_ids: Vec<uuid::Uuid> = created.iter().map(|item| item.id).collect();
         let rows = addition_rows(&duplicates, target_list_id, &created_ids, open_draft);
         let text = result_banner(&target_name, &added, &duplicates, on_list, result);
-        let banner = text.map(|text| {
-            if rows.is_empty() {
-                Banner::text(text)
-            } else {
-                Banner::with_button_rows(text, rows)
-            }
-        });
+        let banner = text.map(|text| Banner::with_button_rows(text, rows));
 
         let screen = match &draft {
             Some(draft) if show_card => Screen::Draft { draft_id: draft.id },
@@ -813,8 +808,6 @@ impl CaptureWorker {
             return Ok(false);
         };
         let actor = Actor::user(prepared.user.id, prepared.user.role);
-        let timezone = context.timezone.name();
-        let today = context.today();
         let active = active_screen(&mut *tx, job.chat_id).await?;
 
         let parts = split_titles(text);
@@ -834,74 +827,38 @@ impl CaptureWorker {
             return Ok(true);
         }
 
-        let mut existing = items::list_by_list(&mut *tx, job.household_id, target_list_id)
-            .await
-            .map_err(into_sqlx)?;
-        let mut new_items = Vec::new();
-        for title in parts {
-            let draft = ItemDraft {
-                title,
-                quantity: Some(1.0),
-                ..ItemDraft::default()
-            };
-            let mut new_item = draft
-                .to_new_item(target_list_id, context.timezone, ListKind::Shopping)
-                .map_err(into_sqlx)?;
-            new_item.list_id = target_list_id;
-            new_items.push(new_item);
-        }
+        let added = add_parts(
+            &mut *tx,
+            job.household_id,
+            &actor,
+            target_list_id,
+            context.timezone,
+            context.today(),
+            now,
+            parts,
+        )
+        .await
+        .map_err(into_sqlx)?;
 
-        let mut created: Vec<Item> = Vec::new();
-        let mut duplicates: Vec<DuplicateChoice> = Vec::new();
-        let mut skipped = Vec::new();
-        for new_item in new_items {
-            let (to_create, found) = plan_additions(&existing, vec![new_item]);
-            for choice in found {
-                merge_duplicate_choice(&mut duplicates, choice);
-            }
-            for new_item in to_create {
-                let assignee = new_item.assignee_user_id;
-                let title = new_item.title.clone();
-                let validated =
-                    match validate_new_item(ListKind::Shopping, timezone, new_item, today) {
-                        Ok(validated) => validated,
-                        // Слишком длинную часть не теряем из-за остальных:
-                        // покажем её в баннере.
-                        Err(DomainError::Validation(_)) => {
-                            skipped.push(title);
-                            continue;
-                        }
-                        Err(error) => return Err(into_sqlx(error)),
-                    };
-                let item = items::create(
-                    &mut *tx,
-                    job.household_id,
-                    &actor,
-                    target_list_id,
-                    validated,
-                    assignee,
-                    now,
-                )
-                .await
-                .map_err(into_sqlx)?;
-                existing.push(item.clone());
-                created.push(item);
-            }
-        }
-
-        let titles: Vec<String> = created.iter().map(|item| item.title.clone()).collect();
-        let created_ids: Vec<uuid::Uuid> = created.iter().map(|item| item.id).collect();
-        let rows = addition_rows(&duplicates, target_list_id, &created_ids, None);
+        let titles: Vec<String> = added
+            .created
+            .iter()
+            .map(|item| item.title.clone())
+            .collect();
+        let created_ids: Vec<uuid::Uuid> = added.created.iter().map(|item| item.id).collect();
+        let rows = addition_rows(&added.duplicates, target_list_id, &created_ids, None);
         let on_list = matches!(
             &active,
             Some(Screen::List { list_id, .. }) if *list_id == target_list_id
         );
-        let text = split_banner(&target_name, &titles, &duplicates, &skipped, on_list);
-        let banner = if rows.is_empty() {
-            Banner::text(text)
-        } else {
-            Banner::with_button_rows(text, rows)
-        };
+        let text = split_banner(
+            &target_name,
+            &titles,
+            &added.duplicates,
+            &added.skipped,
+            on_list,
+        );
+        let banner = Banner::with_button_rows(text, rows);
         let screen = active.unwrap_or(Screen::Menu);
         self.bot
             .present_to(

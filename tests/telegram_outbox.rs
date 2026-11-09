@@ -5,7 +5,7 @@ mod support;
 use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{DateTime, Duration, Utc};
-use sqlx::PgPool;
+use sqlx::{Acquire, PgPool};
 use support::telegram::{Call, FakeTelegram};
 use support::{db, next_telegram_id};
 use tasklerq::telegram::api::TelegramError;
@@ -41,14 +41,13 @@ impl Rig {
 
     async fn screen_with(&self, html: &str, placement: Placement) -> i64 {
         let mut conn = self.pool.acquire().await.expect("conn");
-        outbox::enqueue(
+        outbox::enqueue_screen(
             &mut conn,
             self.chat,
-            &Outgoing::Screen {
-                html: html.into(),
-                placement,
-            },
-            None,
+            "menu",
+            &serde_json::json!({}),
+            html.into(),
+            placement,
             self.now,
         )
         .await
@@ -1274,5 +1273,162 @@ async fn failed_delivery_does_not_schedule_deletion() {
     assert!(
         rig.delete_rows().await.is_empty(),
         "an undelivered message has no id to delete"
+    );
+}
+
+/// Дождаться, пока соединение встанет в ожидание блокировки.
+async fn wait_for_lock(pool: &PgPool, pid: i32) {
+    let wait = async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_stat_activity
+                     WHERE pid = $1 AND wait_event_type = 'Lock'
+                 )",
+            )
+            .bind(pid)
+            .fetch_one(pool)
+            .await
+            .expect("pg_stat_activity");
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(2)).await;
+        }
+    };
+    tokio::time::timeout(StdDuration::from_secs(5), wait)
+        .await
+        .expect("the transaction must wait for the row lock");
+}
+
+/// Исход задачи обновления: результат `enqueue_screen` и коммита.
+type UpdateOutcome = (Result<Option<i64>, sqlx::Error>, Result<(), sqlx::Error>);
+
+/// Транзакция доставки, удерживающая строку `outbox`.
+type DeliveryTx = sqlx::Transaction<'static, sqlx::Postgres>;
+
+/// Подготовить клинч обновления с доставкой: транзакция доставки захватила
+/// строку `in_flight`, а задача обновления ждёт блокировки, ставя новый экран.
+///
+/// Возвращает транзакцию доставки и задачу обновления. Тест сам выбирает
+/// окончание — commit или rollback — и проверяет исход.
+async fn screen_update_clash(
+    pool: &PgPool,
+    in_flight: i64,
+    chat: i64,
+    now: DateTime<Utc>,
+) -> (DeliveryTx, tokio::task::JoinHandle<UpdateOutcome>) {
+    let mut delivery_tx = pool.begin().await.expect("delivery transaction");
+    sqlx::query("SELECT seq FROM outbox WHERE seq = $1 FOR UPDATE")
+        .bind(in_flight)
+        .execute(&mut *delivery_tx)
+        .await
+        .expect("delivery claims the row");
+
+    let mut updating = pool.acquire().await.expect("update connection");
+    let update_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *updating)
+        .await
+        .expect("update pid");
+    let update = tokio::spawn(async move {
+        let mut update_tx = updating.begin().await.expect("update transaction");
+        let enqueued = outbox::enqueue_screen(
+            &mut update_tx,
+            chat,
+            "menu",
+            &serde_json::json!({}),
+            "new".into(),
+            Placement::Visible,
+            now,
+        )
+        .await;
+        let committed = update_tx.commit().await;
+        (enqueued, committed)
+    });
+    // Воркер обновлений берёт строки `outbox` раньше `telegram_views`, поэтому
+    // он ждёт доставку, не удерживая запись вида.
+    wait_for_lock(pool, update_pid).await;
+
+    (delivery_tx, update)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enqueue_and_delivery_take_locks_in_the_same_order() {
+    let db = db().await;
+    let rig = Rig::new(&db.pool);
+    rig.put_view().await;
+    let in_flight = rig.screen("old").await;
+
+    let (mut delivery_tx, update) =
+        screen_update_clash(&db.pool, in_flight, rig.chat, rig.now).await;
+
+    let written = views::set_message(&mut delivery_tx, rig.chat, 42, false, rig.now).await;
+    let delivery_committed = delivery_tx.commit().await;
+    written.expect("delivery writes the view without a deadlock");
+    delivery_committed.expect("delivery commit");
+
+    let (enqueued, committed) = update.await.expect("update task");
+    let seq = enqueued
+        .expect("enqueue must not deadlock with the delivery")
+        .expect("new screen");
+    committed.expect("update commit");
+
+    let status: String = sqlx::query_scalar("SELECT status::text FROM outbox WHERE seq = $1")
+        .bind(in_flight)
+        .fetch_one(&db.pool)
+        .await
+        .expect("in-flight row");
+    assert_eq!(
+        status, "skipped",
+        "after the delivery releases the row, the new screen evicts it"
+    );
+    let pending: Vec<i64> = sqlx::query_scalar(
+        "SELECT seq FROM outbox
+         WHERE chat_id = $1 AND status = 'pending' AND kind = 'screen'
+         ORDER BY seq",
+    )
+    .bind(rig.chat)
+    .fetch_all(&db.pool)
+    .await
+    .expect("pending screens");
+    assert_eq!(pending, vec![seq], "only the new screen waits for delivery");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_screen_held_by_a_rolled_back_delivery_is_still_evicted() {
+    let db = db().await;
+    let rig = Rig::new(&db.pool);
+    rig.put_view().await;
+    let in_flight = rig.screen_with("old", Placement::Fresh).await;
+
+    let (delivery_tx, update) = screen_update_clash(&db.pool, in_flight, rig.chat, rig.now).await;
+
+    // Доставка откатилась (например, лимитер не дал слот): строка A осталась
+    // `pending`, и новый экран должен её вытеснить, а не обойти.
+    delivery_tx.rollback().await.expect("delivery rollback");
+
+    let (enqueued, committed) = update.await.expect("update task");
+    let seq = enqueued.expect("enqueue").expect("new screen");
+    committed.expect("update commit");
+
+    let status_a: String = sqlx::query_scalar("SELECT status::text FROM outbox WHERE seq = $1")
+        .bind(in_flight)
+        .fetch_one(&db.pool)
+        .await
+        .expect("in-flight row");
+    assert_eq!(status_a, "skipped", "the rolled-back screen is evicted");
+    let pending: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT seq, payload->>'placement' FROM outbox
+         WHERE chat_id = $1 AND status = 'pending' AND kind = 'screen'
+         ORDER BY seq",
+    )
+    .bind(rig.chat)
+    .fetch_all(&db.pool)
+    .await
+    .expect("pending screens");
+    assert_eq!(
+        pending,
+        vec![(seq, "fresh".to_owned())],
+        "only B waits, and it inherits A's placement"
     );
 }

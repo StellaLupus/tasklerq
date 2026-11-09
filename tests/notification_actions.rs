@@ -3,24 +3,17 @@
 
 mod support;
 
-use std::sync::Arc;
-
 use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use serde_json::json;
 use sqlx::PgPool;
+use support::notifications::{button_of, tick_and_deliver};
 use support::telegram::{Call, Harness, buttons};
 use support::{TestHousehold, create_item, isolated_db, new_item, next_telegram_id};
 use tasklerq::domain::models::{Actor, Item, RecurrenceFreq, UserRole};
-use tasklerq::jobs::scheduler::{Scheduler, TickStats};
 use tasklerq::storage::repositories::items;
 use tasklerq::storage::repositories::notifications::{self, NewDelivery, NotificationKind};
-use tokio::sync::Notify;
 use uuid::Uuid;
-
-fn scheduler(pool: &PgPool) -> Scheduler {
-    Scheduler::new(pool.clone(), Arc::new(Notify::new()))
-}
 
 async fn onboarded(pool: &PgPool) -> Harness {
     let mut bot = Harness::new(pool, next_telegram_id()).named("Alice");
@@ -143,23 +136,6 @@ async fn create_task_without_due(pool: &PgPool, household: &TestHousehold, title
         item,
     )
     .await
-}
-
-async fn tick_and_deliver(bot: &mut Harness, pool: &PgPool, at: DateTime<Utc>) -> TickStats {
-    let stats = scheduler(pool).tick(at).await.expect("scheduler tick");
-    if at > bot.now {
-        bot.advance(at - bot.now);
-    }
-    bot.deliver().await;
-    stats
-}
-
-fn button_of(html: &str, label: &str) -> String {
-    buttons(html)
-        .into_iter()
-        .find(|(text, _)| text.contains(label))
-        .unwrap_or_else(|| panic!("button `{label}` not found in:\n{html}"))
-        .1
 }
 
 fn message_count(bot: &Harness, needle: &str) -> usize {

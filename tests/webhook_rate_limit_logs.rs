@@ -7,7 +7,7 @@
 mod support;
 
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
@@ -23,6 +23,7 @@ use tokio::sync::Notify;
 use tower::ServiceExt;
 
 use support::isolated_db;
+use support::logs::LogBuffer;
 
 const SECRET: &str = "configured-webhook-SECRET-value";
 const WARNING: &str = "webhook requests from one IP are rate limited";
@@ -55,29 +56,6 @@ async fn post_webhook_from(app: &Router, forwarded: &str) -> StatusCode {
         .await
         .expect("response")
         .status()
-}
-
-/// Писатель журнала в память.
-#[derive(Clone, Default)]
-struct LogBuffer(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for LogBuffer {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().expect("lock").extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
-    type Writer = LogBuffer;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
 }
 
 fn warnings(captured: &str) -> usize {
@@ -122,7 +100,7 @@ async fn a_rejected_webhook_flood_logs_one_warning_and_counts_every_request() {
         );
     }
 
-    let captured = String::from_utf8(logs.0.lock().expect("lock").clone()).expect("utf8");
+    let captured = logs.contents();
     assert_eq!(
         warnings(&captured),
         1,

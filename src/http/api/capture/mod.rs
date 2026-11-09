@@ -191,7 +191,8 @@ pub struct CaptureRequest {
     /// Конкретный список household для всех элементов.
     #[serde(default)]
     pub list_id: Option<Uuid>,
-    /// Ключ повтора; заголовок `Idempotency-Key` имеет приоритет над полем.
+    /// Ключ повтора; можно передать заголовком `Idempotency-Key` или этим полем.
+    /// Если заданы оба и различаются, ответ — `422`.
     #[serde(default)]
     pub idempotency_key: Option<String>,
 }

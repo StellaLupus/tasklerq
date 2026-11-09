@@ -40,6 +40,7 @@ enum ReleaseMode {
 struct BatchCandidate {
     delivery_id: Uuid,
     scheduled_at: DateTime<Utc>,
+    scope: DeliveryScope,
     entry: notify::BatchEntry,
 }
 
@@ -222,10 +223,10 @@ async fn prepare_deferred_batch(
             restore_snooze_time(&mut *conn, row.id, at, now).await?;
             continue;
         }
-        if DeliveryScope::of(row.kind).is_none() {
+        let Some(scope) = DeliveryScope::of(row.kind) else {
             // Запрос не выбирает сводку: она доставляется своим путём.
             continue;
-        }
+        };
         let Some((chat_id, telegram_user_id)) = ready_target(&mut *conn, &row, now).await? else {
             continue;
         };
@@ -243,6 +244,7 @@ async fn prepare_deferred_batch(
         candidates.push(BatchCandidate {
             delivery_id: row.id,
             scheduled_at: row.scheduled_at,
+            scope,
             entry: notify::BatchEntry {
                 item_id: item.id,
                 kind: row.kind,
@@ -333,10 +335,15 @@ async fn commit_prepared_batch(
     match prepared {
         PreparedBatch::None => Ok(()),
         PreparedBatch::Single { candidate } => {
-            let scope = DeliveryScope::of(candidate.entry.kind)
-                .expect("batch candidates are never digests");
-            delivery::deliver_one_in_conn(conn, scope, candidate.delivery_id, user_id, now, false)
-                .await?;
+            delivery::deliver_one_in_conn(
+                conn,
+                candidate.scope,
+                candidate.delivery_id,
+                user_id,
+                now,
+                false,
+            )
+            .await?;
             Ok(())
         }
         PreparedBatch::Message {

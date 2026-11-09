@@ -622,35 +622,9 @@ async fn a_failing_digest_step_does_not_stop_reminder_delivery() {
     .await;
     let chat = chat_id(&db.pool, household.owner_id).await;
 
-    // DDL на `notification_deliveries` ломает вставку любой сводки; база
-    // отдельная, потому что в общей он задел бы параллельные тики.
-    sqlx::query(
-        "CREATE FUNCTION fail_digest() RETURNS trigger AS $$
-         BEGIN
-             RAISE EXCEPTION 'forced digest failure';
-         END $$ LANGUAGE plpgsql",
-    )
-    .execute(&db.pool)
-    .await
-    .expect("function");
-    sqlx::query(
-        "CREATE TRIGGER fail_digest BEFORE INSERT ON notification_deliveries
-         FOR EACH ROW WHEN (NEW.kind = 'digest') EXECUTE FUNCTION fail_digest()",
-    )
-    .execute(&db.pool)
-    .await
-    .expect("trigger");
-
-    let result = scheduler(&db.pool).tick(due - Duration::minutes(15)).await;
-
-    sqlx::query("DROP TRIGGER fail_digest ON notification_deliveries")
-        .execute(&db.pool)
-        .await
-        .expect("drop trigger");
-    sqlx::query("DROP FUNCTION fail_digest()")
-        .execute(&db.pool)
-        .await
-        .expect("drop function");
+    let result =
+        support::notifications::tick_with_a_failing_digest(&db.pool, due - Duration::minutes(15))
+            .await;
 
     assert!(
         result.is_err(),

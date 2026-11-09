@@ -14,7 +14,6 @@ use crate::capture::validate::{DraftItem, parse_date, parse_time};
 use crate::domain::models::{
     DraftStatus, ItemPriority, ListKind, MonthRule, NewItem, RecurrenceFreq,
 };
-use crate::domain::validation::validate_new_item;
 use crate::storage::repositories::capture_jobs::{self, NewJob};
 use crate::storage::repositories::drafts::DRAFT_TTL_MINUTES;
 use crate::storage::repositories::{items, lists};
@@ -22,12 +21,12 @@ use crate::telegram::rich::{Block, Span, button, inline_char_len, inline_len};
 use crate::telegram::ru;
 use crate::telegram::views;
 
+use super::additions::add_parts;
 use super::card::{describe_recurrence_draft, priority_label};
 use super::forms;
 use super::model::{
     Action, DuplicateChoice, Editor, EditorTarget, ItemDraft, RecurrenceDraft, Screen, Step,
-    SubtaskDraft, Ui, addition_rows, duplicate_notice, list_screen, merge_duplicate_choice,
-    plan_additions,
+    SubtaskDraft, Ui, addition_rows, duplicate_notice, list_screen,
 };
 use super::screens::nav_row;
 use super::{Ctx, Fail};
@@ -194,68 +193,29 @@ pub async fn intake_split(ctx: &mut Ctx<'_>, text: &str, list_id: Uuid) -> Resul
         return ctx.refresh().await;
     }
 
-    let timezone = ctx.tz.name().to_owned();
-    let today = ctx.now.with_timezone(&ctx.tz).date_naive();
-    let mut existing = items::list_by_list(&mut *ctx.conn, household_id, list.id).await?;
-    let mut new_items = Vec::new();
-    for title in parts {
-        let draft = ItemDraft {
-            title,
-            quantity: Some(1.0),
-            ..ItemDraft::default()
-        };
-        let mut new_item = draft.to_new_item(list.id, ctx.tz, list.kind)?;
-        // Экран задаёт целевой список: деление не уводит покупку в другой.
-        new_item.list_id = list.id;
-        new_items.push(new_item);
-    }
+    let timezone = ctx.tz;
+    let today = ctx.now.with_timezone(&timezone).date_naive();
+    let added = add_parts(
+        &mut *ctx.conn,
+        household_id,
+        &actor,
+        list.id,
+        timezone,
+        today,
+        ctx.now,
+        parts,
+    )
+    .await?;
 
-    let mut created = Vec::new();
-    let mut duplicates: Vec<DuplicateChoice> = Vec::new();
-    let mut skipped = Vec::new();
-    for new_item in new_items {
-        let (to_create, found) = plan_additions(&existing, vec![new_item]);
-        for choice in found {
-            merge_duplicate_choice(&mut duplicates, choice);
-        }
-        for new_item in to_create {
-            let assignee = new_item.assignee_user_id;
-            let title = new_item.title.clone();
-            let validated = match validate_new_item(ListKind::Shopping, &timezone, new_item, today)
-            {
-                Ok(validated) => validated,
-                // Слишком длинную часть не теряем из-за остальных: покажем её
-                // в баннере.
-                Err(crate::domain::error::DomainError::Validation(_)) => {
-                    skipped.push(title);
-                    continue;
-                }
-                Err(error) => return Err(error.into()),
-            };
-            let item = items::create(
-                &mut *ctx.conn,
-                household_id,
-                &actor,
-                list.id,
-                validated,
-                assignee,
-                ctx.now,
-            )
-            .await?;
-            existing.push(item.clone());
-            created.push(item);
-        }
-    }
-
-    let titles: Vec<String> = created.iter().map(|item| item.title.clone()).collect();
-    let created_ids: Vec<Uuid> = created.iter().map(|item| item.id).collect();
-    let rows = addition_rows(&duplicates, list.id, &created_ids, None);
-    let banner = split_banner(&list.name, &titles, &duplicates, &skipped, true);
-    if rows.is_empty() {
-        ctx.banner(banner);
-    } else {
-        ctx.banner_rows(banner, rows);
-    }
+    let titles: Vec<String> = added
+        .created
+        .iter()
+        .map(|item| item.title.clone())
+        .collect();
+    let created_ids: Vec<Uuid> = added.created.iter().map(|item| item.id).collect();
+    let rows = addition_rows(&added.duplicates, list.id, &created_ids, None);
+    let banner = split_banner(&list.name, &titles, &added.duplicates, &added.skipped, true);
+    ctx.banner_rows(banner, rows);
 
     let current = views::get(&mut *ctx.conn, ctx.chat_id)
         .await?

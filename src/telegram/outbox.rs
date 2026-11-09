@@ -82,17 +82,26 @@ fn delete_after_from_payload(payload: &Value) -> Option<Option<u32>> {
     }
 }
 
+/// Экран навигации: HTML и правило видимости активного сообщения.
+///
+/// Поля закрыты намеренно: собрать [`Outgoing::Screen`] снаружи модуля нельзя,
+/// поэтому экран ставится в очередь только через [`enqueue_screen`], который
+/// держит общий с воркером доставки порядок блокировок `outbox` →
+/// `telegram_views`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenMessage {
+    html: String,
+    placement: Placement,
+}
+
 /// Что отправить.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+///
+/// Без `Serialize`/`Deserialize`: иначе экран можно было бы собрать из JSON в
+/// обход [`enqueue_screen`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outgoing {
     /// Экран навигации: редактирует активное сообщение чата или заменяет его.
-    Screen {
-        /// HTML RichMessage.
-        html: String,
-        /// Правило видимости активного сообщения.
-        placement: Placement,
-    },
+    Screen(ScreenMessage),
     /// Новое самостоятельное сообщение.
     Message {
         /// HTML.
@@ -102,7 +111,6 @@ pub enum Outgoing {
         /// Удалить сообщение через столько секунд после доставки.
         ///
         /// `None` — без автоудаления; так читаются старые строки без поля.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         delete_after: Option<u32>,
     },
     /// Редактирование конкретного сообщения (например, уведомления).
@@ -131,7 +139,7 @@ impl Outgoing {
 
     fn payload(&self) -> Value {
         match self {
-            Self::Screen { html, placement } => {
+            Self::Screen(ScreenMessage { html, placement }) => {
                 json!({"html": html, "placement": placement})
             }
             Self::Message {
@@ -152,10 +160,10 @@ impl Outgoing {
 
     fn from_row(kind: &str, payload: &Value) -> Option<Self> {
         match kind {
-            "screen" => Some(Self::Screen {
+            "screen" => Some(Self::Screen(ScreenMessage {
                 html: payload.get("html")?.as_str()?.to_owned(),
                 placement: Placement::from_payload(payload)?,
-            }),
+            })),
             "message" => Some(Self::Message {
                 html: payload.get("html")?.as_str()?.to_owned(),
                 rich: payload
@@ -183,10 +191,8 @@ impl Outgoing {
 /// Поставить сообщение в очередь. Возвращает `seq` или `None`, если сообщение с
 /// таким `dedupe_key` уже есть.
 ///
-/// Экран заменяет все ещё не доставленные экраны того же чата: пользователю
-/// нужно только актуальное состояние. Он наследует самый сильный `placement`
-/// вытесненных экранов, чтобы `/start` (`fresh`) не потерялся, если до доставки
-/// пришёл другой экран.
+/// Экран ставится только через [`enqueue_screen`]: он держит общий с воркером
+/// доставки порядок блокировок `outbox` → `telegram_views`.
 pub async fn enqueue(
     conn: &mut PgConnection,
     chat_id: i64,
@@ -212,10 +218,15 @@ pub async fn enqueue_at(
     now: DateTime<Utc>,
     run_at: DateTime<Utc>,
 ) -> Result<Option<i64>, sqlx::Error> {
-    let outgoing = if let Outgoing::Screen { html, placement } = outgoing {
+    let outgoing = if let Outgoing::Screen(screen) = outgoing {
         // Блокировка и вытеснение — один запрос: воркер не может доставить
         // строку между чтением `placement` и её вытеснением, иначе новый
         // экран унаследовал бы режим уже доставленного.
+        //
+        // Строки `outbox` берутся раньше записи `telegram_views`: воркер
+        // доставки тоже сначала блокирует строку `outbox`, а затем пишет
+        // `telegram_views`. Обратный порядок замыкал клинч; экраны ставятся
+        // через [`enqueue_screen`], который держит этот порядок.
         //
         // Вытесняемая строка с неизвестным `placement` тоже уходит в
         // `skipped`: в выборе режима она не участвует и в dead-letter не
@@ -241,12 +252,12 @@ pub async fn enqueue_at(
         let placement = pending
             .iter()
             .filter_map(Placement::from_payload)
-            .fold(*placement, std::cmp::max);
+            .fold(screen.placement, std::cmp::max);
 
-        Outgoing::Screen {
-            html: html.clone(),
+        Outgoing::Screen(ScreenMessage {
+            html: screen.html.clone(),
             placement,
-        }
+        })
     } else {
         outgoing.clone()
     };
@@ -266,6 +277,38 @@ pub async fn enqueue_at(
     .fetch_optional(conn)
     .await?;
 
+    Ok(seq)
+}
+
+/// Поставить экран в очередь и сохранить его состояние для перерисовки.
+///
+/// Экран заменяет все ещё не доставленные экраны того же чата: пользователю
+/// нужно только актуальное состояние. Он наследует самый сильный `placement`
+/// вытесненных экранов, чтобы `/start` (`fresh`) не потерялся, если до доставки
+/// пришёл другой экран.
+///
+/// Обе записи должны идти в одной транзакции вызывающего. Порядок блокировок
+/// важен: сначала строки `outbox` (вытеснение ожидающих экранов), затем
+/// `telegram_views`. Воркер доставки блокирует строку `outbox` и только потом
+/// пишет `telegram_views`; обратный порядок замыкал клинч между воркерами.
+pub async fn enqueue_screen(
+    conn: &mut PgConnection,
+    chat_id: i64,
+    view_key: &str,
+    state: &Value,
+    html: String,
+    placement: Placement,
+    now: DateTime<Utc>,
+) -> Result<Option<i64>, sqlx::Error> {
+    let seq = enqueue(
+        conn,
+        chat_id,
+        &Outgoing::Screen(ScreenMessage { html, placement }),
+        None,
+        now,
+    )
+    .await?;
+    views::set(conn, chat_id, view_key, state, now).await?;
     Ok(seq)
 }
 
@@ -704,13 +747,15 @@ async fn deliver(
     let db = |error: sqlx::Error| TelegramError::Transient(format!("database: {error}"));
 
     match outgoing {
-        Outgoing::Screen { html, placement } => {
-            let rich = RichMessage { html: html.clone() };
+        Outgoing::Screen(screen) => {
+            let rich = RichMessage {
+                html: screen.html.clone(),
+            };
             let active = views::get(conn, row.chat_id).await.map_err(db)?;
             let target = active.as_ref().and_then(|view| view.message_id);
             let buried = active.as_ref().is_some_and(|view| view.buried);
 
-            let old_id = match (target, placement) {
+            let old_id = match (target, screen.placement) {
                 (Some(old_id), Placement::Fresh) => Some(old_id),
                 (Some(old_id), Placement::Visible) if buried => Some(old_id),
                 _ => None,
@@ -864,10 +909,10 @@ mod tests {
     #[test]
     fn outgoing_round_trips_through_rows() {
         for outgoing in [
-            Outgoing::Screen {
+            Outgoing::Screen(ScreenMessage {
                 html: "a".into(),
                 placement: Placement::Visible,
-            },
+            }),
             Outgoing::Message {
                 html: "b".into(),
                 rich: true,
@@ -894,10 +939,10 @@ mod tests {
     #[test]
     fn screen_round_trips_every_placement() {
         for placement in [Placement::InPlace, Placement::Visible, Placement::Fresh] {
-            let outgoing = Outgoing::Screen {
+            let outgoing = Outgoing::Screen(ScreenMessage {
                 html: "a".into(),
                 placement,
-            };
+            });
             assert_eq!(
                 Outgoing::from_row(outgoing.kind(), &outgoing.payload()),
                 Some(outgoing)
@@ -909,10 +954,10 @@ mod tests {
     fn screen_row_without_placement_reads_as_visible() {
         assert_eq!(
             Outgoing::from_row("screen", &json!({"html": "a"})),
-            Some(Outgoing::Screen {
+            Some(Outgoing::Screen(ScreenMessage {
                 html: "a".into(),
                 placement: Placement::Visible,
-            })
+            }))
         );
     }
 
