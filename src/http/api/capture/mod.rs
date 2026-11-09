@@ -295,7 +295,9 @@ async fn capture_inner(
     let capture_id = Uuid::now_v7();
 
     let text = request.text.trim().to_owned();
-    let length = text.chars().count();
+    // Длина считается по тексту без управляющих символов: текст только из них
+    // после очистки пуст и до LLM доходить не должен.
+    let length = sanitize(&text).trim().chars().count();
     if length == 0 || length > usize::try_from(capture.config.max_text_chars).unwrap_or(0) {
         log_capture(source, "invalid", capture_id);
         return Err(ApiError::validation(format!(

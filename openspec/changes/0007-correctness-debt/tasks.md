@@ -8,16 +8,16 @@
 
 ## 2. Capture
 
-- [ ] 2.1 В обработчике `src/http/api/capture/mod.rs` проверять длину по `sanitize(text).trim()` до квоты и LLM (design, решение 6). Проверить тестом в `tests/capture_api.rs`: `text` из `\u0007\u0008` → `422`, фейковый LLM не вызван, позиций нет, `llm_runs` пуст.
+- [x] 2.1 В обработчике `src/http/api/capture/mod.rs` проверять длину по `sanitize(text).trim()` до квоты и LLM (design, решение 6). Проверить тестом в `tests/capture_api.rs`: `text` из `\u0007\u0008` → `422`, фейковый LLM не вызван, позиций нет, `llm_runs` пуст.
 
 ## 3. Уведомления
 
-- [ ] 3.1 В `Scheduler::tick()` (`src/jobs/scheduler.rs`) выполнять шаги по отдельности, ошибку каждого писать с `step`, возвращать `Err` последней ошибки, если упал хотя бы один шаг (design, решение 5). Проверить тестом в `tests/notifications.rs`: триггер `BEFORE INSERT ON notification_deliveries WHEN (NEW.kind = 'digest')` с `RAISE EXCEPTION`, тик возвращает `Err`, но напоминание, срок которого наступил, поставлено в outbox. Удалить триггер в конце теста.
-- [ ] 3.2 В `reminder_stale()` (`src/jobs/notice.rs`) считать snooze без `origin_key` устаревшим (design, решение 4). Убрать упоминания переходного правила в комментариях и в `docs/domain-model.md`. Заменить тесты 0005 «NULL до миграции не устаревает» тестом: pending snooze без `origin_key` после тика `cancelled` и не доставлен.
+- [x] 3.1 В `Scheduler::tick()` (`src/jobs/scheduler.rs`) выполнять шаги по отдельности, ошибку каждого писать с `step`, возвращать `Err` последней ошибки, если упал хотя бы один шаг (design, решение 5). Проверить тестом в `tests/notifications.rs`: триггер `BEFORE INSERT ON notification_deliveries WHEN (NEW.kind = 'digest')` с `RAISE EXCEPTION`, тик возвращает `Err`, но напоминание, срок которого наступил, поставлено в outbox. Удалить триггер в конце теста.
+- [x] 3.2 В `reminder_stale()` (`src/jobs/notice.rs`) считать snooze без `origin_key` устаревшим (design, решение 4). Убрать упоминания переходного правила в комментариях и в `docs/domain-model.md`. Заменить тесты 0005 «NULL до миграции не устаревает» тестом: pending snooze без `origin_key` после тика `cancelled` и не доставлен.
 
 ## 4. Итоговая проверка
 
-- [ ] 4.1 Прогнать `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` и `cargo test`, все должны пройти. Затем `openspec validate 0007-correctness-debt --strict` должен пройти без ошибок.
+- [x] 4.1 Прогнать `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` и `cargo test`, все должны пройти. Затем `openspec validate 0007-correctness-debt --strict` должен пройти без ошибок.
 
 ## Workflow follow-up
 

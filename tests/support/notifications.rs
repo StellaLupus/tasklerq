@@ -148,19 +148,32 @@ pub async fn insert_delivery(
     scheduled_at: DateTime<Utc>,
     deferred: bool,
 ) -> Uuid {
+    // Snooze привязан к вхождению срока: без привязки он считается устаревшим.
+    let origin_key = if kind == "snooze" {
+        let (due_at, due_date): (Option<DateTime<Utc>>, Option<NaiveDate>) =
+            sqlx::query_as("SELECT due_at, due_date FROM items WHERE id = $1")
+                .bind(item_id)
+                .fetch_one(pool)
+                .await
+                .expect("item due");
+        Some(tasklerq::jobs::scheduler::snooze_origin(due_at, due_date))
+    } else {
+        None
+    };
     let id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO notification_deliveries (
-             id, household_id, user_id, item_id, occurrence_key, kind,
+             id, household_id, user_id, item_id, occurrence_key, origin_key, kind,
              status, scheduled_at, deferred, created_at, updated_at
          )
-         VALUES ($1, $2, $3, $4, $5, $6::notification_kind, 'pending', $7, $8, $7, $7)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7::notification_kind, 'pending', $8, $9, $8, $8)",
     )
     .bind(id)
     .bind(household_id)
     .bind(user_id)
     .bind(item_id)
     .bind(key)
+    .bind(origin_key)
     .bind(kind)
     .bind(scheduled_at)
     .bind(deferred)

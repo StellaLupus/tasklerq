@@ -987,11 +987,11 @@ async fn too_many_items_in_the_retry_is_rejected_not_fallen_back() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn control_characters_only_cannot_be_stored_and_release_the_key() {
+async fn control_characters_only_are_rejected_before_the_key_is_reserved() {
     let db = db().await;
     let household = support::create_household(&db.pool).await;
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
-    let ai = StubAi::new(vec![Err(HaError::Unreachable), Err(HaError::Unreachable)]);
+    let ai = StubAi::new(Vec::new());
     let app = app(&db.pool, ai.clone(), config());
     let key = Uuid::now_v7().to_string();
     let payload = body("\u{1}\u{2}", "ha_voice", "auto");
@@ -1006,15 +1006,22 @@ async fn control_characters_only_cannot_be_stored_and_release_the_key() {
             .fetch_one(&db.pool)
             .await
             .expect("count requests");
-    assert_eq!(requests, 0, "the reservation must be released");
+    assert_eq!(
+        requests, 0,
+        "the key must not be reserved for rejected text"
+    );
 
     let (status, _, json) = call_with_key(&app, &token, Some(&key), payload).await;
     assert_eq!(
         status,
         StatusCode::UNPROCESSABLE_ENTITY,
-        "the repeat must be processed again, not rejected as 409: {json}"
+        "the repeat must not find a reservation and return 409: {json}"
     );
-    assert_eq!(ai.calls(), 2);
+    assert_eq!(
+        ai.calls(),
+        0,
+        "control-only text must be rejected before the LLM"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
