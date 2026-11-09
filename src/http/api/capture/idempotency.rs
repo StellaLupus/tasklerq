@@ -32,7 +32,7 @@ pub(super) fn header_key(
     Ok(first)
 }
 
-/// Ключ повтора: заголовок сильнее поля, но различающиеся значения — ошибка.
+/// Ключ повтора из заголовка или поля; если заданы оба и различаются — ошибка.
 pub(super) fn resolve_idempotency_key(
     header: Option<&HeaderValue>,
     field: Option<&str>,

@@ -12,14 +12,15 @@
 - [x] 2.2 Ввести `MAX_INPUT_QUANTITY` в `src/domain/validation.rs` и использовать её вместо `MAX_QUANTITY` в `src/telegram/bot/model.rs` и `src/capture/validate.rs` (design, решение 2). Проверить: `cargo test` проходит, `grep -rn "9_999.0" src` находит одно определение.
 - [x] 2.3 Заменить `expect` в `src/jobs/batch.rs` на `let … else` при проверке вида и сохранить `scope` в `BatchCandidate` (design, решение 3). Проверить: `cargo test --test notification_batches` проходит, `grep -n "expect(" src/jobs/batch.rs` пуст.
 - [x] 2.4 Исправить комментарий поля `idempotency_key` в `CaptureRequest` (`src/http/api/capture/mod.rs`): при расхождении заголовка и поля ответ `422`, как в `idempotency.rs`. Миграцию `0007` не трогать. Удалить `JournalPage::has_next` (`src/storage/repositories/items/completions.rs`) и его вызовы в `tests/item_lifecycle.rs`. Проверить: `cargo test --test item_lifecycle` проходит.
+  - Доделано по ревью: doc-комментарий `resolve_idempotency_key` тоже без «приоритета».
 - [x] 2.5 Убрать ветки `if rows.is_empty()` при сборке баннера прямого добавления (`Banner::with_button_rows` уже отбрасывает пустые ряды) в `shopping.rs`, `capture_worker.rs`, `bot/capture/mod.rs` и строить ряд «Открыть» черновика без `addition_rows(&[], Uuid::nil(), …)`. Проверить: тесты прямого добавления и отмены проходят без изменений, `grep -n "Uuid::nil()" src/telegram/bot/shopping.rs` пуст.
 - [x] 2.6 Показ карточки `Screen::Item { item_id, back, completion_id: None }` в `set_due`, `apply_due` и `finish_due` (`src/telegram/bot/card.rs`) — одной функцией вместо четырёх копий. Проверить: тесты карточки и сроков проходят без изменений.
 
 ## 3. Недостающие тесты
 
-- [ ] 3.1 Добавить тесты: `undo_last` после возврата выполнения из журнала отказывает (закрепляет текущее поведение: событие `reopened` с `undo_of` повторно не отменяется); блок «Выполнения» в карточке показывает не больше пяти строк (`telegram-rich-ui`, «Блок выполнений в карточке»). Проверить: тесты проходят.
-- [ ] 3.2 Брать ожидаемое время в `notification_batch_actions::snooze_in_a_block_creates_one_delivery_and_an_ordinary_reminder_later` от времени записи в базе или от интервала часов стенда до и после нажатия (design, решение 4). Проверить: `cargo test --test notification_batch_actions -- --exact snooze_in_a_block_creates_one_delivery_and_an_ordinary_reminder_later` выводит `1 passed`; рассуждение в комментарии теста объясняет, почему сдвиг часов стенда больше не влияет.
-- [ ] 3.3 Добавить юнит-тест в `src/jobs/quiet.rs`: тихие часы в `Europe/Berlin` с концом в 02:30 на 2026-03-29 дают конец интервала в 03:00 по местному времени. Проверить: тест проходит.
+- [x] 3.1 Добавить тесты: `undo_last` после возврата выполнения из журнала отказывает (закрепляет текущее поведение: событие `reopened` с `undo_of` повторно не отменяется); блок «Выполнения» в карточке показывает не больше пяти строк (`telegram-rich-ui`, «Блок выполнений в карточке»). Проверить: тесты проходят.
+- [x] 3.2 Брать ожидаемое время в `notification_batch_actions::snooze_in_a_block_creates_one_delivery_and_an_ordinary_reminder_later` от времени записи в базе или от интервала часов стенда до и после нажатия (design, решение 4). Проверить: `cargo test --test notification_batch_actions -- --exact snooze_in_a_block_creates_one_delivery_and_an_ordinary_reminder_later` выводит `1 passed`; рассуждение в комментарии теста объясняет, почему сдвиг часов стенда больше не влияет.
+- [x] 3.3 Добавить юнит-тест в `src/jobs/quiet.rs`: тихие часы в `Europe/Berlin` с концом в 02:30 на 2026-03-29 дают конец интервала в 03:00 по местному времени. Проверить: тест проходит.
 
 ## 4. Нагрузочный тест
 

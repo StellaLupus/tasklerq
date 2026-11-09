@@ -5164,6 +5164,65 @@ async fn card_shows_the_completion_block_with_plan_fact_actor_and_deviation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn card_completion_block_shows_at_most_five_latest_completions() {
+    let db = db().await;
+    let moscow = chrono_tz::Tz::Europe__Moscow;
+    let today = NaiveDate::from_ymd_opt(2026, 11, 10).expect("date");
+    let now = local_utc(moscow, today, 12, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let start = NaiveDate::from_ymd_opt(2026, 11, 4).expect("date");
+    let mut input = new_item(household.tasks_list_id, "Полить цветы");
+    input.due_date = Some(start);
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Daily, Vec::new()));
+    let item = create_item(&db.pool, &household, household.tasks_list_id, &actor, input).await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let mut version = item.version;
+    for day in 4..=9 {
+        let completed = items::complete(
+            &mut conn,
+            household.household_id,
+            &actor,
+            item.id,
+            Some(version),
+            "Europe/Moscow",
+            local_utc(
+                moscow,
+                NaiveDate::from_ymd_opt(2026, 11, day).expect("date"),
+                12,
+                0,
+            ),
+        )
+        .await
+        .expect("complete");
+        version = completed.version;
+    }
+    drop(conn);
+
+    // Шесть выполнений с планом на 4–9 ноября; в журнале последнее — 9-го.
+    bot.press("Задачи").await;
+    bot.press("История").await;
+    bot.press("Полить цветы").await;
+    bot.assert_screen_contains("Выполнения");
+    let screen = bot.screen();
+    assert_eq!(
+        screen.matches(" · Alice").count(),
+        5,
+        "the block must keep exactly the five latest completions:\n{screen}"
+    );
+    assert!(
+        screen.contains("пн, 9 ноя → пн, 9 ноя, 12:00 · Alice"),
+        "the latest completion is shown:\n{screen}"
+    );
+    assert!(
+        !screen.contains("ср, 4 ноя"),
+        "the oldest completion must be dropped:\n{screen}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn history_entry_offers_revert_only_for_the_latest_completion() {
     let db = db().await;
     let moscow = chrono_tz::Tz::Europe__Moscow;

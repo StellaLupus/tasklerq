@@ -4383,6 +4383,82 @@ async fn revert_completion_records_reopened_undo_of() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undo_last_after_reverting_a_completion_does_not_roll_back_an_earlier_action() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let due = date(2026, 11, 4);
+    let mut input = support::new_item(household.tasks_list_id, "Оплатить интернет");
+    input.due_date = Some(due);
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let now = Utc::now().trunc_subsecs(6);
+
+    let completed = items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Some(created.version),
+        "Europe/Moscow",
+        now + Duration::seconds(1),
+    )
+    .await
+    .expect("complete");
+    assert_eq!(completed.status, ItemStatus::Done);
+    let completion_id =
+        items::completions::latest_for_item(&mut conn, household.household_id, created.id)
+            .await
+            .expect("latest completion")
+            .expect("a completion is recorded")
+            .completion
+            .event_id;
+
+    let reverted = items::revert_completion(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        completion_id,
+        now + Duration::seconds(2),
+    )
+    .await
+    .expect("revert the completion");
+    assert_eq!(reverted.status, ItemStatus::Open);
+
+    // Возврат выполнения — уже компенсирующее событие (`reopened` с `undo_of`).
+    // Повторная отмена не должна спускаться к более раннему действию.
+    let error = items::undo_last(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        now + Duration::seconds(3),
+    )
+    .await
+    .expect_err("a compensating reopen must not be undone again");
+    assert!(
+        matches!(&error, DomainError::Conflict { message, .. } if message == "there is no action to undo"),
+        "expected the explicit refusal of a repeated undo, got {error:?}"
+    );
+
+    let current = items::get(&mut conn, household.household_id, created.id)
+        .await
+        .expect("item stays");
+    assert_eq!(current.status, ItemStatus::Open);
+    assert!(current.deleted_at.is_none());
+    assert_eq!(current.due_date, Some(due));
+    assert_eq!(current.completed_at, None);
+    assert_eq!(current.version, reverted.version);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn journal_tolerates_a_broken_due_snapshot() {
     let db = support::db().await;
     let household = support::create_household(&db.pool).await;

@@ -103,3 +103,40 @@ pub(crate) fn desired_schedule(
         quiet_end_at(now, timezone, settings).unwrap_or(base)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::TimeZone;
+
+    use super::*;
+
+    #[test]
+    fn quiet_end_is_shifted_forward_across_the_spring_dst_gap() {
+        let timezone = chrono_tz::Europe::Berlin;
+        let settings = NotificationSettings {
+            quiet_start: "22:00".into(),
+            quiet_end: "02:30".into(),
+            ..NotificationSettings::default()
+        };
+        // 00:30 по Берлину 29 марта 2026 — это 23:30 UTC 28-го. В эту ночь
+        // часы прыгают с 02:00 на 03:00, поэтому местного 02:30 не существует.
+        let instant = Utc
+            .with_ymd_and_hms(2026, 3, 28, 23, 30, 0)
+            .single()
+            .expect("instant");
+
+        let end = quiet_end_at(instant, timezone, &settings).expect("inside quiet hours");
+
+        assert_eq!(
+            end,
+            Utc.with_ymd_and_hms(2026, 3, 29, 1, 0, 0)
+                .single()
+                .expect("end")
+        );
+        assert_eq!(
+            end.with_timezone(&timezone).format("%H:%M").to_string(),
+            "03:00",
+            "the nonexistent 02:30 moves forward to the first existing local time"
+        );
+    }
+}
