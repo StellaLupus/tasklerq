@@ -245,6 +245,46 @@ pub async fn outbox_messages(pool: &PgPool, chat: i64) -> Vec<String> {
     .expect("outbox")
 }
 
+/// Тик с триггером, ломающим вставку сводки: шаг сводки сообщает ошибку, а
+/// триггер снимается и в этом случае, поэтому база остаётся пригодной.
+///
+/// База должна быть отдельной: DDL на `notification_deliveries` задел бы
+/// параллельные тики общей базы.
+pub async fn tick_with_a_failing_digest(
+    pool: &PgPool,
+    at: DateTime<Utc>,
+) -> Result<TickStats, sqlx::Error> {
+    sqlx::query(
+        "CREATE FUNCTION fail_digest() RETURNS trigger AS $$
+         BEGIN
+             RAISE EXCEPTION 'forced digest failure';
+         END $$ LANGUAGE plpgsql",
+    )
+    .execute(pool)
+    .await
+    .expect("function");
+    sqlx::query(
+        "CREATE TRIGGER fail_digest BEFORE INSERT ON notification_deliveries
+         FOR EACH ROW WHEN (NEW.kind = 'digest') EXECUTE FUNCTION fail_digest()",
+    )
+    .execute(pool)
+    .await
+    .expect("trigger");
+
+    let result = scheduler(pool).tick(at).await;
+
+    sqlx::query("DROP TRIGGER fail_digest ON notification_deliveries")
+        .execute(pool)
+        .await
+        .expect("drop trigger");
+    sqlx::query("DROP FUNCTION fail_digest()")
+        .execute(pool)
+        .await
+        .expect("drop function");
+
+    result
+}
+
 pub async fn tick_and_deliver(bot: &mut Harness, pool: &PgPool, at: DateTime<Utc>) -> TickStats {
     let stats = scheduler(pool).tick(at).await.expect("tick");
     if at > bot.now {

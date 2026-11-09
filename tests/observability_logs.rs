@@ -6,9 +6,6 @@
 
 mod support;
 
-use std::sync::Arc;
-use std::sync::Mutex;
-
 use axum::body::Body;
 use axum::http::Request;
 use http_body_util::BodyExt;
@@ -17,33 +14,9 @@ use tasklerq::http::router::{AppState, build_router};
 use tasklerq::security_audit::Audit;
 use tower::ServiceExt;
 
+use support::logs::LogBuffer;
 use support::next_telegram_id;
 use support::telegram::Harness;
-
-/// Писатель журнала в память.
-#[derive(Clone, Default)]
-struct LogBuffer(Arc<Mutex<Vec<u8>>>);
-
-struct LogWriter(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for LogWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().expect("lock").extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
-    type Writer = LogWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        LogWriter(self.0.clone())
-    }
-}
 
 fn records(captured: &str) -> Vec<Value> {
     captured
@@ -101,7 +74,7 @@ fn logs_keep_identifiers_and_results_but_not_the_message_text() {
         });
     });
 
-    let captured = String::from_utf8(logs.0.lock().expect("lock").clone()).expect("utf8");
+    let captured = logs.contents();
     let records = records(&captured);
 
     let update = record(&records, "telegram update finished");

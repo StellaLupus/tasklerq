@@ -6,7 +6,7 @@
 
 mod support;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use async_trait::async_trait;
@@ -22,6 +22,7 @@ use tasklerq::http::router::{AppState, build_router};
 use tasklerq::security_audit::Audit;
 use tower::ServiceExt;
 
+use support::logs::LogBuffer;
 use support::{db, issue_token};
 
 struct StubAi;
@@ -38,31 +39,6 @@ impl AiTask for StubAi {
         _timeout: StdDuration,
     ) -> Result<Value, HaError> {
         Ok(json!({"items": [{"target_kind": "shopping", "title": "секретный заголовок"}]}))
-    }
-}
-
-/// Писатель журнала в память.
-#[derive(Clone, Default)]
-struct LogBuffer(Arc<Mutex<Vec<u8>>>);
-
-struct LogWriter(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for LogWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().expect("lock").extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
-    type Writer = LogWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        LogWriter(self.0.clone())
     }
 }
 
@@ -118,8 +94,7 @@ fn capture_logs_have_metadata_but_not_the_text() {
         });
     });
 
-    let captured = logs.0.lock().expect("lock").clone();
-    let captured = String::from_utf8(captured).expect("utf8");
+    let captured = logs.contents();
     assert!(
         captured.contains("capture finished"),
         "the capture must be logged:\n{captured}"
@@ -190,8 +165,7 @@ fn a_disabled_llm_logs_the_fallback_reason_without_the_text() {
         });
     });
 
-    let captured = logs.0.lock().expect("lock").clone();
-    let captured = String::from_utf8(captured).expect("utf8");
+    let captured = logs.contents();
     assert!(
         captured.contains("\"metric\":\"capture_fallback_total\"")
             && captured.contains("\"reason\":\"llm_disabled\""),
@@ -277,8 +251,7 @@ fn capture_logs_for(
         })
     });
 
-    let captured = logs.0.lock().expect("lock").clone();
-    (status, String::from_utf8(captured).expect("utf8"))
+    (status, logs.contents())
 }
 
 fn assert_capture_log(captured: &str, status: &str, text: &str) {

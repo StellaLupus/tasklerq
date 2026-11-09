@@ -2,8 +2,9 @@
 
 ## 1. Тестовые хелперы
 
-- [ ] 1.1 Собрать `LogBuffer` с `MakeWriter` в `tests/support` и перевести на него `tests/capture_api_logs.rs`, `tests/degradation_logs.rs`, `tests/llm_logs.rs`, `tests/observability_logs.rs`, `tests/outbox_dead_logs.rs`, `tests/webhook_rate_limit_logs.rs`, `tests/secret_redaction.rs`. `FailureLogs` в `tests/load_webhook.rs` и копии в `src/app.rs`, `src/config/tests.rs` не трогать. Проверить: `cargo test` проходит, `grep -ln "struct LogBuffer" tests/*.rs` пуст.
-- [ ] 1.2 Заменить в `tests/notification_actions.rs` копии `tick_and_deliver` и `button_of` версиями из `tests/support/notifications.rs`. Проверить: `cargo test --test notification_actions` проходит.
+- [x] 1.1 Собрать `LogBuffer` с `MakeWriter` в `tests/support` и перевести на него `tests/capture_api_logs.rs`, `tests/degradation_logs.rs`, `tests/llm_logs.rs`, `tests/observability_logs.rs`, `tests/outbox_dead_logs.rs`, `tests/webhook_rate_limit_logs.rs`, `tests/secret_redaction.rs`. `FailureLogs` в `tests/load_webhook.rs` и копии в `src/app.rs`, `src/config/tests.rs` не трогать. Проверить: `cargo test` проходит, `grep -ln "struct LogBuffer" tests/*.rs` пуст.
+- [x] 1.2 Заменить в `tests/notification_actions.rs` копии `tick_and_deliver` и `button_of` версиями из `tests/support/notifications.rs`. Проверить: `cargo test --test notification_actions` проходит.
+- [x] 1.3 Собрать в хелперы копии в тестах: подготовку «карточка задачи поверх прямого добавления с черновиком» (три теста отмены в `tests/telegram_capture.rs`) и триггер, ломающий вставку сводки (`tests/notifications.rs`, `tests/scheduler_step_logs.rs`). Проверить: `cargo test --test telegram_capture --test notifications --test scheduler_step_logs` проходит.
 
 ## 2. Код
 

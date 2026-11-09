@@ -3125,18 +3125,19 @@ async fn a_direct_add_can_be_undone_within_ten_minutes() {
     assert_eq!(state["t"], json!("list"), "the list must stay on screen");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn undo_over_a_task_card_keeps_the_card_and_offers_the_draft() {
-    let db = db().await;
+/// Стенд «карточка задачи поверх прямого добавления с черновиком»: разбор
+/// кладёт покупку и задачу в покупки, а пользователь успевает открыть карточку
+/// другой задачи. Проверку `Pass::Drafted` оставляют тесты.
+async fn task_card_over_direct_add(pool: &PgPool) -> Stand {
     let mut stand = stand(
-        &db.pool,
+        pool,
         vec![Ok(json!({"items": [
             {"target_kind": "shopping", "title": "Молоко"},
             {"target_kind": "tasks", "title": "Позвонить маме"}
         ]}))],
     )
     .await;
-    seed_task_item(&db.pool, stand.bot.chat, "Проверить почту").await;
+    seed_task_item(pool, stand.bot.chat, "Проверить почту").await;
 
     stand.bot.press("Покупки").await;
     stand.bot.text("молоко и позвонить маме").await;
@@ -3144,6 +3145,13 @@ async fn undo_over_a_task_card_keeps_the_card_and_offers_the_draft() {
     stand.bot.press("Назад").await;
     stand.bot.press("Задачи").await;
     stand.bot.press("Проверить почту").await;
+    stand
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undo_over_a_task_card_keeps_the_card_and_offers_the_draft() {
+    let db = db().await;
+    let mut stand = task_card_over_direct_add(&db.pool).await;
     stand.bot.assert_screen_contains("Задачи › Проверить почту");
 
     assert_eq!(stand.work().await, Pass::Drafted);
@@ -3240,22 +3248,7 @@ async fn undo_after_ten_minutes_keeps_the_positions() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_expired_undo_over_a_task_card_offers_the_draft() {
     let db = db().await;
-    let mut stand = stand(
-        &db.pool,
-        vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко"},
-            {"target_kind": "tasks", "title": "Позвонить маме"}
-        ]}))],
-    )
-    .await;
-    seed_task_item(&db.pool, stand.bot.chat, "Проверить почту").await;
-
-    stand.bot.press("Покупки").await;
-    stand.bot.text("молоко и позвонить маме").await;
-    // Пока идёт разбор, пользователь открыл карточку задачи.
-    stand.bot.press("Назад").await;
-    stand.bot.press("Задачи").await;
-    stand.bot.press("Проверить почту").await;
+    let mut stand = task_card_over_direct_add(&db.pool).await;
 
     assert_eq!(stand.work().await, Pass::Drafted);
     stand.bot.advance(Duration::minutes(11));
@@ -3395,22 +3388,7 @@ async fn undo_skips_a_position_deleted_by_hand() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn undo_after_a_manual_delete_offers_the_draft() {
     let db = db().await;
-    let mut stand = stand(
-        &db.pool,
-        vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко"},
-            {"target_kind": "tasks", "title": "Позвонить маме"}
-        ]}))],
-    )
-    .await;
-    seed_task_item(&db.pool, stand.bot.chat, "Проверить почту").await;
-
-    stand.bot.press("Покупки").await;
-    stand.bot.text("молоко и позвонить маме").await;
-    // Пока идёт разбор, пользователь открыл карточку задачи.
-    stand.bot.press("Назад").await;
-    stand.bot.press("Задачи").await;
-    stand.bot.press("Проверить почту").await;
+    let mut stand = task_card_over_direct_add(&db.pool).await;
 
     assert_eq!(stand.work().await, Pass::Drafted);
 

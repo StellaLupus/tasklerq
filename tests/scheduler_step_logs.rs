@@ -7,46 +7,9 @@
 
 mod support;
 
-use std::io::Write;
-use std::sync::{Arc, Mutex};
-
 use chrono::Duration;
 use serde_json::json;
-use tasklerq::jobs::scheduler::Scheduler;
-use tokio::sync::Notify;
-
-/// Писатель журнала в память.
-#[derive(Clone, Default)]
-struct LogBuffer(Arc<Mutex<Vec<u8>>>);
-
-impl LogBuffer {
-    fn contents(&self) -> String {
-        let bytes = self.0.lock().expect("log buffer lock").clone();
-        String::from_utf8(bytes).expect("logs are UTF-8")
-    }
-}
-
-impl Write for LogBuffer {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0
-            .lock()
-            .expect("log buffer lock")
-            .extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for LogBuffer {
-    type Writer = Self;
-
-    fn make_writer(&'writer self) -> Self::Writer {
-        self.clone()
-    }
-}
+use support::logs::LogBuffer;
 
 #[test]
 fn a_failed_digest_step_is_logged_with_its_name_and_still_delivers_reminders() {
@@ -97,38 +60,11 @@ fn a_failed_digest_step_is_logged_with_its_name_and_still_delivers_reminders() {
             )
             .await;
 
-            // DDL на `notification_deliveries` ломает вставку любой сводки; база
-            // отдельная, потому что в общей он задел бы параллельные тики.
-            sqlx::query(
-                "CREATE FUNCTION fail_digest_log() RETURNS trigger AS $$
-                 BEGIN
-                     RAISE EXCEPTION 'forced digest failure';
-                 END $$ LANGUAGE plpgsql",
+            let result = support::notifications::tick_with_a_failing_digest(
+                &db.pool,
+                due - Duration::minutes(15),
             )
-            .execute(&db.pool)
-            .await
-            .expect("function");
-            sqlx::query(
-                "CREATE TRIGGER fail_digest_log BEFORE INSERT ON notification_deliveries
-                 FOR EACH ROW WHEN (NEW.kind = 'digest')
-                 EXECUTE FUNCTION fail_digest_log()",
-            )
-            .execute(&db.pool)
-            .await
-            .expect("trigger");
-
-            let result = Scheduler::new(db.pool.clone(), Arc::new(Notify::new()))
-                .tick(due - Duration::minutes(15))
-                .await;
-
-            sqlx::query("DROP TRIGGER fail_digest_log ON notification_deliveries")
-                .execute(&db.pool)
-                .await
-                .expect("drop trigger");
-            sqlx::query("DROP FUNCTION fail_digest_log()")
-                .execute(&db.pool)
-                .await
-                .expect("drop function");
+            .await;
 
             let delivered: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM notification_deliveries

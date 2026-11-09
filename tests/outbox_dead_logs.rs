@@ -6,41 +6,17 @@
 
 mod support;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::{DateTime, Duration, Timelike, Utc};
 use serde_json::json;
+use support::logs::LogBuffer;
 use support::telegram::FakeTelegram;
 use tasklerq::jobs::scheduler::Scheduler;
 use tasklerq::telegram::api::TelegramError;
 use tasklerq::telegram::outbox::OutboxWorker;
 use tokio::sync::Notify;
-
-/// Писатель журнала в память.
-#[derive(Clone, Default)]
-struct LogBuffer(Arc<Mutex<Vec<u8>>>);
-
-struct LogWriter(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for LogWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().expect("lock").extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
-    type Writer = LogWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        LogWriter(self.0.clone())
-    }
-}
 
 fn rounded_now() -> DateTime<Utc> {
     Utc::now()
@@ -119,8 +95,7 @@ fn dead_notification_logs_the_metric_and_code_without_its_text() {
         });
     });
 
-    let captured = logs.0.lock().expect("lock").clone();
-    let captured = String::from_utf8(captured).expect("utf8");
+    let captured = logs.contents();
     assert!(
         captured.contains("\"metric\":\"outbox_dead\"")
             && captured.contains("\"error\":\"forbidden\""),
@@ -187,8 +162,7 @@ fn invalid_payload_is_dead_letter_with_time_and_metric() {
     assert_eq!(last_error.as_deref(), Some("invalid_payload"));
     assert_eq!(dead_at, Some(now), "dead-letter time must be stored");
 
-    let captured = logs.0.lock().expect("lock").clone();
-    let captured = String::from_utf8(captured).expect("utf8");
+    let captured = logs.contents();
     assert!(
         captured.contains("\"metric\":\"outbox_dead\"")
             && captured.contains("\"error\":\"invalid_payload\"")
