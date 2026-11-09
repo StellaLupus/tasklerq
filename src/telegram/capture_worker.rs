@@ -760,7 +760,8 @@ impl CaptureWorker {
             .as_ref()
             .filter(|_| result == DirectResult::DraftBanner)
             .map(|draft| draft.id);
-        let rows = addition_rows(&duplicates, target_list_id, &created, open_draft);
+        let created_ids: Vec<uuid::Uuid> = created.iter().map(|item| item.id).collect();
+        let rows = addition_rows(&duplicates, target_list_id, &created_ids, open_draft);
         let text = result_banner(&target_name, &added, &duplicates, on_list, result);
         let banner = text.map(|text| {
             if rows.is_empty() {
@@ -889,7 +890,8 @@ impl CaptureWorker {
         }
 
         let titles: Vec<String> = created.iter().map(|item| item.title.clone()).collect();
-        let rows = addition_rows(&duplicates, target_list_id, &created, None);
+        let created_ids: Vec<uuid::Uuid> = created.iter().map(|item| item.id).collect();
+        let rows = addition_rows(&duplicates, target_list_id, &created_ids, None);
         let on_list = matches!(
             &active,
             Some(Screen::List { list_id, .. }) if *list_id == target_list_id

@@ -1947,6 +1947,40 @@ async fn seed_shopping_item(
     id
 }
 
+async fn tasks_list_id(pool: &PgPool, telegram_id: i64) -> uuid::Uuid {
+    sqlx::query_scalar(
+        "SELECT l.id FROM lists l
+         JOIN users u ON u.household_id = l.household_id
+         WHERE u.telegram_user_id = $1 AND l.kind = 'tasks' AND l.is_default
+         LIMIT 1",
+    )
+    .bind(telegram_id)
+    .fetch_one(pool)
+    .await
+    .expect("tasks list")
+}
+
+async fn seed_task_item(pool: &PgPool, telegram_id: i64, title: &str) -> uuid::Uuid {
+    let household = household_id(pool, telegram_id).await;
+    let list = tasks_list_id(pool, telegram_id).await;
+    let id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO items (
+             id, household_id, list_id, title, status, priority, source,
+             position, created_at, updated_at
+         )
+         VALUES ($1, $2, $3, $4, 'open', 'normal', 'telegram', 1, now(), now())",
+    )
+    .bind(id)
+    .bind(household)
+    .bind(list)
+    .bind(title)
+    .execute(pool)
+    .await
+    .expect("seeded task");
+    id
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shopping_text_adds_positions_without_confirmation() {
     let db = db().await;
@@ -3089,6 +3123,91 @@ async fn a_direct_add_can_be_undone_within_ten_minutes() {
     );
     let state: Value = serde_json::from_str(&stand.view_state().await).expect("view json");
     assert_eq!(state["t"], json!("list"), "the list must stay on screen");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undo_over_a_task_card_keeps_the_card_and_offers_the_draft() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Молоко"},
+            {"target_kind": "tasks", "title": "Позвонить маме"}
+        ]}))],
+    )
+    .await;
+    seed_task_item(&db.pool, stand.bot.chat, "Проверить почту").await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("молоко и позвонить маме").await;
+    // Пока идёт разбор, пользователь открыл карточку задачи.
+    stand.bot.press("Назад").await;
+    stand.bot.press("Задачи").await;
+    stand.bot.press("Проверить почту").await;
+    stand.bot.assert_screen_contains("Задачи › Проверить почту");
+
+    assert_eq!(stand.work().await, Pass::Drafted);
+    stand
+        .bot
+        .assert_screen_contains("Добавлено в «Покупки»: Молоко");
+    stand.bot.assert_screen_contains("Черновик готов");
+    stand.bot.assert_has_button("Открыть");
+    stand.bot.assert_has_button("Отменить");
+
+    stand.bot.press("Отменить").await;
+
+    let state: Value = serde_json::from_str(&stand.view_state().await).expect("view json");
+    assert_eq!(
+        state["t"],
+        json!("item"),
+        "the task card must stay on screen"
+    );
+    stand.bot.assert_screen_contains("Задачи › Проверить почту");
+    stand.bot.assert_screen_contains("Добавление отменено");
+    stand.bot.assert_has_button("Открыть");
+    assert_eq!(
+        deleted_titles(&db.pool, stand.bot.chat).await,
+        vec![
+            ("Молоко".to_owned(), true),
+            ("Проверить почту".to_owned(), false),
+        ],
+        "only the added purchases are removed"
+    );
+
+    stand.bot.press("Открыть").await;
+    stand.bot.assert_screen_contains("Позвонить маме");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undo_after_a_duplicate_choice_removes_the_created_position() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Молоко"},
+            {"target_kind": "shopping", "title": "Хлеб"}
+        ]}))],
+    )
+    .await;
+    seed_shopping_item(&db.pool, stand.bot.chat, "Молоко", 2.0, "л").await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("молоко и хлеб").await;
+    assert_eq!(stand.work().await, Pass::Drafted);
+    stand.bot.assert_has_button("Отменить");
+
+    stand.bot.press("Увеличить до 3 л").await;
+    stand.bot.assert_screen_contains("Добавлено: Молоко · 3 л");
+    stand.bot.assert_has_button("Отменить");
+
+    stand.bot.press("Отменить").await;
+
+    stand.bot.assert_screen_contains("Добавление отменено");
+    assert_eq!(
+        deleted_titles(&db.pool, stand.bot.chat).await,
+        vec![("Молоко".to_owned(), false), ("Хлеб".to_owned(), true),],
+        "undo must remove only the position created by this addition"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

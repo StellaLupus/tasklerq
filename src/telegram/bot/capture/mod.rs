@@ -248,7 +248,8 @@ pub async fn intake_split(ctx: &mut Ctx<'_>, text: &str, list_id: Uuid) -> Resul
     }
 
     let titles: Vec<String> = created.iter().map(|item| item.title.clone()).collect();
-    let rows = addition_rows(&duplicates, list.id, &created, None);
+    let created_ids: Vec<Uuid> = created.iter().map(|item| item.id).collect();
+    let rows = addition_rows(&duplicates, list.id, &created_ids, None);
     let banner = split_banner(&list.name, &titles, &duplicates, &skipped, true);
     if rows.is_empty() {
         ctx.banner(banner);

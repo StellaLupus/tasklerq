@@ -12,7 +12,7 @@ use crate::telegram::views;
 use super::card::{self, UndoOutcome};
 use super::model::{
     Action, DuplicateChoice, ItemDraft, PAGE_SIZE, Screen, Ui, addition_rows, duplicate_notice,
-    list_screen, screen_heading,
+    screen_heading,
 };
 use super::screens::{back_button, clip, list_back, nav_row};
 use super::{Ctx, Fail};
@@ -412,6 +412,7 @@ async fn show_duplicate_result(
     label: &str,
     rest: &[DuplicateChoice],
     draft_id: Option<Uuid>,
+    created_ids: &[Uuid],
 ) -> Result<(), Fail> {
     let text = match rest.split_first() {
         Some(_) => {
@@ -424,7 +425,7 @@ async fn show_duplicate_result(
         }
         None => format!("Добавлено: {label}"),
     };
-    let rows = addition_rows(rest, list_id, &[], draft_id);
+    let rows = addition_rows(rest, list_id, created_ids, draft_id);
     if rows.is_empty() {
         ctx.banner(text);
     } else {
@@ -441,6 +442,7 @@ pub async fn duplicate_increase(
     quantity: f64,
     rest: Vec<DuplicateChoice>,
     draft_id: Option<Uuid>,
+    created_ids: Vec<Uuid>,
 ) -> Result<(), Fail> {
     let household = ctx.household()?.clone();
     let actor = ctx.actor()?;
@@ -462,7 +464,7 @@ pub async fn duplicate_increase(
     {
         Ok(item) => {
             let label = position_label(&item);
-            show_duplicate_result(ctx, item.list_id, &label, &rest, draft_id).await
+            show_duplicate_result(ctx, item.list_id, &label, &rest, draft_id, &created_ids).await
         }
         Err(crate::domain::error::DomainError::Conflict { .. })
         | Err(crate::domain::error::DomainError::NotFound) => {
@@ -472,7 +474,7 @@ pub async fn duplicate_increase(
                     text.push(' ');
                     text.push_str(&notice);
                 }
-                let rows = addition_rows(&rest, current.list_id, &[], draft_id);
+                let rows = addition_rows(&rest, current.list_id, &created_ids, draft_id);
                 if rows.is_empty() {
                     ctx.banner(text);
                 } else {
@@ -481,7 +483,7 @@ pub async fn duplicate_increase(
                 return present_after_duplicate(ctx, current.list_id).await;
             }
             let text = "Позиция изменилась, откройте список";
-            let rows = addition_rows(&[], Uuid::nil(), &[], draft_id);
+            let rows = addition_rows(&[], Uuid::nil(), &created_ids, draft_id);
             if rows.is_empty() {
                 ctx.banner(text);
             } else {
@@ -494,6 +496,7 @@ pub async fn duplicate_increase(
 }
 
 /// «📄 Добавить отдельно»: создать вторую позицию с тем же названием.
+#[allow(clippy::too_many_arguments)]
 pub async fn duplicate_separate(
     ctx: &mut Ctx<'_>,
     list_id: Uuid,
@@ -502,6 +505,7 @@ pub async fn duplicate_separate(
     unit: Option<String>,
     rest: Vec<DuplicateChoice>,
     draft_id: Option<Uuid>,
+    created_ids: Vec<Uuid>,
 ) -> Result<(), Fail> {
     let household = ctx.household()?.clone();
     let actor = ctx.actor()?;
@@ -526,25 +530,32 @@ pub async fn duplicate_separate(
     )
     .await?;
     let label = position_label(&item);
-    show_duplicate_result(ctx, list.id, &label, &rest, draft_id).await
+    show_duplicate_result(ctx, list.id, &label, &rest, draft_id, &created_ids).await
 }
 
-/// Перерисовать список после отмены добавления. Пропавший список оставляет
-/// текущий экран.
+/// Перерисовать список после отмены добавления, только если он открыт.
+/// Пропавший список и другой экран (например, карточка задачи) остаются как
+/// есть.
 async fn present_after_undo(ctx: &mut Ctx<'_>, list_id: Option<Uuid>) -> Result<(), Fail> {
     let Some(list_id) = list_id else {
         return ctx.refresh().await;
     };
     let household_id = ctx.household()?.id;
-    let list = match lists::get_visible(&mut *ctx.conn, household_id, list_id).await {
-        Ok(list) => list,
-        Err(crate::domain::error::DomainError::NotFound) => return ctx.refresh().await,
-        Err(error) => return Err(error.into()),
-    };
-    let current = views::get(&mut *ctx.conn, ctx.chat_id)
-        .await?
-        .and_then(|view| serde_json::from_value::<Screen>(view.state).ok());
-    ctx.present(list_screen(current.as_ref(), list.id)).await
+    match lists::get_visible(&mut *ctx.conn, household_id, list_id).await {
+        Ok(_) => present_after_duplicate(ctx, list_id).await,
+        Err(crate::domain::error::DomainError::NotFound) => ctx.refresh().await,
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Баннер отмены с кнопкой «Открыть» ожидающего черновика.
+fn undo_banner(ctx: &mut Ctx<'_>, text: &str, draft_id: Option<Uuid>) {
+    let rows = addition_rows(&[], Uuid::nil(), &[], draft_id);
+    if rows.is_empty() {
+        ctx.banner(text);
+    } else {
+        ctx.banner_rows(text, rows);
+    }
 }
 
 /// «↩️ Отменить» в баннере прямого добавления: мягко удалить созданные
@@ -553,7 +564,11 @@ async fn present_after_undo(ctx: &mut Ctx<'_>, list_id: Option<Uuid>) -> Result<
 /// Окно считается от `created_at` позиции, а не от нажатия. Уже удалённые
 /// позиции пропускаются: их нечего отменять. Чужое добавление отменяет только
 /// автор или владелец household.
-pub async fn added_undo(ctx: &mut Ctx<'_>, item_ids: &[Uuid]) -> Result<(), Fail> {
+pub async fn added_undo(
+    ctx: &mut Ctx<'_>,
+    item_ids: &[Uuid],
+    draft_id: Option<Uuid>,
+) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
     let actor = ctx.actor()?;
 
@@ -571,19 +586,19 @@ pub async fn added_undo(ctx: &mut Ctx<'_>, item_ids: &[Uuid]) -> Result<(), Fail
     }
 
     if alive.is_empty() {
-        ctx.banner("Добавление уже отменено");
+        undo_banner(ctx, "Добавление уже отменено", draft_id);
         return present_after_undo(ctx, list_id).await;
     }
 
     let window = chrono::Duration::minutes(items::UNDO_WINDOW_MINUTES);
     if alive.iter().any(|item| ctx.now - item.created_at > window) {
-        ctx.banner("Время отмены истекло");
+        undo_banner(ctx, "Время отмены истекло", draft_id);
         return present_after_undo(ctx, list_id).await;
     }
 
     for item in &alive {
         items::soft_delete(&mut *ctx.conn, household_id, &actor, item.id, ctx.now).await?;
     }
-    ctx.banner("Добавление отменено");
+    undo_banner(ctx, "Добавление отменено", draft_id);
     present_after_undo(ctx, list_id).await
 }
