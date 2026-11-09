@@ -467,6 +467,16 @@ pub async fn set_due(
         return apply_due(ctx, item_id, version, due, back).await;
     }
 
+    if item.due_at.is_none() && item.due_date.is_none() {
+        return ctx
+            .present(Screen::Item {
+                item_id,
+                back: Box::new(back),
+                completion_id: None,
+            })
+            .await;
+    }
+
     let household = ctx.household()?.clone();
     let actor = ctx.actor()?;
     let patch = if item.due_at.is_some() {
@@ -474,13 +484,11 @@ pub async fn set_due(
             due_at: Field::Null,
             ..ItemPatch::default()
         }
-    } else if item.due_date.is_some() {
+    } else {
         ItemPatch {
             due_date: Field::Null,
             ..ItemPatch::default()
         }
-    } else {
-        ItemPatch::default()
     };
     let saved = items::update(
         &mut *ctx.conn,

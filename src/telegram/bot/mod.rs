@@ -459,13 +459,21 @@ impl Bot {
         screen: Screen,
         banner: Option<Banner>,
     ) -> Result<(), sqlx::Error> {
-        let mut ctx = self.context(conn, now, to, banner);
+        let mut ctx = self.context(conn, now, to, banner.clone());
         match ctx.present(screen).await {
             Ok(()) => Ok(()),
             Err(Fail::Infra(error)) => Err(error),
-            Err(Fail::User(_)) => {
-                tracing::debug!("screen could not be presented to the user");
-                Ok(())
+            Err(Fail::User(reason)) => {
+                tracing::debug!(%reason, "screen could not be presented to the user");
+                let mut ctx = self.context(conn, now, to, banner);
+                match ctx.present(Screen::Menu).await {
+                    Ok(()) => Ok(()),
+                    Err(Fail::Infra(error)) => Err(error),
+                    Err(Fail::User(reason)) => {
+                        tracing::debug!(%reason, "menu could not be presented to the user");
+                        Ok(())
+                    }
+                }
             }
         }
     }

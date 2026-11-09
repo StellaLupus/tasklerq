@@ -2176,6 +2176,50 @@ async fn a_direct_draft_result_opens_a_card_without_an_active_screen() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_result_for_a_deleted_list_falls_back_to_the_main_menu() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            {"target_kind": "shopping", "title": "Молоко"},
+            {"target_kind": "tasks", "title": "Позвонить маме"}
+        ]}))],
+    )
+    .await;
+
+    stand.bot.press("Покупки").await;
+    stand.bot.text("молоко и позвонить маме").await;
+    let list = shopping_list_id(&db.pool, stand.bot.chat).await;
+    sqlx::query("UPDATE lists SET deleted_at = now() WHERE id = $1")
+        .bind(list)
+        .execute(&db.pool)
+        .await
+        .expect("delete the list while the job runs");
+
+    assert_eq!(stand.work().await, Pass::Drafted);
+
+    let state: Value = serde_json::from_str(&stand.view_state().await).expect("view json");
+    assert_eq!(
+        state["t"],
+        json!("menu"),
+        "a banner for a deleted list must be shown over the main menu"
+    );
+    let screen = stand.bot.screen();
+    assert!(
+        screen.contains("Черновик готов"),
+        "the result banner must not be lost:\n{screen}"
+    );
+    let rows = button_rows(&screen);
+    assert_eq!(
+        rows.first()
+            .and_then(|row| row.first())
+            .map(|(label, _)| label.as_str()),
+        Some("Открыть"),
+        "the banner must keep its own buttons over the menu:\n{screen}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_invalid_purchase_from_the_shopping_screen_keeps_the_list_with_a_banner() {
     let db = db().await;
     let long_title = "я".repeat(201);
