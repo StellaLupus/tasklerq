@@ -67,6 +67,60 @@ async fn parallel_runs_apply_each_migration_exactly_once() {
     );
 }
 
+/// Поиск по описанию и подзадачам опирается на trigram-индексы из 0015.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_trigram_indexes_are_created_for_notes_and_subtasks() {
+    let db = support::empty_db().await;
+    migrations::run(&db.pool)
+        .await
+        .expect("migrations should apply on a clean database");
+
+    let indexes: Vec<(String, String)> = sqlx::query_as(
+        "SELECT indexname, indexdef
+         FROM pg_indexes
+         WHERE schemaname = 'public'
+           AND indexname IN ('items_notes_trgm_idx', 'subtasks_title_trgm_idx')
+         ORDER BY indexname",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("index lookup");
+
+    assert_eq!(
+        indexes.len(),
+        2,
+        "0015 must create both trigram indexes: {indexes:?}"
+    );
+    for (name, definition) in &indexes {
+        assert!(
+            definition.contains("USING gin"),
+            "{name} must be a GIN index: {definition}"
+        );
+        assert!(
+            definition.contains("gin_trgm_ops"),
+            "{name} must use gin_trgm_ops: {definition}"
+        );
+    }
+    let items_notes = indexes
+        .iter()
+        .find(|(name, _)| name == "items_notes_trgm_idx")
+        .expect("items_notes_trgm_idx must exist");
+    assert!(
+        items_notes.1.contains("notes gin_trgm_ops"),
+        "items_notes_trgm_idx must index items.notes: {}",
+        items_notes.1
+    );
+    let subtasks_title = indexes
+        .iter()
+        .find(|(name, _)| name == "subtasks_title_trgm_idx")
+        .expect("subtasks_title_trgm_idx must exist");
+    assert!(
+        subtasks_title.1.contains("title gin_trgm_ops"),
+        "subtasks_title_trgm_idx must index subtasks.title: {}",
+        subtasks_title.1
+    );
+}
+
 /// Скопировать встроенные миграции до версии `version` включительно.
 fn copy_migrations_through(version: i64, target: &std::path::Path) {
     let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");

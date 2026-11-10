@@ -508,3 +508,85 @@ async fn search_treats_sql_and_like_syntax_as_plain_text() {
     .expect("items table must still exist");
     assert_eq!(count, 4);
 }
+
+/// `\`, `%` и `_` в запросе ищутся буквально, а не как шаблон `LIKE`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_escapes_like_metacharacters() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let actor = household.owner();
+    let query = r"alpha\%_beta";
+
+    let by_title = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        support::new_item(household.tasks_list_id, r"Задача alpha\%_beta в названии"),
+    )
+    .await;
+
+    let mut notes = support::new_item(household.tasks_list_id, "Задача с описанием");
+    notes.notes = Some(r"Описание alpha\%_beta внутри".into());
+    let by_notes =
+        support::create_item(&db.pool, &household, household.tasks_list_id, &actor, notes).await;
+
+    let mut tagged = support::new_item(household.tasks_list_id, "Задача с тегом");
+    tagged.tags = vec![query.into()];
+    let by_tag = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        tagged,
+    )
+    .await;
+
+    let mut subtasked = support::new_item(household.tasks_list_id, "Задача с подзадачей");
+    subtasked.subtasks = vec![support::subtask(r"Подзадача alpha\%_beta")];
+    let by_subtask = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        subtasked,
+    )
+    .await;
+
+    // Приманки совпали бы, если не экранировать `\` и `%` (шаблон `\\%`
+    // означает «литеральный `\` и любой хвост») или `_` (шаблон `_` — любой
+    // один символ).
+    let backslash_decoy = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        support::new_item(household.tasks_list_id, r"Приманка alpha\zz_betax"),
+    )
+    .await;
+    let underscore_decoy = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        support::new_item(household.tasks_list_id, r"Приманка alpha\%xbeta"),
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let filters = SearchFilters {
+        q: Some(query.into()),
+        ..SearchFilters::default()
+    };
+    let (hits, _) = items::search(&mut conn, household.household_id, "Europe/Moscow", &filters)
+        .await
+        .expect("search with like metacharacters");
+    let ids: HashSet<Uuid> = hits.iter().map(|hit| hit.item.id).collect();
+    assert_eq!(
+        ids,
+        HashSet::from([by_title.id, by_notes.id, by_tag.id, by_subtask.id]),
+        "the query must be a literal substring, not a LIKE pattern"
+    );
+    assert!(!ids.contains(&backslash_decoy.id));
+    assert!(!ids.contains(&underscore_decoy.id));
+}
