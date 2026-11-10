@@ -7,7 +7,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
-use crate::domain::events::effective_end;
+use crate::domain::events::{effective_end, is_past};
 use crate::domain::models::Item;
 use crate::domain::recurrence::parse_timezone;
 
@@ -89,7 +89,7 @@ pub async fn menu_counts_with_timezone(
                             OR (i.due_at >= $2
                                 AND (i.due_at AT TIME ZONE $4)::date = $3))
                  ),
-                 -- 0009-events 8.x/9.x: открытые события не считаются покупками.
+                 -- 0009-events: открытые события не считаются покупками.
                  count(*) FILTER (
                      WHERE l.kind IN ('shopping', 'checklist') AND i.status = 'open'
                  )
@@ -233,6 +233,59 @@ pub async fn open_assigned_tasks(
     .await?;
 
     Ok(count)
+}
+
+/// Начало и конец события для счётчика списка событий.
+#[derive(sqlx::FromRow)]
+struct EventListTimes {
+    list_id: Uuid,
+    due_at: Option<DateTime<Utc>>,
+    due_date: Option<NaiveDate>,
+    end_at: Option<DateTime<Utc>>,
+    end_date: Option<NaiveDate>,
+}
+
+/// Открытые события по спискам, которые ещё не прошли.
+///
+/// Счётчик списка событий в «Все списки» считает так же, как повестка:
+/// прошедшее событие не показывается и не считается. Конец определяет домен,
+/// потому что у вседневных событий это начало следующего дня в поясе household.
+pub async fn open_event_counts_by_list(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    household_timezone: &str,
+    now: DateTime<Utc>,
+) -> Result<HashMap<Uuid, i64>, DomainError> {
+    let household_tz = parse_timezone(household_timezone)?;
+    let events: Vec<EventListTimes> = sqlx::query_as(
+        "SELECT i.list_id, i.due_at, i.due_date, i.end_at, i.end_date
+         FROM items i
+         JOIN lists l ON l.id = i.list_id
+         WHERE i.household_id = $1
+           AND i.deleted_at IS NULL
+           AND l.deleted_at IS NULL
+           AND NOT l.is_archived
+           AND l.kind = 'events'
+           AND i.status = 'open'",
+    )
+    .bind(household_id)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    let mut counts: HashMap<Uuid, i64> = HashMap::new();
+    for event in events {
+        if !is_past(
+            event.due_at,
+            event.due_date,
+            event.end_at,
+            event.end_date,
+            household_tz,
+            now,
+        ) {
+            *counts.entry(event.list_id).or_insert(0) += 1;
+        }
+    }
+    Ok(counts)
 }
 
 /// Число открытых элементов по спискам household.

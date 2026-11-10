@@ -6410,3 +6410,88 @@ async fn agenda_of_a_single_event_list_shows_only_its_events() {
     bot.press("Назад").await;
     bot.assert_screen_contains("<h3>Все списки</h3>");
 }
+
+// 0009-events 8.3: «Просрочено» входит в общий лимит и вытесняет дни окна.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agenda_overdue_section_fills_the_limit_and_displaces_days() {
+    let db = db().await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(moscow, today, 10, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+
+    for n in 0..31 {
+        let mut task = new_item(household.tasks_list_id, &format!("Просрочено {n:02}"));
+        task.due_date = Some(today - Duration::days(1));
+        create_item(&db.pool, &household, household.tasks_list_id, &actor, task).await;
+    }
+    for n in 0..3 {
+        let mut task = new_item(household.tasks_list_id, &format!("Сегодня {n:02}"));
+        task.due_date = Some(today);
+        create_item(&db.pool, &household, household.tasks_list_id, &actor, task).await;
+    }
+
+    bot.press("Повестка").await;
+    let overdue_rows = support::telegram::buttons(&bot.screen())
+        .into_iter()
+        .filter(|(label, _)| label.starts_with("☐ Просрочено"))
+        .count();
+    assert_eq!(overdue_rows, 30, "only the first thirty rows are shown");
+    assert!(
+        !bot.screen().contains("Сегодня 00"),
+        "the overdue section must displace the days of the window:\n{}",
+        bot.screen()
+    );
+    // Скрыты одна просроченная задача и три сегодняшние: счётчик считает всё.
+    bot.assert_screen_contains("…и ещё 4");
+
+    bot.press("Дальше").await;
+    assert!(
+        !bot.screen().contains("Просрочено"),
+        "the next page must not repeat the overdue section:\n{}",
+        bot.screen()
+    );
+}
+
+// 0009-events 8.3: счётчик списка событий в «Все списки» не считает прошедшие.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_lists_event_counter_skips_past_events() {
+    let db = db().await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(moscow, today, 10, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let school = lists::create(
+        &mut conn,
+        household.household_id,
+        ListKind::Events,
+        "Школа",
+        Utc::now(),
+    )
+    .await
+    .expect("school list");
+    drop(conn);
+
+    let mut past = new_item(school.id, "Собрание");
+    past.due_at = Some(local_utc(moscow, today - Duration::days(1), 14, 0));
+    past.end_at = Some(local_utc(moscow, today - Duration::days(1), 15, 0));
+    create_item(&db.pool, &household, school.id, &actor, past).await;
+
+    let mut future = new_item(school.id, "Урок");
+    future.due_at = Some(local_utc(moscow, today, 14, 0));
+    future.end_at = Some(local_utc(moscow, today, 15, 0));
+    create_item(&db.pool, &household, school.id, &actor, future).await;
+
+    bot.text("/start").await;
+    bot.press("Все списки").await;
+    assert!(
+        bot.screen().contains("🗓 Школа · 1"),
+        "the event list counter must skip a passed event:\n{}",
+        bot.screen()
+    );
+}

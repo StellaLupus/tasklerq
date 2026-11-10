@@ -197,9 +197,9 @@ async fn list_of_editor(
 
 async fn main_view(ctx: &mut Ctx<'_>, editor: &Editor) -> Result<Ui, Fail> {
     let list = list_of_editor(ctx, editor).await?;
-    // 0009-events 9.1: у события будет свой набор полей редактора, без
-    // количества и единицы; пока оно попадает в ветку не-задачи.
-    let shopping = list.kind != ListKind::Tasks;
+    let kind = list.kind;
+    let shopping = !matches!(kind, ListKind::Tasks | ListKind::Events);
+    let events = kind == ListKind::Events;
     let screen = editor.screen();
     let title = if editor.draft.title.trim().is_empty() {
         "(без названия)".to_owned()
@@ -210,11 +210,29 @@ async fn main_view(ctx: &mut Ctx<'_>, editor: &Editor) -> Result<Ui, Fail> {
     if let Some(error) = &editor.error {
         ui = ui.bold(format!("⚠️ {error}"));
     }
-    for line in values(ctx, editor, shopping).await? {
+    for line in values(ctx, editor, kind).await? {
         ui = ui.text(line);
     }
 
-    if shopping {
+    if events {
+        ui = ui
+            .row(vec![
+                field_button("📅 Начало", Step::Due),
+                field_button("🏁 Конец", Step::End),
+            ])
+            .row(vec![
+                field_button("🔁 Повторение", Step::Recurrence),
+                field_button("👤 Чьё событие", Step::Assignee),
+            ])
+            .row(vec![
+                field_button("🏷 Теги", Step::Tags),
+                field_button("📝 Заметка", Step::Notes),
+            ])
+            .row(vec![
+                field_button("📋 Список", Step::List),
+                field_button("✏️ Название", Step::Title),
+            ]);
+    } else if shopping {
         ui = ui
             .row(vec![
                 field_button("🔢 Количество", Step::Quantity),
@@ -262,18 +280,17 @@ async fn main_view(ctx: &mut Ctx<'_>, editor: &Editor) -> Result<Ui, Fail> {
 
 async fn field_view(ctx: &mut Ctx<'_>, editor: &Editor, step: Step) -> Result<Ui, Fail> {
     let list = list_of_editor(ctx, editor).await?;
-    // 0009-events 9.1: поля события добавит редактор события.
-    let shopping = list.kind != ListKind::Tasks;
+    let kind = list.kind;
     let screen = editor.screen();
     let mut ui = Ui::new();
     if let Some(error) = &editor.error {
         ui = ui.bold(format!("⚠️ {error}"));
     }
-    for line in values(ctx, editor, shopping).await? {
+    for line in values(ctx, editor, kind).await? {
         ui = ui.text(line);
     }
     ui = ui.heading(screen.trail_with_names(
-        prompt_title(step, shopping),
+        prompt_title(step, kind),
         Some(&list.name),
         None,
         Some("Редактор"),
@@ -284,13 +301,13 @@ async fn field_view(ctx: &mut Ctx<'_>, editor: &Editor, step: Step) -> Result<Ui
 
     match step {
         Step::List => {
-            if editor.allows_list_switch() {
+            // Список события выбирается только среди списков событий: тип
+            // элемента при создании события не переключается.
+            if editor.allows_list_switch() && kind != ListKind::Events {
                 // Создание из меню и пункт черновика без списка: «📋 Список»
                 // переключает и тип, поэтому показаны все списки.
                 let household_id = ctx.household()?.id;
                 let mut lists = lists::list(&mut *ctx.conn, household_id).await?;
-                // 0009-events 8.x/9.x: редактор события выберет список событий;
-                // до появления его полей «Календарь» в выборе не предлагается.
                 lists.retain(|list| !list.is_archived && list.kind != ListKind::Events);
                 lists.sort_by_key(|list| list.kind != ListKind::Tasks);
                 for list in lists {
@@ -310,21 +327,26 @@ async fn field_view(ctx: &mut Ctx<'_>, editor: &Editor, step: Step) -> Result<Ui
                     )]);
                 }
             } else {
-                for list in super::lists_of_kind(ctx, list.kind).await? {
+                for list in super::lists_of_kind(ctx, kind).await? {
                     let mark = if list.id == editor.list_id {
                         "● "
                     } else {
                         ""
                     };
+                    let icon = if list.kind == ListKind::Events {
+                        "🗓 "
+                    } else {
+                        ""
+                    };
                     ui = ui.row(vec![choice(
-                        format!("{mark}{}", clip(&list.name, 40)),
+                        format!("{mark}{icon}{}", clip(&list.name, 40)),
                         Choice::List(list.id),
                     )]);
                 }
             }
         }
-        Step::Due | Step::Priority | Step::Assignee | Step::Tags | Step::Subtasks => {
-            ui = choice_buttons(ctx, ui, step, &editor.draft).await?;
+        Step::Due | Step::End | Step::Priority | Step::Assignee | Step::Tags | Step::Subtasks => {
+            ui = choice_buttons(ctx, ui, step, &editor.draft, kind).await?;
         }
         Step::Recurrence => {
             ui = recurrence_buttons(ui, editor);
@@ -348,6 +370,7 @@ async fn field_view(ctx: &mut Ctx<'_>, editor: &Editor, step: Step) -> Result<Ui
         }
         Step::Title
         | Step::DueText
+        | Step::EndText
         | Step::NewTag
         | Step::Weekdays
         | Step::MonthRule
@@ -444,8 +467,10 @@ fn recurrence_buttons(mut ui: Ui, editor: &Editor) -> Ui {
 }
 
 /// Значения полей текстом: изменённые видны сразу, ещё до сохранения.
-async fn values(ctx: &mut Ctx<'_>, editor: &Editor, shopping: bool) -> Result<Vec<String>, Fail> {
+async fn values(ctx: &mut Ctx<'_>, editor: &Editor, kind: ListKind) -> Result<Vec<String>, Fail> {
     let draft = &editor.draft;
+    let shopping = !matches!(kind, ListKind::Tasks | ListKind::Events);
+    let events = kind == ListKind::Events;
     let title = if draft.title.trim().is_empty() {
         "(без названия)".to_owned()
     } else {
@@ -463,6 +488,45 @@ async fn values(ctx: &mut Ctx<'_>, editor: &Editor, shopping: bool) -> Result<Ve
         lines.push(format!(
             "Единица: {}",
             clip(draft.unit.as_deref().unwrap_or("шт"), 16)
+        ));
+        lines.push(format!(
+            "Заметка: {}",
+            draft
+                .notes
+                .as_deref()
+                .map_or_else(|| "—".to_owned(), |notes| clip(notes, 60))
+        ));
+    } else if events {
+        let (due_at, due_date) = draft.due(ctx.tz)?;
+        lines.push(match ru::due_label(due_at, due_date, ctx.tz, ctx.now) {
+            Some(start) => format!("Начало: {}", ru::capitalize(&start)),
+            None => "Начало: без начала".to_owned(),
+        });
+        // Дату без времени показываем датой, а не полуночью следующего дня.
+        let end_label = if let (Some(date), None) = (draft.end_date, draft.end_time) {
+            ru::due_label(None, Some(date), ctx.tz, ctx.now)
+        } else {
+            let (end_at, end_date) = draft.end(ctx.tz)?;
+            ru::due_label(end_at, end_date, ctx.tz, ctx.now)
+        };
+        lines.push(match end_label {
+            Some(end) => format!("Конец: {}", ru::capitalize(&end)),
+            None => "Конец: без конца".to_owned(),
+        });
+        lines.push(format!(
+            "Повторение: {}",
+            draft
+                .recurrence
+                .as_ref()
+                .map_or_else(|| "нет".to_owned(), describe_recurrence_draft)
+        ));
+        lines.push(format!(
+            "Теги: {}",
+            if draft.tags.is_empty() {
+                "нет".to_owned()
+            } else {
+                clip(&draft.tags.join(", "), 80)
+            }
         ));
         lines.push(format!(
             "Заметка: {}",
@@ -517,8 +581,13 @@ async fn values(ctx: &mut Ctx<'_>, editor: &Editor, shopping: bool) -> Result<Ve
                 .map_or_else(|| "—".to_owned(), |notes| clip(notes, 60))
         ));
     }
+    let assignee_label = if events {
+        "Чьё событие"
+    } else {
+        "Исполнитель"
+    };
     lines.push(format!(
-        "Исполнитель: {}",
+        "{assignee_label}: {}",
         match draft.assignee {
             Some(id) => {
                 let household_id = ctx.household()?.id;
@@ -547,6 +616,7 @@ fn value_eq(
     Ok(match field {
         EditorField::Title => draft.title == snapshot.title,
         EditorField::Due => draft.due(timezone)? == (snapshot.due_at, snapshot.due_date),
+        EditorField::End => draft.end(timezone)? == (snapshot.end_at, snapshot.end_date),
         EditorField::Priority => draft.priority == snapshot.priority,
         EditorField::Assignee => draft.assignee == snapshot.assignee,
         EditorField::Tags => sorted(&draft.tags) == sorted(&snapshot.tags),
@@ -601,6 +671,7 @@ fn current_differs(field: EditorField, current: &ItemSnapshot, base: &ItemSnapsh
     match field {
         EditorField::Title => current.title != base.title,
         EditorField::Due => (current.due_at, current.due_date) != (base.due_at, base.due_date),
+        EditorField::End => (current.end_at, current.end_date) != (base.end_at, base.end_date),
         EditorField::Priority => current.priority != base.priority,
         EditorField::Assignee => current.assignee != base.assignee,
         EditorField::Tags => sorted(&current.tags) != sorted(&base.tags),
@@ -646,6 +717,10 @@ fn adopt(base: &mut ItemSnapshot, seen: &ItemSnapshot, field: EditorField) {
             base.due_at = seen.due_at;
             base.due_date = seen.due_date;
         }
+        EditorField::End => {
+            base.end_at = seen.end_at;
+            base.end_date = seen.end_date;
+        }
         EditorField::Priority => base.priority = seen.priority,
         EditorField::Assignee => base.assignee = seen.assignee,
         EditorField::Tags => base.tags.clone_from(&seen.tags),
@@ -673,6 +748,10 @@ fn restore(
         EditorField::Due => {
             draft.date = seen_draft.date;
             draft.time = seen_draft.time;
+        }
+        EditorField::End => {
+            draft.end_date = seen_draft.end_date;
+            draft.end_time = seen_draft.end_time;
         }
         EditorField::Priority => draft.priority = seen.priority,
         EditorField::Assignee => draft.assignee = seen.assignee,
@@ -722,6 +801,13 @@ async fn save_item(
     item_id: Uuid,
     base: ItemSnapshot,
 ) -> Result<(), Fail> {
+    let household_id = ctx.household()?.id;
+    let list = lists::get_visible(&mut *ctx.conn, household_id, editor.list_id).await?;
+    if let Some((message, field)) = event_draft_problem(&editor, list.kind, ctx.tz)? {
+        editor.error = Some(message);
+        editor.field = field;
+        return show(ctx, editor).await;
+    }
     let back = editor.back();
     let timezone = ctx.tz;
     let attempt = {
@@ -732,6 +818,53 @@ async fn save_item(
         save_with_retry(&mut editor, &base, timezone, &mut backend).await?
     };
     finish_save(ctx, editor, back, attempt).await
+}
+
+/// Проблема черновика события, которую нужно объяснить до записи.
+///
+/// У события обязательно начало, конец того же вида, что начало, и не раньше
+/// него. Проверка общая для создания и правки: домен отвергает те же значения,
+/// но отвечает общим сообщением, а редактор должен назвать причину.
+fn event_draft_problem(
+    editor: &Editor,
+    kind: ListKind,
+    timezone: chrono_tz::Tz,
+) -> Result<Option<(String, Option<Step>)>, DomainError> {
+    if kind != ListKind::Events {
+        return Ok(None);
+    }
+    let draft = &editor.draft;
+    if draft.date.is_none() {
+        return Ok(Some((
+            "Укажите начало события.".to_owned(),
+            Some(Step::Due),
+        )));
+    }
+    // Конец того же вида, что начало: у вседневного события время не имеет
+    // смысла, а событию со временем нужен момент, а не дата.
+    if draft.time.is_none() && draft.end_time.is_some() {
+        return Ok(Some((
+            "У события без времени конец задаётся датой.".to_owned(),
+            Some(Step::End),
+        )));
+    }
+    if draft.time.is_some() && draft.end_date.is_some() && draft.end_time.is_none() {
+        return Ok(Some((
+            "Для события со временем укажите время конца.".to_owned(),
+            Some(Step::End),
+        )));
+    }
+    let (due_at, due_date) = draft.due(timezone)?;
+    let (end_at, end_date) = draft.end(timezone)?;
+    let ends_before_start = match (due_at, due_date, end_at, end_date) {
+        (Some(start), _, Some(end), _) => end <= start,
+        (_, Some(start), _, Some(end)) => end < start,
+        _ => false,
+    };
+    if ends_before_start {
+        return Ok(Some(("Конец раньше начала.".to_owned(), None)));
+    }
+    Ok(None)
 }
 
 /// Создать элемент из редактора.
@@ -746,17 +879,26 @@ async fn save_new(
         editor.duplicate = None;
     }
     let list = lists::get_visible(&mut *ctx.conn, household.id, editor.list_id).await?;
-    // 0009-events 9.1: у события не будет полей покупки при сохранении.
-    let shopping = list.kind != ListKind::Tasks;
+    let events = list.kind == ListKind::Events;
+    let shopping = !matches!(list.kind, ListKind::Tasks | ListKind::Events);
 
     if editor.draft.title.trim().is_empty() {
         editor.error = Some("Название не может быть пустым.".to_owned());
         editor.field = Some(Step::Title);
         return show(ctx, editor).await;
     }
+    if let Some((message, field)) = event_draft_problem(&editor, list.kind, ctx.tz)? {
+        editor.error = Some(message);
+        editor.field = field;
+        return show(ctx, editor).await;
+    }
     let (due_at, due_date) = editor.draft.due(ctx.tz)?;
     if due_at.is_some_and(|at| at < ctx.now) || due_date.is_some_and(|date| date < today(ctx)) {
-        editor.error = Some("Срок уже прошёл.".to_owned());
+        editor.error = Some(if events {
+            "Начало уже прошло.".to_owned()
+        } else {
+            "Срок уже прошёл.".to_owned()
+        });
         editor.field = Some(Step::Due);
         return show(ctx, editor).await;
     }
@@ -826,6 +968,10 @@ fn created_screen(back: &Screen, list_id: Uuid) -> Screen {
             page: 0,
             edit: *edit,
             from_lists: *from_lists,
+        },
+        Screen::Agenda { list, page } => Screen::Agenda {
+            list: *list,
+            page: *page,
         },
         _ => Screen::List {
             list_id,
@@ -981,6 +1127,9 @@ async fn write(
             EditorField::Due => {
                 apply_due_patch(&mut patch, &editor.draft, current, ctx.tz)?;
             }
+            EditorField::End => {
+                apply_end_patch(&mut patch, &editor.draft, current, ctx.tz)?;
+            }
             _ => merge(&mut patch, editor.draft.patch_for(field.step(), ctx.tz)?),
         }
     }
@@ -1022,6 +1171,30 @@ fn apply_due_patch(
             }
             if current.due_date.is_some() {
                 patch.due_date = Field::Null;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Конец с учётом текущего значения: «Без конца» очищает только то, что
+/// действительно задано, и не передаёт `null` в оба поля сразу.
+fn apply_end_patch(
+    patch: &mut ItemPatch,
+    draft: &ItemDraft,
+    current: &Item,
+    timezone: chrono_tz::Tz,
+) -> Result<(), DomainError> {
+    let (end_at, end_date) = draft.end(timezone)?;
+    match (end_at, end_date) {
+        (Some(at), _) => patch.end_at = Field::Value(at),
+        (None, Some(date)) => patch.end_date = Field::Value(date),
+        (None, None) => {
+            if current.end_at.is_some() {
+                patch.end_at = Field::Null;
+            }
+            if current.end_date.is_some() {
+                patch.end_date = Field::Null;
             }
         }
     }
@@ -1205,6 +1378,7 @@ fn field_title(field: EditorField) -> &'static str {
     match field {
         EditorField::Title => "Название",
         EditorField::Due => "Срок",
+        EditorField::End => "Конец",
         EditorField::Priority => "Приоритет",
         EditorField::Assignee => "Исполнитель",
         EditorField::Tags => "Теги",
@@ -1229,6 +1403,11 @@ async fn field_value(
             let (due_at, due_date) = draft.due(ctx.tz)?;
             ru::due_label(due_at, due_date, ctx.tz, ctx.now)
                 .map_or_else(|| "без срока".to_owned(), |due| ru::capitalize(&due))
+        }
+        EditorField::End => {
+            let (end_at, end_date) = draft.end(ctx.tz)?;
+            ru::due_label(end_at, end_date, ctx.tz, ctx.now)
+                .map_or_else(|| "без конца".to_owned(), |end| ru::capitalize(&end))
         }
         EditorField::Priority => priority_label(draft.priority).to_owned(),
         EditorField::Assignee => match draft.assignee {
@@ -1479,9 +1658,8 @@ fn switch_list(editor: &mut Editor, list: &crate::domain::models::List) {
         EditorTarget::New { kind, .. } | EditorTarget::DraftItem { kind, .. } => *kind,
         EditorTarget::Item { .. } => return,
     };
-    // 0009-events 9.1: переключение на список событий будет отдельной веткой.
-    let was_shopping = old_kind != ListKind::Tasks;
-    let shopping = list.kind != ListKind::Tasks;
+    let was_shopping = !matches!(old_kind, ListKind::Tasks | ListKind::Events);
+    let shopping = !matches!(list.kind, ListKind::Tasks | ListKind::Events);
     if was_shopping != shopping {
         if shopping {
             editor.draft.date = None;
@@ -1561,6 +1739,8 @@ mod tests {
             notes: None,
             due_at: None,
             due_date: None,
+            end_at: None,
+            end_date: None,
             priority: ItemPriority::Normal,
             assignee: None,
             tags: vec!["дом".into()],

@@ -43,9 +43,6 @@ pub enum TextRoute {
         /// Название списка для подсказки.
         list_name: String,
     },
-    /// Повестка: свободный текст уходит в общий разбор; подсказка как у
-    /// остальных экранов с общим разбором.
-    Agenda,
     /// Остальные экраны: общий разбор.
     General,
 }
@@ -84,7 +81,7 @@ impl TextRoute {
                 },
                 None => Self::General,
             },
-            Screen::Agenda { .. } => Self::Agenda,
+            Screen::Agenda { .. } => Self::Menu,
             Screen::Welcome
             | Screen::FirstContact(_)
             | Screen::Lists
@@ -121,7 +118,7 @@ impl TextRoute {
     /// объясняет ввод сам (поле редактора) или текст здесь ничего не делает.
     pub fn hint(&self, llm_capture: bool) -> Option<String> {
         match self {
-            Self::Menu | Self::Agenda => Some(
+            Self::Menu => Some(
                 if llm_capture {
                     ru::MENU_HINT
                 } else {
@@ -236,6 +233,7 @@ mod tests {
         let tasks = list(ListKind::Tasks, "Дача");
         let shopping = list(ListKind::Shopping, "Покупки");
         let checklist = list(ListKind::Checklist, "Сборы");
+        let events = list(ListKind::Events, "Календарь");
         let back = Box::new(Screen::Menu);
         vec![
             (Screen::Menu, None, None),
@@ -283,6 +281,16 @@ mod tests {
                 },
                 None,
                 Some(checklist),
+            ),
+            (
+                Screen::List {
+                    list_id: events.id,
+                    page: 0,
+                    edit: false,
+                    from_lists: false,
+                },
+                None,
+                Some(events),
             ),
             (
                 Screen::List {
@@ -454,15 +462,8 @@ mod tests {
         for (screen, form, list) in screens() {
             let route = TextRoute::classify(&screen, form.as_ref(), list.as_ref());
             let expected = |llm_capture: bool| match &screen {
-                Screen::Menu => Some(
-                    if llm_capture {
-                        ru::MENU_HINT
-                    } else {
-                        ru::MENU_HINT_NO_LLM
-                    }
-                    .to_owned(),
-                ),
-                Screen::Agenda { .. } => Some(
+                // Повестка идёт тем же путём, что меню.
+                Screen::Menu | Screen::Agenda { .. } => Some(
                     if llm_capture {
                         ru::MENU_HINT
                     } else {
@@ -474,10 +475,8 @@ mod tests {
                 Screen::List { .. } => list.as_ref().map(|list| match list.kind {
                     ListKind::Shopping if !llm_capture => ru::split_list_hint(&list.name),
                     ListKind::Shopping | ListKind::Tasks => ru::list_hint(&list.name),
-                    // Чек-лист уходит в общий разбор, поэтому обещает то же,
-                    // что остальные экраны с общим разбором.
-                    // 0009-events 8.2: список событий откроет повестку; пока
-                    // текст на его экране уходит в общий разбор, как у чек-листа.
+                    // Чек-лист и список событий уходят в общий разбор, поэтому
+                    // обещают то же, что остальные экраны с общим разбором.
                     ListKind::Checklist | ListKind::Events => if llm_capture {
                         ru::MENU_HINT
                     } else {
@@ -527,6 +526,19 @@ mod tests {
                     "hint and text path disagree for {screen:?}, llm_capture={llm_capture}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_agenda_routes_text_like_the_menu() {
+        let screen = Screen::Agenda {
+            list: None,
+            page: 0,
+        };
+        let route = TextRoute::classify(&screen, None, None);
+        assert_eq!(route, TextRoute::Menu);
+        for llm_capture in [true, false] {
+            assert_eq!(route.hint(llm_capture), TextRoute::Menu.hint(llm_capture));
         }
     }
 

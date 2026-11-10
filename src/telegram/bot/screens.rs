@@ -291,9 +291,18 @@ fn welcome() -> Ui {
 }
 
 async fn lists_screen(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
-    let household_id = ctx.household()?.id;
+    let household = ctx.household()?.clone();
+    let household_id = household.id;
     let all_lists = lists::list(&mut *ctx.conn, household_id).await?;
     let open = items::open_counts_by_list(&mut *ctx.conn, household_id).await?;
+    // Счётчик списка событий считает только не прошедшие события, как повестка.
+    let upcoming = items::open_event_counts_by_list(
+        &mut *ctx.conn,
+        household_id,
+        &household.timezone,
+        ctx.now,
+    )
+    .await?;
 
     let mut ui = Ui::new().heading("Все списки");
     for list in all_lists.iter().filter(|list| !list.is_archived) {
@@ -326,12 +335,13 @@ async fn lists_screen(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
                 },
             ),
         };
+        let count = if list.kind == ListKind::Events {
+            upcoming.get(&list.id).copied().unwrap_or(0)
+        } else {
+            open.get(&list.id).copied().unwrap_or(0)
+        };
         ui = ui.row(vec![go(
-            &format!(
-                "{icon} {} · {}",
-                clip(&list.name, 30),
-                open.get(&list.id).copied().unwrap_or(0)
-            ),
+            &format!("{icon} {} · {}", clip(&list.name, 30), count),
             target,
         )]);
     }
@@ -751,10 +761,9 @@ async fn results(
         );
         if hit.item.status == ItemStatus::Done {
             label.push_str(" · выполнено");
-        } else if hit.list_kind == ListKind::Events {
-            // У события нет отметки выполнения; название списка уже в
-            // подписи, количество и срок не добавляются.
         } else if hit.list_kind != ListKind::Tasks {
+            // События и покупки: у события количества нет, поэтому подпись
+            // остаётся только с названием списка.
             if let Some(quantity) = hit.item.quantity {
                 label.push_str(&format!(
                     " · {}",

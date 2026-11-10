@@ -127,8 +127,6 @@ pub async fn view(ctx: &mut Ctx<'_>, list: Option<Uuid>, page: u32) -> Result<Ui
     let mut budget = MAX_ROWS;
     let total = overdue.len() + rows.len();
     if total == 0 {
-        // 0009-events 9.1: кнопка «➕ Событие» появится вместе с редактором
-        // события; пока пустое состояние только предлагает его добавить.
         ui = ui.text("На эти дни ничего не запланировано — добавьте событие.");
     } else {
         if !overdue.is_empty() {
@@ -192,6 +190,14 @@ pub async fn view(ctx: &mut Ctx<'_>, list: Option<Uuid>, page: u32) -> Result<Ui
     } else {
         Screen::Menu
     };
+    let ui = ui.row(vec![button(
+        "➕ Событие",
+        Action::Add {
+            list_id: list,
+            kind: ListKind::Events,
+            back: Some(screen.clone()),
+        },
+    )]);
     Ok(ui.row(navigation).row(nav_row(&screen, back)))
 }
 

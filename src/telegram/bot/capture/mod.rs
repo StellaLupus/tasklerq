@@ -817,6 +817,14 @@ pub(super) async fn save_draft_item(
 ) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
     let list = lists::get_visible(&mut *ctx.conn, household_id, list_id).await?;
+    // События не входят в контекст разбора (6.1) и не предлагаются в выборе
+    // списка. Если список всё же оказался списком событий, отказ объясняется,
+    // а не приходит как `list_missing`.
+    if list.kind == ListKind::Events {
+        return Err(Fail::User(
+            "Событие нельзя сохранить из разбора: выберите список задач или покупок.".into(),
+        ));
+    }
     let previous = draft::view(&mut *ctx.conn, household_id, draft_id, ctx.now)
         .await?
         .raw
@@ -920,6 +928,8 @@ fn seed(raw: &RawItem, view: &DraftView) -> ItemDraft {
         recurrence,
         quantity: raw.quantity,
         unit: raw.unit.clone(),
+        end_date: None,
+        end_time: None,
     }
 }
 
@@ -952,9 +962,9 @@ fn to_raw(draft: &ItemDraft, kind: ListKind, list_name: &str, until: Option<Stri
         weekdays: rule.weekdays.iter().map(|day| i64::from(*day)).collect(),
         until,
     });
-    // 0009-events 6.1: разбор не должен видеть списки событий; пока событие
-    // попадает в ветку не-задачи.
-    let shopping = kind != ListKind::Tasks;
+    // Поля покупки есть только у `shopping` и `checklist`; в списках событий
+    // разбор не работает.
+    let shopping = !matches!(kind, ListKind::Tasks | ListKind::Events);
 
     RawItem {
         target_kind: kind,

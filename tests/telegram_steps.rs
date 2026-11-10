@@ -528,3 +528,62 @@ async fn create_shopping_preview_keeps_the_chosen_quantity_and_unit() {
     bot.assert_screen_contains("Количество: 2 л");
     bot.assert_screen_contains("Список: Покупки");
 }
+
+// 0009-events 9.1: событие без начала не создаётся, а редактор остаётся открыт.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn event_without_start_stays_open_with_an_explanation() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+
+    bot.press("Повестка").await;
+    bot.press("Событие").await;
+    bot.text("Маникюр").await;
+    bot.press("Сохранить").await;
+
+    bot.assert_screen_contains("Укажите начало события.");
+    bot.assert_screen_contains("Когда начало?");
+
+    let saved: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM items
+         WHERE household_id = $1 AND title = 'Маникюр' AND deleted_at IS NULL",
+    )
+    .bind(stand_household(&db.pool, bot.chat).await.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("count");
+    assert_eq!(saved, 0, "an event must not be created without a start");
+}
+
+// 0009-events 9.1: конец раньше начала отклоняется, событие не создаётся.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn event_end_before_start_is_rejected_and_creates_nothing() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+
+    bot.press("Повестка").await;
+    bot.press("Событие").await;
+    bot.text("Маникюр").await;
+    bot.press("Начало").await;
+    bot.press("Дата и время").await;
+    bot.text("завтра 14:00").await;
+    bot.press("Конец").await;
+    bot.press("Дата и время").await;
+    bot.text("сегодня 09:00").await;
+    bot.press("Сохранить").await;
+
+    bot.assert_screen_contains("Конец раньше начала.");
+    bot.assert_has_button("💾 Сохранить");
+
+    let saved: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM items
+         WHERE household_id = $1 AND title = 'Маникюр' AND deleted_at IS NULL",
+    )
+    .bind(stand_household(&db.pool, bot.chat).await.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("count");
+    assert_eq!(
+        saved, 0,
+        "an event with a reversed interval must not be created"
+    );
+}
