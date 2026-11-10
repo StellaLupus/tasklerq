@@ -84,6 +84,13 @@ pub enum Screen {
     FirstContact(FirstContactScreen),
     /// Все списки.
     Lists,
+    /// Повестка: события и задачи по дням из календарной развёртки.
+    Agenda {
+        /// Список событий; без значения — общая повестка.
+        list: Option<Uuid>,
+        /// Страница-окно по семь дней с нуля.
+        page: u32,
+    },
     /// Список задач или покупок.
     List {
         /// Список.
@@ -267,6 +274,7 @@ impl Screen {
         match self {
             Self::Menu | Self::Welcome | Self::FirstContact(_) => 1,
             Self::Lists
+            | Self::Agenda { .. }
             | Self::Mine { .. }
             | Self::Results { .. }
             | Self::Settings
@@ -311,6 +319,7 @@ impl Screen {
             Self::Welcome => "Пространство создано",
             Self::FirstContact(_) => "Первый контакт",
             Self::Lists => "Все списки",
+            Self::Agenda { .. } => "Повестка",
             Self::List { .. } => "Список",
             Self::Item { .. } => "Карточка",
             Self::Due { .. } => "Срок",
@@ -349,6 +358,7 @@ impl Screen {
         match self {
             Self::Menu | Self::Welcome | Self::FirstContact(_) => Vec::new(),
             Self::Lists
+            | Self::Agenda { .. }
             | Self::Mine { .. }
             | Self::Results { .. }
             | Self::Settings
@@ -492,6 +502,10 @@ pub enum Step {
     Due,
     /// Ввод даты текстом.
     DueText,
+    /// Конец события.
+    End,
+    /// Ввод конца события текстом.
+    EndText,
     /// Приоритет.
     Priority,
     /// Исполнитель.
@@ -525,6 +539,7 @@ impl Step {
             self,
             Self::Title
                 | Self::DueText
+                | Self::EndText
                 | Self::NewTag
                 | Self::Subtasks
                 | Self::Interval
@@ -547,6 +562,8 @@ pub enum EditorField {
     Title,
     /// Срок.
     Due,
+    /// Конец события.
+    End,
     /// Приоритет.
     Priority,
     /// Исполнитель.
@@ -573,6 +590,7 @@ impl EditorField {
         match step {
             Step::Title => Some(Self::Title),
             Step::Due | Step::DueText => Some(Self::Due),
+            Step::End | Step::EndText => Some(Self::End),
             Step::Priority => Some(Self::Priority),
             Step::Assignee => Some(Self::Assignee),
             Step::Tags | Step::NewTag => Some(Self::Tags),
@@ -592,6 +610,7 @@ impl EditorField {
         match self {
             Self::Title => Step::Title,
             Self::Due => Step::Due,
+            Self::End => Step::End,
             Self::Priority => Step::Priority,
             Self::Assignee => Step::Assignee,
             Self::Tags => Step::Tags,
@@ -618,6 +637,12 @@ pub struct ItemSnapshot {
     pub due_at: Option<DateTime<Utc>>,
     /// Вседневный срок.
     pub due_date: Option<NaiveDate>,
+    /// Конец события со временем.
+    #[serde(default)]
+    pub end_at: Option<DateTime<Utc>>,
+    /// Вседневный конец события (включительно).
+    #[serde(default)]
+    pub end_date: Option<NaiveDate>,
     /// Приоритет.
     pub priority: ItemPriority,
     /// Исполнитель.
@@ -643,6 +668,8 @@ impl ItemSnapshot {
             notes: item.notes.clone(),
             due_at: item.due_at,
             due_date: item.due_date,
+            end_at: item.end_at,
+            end_date: item.end_date,
             priority: item.priority,
             assignee: item.assignee_user_id,
             tags: item.tags.iter().map(|tag| tag.name.clone()).collect(),
@@ -708,6 +735,8 @@ pub enum Choice {
     DueTomorrow,
     /// Без срока.
     DueNone,
+    /// Без конца события.
+    EndNone,
     /// Приоритет.
     Priority(ItemPriority),
     /// Исполнитель; `None` снимает.
@@ -1061,6 +1090,13 @@ pub enum Action {
         /// Элемент.
         item_id: Uuid,
     },
+    /// Закрыть напоминание о событии: удалить сообщение, не меняя событие.
+    NoticeClose,
+    /// Открыть быстрый выбор начала события из напоминания.
+    NoticeMove {
+        /// Событие.
+        item_id: Uuid,
+    },
     /// Отменить завершение из уведомления.
     NoticeUndo {
         /// Элемент.
@@ -1097,6 +1133,13 @@ pub enum Action {
         /// Сводное сообщение.
         batch_id: Uuid,
         /// Элемент.
+        item_id: Uuid,
+    },
+    /// Открыть быстрый выбор начала события из блока сводного сообщения.
+    BatchMove {
+        /// Сводное сообщение.
+        batch_id: Uuid,
+        /// Событие.
         item_id: Uuid,
     },
     /// Завершить все ещё открытые задачи сводного сообщения.
@@ -1290,6 +1333,12 @@ pub struct ItemDraft {
     pub quantity: Option<f64>,
     /// Единица измерения.
     pub unit: Option<String>,
+    /// Дата конца события (включительно).
+    #[serde(default)]
+    pub end_date: Option<NaiveDate>,
+    /// Время конца события; без даты относится ко дню начала.
+    #[serde(default)]
+    pub end_time: Option<NaiveTime>,
 }
 
 impl ItemDraft {
@@ -1301,6 +1350,13 @@ impl ItemDraft {
     /// Черновик по снимку значений элемента.
     pub fn from_snapshot(snapshot: &ItemSnapshot, timezone: Tz) -> Self {
         let (date, time) = match (snapshot.due_at, snapshot.due_date) {
+            (Some(at), _) => {
+                let local = at.with_timezone(&timezone);
+                (Some(local.date_naive()), Some(local.time()))
+            }
+            (None, date) => (date, None),
+        };
+        let (end_date, end_time) = match (snapshot.end_at, snapshot.end_date) {
             (Some(at), _) => {
                 let local = at.with_timezone(&timezone);
                 (Some(local.date_naive()), Some(local.time()))
@@ -1319,6 +1375,8 @@ impl ItemDraft {
             recurrence: snapshot.recurrence.as_ref().map(RecurrenceDraft::from_rule),
             quantity: snapshot.quantity,
             unit: snapshot.unit.clone(),
+            end_date,
+            end_time,
         }
     }
 
@@ -1335,6 +1393,39 @@ impl ItemDraft {
         }
     }
 
+    /// Конец события для домена: (со временем, на весь день).
+    ///
+    /// Время без даты относится ко дню начала, а если оно не позже времени
+    /// начала — к следующему дню (design, решение 7). Дату без времени у
+    /// события со временем редактор отклоняет до записи, поэтому здесь она
+    /// остаётся датой и показывается датой, а не полуночью. Без начала конца
+    /// тоже нет: сохранение события без начала отклоняется отдельно.
+    #[allow(clippy::type_complexity)]
+    pub fn end(
+        &self,
+        timezone: Tz,
+    ) -> Result<(Option<chrono::DateTime<chrono::Utc>>, Option<NaiveDate>), DomainError> {
+        if self.end_date.is_none() && self.end_time.is_none() {
+            return Ok((None, None));
+        }
+        match (self.date, self.time) {
+            (Some(start_date), Some(start_time)) => {
+                let Some(end_time) = self.end_time else {
+                    return Ok((None, self.end_date));
+                };
+                let mut date = self.end_date.unwrap_or(start_date);
+                if self.end_date.is_none() && end_time <= start_time {
+                    date += chrono::Duration::days(1);
+                }
+                Ok((Some(resolve_local(timezone, date, end_time)?), None))
+            }
+            // У вседневного начала конец тоже вседневный: время без даты
+            // относится к дню начала.
+            (Some(start_date), None) => Ok((None, Some(self.end_date.unwrap_or(start_date)))),
+            (None, _) => Ok((None, None)),
+        }
+    }
+
     /// Вход домена для создания элемента.
     pub fn to_new_item(
         &self,
@@ -1343,7 +1434,9 @@ impl ItemDraft {
         kind: ListKind,
     ) -> Result<NewItem, DomainError> {
         let (due_at, due_date) = self.due(timezone)?;
-        let shopping = kind != ListKind::Tasks;
+        let (end_at, end_date) = self.end(timezone)?;
+        // У события нет количества и единицы: это поля покупки.
+        let shopping = !matches!(kind, ListKind::Tasks | ListKind::Events);
         Ok(NewItem {
             list_id,
             title: self.title.clone(),
@@ -1351,6 +1444,8 @@ impl ItemDraft {
             priority: self.priority,
             due_at,
             due_date,
+            end_at,
+            end_date,
             assignee_user_id: self.assignee,
             source: crate::domain::models::ItemSource::Telegram,
             quantity: shopping.then(|| self.quantity.unwrap_or(1.0)),
@@ -1398,6 +1493,10 @@ impl ItemDraft {
                 } else if due_date.is_some() {
                     patch.due_at = Field::Missing;
                 }
+            }
+            Step::End | Step::EndText => {
+                // Снятие конца зависит от текущего элемента: патч собирает
+                // `apply_end_patch`, чтобы не передавать `null` в оба поля.
             }
             Step::Priority => patch.priority = Some(self.priority),
             Step::Assignee => {

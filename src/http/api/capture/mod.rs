@@ -411,12 +411,14 @@ async fn capture_inner(
         }
     }
 
-    // Конкретный список проверяется после резерва: чужой, отсутствующий и
-    // архивный список дают один и тот же 422, чтобы не раскрывать чужие данные.
+    // Конкретный список проверяется после резерва: чужой, отсутствующий,
+    // архивный и список событий дают один и тот же 422, чтобы не раскрывать
+    // чужие данные. Список событий отклоняется до квоты и LLM (0009-events
+    // 6.1): разбор не создаёт события.
     let target_list = match request.list_id {
         Some(list_id) => match lists::get_visible(&mut conn, auth.household_id, list_id).await {
-            Ok(list) => Some(list),
-            Err(DomainError::NotFound) => {
+            Ok(list) if list.kind != ListKind::Events => Some(list),
+            Ok(_) | Err(DomainError::NotFound) => {
                 log_capture(source, "invalid", capture_id);
                 return Err(ApiError::validation("Unknown list"));
             }
@@ -1110,6 +1112,9 @@ pub(super) fn applied_speech(items: &[CaptureItem]) -> String {
                 ListKind::Shopping => format!("Добавил покупку: {titles}."),
                 ListKind::Tasks => format!("Добавил задачу: {titles}."),
                 ListKind::Checklist => format!("Добавил позицию: {titles}."),
+                // 0009-events 6.1: списки событий исключаются из разбора;
+                // до этого у события нейтральный текст, не задача и не покупка.
+                ListKind::Events => format!("Добавил элемент: {titles}."),
             }
         }
         Some(kind) if count <= 3 => {
@@ -1134,6 +1139,12 @@ fn kind_noun(kind: ListKind, count: usize) -> String {
         ListKind::Shopping => crate::telegram::ru::purchases(count as i64),
         ListKind::Tasks => crate::telegram::ru::tasks(count as i64),
         ListKind::Checklist => crate::telegram::ru::positions(count as i64),
+        // 0009-events 6.1: списки событий исключаются из разбора;
+        // до этого — нейтральное «элементы», не задачи и не покупки.
+        ListKind::Events => format!(
+            "{count} {}",
+            crate::telegram::ru::plural(count as i64, "элемент", "элемента", "элементов")
+        ),
     }
 }
 

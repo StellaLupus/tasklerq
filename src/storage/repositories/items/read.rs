@@ -5,8 +5,9 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use super::row::{ITEM_COLUMNS, ItemRow, hydrate_many, load_item, row_by_id};
+use crate::domain::calendar::CalendarItem;
 use crate::domain::error::DomainError;
-use crate::domain::models::Item;
+use crate::domain::models::{Item, ListKind};
 use crate::storage::repositories::lists;
 
 /// Получить активный элемент.
@@ -52,20 +53,27 @@ pub async fn list_by_list(
     hydrate_many(conn, rows).await
 }
 
-/// Задачи со сроком или повторением для календаря.
+/// Задачи и события со сроком или повторением для календаря.
 pub async fn calendar_items(
     conn: &mut PgConnection,
     household_id: Uuid,
-) -> Result<Vec<Item>, DomainError> {
-    let rows = sqlx::query_as::<_, ItemRow>(&format!(
-        "SELECT {ITEM_COLUMNS}
+) -> Result<Vec<CalendarItem>, DomainError> {
+    #[derive(sqlx::FromRow)]
+    struct CalendarRow {
+        #[sqlx(flatten)]
+        item: ItemRow,
+        kind: ListKind,
+    }
+
+    let rows = sqlx::query_as::<_, CalendarRow>(&format!(
+        "SELECT {ITEM_COLUMNS}, l.kind
          FROM items i
          JOIN lists l ON l.id = i.list_id
          WHERE i.household_id = $1
            AND i.deleted_at IS NULL
            AND l.deleted_at IS NULL
            AND NOT l.is_archived
-           AND l.kind = 'tasks'
+           AND l.kind IN ('tasks', 'events')
            AND (i.due_at IS NOT NULL OR i.due_date IS NOT NULL OR i.recurrence_freq IS NOT NULL)
          ORDER BY i.due_date NULLS LAST, i.due_at NULLS LAST, i.id"
     ))
@@ -73,7 +81,15 @@ pub async fn calendar_items(
     .fetch_all(&mut *conn)
     .await?;
 
-    hydrate_many(conn, rows).await
+    let kinds: Vec<ListKind> = rows.iter().map(|row| row.kind).collect();
+    // `hydrate_many` собирает результат в порядке входных строк, поэтому
+    // `zip` возвращает каждый тип списка вместе с его элементом.
+    let items = hydrate_many(conn, rows.into_iter().map(|row| row.item).collect()).await?;
+    Ok(items
+        .into_iter()
+        .zip(kinds)
+        .map(|(item, kind)| CalendarItem { item, kind })
+        .collect())
 }
 
 /// Все неудалённые элементы household вместе с неудалёнными списками.

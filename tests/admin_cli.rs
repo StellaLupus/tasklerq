@@ -273,7 +273,7 @@ async fn household_create_with_owner_creates_owner_and_default_lists() {
     .fetch_one(&db.pool)
     .await
     .expect("lists");
-    assert_eq!(lists, 2, "both default lists are created");
+    assert_eq!(lists, 3, "all three default lists are created");
 
     let users: Vec<(i64, String, String)> = sqlx::query_as(
         "SELECT telegram_user_id, role::text, display_name FROM users

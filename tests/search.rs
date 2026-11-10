@@ -5,8 +5,10 @@ mod support;
 use std::collections::HashSet;
 
 use chrono::{Duration, Utc};
+use support::TestHousehold;
+use support::telegram::{Harness, buttons};
 use tasklerq::domain::error::DomainError;
-use tasklerq::domain::models::{ItemStatus, ListKind};
+use tasklerq::domain::models::{Actor, ItemStatus, ListKind, UserRole};
 use tasklerq::domain::search::{SearchFilters, decode_cursor};
 use tasklerq::storage::repositories::items;
 use uuid::Uuid;
@@ -589,4 +591,105 @@ async fn search_escapes_like_metacharacters() {
     );
     assert!(!ids.contains(&backslash_decoy.id));
     assert!(!ids.contains(&underscore_decoy.id));
+}
+
+// 0009-events 8.4: событие находится по названию.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_finds_an_event_by_title() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+
+    let mut event = support::new_item(household.events_list_id, "Родительское собрание");
+    event.due_at = Some(Utc::now() + Duration::days(1));
+    let event = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        event,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let filters = SearchFilters {
+        q: Some("собрание".into()),
+        ..SearchFilters::default()
+    };
+    let (hits, _) = items::search(&mut conn, household.household_id, "Europe/Moscow", &filters)
+        .await
+        .expect("search by event title");
+    assert_eq!(
+        hits.iter().map(|hit| hit.item.id).collect::<Vec<_>>(),
+        vec![event.id]
+    );
+    assert_eq!(hits[0].list_kind, ListKind::Events);
+}
+
+// 0009-events 8.4: строка события в результатах поиска без отметки выполнения.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn event_row_in_search_results_has_no_completion_mark() {
+    let db = support::db().await;
+    let telegram_id = support::next_telegram_id();
+    let mut bot = Harness::new(&db.pool, telegram_id);
+    bot.text("/start").await;
+    bot.text("Семья").await;
+    bot.press("Москва").await;
+    bot.press("меню").await;
+    let household = telegram_household(&db.pool, telegram_id).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+
+    let mut event = support::new_item(household.events_list_id, "Родительское собрание");
+    event.due_at = Some(Utc::now() + Duration::days(1));
+    support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &actor,
+        event,
+    )
+    .await;
+
+    bot.press("Поиск").await;
+    bot.text("собрание").await;
+    let labels: Vec<String> = buttons(&bot.screen())
+        .into_iter()
+        .map(|(label, _)| label)
+        .filter(|label| label.contains("Родительское собрание"))
+        .collect();
+    assert_eq!(
+        labels,
+        vec!["Родительское собрание · Календарь".to_owned()],
+        "an event row must not carry the open-task or done mark: {labels:?}"
+    );
+}
+
+async fn telegram_household(pool: &sqlx::PgPool, telegram_id: i64) -> TestHousehold {
+    let (household_id, owner_id): (Uuid, Uuid) = sqlx::query_as(
+        "SELECT household_id, id FROM users WHERE telegram_user_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(telegram_id)
+    .fetch_one(pool)
+    .await
+    .expect("user");
+    let list = |kind: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM lists WHERE household_id = $1 AND kind = $2::list_kind AND is_default",
+            )
+            .bind(household_id)
+            .bind(kind)
+            .fetch_one(&pool)
+            .await
+            .expect("list")
+        }
+    };
+    TestHousehold {
+        household_id,
+        owner_id,
+        member_id: owner_id,
+        tasks_list_id: list("tasks").await,
+        shopping_list_id: list("shopping").await,
+        events_list_id: list("events").await,
+    }
 }

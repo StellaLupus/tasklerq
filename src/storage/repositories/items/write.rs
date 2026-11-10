@@ -15,7 +15,7 @@ use crate::domain::recurrence::{Due, parse_timezone, resolve_local, rule_changed
 use crate::domain::validation::{
     MAX_NOTES, MAX_TITLE, ValidatedItem, normalize_due_for_recurrence, normalize_recurrence,
     normalize_subtasks, normalize_tags, normalize_text, normalize_text_allow_empty, normalize_unit,
-    validate_quantity,
+    validate_fields_for_kind, validate_quantity,
 };
 use crate::storage::repositories::{active_member, events, lists, notifications, subtasks, tags};
 
@@ -47,6 +47,8 @@ pub async fn create(
         priority,
         due_at,
         due_date,
+        end_at,
+        end_date,
         quantity,
         unit,
         tags: tag_names,
@@ -80,15 +82,16 @@ pub async fn create(
     sqlx::query(
         "INSERT INTO items (
              id, household_id, list_id, title, notes, status, priority, due_at, due_date,
-             assignee_user_id, created_by_user_id, source, quantity, unit, position,
-             recurrence_freq, recurrence_interval, recurrence_byweekday, recurrence_until,
-             recurrence_timezone, recurrence_anchor_date, recurrence_month_rule,
-             recurrence_occurrence_date, recurrence_occurrence_time, created_at, updated_at
+             end_at, end_date, assignee_user_id, created_by_user_id, source, quantity, unit,
+             position, recurrence_freq, recurrence_interval, recurrence_byweekday,
+             recurrence_until, recurrence_timezone, recurrence_anchor_date,
+             recurrence_month_rule, recurrence_occurrence_date, recurrence_occurrence_time,
+             created_at, updated_at
          )
          VALUES (
-             $1, $2, $3, $4, $5, 'open', $6, $7, $8, $9, $10, $11,
-             $12::float8::numeric, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
-             $23, $24, $24
+             $1, $2, $3, $4, $5, 'open', $6, $7, $8, $9, $10, $11, $12, $13,
+             $14::float8::numeric, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24,
+             $25, $26, $26
          )",
     )
     .bind(item_id)
@@ -99,6 +102,8 @@ pub async fn create(
     .bind(priority)
     .bind(due_at)
     .bind(due_date)
+    .bind(end_at)
+    .bind(end_date)
     .bind(assignee_user_id)
     .bind(actor.user_id)
     .bind(source)
@@ -292,6 +297,33 @@ async fn update_inner(
     // того же срока не должен переякоривать серию и терять слот вхождения.
     let due_changed = due_at != row.due_at || due_date != row.due_date;
 
+    let mut end_at = row.end_at;
+    let mut end_date = row.end_date;
+    if patch.end_at.is_set() && patch.end_date.is_set() {
+        return Err(DomainError::Validation(
+            "end_at and end_date are mutually exclusive".into(),
+        ));
+    }
+    match patch.end_at {
+        Field::Missing => {}
+        Field::Null => {
+            end_at = None;
+        }
+        Field::Value(value) => {
+            end_at = Some(value);
+            end_date = None;
+        }
+    }
+    match patch.end_date {
+        Field::Missing => {}
+        Field::Null => {
+            end_date = None;
+        }
+        Field::Value(value) => {
+            end_date = Some(value);
+            end_at = None;
+        }
+    }
     let old_recurrence = row.recurrence();
     let mut recurrence = old_recurrence.clone();
     let today = local_today(household_timezone, now)?;
@@ -312,9 +344,10 @@ async fn update_inner(
         }
         Field::Null => recurrence = None,
         Field::Value(input) => {
-            if target_list.kind != ListKind::Tasks {
+            // Повторение доступно задачам и событиям по одним правилам.
+            if !matches!(target_list.kind, ListKind::Tasks | ListKind::Events) {
                 return Err(DomainError::Validation(
-                    "recurrence is only allowed for task lists".into(),
+                    "recurrence is only allowed for task and event lists".into(),
                 ));
             }
             let mut normalized =
@@ -406,21 +439,67 @@ async fn update_inner(
         }
     }
 
-    let (quantity, unit) = if target_list.kind == ListKind::Tasks {
-        (None, None)
-    } else {
-        let quantity = match patch.quantity {
-            Field::Missing => row.quantity.unwrap_or(1.0),
-            Field::Null => 1.0,
-            Field::Value(value) => value,
-        };
-        let quantity = validate_quantity(Some(quantity))?;
-        let unit = match patch.unit {
-            Field::Missing => row.unit.clone().unwrap_or_else(|| "шт".into()),
-            Field::Null => "шт".into(),
-            Field::Value(value) => normalize_unit(Some(value)),
-        };
-        (Some(quantity), Some(unit))
+    // 0009-events 3.3: перенос начала события без конца в том же патче
+    // сохраняет длительность — конец сдвигается на ту же величину. Явно
+    // переданный конец (значение или очистка) применяется как есть. Смена вида
+    // начала не сдвигает конец другого вида: её отклонит проверка полей.
+    //
+    // Условие считается по итоговым `due_*` после нормализации: смена только
+    // `month_rule = last_day` тоже передвигает начало, хотя `due_changed` до
+    // нормализации ещё не выставлен. Иначе конец остался бы на прежней дате и
+    // длительность события изменилась бы.
+    let start_changed = due_at != row.due_at || due_date != row.due_date;
+    let shift_end_with_start = target_list.kind == ListKind::Events
+        && start_changed
+        && patch.end_at.is_missing()
+        && patch.end_date.is_missing();
+
+    // Сдвиг конца от итогового начала: после нормализации `last_day` начало
+    // может переехать на конец месяца, и длительность сохраняется от него.
+    if shift_end_with_start {
+        if let (Some(old_start), Some(new_start)) = (row.due_at, due_at) {
+            let shift = new_start - old_start;
+            end_at = row
+                .end_at
+                .map(|old_end| {
+                    old_end
+                        .checked_add_signed(shift)
+                        .ok_or_else(|| DomainError::Validation("event end is out of range".into()))
+                })
+                .transpose()?;
+        }
+        if let (Some(old_start), Some(new_start)) = (row.due_date, due_date) {
+            let shift = new_start - old_start;
+            end_date = row
+                .end_date
+                .map(|old_end| {
+                    old_end
+                        .checked_add_signed(shift)
+                        .ok_or_else(|| DomainError::Validation("event end is out of range".into()))
+                })
+                .transpose()?;
+        }
+    }
+
+    // У события нет полей покупки: количество и единица не поддерживаются.
+    let quantity_supplied = matches!(&patch.quantity, Field::Value(_));
+    let unit_supplied = matches!(&patch.unit, Field::Value(_));
+    let (quantity, unit) = match target_list.kind {
+        ListKind::Tasks | ListKind::Events => (None, None),
+        _ => {
+            let quantity = match patch.quantity {
+                Field::Missing => row.quantity.unwrap_or(1.0),
+                Field::Null => 1.0,
+                Field::Value(value) => value,
+            };
+            let quantity = validate_quantity(Some(quantity))?;
+            let unit = match patch.unit {
+                Field::Missing => row.unit.clone().unwrap_or_else(|| "шт".into()),
+                Field::Null => "шт".into(),
+                Field::Value(value) => normalize_unit(Some(value)),
+            };
+            (Some(quantity), Some(unit))
+        }
     };
 
     let assignee_user_id = match patch.assignee_user_id {
@@ -445,6 +524,18 @@ async fn update_inner(
             })
             .collect(),
     };
+
+    validate_fields_for_kind(
+        target_list.kind,
+        due_at,
+        due_date,
+        end_at,
+        end_date,
+        priority,
+        quantity_supplied,
+        unit_supplied,
+        !subtask_inputs.is_empty(),
+    )?;
 
     let (
         recurrence_freq,
@@ -478,6 +569,8 @@ async fn update_inner(
         && priority == current.priority
         && due_at == current.due_at
         && due_date == current.due_date
+        && end_at == current.end_at
+        && end_date == current.end_date
         && assignee_user_id == current.assignee_user_id
         && quantity == current.quantity
         && unit == current.unit
@@ -494,14 +587,14 @@ async fn update_inner(
     sqlx::query(
         "UPDATE items
          SET list_id = $3, title = $4, notes = $5, priority = $6,
-             due_at = $7, due_date = $8, assignee_user_id = $9,
-             quantity = $10::float8::numeric, unit = $11,
-             recurrence_freq = $12, recurrence_interval = $13,
-             recurrence_byweekday = $14, recurrence_until = $15,
-             recurrence_timezone = $16, recurrence_anchor_date = $17,
-             recurrence_month_rule = $18, recurrence_occurrence_date = $19,
-             recurrence_occurrence_time = $20,
-             version = version + 1, updated_at = $21
+             due_at = $7, due_date = $8, end_at = $9, end_date = $10,
+             assignee_user_id = $11, quantity = $12::float8::numeric, unit = $13,
+             recurrence_freq = $14, recurrence_interval = $15,
+             recurrence_byweekday = $16, recurrence_until = $17,
+             recurrence_timezone = $18, recurrence_anchor_date = $19,
+             recurrence_month_rule = $20, recurrence_occurrence_date = $21,
+             recurrence_occurrence_time = $22,
+             version = version + 1, updated_at = $23
          WHERE id = $1 AND household_id = $2 AND deleted_at IS NULL",
     )
     .bind(item_id)
@@ -512,6 +605,8 @@ async fn update_inner(
     .bind(priority)
     .bind(due_at)
     .bind(due_date)
+    .bind(end_at)
+    .bind(end_date)
     .bind(assignee_user_id)
     .bind(quantity)
     .bind(&unit)

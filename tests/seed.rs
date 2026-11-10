@@ -30,10 +30,30 @@ async fn seed_is_idempotent_and_creates_demo_data() {
     let second = counts(&db.pool).await;
     assert_eq!(first, second, "repeated seed must not create duplicates");
 
+    // База после миграции 0017: «Календарь» уже есть со случайным UUID.
+    // Seed не должен падать на уникальности имени и default-списка событий.
+    sqlx::query(
+        "UPDATE lists
+         SET id = gen_random_uuid()
+         WHERE kind = 'events'
+           AND household_id = (SELECT id FROM households WHERE name = 'Демо-семья')",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("simulate the migration-created calendar");
+    seed::run(&db.pool)
+        .await
+        .expect("seed over a migrated database");
+    let migrated = counts(&db.pool).await;
+    assert_eq!(
+        second, migrated,
+        "seed must stay idempotent when the events list came from 0017"
+    );
+
     let (households, users, lists, items, subtasks, item_tags, events) = first;
     assert_eq!(households, 1);
     assert_eq!(users, 2);
-    assert_eq!(lists, 2);
+    assert_eq!(lists, 3);
     assert_eq!(items, 5);
     assert_eq!(subtasks, 2);
     assert_eq!(item_tags, 2);

@@ -312,6 +312,8 @@ fn validate_item_in(
                 priority,
                 due_at,
                 due_date,
+                end_at: None,
+                end_date: None,
                 assignee_user_id,
                 source,
                 quantity,
@@ -524,6 +526,7 @@ fn validate_recurrence(
     let Schedule { start, .. } = schedule;
     let errors_before = errors.len();
 
+    // 0009-events 5.1: повторение станет доступно и спискам событий.
     if list_kind != ListKind::Tasks {
         fail(
             errors,

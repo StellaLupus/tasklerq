@@ -367,7 +367,9 @@ pub async fn clear_undo(
     }
     let kind_ok = lists::get_visible(&mut *ctx.conn, household_id, list_id)
         .await
-        .map(|list| list.kind != ListKind::Tasks)
+        // Отмена очистки возвращает в список покупок или чек-лист; у задач и
+        // событий такого экрана нет, поэтому открывается меню.
+        .map(|list| matches!(list.kind, ListKind::Shopping | ListKind::Checklist))
         .unwrap_or(false);
     let target = if kind_ok {
         Screen::List {

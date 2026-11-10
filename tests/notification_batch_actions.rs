@@ -4,11 +4,74 @@ mod support;
 
 use chrono::{DateTime, Duration, Utc};
 use support::notifications::*;
-use support::telegram::buttons;
-use tasklerq::domain::models::{Actor, RecurrenceFreq, UserRole};
+use support::telegram::{Harness, buttons};
+use tasklerq::domain::models::{Actor, Item, RecurrenceFreq, UserRole};
 use tasklerq::jobs::scheduler::occurrence_key;
 use tasklerq::storage::repositories::items;
+use tasklerq::telegram::bot::model::Action;
+use tasklerq::telegram::callbacks::{self, NewToken, Scope};
 use uuid::Uuid;
+
+async fn create_event(
+    pool: &sqlx::PgPool,
+    household: &support::TestHousehold,
+    title: &str,
+    due_at: DateTime<Utc>,
+    end_at: DateTime<Utc>,
+) -> Item {
+    let mut item = support::new_item(household.events_list_id, title);
+    item.due_at = Some(due_at);
+    item.end_at = Some(end_at);
+    item.assignee_user_id = Some(household.owner_id);
+    support::create_item(
+        pool,
+        household,
+        household.events_list_id,
+        &Actor::user(household.owner_id, UserRole::Owner),
+        item,
+    )
+    .await
+}
+
+fn labels(html: &str) -> Vec<String> {
+    buttons(html).into_iter().map(|(label, _)| label).collect()
+}
+
+async fn latest_batch_id(pool: &sqlx::PgPool, chat: i64) -> Uuid {
+    sqlx::query_scalar(
+        "SELECT id FROM notification_batches WHERE chat_id = $1
+         ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(chat)
+    .fetch_one(pool)
+    .await
+    .expect("batch id")
+}
+
+/// Токен действия сводного сообщения, как у кнопки до перерисовки.
+///
+/// Общие кнопки исчезают из сообщения, когда подходящих блоков не остаётся,
+/// поэтому повторное нажатие проверяется токеном, выпущенным вручную.
+async fn batch_action_token(
+    pool: &sqlx::PgPool,
+    bot: &Harness,
+    household: &support::TestHousehold,
+    action: Action,
+) -> String {
+    let specs = [NewToken {
+        telegram_user_id: bot.chat,
+        household_id: Some(household.household_id),
+        scope: Scope::Notice,
+        action: action.name(),
+        payload: serde_json::to_value(&action).expect("payload"),
+        version: action.version(),
+    }];
+    let mut conn = pool.acquire().await.expect("conn");
+    callbacks::issue_many(&mut conn, &specs, bot.now)
+        .await
+        .expect("batch action token")
+        .remove(0)
+}
 
 async fn snooze_origin_rows(
     pool: &sqlx::PgPool,
@@ -154,7 +217,22 @@ async fn snooze_all_creates_one_more_batch_and_repeat_adds_no_deliveries() {
     assert_eq!(snooze_rows(second.id).await.len(), 1);
 
     let (_, edited) = bot.latest();
-    let again = button_of(&edited, "Отложить все на час");
+    assert!(
+        !edited.contains("Отложить все на час"),
+        "no open task blocks left: {edited}"
+    );
+    assert_eq!(snooze_rows(first.id).await.len(), 1);
+    assert_eq!(snooze_rows(second.id).await.len(), 1);
+
+    // Повторное нажатие по тому же токену не создаёт новых доставок.
+    let batch_id = latest_batch_id(&db.pool, bot.chat).await;
+    let again = batch_action_token(
+        &db.pool,
+        &bot,
+        &household,
+        Action::BatchSnoozeAll { batch_id },
+    )
+    .await;
     bot.press_data(&again, message_id).await;
     assert_eq!(snooze_rows(first.id).await.len(), 1);
     assert_eq!(snooze_rows(second.id).await.len(), 1);
@@ -694,11 +772,23 @@ async fn complete_all_moves_a_recurring_task_by_one_occurrence_and_repeat_change
     assert_eq!(item_status(&db.pool, plain.id).await.0, "done");
 
     let (_, edited) = bot.latest();
-    let again = button_of(&edited, "Выполнить все");
+    assert!(
+        !edited.contains("Выполнить все"),
+        "no actionable task blocks left: {edited}"
+    );
+    let batch_id = latest_batch_id(&db.pool, bot.chat).await;
+    let again = batch_action_token(
+        &db.pool,
+        &bot,
+        &household,
+        Action::BatchCompleteAll { batch_id },
+    )
+    .await;
     bot.press_data(&again, message_id).await;
     assert_eq!(item_status(&db.pool, recurring.id).await.1, version);
     assert_eq!(item_status(&db.pool, recurring.id).await.2, next_due);
     assert_eq!(completed_events(&db.pool, recurring.id).await, 1);
+    assert_eq!(item_status(&db.pool, plain.id).await.0, "done");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -882,8 +972,10 @@ async fn complete_all_keeps_done_missing_and_archived_blocks_unchanged() {
     assert!(after.contains("Задача удалена"), "{after}");
     assert!(after.contains("Список в архиве"), "{after}");
 
-    let again = button_of(&after, "Выполнить все");
-    bot.press_data(&again, message_id).await;
+    assert!(
+        !after.contains("Выполнить все"),
+        "no actionable task blocks left: {after}"
+    );
     // Кнопки получают новые callback-токены на каждую отрисовку: сравниваем
     // видимую часть сообщения.
     let visible = |html: &str| {
@@ -892,6 +984,27 @@ async fn complete_all_keeps_done_missing_and_archived_blocks_unchanged() {
             .unwrap_or(html)
             .to_owned()
     };
+    // Повторное нажатие по тому же токену не трогает выполненные, удалённые и
+    // архивные блоки.
+    let batch_id = latest_batch_id(&db.pool, bot.chat).await;
+    let again = batch_action_token(
+        &db.pool,
+        &bot,
+        &household,
+        Action::BatchCompleteAll { batch_id },
+    )
+    .await;
+    bot.press_data(&again, message_id).await;
+    assert_eq!(item_status(&db.pool, done.id).await.1, done_version);
+    assert_eq!(item_status(&db.pool, archived.id).await.1, archived_version);
+    assert_eq!(item_status(&db.pool, archived.id).await.0, "open");
+    let deleted_at: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT deleted_at FROM items WHERE id = $1")
+            .bind(deleted.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("deleted item");
+    assert!(deleted_at.is_some());
     assert_eq!(
         visible(&batch_message(&bot, message_id)),
         visible(&after),
@@ -1254,4 +1367,451 @@ async fn complete_all_with_a_snoozed_recurring_block_cancels_the_snooze() {
         "the cancelled snooze must not arrive in an hour"
     );
     assert_eq!(snooze_rows(&db.pool, recurring.id).await[0].0, "cancelled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn complete_all_with_mixed_blocks_leaves_the_event_untouched() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = bot.now.with_timezone(&moscow).date_naive();
+    let morning = local_utc(moscow, day, 8, 0);
+    let due = local_utc(moscow, day, 9, 0);
+    let event_start = local_utc(moscow, day, 10, 0);
+    let first = create_task(&db.pool, &household, "Первая", due, None).await;
+    let second = create_task(&db.pool, &household, "Вторая", due, None).await;
+    let event = create_event(
+        &db.pool,
+        &household,
+        "Маникюр",
+        event_start,
+        event_start + Duration::hours(1),
+    )
+    .await;
+    deferred_reminder(&db.pool, &household, first.id, due, morning).await;
+    deferred_reminder(&db.pool, &household, second.id, due, morning).await;
+    deferred_reminder(&db.pool, &household, event.id, event_start, morning).await;
+
+    tick_and_deliver(&mut bot, &db.pool, morning).await;
+    let (message_id, html) = bot.latest();
+    assert!(html.contains("Маникюр"), "{html}");
+    let labels = labels(&html);
+    assert_eq!(
+        labels
+            .iter()
+            .filter(|label| label.contains("Перенести"))
+            .count(),
+        1,
+        "the event block has its own move button: {labels:?}"
+    );
+    assert_eq!(
+        labels
+            .iter()
+            .filter(|label| label.contains("Открыть"))
+            .count(),
+        3,
+        "{labels:?}"
+    );
+    assert_eq!(
+        labels
+            .iter()
+            .filter(|label| label.contains("Выполнено"))
+            .count(),
+        2,
+        "only task blocks offer «Выполнено»: {labels:?}"
+    );
+    assert_eq!(
+        labels
+            .iter()
+            .filter(|label| label.contains("На час"))
+            .count(),
+        2,
+        "only task blocks offer «На час»: {labels:?}"
+    );
+
+    let event_before = item_status(&db.pool, event.id).await;
+    bot.press_data(&button_of(&html, "Выполнить все"), message_id)
+        .await;
+
+    assert_eq!(item_status(&db.pool, first.id).await.0, "done");
+    assert_eq!(item_status(&db.pool, second.id).await.0, "done");
+    assert_eq!(
+        item_status(&db.pool, event.id).await,
+        event_before,
+        "«Выполнить все» must not touch an event"
+    );
+    assert_eq!(completed_events(&db.pool, event.id).await, 0);
+
+    let (_, edited) = bot.latest();
+    assert!(edited.contains("Выполнено 2"), "{edited}");
+    assert_eq!(block_count(&edited, "✅ Выполнено"), 2, "{edited}");
+    assert_eq!(block_count(&edited, "📅 Перенести"), 1, "{edited}");
+    assert!(edited.contains("Маникюр"), "{edited}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snooze_all_with_mixed_blocks_creates_no_event_snooze() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = bot.now.with_timezone(&moscow).date_naive();
+    let morning = local_utc(moscow, day, 8, 0);
+    let due = local_utc(moscow, day, 9, 0);
+    let event_start = local_utc(moscow, day, 10, 0);
+    let task = create_task(&db.pool, &household, "Позвонить маме", due, None).await;
+    let event = create_event(
+        &db.pool,
+        &household,
+        "Маникюр",
+        event_start,
+        event_start + Duration::hours(1),
+    )
+    .await;
+    deferred_reminder(&db.pool, &household, task.id, due, morning).await;
+    deferred_reminder(&db.pool, &household, event.id, event_start, morning).await;
+
+    tick_and_deliver(&mut bot, &db.pool, morning).await;
+    let (message_id, html) = bot.latest();
+    assert!(html.contains("Маникюр"), "{html}");
+    let event_before = item_status(&db.pool, event.id).await;
+
+    bot.press_data(&button_of(&html, "Отложить все на час"), message_id)
+        .await;
+
+    let task_rows = snooze_rows(&db.pool, task.id).await;
+    assert_eq!(task_rows.len(), 1, "{task_rows:?}");
+    assert_eq!(task_rows[0].0, "pending", "{task_rows:?}");
+    assert!(
+        snooze_rows(&db.pool, event.id).await.is_empty(),
+        "«Отложить все на час» must not snooze an event"
+    );
+    assert_eq!(item_status(&db.pool, event.id).await, event_before);
+
+    let (_, edited) = bot.latest();
+    assert_eq!(block_count(&edited, "😴 Напомню в"), 1, "{edited}");
+    assert_eq!(block_count(&edited, "📅 Перенести"), 1, "{edited}");
+    assert!(edited.contains("Маникюр"), "{edited}");
+
+    // Через час приходит обычное напоминание только о задаче.
+    let snoozed_at = task_rows[0].1;
+    assert_eq!(
+        tick_and_deliver(&mut bot, &db.pool, snoozed_at)
+            .await
+            .delivered,
+        1
+    );
+    let (_, next) = bot.latest();
+    assert!(next.contains("Позвонить маме"), "{next}");
+    assert!(
+        !next.contains("Маникюр"),
+        "a snoozed event reminder must not be created: {next}"
+    );
+    assert!(snooze_rows(&db.pool, event.id).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moving_an_event_block_opens_the_event_quick_due_screen() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = bot.now.with_timezone(&moscow).date_naive();
+    let morning = local_utc(moscow, day, 8, 0);
+    let due = local_utc(moscow, day, 9, 0);
+    let event_start = local_utc(moscow, day, 10, 0);
+    let task = create_task(&db.pool, &household, "Позвонить маме", due, None).await;
+    let event = create_event(
+        &db.pool,
+        &household,
+        "Маникюр",
+        event_start,
+        event_start + Duration::hours(1),
+    )
+    .await;
+    deferred_reminder(&db.pool, &household, task.id, due, morning).await;
+    deferred_reminder(&db.pool, &household, event.id, event_start, morning).await;
+
+    tick_and_deliver(&mut bot, &db.pool, morning).await;
+    let (message_id, html) = bot.latest();
+    bot.press_data(&button_of(&html, "Перенести"), message_id)
+        .await;
+
+    bot.assert_screen_contains("Срок");
+    for label in ["Сегодня", "Завтра", "📅 Дата и время"] {
+        bot.assert_has_button(label);
+    }
+    assert!(
+        bot.find_button("Без срока").is_none(),
+        "an event has no «Без срока» in the quick due screen:\n{}",
+        bot.screen()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moving_a_deleted_event_block_reports_it_as_an_event() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = bot.now.with_timezone(&moscow).date_naive();
+    let morning = local_utc(moscow, day, 8, 0);
+    let due = local_utc(moscow, day, 9, 0);
+    let event_start = local_utc(moscow, day, 10, 0);
+    let task = create_task(&db.pool, &household, "Позвонить маме", due, None).await;
+    let event = create_event(
+        &db.pool,
+        &household,
+        "Маникюр",
+        event_start,
+        event_start + Duration::hours(1),
+    )
+    .await;
+    deferred_reminder(&db.pool, &household, task.id, due, morning).await;
+    deferred_reminder(&db.pool, &household, event.id, event_start, morning).await;
+
+    tick_and_deliver(&mut bot, &db.pool, morning).await;
+    let (message_id, html) = bot.latest();
+    let move_button = button_of(&html, "Перенести");
+    let mut conn = db.pool.acquire().await.expect("conn");
+    items::soft_delete(
+        &mut conn,
+        household.household_id,
+        &Actor::user(household.owner_id, UserRole::Owner),
+        event.id,
+        bot.now,
+    )
+    .await
+    .expect("delete event");
+
+    bot.press_data(&move_button, message_id).await;
+    let toast = bot
+        .fake
+        .answers()
+        .last()
+        .expect("callback answer")
+        .1
+        .clone();
+    assert_eq!(toast.as_deref(), Some("Событие больше недоступно"));
+    let batch = batch_message(&bot, message_id);
+    assert!(batch.contains("Событие удалено"), "{batch}");
+    assert!(
+        !batch.contains("Задача удалена"),
+        "a deleted event must not be called a task: {batch}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn event_only_batch_hides_common_task_actions() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = bot.now.with_timezone(&moscow).date_naive();
+    let morning = local_utc(moscow, day, 8, 0);
+    let first_start = local_utc(moscow, day, 10, 0);
+    let second_start = local_utc(moscow, day, 11, 0);
+    let first = create_event(
+        &db.pool,
+        &household,
+        "Маникюр",
+        first_start,
+        first_start + Duration::hours(1),
+    )
+    .await;
+    let second = create_event(
+        &db.pool,
+        &household,
+        "Стрижка",
+        second_start,
+        second_start + Duration::hours(1),
+    )
+    .await;
+    deferred_reminder(&db.pool, &household, first.id, first_start, morning).await;
+    deferred_reminder(&db.pool, &household, second.id, second_start, morning).await;
+
+    tick_and_deliver(&mut bot, &db.pool, morning).await;
+    let (_, html) = bot.latest();
+    assert!(html.contains("Пока были тихие часы"), "{html}");
+    assert_eq!(block_count(&html, "📅 Перенести"), 2, "{html}");
+    let labels = labels(&html);
+    assert!(
+        !labels.iter().any(|label| label.contains("Выполнить все")),
+        "no task blocks: {labels:?}"
+    );
+    assert!(
+        !labels
+            .iter()
+            .any(|label| label.contains("Отложить все на час")),
+        "no task blocks: {labels:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_complete_and_snooze_tokens_on_an_event_block_refuse_and_change_nothing() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = bot.now.with_timezone(&moscow).date_naive();
+    let morning = local_utc(moscow, day, 8, 0);
+    let due = local_utc(moscow, day, 9, 0);
+    let event_start = local_utc(moscow, day, 10, 0);
+    let task = create_task(&db.pool, &household, "Позвонить маме", due, None).await;
+    let event = create_event(
+        &db.pool,
+        &household,
+        "Маникюр",
+        event_start,
+        event_start + Duration::hours(1),
+    )
+    .await;
+    deferred_reminder(&db.pool, &household, task.id, due, morning).await;
+    deferred_reminder(&db.pool, &household, event.id, event_start, morning).await;
+
+    tick_and_deliver(&mut bot, &db.pool, morning).await;
+    let (message_id, _) = bot.latest();
+    let batch_id = latest_batch_id(&db.pool, bot.chat).await;
+    let before = item_status(&db.pool, event.id).await;
+    for (action, refusal) in [
+        (
+            Action::BatchComplete {
+                batch_id,
+                item_id: event.id,
+                version: event.version,
+            },
+            "Событие нельзя выполнить",
+        ),
+        (
+            Action::BatchSnooze {
+                batch_id,
+                item_id: event.id,
+                version: None,
+            },
+            "Событие нельзя отложить",
+        ),
+    ] {
+        let token = batch_action_token(&db.pool, &bot, &household, action).await;
+        bot.press_data(&token, message_id).await;
+        let toast = bot
+            .fake
+            .answers()
+            .last()
+            .expect("callback answer")
+            .1
+            .clone();
+        assert_eq!(toast.as_deref(), Some(refusal));
+        assert!(
+            snooze_rows(&db.pool, event.id).await.is_empty(),
+            "a stale {refusal:?} on an event block must not create a snooze"
+        );
+        assert_eq!(item_status(&db.pool, event.id).await, before);
+        assert_eq!(completed_events(&db.pool, event.id).await, 0);
+    }
+    let batch = batch_message(&bot, message_id);
+    assert!(!batch.contains("Напомню в"), "{batch}");
+    assert!(!batch.contains("✅ Выполнено"), "{batch}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_actions_on_a_deleted_event_block_report_the_event_is_unavailable() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = bot.now.with_timezone(&moscow).date_naive();
+    let morning = local_utc(moscow, day, 8, 0);
+    let due = local_utc(moscow, day, 9, 0);
+    let event_start = local_utc(moscow, day, 10, 0);
+    let task = create_task(&db.pool, &household, "Позвонить маме", due, None).await;
+    let event = create_event(
+        &db.pool,
+        &household,
+        "Маникюр",
+        event_start,
+        event_start + Duration::hours(1),
+    )
+    .await;
+    deferred_reminder(&db.pool, &household, task.id, due, morning).await;
+    deferred_reminder(&db.pool, &household, event.id, event_start, morning).await;
+
+    tick_and_deliver(&mut bot, &db.pool, morning).await;
+    let (message_id, _) = bot.latest();
+    let batch_id = latest_batch_id(&db.pool, bot.chat).await;
+    let snooze = batch_action_token(
+        &db.pool,
+        &bot,
+        &household,
+        Action::BatchSnooze {
+            batch_id,
+            item_id: event.id,
+            version: None,
+        },
+    )
+    .await;
+    let complete = batch_action_token(
+        &db.pool,
+        &bot,
+        &household,
+        Action::BatchComplete {
+            batch_id,
+            item_id: event.id,
+            version: event.version,
+        },
+    )
+    .await;
+    let mut conn = db.pool.acquire().await.expect("conn");
+    items::soft_delete(
+        &mut conn,
+        household.household_id,
+        &Actor::user(household.owner_id, UserRole::Owner),
+        event.id,
+        bot.now,
+    )
+    .await
+    .expect("delete event");
+    drop(conn);
+    let (version, deleted_at): (i32, Option<DateTime<Utc>>) =
+        sqlx::query_as("SELECT version, deleted_at FROM items WHERE id = $1")
+            .bind(event.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("deleted event");
+    assert!(deleted_at.is_some());
+
+    for token in [&snooze, &complete] {
+        bot.press_data(token, message_id).await;
+        let toast = bot
+            .fake
+            .answers()
+            .last()
+            .expect("callback answer")
+            .1
+            .clone();
+        assert_eq!(toast.as_deref(), Some("Событие больше недоступно"));
+    }
+    assert!(
+        snooze_rows(&db.pool, event.id).await.is_empty(),
+        "a stale action on a deleted event must not create a snooze"
+    );
+    let (after_version, after_deleted_at): (i32, Option<DateTime<Utc>>) =
+        sqlx::query_as("SELECT version, deleted_at FROM items WHERE id = $1")
+            .bind(event.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("deleted event");
+    assert_eq!(after_version, version);
+    assert_eq!(after_deleted_at, deleted_at);
+    assert_eq!(completed_events(&db.pool, event.id).await, 0);
+    let batch = batch_message(&bot, message_id);
+    assert!(batch.contains("Событие удалено"), "{batch}");
+    assert!(!batch.contains("Задача удалена"), "{batch}");
 }

@@ -174,7 +174,7 @@ async fn lock_installation(conn: &mut PgConnection, mode: TenancyMode) -> Result
     Ok(())
 }
 
-/// Вставить household и два списка по умолчанию.
+/// Вставить household и три списка по умолчанию.
 async fn insert_household(
     conn: &mut PgConnection,
     name: &str,
@@ -198,6 +198,7 @@ async fn insert_household(
 
     insert_default_list(conn, household.id, ListKind::Tasks, "Задачи", 0, now).await?;
     insert_default_list(conn, household.id, ListKind::Shopping, "Покупки", 1, now).await?;
+    insert_default_list(conn, household.id, ListKind::Events, "Календарь", 2, now).await?;
 
     Ok(household)
 }

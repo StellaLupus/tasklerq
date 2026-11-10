@@ -54,6 +54,11 @@ pub struct CaptureContext {
 impl CaptureContext {
     /// Собрать контекст из моделей; архивные и удалённые списки и удалённые
     /// участники в него не попадают.
+    ///
+    /// Списки событий исключены (0009-events 6.1): разбор не создаёт события,
+    /// поэтому их нет ни в промпте, ни среди целевых списков элементов
+    /// черновика. Выбор целевого списка и промпт берут списки отсюда, так что
+    /// одного фильтра достаточно.
     pub fn new(
         timezone: &str,
         now: DateTime<Utc>,
@@ -62,7 +67,9 @@ impl CaptureContext {
     ) -> Result<Self, DomainError> {
         let lists = lists
             .iter()
-            .filter(|list| !list.is_archived && list.deleted_at.is_none())
+            .filter(|list| {
+                !list.is_archived && list.deleted_at.is_none() && list.kind != ListKind::Events
+            })
             .map(|list| ListRef {
                 id: list.id,
                 name: list.name.clone(),
@@ -117,5 +124,33 @@ impl CaptureContext {
             .clone()
             .find(|list| list.is_default)
             .or_else(|| of_kind.next())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture::test_support::{model_list, now};
+
+    #[test]
+    fn event_lists_are_not_part_of_the_capture_context() {
+        let lists = vec![
+            model_list("Задачи", ListKind::Tasks, true),
+            model_list("Покупки", ListKind::Shopping, true),
+            model_list("Календарь", ListKind::Events, true),
+        ];
+
+        let context =
+            CaptureContext::new("Europe/Moscow", now(), &lists, &[]).expect("context is valid");
+
+        assert_eq!(
+            context
+                .lists
+                .iter()
+                .map(|list| list.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Задачи", "Покупки"]
+        );
+        assert!(context.default_list(ListKind::Events).is_none());
     }
 }

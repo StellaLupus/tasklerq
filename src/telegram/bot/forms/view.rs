@@ -1,6 +1,6 @@
 //! Экраны форм.
 
-use crate::domain::models::{ItemPriority, MonthRule, RecurrenceFreq};
+use crate::domain::models::{ItemPriority, ListKind, MonthRule, RecurrenceFreq};
 use crate::domain::validation::{MAX_SUBTASKS, MAX_TAGS};
 use crate::storage::repositories::{tags, users};
 use crate::telegram::rich::{Button, button};
@@ -124,14 +124,21 @@ pub(super) fn units_row(ui: Ui) -> Ui {
     ])
 }
 
-pub(super) fn prompt_title(step: Step, shopping: bool) -> &'static str {
+pub(super) fn prompt_title(step: Step, kind: ListKind) -> &'static str {
+    let events = kind == ListKind::Events;
+    let shopping = !matches!(kind, ListKind::Tasks | ListKind::Events);
     match step {
         Step::List => "В какой список?",
+        Step::Title if events => "Как назвать событие?",
         Step::Title if shopping => "Что купить?",
         Step::Title => "Как назвать задачу?",
+        Step::Due if events => "Когда начало?",
         Step::Due => "Когда сделать?",
+        Step::DueText if events => "Введите начало",
         Step::DueText => "Введите срок",
+        Step::End | Step::EndText => "Когда конец?",
         Step::Priority => "Какой приоритет?",
+        Step::Assignee if events => "Чьё событие?",
         Step::Assignee => "Кто исполнитель?",
         Step::Tags => "Теги",
         Step::NewTag => "Новый тег",
@@ -142,6 +149,7 @@ pub(super) fn prompt_title(step: Step, shopping: bool) -> &'static str {
         Step::Interval => "Повторять каждые сколько?",
         Step::Quantity => "Сколько?",
         Step::Unit => "В чём измерять?",
+        Step::Notes if events => "Заметка",
         Step::Notes => "Описание",
     }
 }
@@ -150,6 +158,7 @@ pub(super) fn prompt_hint(step: Step, draft: &ItemDraft) -> String {
     match step {
         Step::Title => "Отправьте название сообщением (до 200 символов).".to_owned(),
         Step::DueText => ru::DUE_HINT.to_owned(),
+        Step::EndText => ru::END_HINT.to_owned(),
         Step::NewTag => "Отправьте название тега (до 32 символов).".to_owned(),
         Step::Subtasks => format!(
             "Отправьте название подзадачи, чтобы добавить (до {MAX_SUBTASKS}). Сейчас: {}.",
@@ -169,19 +178,27 @@ pub(super) async fn choice_buttons(
     mut ui: Ui,
     step: Step,
     draft: &ItemDraft,
+    kind: ListKind,
 ) -> Result<Ui, Fail> {
     let household_id = ctx.household()?.id;
     match step {
         Step::Due => {
-            ui = ui
-                .row(vec![
-                    choose("Сегодня", Choice::DueToday),
-                    choose("Завтра", Choice::DueTomorrow),
-                ])
-                .row(vec![
-                    go_step("📅 Дата и время", Step::DueText),
-                    choose("Без срока", Choice::DueNone),
-                ]);
+            ui = ui.row(vec![
+                choose("Сегодня", Choice::DueToday),
+                choose("Завтра", Choice::DueTomorrow),
+            ]);
+            let mut row = vec![go_step("📅 Дата и время", Step::DueText)];
+            // У события начало обязательно, «Без срока» ему не предлагается.
+            if kind != ListKind::Events {
+                row.push(choose("Без срока", Choice::DueNone));
+            }
+            ui = ui.row(row);
+        }
+        Step::End => {
+            ui = ui.row(vec![
+                go_step("📅 Дата и время", Step::EndText),
+                choose("Без конца", Choice::EndNone),
+            ]);
         }
         Step::Priority => {
             ui = ui
@@ -309,6 +326,7 @@ pub(super) async fn choice_buttons(
         Step::List
         | Step::Title
         | Step::DueText
+        | Step::EndText
         | Step::NewTag
         | Step::Interval
         | Step::Quantity

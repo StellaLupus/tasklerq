@@ -2,7 +2,7 @@
 
 mod support;
 
-use chrono::Utc;
+use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::PgConnection;
 use uuid::Uuid;
 
@@ -14,6 +14,44 @@ fn error_code(error: &sqlx::Error) -> Option<String> {
         sqlx::Error::Database(database) => database.code().map(|code| code.into_owned()),
         _ => None,
     }
+}
+
+fn constraint_name(error: &sqlx::Error) -> Option<String> {
+    match error {
+        sqlx::Error::Database(database) => database.constraint().map(str::to_owned),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_item_with_ends(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    list_id: Uuid,
+    suffix: &str,
+    due_at: Option<DateTime<Utc>>,
+    due_date: Option<NaiveDate>,
+    end_at: Option<DateTime<Utc>>,
+    end_date: Option<NaiveDate>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO items (
+             id, household_id, list_id, title, status, priority, source,
+             due_at, due_date, end_at, end_date, position, version
+         )
+         VALUES ($1, $2, $3, $4, 'open', 'normal', 'api', $5, $6, $7, $8, 0, 1)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(household_id)
+    .bind(list_id)
+    .bind(format!("item {suffix}"))
+    .bind(due_at)
+    .bind(due_date)
+    .bind(end_at)
+    .bind(end_date)
+    .execute(conn)
+    .await
+    .map(|_| ())
 }
 
 async fn insert_minimal_item(
@@ -149,6 +187,143 @@ async fn item_checks_reject_invalid_rows() {
     )
     .await
     .expect("valid item should insert");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn event_end_columns_are_checked_by_the_database() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let due_at = "2026-11-11T14:00:00Z"
+        .parse::<DateTime<Utc>>()
+        .expect("due_at");
+    let end_after = "2026-11-11T15:30:00Z"
+        .parse::<DateTime<Utc>>()
+        .expect("end_at");
+    let end_equal = due_at;
+    let end_before = "2026-11-11T13:00:00Z"
+        .parse::<DateTime<Utc>>()
+        .expect("end_at");
+    let due_date = NaiveDate::from_ymd_opt(2026, 11, 11).expect("due_date");
+    let end_same_day = due_date;
+    let end_before_day = NaiveDate::from_ymd_opt(2026, 11, 10).expect("end_date");
+
+    let cases = [
+        (
+            "end_at without due_at",
+            None,
+            None,
+            Some(end_after),
+            None,
+            "items_end_at_after_due_at",
+        ),
+        (
+            "end_at equal to due_at",
+            Some(due_at),
+            None,
+            Some(end_equal),
+            None,
+            "items_end_at_after_due_at",
+        ),
+        (
+            "end_at before due_at",
+            Some(due_at),
+            None,
+            Some(end_before),
+            None,
+            "items_end_at_after_due_at",
+        ),
+        (
+            "end_date without due_date",
+            None,
+            None,
+            None,
+            Some(end_same_day),
+            "items_end_date_not_before_due_date",
+        ),
+        (
+            "end_date before due_date",
+            None,
+            Some(due_date),
+            None,
+            Some(end_before_day),
+            "items_end_date_not_before_due_date",
+        ),
+        // `items_end_exclusive` избыточно: оба конца одновременно требовали бы
+        // и `due_at`, и `due_date`, а их запрещает `items_due_exclusive`.
+        // В этом случае нарушено и `items_end_date_not_before_due_date`
+        // (`end_date` задан без `due_date`), и PostgreSQL сообщает его, а не
+        // `items_end_exclusive`.
+        (
+            "both end_at and end_date",
+            Some(due_at),
+            None,
+            Some(end_after),
+            Some(end_same_day),
+            "items_end_date_not_before_due_date",
+        ),
+    ];
+
+    for (suffix, due_at, due_date, end_at, end_date, constraint) in cases {
+        let error = insert_item_with_ends(
+            &mut conn,
+            household.household_id,
+            household.tasks_list_id,
+            suffix,
+            due_at,
+            due_date,
+            end_at,
+            end_date,
+        )
+        .await
+        .expect_err(suffix);
+        assert_eq!(error_code(&error).as_deref(), Some("23514"), "{suffix}");
+        assert_eq!(
+            constraint_name(&error).as_deref(),
+            Some(constraint),
+            "{suffix}"
+        );
+    }
+
+    insert_item_with_ends(
+        &mut conn,
+        household.household_id,
+        household.tasks_list_id,
+        "valid end_at",
+        Some(due_at),
+        None,
+        Some(end_after),
+        None,
+    )
+    .await
+    .expect("a timed end after the start should insert");
+
+    insert_item_with_ends(
+        &mut conn,
+        household.household_id,
+        household.tasks_list_id,
+        "valid end_date",
+        None,
+        Some(due_date),
+        None,
+        Some(end_same_day),
+    )
+    .await
+    .expect("an all-day end on the start day should insert");
+
+    insert_item_with_ends(
+        &mut conn,
+        household.household_id,
+        household.tasks_list_id,
+        "no end",
+        Some(due_at),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("a start without an end should still insert");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

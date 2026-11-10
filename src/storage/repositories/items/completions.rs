@@ -4,13 +4,14 @@
 //! отбора используется разделом «Выполнено сегодня» и счётчиком меню, поэтому
 //! живёт здесь, а не в экранах.
 
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use chrono_tz::Tz;
 use serde_json::Value;
 use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
+use crate::domain::events::start_of_day;
 use crate::domain::models::{Item, ItemStatus};
 
 /// Название выполнения, если снимок `payload.before` его не сохранил.
@@ -22,12 +23,18 @@ pub const JOURNAL_PAGE_SIZE: usize = 8;
 /// Общее условие отбора выполнения для журнала и раздела «Выполнено сегодня».
 ///
 /// Подставляется как фрагмент `WHERE` с `$1` — household. Список
-/// `item_events` уже алиасирован как `e`, элемент — как `i`.
+/// `item_events` уже алиасирован как `e`, элемент — как `i`. События не имеют
+/// состояния «выполнено» (0009-events, design решение 1), поэтому строка
+/// события не попадает в выборки выполненных даже при устаревшей или битой
+/// записи журнала.
 const COMPLETION_SELECTION: &str = "\
     e.household_id = $1
     AND e.event_type = 'completed'
     AND e.undo_of IS NULL
     AND i.deleted_at IS NULL
+    AND NOT EXISTS (
+        SELECT 1 FROM lists el WHERE el.id = i.list_id AND el.kind = 'events'
+    )
     AND NOT EXISTS (
         SELECT 1 FROM item_events undo WHERE undo.undo_of = e.id
     )
@@ -150,13 +157,7 @@ struct JournalRow {
 /// время: тогда берётся первый существующий местный час.
 pub fn day_start(timezone: Tz, now: DateTime<Utc>) -> DateTime<Utc> {
     let date = now.with_timezone(&timezone).date_naive();
-    (0..24)
-        .find_map(|hour| {
-            date.and_hms_opt(hour, 0, 0)
-                .and_then(|local| timezone.from_local_datetime(&local).earliest())
-        })
-        .map(|local| local.with_timezone(&Utc))
-        .expect("a local date has at least one existing hour")
+    start_of_day(timezone, date)
 }
 
 /// Выполнения household с `since`, начиная с поздних, по одному списку.

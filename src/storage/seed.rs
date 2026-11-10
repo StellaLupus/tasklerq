@@ -9,6 +9,7 @@ const OWNER: &str = "0190a000-0000-7000-8000-000000000002";
 const MEMBER: &str = "0190a000-0000-7000-8000-000000000003";
 const TASKS_LIST: &str = "0190a000-0000-7000-8000-000000000010";
 const SHOPPING_LIST: &str = "0190a000-0000-7000-8000-000000000011";
+const EVENTS_LIST: &str = "0190a000-0000-7000-8000-000000000012";
 const TAG_HOME: &str = "0190a000-0000-7000-8000-000000000020";
 const TAG_URGENT: &str = "0190a000-0000-7000-8000-000000000021";
 const ITEM_CALL: &str = "0190a000-0000-7000-8000-000000000030";
@@ -73,12 +74,14 @@ pub async fn run(pool: &PgPool) -> Result<(), sqlx::Error> {
              created_at, updated_at
          )
          VALUES
-             ($1, $3, 'tasks', 'Задачи', true, false, 0, $4, $4),
-             ($2, $3, 'shopping', 'Покупки', true, false, 1, $4, $4)
-         ON CONFLICT (id) DO NOTHING",
+             ($1, $4, 'tasks', 'Задачи', true, false, 0, $5, $5),
+             ($2, $4, 'shopping', 'Покупки', true, false, 1, $5, $5),
+             ($3, $4, 'events', 'Календарь', true, false, 2, $5, $5)
+         ON CONFLICT DO NOTHING",
     )
     .bind(uuid(TASKS_LIST))
     .bind(uuid(SHOPPING_LIST))
+    .bind(uuid(EVENTS_LIST))
     .bind(uuid(HOUSEHOLD))
     .bind(now)
     .execute(&mut *tx)

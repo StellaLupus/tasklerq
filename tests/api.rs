@@ -142,7 +142,7 @@ async fn list_and_item_crud_contract() {
     let (status, lists) =
         support::request(&app, Method::GET, "/api/v1/lists", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(lists.as_array().expect("lists").len(), 2);
+    assert_eq!(lists.as_array().expect("lists").len(), 3);
 
     let (status, created_list) = support::request(
         &app,
@@ -614,7 +614,7 @@ async fn search_and_snapshot_contract() {
     let (status, snapshot) =
         support::request(&app, Method::GET, "/api/v1/snapshot", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(snapshot["lists"].as_array().expect("lists").len(), 2);
+    assert_eq!(snapshot["lists"].as_array().expect("lists").len(), 3);
     assert!(snapshot["server_time"].is_string());
     let next_since = snapshot["next_since"]
         .as_str()
@@ -1739,4 +1739,343 @@ async fn search_over_http_treats_sql_as_text_and_returns_200() {
     .await
     .expect("items table must still exist");
     assert_eq!(count, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn patch_rejects_event_ends_that_the_database_would_reject() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let token =
+        support::issue_token(&db.pool, household.household_id, &["ha:read", "ha:write"]).await;
+    let app = support::app(&db.pool);
+
+    let (status, event) = support::request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/lists/{}/items", household.events_list_id),
+        Some(&token),
+        Some(json!({"title": "Маникюр", "due_at": "2026-11-11T14:00:00Z"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create event: {event}");
+    let event_id = event["id"].as_str().expect("event id").to_owned();
+    let event_uri = format!("/api/v1/items/{event_id}");
+
+    let (status, body) = support::request(
+        &app,
+        Method::PATCH,
+        &event_uri,
+        Some(&token),
+        Some(json!({"version": 1, "end_at": "2026-11-11T13:00:00Z"})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "end before start: {body}"
+    );
+    assert_eq!(body["error"]["code"], "validation_error");
+
+    // Конец без начала: база отклонила бы это ограничением `end_at`.
+    let (status, body) = support::request(
+        &app,
+        Method::PATCH,
+        &event_uri,
+        Some(&token),
+        Some(json!({
+            "version": 1,
+            "due_at": null,
+            "end_at": "2026-11-11T15:00:00Z"
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "end without start: {body}"
+    );
+    assert_eq!(body["error"]["code"], "validation_error");
+
+    // Событие без конца не может остаться без начала: правило проверяет
+    // домен, а не ограничение базы.
+    let (status, body) = support::request(
+        &app,
+        Method::PATCH,
+        &event_uri,
+        Some(&token),
+        Some(json!({"version": 1, "due_at": null})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "clear start of an event without end: {body}"
+    );
+    assert_eq!(body["error"]["code"], "validation_error");
+
+    let (status, task) = support::request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/lists/{}/items", household.tasks_list_id),
+        Some(&token),
+        Some(json!({"title": "Задача", "due_date": "2026-11-11"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create task: {task}");
+    let task_id = task["id"].as_str().expect("task id").to_owned();
+
+    // Конец у задачи: ограничение базы о нём ничего не знает, проверяет домен.
+    let (status, body) = support::request(
+        &app,
+        Method::PATCH,
+        &format!("/api/v1/items/{task_id}"),
+        Some(&token),
+        Some(json!({"version": 1, "end_date": "2026-11-12"})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "end for a task: {body}"
+    );
+    assert_eq!(body["error"]["code"], "validation_error");
+
+    let (status, fetched) =
+        support::request(&app, Method::GET, &event_uri, Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
+    assert_eq!(
+        fetched["version"], 1,
+        "a rejected patch must not change the event"
+    );
+    assert_eq!(fetched["end_at"], Value::Null);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_are_created_and_patched_with_their_end() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let token =
+        support::issue_token(&db.pool, household.household_id, &["ha:read", "ha:write"]).await;
+    let app = support::app(&db.pool);
+    let events_uri = format!("/api/v1/lists/{}/items", household.events_list_id);
+
+    let (status, timed) = support::request(
+        &app,
+        Method::POST,
+        &events_uri,
+        Some(&token),
+        Some(json!({
+            "title": "Маникюр",
+            "due_at": "2026-11-11T14:00:00Z",
+            "end_at": "2026-11-11T15:30:00Z"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "timed event: {timed}");
+    assert_eq!(timed["due_at"], "2026-11-11T14:00:00Z");
+    assert_eq!(timed["end_at"], "2026-11-11T15:30:00Z");
+    assert_eq!(timed["end_date"], Value::Null);
+    let timed_id = timed["id"].as_str().expect("timed event id").to_owned();
+
+    let (status, all_day) = support::request(
+        &app,
+        Method::POST,
+        &events_uri,
+        Some(&token),
+        Some(json!({
+            "title": "Отпуск",
+            "due_date": "2027-03-05",
+            "end_date": "2027-03-10"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "all-day event: {all_day}");
+    assert_eq!(all_day["due_date"], "2027-03-05");
+    assert_eq!(all_day["end_date"], "2027-03-10");
+    assert_eq!(all_day["end_at"], Value::Null);
+
+    // PATCH принимает конец через `ItemPatch` и отдаёт его в ответе.
+    let (status, patched) = support::request(
+        &app,
+        Method::PATCH,
+        &format!("/api/v1/items/{timed_id}"),
+        Some(&token),
+        Some(json!({"version": 1, "end_at": "2026-11-11T16:00:00Z"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "patch end: {patched}");
+    assert_eq!(patched["end_at"], "2026-11-11T16:00:00Z");
+    assert_eq!(patched["due_at"], "2026-11-11T14:00:00Z");
+
+    let (status, fetched) = support::request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/items/{timed_id}"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
+    assert_eq!(fetched["end_at"], "2026-11-11T16:00:00Z");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn event_creation_and_completion_errors_are_422() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let token =
+        support::issue_token(&db.pool, household.household_id, &["ha:read", "ha:write"]).await;
+    let app = support::app(&db.pool);
+    let events_uri = format!("/api/v1/lists/{}/items", household.events_list_id);
+    let tasks_uri = format!("/api/v1/lists/{}/items", household.tasks_list_id);
+
+    let cases = [
+        (events_uri.clone(), json!({"title": "Без начала"})),
+        (
+            tasks_uri,
+            json!({
+                "title": "Задача с концом",
+                "due_date": "2026-11-11",
+                "end_date": "2026-11-12"
+            }),
+        ),
+        (
+            events_uri.clone(),
+            json!({
+                "title": "Событие с подзадачами",
+                "due_at": "2026-11-11T14:00:00Z",
+                "subtasks": [{"title": "Купить лак"}]
+            }),
+        ),
+    ];
+    for (uri, body) in cases {
+        let (status, response) =
+            support::request(&app, Method::POST, &uri, Some(&token), Some(body.clone())).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{body} must be rejected: {response}"
+        );
+        assert_eq!(response["error"]["code"], "validation_error");
+    }
+
+    let (status, event) = support::request(
+        &app,
+        Method::POST,
+        &events_uri,
+        Some(&token),
+        Some(json!({
+            "title": "Маникюр",
+            "due_at": "2026-11-11T14:00:00Z",
+            "end_at": "2026-11-11T15:30:00Z"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{event}");
+    let event_id = event["id"].as_str().expect("event id").to_owned();
+
+    let (status, body) = support::request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/items/{event_id}/complete"),
+        Some(&token),
+        Some(json!({"version": 1})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "validation_error");
+
+    let (status, fetched) = support::request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/items/{event_id}"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
+    assert_eq!(fetched["status"], "open");
+    assert_eq!(fetched["version"], 1);
+    assert_eq!(fetched["end_at"], "2026-11-11T15:30:00Z");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_lists_accepts_events_and_enforces_the_list_limit() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let token =
+        support::issue_token(&db.pool, household.household_id, &["ha:read", "ha:write"]).await;
+    let app = support::app(&db.pool);
+
+    let (status, school) = support::request(
+        &app,
+        Method::POST,
+        "/api/v1/lists",
+        Some(&token),
+        Some(json!({"kind": "events", "name": "Школа"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "events list: {school}");
+    assert_eq!(school["kind"], "events");
+
+    let (status, body) = support::request(
+        &app,
+        Method::POST,
+        "/api/v1/lists",
+        Some(&token),
+        Some(json!({"kind": "tasks", "name": "Ещё задачи"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "validation_error");
+
+    // Три списка по умолчанию и «Школа» уже есть: добавляем ещё 16 до лимита.
+    for n in 0..16 {
+        let (status, body) = support::request(
+            &app,
+            Method::POST,
+            "/api/v1/lists",
+            Some(&token),
+            Some(json!({"kind": "checklist", "name": format!("Список {n}")})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "list {n}: {body}");
+    }
+
+    let (checklist_status, checklist_body) = support::request(
+        &app,
+        Method::POST,
+        "/api/v1/lists",
+        Some(&token),
+        Some(json!({"kind": "checklist", "name": "Сверх лимита"})),
+    )
+    .await;
+    assert_eq!(
+        checklist_status,
+        StatusCode::CONFLICT,
+        "checklist over the limit: {checklist_body}"
+    );
+
+    let (events_status, events_body) = support::request(
+        &app,
+        Method::POST,
+        "/api/v1/lists",
+        Some(&token),
+        Some(json!({"kind": "events", "name": "Второй календарь"})),
+    )
+    .await;
+    assert_eq!(
+        events_status, checklist_status,
+        "events over the limit must use the same status as other kinds: {events_body}"
+    );
+    assert_eq!(events_body["error"]["code"], "conflict");
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM lists WHERE household_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(household.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("list count");
+    assert_eq!(count, 20);
 }

@@ -12,9 +12,9 @@ use super::{
     UNDO_WINDOW_EXPIRED, UNDO_WINDOW_MINUTES, local_today, recurrence_values, version_conflict,
 };
 use crate::domain::error::DomainError;
-use crate::domain::models::{Actor, EventType, Item, ItemStatus};
+use crate::domain::models::{Actor, EventType, Item, ItemStatus, ListKind};
 use crate::domain::recurrence::Due;
-use crate::storage::repositories::{events, notifications, subtasks, tags};
+use crate::storage::repositories::{events, lists, notifications, subtasks, tags};
 
 /// Завершить элемент.
 pub async fn complete(
@@ -27,6 +27,7 @@ pub async fn complete(
     now: DateTime<Utc>,
 ) -> Result<Item, DomainError> {
     let row = row_by_id(conn, household_id, item_id, false, true).await?;
+    ensure_not_event(conn, household_id, row.list_id).await?;
     let current = hydrate_one(conn, row.clone()).await?;
     if let Some(version) = version
         && version != row.version
@@ -139,6 +140,7 @@ pub async fn reopen(
     now: DateTime<Utc>,
 ) -> Result<Item, DomainError> {
     let row = row_by_id(conn, household_id, item_id, false, true).await?;
+    ensure_not_event(conn, household_id, row.list_id).await?;
     let current = hydrate_one(conn, row.clone()).await?;
     if let Some(version) = version
         && version != row.version
@@ -186,6 +188,7 @@ pub async fn revert_completion(
     now: DateTime<Utc>,
 ) -> Result<Item, DomainError> {
     let row = row_by_id(conn, household_id, item_id, false, true).await?;
+    ensure_not_event(conn, household_id, row.list_id).await?;
     let current = hydrate_one(conn, row.clone()).await?;
 
     let completion = completions::latest_for_item(conn, household_id, item_id)
@@ -441,16 +444,16 @@ pub async fn undo_last(
     sqlx::query(
         "UPDATE items
          SET list_id = $3, title = $4, notes = $5, status = $6, priority = $7,
-             due_at = $8, due_date = $9, assignee_user_id = $10,
-             created_by_user_id = $11, source = $12, capture_id = $13,
-             completed_at = $14, completed_by_user_id = $15,
-             quantity = $16::float8::numeric, unit = $17, position = $18,
-             recurrence_freq = $19, recurrence_interval = $20,
-             recurrence_byweekday = $21, recurrence_until = $22,
-             recurrence_timezone = $23, recurrence_anchor_date = $24,
-             recurrence_month_rule = $25, recurrence_occurrence_date = $26,
-             recurrence_occurrence_time = $27,
-             deleted_at = $28, version = $29, updated_at = $30
+             due_at = $8, due_date = $9, end_at = $10, end_date = $11,
+             assignee_user_id = $12, created_by_user_id = $13, source = $14,
+             capture_id = $15, completed_at = $16, completed_by_user_id = $17,
+             quantity = $18::float8::numeric, unit = $19, position = $20,
+             recurrence_freq = $21, recurrence_interval = $22,
+             recurrence_byweekday = $23, recurrence_until = $24,
+             recurrence_timezone = $25, recurrence_anchor_date = $26,
+             recurrence_month_rule = $27, recurrence_occurrence_date = $28,
+             recurrence_occurrence_time = $29,
+             deleted_at = $30, version = $31, updated_at = $32
          WHERE id = $1 AND household_id = $2",
     )
     .bind(item_id)
@@ -462,6 +465,8 @@ pub async fn undo_last(
     .bind(before.priority)
     .bind(before.due_at)
     .bind(before.due_date)
+    .bind(before.end_at)
+    .bind(before.end_date)
     .bind(before.assignee_user_id)
     .bind(before.created_by_user_id)
     .bind(before.source)
@@ -519,6 +524,20 @@ pub async fn undo_last(
     .await?;
 
     Ok(updated)
+}
+
+/// Событие не выполняется и не возвращается в работу (design, решение 1).
+async fn ensure_not_event(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    list_id: Uuid,
+) -> Result<(), DomainError> {
+    if lists::get(conn, household_id, list_id).await?.kind == ListKind::Events {
+        return Err(DomainError::Validation(
+            "events cannot be completed or reopened".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_can_modify(actor: &Actor, created_by_user_id: Option<Uuid>) -> Result<(), DomainError> {

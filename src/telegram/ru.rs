@@ -104,14 +104,19 @@ pub fn weekday_long(iso: u32) -> &'static str {
     .unwrap_or("")
 }
 
-/// Заголовок группы журнала: «Вторник, 4 ноя»; будущий день — с «(впереди)».
-pub fn planned_day_label(date: NaiveDate, today: NaiveDate) -> String {
-    let label = format!(
+/// Заголовок дня: «Вторник, 4 ноя».
+pub fn day_label(date: NaiveDate) -> String {
+    format!(
         "{}, {} {}",
         weekday_long(date.weekday().number_from_monday()),
         date.day(),
         month_short(date.month())
-    );
+    )
+}
+
+/// Заголовок группы журнала: «Вторник, 4 ноя»; будущий день — с «(впереди)».
+pub fn planned_day_label(date: NaiveDate, today: NaiveDate) -> String {
+    let label = day_label(date);
     if date > today {
         format!("{label} (впереди)")
     } else {
@@ -404,6 +409,12 @@ pub struct ParsedDue {
 /// Подсказка с форматом срока.
 pub const DUE_HINT: &str =
     "Примеры: «завтра», «чт 12:00», «25.12», «25.12.2026», «25.12 18:30» или «18:30».";
+
+/// Подсказка с форматом конца события.
+///
+/// Время без даты относится ко дню начала, а если оно не позже времени начала —
+/// к следующему дню.
+pub const END_HINT: &str = "Примеры: «15:30», «завтра 15:30», «25.12» или «25.12.2026». Без даты время относится к дню начала.";
 
 /// Разобрать срок: «сегодня», «завтра», «послезавтра», `ДД.ММ[.ГГГГ]`,
 /// `ЧЧ:ММ` и их сочетания. `None` — формат не распознан.

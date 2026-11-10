@@ -25,6 +25,7 @@ pub async fn build(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
         Screen::Welcome => Ok(welcome()),
         Screen::FirstContact(contact) => Ok(super::onboarding::first_contact(contact)),
         Screen::Lists => lists_screen(ctx).await,
+        Screen::Agenda { list, page } => super::agenda::view(ctx, *list, *page).await,
         Screen::List {
             list_id,
             page,
@@ -80,11 +81,13 @@ pub async fn build(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
     // Маршрут нужен только экранам, у которых есть подсказка ввода: так
     // построение остальных экранов не делает лишних запросов.
     let hint = match screen {
-        Screen::Menu | Screen::Form | Screen::List { .. } | Screen::Results { .. } => {
-            super::routing::route(ctx, screen)
-                .await?
-                .hint(ctx.llm_capture)
-        }
+        Screen::Menu
+        | Screen::Form
+        | Screen::List { .. }
+        | Screen::Results { .. }
+        | Screen::Agenda { .. } => super::routing::route(ctx, screen)
+            .await?
+            .hint(ctx.llm_capture),
         _ => None,
     };
     if let Some(hint) = hint {
@@ -154,7 +157,14 @@ fn priority_marker(item: &Item) -> &'static str {
 async fn menu(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
     let household = ctx.household()?.clone();
     let user_id = ctx.user()?.id;
-    let counts = items::menu_counts(&mut *ctx.conn, household.id, ctx.tz.name(), ctx.now).await?;
+    let counts = items::menu_counts_with_timezone(
+        &mut *ctx.conn,
+        household.id,
+        ctx.tz.name(),
+        &household.timezone,
+        ctx.now,
+    )
+    .await?;
     let mine_count = items::open_assigned_tasks(&mut *ctx.conn, household.id, user_id).await?;
     let all_lists = lists::list(&mut *ctx.conn, household.id).await?;
     let visible: Vec<&List> = all_lists.iter().filter(|list| !list.is_archived).collect();
@@ -243,10 +253,27 @@ async fn menu(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
             ),
         ])
         .row(vec![
+            go(
+                "🗓 Повестка",
+                Screen::Agenda {
+                    list: None,
+                    page: 0,
+                },
+            ),
             button("🔎 Поиск", Action::SearchStart),
-            go("⚙️ Настройки", Screen::Settings),
-        ]);
-    if visible.len() > 2 {
+        ])
+        .row(vec![go("⚙️ Настройки", Screen::Settings)]);
+    // 0009-events 8.1: список событий не считается дополнительным для
+    // кнопки «Все списки», но два и более списков событий показывают её сами.
+    let regular_lists = visible
+        .iter()
+        .filter(|list| list.kind != ListKind::Events)
+        .count();
+    let event_lists = visible
+        .iter()
+        .filter(|list| list.kind == ListKind::Events)
+        .count();
+    if regular_lists > 2 || event_lists >= 2 {
         ui = ui.row(vec![go("🗂 Все списки", Screen::Lists)]);
     }
     Ok(ui)
@@ -255,7 +282,7 @@ async fn menu(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
 fn welcome() -> Ui {
     Ui::new()
         .heading("Пространство создано")
-        .text("Созданы списки «Задачи» и «Покупки».")
+        .text("Созданы списки «Задачи», «Покупки» и «Календарь».")
         .text("Отправьте мне любую фразу — например: «завтра купить молоко и позвонить маме».")
         .row(vec![
             go("📋 Открыть меню", Screen::Menu),
@@ -264,29 +291,58 @@ fn welcome() -> Ui {
 }
 
 async fn lists_screen(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
-    let household_id = ctx.household()?.id;
+    let household = ctx.household()?.clone();
+    let household_id = household.id;
     let all_lists = lists::list(&mut *ctx.conn, household_id).await?;
     let open = items::open_counts_by_list(&mut *ctx.conn, household_id).await?;
+    // Счётчик списка событий считает только не прошедшие события, как повестка.
+    let upcoming = items::open_event_counts_by_list(
+        &mut *ctx.conn,
+        household_id,
+        &household.timezone,
+        ctx.now,
+    )
+    .await?;
 
     let mut ui = Ui::new().heading("Все списки");
     for list in all_lists.iter().filter(|list| !list.is_archived) {
-        let icon = if list.kind == ListKind::Tasks {
-            "📋"
+        let (icon, target) = match list.kind {
+            ListKind::Tasks => (
+                "📋",
+                Screen::List {
+                    list_id: list.id,
+                    page: 0,
+                    edit: false,
+                    from_lists: true,
+                },
+            ),
+            // Список событий открывает повестку этого списка, а не список
+            // покупок.
+            ListKind::Events => (
+                "🗓",
+                Screen::Agenda {
+                    list: Some(list.id),
+                    page: 0,
+                },
+            ),
+            ListKind::Shopping | ListKind::Checklist => (
+                "🛒",
+                Screen::List {
+                    list_id: list.id,
+                    page: 0,
+                    edit: false,
+                    from_lists: true,
+                },
+            ),
+        };
+        let count = if list.kind == ListKind::Events {
+            upcoming.get(&list.id).copied().unwrap_or(0)
         } else {
-            "🛒"
+            open.get(&list.id).copied().unwrap_or(0)
         };
         ui = ui.row(vec![go(
-            &format!(
-                "{icon} {} · {}",
-                clip(&list.name, 30),
-                open.get(&list.id).copied().unwrap_or(0)
-            ),
-            Screen::List {
-                list_id: list.id,
-                page: 0,
-                edit: false,
-                from_lists: true,
-            },
+            &format!("{icon} {} · {}", clip(&list.name, 30), count),
+            target,
         )]);
     }
     Ok(ui.row(nav_row(&Screen::Lists, Screen::Menu)))
@@ -334,7 +390,7 @@ fn section_of(item: &Item, tz: Tz, now: DateTime<Utc>) -> Section {
     }
 }
 
-fn sort_tasks(items: &mut [Item], tz: Tz, now: DateTime<Utc>) {
+pub(super) fn sort_tasks(items: &mut [Item], tz: Tz, now: DateTime<Utc>) {
     let priority_rank = |item: &Item| match item.priority {
         ItemPriority::Urgent => 0,
         ItemPriority::High => 1,
@@ -706,6 +762,8 @@ async fn results(
         if hit.item.status == ItemStatus::Done {
             label.push_str(" · выполнено");
         } else if hit.list_kind != ListKind::Tasks {
+            // События и покупки: у события количества нет, поэтому подпись
+            // остаётся только с названием списка.
             if let Some(quantity) = hit.item.quantity {
                 label.push_str(&format!(
                     " · {}",

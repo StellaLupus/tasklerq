@@ -31,9 +31,9 @@ pub async fn create(
     Json(request): Json<CreateListRequest>,
 ) -> Result<(StatusCode, Json<List>), ApiError> {
     require_write(&state, &auth).await?;
-    if request.kind == ListKind::Tasks {
+    if matches!(request.kind, ListKind::Tasks) {
         return Err(ApiError::validation(
-            "additional lists must have kind shopping or checklist",
+            "additional lists must have kind shopping, checklist or events",
         ));
     }
 

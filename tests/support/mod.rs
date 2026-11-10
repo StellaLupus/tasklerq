@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use chrono::Utc;
+use chrono::{NaiveDate, TimeZone, Utc};
 use http_body_util::BodyExt;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -211,7 +211,7 @@ async fn start_db() -> SharedDatabase {
     }
 }
 
-/// Household с owner, member и двумя списками по умолчанию.
+/// Household с owner, member и тремя списками по умолчанию.
 #[derive(Debug, Clone, Copy)]
 pub struct TestHousehold {
     pub household_id: Uuid,
@@ -219,6 +219,7 @@ pub struct TestHousehold {
     pub member_id: Uuid,
     pub tasks_list_id: Uuid,
     pub shopping_list_id: Uuid,
+    pub events_list_id: Uuid,
 }
 
 impl TestHousehold {
@@ -289,6 +290,11 @@ pub async fn create_household(pool: &PgPool) -> TestHousehold {
         .find(|list| list.kind == tasklerq::domain::models::ListKind::Shopping)
         .expect("shopping list")
         .id;
+    let events_list_id = all_lists
+        .iter()
+        .find(|list| list.kind == tasklerq::domain::models::ListKind::Events)
+        .expect("events list")
+        .id;
 
     TestHousehold {
         household_id: household.id,
@@ -296,7 +302,20 @@ pub async fn create_household(pool: &PgPool) -> TestHousehold {
         member_id,
         tasks_list_id,
         shopping_list_id,
+        events_list_id,
     }
+}
+
+/// Дата для тестов календаря и примеров API.
+pub fn date(year: i32, month: u32, day: u32) -> NaiveDate {
+    NaiveDate::from_ymd_opt(year, month, day).expect("valid date")
+}
+
+/// Момент UTC с точностью до минут для тестов календаря и примеров API.
+pub fn utc(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> chrono::DateTime<Utc> {
+    Utc.with_ymd_and_hms(year, month, day, hour, minute, 0)
+        .single()
+        .expect("valid instant")
 }
 
 /// Новый элемент с минимальными полями.
@@ -308,6 +327,8 @@ pub fn new_item(list_id: Uuid, title: &str) -> NewItem {
         priority: ItemPriority::Normal,
         due_at: None,
         due_date: None,
+        end_at: None,
+        end_date: None,
         assignee_user_id: None,
         source: ItemSource::Api,
         quantity: None,

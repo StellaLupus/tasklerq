@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Datelike, Duration, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use chrono_tz::Tz;
 use uuid::Uuid;
 
@@ -115,9 +115,13 @@ async fn load(ctx: &mut Ctx<'_>, item_id: Uuid) -> Result<(Item, List), Fail> {
     Ok((item, list))
 }
 
-/// Можно ли менять срок: только у открытой задачи из списка задач.
+/// Можно ли менять срок: у задачи — пока она открыта, у события — всегда.
 fn due_editable(item: &Item, list: &List) -> bool {
-    item.status != ItemStatus::Done && list.kind == ListKind::Tasks
+    match list.kind {
+        ListKind::Tasks => item.status != ItemStatus::Done,
+        ListKind::Events => true,
+        ListKind::Shopping | ListKind::Checklist => false,
+    }
 }
 
 /// Доступен ли ввод срока; для выполненного элемента и покупки — нет.
@@ -161,6 +165,13 @@ pub(super) async fn parent_list_name(
     }
 }
 
+/// Момент события строкой карточки: «Завтра, 14:00» или «Послезавтра»; без
+/// значения — прочерк.
+fn event_moment(at: Option<DateTime<Utc>>, date: Option<NaiveDate>, ctx: &Ctx<'_>) -> String {
+    ru::due_label(at, date, ctx.tz, ctx.now)
+        .map_or_else(|| "—".to_owned(), |label| ru::capitalize(&label))
+}
+
 /// Карточка элемента.
 pub async fn view(
     ctx: &mut Ctx<'_>,
@@ -170,10 +181,9 @@ pub async fn view(
 ) -> Result<Ui, Fail> {
     let (item, list) = load(ctx, item_id).await?;
     let names = names(ctx).await?;
-    let shopping = list.kind != ListKind::Tasks;
-    let completions = if shopping {
-        Vec::new()
-    } else {
+    let events = list.kind == ListKind::Events;
+    let shopping = !matches!(list.kind, ListKind::Tasks | ListKind::Events);
+    let completions = if list.kind == ListKind::Tasks {
         let household_id = ctx.household()?.id;
         items::completions::recent_for_item(
             &mut *ctx.conn,
@@ -182,6 +192,8 @@ pub async fn view(
             RECENT_COMPLETIONS,
         )
         .await?
+    } else {
+        Vec::new()
     };
     let here = Screen::Item {
         item_id,
@@ -200,7 +212,18 @@ pub async fn view(
             ru::quantity_label(quantity, item.unit.as_deref())
         ));
     }
-    if let Some(due) = ru::due_label(item.due_at, item.due_date, ctx.tz, ctx.now) {
+    if events {
+        // У события карточка показывает начало и конец отдельными строками:
+        // «📅 Срок» здесь означал бы только начало.
+        ui = ui.text(format!(
+            "📅 Начало: {}",
+            event_moment(item.due_at, item.due_date, ctx)
+        ));
+        ui = ui.text(format!(
+            "🏁 Конец: {}",
+            event_moment(item.end_at, item.end_date, ctx)
+        ));
+    } else if let Some(due) = ru::due_label(item.due_at, item.due_date, ctx.tz, ctx.now) {
         let overdue = !done && is_overdue(&item, ctx);
         ui = ui.text(format!(
             "📅 {}{}",
@@ -212,7 +235,7 @@ pub async fn view(
             }
         ));
     }
-    if !shopping {
+    if !shopping && !events {
         ui = ui.text(format!("Приоритет: {}", priority_label(item.priority)));
     }
     if !item.tags.is_empty() {
@@ -220,7 +243,11 @@ pub async fn view(
         ui = ui.text(format!("🏷 {}", tags.join(", ")));
     }
     if let Some(name) = item.assignee_user_id.and_then(|id| names.get(&id)) {
-        ui = ui.text(format!("👤 {name}"));
+        ui = ui.text(if events {
+            format!("👤 Чьё событие: {name}")
+        } else {
+            format!("👤 {name}")
+        });
     }
     if let Some(rule) = &item.recurrence {
         ui = ui.text(format!("🔁 {}", describe_recurrence(rule)));
@@ -261,6 +288,37 @@ pub async fn view(
             .map(|completion| completion_line(completion, &names, ctx.tz, ctx.now))
             .collect();
         ui = ui.bold("Выполнения").collapsed_quote(lines.join("\n"));
+    }
+
+    if events {
+        // Событие не выполняется: вместо отметки — перенос начала и правка.
+        let edit = button(
+            ru::EDIT_BUTTON,
+            Action::Edit {
+                item_id,
+                back: here.clone(),
+            },
+        );
+        let delete = button(
+            "🗑 Удалить",
+            Action::DeleteAsk {
+                item_id,
+                back: back.clone(),
+            },
+        );
+        let move_button = button(
+            "📅 Перенести",
+            Action::Go {
+                to: Screen::Due {
+                    item_id,
+                    back: Box::new(back.clone()),
+                },
+            },
+        );
+        return Ok(ui
+            .row(vec![move_button, edit])
+            .row(vec![delete])
+            .row(nav_row(&here, back.clone())));
     }
 
     // Для задачи возврат ведёт туда, откуда открыли карточку (журнал, список
@@ -433,7 +491,7 @@ pub async fn due(ctx: &mut Ctx<'_>, item_id: Uuid, back: &Screen) -> Result<Ui, 
                 },
             ),
         ]);
-    if item.recurrence.is_none() {
+    if list.kind != ListKind::Events && item.recurrence.is_none() {
         ui = ui.row(vec![quick("Без срока", QuickDue::None)]);
     }
     let card = Screen::Item {
@@ -470,6 +528,11 @@ pub async fn set_due(
         let due = quick_due(&item, choice, ctx.now, ctx.tz)?;
         return apply_due(ctx, item_id, version, due, back).await;
     }
+    // У события нет варианта «Без срока»: устаревшая кнопка не должна снимать
+    // начало.
+    if list.kind == ListKind::Events {
+        return present_item(ctx, item_id, back).await;
+    }
 
     if item.due_at.is_none() && item.due_date.is_none() {
         return present_item(ctx, item_id, back).await;
@@ -499,7 +562,7 @@ pub async fn set_due(
         ctx.now,
     )
     .await;
-    finish_due(ctx, item_id, saved, back).await
+    finish_due(ctx, item_id, saved, back, list.kind == ListKind::Events).await
 }
 
 /// Перенести срок через `reschedule_occurrence` и вернуться в карточку.
@@ -527,7 +590,7 @@ pub async fn apply_due(
         ctx.now,
     )
     .await;
-    finish_due(ctx, item_id, saved, back).await
+    finish_due(ctx, item_id, saved, back, list.kind == ListKind::Events).await
 }
 
 /// Баннер нового срока и карточка; конфликт показывает актуальную карточку.
@@ -536,9 +599,12 @@ async fn finish_due(
     item_id: Uuid,
     saved: Result<Item, DomainError>,
     back: Screen,
+    events: bool,
 ) -> Result<(), Fail> {
     match saved {
         Ok(item) => match ru::due_label(item.due_at, item.due_date, ctx.tz, ctx.now) {
+            // У события «срок» — это начало, и карточка называет его так же.
+            Some(due) if events => ctx.banner(format!("Начало: {due}")),
             Some(due) => ctx.banner(format!("Срок: {due}")),
             None => ctx.banner("Срок снят"),
         },
@@ -678,6 +744,12 @@ pub async fn complete(
     version: i32,
     back: Screen,
 ) -> Result<(), Fail> {
+    let (_, list) = load(ctx, item_id).await?;
+    // Событие не выполняется: кнопка могла остаться на старом сообщении.
+    if list.kind == ListKind::Events {
+        ctx.alert("Событие нельзя выполнить.");
+        return Ok(());
+    }
     let household = ctx.household()?.clone();
     let actor = ctx.actor()?;
     let item = items::complete(
@@ -726,6 +798,11 @@ pub async fn reopen(
     let household_id = ctx.household()?.id;
     let actor = ctx.actor()?;
     let (item, list) = load(ctx, item_id).await?;
+    // Событие не выполняется, поэтому и возвращать его не из чего.
+    if list.kind == ListKind::Events {
+        ctx.alert("Событие нельзя вернуть в работу.");
+        return Ok(());
+    }
     let result = if list.kind == ListKind::Tasks {
         // Кнопка помнит версию элемента на момент отрисовки. Это относится и к
         // карточкам из журнала и «Выполнено сегодня»: если задачу успели

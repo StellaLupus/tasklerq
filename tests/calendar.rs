@@ -6,12 +6,34 @@ use axum::http::Method;
 use chrono::{NaiveDate, TimeZone, Utc};
 use serde_json::json;
 use tasklerq::domain::calendar;
-use tasklerq::domain::models::{MonthRule, RecurrenceFreq};
+use tasklerq::domain::models::{ListKind, MonthRule, RecurrenceFreq};
 use tasklerq::domain::recurrence::{Due, parse_timezone};
 use tasklerq::storage::repositories::items;
 
-fn date(year: i32, month: u32, day: u32) -> NaiveDate {
-    NaiveDate::from_ymd_opt(year, month, day).expect("valid date")
+use support::{date, utc};
+
+async fn expand_household(
+    pool: &sqlx::PgPool,
+    household: &support::TestHousehold,
+    start: NaiveDate,
+    end: NaiveDate,
+) -> Vec<calendar::CalendarEvent> {
+    let mut conn = pool.acquire().await.expect("connection");
+    let items = items::calendar_items(&mut conn, household.household_id)
+        .await
+        .expect("calendar items");
+    let timezone = parse_timezone("Europe/Moscow").expect("timezone");
+    let mut events = Vec::new();
+    for entry in &items {
+        events.extend(
+            calendar::expand_item(entry, start, end, timezone).expect("expand calendar item"),
+        );
+    }
+    events
+}
+
+fn json_time(time: &calendar::CalendarTime) -> serde_json::Value {
+    serde_json::to_value(time).expect("serialize time")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -80,9 +102,9 @@ async fn calendar_expands_all_day_timed_and_recurring_tasks() {
     let end = date(2026, 11, 30);
 
     let mut events = Vec::new();
-    for item in &items {
+    for entry in &items {
         events.extend(
-            calendar::expand_item(item, start, end, timezone).expect("expand calendar item"),
+            calendar::expand_item(entry, start, end, timezone).expect("expand calendar item"),
         );
     }
 
@@ -178,9 +200,9 @@ async fn calendar_shows_a_rescheduled_occurrence_on_its_new_date() {
         .expect("calendar items");
     let timezone = parse_timezone("Europe/Moscow").expect("timezone");
     let mut events = Vec::new();
-    for item in &items {
+    for entry in &items {
         events.extend(
-            calendar::expand_item(item, date(2025, 11, 1), date(2025, 12, 10), timezone)
+            calendar::expand_item(entry, date(2025, 11, 1), date(2025, 12, 10), timezone)
                 .expect("expand calendar item"),
         );
     }
@@ -237,9 +259,9 @@ async fn calendar_shows_a_rescheduled_occurrence_earlier_than_its_slot() {
         .expect("calendar items");
     let timezone = parse_timezone("Europe/Moscow").expect("timezone");
     let mut events = Vec::new();
-    for item in &items {
+    for entry in &items {
         events.extend(
-            calendar::expand_item(item, date(2026, 11, 1), date(2026, 12, 1), timezone)
+            calendar::expand_item(entry, date(2026, 11, 1), date(2026, 12, 1), timezone)
                 .expect("expand calendar item"),
         );
     }
@@ -300,9 +322,9 @@ async fn calendar_shows_a_rescheduled_occurrence_later_than_its_slot() {
         .expect("calendar items");
     let timezone = parse_timezone("Europe/Moscow").expect("timezone");
     let mut events = Vec::new();
-    for item in &items {
+    for entry in &items {
         events.extend(
-            calendar::expand_item(item, date(2025, 11, 1), date(2025, 11, 30), timezone)
+            calendar::expand_item(entry, date(2025, 11, 1), date(2025, 11, 30), timezone)
                 .expect("expand calendar item"),
         );
     }
@@ -372,9 +394,9 @@ async fn calendar_shows_a_rescheduled_timed_occurrence() {
         .expect("calendar items");
     let timezone = parse_timezone("Europe/Moscow").expect("timezone");
     let mut events = Vec::new();
-    for item in &items {
+    for entry in &items {
         events.extend(
-            calendar::expand_item(item, date(2026, 11, 1), date(2026, 12, 1), timezone)
+            calendar::expand_item(entry, date(2026, 11, 1), date(2026, 12, 1), timezone)
                 .expect("expand calendar item"),
         );
     }
@@ -447,9 +469,9 @@ async fn calendar_shows_a_rescheduled_occurrence_with_the_series_time() {
         .expect("calendar items");
     let timezone = parse_timezone("Europe/Moscow").expect("timezone");
     let mut events = Vec::new();
-    for item in &items {
+    for entry in &items {
         events.extend(
-            calendar::expand_item(item, date(2026, 11, 1), date(2026, 12, 1), timezone)
+            calendar::expand_item(entry, date(2026, 11, 1), date(2026, 12, 1), timezone)
                 .expect("expand calendar item"),
         );
     }
@@ -536,4 +558,418 @@ async fn calendar_http_requires_range_and_serializes_events() {
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn calendar_event_with_end_keeps_its_time_end() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+
+    let mut input = support::new_item(household.events_list_id, "Маникюр");
+    input.due_at = Some(utc(2026, 11, 11, 14, 0));
+    input.end_at = Some(utc(2026, 11, 11, 15, 30));
+    let event = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let events = expand_household(&db.pool, &household, date(2026, 11, 1), date(2026, 12, 1)).await;
+    let occurrence: Vec<_> = events
+        .iter()
+        .filter(|occurrence| occurrence.item_id == event.id)
+        .collect();
+
+    assert_eq!(occurrence.len(), 1);
+    assert_eq!(occurrence[0].kind, ListKind::Events);
+    assert!(!occurrence[0].all_day);
+    assert_eq!(
+        json_time(&occurrence[0].start),
+        json!("2026-11-11T14:00:00Z")
+    );
+    assert_eq!(json_time(&occurrence[0].end), json!("2026-11-11T15:30:00Z"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn calendar_event_without_end_lasts_an_hour() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+
+    let mut input = support::new_item(household.events_list_id, "Звонок");
+    input.due_at = Some(utc(2026, 11, 11, 10, 0));
+    let event = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let events = expand_household(&db.pool, &household, date(2026, 11, 1), date(2026, 12, 1)).await;
+    let occurrence: Vec<_> = events
+        .iter()
+        .filter(|occurrence| occurrence.item_id == event.id)
+        .collect();
+
+    assert_eq!(occurrence.len(), 1);
+    assert_eq!(
+        json_time(&occurrence[0].start),
+        json!("2026-11-11T10:00:00Z")
+    );
+    assert_eq!(json_time(&occurrence[0].end), json!("2026-11-11T11:00:00Z"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn calendar_multi_day_event_ends_on_the_next_day() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+
+    let mut input = support::new_item(household.events_list_id, "Отпуск");
+    input.due_date = Some(date(2027, 3, 5));
+    input.end_date = Some(date(2027, 3, 10));
+    let event = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let events = expand_household(&db.pool, &household, date(2027, 3, 1), date(2027, 4, 1)).await;
+    let occurrence: Vec<_> = events
+        .iter()
+        .filter(|occurrence| occurrence.item_id == event.id)
+        .collect();
+
+    assert_eq!(occurrence.len(), 1);
+    assert_eq!(occurrence[0].kind, ListKind::Events);
+    assert!(occurrence[0].all_day);
+    assert_eq!(json_time(&occurrence[0].start), json!("2027-03-05"));
+    assert_eq!(
+        json_time(&occurrence[0].end),
+        json!("2027-03-11"),
+        "the inclusive end date is returned exclusive"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn calendar_includes_an_event_that_started_before_the_interval() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+
+    let mut input = support::new_item(household.events_list_id, "Командировка");
+    input.due_date = Some(date(2027, 2, 27));
+    input.end_date = Some(date(2027, 3, 2));
+    let event = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let events = expand_household(&db.pool, &household, date(2027, 3, 1), date(2027, 4, 1)).await;
+    let occurrence: Vec<_> = events
+        .iter()
+        .filter(|occurrence| occurrence.item_id == event.id)
+        .collect();
+
+    assert_eq!(occurrence.len(), 1);
+    assert_eq!(json_time(&occurrence[0].start), json!("2027-02-27"));
+    assert_eq!(json_time(&occurrence[0].end), json!("2027-03-03"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn calendar_expands_a_recurring_event_with_its_duration() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+
+    let mut input = support::new_item(household.events_list_id, "Тренировка");
+    input.due_at = Some(utc(2026, 11, 3, 15, 0));
+    input.end_at = Some(utc(2026, 11, 3, 16, 0));
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Weekly, vec![2]));
+    let event = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let events = expand_household(&db.pool, &household, date(2026, 11, 1), date(2026, 12, 1)).await;
+    let occurrence: Vec<_> = events
+        .iter()
+        .filter(|occurrence| occurrence.item_id == event.id)
+        .collect();
+
+    let starts: Vec<_> = occurrence
+        .iter()
+        .map(|occurrence| json_time(&occurrence.start))
+        .collect();
+    let ends: Vec<_> = occurrence
+        .iter()
+        .map(|occurrence| json_time(&occurrence.end))
+        .collect();
+    assert_eq!(
+        starts,
+        vec![
+            json!("2026-11-03T15:00:00Z"),
+            json!("2026-11-10T15:00:00Z"),
+            json!("2026-11-17T15:00:00Z"),
+            json!("2026-11-24T15:00:00Z")
+        ]
+    );
+    assert_eq!(
+        ends,
+        vec![
+            json!("2026-11-03T16:00:00Z"),
+            json!("2026-11-10T16:00:00Z"),
+            json!("2026-11-17T16:00:00Z"),
+            json!("2026-11-24T16:00:00Z")
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn calendar_includes_a_recurring_event_started_before_the_interval() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+
+    let mut input = support::new_item(household.events_list_id, "Отчётный период");
+    input.due_date = Some(date(2026, 3, 27));
+    input.end_date = Some(date(2026, 4, 2));
+    let mut rule = support::recurrence(RecurrenceFreq::Monthly, Vec::new());
+    rule.month_rule = Some(MonthRule::AnchorDay);
+    input.recurrence = Some(rule);
+    let event = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let events = expand_household(&db.pool, &household, date(2026, 4, 1), date(2026, 5, 1)).await;
+    let occurrence: Vec<_> = events
+        .iter()
+        .filter(|occurrence| occurrence.item_id == event.id)
+        .collect();
+
+    assert_eq!(
+        occurrence
+            .iter()
+            .map(|occurrence| json_time(&occurrence.start))
+            .collect::<Vec<_>>(),
+        vec![json!("2026-03-27"), json!("2026-04-27")],
+        "the occurrence started in March and the April one are not duplicated"
+    );
+    assert_eq!(
+        occurrence
+            .iter()
+            .map(|occurrence| json_time(&occurrence.end))
+            .collect::<Vec<_>>(),
+        vec![json!("2026-04-03"), json!("2026-05-04")]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn calendar_drops_an_event_occurrence_before_the_interval() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+
+    // Однодневное ежедневное событие: развёртка начинается на день раньше
+    // запроса, но вхождение предыдущего дня не пересекается с интервалом.
+    let mut input = support::new_item(household.events_list_id, "Зарядка");
+    input.due_date = Some(date(2026, 11, 1));
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Daily, Vec::new()));
+    let event = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let events =
+        expand_household(&db.pool, &household, date(2026, 11, 10), date(2026, 11, 12)).await;
+    let starts: Vec<_> = events
+        .iter()
+        .filter(|occurrence| occurrence.item_id == event.id)
+        .map(|occurrence| json_time(&occurrence.start))
+        .collect();
+
+    assert_eq!(
+        starts,
+        vec![json!("2026-11-10"), json!("2026-11-11")],
+        "the one-day occurrence of the previous day must not leak into the answer"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn calendar_drops_a_multi_day_occurrence_that_ends_at_the_interval_start() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+
+    // Двухдневное ежедневное событие: вхождение 1 ноября заканчивается ровно
+    // в начале интервала и не попадает в ответ, а следующие — попадают.
+    let mut input = support::new_item(household.events_list_id, "Смена");
+    input.due_date = Some(date(2026, 11, 1));
+    input.end_date = Some(date(2026, 11, 2));
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Daily, Vec::new()));
+    let event = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let events = expand_household(&db.pool, &household, date(2026, 11, 3), date(2026, 11, 6)).await;
+    let starts: Vec<_> = events
+        .iter()
+        .filter(|occurrence| occurrence.item_id == event.id)
+        .map(|occurrence| json_time(&occurrence.start))
+        .collect();
+
+    assert_eq!(
+        starts,
+        vec![
+            json!("2026-11-02"),
+            json!("2026-11-03"),
+            json!("2026-11-04"),
+            json!("2026-11-05")
+        ],
+        "an occurrence that ends exactly at the interval start is not included"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn calendar_shows_a_moved_multi_day_occurrence_started_before_the_interval() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+
+    let mut input = support::new_item(household.events_list_id, "Командировка");
+    input.due_date = Some(date(2026, 11, 2));
+    input.end_date = Some(date(2026, 11, 4));
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Weekly, vec![1]));
+    let event = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        event.id,
+        event.version,
+        Due::AllDay(date(2026, 11, 5)),
+        "Europe/Moscow",
+        Utc.with_ymd_and_hms(2026, 11, 1, 12, 0, 0)
+            .single()
+            .expect("fixed moment"),
+    )
+    .await
+    .expect("reschedule occurrence");
+    drop(conn);
+
+    let events =
+        expand_household(&db.pool, &household, date(2026, 11, 6), date(2026, 11, 20)).await;
+    let occurrences: Vec<_> = events
+        .iter()
+        .filter(|occurrence| occurrence.item_id == event.id)
+        .collect();
+
+    assert_eq!(
+        occurrences
+            .iter()
+            .map(|occurrence| json_time(&occurrence.start))
+            .collect::<Vec<_>>(),
+        vec![
+            json!("2026-11-05"),
+            json!("2026-11-09"),
+            json!("2026-11-16")
+        ],
+        "the moved multi-day occurrence started before the interval and is still running in it"
+    );
+    assert_eq!(
+        occurrences
+            .iter()
+            .map(|occurrence| json_time(&occurrence.end))
+            .collect::<Vec<_>>(),
+        vec![
+            json!("2026-11-08"),
+            json!("2026-11-12"),
+            json!("2026-11-19")
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn calendar_keeps_a_moved_timed_occurrence_at_the_interval_boundary_in_the_series_timezone() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+
+    // Серия живёт в поясе UTC+14, household — в Москве. Перенесённое
+    // вхождение 05:00 местного времени 6 ноября — это 15:00Z 5 ноября: по
+    // поясу household оно уже вчерашнее, по поясу серии — начало интервала.
+    let mut input = support::new_item(household.events_list_id, "Созвон");
+    input.due_at = Some(utc(2026, 11, 6, 2, 0));
+    let mut rule = support::recurrence(RecurrenceFreq::Weekly, vec![5]);
+    rule.timezone = Some("Pacific/Kiritimati".into());
+    input.recurrence = Some(rule);
+    let event = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        event.id,
+        event.version,
+        Due::Timed(utc(2026, 11, 5, 15, 0)),
+        "Europe/Moscow",
+        Utc.with_ymd_and_hms(2026, 11, 1, 12, 0, 0)
+            .single()
+            .expect("fixed moment"),
+    )
+    .await
+    .expect("reschedule occurrence");
+    drop(conn);
+
+    let events =
+        expand_household(&db.pool, &household, date(2026, 11, 6), date(2026, 11, 13)).await;
+    let starts: Vec<_> = events
+        .iter()
+        .filter(|occurrence| occurrence.item_id == event.id)
+        .map(|occurrence| json_time(&occurrence.start))
+        .collect();
+
+    assert_eq!(
+        starts,
+        vec![json!("2026-11-05T15:00:00Z")],
+        "the interval boundary is counted in the series timezone"
+    );
 }

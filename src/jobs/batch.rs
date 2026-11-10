@@ -23,6 +23,7 @@ use super::delivery::{
 };
 use super::digest;
 use super::notice::{NOTICE_ROW_COLUMNS, NOTICE_ROW_FROM, NoticeRow};
+use crate::domain::models::ListKind;
 use crate::storage::repositories::notifications;
 use crate::telegram::bot::notify;
 
@@ -257,7 +258,12 @@ async fn prepare_deferred_batch(
                     now,
                 ),
                 version: item.version,
-                state: notify::BatchEntryState::Open,
+                state: if list.kind == ListKind::Events {
+                    notify::BatchEntryState::Event
+                } else {
+                    notify::BatchEntryState::Open
+                },
+                is_event: list.kind == ListKind::Events,
             },
         });
     }
@@ -283,7 +289,16 @@ async fn prepare_deferred_batch(
 
     let batch_id = Uuid::now_v7();
     let page = &entries[..entries.len().min(notify::BATCH_PAGE_SIZE)];
-    let ui = notify::batch_ui(batch_id, 0, page, entries.len(), None, identity.timezone);
+    let actions = notify::BatchActions::of(&entries);
+    let ui = notify::batch_ui(
+        batch_id,
+        0,
+        page,
+        entries.len(),
+        None,
+        actions,
+        identity.timezone,
+    );
     let html = notify::render_notice(
         &mut *conn,
         identity.telegram_user_id,

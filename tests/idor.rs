@@ -8,15 +8,20 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 const SECRET_TITLE: &str = "Секретная задача семьи А";
+const SECRET_EVENT_TITLE: &str = "Секретное событие семьи А";
 
 struct Fixture {
     victim: support::TestHousehold,
     item_id: Uuid,
     item_version: i32,
+    event_id: Uuid,
+    event_version: i32,
     attacker_token: String,
     attacker_list: Uuid,
     attacker_item: Uuid,
     attacker_item_version: i32,
+    attacker_event: Uuid,
+    attacker_event_version: i32,
 }
 
 async fn fixture(pool: &sqlx::PgPool) -> Fixture {
@@ -28,6 +33,18 @@ async fn fixture(pool: &sqlx::PgPool) -> Fixture {
     let secret =
         support::create_item(pool, &victim, victim.tasks_list_id, &victim.owner(), secret).await;
 
+    let mut secret_event = support::new_item(victim.events_list_id, SECRET_EVENT_TITLE);
+    secret_event.due_at = Some(chrono::Utc::now());
+    secret_event.end_at = Some(chrono::Utc::now() + chrono::Duration::hours(1));
+    let secret_event = support::create_item(
+        pool,
+        &victim,
+        victim.events_list_id,
+        &victim.owner(),
+        secret_event,
+    )
+    .await;
+
     let attacker = support::create_household(pool).await;
     let own = support::create_item(
         pool,
@@ -37,6 +54,16 @@ async fn fixture(pool: &sqlx::PgPool) -> Fixture {
         support::new_item(attacker.tasks_list_id, "Моя задача"),
     )
     .await;
+    let mut own_event = support::new_item(attacker.events_list_id, "Моё событие");
+    own_event.due_at = Some(chrono::Utc::now());
+    let own_event = support::create_item(
+        pool,
+        &attacker,
+        attacker.events_list_id,
+        &attacker.owner(),
+        own_event,
+    )
+    .await;
     let attacker_token =
         support::issue_token(pool, attacker.household_id, &["ha:read", "ha:write"]).await;
 
@@ -44,10 +71,14 @@ async fn fixture(pool: &sqlx::PgPool) -> Fixture {
         victim,
         item_id: secret.id,
         item_version: secret.version,
+        event_id: secret_event.id,
+        event_version: secret_event.version,
         attacker_token,
         attacker_list: attacker.tasks_list_id,
         attacker_item: own.id,
         attacker_item_version: own.version,
+        attacker_event: own_event.id,
+        attacker_event_version: own_event.version,
     }
 }
 
@@ -56,6 +87,10 @@ fn assert_hidden(status: StatusCode, body: &Value, case: &str) {
     assert_eq!(body["error"]["code"], "not_found", "{case}");
     let rendered = body.to_string();
     assert!(!rendered.contains(SECRET_TITLE), "{case}: leaked title");
+    assert!(
+        !rendered.contains(SECRET_EVENT_TITLE),
+        "{case}: leaked event title"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -65,8 +100,11 @@ async fn foreign_resources_are_not_found_on_every_endpoint() {
     let app = support::app(&db.pool);
     let token = Some(f.attacker_token.as_str());
     let list = f.victim.tasks_list_id;
+    let events_list = f.victim.events_list_id;
     let item = f.item_id;
     let version = f.item_version;
+    let event = f.event_id;
+    let event_version = f.event_version;
 
     let cases: Vec<(&str, Method, String, Option<Value>)> = vec![
         (
@@ -135,6 +173,57 @@ async fn foreign_resources_are_not_found_on_every_endpoint() {
             format!("/api/v1/items/{}", f.attacker_item),
             Some(json!({"version": f.attacker_item_version, "list_id": list})),
         ),
+        (
+            "list foreign events",
+            Method::GET,
+            format!("/api/v1/lists/{events_list}/items"),
+            None,
+        ),
+        (
+            "create event in foreign events list",
+            Method::POST,
+            format!("/api/v1/lists/{events_list}/items"),
+            Some(json!({"title": "Подмена", "due_date": "2026-11-11"})),
+        ),
+        (
+            "rename foreign events list",
+            Method::PATCH,
+            format!("/api/v1/lists/{events_list}"),
+            Some(json!({"name": "Взлом"})),
+        ),
+        (
+            "delete foreign events list",
+            Method::DELETE,
+            format!("/api/v1/lists/{events_list}"),
+            None,
+        ),
+        (
+            "get foreign event",
+            Method::GET,
+            format!("/api/v1/items/{event}"),
+            None,
+        ),
+        (
+            "patch foreign event",
+            Method::PATCH,
+            format!("/api/v1/items/{event}"),
+            Some(json!({"version": event_version, "title": "Взлом"})),
+        ),
+        (
+            "delete foreign event",
+            Method::DELETE,
+            format!("/api/v1/items/{event}"),
+            None,
+        ),
+        (
+            "move own event to a foreign events list",
+            Method::PATCH,
+            format!("/api/v1/items/{}", f.attacker_event),
+            Some(json!({
+                "version": f.attacker_event_version,
+                "list_id": events_list
+            })),
+        ),
     ];
 
     for (case, method, uri, body) in cases {
@@ -188,6 +277,11 @@ async fn collections_never_contain_foreign_data() {
             f.victim.tasks_list_id
         ),
         format!(
+            "/api/v1/search?status=all&list_id={}",
+            f.victim.events_list_id
+        ),
+        "/api/v1/search?status=all&q=Секретное".to_owned(),
+        format!(
             "/api/v1/search?status=all&assignee_user_id={}",
             f.victim.member_id
         ),
@@ -206,6 +300,10 @@ async fn collections_never_contain_foreign_data() {
         let rendered = body.to_string();
         assert!(!rendered.contains(SECRET_TITLE), "{uri}: leaked title");
         assert!(
+            !rendered.contains(SECRET_EVENT_TITLE),
+            "{uri}: leaked event title"
+        );
+        assert!(
             !rendered.contains(&f.victim.member_id.to_string())
                 && !rendered.contains(&f.victim.owner_id.to_string()),
             "{uri}: leaked a foreign user id"
@@ -213,6 +311,10 @@ async fn collections_never_contain_foreign_data() {
         assert!(
             !rendered.contains(&f.item_id.to_string()),
             "{uri}: leaked a foreign item id"
+        );
+        assert!(
+            !rendered.contains(&f.event_id.to_string()),
+            "{uri}: leaked a foreign event id"
         );
     }
 }

@@ -11,7 +11,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
-use crate::domain::models::{Item, ItemStatus, List};
+use crate::domain::models::{Item, ItemStatus, List, ListKind};
 use crate::domain::recurrence::resolve_local;
 use crate::jobs::keys::snooze_origin;
 use crate::storage::repositories::notifications::{self, NewDelivery, NotificationKind};
@@ -28,8 +28,8 @@ use super::{Ctx, Fail, issue_and_render};
 mod batch;
 
 pub use batch::{
-    BATCH_PAGE_SIZE, BatchEntry, BatchEntryState, batch_complete, batch_complete_all, batch_open,
-    batch_page, batch_snooze, batch_snooze_all, batch_ui,
+    BATCH_PAGE_SIZE, BatchActions, BatchEntry, BatchEntryState, batch_complete, batch_complete_all,
+    batch_move, batch_open, batch_page, batch_snooze, batch_snooze_all, batch_ui,
 };
 
 /// Час, на который переносится напоминание «до завтра».
@@ -58,6 +58,17 @@ pub(super) fn title_spans(title: &str) -> Vec<Span> {
     vec![Span::bold(clip(title, 120))]
 }
 
+/// Момент события строкой напоминания: «Сегодня, 14:00»; без значения —
+/// прочерк.
+fn event_moment(
+    at: Option<DateTime<Utc>>,
+    date: Option<NaiveDate>,
+    tz: Tz,
+    now: DateTime<Utc>,
+) -> String {
+    ru::due_label(at, date, tz, now).map_or_else(|| "—".to_owned(), |label| ru::capitalize(&label))
+}
+
 /// Напоминание о сроке.
 pub fn reminder_ui(
     item: &Item,
@@ -70,6 +81,29 @@ pub fn reminder_ui(
         Some(minutes) if minutes > 0 => format!("⏰ Через {}", ru::minutes(minutes)),
         _ => "⏰ Пора".to_owned(),
     };
+    if list.kind == ListKind::Events {
+        // Событие не выполняется и не откладывается: у напоминания свои
+        // действия — закрыть, перенести начало или открыть карточку.
+        return Ui::new()
+            .heading(heading)
+            .spans(title_spans(&item.title))
+            .text(format!(
+                "📅 Начало: {}",
+                event_moment(item.due_at, item.due_date, tz, now)
+            ))
+            .text(format!(
+                "🏁 Конец: {}",
+                event_moment(item.end_at, item.end_date, tz, now)
+            ))
+            .row(vec![
+                button("Закрыть", Action::NoticeClose),
+                button("📅 Перенести", Action::NoticeMove { item_id: item.id }),
+            ])
+            .row(vec![button(
+                "📋 Открыть",
+                Action::NoticeOpen { item_id: item.id },
+            )]);
+    }
     Ui::new()
         .heading(heading)
         .spans(title_spans(&item.title))
@@ -128,6 +162,8 @@ pub struct DigestLine {
     pub title: String,
     /// Срок в человекочитаемом виде.
     pub when: String,
+    /// Строка события, а не задачи: у неё своя отметка.
+    pub is_event: bool,
 }
 
 /// Утренняя сводка.
@@ -139,9 +175,13 @@ pub fn digest_ui(
     shopping_list: Option<Uuid>,
 ) -> Ui {
     const MAX_LINES: usize = 20;
-    let total_tasks = today.len() + overdue.len();
+    let total_lines = today.len() + overdue.len();
+    let mut hidden_event = false;
     let mut ui = Ui::new().heading("☀️ Доброе утро!");
-    let line = |entry: &DigestLine| format!("☐ {} · {}", clip(&entry.title, 60), entry.when);
+    let line = |entry: &DigestLine| {
+        let mark = if entry.is_event { "🗓" } else { "☐" };
+        format!("{mark} {} · {}", clip(&entry.title, 60), entry.when)
+    };
     let mut budget = MAX_LINES;
     for (title, entries) in [("Сегодня", today), ("Просрочено", overdue)] {
         if entries.is_empty() {
@@ -150,10 +190,16 @@ pub fn digest_ui(
         let shown = entries.len().min(budget);
         let mut lines: Vec<String> = entries[..shown].iter().map(line).collect();
         if shown < entries.len() {
-            lines.push(format!(
-                "…и ещё {}",
-                ru::tasks(i64::try_from(entries.len() - shown).unwrap_or(0))
-            ));
+            let hidden = &entries[shown..];
+            let rest = i64::try_from(hidden.len()).unwrap_or(0);
+            let has_event = hidden.iter().any(|entry| entry.is_event);
+            hidden_event |= has_event;
+            // Смешанный хвост не называем задачами: в нём могут быть события.
+            lines.push(if has_event {
+                format!("…и ещё {rest}")
+            } else {
+                format!("…и ещё {}", ru::tasks(rest))
+            });
         }
         budget -= shown;
         ui = ui.bold(title).text(lines.join("\n"));
@@ -191,18 +237,26 @@ pub fn digest_ui(
             },
         ));
     }
-    if total_tasks > MAX_LINES
-        && let Some(list_id) = tasks_list
-    {
-        row.push(back_button(
-            "Показать ещё",
-            Screen::List {
+    if total_lines > MAX_LINES {
+        // 0009-events 8.2: скрытые события открываются в повестке, а скрытые
+        // задачи — в списке задач. Если хвост смешанный, важнее события: в
+        // списке задач их не видно.
+        let more = if hidden_event || tasks_list.is_none() {
+            Some(Screen::Agenda {
+                list: None,
+                page: 0,
+            })
+        } else {
+            tasks_list.map(|list_id| Screen::List {
                 list_id,
                 page: 0,
                 edit: false,
                 from_lists: false,
-            },
-        ));
+            })
+        };
+        if let Some(target) = more {
+            row.push(back_button("Показать ещё", target));
+        }
     }
     ui.row(row)
 }
@@ -365,6 +419,41 @@ pub(super) async fn open(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> R
     .await
 }
 
+/// «Закрыть» из напоминания о событии: удалить сообщение из чата.
+///
+/// Запись доставки не меняется и остаётся `sent`, поэтому напоминание о том же
+/// вхождении повторно не планируется; о следующем вхождении придёт по
+/// расписанию.
+pub async fn close(ctx: &mut Ctx<'_>, message_id: i64) -> Result<(), Fail> {
+    outbox::enqueue(
+        &mut *ctx.conn,
+        ctx.chat_id,
+        &Outgoing::Delete { message_id },
+        Some(&super::delete_dedupe_key(ctx.chat_id, message_id)),
+        ctx.now,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Открыть экран быстрого срока события из уведомления или сводного сообщения.
+pub(super) async fn open_due(ctx: &mut Ctx<'_>, item_id: Uuid) -> Result<(), Fail> {
+    ctx.present(Screen::Due {
+        item_id,
+        back: Box::new(Screen::Menu),
+    })
+    .await
+}
+
+/// «📅 Перенести» из напоминания о событии.
+pub async fn event_due(ctx: &mut Ctx<'_>, item_id: Uuid) -> Result<(), Fail> {
+    if load(ctx, item_id).await?.is_none() {
+        ctx.toast("Событие больше недоступно");
+        return Ok(());
+    }
+    open_due(ctx, item_id).await
+}
+
 pub(super) fn snooze_time(
     until: SnoozeUntil,
     tz: Tz,
@@ -499,6 +588,7 @@ mod tests {
             .map(|n| DigestLine {
                 title: format!("Задача {n}"),
                 when: "сегодня".into(),
+                is_event: false,
             })
             .collect();
         let ui = digest_ui(&lines, &[], 0, Some(Uuid::now_v7()), None);
@@ -509,6 +599,96 @@ mod tests {
         assert_eq!(html.matches("☐ Задача").count(), 20);
         assert!(html.contains("…и ещё 5 задач"));
         assert!(html.contains("Показать ещё"));
+    }
+
+    #[test]
+    fn digest_limit_counts_events_and_tasks_together() {
+        let mut lines: Vec<DigestLine> = (0..15)
+            .map(|n| DigestLine {
+                title: format!("Задача {n}"),
+                when: "сегодня".into(),
+                is_event: false,
+            })
+            .collect();
+        lines.extend((0..10).map(|n| DigestLine {
+            title: format!("Событие {n}"),
+            when: "14:00–15:00".into(),
+            is_event: true,
+        }));
+        let ui = digest_ui(&lines, &[], 0, Some(Uuid::now_v7()), None);
+        let tokens = vec!["t:AAAAAAAAAAAAAAAA".to_owned(); 2];
+        let html = crate::telegram::rich::render(&ui, &tokens).html;
+
+        assert_eq!(html.matches("☐ Задача").count(), 15);
+        assert_eq!(html.matches("🗓 Событие").count(), 5);
+        assert!(html.contains("…и ещё 5"), "{html}");
+        assert!(!html.contains("…и ещё 5 задач"), "{html}");
+        assert!(html.contains("Показать ещё"), "{html}");
+    }
+
+    #[test]
+    fn digest_show_more_opens_the_agenda_when_events_are_hidden() {
+        let mut lines: Vec<DigestLine> = (0..15)
+            .map(|n| DigestLine {
+                title: format!("Задача {n}"),
+                when: "сегодня".into(),
+                is_event: false,
+            })
+            .collect();
+        lines.extend((0..10).map(|n| DigestLine {
+            title: format!("Событие {n}"),
+            when: "14:00–15:00".into(),
+            is_event: true,
+        }));
+        let ui = digest_ui(&lines, &[], 0, Some(Uuid::now_v7()), None);
+        let more = ui
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                crate::telegram::rich::Block::Buttons(buttons) => {
+                    buttons.iter().find(|button| button.label == "Показать ещё")
+                }
+                _ => None,
+            })
+            .expect("«Показать ещё» with a mixed tail");
+        assert!(matches!(
+            more.action,
+            Action::Go {
+                to: Screen::Agenda {
+                    list: None,
+                    page: 0
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn digest_show_more_keeps_the_task_list_when_only_tasks_are_hidden() {
+        let lines: Vec<DigestLine> = (0..25)
+            .map(|n| DigestLine {
+                title: format!("Задача {n}"),
+                when: "сегодня".into(),
+                is_event: false,
+            })
+            .collect();
+        let list_id = Uuid::now_v7();
+        let ui = digest_ui(&lines, &[], 0, Some(list_id), None);
+        let more = ui
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                crate::telegram::rich::Block::Buttons(buttons) => {
+                    buttons.iter().find(|button| button.label == "Показать ещё")
+                }
+                _ => None,
+            })
+            .expect("«Показать ещё» with hidden tasks");
+        assert!(matches!(
+            more.action,
+            Action::Go {
+                to: Screen::List { list_id: id, .. }
+            } if id == list_id
+        ));
     }
 
     #[test]

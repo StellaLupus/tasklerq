@@ -114,7 +114,7 @@ async fn headless_disabled_telegram_serves_the_home_assistant_scenario() {
     let (status, snapshot) =
         request(&app, Method::GET, "/api/v1/snapshot", Some(&ha), None, None).await;
     assert_eq!(status, StatusCode::OK, "{snapshot}");
-    assert_eq!(snapshot["lists"].as_array().expect("lists").len(), 2);
+    assert_eq!(snapshot["lists"].as_array().expect("lists").len(), 3);
     assert_eq!(snapshot["deleted_item_ids"], json!([]));
     let next_since = snapshot["next_since"]
         .as_str()

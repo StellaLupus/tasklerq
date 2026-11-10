@@ -590,7 +590,7 @@ curl -fsS -X POST http://127.0.0.1:18080/api/v1/capture \
 | `tasklerq admin token create [--household <id>] --name "Home Assistant" --scopes ha:read,ha:write [--expires-in-days N]` | Выпустить токен. Значение показывается один раз, в базе хранится только хеш. `--scopes`: `ha:read`, `ha:write`, `capture:write`, `metrics:read`. `--expires-in-days N` задаёт срок. |
 | `tasklerq admin token list [--household <id>]` | id, префикс, состояние, scopes и название без секретов. |
 | `tasklerq admin token revoke <id> [--yes]` | Отозвать токен. Опасная команда: без `--yes` спрашивает `y/N` в терминале; без TTY завершается ошибкой и токен не меняет. |
-| `tasklerq admin household create --name "Семья" --timezone Europe/Moscow [--owner-telegram-id <id> [--owner-name "Имя"]]` | Создать household, списки «Задачи»/«Покупки» и, если указан `--owner-telegram-id`, владельца одной транзакцией. Без владельца печатает подсказку `admin user add`. В режиме `single` второй активный household отклоняется с `409`. |
+| `tasklerq admin household create --name "Семья" --timezone Europe/Moscow [--owner-telegram-id <id> [--owner-name "Имя"]]` | Создать household, списки «Задачи»/«Покупки»/«Календарь» и, если указан `--owner-telegram-id`, владельца одной транзакцией. Без владельца печатает подсказку `admin user add`. В режиме `single` второй активный household отклоняется с `409`. |
 | `tasklerq admin household list` | id, название, часовой пояс, Telegram ID владельца или `-`, число участников, открытых задач, активных токенов и дата создания. |
 | `tasklerq admin household delete --household <id> [--yes]` | Мягко удалить household: household и активные участники помечаются удалёнными, токены и приглашения отзываются. Без `--yes` просит ввести название household; без TTY завершается ошибкой и ничего не меняет. Уведомления участникам не отправляются. |
 | `tasklerq admin user add --telegram-id <id> --role owner\|member [--name "Имя"] [--household <id>]` | Добавить участника, записать `member_joined`, отклонить занятый Telegram ID и второго `owner`. |
@@ -783,6 +783,14 @@ sudo /usr/local/bin/docker compose up -d tasklerq
 
 Схема должна быть совместима с предыдущей версией (expand/contract): если
 миграция разрушительная — откат только через restore backup.
+
+Для события (change `0009-events`) миграция `0016` добавляет значение `events`
+в `list_kind`, а `0017` — колонки конца и список «Календарь». После применения
+`0016` прежняя версия сервера не читает списки household с
+`list_kind = 'events'`, поэтому откат тегом не годится: нужен restore резервной
+копии, сделанной перед обновлением (раздел 11), в новую базу. Предупреждение
+`unknown_versions` здесь не помогает: оно покрывает более новые миграции, а не
+неизвестное значение enum.
 
 Откат тегом работает на образах, собранных после v0.1.0 и содержащих изменение
 «запуск на схеме с более новыми миграциями». Признак такого образа: при старте

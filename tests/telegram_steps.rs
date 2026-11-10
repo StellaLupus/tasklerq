@@ -287,6 +287,7 @@ async fn stand_household(pool: &sqlx::PgPool, chat: i64) -> support::TestHouseho
         member_id: owner_id,
         tasks_list_id: list("tasks").await.expect("default tasks list"),
         shopping_list_id: list("shopping").await.expect("default shopping list"),
+        events_list_id: list("events").await.expect("default events list"),
     }
 }
 
@@ -526,4 +527,123 @@ async fn create_shopping_preview_keeps_the_chosen_quantity_and_unit() {
     bot.assert_screen_contains("Название: Молоко");
     bot.assert_screen_contains("Количество: 2 л");
     bot.assert_screen_contains("Список: Покупки");
+}
+
+// 0009-events 9.1: событие без начала не создаётся, а редактор остаётся открыт.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn event_without_start_stays_open_with_an_explanation() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+
+    bot.press("Повестка").await;
+    bot.press("Событие").await;
+    bot.text("Маникюр").await;
+    bot.press("Сохранить").await;
+
+    bot.assert_screen_contains("Укажите начало события.");
+    bot.assert_screen_contains("Когда начало?");
+
+    let saved: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM items
+         WHERE household_id = $1 AND title = 'Маникюр' AND deleted_at IS NULL",
+    )
+    .bind(stand_household(&db.pool, bot.chat).await.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("count");
+    assert_eq!(saved, 0, "an event must not be created without a start");
+}
+
+// 0009-events 9.1: конец раньше начала отклоняется, событие не создаётся.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn event_end_before_start_is_rejected_and_creates_nothing() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+
+    bot.press("Повестка").await;
+    bot.press("Событие").await;
+    bot.text("Маникюр").await;
+    bot.press("Начало").await;
+    bot.press("Дата и время").await;
+    bot.text("завтра 14:00").await;
+    bot.press("Конец").await;
+    bot.press("Дата и время").await;
+    bot.text("сегодня 09:00").await;
+    bot.press("Сохранить").await;
+
+    bot.assert_screen_contains("Конец раньше начала.");
+    bot.assert_has_button("💾 Сохранить");
+
+    let saved: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM items
+         WHERE household_id = $1 AND title = 'Маникюр' AND deleted_at IS NULL",
+    )
+    .bind(stand_household(&db.pool, bot.chat).await.household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("count");
+    assert_eq!(
+        saved, 0,
+        "an event with a reversed interval must not be created"
+    );
+}
+
+// 0009-events 9.2 (ревью 9.1): перенос только начала сдвигает конец доменом,
+// сохраняя длительность.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editing_only_the_start_of_an_event_shifts_the_end() {
+    use chrono::{DateTime, TimeZone};
+
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = stand_household(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let today = bot.now.with_timezone(&moscow).date_naive();
+    let tomorrow = today + Duration::days(1);
+    let after_tomorrow = today + Duration::days(2);
+    let at = |date: chrono::NaiveDate, hour: u32| {
+        moscow
+            .from_local_datetime(&date.and_hms_opt(hour, 0, 0).expect("time"))
+            .single()
+            .expect("local time")
+            .with_timezone(&Utc)
+    };
+
+    let mut event = support::new_item(household.events_list_id, "Маникюр");
+    event.due_at = Some(at(tomorrow, 14));
+    event.end_at = Some(at(tomorrow, 15));
+    let event = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        event,
+    )
+    .await;
+
+    bot.press("Повестка").await;
+    bot.press("Маникюр").await;
+    bot.press("Править").await;
+    bot.press("Начало").await;
+    bot.press("Дата и время").await;
+    bot.text("послезавтра 14:00").await;
+    bot.press("Сохранить").await;
+
+    bot.assert_screen_contains("Сохранено");
+    let (due_at, end_at): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) =
+        sqlx::query_as("SELECT due_at, end_at FROM items WHERE id = $1")
+            .bind(event.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("event");
+    assert_eq!(
+        due_at,
+        Some(at(after_tomorrow, 14)),
+        "the start moves to the day after tomorrow"
+    );
+    assert_eq!(
+        end_at,
+        Some(at(after_tomorrow, 15)),
+        "the end follows the start and keeps the one-hour duration"
+    );
 }

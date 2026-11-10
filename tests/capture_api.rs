@@ -560,6 +560,131 @@ async fn invalid_request_fields_are_rejected_before_the_llm() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_explicit_events_list_is_rejected_before_the_llm_and_quota() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(shopping("молоко"))]);
+    let app = app(&db.pool, ai.clone(), config());
+
+    // Отказ такой же, как у неизвестного списка: резерв ключа уже взят, но
+    // ошибка освобождает его, а квота и LLM не трогаются.
+    let body = json!({
+        "text": "маникюр завтра с 14 до 15:30",
+        "source": "api",
+        "mode": "auto",
+        "list_id": household.events_list_id,
+        "idempotency_key": "events-list"
+    });
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(body.clone()),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{json}");
+    assert_error_envelope(&json, "validation_error");
+    assert_eq!(
+        ai.calls(),
+        0,
+        "the LLM must not be called for an events list"
+    );
+    assert_eq!(item_count(&db.pool, household.household_id).await, 0);
+    assert_eq!(draft_count(&db.pool, household.household_id).await, 0);
+    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM llm_runs WHERE household_id = $1")
+        .bind(household.household_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("llm runs");
+    assert_eq!(runs, 0, "no LLM run must be recorded and the quota stays");
+
+    // Резерв ключа освобождён отказом: повтор с тем же ключом снова проходит
+    // проверку списка и даёт тот же `422`, а не `409` «in progress».
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{json}");
+    assert_error_envelope(&json, "validation_error");
+    assert_eq!(ai.calls(), 0, "the repeat must not reach the LLM either");
+    assert_eq!(item_count(&db.pool, household.household_id).await, 0);
+    assert_eq!(draft_count(&db.pool, household.household_id).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_interval_phrase_stays_a_task_and_never_becomes_an_event() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(json!({"items": [
+        {"target_kind": "tasks", "title": "маникюр"}
+    ]}))]);
+    let app = app(&db.pool, ai.clone(), config());
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(body("маникюр завтра с 14 до 15:30", "ha_voice", "draft")),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["status"], "draft");
+    assert_eq!(json["items"][0]["kind"], "tasks");
+    assert_eq!(
+        json["items"][0]["list_id"],
+        household.tasks_list_id.to_string()
+    );
+    assert_eq!(
+        item_count(&db.pool, household.household_id).await,
+        0,
+        "a draft must not create an event"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_event_list_name_from_the_llm_falls_back_to_the_kind_default() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(json!({"items": [
+        {"target_kind": "tasks", "target_list": "Календарь", "title": "маникюр"}
+    ]}))]);
+    let app = app(&db.pool, ai.clone(), config());
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(body("маникюр завтра", "api", "draft")),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["status"], "draft");
+    assert_eq!(json["items"][0]["kind"], "tasks");
+    assert_eq!(
+        json["items"][0]["list_id"],
+        household.tasks_list_id.to_string(),
+        "the events list with that name must not become the target list"
+    );
+    assert_ne!(
+        json["items"][0]["list_id"],
+        household.events_list_id.to_string()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_text_without_printable_characters_is_rejected_before_the_llm() {
     let db = db().await;
     let household = support::create_household(&db.pool).await;

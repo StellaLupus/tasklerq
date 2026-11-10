@@ -2,14 +2,22 @@
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
+use crate::domain::events::{effective_end, is_past};
+use crate::domain::models::Item;
 use crate::domain::recurrence::parse_timezone;
 
 use super::completions;
+use super::row::{ITEM_COLUMNS, ItemRow, hydrate_many};
+
+/// Условие просроченной задачи: срок со временем прошёл или вседневный срок
+/// раньше сегодняшнего дня. Параметры — `$2` (сейчас) и `$3` (сегодня в поясе
+/// пользователя).
+const OVERDUE_TASKS_CONDITION: &str = "i.due_at < $2 OR i.due_date < $3";
 
 /// Счётчики главного меню.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -18,12 +26,22 @@ pub struct MenuCounts {
     pub open_tasks: i64,
     /// Из них просроченные.
     pub overdue_tasks: i64,
-    /// Открытые задачи со сроком на текущий день, ещё не просроченные.
+    /// Открытые задачи и события на сегодня: задачи со сроком на текущий день
+    /// и ещё не просроченные, события, которые начинаются сегодня или ещё идут.
     pub due_today_tasks: i64,
     /// Невыполненные позиции в `shopping` и `checklist`.
     pub open_shopping: i64,
     /// Выполнения задач сегодня по правилу раздела «Выполнено сегодня».
     pub done_today: i64,
+}
+
+/// Начало и конец события для счётчика «на сегодня».
+#[derive(sqlx::FromRow)]
+struct EventTimes {
+    due_at: Option<DateTime<Utc>>,
+    due_date: Option<NaiveDate>,
+    end_at: Option<DateTime<Utc>>,
+    end_date: Option<NaiveDate>,
 }
 
 /// Счётчики меню на момент `now` в часовом поясе `timezone`.
@@ -33,16 +51,37 @@ pub async fn menu_counts(
     timezone: &str,
     now: DateTime<Utc>,
 ) -> Result<MenuCounts, DomainError> {
+    let household_timezone: String =
+        sqlx::query_scalar("SELECT timezone FROM households WHERE id = $1")
+            .bind(household_id)
+            .fetch_one(&mut *conn)
+            .await?;
+    menu_counts_with_timezone(conn, household_id, timezone, &household_timezone, now).await
+}
+
+/// Счётчики меню с уже известным поясом household.
+///
+/// Вызывающий экран уже держит household, поэтому не делает лишний `SELECT`.
+pub async fn menu_counts_with_timezone(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    timezone: &str,
+    household_timezone: &str,
+    now: DateTime<Utc>,
+) -> Result<MenuCounts, DomainError> {
     let tz = parse_timezone(timezone)?;
     let today = now.with_timezone(&tz).date_naive();
+    // Вседневный конец события считается в поясе household: так событие
+    // проходит для всех участников одновременно (design, решение 3).
+    let household_tz = parse_timezone(household_timezone)?;
 
     let (open_tasks, overdue_tasks, due_today_tasks, open_shopping): (i64, i64, i64, i64) =
-        sqlx::query_as(
+        sqlx::query_as(&format!(
             "SELECT
                  count(*) FILTER (WHERE l.kind = 'tasks' AND i.status = 'open'),
                  count(*) FILTER (
                      WHERE l.kind = 'tasks' AND i.status = 'open'
-                       AND (i.due_at < $2 OR i.due_date < $3)
+                       AND ({OVERDUE_TASKS_CONDITION})
                  ),
                  count(*) FILTER (
                      WHERE l.kind = 'tasks' AND i.status = 'open'
@@ -50,20 +89,80 @@ pub async fn menu_counts(
                             OR (i.due_at >= $2
                                 AND (i.due_at AT TIME ZONE $4)::date = $3))
                  ),
-                 count(*) FILTER (WHERE l.kind <> 'tasks' AND i.status = 'open')
+                 -- 0009-events: открытые события не считаются покупками.
+                 count(*) FILTER (
+                     WHERE l.kind IN ('shopping', 'checklist') AND i.status = 'open'
+                 )
              FROM items i
              JOIN lists l ON l.id = i.list_id
              WHERE i.household_id = $1
                AND i.deleted_at IS NULL
                AND l.deleted_at IS NULL
                AND NOT l.is_archived",
-        )
+        ))
         .bind(household_id)
         .bind(now)
         .bind(today)
         .bind(timezone)
         .fetch_one(&mut *conn)
         .await?;
+
+    // 0009-events 8.1: событие на сегодня начинается сегодня или началось
+    // раньше и ещё не прошло. Конец считает домен: у вседневных событий это
+    // начало следующего дня в поясе household, включая переходы DST, которые
+    // SQL повторил бы неточно. SQL-предфильтр с запасом в двое суток отсекает
+    // давно прошедшие события до чтения: разовые события остаются `open`
+    // навсегда, и без него выборка росла бы на каждом показе меню.
+    let events: Vec<EventTimes> = sqlx::query_as(
+        "SELECT i.due_at, i.due_date, i.end_at, i.end_date
+         FROM items i
+         JOIN lists l ON l.id = i.list_id
+         WHERE i.household_id = $1
+           AND i.deleted_at IS NULL
+           AND l.deleted_at IS NULL
+           AND NOT l.is_archived
+           AND l.kind = 'events'
+           AND i.status = 'open'
+           AND COALESCE(
+                 i.end_at,
+                 CASE WHEN i.end_date IS NOT NULL
+                      THEN ((i.end_date + 1)::timestamp AT TIME ZONE $3)
+                 END,
+                 CASE WHEN i.due_at IS NOT NULL
+                      THEN i.due_at + interval '1 hour'
+                 END,
+                 CASE WHEN i.due_date IS NOT NULL
+                      THEN ((i.due_date + 1)::timestamp AT TIME ZONE $3)
+                 END
+               ) > $2 - interval '2 days'",
+    )
+    .bind(household_id)
+    .bind(now)
+    .bind(household_timezone)
+    .fetch_all(&mut *conn)
+    .await?;
+    let due_today_events = events
+        .iter()
+        .filter(|event| {
+            let starts_today = event.due_date.is_some_and(|date| date == today)
+                || event
+                    .due_at
+                    .is_some_and(|at| at.with_timezone(&tz).date_naive() == today);
+            let started = starts_today
+                || event.due_at.is_some_and(|at| at < now)
+                || event.due_date.is_some_and(|date| date < today);
+            started
+                && effective_end(
+                    event.due_at,
+                    event.due_date,
+                    event.end_at,
+                    event.end_date,
+                    household_tz,
+                )
+                .is_some_and(|end| end > now)
+        })
+        .count() as i64;
+    let due_today_tasks = due_today_tasks + due_today_events;
 
     // «Выполнено» — те же события, что попадают в разделы «Выполнено сегодня»,
     // и только по спискам задач.
@@ -95,6 +194,37 @@ pub async fn menu_counts(
     })
 }
 
+/// Открытые просроченные задачи всех списков household.
+///
+/// Отдельный запрос для раздела «Просрочено» повестки: календарная развёртка
+/// не возвращает прошлое. Условие то же, что у счётчика просроченных в меню.
+pub async fn overdue_tasks(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    today: NaiveDate,
+    now: DateTime<Utc>,
+) -> Result<Vec<Item>, DomainError> {
+    let rows = sqlx::query_as::<_, ItemRow>(&format!(
+        "SELECT {ITEM_COLUMNS}
+         FROM items i
+         JOIN lists l ON l.id = i.list_id
+         WHERE i.household_id = $1
+           AND i.deleted_at IS NULL
+           AND l.deleted_at IS NULL
+           AND NOT l.is_archived
+           AND l.kind = 'tasks'
+           AND i.status = 'open'
+           AND ({OVERDUE_TASKS_CONDITION})
+         ORDER BY i.due_at NULLS LAST, i.due_date NULLS LAST, i.id",
+    ))
+    .bind(household_id)
+    .bind(now)
+    .bind(today)
+    .fetch_all(&mut *conn)
+    .await?;
+    hydrate_many(conn, rows).await
+}
+
 /// Открытые задачи, назначенные участнику.
 pub async fn open_assigned_tasks(
     conn: &mut PgConnection,
@@ -119,6 +249,76 @@ pub async fn open_assigned_tasks(
     .await?;
 
     Ok(count)
+}
+
+/// Начало и конец события для счётчика списка событий.
+#[derive(sqlx::FromRow)]
+struct EventListTimes {
+    list_id: Uuid,
+    due_at: Option<DateTime<Utc>>,
+    due_date: Option<NaiveDate>,
+    end_at: Option<DateTime<Utc>>,
+    end_date: Option<NaiveDate>,
+}
+
+/// Открытые события по спискам, которые ещё не прошли.
+///
+/// Счётчик списка событий в «Все списки» считает так же, как повестка:
+/// прошедшее событие не показывается и не считается. Конец определяет домен,
+/// потому что у вседневных событий это начало следующего дня в поясе household.
+pub async fn open_event_counts_by_list(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    household_timezone: &str,
+    now: DateTime<Utc>,
+) -> Result<HashMap<Uuid, i64>, DomainError> {
+    let household_tz = parse_timezone(household_timezone)?;
+    // Тот же грубый предфильтр, что у счётчика «на сегодня»: он отсекает
+    // давно прошедшие разовые события, а точную границу по-прежнему считает
+    // домен ниже (`is_past`).
+    let events: Vec<EventListTimes> = sqlx::query_as(
+        "SELECT i.list_id, i.due_at, i.due_date, i.end_at, i.end_date
+         FROM items i
+         JOIN lists l ON l.id = i.list_id
+         WHERE i.household_id = $1
+           AND i.deleted_at IS NULL
+           AND l.deleted_at IS NULL
+           AND NOT l.is_archived
+           AND l.kind = 'events'
+           AND i.status = 'open'
+           AND COALESCE(
+                 i.end_at,
+                 CASE WHEN i.end_date IS NOT NULL
+                      THEN ((i.end_date + 1)::timestamp AT TIME ZONE $3)
+                 END,
+                 CASE WHEN i.due_at IS NOT NULL
+                      THEN i.due_at + interval '1 hour'
+                 END,
+                 CASE WHEN i.due_date IS NOT NULL
+                      THEN ((i.due_date + 1)::timestamp AT TIME ZONE $3)
+                 END
+               ) > $2 - interval '2 days'",
+    )
+    .bind(household_id)
+    .bind(now)
+    .bind(household_timezone)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    let mut counts: HashMap<Uuid, i64> = HashMap::new();
+    for event in events {
+        if !is_past(
+            event.due_at,
+            event.due_date,
+            event.end_at,
+            event.end_date,
+            household_tz,
+            now,
+        ) {
+            *counts.entry(event.list_id).or_insert(0) += 1;
+        }
+    }
+    Ok(counts)
 }
 
 /// Число открытых элементов по спискам household.

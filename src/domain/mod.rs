@@ -2,6 +2,7 @@
 
 pub mod calendar;
 pub mod error;
+pub mod events;
 pub mod first_contact;
 pub mod identity;
 pub mod models;

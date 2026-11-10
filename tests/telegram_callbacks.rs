@@ -4,8 +4,11 @@ mod support;
 
 use chrono::{Duration, Utc};
 use serde_json::json;
-use support::{create_household, db};
+use support::telegram::Harness;
+use support::{create_household, create_item, db, new_item};
 use tasklerq::auth::tokens::hash_token;
+use tasklerq::domain::models::Item;
+use tasklerq::telegram::bot::model::{Action, QuickDue, Screen};
 use tasklerq::telegram::callbacks::{self, Consumed, MAX_CALLBACK_BYTES, NewToken, Scope};
 
 fn spec(user: i64, household: Option<uuid::Uuid>) -> NewToken {
@@ -198,4 +201,171 @@ async fn expired_tokens_are_purged() {
             .await
             .expect("count");
     assert_eq!(left, 0);
+}
+
+// 0009-events 9.2: устаревшие кнопки карточки события отказывают и не меняют
+// событие.
+
+/// Стенд владельца household и событие в его календаре: заготовка для
+/// устаревших кнопок 9.2.
+async fn event_stand(pool: &sqlx::PgPool) -> (Harness, Item, uuid::Uuid) {
+    let household = create_household(pool).await;
+    let telegram_id: i64 = sqlx::query_scalar("SELECT telegram_user_id FROM users WHERE id = $1")
+        .bind(household.owner_id)
+        .fetch_one(pool)
+        .await
+        .expect("owner");
+    let bot = Harness::new(pool, telegram_id);
+    let now = bot.now;
+    let mut input = new_item(household.events_list_id, "Маникюр");
+    input.due_at = Some(now + Duration::hours(2));
+    input.end_at = Some(now + Duration::hours(3));
+    let event = create_item(
+        pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+    (bot, event, household.household_id)
+}
+
+/// Callback-токен на действие, которого на экране уже нет.
+async fn action_token(
+    pool: &sqlx::PgPool,
+    telegram_id: i64,
+    household_id: uuid::Uuid,
+    action: &Action,
+    now: chrono::DateTime<Utc>,
+) -> String {
+    let mut conn = pool.acquire().await.expect("conn");
+    callbacks::issue_many(
+        &mut conn,
+        &[NewToken {
+            telegram_user_id: telegram_id,
+            household_id: Some(household_id),
+            scope: Scope::Screen,
+            action: action.name(),
+            payload: serde_json::to_value(action).expect("payload"),
+            version: None,
+        }],
+        now,
+    )
+    .await
+    .expect("token")
+    .remove(0)
+}
+
+/// Событие не изменилось: ни состояние, ни сроки, ни версия.
+async fn assert_event_unchanged(pool: &sqlx::PgPool, event: &Item) {
+    let (status, due_at, end_at, version): (
+        String,
+        Option<chrono::DateTime<Utc>>,
+        Option<chrono::DateTime<Utc>>,
+        i32,
+    ) = sqlx::query_as("SELECT status::text, due_at, end_at, version FROM items WHERE id = $1")
+        .bind(event.id)
+        .fetch_one(pool)
+        .await
+        .expect("event");
+    assert_eq!((status.as_str(), version), ("open", event.version));
+    assert_eq!((due_at, end_at), (event.due_at, event.end_at));
+}
+
+/// Экран, сохранённый за чатом: `t` — вид активного экрана.
+async fn saved_screen_kind(pool: &sqlx::PgPool, chat_id: i64) -> String {
+    let state: serde_json::Value =
+        sqlx::query_scalar("SELECT state FROM telegram_views WHERE chat_id = $1")
+            .bind(chat_id)
+            .fetch_one(pool)
+            .await
+            .expect("saved screen");
+    state["t"].as_str().expect("screen kind").to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_complete_callback_on_an_event_is_refused_and_changes_nothing() {
+    let db = db().await;
+    let (mut bot, event, household_id) = event_stand(&db.pool).await;
+    let action = Action::Complete {
+        item_id: event.id,
+        version: event.version,
+        back: Screen::Agenda {
+            list: None,
+            page: 0,
+        },
+    };
+    let token = action_token(&db.pool, bot.chat, household_id, &action, bot.now).await;
+
+    bot.press_data(&token, 1).await;
+
+    assert_event_unchanged(&db.pool, &event).await;
+    let completions: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM item_events WHERE item_id = $1 AND event_type = 'completed'",
+    )
+    .bind(event.id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("completions");
+    assert_eq!(completions, 0, "an event must not be completed");
+    assert!(
+        bot.fake.answers().iter().any(|(_, text, alert)| {
+            *alert && text.as_deref() == Some("Событие нельзя выполнить.")
+        }),
+        "the stale button must be refused with an alert: {:?}",
+        bot.fake.answers()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_without_due_callback_on_an_event_keeps_the_start() {
+    let db = db().await;
+    let (mut bot, event, household_id) = event_stand(&db.pool).await;
+    let action = Action::DueSet {
+        item_id: event.id,
+        version: event.version,
+        due: QuickDue::None,
+        back: Screen::Agenda {
+            list: None,
+            page: 0,
+        },
+    };
+    let token = action_token(&db.pool, bot.chat, household_id, &action, bot.now).await;
+
+    bot.press_data(&token, 1).await;
+
+    assert_event_unchanged(&db.pool, &event).await;
+    assert_eq!(
+        saved_screen_kind(&db.pool, bot.chat).await,
+        "item",
+        "the stale «Без срока» only reopens the event card"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_reopen_callback_on_an_event_is_refused_and_changes_nothing() {
+    let db = db().await;
+    let (mut bot, event, household_id) = event_stand(&db.pool).await;
+    let action = Action::Reopen {
+        item_id: event.id,
+        version: event.version,
+        back: Screen::Agenda {
+            list: None,
+            page: 0,
+        },
+        completion_id: None,
+    };
+    let token = action_token(&db.pool, bot.chat, household_id, &action, bot.now).await;
+
+    bot.press_data(&token, 1).await;
+
+    assert_event_unchanged(&db.pool, &event).await;
+    assert!(
+        bot.fake.answers().iter().any(|(_, text, alert)| {
+            *alert && text.as_deref() == Some("Событие нельзя вернуть в работу.")
+        }),
+        "the stale button must be refused with an alert: {:?}",
+        bot.fake.answers()
+    );
 }

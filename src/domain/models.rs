@@ -27,6 +27,8 @@ pub enum ListKind {
     Shopping,
     /// Чек-лист.
     Checklist,
+    /// События.
+    Events,
 }
 
 /// Статус элемента или подзадачи.
@@ -384,6 +386,10 @@ pub struct Item {
     pub due_at: Option<DateTime<Utc>>,
     /// Вседневный срок.
     pub due_date: Option<NaiveDate>,
+    /// Конец события со временем.
+    pub end_at: Option<DateTime<Utc>>,
+    /// Последний день вседневного события включительно.
+    pub end_date: Option<NaiveDate>,
     /// Исполнитель.
     pub assignee_user_id: Option<Uuid>,
     /// Автор-пользователь.
@@ -445,6 +451,10 @@ pub struct NewItem {
     pub due_at: Option<DateTime<Utc>>,
     /// Вседневный срок.
     pub due_date: Option<NaiveDate>,
+    /// Конец события со временем.
+    pub end_at: Option<DateTime<Utc>>,
+    /// Последний день вседневного события включительно.
+    pub end_date: Option<NaiveDate>,
     /// Исполнитель.
     pub assignee_user_id: Option<Uuid>,
     /// Источник.
@@ -527,6 +537,12 @@ pub struct ItemPatch {
     /// Вседневный срок.
     #[serde(default)]
     pub due_date: Field<NaiveDate>,
+    /// Конец события со временем.
+    #[serde(default)]
+    pub end_at: Field<DateTime<Utc>>,
+    /// Последний день вседневного события включительно.
+    #[serde(default)]
+    pub end_date: Field<NaiveDate>,
     /// Исполнитель.
     #[serde(default)]
     pub assignee_user_id: Field<Uuid>,

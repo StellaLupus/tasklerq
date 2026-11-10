@@ -34,6 +34,10 @@ pub(super) fn apply_choice(
             draft.date = None;
             draft.time = None;
         }
+        Choice::EndNone => {
+            draft.end_date = None;
+            draft.end_time = None;
+        }
         Choice::Priority(priority) => draft.priority = priority,
         Choice::Assignee(assignee) => draft.assignee = assignee,
         Choice::TagToggle(name) => {
@@ -129,6 +133,14 @@ pub(super) fn apply_text(
             draft.date = Some(date);
             draft.time = parsed.time;
         }
+        Step::EndText => {
+            let parsed = ru::parse_due(text, today)
+                .ok_or_else(|| format!("Не понял конец. {}", ru::END_HINT))?;
+            // Время без даты всегда относится ко дню начала, поэтому прежняя
+            // дата конца не сохраняется.
+            draft.end_date = parsed.date;
+            draft.end_time = parsed.time;
+        }
         Step::NewTag => {
             let name = text.to_lowercase();
             if name.is_empty() || name.chars().count() > MAX_TAG {
@@ -190,6 +202,7 @@ pub(super) fn apply_text(
         }
         Step::List
         | Step::Due
+        | Step::End
         | Step::Priority
         | Step::Assignee
         | Step::Tags

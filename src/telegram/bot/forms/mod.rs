@@ -381,10 +381,15 @@ pub async fn finish(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
 
 async fn lists_of_kind(ctx: &mut Ctx<'_>, kind: ListKind) -> Result<Vec<List>, Fail> {
     let household_id = ctx.household()?.id;
-    let wanted_shopping = kind != ListKind::Tasks;
     Ok(lists::list(&mut *ctx.conn, household_id)
         .await?
         .into_iter()
-        .filter(|list| !list.is_archived && (list.kind != ListKind::Tasks) == wanted_shopping)
+        .filter(|list| {
+            !list.is_archived
+                && match kind {
+                    ListKind::Tasks | ListKind::Events => list.kind == kind,
+                    _ => !matches!(list.kind, ListKind::Tasks | ListKind::Events),
+                }
+        })
         .collect())
 }

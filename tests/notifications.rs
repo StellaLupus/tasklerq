@@ -76,6 +76,79 @@ async fn create_all_day_task(
     .await
 }
 
+async fn create_event(
+    db: &TestDb,
+    household: &TestHousehold,
+    title: &str,
+    due_at: DateTime<Utc>,
+    end_at: DateTime<Utc>,
+) -> Item {
+    let mut item = support::new_item(household.events_list_id, title);
+    item.due_at = Some(due_at);
+    item.end_at = Some(end_at);
+    support::create_item(
+        &db.pool,
+        household,
+        household.events_list_id,
+        &household.owner(),
+        item,
+    )
+    .await
+}
+
+async fn create_recurring_event(
+    db: &TestDb,
+    household: &TestHousehold,
+    title: &str,
+    due_at: DateTime<Utc>,
+    end_at: DateTime<Utc>,
+    recurrence: RecurrenceInput,
+) -> Item {
+    let mut item = support::new_item(household.events_list_id, title);
+    item.due_at = Some(due_at);
+    item.end_at = Some(end_at);
+    item.recurrence = Some(recurrence);
+    support::create_item(
+        &db.pool,
+        household,
+        household.events_list_id,
+        &household.owner(),
+        item,
+    )
+    .await
+}
+
+async fn create_all_day_event(
+    db: &TestDb,
+    household: &TestHousehold,
+    title: &str,
+    due_date: NaiveDate,
+    end_date: Option<NaiveDate>,
+) -> Item {
+    let mut item = support::new_item(household.events_list_id, title);
+    item.due_date = Some(due_date);
+    item.end_date = end_date;
+    support::create_item(
+        &db.pool,
+        household,
+        household.events_list_id,
+        &household.owner(),
+        item,
+    )
+    .await
+}
+
+/// Назначить событие в обход уведомления о назначении: тесты напоминаний
+/// проверяют выбор получателя, а не отдельную доставку назначения.
+async fn assign_without_notice(pool: &PgPool, item_id: Uuid, user_id: Uuid) {
+    sqlx::query("UPDATE items SET assignee_user_id = $2 WHERE id = $1")
+        .bind(item_id)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("raw assignee");
+}
+
 /// Создать задачу с исполнителем в обход уведомления о назначении.
 ///
 /// Тесты напоминаний проверяют выбор получателя, а не доставку назначения:
@@ -590,6 +663,239 @@ async fn repeated_ticks_do_not_send_the_same_reminder_twice() {
     let rows = delivery_rows(&db.pool, item.id).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].0, "sent");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timed_event_reminder_goes_to_its_participant_at_lead_time() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let due = rounded_now() + Duration::hours(3);
+    let event = create_event(&db, &household, "Маникюр", due, due + Duration::minutes(90)).await;
+    assign_without_notice(&db.pool, event.id, household.member_id).await;
+    let owner_chat = chat_id(&db.pool, household.owner_id).await;
+    let member_chat = chat_id(&db.pool, household.member_id).await;
+    let scheduler = scheduler(&db.pool);
+
+    let early = scheduler
+        .tick(due - Duration::minutes(16))
+        .await
+        .expect("early tick");
+    assert_eq!(early.planned, 0);
+    assert_eq!(early.delivered, 0);
+    assert!(messages(&db.pool, member_chat).await.is_empty());
+
+    let on_time = scheduler
+        .tick(due - Duration::minutes(15))
+        .await
+        .expect("on-time tick");
+    assert_eq!(on_time.planned, 1);
+    assert_eq!(on_time.delivered, 1);
+
+    let sent = messages(&db.pool, member_chat).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(sent[0].contains("Маникюр"), "{sent:?}");
+    assert!(
+        messages(&db.pool, owner_chat).await.is_empty(),
+        "the author must not get a reminder for another participant's event"
+    );
+    let rows = delivery_rows(&db.pool, event.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "sent");
+    assert_eq!(rows[0].1, occurrence_key(due));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_multiday_all_day_event_reminds_only_on_its_first_day() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let first = NaiveDate::from_ymd_opt(2026, 3, 5).expect("first day");
+    let last = NaiveDate::from_ymd_opt(2026, 3, 10).expect("last day");
+    let event = create_all_day_event(&db, &household, "Отпуск", first, Some(last)).await;
+    assign_without_notice(&db.pool, event.id, household.owner_id).await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let scheduler = scheduler(&db.pool);
+
+    let early = scheduler
+        .tick(local_utc(moscow, first, 8, 59))
+        .await
+        .expect("early tick");
+    assert_eq!(early.planned, 0);
+    assert!(messages(&db.pool, chat).await.is_empty());
+
+    let on_time = scheduler
+        .tick(local_utc(moscow, first, 9, 0))
+        .await
+        .expect("first-day tick");
+    assert_eq!(on_time.delivered, 1);
+    assert_eq!(messages(&db.pool, chat).await.len(), 1);
+
+    let next_day = scheduler
+        .tick(local_utc(moscow, first + Duration::days(1), 9, 0))
+        .await
+        .expect("second-day tick");
+    assert_eq!(next_day.planned, 0);
+    assert_eq!(next_day.delivered, 0);
+    assert_eq!(messages(&db.pool, chat).await.len(), 1);
+    let rows = delivery_rows(&db.pool, event.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].1, all_day_occurrence_key(first));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_recurring_event_occurrence_gets_its_own_reminder() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    // Вторник 10 ноября 2026, 18:00–19:00 по Москве.
+    let start = local_utc(
+        moscow,
+        NaiveDate::from_ymd_opt(2026, 11, 10).expect("day"),
+        18,
+        0,
+    );
+    let event = create_recurring_event(
+        &db,
+        &household,
+        "Тренировка",
+        start,
+        start + Duration::hours(1),
+        support::recurrence(RecurrenceFreq::Weekly, vec![2]),
+    )
+    .await;
+    assign_without_notice(&db.pool, event.id, household.owner_id).await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let scheduler = scheduler(&db.pool);
+
+    assert_eq!(
+        scheduler
+            .tick(start - Duration::minutes(15))
+            .await
+            .expect("first occurrence")
+            .delivered,
+        1
+    );
+    assert_eq!(
+        scheduler
+            .tick(start - Duration::minutes(15))
+            .await
+            .expect("same occurrence")
+            .delivered,
+        0
+    );
+
+    scheduler
+        .tick(start + Duration::hours(1))
+        .await
+        .expect("the event moves to the next occurrence");
+
+    let next_start = start + Duration::days(7);
+    assert_eq!(
+        scheduler
+            .tick(next_start - Duration::minutes(15))
+            .await
+            .expect("next occurrence")
+            .delivered,
+        1
+    );
+    let rows = delivery_rows(&db.pool, event.id).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0].1, occurrence_key(start));
+    assert_eq!(rows[1].1, occurrence_key(next_start));
+    assert_eq!(messages(&db.pool, chat).await.len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_past_event_reminder_is_cancelled_instead_of_delivered() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    // Событие 07:00–07:30, а тихие часы откладывают напоминание до 08:00.
+    let day = NaiveDate::from_ymd_opt(2026, 11, 10).expect("day");
+    let start = local_utc(moscow, day, 7, 0);
+    let end = local_utc(moscow, day, 7, 30);
+    let event = create_event(&db, &household, "Зарядка", start, end).await;
+    assign_without_notice(&db.pool, event.id, household.owner_id).await;
+    enable_quiet(&db.pool, household.owner_id, "22:00", "08:00").await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let scheduler = scheduler(&db.pool);
+
+    let planned = scheduler
+        .tick(start - Duration::minutes(15))
+        .await
+        .expect("quiet-hours tick");
+    assert_eq!(planned.planned, 1);
+    assert_eq!(planned.delivered, 0);
+    assert!(messages(&db.pool, chat).await.is_empty());
+
+    let morning = scheduler
+        .tick(local_utc(moscow, day, 8, 0))
+        .await
+        .expect("morning tick");
+    assert_eq!(morning.delivered, 0);
+    assert_eq!(morning.cancelled, 1);
+    assert!(messages(&db.pool, chat).await.is_empty());
+
+    let rows = delivery_rows(&db.pool, event.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "cancelled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_changed_occurrence_cancels_the_reminder_of_the_old_one() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    // Еженедельное событие 07:00–07:30; тихие часы откладывают напоминание до
+    // 08:00, когда первое вхождение уже закончилось и событие перешло на
+    // следующую неделю.
+    let day = NaiveDate::from_ymd_opt(2026, 11, 10).expect("day");
+    let start = local_utc(moscow, day, 7, 0);
+    let end = local_utc(moscow, day, 7, 30);
+    let event = create_recurring_event(
+        &db,
+        &household,
+        "Зарядка",
+        start,
+        end,
+        support::recurrence(RecurrenceFreq::Weekly, vec![2]),
+    )
+    .await;
+    assign_without_notice(&db.pool, event.id, household.owner_id).await;
+    enable_quiet(&db.pool, household.owner_id, "22:00", "08:00").await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let scheduler = scheduler(&db.pool);
+
+    let planned = scheduler
+        .tick(start - Duration::minutes(15))
+        .await
+        .expect("quiet-hours tick");
+    assert_eq!(planned.planned, 1);
+    assert_eq!(planned.delivered, 0);
+    assert!(messages(&db.pool, chat).await.is_empty());
+
+    let morning = scheduler
+        .tick(local_utc(moscow, day, 8, 0))
+        .await
+        .expect("morning tick");
+    assert_eq!(morning.delivered, 0);
+    assert_eq!(morning.cancelled, 1);
+    assert!(messages(&db.pool, chat).await.is_empty());
+
+    let rows = delivery_rows(&db.pool, event.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "cancelled");
+    assert_eq!(rows[0].1, occurrence_key(start));
+
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let current = items::get(&mut conn, household.household_id, event.id)
+        .await
+        .expect("advanced event");
+    assert_eq!(
+        current.due_at,
+        Some(start + Duration::days(7)),
+        "the event must have moved to the next occurrence"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2091,6 +2397,15 @@ async fn empty_digest_says_the_day_is_free() {
     let moscow = chrono_tz::Europe::Moscow;
     let day = digest_day();
     enable_digest(&db.pool, household.owner_id).await;
+    // Событие завтра не делает сегодняшний день занятым.
+    create_all_day_event(
+        &db,
+        &household,
+        "Завтрашнее событие",
+        day + Duration::days(1),
+        None,
+    )
+    .await;
     let chat = chat_id(&db.pool, household.owner_id).await;
 
     let stats = scheduler(&db.pool)
@@ -2106,6 +2421,79 @@ async fn empty_digest_says_the_day_is_free() {
     assert!(!html.contains("Сегодня"), "{html}");
     assert!(!html.contains("Просрочено"), "{html}");
     assert!(!html.contains("Покупки:"), "{html}");
+    assert!(!html.contains("Завтрашнее событие"), "{html}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_shows_today_events_and_keeps_them_out_of_overdue() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    enable_digest(&db.pool, household.owner_id).await;
+
+    create_event(
+        &db,
+        &household,
+        "Маникюр",
+        local_utc(moscow, day, 14, 0),
+        local_utc(moscow, day, 15, 30),
+    )
+    .await;
+    // Многодневное событие началось раньше и ещё идёт.
+    create_all_day_event(
+        &db,
+        &household,
+        "Отпуск",
+        day - Duration::days(2),
+        Some(day + Duration::days(1)),
+    )
+    .await;
+    // Прошедшее событие не попадает ни в «Сегодня», ни в «Просрочено».
+    create_all_day_event(
+        &db,
+        &household,
+        "Вчерашняя встреча",
+        day - Duration::days(1),
+        Some(day - Duration::days(1)),
+    )
+    .await;
+    create_task(
+        &db,
+        &household,
+        "Просроченная задача",
+        Some(local_utc(moscow, day - Duration::days(1), 12, 0)),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+
+    let stats = scheduler(&db.pool)
+        .tick(local_utc(moscow, day, 8, 30))
+        .await
+        .expect("digest tick");
+    assert_eq!(stats.delivered, 1);
+
+    let sent = messages(&db.pool, chat).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let html = &sent[0];
+    assert!(html.contains("Маникюр"), "{html}");
+    assert!(html.contains("14:00–15:30"), "{html}");
+    assert!(html.contains("Отпуск"), "{html}");
+    assert!(html.contains("Просроченная задача"), "{html}");
+    assert!(!html.contains("Вчерашняя встреча"), "{html}");
+
+    let overdue_at = html.find("<b>Просрочено</b>").expect("overdue heading");
+    assert!(
+        html.find("Маникюр").expect("manicure") < overdue_at,
+        "a today event must not fall into the overdue section: {html}"
+    );
+    assert!(
+        html.find("Отпуск").expect("vacation") < overdue_at,
+        "an ongoing multi-day event must not fall into the overdue section: {html}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

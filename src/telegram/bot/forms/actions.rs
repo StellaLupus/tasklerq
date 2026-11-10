@@ -2,10 +2,10 @@
 
 use uuid::Uuid;
 
-use crate::domain::models::{Item, List};
+use crate::domain::models::{Item, List, ListKind};
 use crate::domain::recurrence::Due;
 use crate::domain::settings::{NotificationSettingsUpdate, ProfileUpdate, parse_hhmm};
-use crate::storage::repositories::{items, members, users};
+use crate::storage::repositories::{items, lists, members, users};
 use crate::telegram::ru;
 use crate::telegram::views::{self};
 
@@ -209,12 +209,26 @@ async fn due_text(
     back: Screen,
     text: &str,
 ) -> Result<(), Fail> {
-    let (_, mut draft) = load_item_draft(ctx, item_id).await?;
+    let (item, mut draft) = load_item_draft(ctx, item_id).await?;
+    let household_id = ctx.household()?.id;
+    let list = lists::get(&mut *ctx.conn, household_id, item.list_id).await?;
     let today = today(ctx);
     let now_time = ctx.now.with_timezone(&ctx.tz).time();
     if let Err(message) = apply_text(Step::DueText, &mut draft, text, today, now_time) {
         ctx.banner(message);
         return ctx.present(Screen::Form).await;
+    }
+    if list.kind == ListKind::Events {
+        // Быстрый срок события сохраняет вид начала: иначе конец остался бы
+        // другого вида, и домен отверг бы запись.
+        match (item.due_at, draft.time) {
+            (Some(at), None) => draft.time = Some(at.with_timezone(&ctx.tz).time()),
+            (None, Some(_)) => {
+                ctx.banner("У события без времени начало задаётся датой.".to_owned());
+                return ctx.present(Screen::Form).await;
+            }
+            _ => {}
+        }
     }
     let (due_at, due_date) = draft.due(ctx.tz)?;
     let due = match (due_at, due_date) {

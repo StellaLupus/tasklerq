@@ -188,8 +188,8 @@ Scopes не иерархичны: `ha:write` не даёт права на чт�
 
 | Понятие | Формат |
 | --- | --- |
-| Момент времени (`due_at`, `completed_at`, `created_at`, `updated_at`, `server_time`, `next_since`, `expires_at`) | RFC 3339 в UTC: `2026-11-03T12:00:00Z`. На входе принимается и смещение (`2026-11-03T15:00:00+03:00`), сервер приводит к UTC. |
-| Дата без времени (`due_date`, `until`, `anchor_date`, `start`/`end` all-day события) | `YYYY-MM-DD`. |
+| Момент времени (`due_at`, `end_at`, `completed_at`, `created_at`, `updated_at`, `server_time`, `next_since`, `expires_at`) | RFC 3339 в UTC: `2026-11-03T12:00:00Z`. На входе принимается и смещение (`2026-11-03T15:00:00+03:00`), сервер приводит к UTC. |
+| Дата без времени (`due_date`, `end_date`, `until`, `anchor_date`, `start`/`end` all-day события) | `YYYY-MM-DD`. |
 | Параметры `start`/`end`/`calendar_end`/`since` | `start`/`end`/`calendar_end` — `YYYY-MM-DD`; `since` — RFC 3339. |
 
 - Все моменты времени в ответах — UTC с суффиксом `Z`.
@@ -204,6 +204,9 @@ Scopes не иерархичны: `ha:write` не даёт права на чт�
   `recurrence.timezone` (по умолчанию — timezone household). Переход DST не
   сдвигает локальное время серии.
 - `due_at` и `due_date` взаимоисключающие: одновременно задать оба нельзя.
+- У элемента списка `events` поля `due_at`/`due_date` означают начало события,
+  а конец хранится в `end_at`/`end_date`; `end_date` включительный. У задачи
+  `due_*` — по-прежнему срок, `end_*` у неё нет (см. §4).
 
 ### 1.7 Идентификаторы
 
@@ -218,7 +221,7 @@ Scopes не иерархичны: `ha:write` не даёт права на чт�
 
 | Перечисление | Значения |
 | --- | --- |
-| `ListKind` | `tasks`, `shopping`, `checklist` |
+| `ListKind` | `tasks`, `shopping`, `checklist`, `events` |
 | `ItemStatus` | `open`, `done` |
 | `ItemPriority` | `low`, `normal`, `high`, `urgent` |
 | `ItemSource` | `telegram`, `ha_todo`, `ha_voice`, `ha_automation`, `api`, `import` |
@@ -318,7 +321,7 @@ Scope: `ha:read`. Параметров нет.
 | --- | --- | --- | --- |
 | `id` | uuid | нет | Идентификатор. |
 | `household_id` | uuid | нет | Household. |
-| `kind` | string | нет | `tasks`, `shopping`, `checklist`. |
+| `kind` | string | нет | `tasks`, `shopping`, `checklist`, `events`. |
 | `name` | string | нет | Название. |
 | `is_default` | boolean | нет | Список по умолчанию своего `kind`. |
 | `is_archived` | boolean | нет | Архивирован. |
@@ -376,8 +379,12 @@ Scope: `ha:write`. `Content-Type: application/json`.
 
 | Поле | Тип | Обязательно | Ограничения |
 | --- | --- | --- | --- |
-| `kind` | string | да | `shopping` или `checklist`. `tasks` отклоняется (`422`): список задач в household один и создаётся при онбординге. |
+| `kind` | string | да | `shopping`, `checklist` или `events`. `tasks` отклоняется (`422`): список задач в household один и создаётся при онбординге. |
 | `name` | string | да | 1..64 символа; уникален в household без учёта регистра среди неудалённых списков. |
+
+Список `events` — обычный список событий и входит в общий лимит 20 списков
+household. Лимит 20 проверяется при создании пользователем; при превышении
+ответ `409`.
 
 ```json
 {"kind": "checklist", "name": "Дача"}
@@ -400,6 +407,29 @@ Scope: `ha:write`. `Content-Type: application/json`.
 }
 ```
 
+Пример создания списка событий:
+
+```json
+{"kind": "events", "name": "Школа"}
+```
+
+Ответ `201`:
+
+```json
+{
+  "id": "019a1b2c-7e9f-7a0b-9c1d-4d5e6f7081a2",
+  "household_id": "019a1b2c-3d4e-7f60-8a9b-0c1d2e3f4a5b",
+  "kind": "events",
+  "name": "Школа",
+  "is_default": false,
+  "is_archived": false,
+  "position": 3,
+  "created_at": "2026-10-31T10:05:00Z",
+  "updated_at": "2026-10-31T10:05:00Z",
+  "deleted_at": null
+}
+```
+
 Коды:
 
 | Код | Когда |
@@ -407,7 +437,7 @@ Scope: `ha:write`. `Content-Type: application/json`.
 | `201` | Список создан. |
 | `401` / `403` | Нет токена / нет `ha:write`. |
 | `409` | Уже 20 списков (`household cannot have more than 20 lists`) или имя занято (`list with this name already exists`). |
-| `422` | `kind=tasks`, пустое/длинное имя, битое тело. |
+| `422` | `kind=tasks` (`additional lists must have kind shopping, checklist or events`), пустое/длинное имя, битое тело. |
 | `500` | Ошибка БД. |
 
 ### `PATCH /api/v1/lists/{id}`
@@ -467,8 +497,10 @@ Scope: `ha:write`. Тела нет.
 | `notes` | string | да | Описание. |
 | `status` | string | нет | `open` или `done`. |
 | `priority` | string | нет | `low`, `normal`, `high`, `urgent`. |
-| `due_at` | string | да | RFC 3339 UTC; взаимоисключающе с `due_date`. |
-| `due_date` | string | да | `YYYY-MM-DD`; взаимоисключающе с `due_at`. |
+| `due_at` | string | да | RFC 3339 UTC; взаимоисключающе с `due_date`. У задачи — срок, у события — начало. |
+| `due_date` | string | да | `YYYY-MM-DD`; взаимоисключающе с `due_at`. У задачи — срок, у события — начало (вседневное). |
+| `end_at` | string | да | RFC 3339 UTC, конец события со временем. Только для `events`, у остальных `null`. |
+| `end_date` | string | да | `YYYY-MM-DD`, последний день вседневного события **включительно**. Только для `events`, у остальных `null`. В ответе календаря превращается в исключающий конец (см. §6). |
 | `assignee_user_id` | uuid | да | Активный участник household. |
 | `created_by_user_id` | uuid | да | Автор; у внешнего API/HA — `null`. |
 | `source` | string | нет | `telegram`, `ha_todo`, `ha_voice`, `ha_automation`, `api`, `import`. |
@@ -526,6 +558,8 @@ Scope: `ha:write`. Тела нет.
   "priority": "high",
   "due_at": "2026-11-05T15:00:00Z",
   "due_date": null,
+  "end_at": null,
+  "end_date": null,
   "assignee_user_id": "019a1b2c-4a5b-7c6d-8e9f-0a1b2c3d4e5f",
   "created_by_user_id": null,
   "source": "ha_todo",
@@ -601,15 +635,17 @@ Scope: `ha:write`. `Content-Type: application/json`.
 | --- | --- | --- | --- |
 | `title` | string | да | 1..200 символов. |
 | `notes` | string | нет | 0..2000; `null` = без описания. |
-| `priority` | string | нет | `low`/`normal`/`high`/`urgent`; по умолчанию `normal`. |
-| `due_at` | string | нет | RFC 3339; нельзя вместе с `due_date`. |
-| `due_date` | string | нет | `YYYY-MM-DD`; нельзя вместе с `due_at`. |
+| `priority` | string | нет | `low`/`normal`/`high`/`urgent`; по умолчанию `normal`. У события допустим только `normal`. |
+| `due_at` | string | нет | RFC 3339; нельзя вместе с `due_date`. У события — начало. |
+| `due_date` | string | нет | `YYYY-MM-DD`; нельзя вместе с `due_at`. У события — начало (вседневное). |
+| `end_at` | string | нет | RFC 3339, конец события со временем. Только для `events` вместе с `due_at`; должен быть позже начала, длительность не больше 366 дней. |
+| `end_date` | string | нет | `YYYY-MM-DD`, последний день вседневного события **включительно**. Только для `events` вместе с `due_date`; не раньше начала, длительность не больше 366 дней. |
 | `assignee_user_id` | uuid | нет | Должен быть активным участником household, иначе `422`. |
-| `quantity` | number | нет | Только для `shopping`/`checklist`: `> 0`, `<= 9999.999`, не более 3 знаков после запятой; по умолчанию `1`. Для `tasks` игнорируется. |
-| `unit` | string | нет | Только для `shopping`/`checklist`: до 16 символов; по умолчанию `шт`. Для `tasks` игнорируется. |
+| `quantity` | number | нет | Только для `shopping`/`checklist`: `> 0`, `<= 9999.999`, не более 3 знаков после запятой; по умолчанию `1`. Для `tasks` игнорируется, у события отклоняется (`422`). |
+| `unit` | string | нет | Только для `shopping`/`checklist`: до 16 символов; по умолчанию `шт`. Для `tasks` игнорируется, у события отклоняется (`422`). |
 | `tags` | array[string] | нет | До 10 тегов, каждый 1..32; приводится к нижнему регистру, дубликаты удаляются. По умолчанию `[]`. |
-| `subtasks` | array[object] | нет | До 50; элемент `{"title": string 1..200, "status"?: "open"\|"done"}`; `status` по умолчанию `open`. |
-| `recurrence` | object | нет | Только для списков `tasks`; поля — как у `recurrence` в ответе, но `interval`, `byweekday`, `until`, `timezone`, `anchor_date`, `month_rule` необязательны. |
+| `subtasks` | array[object] | нет | До 50; элемент `{"title": string 1..200, "status"?: "open"\|"done"}`; `status` по умолчанию `open`. У события непустой список отклоняется (`422`). |
+| `recurrence` | object | нет | Только для списков `tasks` и `events`; поля — как у `recurrence` в ответе, но `interval`, `byweekday`, `until`, `timezone`, `anchor_date`, `month_rule` необязательны. |
 | `source` | string | нет | `ItemSource`; по умолчанию `api`. Компонент для `todo`-сущности передаёт `ha_todo`. |
 
 Правила `recurrence` на входе:
@@ -632,11 +668,102 @@ Scope: `ha:write`. `Content-Type: application/json`.
 (вседневную дату) не раньше сегодня. `last_day` приводит `due_date` к
 последнему дню месяца.
 
+Правила события (список `kind=events`):
+
+- `due_at` или `due_date` — начало события, оно обязательно. Событие без начала
+  не создаётся.
+- Конец — только того же вида, что начало: `end_at` при `due_at`, `end_date`
+  при `due_date`. Одновременно `end_at` и `end_date` передавать нельзя.
+- `end_date` — последний день события включительно: `2027-03-05`..`2027-03-10`
+  занимает шесть дней. В календаре такой конец отдаётся как `2027-03-11` (см.
+  §6).
+- Длительность — не больше 366 дней; конец со временем должен быть строго
+  позже начала, вседневный конец — не раньше начала.
+- `priority` у события всегда `normal`; `quantity`, `unit` и непустые
+  `subtasks` отклоняются.
+- Повторение разрешено; каждое вхождение сохраняет длительность события.
+- Конец задаётся только у события: у задачи, покупки и пункта чек-листа любой
+  `end_*` даёт `422`.
+
+Пример события со временем (смещение `+03:00` сервер приводит к UTC):
+
+```json
+{
+  "title": "Маникюр",
+  "due_at": "2026-11-11T14:00:00+03:00",
+  "end_at": "2026-11-11T15:30:00+03:00"
+}
+```
+
+Ответ `201` (фрагмент `ItemResponse`):
+
+```json
+{
+  "id": "019a1b2c-a1b2-7c3d-8e4f-5e6f708192a3",
+  "list_id": "019a1b2c-7d8e-7f90-8a1b-3c4d5e6f7081",
+  "title": "Маникюр",
+  "status": "open",
+  "priority": "normal",
+  "due_at": "2026-11-11T11:00:00Z",
+  "due_date": null,
+  "end_at": "2026-11-11T12:30:00Z",
+  "end_date": null,
+  "quantity": null,
+  "unit": null,
+  "version": 1
+}
+```
+
+Пример многодневного вседневного события:
+
+```json
+{"title": "Отпуск", "due_date": "2027-03-05", "end_date": "2027-03-10"}
+```
+
+Ответ `201` содержит `"due_date": "2027-03-05"` и
+`"end_date": "2027-03-10"`.
+
+Пример ошибки — событие без начала:
+
+```json
+{"title": "Без начала"}
+```
+
+Ответ `422`:
+
+```json
+{
+  "error": {
+    "code": "validation_error",
+    "message": "an event must have due_at or due_date",
+    "details": {},
+    "request_id": "019a1b2c-3d4e-7f60-8a9b-0c1d2e3f4a5b"
+  }
+}
+```
+
 Ответ `201` — созданный `ItemResponse`.
 
 Коды: `201`; `400` (невалидный UUID в пути); `401`; `403`; `404` (список не
-существует, чужой, удалён или архивирован); `422` (валидация полей, чужой
-исполнитель, повторение в не-`tasks` списке, `due_at`+`due_date`); `500`.
+существует, чужой, удалён или архивирован); `422`; `500`.
+
+Причины `422` (`validation_error`, `message` — как в коде):
+
+| Причина | `message` |
+| --- | --- |
+| Событие без начала | `an event must have due_at or due_date` |
+| Конец и начало разного вида | `end_at requires due_at`, `end_date requires due_date` |
+| Одновременно `end_at` и `end_date` | `end_at and end_date are mutually exclusive` |
+| Конец раньше начала / нулевая длительность | `event end must be after its start`, `event end must not be before its start` |
+| Длительность больше 366 дней | `event duration must be at most 366 days` |
+| Конец у не-события | `end_at and end_date are only allowed for events` |
+| Приоритет события не `normal` | `an event priority must be normal` |
+| Количество/единица у события | `quantity and unit are not supported for events` |
+| Подзадачи у события | `subtasks are not supported for events` |
+| Повторение в `shopping`/`checklist` | `recurrence is only allowed for task and event lists` |
+| `due_at` и `due_date` сразу | `due_at and due_date are mutually exclusive` |
+| Чужой исполнитель | `assignee must be an active member of the household` |
+| Пустое название | `title must not be empty` |
 
 ### 4.3 `GET /api/v1/items/{id}`
 
@@ -659,15 +786,17 @@ Scope: `ha:write`. `Content-Type: application/json`.
 | `version` | integer | нет | Обязательна. Ожидаемая текущая версия. |
 | `title` | string | да | 1..200. `null` игнорируется (очистить название нельзя). |
 | `notes` | string | да | 0..2000. `null` очищает. |
-| `priority` | string | да | `low`/`normal`/`high`/`urgent`. `null` игнорируется. |
-| `due_at` | string | да | RFC 3339. `null` очищает `due_at`. |
-| `due_date` | string | да | `YYYY-MM-DD`. `null` очищает `due_date`. |
+| `priority` | string | да | `low`/`normal`/`high`/`urgent`. `null` игнорируется. У события допустим только `normal`. |
+| `due_at` | string | да | RFC 3339. `null` очищает `due_at`. У события — начало. |
+| `due_date` | string | да | `YYYY-MM-DD`. `null` очищает `due_date`. У события — начало (вседневное). |
+| `end_at` | string | да | RFC 3339, конец события со временем. `null` очищает. Только для `events` вместе с `due_at`. |
+| `end_date` | string | да | `YYYY-MM-DD`, последний день вседневного события включительно. `null` очищает. Только для `events` вместе с `due_date`. |
 | `assignee_user_id` | uuid | да | `null` снимает исполнителя; значение проверяется на активного участника. |
-| `quantity` | number | да | `null` → `1`; только для `shopping`/`checklist`, для `tasks` игнорируется. |
-| `unit` | string | да | `null` → `шт`; только для `shopping`/`checklist`, для `tasks` игнорируется. |
+| `quantity` | number | да | `null` → `1`; только для `shopping`/`checklist`, для `tasks` игнорируется, у события отклоняется. |
+| `unit` | string | да | `null` → `шт`; только для `shopping`/`checklist`, для `tasks` игнорируется, у события отклоняется. |
 | `tags` | array[string] | да | Заменяет весь набор тегов. `null` игнорируется. |
-| `subtasks` | array[object] | да | Заменяет весь набор подзадач. `null` игнорируется. |
-| `recurrence` | object | да | `null` удаляет повторение; объект заменяет правило. Только для `tasks`. |
+| `subtasks` | array[object] | да | Заменяет весь набор подзадач. `null` игнорируется; у события непустой набор отклоняется. |
+| `recurrence` | object | да | `null` удаляет повторение; объект заменяет правило. Только для `tasks` и `events`. |
 | `list_id` | uuid | да | Перенос в другой список того же `kind`; целевой список должен быть неудалённым и неархивным. `null` игнорируется. |
 
 Важные правила:
@@ -682,7 +811,15 @@ Scope: `ha:write`. `Content-Type: application/json`.
 - Если позиция лежит в архивном списке, `PATCH` даёт `404`.
 - `complete`, `reopen`, `DELETE` и `undo` архивность списка не проверяют:
   для позиции архивного списка они работают.
-- Перенос в список другого `kind` → `422`.
+- Перенос в список другого `kind` → `422` (`cannot move an item to a list of
+  another kind`). Событие переносится только между списками `events`.
+- У события начало меняют через `due_at`/`due_date`. Если `end_at`/`end_date`
+  в том же запросе не переданы, конец сдвигается на ту же длительность; явно
+  переданный конец (значение или `null`) применяется как есть. Смена вида
+  начала при существующем конце другого вида → `422` (`end_at requires
+  due_at` / `end_date requires due_date`).
+- `end_*` у не-события → `422` (`end_at and end_date are only allowed for
+  events`); невалидная длительность события — как в §4.2.
 - `PATCH` без фактических изменений (тело повторяет текущее состояние) даёт
   `200` и не меняет `version`/`updated_at`, но проверка `version` идёт первой:
   с устаревшей `version` такой запрос даёт `409` (см. §1.5).
@@ -695,9 +832,20 @@ Scope: `ha:write`. `Content-Type: application/json`.
 
 Ответ `200` — обновлённый `ItemResponse` с `version = 3`.
 
+Пример переноса начала события без изменения длительности (было
+`2026-11-11 14:00`..`15:30` +03:00):
+
+```json
+{"version": 1, "due_at": "2026-11-12T16:00:00+03:00"}
+```
+
+Ответ `200` содержит `"due_at": "2026-11-12T13:00:00Z"` и
+`"end_at": "2026-11-12T14:30:00Z"` — конец сдвинут на те же два часа.
+
 Коды: `200`; `400` (невалидный UUID); `401`; `403`; `404` (нет, чужой,
 удалён или список архивный); `409` (несовпадение `version`, см. §1.4);
-`422` (валидация, оба срока, чужой исполнитель, смена `kind`); `500`.
+`422` (валидация, оба срока, `end_*` вне события или не того вида, чужой
+исполнитель, перенос в список другого `kind`); `500`.
 
 ### 4.5 `DELETE /api/v1/items/{id}`
 
@@ -738,11 +886,13 @@ JSON-объект, например `{}`. Если передан `Content-Type:
 - Повторяющаяся: завершение не ставит `done`, а переносит срок на следующее
   вхождение; `status` остаётся `open`, `completed_at` заполняется,
   `version += 1`. Если серия закончилась (`until`), позиция становится `done`.
+- Событие: `complete` отклоняется `422 validation_error` (`events cannot be
+  completed or reopened`); событие не меняется.
 
 Ответ `200` — `ItemResponse`.
 
 Коды: `200`; `400`; `401`; `403`; `404` (нет/чужой/удалён); `409`
-(несовпадение `version`; `details` — как в §1.4); `500`.
+(несовпадение `version`; `details` — как в §1.4); `422` (событие); `500`.
 
 ### 4.7 `POST /api/v1/items/{id}/reopen`
 
@@ -754,12 +904,13 @@ Scope: `ha:write`. Тело необязательно, то же `{"version"?: 
 Открывает завершённую позицию: `status = open`, восстанавливает `due_at` /
 `due_date` из снимка последнего завершения (если он есть), очищает
 `completed_at`/`completed_by_user_id`, `version += 1`. Уже открытая позиция
-возвращается без изменений (`200`, версия та же).
+возвращается без изменений (`200`, версия та же). Событие: `reopen`
+отклоняется `422 validation_error` (`events cannot be completed or reopened`).
 
 Ответ `200` — `ItemResponse`.
 
 Коды: `200`; `400`; `401`; `403`; `404`; `409` (несовпадение `version`;
-`details` — как в §1.4); `500`.
+`details` — как в §1.4); `422` (событие); `500`.
 
 ### 4.8 `POST /api/v1/items/{id}/undo`
 
@@ -835,6 +986,8 @@ Query-параметры:
       "priority": "normal",
       "due_at": null,
       "due_date": "2026-11-05",
+      "end_at": null,
+      "end_date": null,
       "assignee_user_id": null,
       "created_by_user_id": null,
       "source": "ha_todo",
@@ -940,6 +1093,12 @@ household. Если `calendar_end <= сегодня`, ответ успешен,
 `todo`-синхронизацию. Полный горизонт в этом случае нужно запрашивать через
 `GET /calendar` (но и там лимит 1000 вхождений — см. §6).
 
+`calendar_events` — те же объекты `CalendarEvent`, что в §6: поле `kind`
+(`tasks` или `events`) и настоящий конец события (`end_at`/`end_date`, для
+вседневного — исключающий). Развёртка общая с `GET /calendar`, поэтому
+многодневное событие, начавшееся до сегодня, попадает в снапшот со своими
+началом и концом.
+
 ### 5.5 Когда обязательна полная синхронизация
 
 Сервер различает только «`since` передан» и «`since` не передан». Полная
@@ -987,14 +1146,21 @@ Query-параметры (оба обязательны):
 | --- | --- | --- | --- |
 | `item_id` | uuid | нет | Позиция. |
 | `list_id` | uuid | нет | Список. |
+| `kind` | string | нет | Тип списка элемента: `tasks` или `events`. |
 | `occurrence_key` | string | нет | Детерминированный ключ вхождения. Для all-day: `<item_id>:<YYYY-MM-DD>`; для timed: `<item_id>:<локальное время>` или `<item_id>:<UTC>` у одиночного события. |
 | `start` | string | нет | Для all-day — `YYYY-MM-DD`; для timed — RFC 3339 UTC. |
-| `end` | string | нет | Для all-day — следующий день `YYYY-MM-DD`; для timed — `start + 1 час`, RFC 3339 UTC. |
+| `end` | string | нет | Для all-day — следующий день за последним днём (исключающий `YYYY-MM-DD`); для timed — RFC 3339 UTC. У задачи — `start + 1 час`; у события — настоящий конец из `end_at`, а без него — `start + 1 час`. |
 | `all_day` | boolean | нет | `true` для `due_date`, `false` для `due_at`. |
 | `title` | string | нет | Название позиции. |
 | `status` | string | нет | `open` или `done`. |
 
-Пример:
+Пример запроса:
+
+```http
+GET /api/v1/calendar?start=2026-11-01&end=2027-04-01
+```
+
+Пример ответа:
 
 ```json
 {
@@ -1002,6 +1168,7 @@ Query-параметры (оба обязательны):
     {
       "item_id": "019a1b2c-8e9f-7a0b-9c1d-4d5e6f708192",
       "list_id": "019a1b2c-5b6c-7d8e-9f00-1a2b3c4d5e6f",
+      "kind": "tasks",
       "occurrence_key": "019a1b2c-8e9f-7a0b-9c1d-4d5e6f708192:2026-11-10",
       "start": "2026-11-10",
       "end": "2026-11-11",
@@ -1011,12 +1178,24 @@ Query-параметры (оба обязательны):
     },
     {
       "item_id": "019a1b2c-a1b2-7c3d-8e4f-5e6f708192a3",
-      "list_id": "019a1b2c-5b6c-7d8e-9f00-1a2b3c4d5e6f",
-      "occurrence_key": "019a1b2c-a1b2-7c3d-8e4f-5e6f708192a3:2026-11-10T09:00:00Z",
-      "start": "2026-11-10T09:00:00Z",
-      "end": "2026-11-10T10:00:00Z",
+      "list_id": "019a1b2c-7d8e-7f90-8a1b-3c4d5e6f7081",
+      "kind": "events",
+      "occurrence_key": "019a1b2c-a1b2-7c3d-8e4f-5e6f708192a3:2026-11-11T11:00:00Z",
+      "start": "2026-11-11T11:00:00Z",
+      "end": "2026-11-11T12:30:00Z",
       "all_day": false,
-      "title": "Встреча",
+      "title": "Маникюр",
+      "status": "open"
+    },
+    {
+      "item_id": "019a1b2c-b2c3-7d4e-9f5a-6f708192a3b4",
+      "list_id": "019a1b2c-7d8e-7f90-8a1b-3c4d5e6f7081",
+      "kind": "events",
+      "occurrence_key": "019a1b2c-b2c3-7d4e-9f5a-6f708192a3b4:2027-03-05",
+      "start": "2027-03-05",
+      "end": "2027-03-11",
+      "all_day": true,
+      "title": "Отпуск",
       "status": "open"
     }
   ]
@@ -1025,14 +1204,23 @@ Query-параметры (оба обязательны):
 
 Правила:
 
-- В выдачу попадают только позиции списков `kind=tasks`, неудалённых и
-  неархивных, у которых есть `due_at`, `due_date` или повторение.
-- Завершённые позиции тоже попадают (`status: "done"`); фильтрация — на
-  стороне клиента/карточки.
+- В выдачу попадают только позиции списков `kind=tasks` и `kind=events`,
+  неудалённых и неархивных, у которых есть `due_at`, `due_date` или
+  повторение. Позиции `shopping` и `checklist` в календарь не попадают.
+- Завершённые задачи тоже попадают (`status: "done"`); фильтрация — на
+  стороне клиента/карточки. События всегда `open`.
+- У события `due_*` — начало, `end_*` — конец. Конец в ответе исключающий:
+  `end_at` отдаётся как есть, а `end_date` — как день, следующий за последним
+  (многодневное событие `2027-03-05`..`2027-03-10` даёт `end: "2027-03-11"`).
+  Если конца нет, событие длится час (timed) или день (all-day).
 - Повторяющаяся позиция разворачивается в отдельные события на интервале
-  `[start, end)`; `until` учитывается. При завершении серии следующее
-  вхождение — первое строго позже текущего срока и момента завершения;
-  пропущенные вхождения не накапливаются.
+  `[start, end)`; `until` учитывается. Каждое вхождение повторяющегося события
+  сохраняет длительность события, включая многодневную. Развёртка событий
+  начинается раньше `start` на длительность, поэтому вхождение, начавшееся до
+  интервала и ещё идущее в нём, входит в ответ; лишние вхождения отбрасываются,
+  дубликатов нет.
+- При завершении серии следующее вхождение — первое строго позже текущего
+  срока и момента завершения; пропущенные вхождения не накапливаются.
 - Одиночное timed-событие относится к локальной дате household timezone;
   повторяющееся — к локальной дате `recurrence.timezone`.
 - Порядок: локальная дата начала, затем all-day раньше timed, затем момент
@@ -1072,7 +1260,7 @@ Scope: `capture:write`. `Content-Type: application/json`. Лимит тела �
 | `source` | string | да | `ha_voice`, `ha_automation`, `api`, `shortcut`. `telegram` запрещён. |
 | `mode` | string | да | `auto` или `draft`. |
 | `hint` | string | нет | `tasks`, `shopping`, `checklist` — тип списка по умолчанию для всех элементов. |
-| `list_id` | uuid | нет | Конкретный список household; приоритетнее `hint`. Неизвестный, чужой или архивный список → `422` (`Unknown list`). |
+| `list_id` | uuid | нет | Конкретный список household; приоритетнее `hint`. Неизвестный, чужой, архивный список или список событий → `422` (`Unknown list`). |
 | `idempotency_key` | string | нет | 1..128 видимых ASCII (`0x21..0x7E`, без пробелов). Пустая строка = без ключа. |
 
 ```json
