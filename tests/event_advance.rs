@@ -5,12 +5,13 @@ mod support;
 
 use std::sync::Arc;
 
-use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
 use sqlx::PgPool;
 use support::{TestDb, TestHousehold};
 use tasklerq::domain::models::{Item, ListKind, RecurrenceFreq, RecurrenceInput};
+use tasklerq::domain::recurrence::Due;
 use tasklerq::jobs::scheduler::Scheduler;
-use tasklerq::storage::repositories::lists;
+use tasklerq::storage::repositories::{items, lists};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
@@ -164,7 +165,47 @@ async fn a_series_with_until_stays_on_its_last_occurrence() {
     scheduler(&db.pool)
         .tick(now)
         .await
-        .expect("tick leaves the finished series alone");
+        .expect("tick moves the series to its last occurrence");
+
+    let last_start = utc(2026, 11, 17, 15);
+    let last_end = utc(2026, 11, 17, 16);
+    let current = reload(&db.pool, &household, event.id).await;
+    assert_eq!(
+        current.due_at,
+        Some(last_start),
+        "after a downtime the series lands on its last occurrence"
+    );
+    assert_eq!(current.end_at, Some(last_end), "the end is shifted too");
+    assert_eq!(current.version, event.version + 1);
+
+    scheduler(&db.pool)
+        .tick(now)
+        .await
+        .expect("a second tick leaves the finished series alone");
+    let current = reload(&db.pool, &household, event.id).await;
+    assert_eq!(current.due_at, Some(last_start));
+    assert_eq!(
+        current.version,
+        event.version + 1,
+        "the second tick is a no-op"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_finished_series_already_on_its_last_occurrence_does_not_change() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let start = utc(2026, 11, 17, 15);
+    let end = utc(2026, 11, 17, 16);
+    let mut rule = support::recurrence(RecurrenceFreq::Weekly, vec![2]);
+    rule.until = Some(NaiveDate::from_ymd_opt(2026, 11, 17).expect("date"));
+    let event = create_event(&db, &household, "Тренировка", start, end, rule).await;
+
+    // Среда 18 ноября: последнее вхождение уже прошло.
+    scheduler(&db.pool)
+        .tick(utc(2026, 11, 18, 12))
+        .await
+        .expect("tick leaves the finished series on its last occurrence");
 
     let current = reload(&db.pool, &household, event.id).await;
     assert_eq!(current.due_at, Some(start));
@@ -173,6 +214,71 @@ async fn a_series_with_until_stays_on_its_last_occurrence() {
         current.version, event.version,
         "a finished series must not change the row"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_moved_occurrence_returns_to_the_rule_and_clears_the_slot() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    // Вторник 10 ноября 2026, 18:00–19:00 по Москве.
+    let start = utc(2026, 11, 10, 15);
+    let end = utc(2026, 11, 10, 16);
+    let event = create_event(
+        &db,
+        &household,
+        "Тренировка",
+        start,
+        end,
+        support::recurrence(RecurrenceFreq::Weekly, vec![2]),
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let moved = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        event.id,
+        event.version,
+        // Среда 11 ноября, 19:00 по Москве.
+        Due::Timed(utc(2026, 11, 11, 16)),
+        "Europe/Moscow",
+        utc(2026, 11, 10, 12),
+    )
+    .await
+    .expect("reschedule the nearest occurrence");
+    drop(conn);
+
+    let rule = moved.recurrence.as_ref().expect("rule");
+    assert_eq!(
+        rule.occurrence_date,
+        Some(NaiveDate::from_ymd_opt(2026, 11, 10).expect("date"))
+    );
+    assert_eq!(
+        rule.occurrence_time,
+        Some(NaiveTime::from_hms_opt(18, 0, 0).expect("time"))
+    );
+
+    // Среда 11 ноября, 21:00 по Москве: перенесённое вхождение закончилось.
+    scheduler(&db.pool)
+        .tick(utc(2026, 11, 11, 18))
+        .await
+        .expect("tick returns the event to the rule");
+
+    let current = reload(&db.pool, &household, event.id).await;
+    assert_eq!(
+        current.due_at,
+        Some(utc(2026, 11, 17, 15)),
+        "the next occurrence is the next Tuesday at 18:00"
+    );
+    assert_eq!(current.end_at, Some(utc(2026, 11, 17, 16)));
+    let rule = current.recurrence.as_ref().expect("rule");
+    assert_eq!(
+        rule.occurrence_date, None,
+        "the moved occurrence slot must be cleared"
+    );
+    assert_eq!(rule.occurrence_time, None);
+    assert_eq!(current.version, moved.version + 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

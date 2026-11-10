@@ -328,34 +328,13 @@ async fn update_inner(
     // сохраняет длительность — конец сдвигается на ту же величину. Явно
     // переданный конец (значение или очистка) применяется как есть. Смена вида
     // начала не сдвигает конец другого вида: её отклонит проверка полей.
-    if target_list.kind == ListKind::Events
+    // Сдвиг считается ниже, после нормализации срока: у `last_day`-серии
+    // начало подтягивается к концу месяца, и конец должен считаться от
+    // итогового начала, иначе конец окажется раньше начала.
+    let shift_end_with_start = target_list.kind == ListKind::Events
         && due_changed
         && patch.end_at.is_missing()
-        && patch.end_date.is_missing()
-    {
-        if let (Some(old_start), Some(new_start)) = (row.due_at, due_at) {
-            let shift = new_start - old_start;
-            end_at = row
-                .end_at
-                .map(|old_end| {
-                    old_end
-                        .checked_add_signed(shift)
-                        .ok_or_else(|| DomainError::Validation("event end is out of range".into()))
-                })
-                .transpose()?;
-        }
-        if let (Some(old_start), Some(new_start)) = (row.due_date, due_date) {
-            let shift = new_start - old_start;
-            end_date = row
-                .end_date
-                .map(|old_end| {
-                    old_end
-                        .checked_add_signed(shift)
-                        .ok_or_else(|| DomainError::Validation("event end is out of range".into()))
-                })
-                .transpose()?;
-        }
-    }
+        && patch.end_date.is_missing();
 
     let old_recurrence = row.recurrence();
     let mut recurrence = old_recurrence.clone();
@@ -469,6 +448,33 @@ async fn update_inner(
                     }
                 }
             }
+        }
+    }
+
+    // Сдвиг конца от итогового начала: после нормализации `last_day` начало
+    // может переехать на конец месяца, и длительность сохраняется от него.
+    if shift_end_with_start {
+        if let (Some(old_start), Some(new_start)) = (row.due_at, due_at) {
+            let shift = new_start - old_start;
+            end_at = row
+                .end_at
+                .map(|old_end| {
+                    old_end
+                        .checked_add_signed(shift)
+                        .ok_or_else(|| DomainError::Validation("event end is out of range".into()))
+                })
+                .transpose()?;
+        }
+        if let (Some(old_start), Some(new_start)) = (row.due_date, due_date) {
+            let shift = new_start - old_start;
+            end_date = row
+                .end_date
+                .map(|old_end| {
+                    old_end
+                        .checked_add_signed(shift)
+                        .ok_or_else(|| DomainError::Validation("event end is out of range".into()))
+                })
+                .transpose()?;
         }
     }
 

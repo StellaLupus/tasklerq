@@ -330,6 +330,15 @@ async fn advance_recurring_events(pool: &PgPool, now: DateTime<Utc>) -> Result<u
           AND NOT l.is_archived AND l.kind = 'events'
          JOIN households h ON h.id = i.household_id AND h.deleted_at IS NULL
          WHERE i.deleted_at IS NULL AND i.recurrence_freq IS NOT NULL
+           AND (
+                 i.recurrence_until IS NULL
+                 OR CASE
+                      WHEN i.due_at IS NOT NULL
+                        THEN (i.due_at AT TIME ZONE
+                              COALESCE(NULLIF(i.recurrence_timezone, ''), h.timezone))::date
+                      ELSE i.due_date
+                    END < i.recurrence_until
+               )
            AND COALESCE(
                  i.end_at,
                  CASE WHEN i.end_date IS NOT NULL
@@ -428,9 +437,21 @@ fn plan_event_advance(
         Due::Timed(at) => at,
         Due::AllDay(date) => start_of_day(rule_timezone, date),
     };
+    let mut last_advance: Option<EventAdvance> = None;
     loop {
         let Some(next_due) = rule.next_after(current_due, current_moment)? else {
-            return Ok(None);
+            // Серия закончилась. Если после простоя нашлись прошедшие
+            // вхождения, событие должно остаться на последнем из них, а не на
+            // том, с которого начался пересчёт.
+            return Ok(match last_advance {
+                Some(advance)
+                    if advance.due_at != candidate.due_at
+                        || advance.due_date != candidate.due_date =>
+                {
+                    Some(advance)
+                }
+                _ => None,
+            });
         };
         let advance = shift_event(candidate, next_due)?;
         let end = effective_end(
@@ -443,6 +464,7 @@ fn plan_event_advance(
         if end.is_some_and(|end| end > now) {
             return Ok(Some(advance));
         }
+        last_advance = Some(advance);
         current_moment = match next_due {
             Due::Timed(at) => at,
             Due::AllDay(date) => start_of_day(rule_timezone, date),

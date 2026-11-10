@@ -778,6 +778,55 @@ async fn changing_the_due_of_a_last_day_series_still_normalizes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moving_a_last_day_event_keeps_its_length() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let mut input = support::new_item(household.events_list_id, "Отчётный период");
+    input.due_date = Some(date(2026, 1, 31));
+    input.end_date = Some(date(2026, 2, 2));
+    let mut rule = support::recurrence(RecurrenceFreq::Monthly, Vec::new());
+    rule.month_rule = Some(MonthRule::LastDay);
+    input.recurrence = Some(rule);
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let changed = items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        created.version,
+        ItemPatch {
+            due_date: Field::Value(date(2026, 2, 10)),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        utc(2026, 2, 10, 12),
+    )
+    .await
+    .expect("move the last-day event");
+
+    assert_eq!(
+        changed.due_date,
+        Some(date(2026, 2, 28)),
+        "the new start is normalized to the last day"
+    );
+    assert_eq!(
+        changed.end_date,
+        Some(date(2026, 3, 2)),
+        "the length is kept from the normalized start"
+    );
+    assert_eq!(changed.version, created.version + 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reschedule_occurrence_earlier_than_its_slot_keeps_the_slot() {
     let db = support::db().await;
     let household = support::create_household(&db.pool).await;
