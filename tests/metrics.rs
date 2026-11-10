@@ -20,6 +20,10 @@ use tasklerq::config::{CaptureConfig, SecretString};
 use tasklerq::home_assistant::{AiTask, GenerateData, HaError};
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
+use tasklerq::llm::{
+    Chain, ChatBackend, ChatCompletion, ChatMessage, ChatRequest, LlmError, ResponseFailure, Slot,
+    SystemClock,
+};
 use tasklerq::security_audit::Audit;
 use tasklerq::telegram::api::TelegramError;
 use tasklerq::telegram::bot::{Bot, Outcome};
@@ -134,6 +138,39 @@ impl AiTask for UnavailableAi {
         _timeout: StdDuration,
     ) -> Result<Value, HaError> {
         Err(HaError::Unreachable)
+    }
+}
+
+/// Слот, который всегда отвечает таймаутом.
+struct TimeoutBackend;
+
+#[async_trait]
+impl ChatBackend for TimeoutBackend {
+    async fn complete(
+        &self,
+        _request: &ChatRequest<'_>,
+        _timeout: StdDuration,
+    ) -> Result<ChatCompletion, LlmError> {
+        Err(LlmError::Timeout)
+    }
+}
+
+/// Слот, который всегда отвечает корректным текстом.
+struct AnswerBackend;
+
+#[async_trait]
+impl ChatBackend for AnswerBackend {
+    async fn complete(
+        &self,
+        _request: &ChatRequest<'_>,
+        _timeout: StdDuration,
+    ) -> Result<ChatCompletion, LlmError> {
+        Ok(ChatCompletion {
+            content: r#"{"items":[]}"#.to_owned(),
+            input_tokens: Some(7),
+            output_tokens: Some(3),
+            model: "stub/model".to_owned(),
+        })
     }
 }
 
@@ -556,10 +593,18 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
         "capture_total{source=\"telegram\",status=\"drafted\"}",
         1.0,
     );
-    assert_metric_at_least(&text, "llm_requests_total{status=\"success\"}", 1.0);
-    assert_metric_at_least(&text, "llm_requests_total{status=\"failure\"}", 1.0);
+    assert_metric_at_least(
+        &text,
+        "llm_requests_total{slot=\"primary\",status=\"success\"}",
+        1.0,
+    );
+    assert_metric_at_least(
+        &text,
+        "llm_requests_total{slot=\"primary\",status=\"failure\"}",
+        1.0,
+    );
     assert_metric_at_least(&text, "llm_validation_failures_total", 1.0);
-    assert_metric_at_least(&text, "llm_latency_seconds_count", 2.0);
+    assert_metric_at_least(&text, "llm_latency_seconds_count{slot=\"primary\"}", 2.0);
     assert_metric_at_least(
         &text,
         "http_requests_total{route=\"/webhooks/telegram\",status=\"401\"}",
@@ -580,6 +625,57 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
     assert!(
         !text.contains(&item_id.to_string()),
         "the raw path must not become a metric label:\n{text}"
+    );
+}
+
+#[tokio::test]
+async fn chain_reports_llm_metrics_with_slot_labels() {
+    let primary = Slot::new(
+        "primary",
+        Arc::new(TimeoutBackend),
+        StdDuration::from_secs(1),
+    );
+    let fallback = Slot::new(
+        "fallback",
+        Arc::new(AnswerBackend),
+        StdDuration::from_secs(1),
+    );
+    let chain = Chain::new(primary, Some(fallback));
+    let schema = json!({"type": "object"});
+    let messages = vec![ChatMessage::user("купить молоко")];
+    let request = ChatRequest {
+        messages: &messages,
+        schema_name: "capture_v4",
+        schema: &schema,
+    };
+
+    let outcome = chain
+        .run(
+            &request,
+            StdDuration::from_secs(2),
+            Utc::now(),
+            &SystemClock::new(),
+            |text| Ok::<_, ResponseFailure<()>>(text.to_owned()),
+        )
+        .await;
+    assert!(outcome.result.is_ok());
+
+    let text = tasklerq::metrics::render();
+    assert!(
+        text.contains("llm_requests_total{slot=\"primary\",status=\"failure\"}"),
+        "{text}"
+    );
+    assert!(
+        text.contains("llm_requests_total{slot=\"fallback\",status=\"success\"}"),
+        "{text}"
+    );
+    assert!(
+        text.contains("llm_latency_seconds_count{slot=\"primary\"}"),
+        "{text}"
+    );
+    assert!(
+        text.contains("llm_latency_seconds_bucket{slot=\"fallback\",le=\""),
+        "{text}"
     );
 }
 

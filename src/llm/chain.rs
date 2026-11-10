@@ -16,6 +16,7 @@ use chrono::{DateTime, Utc};
 use super::{ChatBackend, ChatRequest, LlmError, OpenAiBackend};
 use crate::capture::breaker::CircuitBreaker;
 use crate::config::{LlmConfig, SlotConfig};
+use crate::metrics;
 
 /// Имя основного слота в `llm_runs.slot`.
 pub const PRIMARY_SLOT: &str = "primary";
@@ -449,6 +450,14 @@ where
             }
         }
     };
+
+    let status = if error_code.is_none() {
+        "success"
+    } else {
+        "failure"
+    };
+    metrics::llm_request(slot.name, status);
+    metrics::llm_latency(slot.name, duration.as_secs_f64());
 
     (
         Attempt {

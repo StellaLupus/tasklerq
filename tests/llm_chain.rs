@@ -9,6 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value, json};
+use tasklerq::capture::breaker::DEFAULT_THRESHOLD;
 use tasklerq::config::{LlmConfig, SecretString, SlotConfig};
 use tasklerq::llm::{
     Chain, ChainError, ChatBackend, ChatCompletion, ChatMessage, ChatRequest, Clock, LlmError,
@@ -686,4 +687,127 @@ async fn the_outer_timeout_is_reported_as_a_timeout() {
     assert_eq!(outcome.attempts.len(), 1);
     assert_eq!(outcome.attempts[0].error_code, Some("timeout"));
     assert_eq!(outcome.attempts[0].duration, Duration::from_millis(10));
+}
+
+#[tokio::test]
+async fn chain_opens_the_primary_breaker_after_repeated_transport_failures() {
+    let clock = Arc::new(FakeClock::default());
+    let (primary, primary_backend) = slot(
+        "primary",
+        &clock,
+        Duration::from_secs(10),
+        Duration::from_secs(1),
+        Reply::Error(LlmError::Server(503)),
+    );
+    let (fallback, fallback_backend) = slot(
+        "fallback",
+        &clock,
+        Duration::from_secs(10),
+        Duration::from_secs(1),
+        Reply::Content(ANSWER),
+    );
+    let chain = Chain::new(primary, Some(fallback));
+    let schema = schema();
+    let messages = messages();
+    let request = request(&messages, &schema);
+
+    // Каждый разбор: основной падает, резервный отвечает. После порога
+    // предохранитель основного должен разомкнуться сам.
+    for _ in 0..DEFAULT_THRESHOLD {
+        let outcome = chain
+            .run(
+                &request,
+                Duration::from_secs(20),
+                now(),
+                clock.as_ref(),
+                accept,
+            )
+            .await;
+        assert_eq!(outcome.result, Ok(ANSWER.to_owned()));
+        assert_eq!(outcome.attempts.len(), 2);
+    }
+    assert_eq!(primary_backend.calls().len(), DEFAULT_THRESHOLD);
+    assert!(
+        chain.primary().breaker().retry_after(now()).is_some(),
+        "repeated primary failures must open its breaker"
+    );
+
+    let outcome = chain
+        .run(
+            &request,
+            Duration::from_secs(20),
+            now(),
+            clock.as_ref(),
+            accept,
+        )
+        .await;
+
+    assert_eq!(outcome.result, Ok(ANSWER.to_owned()));
+    assert_eq!(outcome.attempts.len(), 1);
+    assert_eq!(outcome.attempts[0].slot, "fallback");
+    assert_eq!(outcome.attempts[0].number, 1);
+    assert_eq!(
+        primary_backend.calls().len(),
+        DEFAULT_THRESHOLD,
+        "an open breaker must not call the primary slot"
+    );
+    assert_eq!(fallback_backend.calls().len(), DEFAULT_THRESHOLD + 1);
+}
+
+#[tokio::test]
+async fn chain_opens_the_primary_breaker_after_repeated_invalid_responses() {
+    let clock = Arc::new(FakeClock::default());
+    let (primary, primary_backend) = slot(
+        "primary",
+        &clock,
+        Duration::from_secs(10),
+        Duration::from_secs(1),
+        Reply::Content("не JSON по схеме"),
+    );
+    let (fallback, fallback_backend) = slot(
+        "fallback",
+        &clock,
+        Duration::from_secs(10),
+        Duration::from_secs(1),
+        Reply::Content(ANSWER),
+    );
+    let chain = Chain::new(primary, Some(fallback));
+    let schema = schema();
+    let messages = messages();
+    let request = request(&messages, &schema);
+
+    for _ in 0..DEFAULT_THRESHOLD {
+        let outcome = chain
+            .run(
+                &request,
+                Duration::from_secs(20),
+                now(),
+                clock.as_ref(),
+                shape,
+            )
+            .await;
+        assert_eq!(outcome.result, Ok(ANSWER.to_owned()));
+        assert_eq!(outcome.attempts[0].error_code, Some("invalid_field"));
+        assert_eq!(outcome.attempts.len(), 2);
+    }
+    assert!(
+        chain.primary().breaker().retry_after(now()).is_some(),
+        "responses rejected by the schema must open the breaker"
+    );
+
+    let outcome = chain
+        .run(
+            &request,
+            Duration::from_secs(20),
+            now(),
+            clock.as_ref(),
+            shape,
+        )
+        .await;
+
+    assert_eq!(outcome.result, Ok(ANSWER.to_owned()));
+    assert_eq!(outcome.attempts.len(), 1);
+    assert_eq!(outcome.attempts[0].slot, "fallback");
+    assert_eq!(primary_backend.calls().len(), DEFAULT_THRESHOLD);
+    assert_eq!(fallback_backend.calls().len(), DEFAULT_THRESHOLD + 1);
 }

@@ -101,14 +101,14 @@ pub fn capture_fallback(source: &str) {
     add_counter("capture_fallback_total", &[("source", source)]);
 }
 
-/// Итог вызова LLM: `success` или `failure`.
-pub fn llm_request(status: &'static str) {
-    add_counter("llm_requests_total", &[("status", status)]);
+/// Итог вызова слота LLM: `success` или `failure`.
+pub fn llm_request(slot: &'static str, status: &'static str) {
+    add_counter("llm_requests_total", &[("slot", slot), ("status", status)]);
 }
 
-/// Латентность вызова LLM, секунды.
-pub fn llm_latency(seconds: f64) {
-    observe("llm_latency_seconds", &[], seconds.max(0.0));
+/// Латентность вызова слота LLM, секунды.
+pub fn llm_latency(slot: &'static str, seconds: f64) {
+    observe("llm_latency_seconds", &[("slot", slot)], seconds.max(0.0));
 }
 
 /// Ответ LLM не прошёл разбор схемы.
@@ -273,8 +273,8 @@ fn help(name: &str) -> &'static str {
         "outbox_dead_total" => "Outbox messages moved to the dead-letter queue.",
         "capture_total" => "Capture outcomes by source and status.",
         "capture_fallback_total" => "Captures created from raw text without the LLM.",
-        "llm_requests_total" => "LLM capture requests by outcome.",
-        "llm_latency_seconds" => "LLM capture request latency.",
+        "llm_requests_total" => "LLM slot capture requests by slot and outcome.",
+        "llm_latency_seconds" => "LLM slot capture request latency by slot.",
         "llm_validation_failures_total" => "LLM responses rejected by schema validation.",
         "http_requests_total" => "HTTP requests by matched route template and status.",
         "db_pool_in_use" => "Database pool connections currently checked out.",

@@ -841,6 +841,8 @@ fn pending_run(
             source,
             mode,
             prompt_version: Some(PROMPT_VERSION),
+            slot: None,
+            attempt: None,
             status,
             error_code,
             latency_ms,

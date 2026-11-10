@@ -510,6 +510,8 @@ impl CaptureWorker {
             source: job.source,
             mode: CaptureMode::Draft,
             prompt_version: Some(PROMPT_VERSION),
+            slot: None,
+            attempt: None,
             status,
             error_code,
             latency_ms,

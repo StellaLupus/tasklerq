@@ -39,6 +39,12 @@ erDiagram
     USERS ||--o{ NOTIFICATION_DELIVERIES : receives
     NOTIFICATION_BATCHES ||--o{ NOTIFICATION_DELIVERIES : contains
     HOUSEHOLDS ||--o{ AUDIT_EVENTS : records
+    LLM_SLOT_CHECKS {
+        text slot PK
+        text fingerprint
+        integer passed
+        integer total
+    }
 ```
 
 ## 3. Таблицы
@@ -347,8 +353,20 @@ household.
 
 `llm_runs`: `id`, `household_id`, `user_id`, `source`, `mode`,
 `prompt_version`, `status` (`success`/`failure`), `error_code`, `latency_ms`,
-`input_tokens`, `output_tokens`, `created_at`. Исходный текст и ответ модели не
-хранятся.
+`input_tokens`, `output_tokens`, `slot`, `attempt`, `created_at`. Исходный текст
+и ответ модели не хранятся. `slot` — имя слота (`primary`/`fallback`),
+`attempt` — номер вызова слота в разборе с единицы: каждая попытка пишется
+отдельной строкой со своим статусом, кодом ошибки, длительностью и токенами
+провайдера. У строк до миграции 0018 и у разборов без вызова слота оба поля
+`NULL`. Суточная квота считает разборы, а не вызовы: строки с `attempt = 1` или
+`attempt IS NULL`, поэтому разбор через основной и резервный слот расходует
+одну единицу.
+
+`llm_slot_checks`: `slot` (PK), `fingerprint`, `fingerprint_parts jsonb`,
+`passed`, `total`, `p95_ms`, `report jsonb`, `checked_at`. Хранится последняя
+проверка слота smoke-набором: одна строка на слот, отпечаток действующей
+конфигурации и результат по фразам. Текста пользователя и ответов модели в
+отчёте нет: только результаты сравнения по полям.
 
 ### 3.12 Outbox и уведомления
 

@@ -974,8 +974,8 @@ curl -fsS \
 - `outbox_dead_total`;
 - `capture_total{source,status}`;
 - `capture_fallback_total{source}`;
-- `llm_requests_total{status}`;
-- `llm_latency_seconds` (гистограмма);
+- `llm_requests_total{slot,status}` — вызовы слотов LLM;
+- `llm_latency_seconds{slot}` (гистограмма) — длительность вызова слота;
 - `llm_validation_failures_total`;
 - `http_requests_total{route,status}` — `route` — шаблон маршрута, а не сырой
   путь;
