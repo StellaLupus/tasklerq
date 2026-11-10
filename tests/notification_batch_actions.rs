@@ -253,7 +253,7 @@ async fn snooze_all_waits_for_its_due_time_after_timezone_change() {
     let moscow = chrono_tz::Europe::Moscow;
     let day = local_today(&bot, moscow);
     let at = local_utc(moscow, day, 9, 0);
-    bot.advance(at - bot.now);
+    bot.freeze_at(at);
     quiet_settings(&db.pool, household.owner_id, false).await;
 
     let due = local_utc(moscow, day, 11, 0);
@@ -316,7 +316,7 @@ async fn grouped_snooze_that_falls_into_quiet_hours_becomes_quiet_deferred() {
     let moscow = chrono_tz::Europe::Moscow;
     let day = local_today(&bot, moscow);
     let at = local_utc(moscow, day, 21, 30);
-    bot.advance(at - bot.now);
+    bot.freeze_at(at);
     quiet_settings(&db.pool, household.owner_id, false).await;
 
     let due = local_utc(moscow, day, 23, 0);
@@ -531,7 +531,7 @@ async fn snooze_all_waits_for_its_due_time_when_quiet_hours_change() {
     let moscow = chrono_tz::Europe::Moscow;
     let day = local_today(&bot, moscow);
     let at = local_utc(moscow, day, 9, 0);
-    bot.advance(at - bot.now);
+    bot.freeze_at(at);
     quiet_settings(&db.pool, household.owner_id, false).await;
 
     let due = local_utc(moscow, day, 11, 0);
@@ -1200,7 +1200,7 @@ async fn cancelled_snooze_block_opens_with_the_current_version_and_snoozes_again
     // времени тика. Ставим часы на утро сценария: днём утро и новый срок уже
     // в прошлом, и оба snooze получают одинаковое время «сейчас + час»,
     // сливаясь в одну запись. Так сценарий одинаков в любое время суток.
-    bot.set_now(morning);
+    bot.freeze_at(morning);
     let due = local_utc(moscow, day, 9, 0);
     let first = create_task(&db.pool, &household, "Первая", due, None).await;
     let second = create_task(&db.pool, &household, "Вторая", due, None).await;
@@ -1284,7 +1284,7 @@ async fn snooze_all_takes_a_block_whose_snooze_was_cancelled() {
     // времени тика. Ставим часы на утро сценария: днём утро и новый срок уже
     // в прошлом, и оба snooze получают одинаковое время «сейчас + час»,
     // сливаясь в одну запись. Так сценарий одинаков в любое время суток.
-    bot.set_now(morning);
+    bot.freeze_at(morning);
     let due = local_utc(moscow, day, 9, 0);
     let first = create_task(&db.pool, &household, "Первая", due, None).await;
     let second = create_task(&db.pool, &household, "Вторая", due, None).await;
