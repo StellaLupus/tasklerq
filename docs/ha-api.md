@@ -699,7 +699,7 @@ Scope: `ha:write`. `Content-Type: application/json`.
 
 ```json
 {
-  "id": "019a1b2c-8e9f-7a0b-9c1d-4d5e6f708192",
+  "id": "019a1b2c-a1b2-7c3d-8e4f-5e6f708192a3",
   "list_id": "019a1b2c-7d8e-7f90-8a1b-3c4d5e6f7081",
   "title": "Маникюр",
   "status": "open",
@@ -1180,9 +1180,9 @@ GET /api/v1/calendar?start=2026-11-01&end=2027-04-01
       "item_id": "019a1b2c-a1b2-7c3d-8e4f-5e6f708192a3",
       "list_id": "019a1b2c-7d8e-7f90-8a1b-3c4d5e6f7081",
       "kind": "events",
-      "occurrence_key": "019a1b2c-a1b2-7c3d-8e4f-5e6f708192a3:2026-11-11T14:00:00Z",
-      "start": "2026-11-11T14:00:00Z",
-      "end": "2026-11-11T15:30:00Z",
+      "occurrence_key": "019a1b2c-a1b2-7c3d-8e4f-5e6f708192a3:2026-11-11T11:00:00Z",
+      "start": "2026-11-11T11:00:00Z",
+      "end": "2026-11-11T12:30:00Z",
       "all_day": false,
       "title": "Маникюр",
       "status": "open"

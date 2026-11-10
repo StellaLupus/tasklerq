@@ -160,6 +160,9 @@ pub fn expand_item(
 
     // Развёртка событий начата раньше интервала: оставляем только вхождения,
     // которые пересекаются с `[start, end)`, чтобы не отдавать прошлое.
+    // Границы интервала считаются в поясе серии — том же, в котором `included`
+    // проверяет перенесённое вхождение, иначе вхождение у границы терялось бы
+    // при поясе серии, отличном от пояса household.
     let mut occurrences = occurrences;
     if entry.kind == ListKind::Events {
         occurrences.retain(|occurrence| {
@@ -170,7 +173,7 @@ pub fn expand_item(
                 timed_span,
                 start,
                 end,
-                household_timezone,
+                timezone,
             )
         });
     }

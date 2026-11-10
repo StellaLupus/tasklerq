@@ -58,8 +58,15 @@ pub async fn calendar_items(
     conn: &mut PgConnection,
     household_id: Uuid,
 ) -> Result<Vec<CalendarItem>, DomainError> {
-    let rows = sqlx::query_as::<_, ItemRow>(&format!(
-        "SELECT {ITEM_COLUMNS}
+    #[derive(sqlx::FromRow)]
+    struct CalendarRow {
+        #[sqlx(flatten)]
+        item: ItemRow,
+        kind: ListKind,
+    }
+
+    let rows = sqlx::query_as::<_, CalendarRow>(&format!(
+        "SELECT {ITEM_COLUMNS}, l.kind
          FROM items i
          JOIN lists l ON l.id = i.list_id
          WHERE i.household_id = $1
@@ -74,24 +81,12 @@ pub async fn calendar_items(
     .fetch_all(&mut *conn)
     .await?;
 
-    let kinds = sqlx::query_as::<_, (Uuid, ListKind)>(
-        "SELECT id, kind
-         FROM lists
-         WHERE household_id = $1 AND deleted_at IS NULL AND NOT is_archived",
-    )
-    .bind(household_id)
-    .fetch_all(&mut *conn)
-    .await?
-    .into_iter()
-    .collect::<std::collections::HashMap<_, _>>();
-
-    let items = hydrate_many(conn, rows).await?;
+    let kinds: Vec<ListKind> = rows.iter().map(|row| row.kind).collect();
+    let items = hydrate_many(conn, rows.into_iter().map(|row| row.item).collect()).await?;
     Ok(items
         .into_iter()
-        .filter_map(|item| {
-            let kind = kinds.get(&item.list_id).copied()?;
-            Some(CalendarItem { item, kind })
-        })
+        .zip(kinds)
+        .map(|(item, kind)| CalendarItem { item, kind })
         .collect())
 }
 

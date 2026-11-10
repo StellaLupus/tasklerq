@@ -1,7 +1,7 @@
 use chrono::TimeZone;
 
 use super::*;
-use crate::capture::test_support::{context, list, member};
+use crate::capture::test_support::{context, list, member, model_list, now};
 
 fn raw(kind: ListKind, title: &str) -> RawItem {
     RawItem {
@@ -638,6 +638,29 @@ fn list_of_another_kind_is_not_used_by_name() {
     let draft = validate_item(&context, ItemSource::Api, raw);
 
     assert_eq!(draft.list_id, Some(context.lists[1].id));
+    assert!(draft.list_auto_selected);
+}
+
+#[test]
+fn event_list_name_from_the_llm_is_not_a_target_list() {
+    // Списки событий не попадают в контекст: имя «Календарь» из ответа модели
+    // остаётся неизвестным и заменяется списком по умолчанию с отметкой.
+    let lists = vec![
+        model_list("Задачи", ListKind::Tasks, true),
+        model_list("Календарь", ListKind::Events, true),
+    ];
+    let context = CaptureContext::new("Europe/Moscow", now(), &lists, &[]).expect("context");
+    let mut raw = task();
+    raw.target_list = Some("Календарь".to_owned());
+
+    let draft = validate_item(&context, ItemSource::Api, raw);
+
+    assert!(draft.is_valid());
+    assert_eq!(
+        draft.list_id,
+        context.default_list(ListKind::Tasks).map(|list| list.id)
+    );
+    assert_ne!(draft.list_id, Some(lists[1].id));
     assert!(draft.list_auto_selected);
 }
 

@@ -411,12 +411,14 @@ async fn capture_inner(
         }
     }
 
-    // Конкретный список проверяется после резерва: чужой, отсутствующий и
-    // архивный список дают один и тот же 422, чтобы не раскрывать чужие данные.
+    // Конкретный список проверяется после резерва: чужой, отсутствующий,
+    // архивный и список событий дают один и тот же 422, чтобы не раскрывать
+    // чужие данные. Список событий отклоняется до квоты и LLM (0009-events
+    // 6.1): разбор не создаёт события.
     let target_list = match request.list_id {
         Some(list_id) => match lists::get_visible(&mut conn, auth.household_id, list_id).await {
-            Ok(list) => Some(list),
-            Err(DomainError::NotFound) => {
+            Ok(list) if list.kind != ListKind::Events => Some(list),
+            Ok(_) | Err(DomainError::NotFound) => {
                 log_capture(source, "invalid", capture_id);
                 return Err(ApiError::validation("Unknown list"));
             }

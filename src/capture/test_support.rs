@@ -5,11 +5,28 @@ use chrono_tz::Europe::Moscow;
 use uuid::Uuid;
 
 use super::context::{CaptureContext, ListRef, MemberRef};
-use crate::domain::models::ListKind;
+use crate::domain::models::{List, ListKind};
 
 /// Пятница, 30 октября 2026, 14:05 по Москве.
 pub fn now() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, 30, 11, 5, 0).unwrap()
+}
+
+/// Строка списка для [`CaptureContext::new`]: заполнены только читаемые поля.
+pub fn model_list(name: &str, kind: ListKind, is_default: bool) -> List {
+    let now = Utc::now();
+    List {
+        id: Uuid::now_v7(),
+        household_id: Uuid::nil(),
+        kind,
+        name: name.to_owned(),
+        is_default,
+        is_archived: false,
+        position: 0,
+        created_at: now,
+        updated_at: now,
+        deleted_at: None,
+    }
 }
 
 pub fn list(name: &str, kind: ListKind, is_default: bool) -> ListRef {

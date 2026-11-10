@@ -181,7 +181,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use crate::capture::test_support::{context, list, member};
+    use crate::capture::test_support::{context, list, member, model_list, now};
 
     const SNAPSHOT: &str = include_str!("prompts/capture-v3.snapshot.txt");
 
@@ -290,6 +290,26 @@ mod tests {
 
         assert!(rendered.contains("- Списки: —\n"));
         assert!(rendered.contains("- Участники: —\n"));
+    }
+
+    #[test]
+    fn event_lists_are_absent_from_the_llm_request() {
+        let lists = vec![
+            model_list("Задачи", ListKind::Tasks, true),
+            model_list("Покупки", ListKind::Shopping, true),
+            model_list("Календарь", ListKind::Events, true),
+        ];
+        let context =
+            CaptureContext::new("Europe/Moscow", now(), &lists, &[]).expect("context is valid");
+
+        let rendered = build_instructions(&context, "маникюр завтра с 14 до 15:30");
+
+        assert!(rendered.contains(r#""Задачи" (tasks)"#));
+        assert!(rendered.contains(r#""Покупки" (shopping)"#));
+        assert!(
+            !rendered.contains("Календарь"),
+            "an events list must not reach the prompt: {rendered}"
+        );
     }
 
     #[test]

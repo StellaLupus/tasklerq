@@ -6,19 +6,11 @@
 mod support;
 
 use axum::http::{Method, StatusCode};
-use chrono::{NaiveDate, TimeZone, Timelike, Utc};
+use chrono::{Timelike, Utc};
 use serde_json::{Value, json};
 use tasklerq::domain::models::{ListKind, RecurrenceFreq};
 
-fn date(year: i32, month: u32, day: u32) -> NaiveDate {
-    NaiveDate::from_ymd_opt(year, month, day).expect("valid date")
-}
-
-fn utc(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> chrono::DateTime<Utc> {
-    Utc.with_ymd_and_hms(year, month, day, hour, minute, 0)
-        .single()
-        .expect("valid instant")
-}
+use support::{date, utc};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_lists_creates_an_events_list() {
@@ -204,8 +196,8 @@ async fn calendar_example_returns_kind_and_real_end() {
     .await;
 
     let mut timed_event = support::new_item(household.events_list_id, "Маникюр");
-    timed_event.due_at = Some(utc(2026, 11, 11, 14, 0));
-    timed_event.end_at = Some(utc(2026, 11, 11, 15, 30));
+    timed_event.due_at = Some(utc(2026, 11, 11, 11, 0));
+    timed_event.end_at = Some(utc(2026, 11, 11, 12, 30));
     support::create_item(
         &db.pool,
         &household,
@@ -260,8 +252,8 @@ async fn calendar_example_returns_kind_and_real_end() {
 
     let event = by_title("Маникюр");
     assert_eq!(event["kind"], "events");
-    assert_eq!(event["start"], "2026-11-11T14:00:00Z");
-    assert_eq!(event["end"], "2026-11-11T15:30:00Z");
+    assert_eq!(event["start"], "2026-11-11T11:00:00Z");
+    assert_eq!(event["end"], "2026-11-11T12:30:00Z");
     assert_eq!(event["all_day"], false);
 
     let multi_day = by_title("Отпуск");
@@ -330,6 +322,7 @@ async fn snapshot_exposes_the_event_kind_and_end() {
     let household = support::create_household(&db.pool).await;
     let token = support::issue_token(&db.pool, household.household_id, &["ha:read"]).await;
     let app = support::app(&db.pool);
+    let timezone = tasklerq::domain::recurrence::parse_timezone("Europe/Moscow").expect("timezone");
 
     let due = (Utc::now() + chrono::Duration::days(1))
         .with_nanosecond(0)
@@ -347,6 +340,23 @@ async fn snapshot_exposes_the_event_kind_and_end() {
     )
     .await;
 
+    // §5.4: многодневное событие, начавшееся до сегодня, попадает в снапшот
+    // со своими началом и концом, хотя окно начинается с сегодняшнего дня.
+    let today = Utc::now().with_timezone(&timezone).date_naive();
+    let started = today - chrono::Duration::days(1);
+    let last_day = today + chrono::Duration::days(1);
+    let mut multi_day = support::new_item(household.events_list_id, "Многодневное");
+    multi_day.due_date = Some(started);
+    multi_day.end_date = Some(last_day);
+    let multi_day = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        multi_day,
+    )
+    .await;
+
     let calendar_end = (Utc::now() + chrono::Duration::days(7))
         .format("%Y-%m-%d")
         .to_string();
@@ -360,15 +370,28 @@ async fn snapshot_exposes_the_event_kind_and_end() {
     .await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
-    let occurrence = body["calendar_events"]
-        .as_array()
-        .expect("calendar events")
-        .iter()
-        .find(|occurrence| occurrence["item_id"] == event.id.to_string())
-        .expect("event in the snapshot");
+    let by_id = |id: &str| {
+        body["calendar_events"]
+            .as_array()
+            .expect("calendar events")
+            .iter()
+            .find(|occurrence| occurrence["item_id"] == id)
+            .unwrap_or_else(|| panic!("event {id} is missing from the snapshot: {body}"))
+    };
+    let occurrence = by_id(&event.id.to_string());
     assert_eq!(occurrence["kind"], "events");
     assert_eq!(
         occurrence["end"],
         end.format("%Y-%m-%dT%H:%M:%SZ").to_string()
     );
+
+    let multi_day = by_id(&multi_day.id.to_string());
+    assert_eq!(multi_day["kind"], "events");
+    assert_eq!(multi_day["start"], started.to_string());
+    assert_eq!(
+        multi_day["end"],
+        (last_day + chrono::Duration::days(1)).to_string(),
+        "the inclusive end date is returned exclusive"
+    );
+    assert_eq!(multi_day["all_day"], true);
 }
