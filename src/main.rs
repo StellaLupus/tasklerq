@@ -188,7 +188,7 @@ struct TokenCreate {
 
 #[derive(Debug, Subcommand)]
 enum HouseholdCommand {
-    /// Создать household и списки «Задачи» и «Покупки».
+    /// Создать household и списки «Задачи», «Покупки» и «Календарь».
     ///
     /// В режиме `single` второй активный household отклоняется с `409`. С
     /// `--owner-telegram-id` владелец создаётся в той же транзакции; без него

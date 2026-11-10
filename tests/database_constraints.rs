@@ -250,9 +250,11 @@ async fn event_end_columns_are_checked_by_the_database() {
             Some(end_before_day),
             "items_end_date_not_before_due_date",
         ),
-        // `items_end_exclusive` требует оба конца, но при этом один из
-        // `items_end_*_due_*` всё равно нарушен из-за взаимоисключающих
-        // `due_at`/`due_date`; PostgreSQL сообщает первое по имени ограничение.
+        // `items_end_exclusive` избыточно: оба конца одновременно требовали бы
+        // и `due_at`, и `due_date`, а их запрещает `items_due_exclusive`.
+        // В этом случае нарушено и `items_end_date_not_before_due_date`
+        // (`end_date` задан без `due_date`), и PostgreSQL сообщает его, а не
+        // `items_end_exclusive`.
         (
             "both end_at and end_date",
             Some(due_at),

@@ -289,9 +289,9 @@ async fn field_view(ctx: &mut Ctx<'_>, editor: &Editor, step: Step) -> Result<Ui
                 // переключает и тип, поэтому показаны все списки.
                 let household_id = ctx.household()?.id;
                 let mut lists = lists::list(&mut *ctx.conn, household_id).await?;
-                lists.retain(|list| !list.is_archived);
-                // 0009-events 9.1: список событий получит свой значок и место
-                // в выборе; пока он сортируется вместе с покупками.
+                // 0009-events 8.x/9.x: редактор события выберет список событий;
+                // до появления его полей «Календарь» в выборе не предлагается.
+                lists.retain(|list| !list.is_archived && list.kind != ListKind::Events);
                 lists.sort_by_key(|list| list.kind != ListKind::Tasks);
                 for list in lists {
                     let icon = if list.kind == ListKind::Tasks {

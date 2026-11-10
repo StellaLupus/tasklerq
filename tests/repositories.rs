@@ -805,6 +805,45 @@ async fn menu_counts_use_local_today_and_completion_events() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn menu_counts_do_not_count_event_lists_as_shopping() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let actor = household.owner();
+    let now = Utc::now();
+
+    support::create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &actor,
+        support::new_item(household.shopping_list_id, "Молоко"),
+    )
+    .await;
+
+    let mut event = support::new_item(household.events_list_id, "Встреча");
+    event.due_date = Some(NaiveDate::from_ymd_opt(2027, 3, 16).expect("event date"));
+    support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &actor,
+        event,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let counts = items::menu_counts(&mut conn, household.household_id, "Europe/Moscow", now)
+        .await
+        .expect("menu counts");
+
+    assert_eq!(counts.open_tasks, 0);
+    assert_eq!(
+        counts.open_shopping, 1,
+        "an open event must not count as a shopping item"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn open_assigned_tasks_counts_only_open_own_tasks_in_visible_task_lists() {
     let db = support::db().await;
     let household = support::create_household(&db.pool).await;

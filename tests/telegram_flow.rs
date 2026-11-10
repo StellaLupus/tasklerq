@@ -33,7 +33,7 @@ async fn onboarding_creates_household_once() {
     bot.assert_screen_contains("выберите часовой пояс");
 
     bot.press("Москва").await;
-    bot.assert_screen_contains("Созданы списки «Задачи» и «Покупки»");
+    bot.assert_screen_contains("Созданы списки «Задачи», «Покупки» и «Календарь»");
 
     let households: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM users u JOIN households h ON h.id = u.household_id
@@ -403,6 +403,11 @@ async fn create_from_menu_switches_to_a_shopping_list() {
 
     bot.press("Список").await;
     bot.assert_screen_contains("В какой список?");
+    let labels: Vec<String> = bot.buttons().into_iter().map(|(label, _)| label).collect();
+    assert!(
+        labels.iter().all(|label| !label.contains("Календарь")),
+        "event lists must not be offered when creating an item: {labels:?}"
+    );
     bot.press("Покупки").await;
     bot.assert_screen_contains("Количество: 1 шт");
     bot.assert_has_button("🔢 Количество");
@@ -1635,6 +1640,33 @@ async fn editor_list_field_moves_only_between_lists_of_the_same_kind() {
         .await
         .expect("list id");
     assert_eq!(list_id, dacha.id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn purchase_editor_list_choice_does_not_offer_the_calendar() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.press("Покупки").await;
+    bot.press("Добавить").await;
+    bot.text("Молоко").await;
+    bot.press("Сохранить").await;
+    bot.press("Править").await;
+    bot.press("Молоко").await;
+    bot.press("Править").await;
+    bot.press("Список").await;
+
+    let labels: Vec<String> = support::telegram::buttons(&bot.screen())
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect();
+    assert!(
+        labels.iter().any(|label| label.contains("Покупки")),
+        "the shopping list must stay available: {labels:?}"
+    );
+    assert!(
+        labels.iter().all(|label| !label.contains("Календарь")),
+        "event lists must not be offered for a purchase: {labels:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

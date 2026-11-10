@@ -50,7 +50,10 @@ pub async fn menu_counts(
                             OR (i.due_at >= $2
                                 AND (i.due_at AT TIME ZONE $4)::date = $3))
                  ),
-                 count(*) FILTER (WHERE l.kind <> 'tasks' AND i.status = 'open')
+                 -- 0009-events 8.x/9.x: открытые события не считаются покупками.
+                 count(*) FILTER (
+                     WHERE l.kind IN ('shopping', 'checklist') AND i.status = 'open'
+                 )
              FROM items i
              JOIN lists l ON l.id = i.list_id
              WHERE i.household_id = $1

@@ -180,6 +180,10 @@ CHECK (recurrence_until IS NULL
            AND recurrence_until <= (recurrence_anchor_date + INTERVAL '5 years')::date))
 ```
 
+`items_end_exclusive` избыточно: оба конца одновременно требовали бы `due_at`
+и `due_date`, что запрещено их взаимоисключением; ограничение оставлено как
+документирующее.
+
 Дополнительно приложение проверяет, что повторение допустимо только для
 `lists.kind = 'tasks'`, а `quantity`/`unit` — только для shopping/checklist.
 Для события `due_at`/`due_date` задают начало, а `end_at`/`end_date` — конец;

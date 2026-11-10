@@ -6,10 +6,12 @@
 use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use chrono_tz::Tz;
 
+use super::recurrence::MAX_CALENDAR_DAYS;
+
 /// Максимальная длительность события в днях.
 ///
 /// Тот же предел, что у интервала календаря.
-pub const MAX_EVENT_DAYS: i64 = 366;
+pub const MAX_EVENT_DAYS: i64 = MAX_CALENDAR_DAYS;
 
 /// Момент, после которого событие считается прошедшим.
 ///
@@ -62,7 +64,7 @@ pub fn is_past(
 ///
 /// В некоторых поясах местной полуночи не существует из-за перехода на летнее
 /// время: тогда берётся первый существующий местный час.
-fn start_of_day(timezone: Tz, date: NaiveDate) -> DateTime<Utc> {
+pub(crate) fn start_of_day(timezone: Tz, date: NaiveDate) -> DateTime<Utc> {
     (0..24)
         .find_map(|hour| {
             date.and_hms_opt(hour, 0, 0)

@@ -4,13 +4,14 @@
 //! отбора используется разделом «Выполнено сегодня» и счётчиком меню, поэтому
 //! живёт здесь, а не в экранах.
 
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use chrono_tz::Tz;
 use serde_json::Value;
 use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
+use crate::domain::events::start_of_day;
 use crate::domain::models::{Item, ItemStatus};
 
 /// Название выполнения, если снимок `payload.before` его не сохранил.
@@ -150,13 +151,7 @@ struct JournalRow {
 /// время: тогда берётся первый существующий местный час.
 pub fn day_start(timezone: Tz, now: DateTime<Utc>) -> DateTime<Utc> {
     let date = now.with_timezone(&timezone).date_naive();
-    (0..24)
-        .find_map(|hour| {
-            date.and_hms_opt(hour, 0, 0)
-                .and_then(|local| timezone.from_local_datetime(&local).earliest())
-        })
-        .map(|local| local.with_timezone(&Utc))
-        .expect("a local date has at least one existing hour")
+    start_of_day(timezone, date)
 }
 
 /// Выполнения household с `since`, начиная с поздних, по одному списку.

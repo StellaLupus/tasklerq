@@ -1796,6 +1796,23 @@ async fn patch_rejects_event_ends_that_the_database_would_reject() {
     );
     assert_eq!(body["error"]["code"], "validation_error");
 
+    // Событие без конца не может остаться без начала: правило проверяет
+    // домен, а не ограничение базы.
+    let (status, body) = support::request(
+        &app,
+        Method::PATCH,
+        &event_uri,
+        Some(&token),
+        Some(json!({"version": 1, "due_at": null})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "clear start of an event without end: {body}"
+    );
+    assert_eq!(body["error"]["code"], "validation_error");
+
     let (status, task) = support::request(
         &app,
         Method::POST,
