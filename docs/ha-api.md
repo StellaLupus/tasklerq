@@ -1260,7 +1260,7 @@ Scope: `capture:write`. `Content-Type: application/json`. Лимит тела �
 | `source` | string | да | `ha_voice`, `ha_automation`, `api`, `shortcut`. `telegram` запрещён. |
 | `mode` | string | да | `auto` или `draft`. |
 | `hint` | string | нет | `tasks`, `shopping`, `checklist` — тип списка по умолчанию для всех элементов. |
-| `list_id` | uuid | нет | Конкретный список household; приоритетнее `hint`. Неизвестный, чужой или архивный список → `422` (`Unknown list`). |
+| `list_id` | uuid | нет | Конкретный список household; приоритетнее `hint`. Неизвестный, чужой, архивный список или список событий → `422` (`Unknown list`). |
 | `idempotency_key` | string | нет | 1..128 видимых ASCII (`0x21..0x7E`, без пробелов). Пустая строка = без ключа. |
 
 ```json

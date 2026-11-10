@@ -569,18 +569,19 @@ async fn an_explicit_events_list_is_rejected_before_the_llm_and_quota() {
 
     // Отказ такой же, как у неизвестного списка: резерв ключа уже взят, но
     // ошибка освобождает его, а квота и LLM не трогаются.
+    let body = json!({
+        "text": "маникюр завтра с 14 до 15:30",
+        "source": "api",
+        "mode": "auto",
+        "list_id": household.events_list_id,
+        "idempotency_key": "events-list"
+    });
     let (status, _, json) = call(
         &app,
         Method::POST,
         "/api/v1/capture",
         Some(&token),
-        Some(json!({
-            "text": "маникюр завтра с 14 до 15:30",
-            "source": "api",
-            "mode": "auto",
-            "list_id": household.events_list_id,
-            "idempotency_key": "events-list"
-        })),
+        Some(body.clone()),
     )
     .await;
 
@@ -599,6 +600,22 @@ async fn an_explicit_events_list_is_rejected_before_the_llm_and_quota() {
         .await
         .expect("llm runs");
     assert_eq!(runs, 0, "no LLM run must be recorded and the quota stays");
+
+    // Резерв ключа освобождён отказом: повтор с тем же ключом снова проходит
+    // проверку списка и даёт тот же `422`, а не `409` «in progress».
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{json}");
+    assert_error_envelope(&json, "validation_error");
+    assert_eq!(ai.calls(), 0, "the repeat must not reach the LLM either");
+    assert_eq!(item_count(&db.pool, household.household_id).await, 0);
+    assert_eq!(draft_count(&db.pool, household.household_id).await, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

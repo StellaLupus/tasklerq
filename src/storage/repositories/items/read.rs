@@ -82,6 +82,8 @@ pub async fn calendar_items(
     .await?;
 
     let kinds: Vec<ListKind> = rows.iter().map(|row| row.kind).collect();
+    // `hydrate_many` собирает результат в порядке входных строк, поэтому
+    // `zip` возвращает каждый тип списка вместе с его элементом.
     let items = hydrate_many(conn, rows.into_iter().map(|row| row.item).collect()).await?;
     Ok(items
         .into_iter()

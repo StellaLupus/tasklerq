@@ -643,8 +643,10 @@ fn list_of_another_kind_is_not_used_by_name() {
 
 #[test]
 fn event_list_name_from_the_llm_is_not_a_target_list() {
-    // Списки событий не попадают в контекст: имя «Календарь» из ответа модели
-    // остаётся неизвестным и заменяется списком по умолчанию с отметкой.
+    // Имя «Календарь» из ответа модели остаётся неизвестным, потому что
+    // `resolve_list` ищет список только того же kind, что и элемент, а не
+    // потому что списки событий отфильтрованы из контекста. Такой элемент всё
+    // равно получает список по умолчанию с отметкой.
     let lists = vec![
         model_list("Задачи", ListKind::Tasks, true),
         model_list("Календарь", ListKind::Events, true),
@@ -662,6 +664,27 @@ fn event_list_name_from_the_llm_is_not_a_target_list() {
     );
     assert_ne!(draft.list_id, Some(lists[1].id));
     assert!(draft.list_auto_selected);
+}
+
+#[test]
+fn event_kind_without_event_lists_in_the_context_has_no_target() {
+    // Парсер ответа LLM не принимает kind `events`, но `validate_item` —
+    // публичная граница проверки, и защита не должна зависеть от парсера.
+    // Без фильтра контекста «Календарь» нашёлся бы по имени и kind, поэтому
+    // тест падает, если списки событий снова попадут в `CaptureContext`.
+    let lists = vec![
+        model_list("Задачи", ListKind::Tasks, true),
+        model_list("Календарь", ListKind::Events, true),
+    ];
+    let context = CaptureContext::new("Europe/Moscow", now(), &lists, &[]).expect("context");
+    let mut raw = raw(ListKind::Events, "Маникюр");
+    raw.target_list = Some("Календарь".to_owned());
+
+    let draft = validate_item(&context, ItemSource::Api, raw);
+
+    assert_eq!(codes(&draft), ["list_missing"]);
+    assert!(draft.list_id.is_none());
+    assert!(draft.item.is_none());
 }
 
 #[test]

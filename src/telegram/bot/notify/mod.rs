@@ -66,6 +66,9 @@ pub fn reminder_ui(
     now: DateTime<Utc>,
     lead_minutes: Option<i64>,
 ) -> Ui {
+    // 0009-events 7.2: у события здесь будут начало и конец, кнопки «Закрыть» и
+    // «📅 Перенести» вместо «✓ Выполнено» и snooze. До 7.2 событие рисуется
+    // этим общим рендером задачи.
     let heading = match lead_minutes {
         Some(minutes) if minutes > 0 => format!("⏰ Через {}", ru::minutes(minutes)),
         _ => "⏰ Пора".to_owned(),
@@ -128,6 +131,8 @@ pub struct DigestLine {
     pub title: String,
     /// Срок в человекочитаемом виде.
     pub when: String,
+    /// Строка события, а не задачи: у неё своя отметка.
+    pub is_event: bool,
 }
 
 /// Утренняя сводка.
@@ -141,7 +146,10 @@ pub fn digest_ui(
     const MAX_LINES: usize = 20;
     let total_tasks = today.len() + overdue.len();
     let mut ui = Ui::new().heading("☀️ Доброе утро!");
-    let line = |entry: &DigestLine| format!("☐ {} · {}", clip(&entry.title, 60), entry.when);
+    let line = |entry: &DigestLine| {
+        let mark = if entry.is_event { "🗓" } else { "☐" };
+        format!("{mark} {} · {}", clip(&entry.title, 60), entry.when)
+    };
     let mut budget = MAX_LINES;
     for (title, entries) in [("Сегодня", today), ("Просрочено", overdue)] {
         if entries.is_empty() {
@@ -150,10 +158,14 @@ pub fn digest_ui(
         let shown = entries.len().min(budget);
         let mut lines: Vec<String> = entries[..shown].iter().map(line).collect();
         if shown < entries.len() {
-            lines.push(format!(
-                "…и ещё {}",
-                ru::tasks(i64::try_from(entries.len() - shown).unwrap_or(0))
-            ));
+            let hidden = &entries[shown..];
+            let rest = i64::try_from(hidden.len()).unwrap_or(0);
+            // Смешанный хвост не называем задачами: в нём могут быть события.
+            lines.push(if hidden.iter().any(|entry| entry.is_event) {
+                format!("…и ещё {rest}")
+            } else {
+                format!("…и ещё {}", ru::tasks(rest))
+            });
         }
         budget -= shown;
         ui = ui.bold(title).text(lines.join("\n"));
@@ -499,6 +511,7 @@ mod tests {
             .map(|n| DigestLine {
                 title: format!("Задача {n}"),
                 when: "сегодня".into(),
+                is_event: false,
             })
             .collect();
         let ui = digest_ui(&lines, &[], 0, Some(Uuid::now_v7()), None);
@@ -509,6 +522,31 @@ mod tests {
         assert_eq!(html.matches("☐ Задача").count(), 20);
         assert!(html.contains("…и ещё 5 задач"));
         assert!(html.contains("Показать ещё"));
+    }
+
+    #[test]
+    fn digest_limit_counts_events_and_tasks_together() {
+        let mut lines: Vec<DigestLine> = (0..15)
+            .map(|n| DigestLine {
+                title: format!("Задача {n}"),
+                when: "сегодня".into(),
+                is_event: false,
+            })
+            .collect();
+        lines.extend((0..10).map(|n| DigestLine {
+            title: format!("Событие {n}"),
+            when: "14:00–15:00".into(),
+            is_event: true,
+        }));
+        let ui = digest_ui(&lines, &[], 0, Some(Uuid::now_v7()), None);
+        let tokens = vec!["t:AAAAAAAAAAAAAAAA".to_owned(); 2];
+        let html = crate::telegram::rich::render(&ui, &tokens).html;
+
+        assert_eq!(html.matches("☐ Задача").count(), 15);
+        assert_eq!(html.matches("🗓 Событие").count(), 5);
+        assert!(html.contains("…и ещё 5"), "{html}");
+        assert!(!html.contains("…и ещё 5 задач"), "{html}");
+        assert!(html.contains("Показать ещё"), "{html}");
     }
 
     #[test]

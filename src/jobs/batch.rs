@@ -241,6 +241,9 @@ async fn prepare_deferred_batch(
                 timezone: row.timezone(),
             });
         }
+        // 0009-events 7.3: событие в сводном сообщении пока рисуется общим
+        // блоком задачи, а «Выполнить все»/«Отложить все на час» его не
+        // пропускают. Отдельный блок события появится в 7.3.
         candidates.push(BatchCandidate {
             delivery_id: row.id,
             scheduled_at: row.scheduled_at,

@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use super::keys::{digest_occurrence_key, item_occurrence_key, snooze_origin};
 use super::quiet::resolved_timezone;
+use crate::domain::events::is_past;
 use crate::domain::models::ItemStatus;
 use crate::domain::settings::NotificationSettings;
 use crate::storage::repositories::notifications::NotificationKind;
@@ -21,7 +22,8 @@ pub(crate) const NOTICE_ROW_COLUMNS: &str = "d.id, d.household_id, d.user_id, d.
         d.occurrence_key, d.origin_key, d.scheduled_at, d.deferred, d.created_at,
         i.id AS item_id, i.title AS item_title, i.status AS item_status,
         i.deleted_at AS item_deleted_at, i.due_at AS item_due_at,
-        i.due_date AS item_due_date,
+        i.due_date AS item_due_date, i.end_at AS item_end_at,
+        i.end_date AS item_end_date,
         i.assignee_user_id AS item_assignee_user_id,
         i.created_by_user_id AS item_created_by_user_id,
         l.id AS list_id, l.kind::text AS list_kind,
@@ -57,6 +59,8 @@ pub(crate) struct NoticeRow {
     pub item_deleted_at: Option<DateTime<Utc>>,
     pub item_due_at: Option<DateTime<Utc>>,
     pub item_due_date: Option<NaiveDate>,
+    pub item_end_at: Option<DateTime<Utc>>,
+    pub item_end_date: Option<NaiveDate>,
     pub item_assignee_user_id: Option<Uuid>,
     pub item_created_by_user_id: Option<Uuid>,
     pub list_id: Option<Uuid>,
@@ -120,11 +124,30 @@ impl NoticeRow {
         self.list_id.is_some() && self.list_deleted_at.is_none()
     }
 
-    /// Список задач доступен: существует, не удалён и не в архиве.
+    /// Список участвует в напоминаниях: задача или событие, не архив.
     fn list_visible(&self) -> bool {
         self.list_exists()
-            && self.list_kind.as_deref() == Some("tasks")
+            && matches!(self.list_kind.as_deref(), Some("tasks" | "events"))
             && self.list_archived != Some(true)
+    }
+
+    /// Момент события вычисляется в поясе household: вседневные границы
+    /// должны проходить одновременно для всех участников.
+    fn household_timezone(&self) -> Tz {
+        resolved_timezone(None, self.household_timezone.as_deref())
+    }
+
+    /// Событие уже прошло к текущему моменту.
+    fn event_passed(&self, now: DateTime<Utc>) -> bool {
+        self.list_kind.as_deref() == Some("events")
+            && is_past(
+                self.item_due_at,
+                self.item_due_date,
+                self.item_end_at,
+                self.item_end_date,
+                self.household_timezone(),
+                now,
+            )
     }
 
     /// Получатель существует, всё ещё в том же household и доступен в Telegram.
@@ -164,10 +187,11 @@ impl NoticeRow {
     /// Запись больше не должна быть доставлена.
     ///
     /// Напоминание сверяется с текущим вхождением срока ([`current_key`]) и
-    /// окном вседневной доставки. Snooze сверяется только со своим
-    /// `origin_key`: он устаревает, когда [`snooze_origin`] по текущему сроку
-    /// задачи даёт другое значение, в том числе когда привязки нет. Поэтому
-    /// смена локальной даты и тихие часы snooze не отменяют.
+    /// окном вседневной доставки. Напоминание о событии дополнительно
+    /// устаревает, когда прошёл его эффективный конец. Snooze сверяется только
+    /// со своим `origin_key`: он устаревает, когда [`snooze_origin`] по
+    /// текущему сроку задачи даёт другое значение, в том числе когда привязки
+    /// нет. Поэтому смена локальной даты и тихие часы snooze не отменяют.
     ///
     /// Назначение не зависит от напоминаний и архива списка: задача остаётся
     /// открытой и всё ещё назначена получателю. Список при этом должен
@@ -197,6 +221,11 @@ impl NoticeRow {
             return true;
         }
         if !self.settings().reminders_enabled {
+            return true;
+        }
+        // Напоминание о событии, которое тихие часы вынесли за его конец,
+        // бесполезно: событие уже прошло (design, решение 8).
+        if self.event_passed(now) {
             return true;
         }
         if self.is_snooze() {

@@ -9,6 +9,8 @@ use super::delivery::{self, DeliveryScope};
 use super::keys::digest_key_date;
 use super::notice::NoticeRow;
 use super::quiet::{desired_schedule, resolved_timezone};
+use crate::domain::events::effective_end;
+use crate::domain::models::ListKind;
 use crate::domain::recurrence::resolve_local;
 use crate::domain::settings::{NotificationSettings, parse_hhmm};
 use crate::storage::repositories::notifications::{self, NewDelivery, NotificationKind};
@@ -185,8 +187,11 @@ fn digest_intended(row: &NoticeRow) -> Option<DateTime<Utc>> {
 struct DigestItem {
     id: Uuid,
     title: String,
+    kind: ListKind,
     due_at: Option<DateTime<Utc>>,
     due_date: Option<NaiveDate>,
+    end_at: Option<DateTime<Utc>>,
+    end_date: Option<NaiveDate>,
 }
 
 struct DigestContent {
@@ -197,7 +202,8 @@ struct DigestContent {
     shopping_list: Option<Uuid>,
 }
 
-/// Ключ сортировки задач сводки: timed по времени, затем вседневные по дате.
+/// Ключ сортировки задач и событий сводки: timed по времени, затем
+/// вседневные по дате.
 fn digest_sort_key(item: &DigestItem) -> (u8, Option<DateTime<Utc>>, Option<NaiveDate>, Uuid) {
     (
         u8::from(item.due_at.is_none()),
@@ -205,6 +211,78 @@ fn digest_sort_key(item: &DigestItem) -> (u8, Option<DateTime<Utc>>, Option<Naiv
         item.due_date,
         item.id,
     )
+}
+
+/// Событие на сегодня: начинается сегодня или началось раньше и ещё идёт.
+fn event_is_today(
+    item: &DigestItem,
+    timezone: Tz,
+    household_timezone: Tz,
+    today: NaiveDate,
+    now: DateTime<Utc>,
+) -> bool {
+    let (start_day, started) = match (item.due_at, item.due_date) {
+        (Some(due_at), _) => (
+            Some(due_at.with_timezone(&timezone).date_naive()),
+            due_at <= now,
+        ),
+        (None, Some(due_date)) => (Some(due_date), due_date <= today),
+        (None, None) => (None, false),
+    };
+    if start_day == Some(today) {
+        return true;
+    }
+    started
+        && effective_end(
+            item.due_at,
+            item.due_date,
+            item.end_at,
+            item.end_date,
+            household_timezone,
+        )
+        .is_some_and(|end| end > now)
+}
+
+/// Начало и конец события для строки сводки.
+fn event_when(item: &DigestItem, timezone: Tz, today: NaiveDate) -> String {
+    match (item.due_at, item.due_date) {
+        (Some(due_at), _) => {
+            let start = due_at.with_timezone(&timezone);
+            let start_day = start.date_naive();
+            let prefix = if start_day == today {
+                String::new()
+            } else {
+                format!("{}, ", ru::date_label(start_day, today))
+            };
+            match item.end_at {
+                Some(end_at) => {
+                    let end = end_at.with_timezone(&timezone);
+                    if end.date_naive() == start_day {
+                        format!("{prefix}{}–{}", start.format("%H:%M"), end.format("%H:%M"))
+                    } else {
+                        format!(
+                            "{prefix}{} – {}, {}",
+                            start.format("%H:%M"),
+                            ru::date_label(end.date_naive(), today),
+                            end.format("%H:%M")
+                        )
+                    }
+                }
+                None => format!("{prefix}{}", start.format("%H:%M")),
+            }
+        }
+        (None, Some(due_date)) => match item.end_date {
+            Some(end_date) if end_date > due_date => {
+                format!(
+                    "{} — {}",
+                    ru::date_label(due_date, today),
+                    ru::date_label(end_date, today)
+                )
+            }
+            _ => ru::ALL_DAY.to_owned(),
+        },
+        (None, None) => String::new(),
+    }
 }
 
 /// Собрать содержимое сводки в момент доставки.
@@ -216,14 +294,15 @@ async fn content(
     conn: &mut PgConnection,
     household_id: Uuid,
     timezone: Tz,
+    household_timezone: Tz,
     now: DateTime<Utc>,
 ) -> Result<DigestContent, sqlx::Error> {
     let mut rows: Vec<DigestItem> = sqlx::query_as(
-        "SELECT i.id, i.title, i.due_at, i.due_date
+        "SELECT i.id, i.title, l.kind, i.due_at, i.due_date, i.end_at, i.end_date
          FROM items i
          JOIN lists l
            ON l.id = i.list_id AND l.deleted_at IS NULL
-          AND NOT l.is_archived AND l.kind = 'tasks'
+          AND NOT l.is_archived AND l.kind IN ('tasks', 'events')
          WHERE i.household_id = $1 AND i.status = 'open' AND i.deleted_at IS NULL
            AND (i.due_at IS NOT NULL OR i.due_date IS NOT NULL)",
     )
@@ -236,29 +315,45 @@ async fn content(
     let mut today_lines = Vec::new();
     let mut overdue_lines = Vec::new();
     for row in rows {
+        if row.kind == ListKind::Events {
+            // Событие никогда не попадает в просроченные: прошедшее просто не
+            // показывается, а начавшееся раньше и ещё идущее — в «Сегодня».
+            if event_is_today(&row, timezone, household_timezone, today, now) {
+                today_lines.push(DigestLine {
+                    when: event_when(&row, timezone, today),
+                    title: row.title,
+                    is_event: true,
+                });
+            }
+            continue;
+        }
         match (row.due_at, row.due_date) {
             (Some(due_at), None) if due_at < now => {
                 overdue_lines.push(DigestLine {
                     title: row.title,
                     when: ru::due_label(Some(due_at), None, timezone, now).unwrap_or_default(),
+                    is_event: false,
                 });
             }
             (Some(due_at), None) if due_at.with_timezone(&timezone).date_naive() == today => {
                 today_lines.push(DigestLine {
                     title: row.title,
                     when: due_at.with_timezone(&timezone).format("%H:%M").to_string(),
+                    is_event: false,
                 });
             }
             (None, Some(due_date)) if due_date < today => {
                 overdue_lines.push(DigestLine {
                     title: row.title,
                     when: ru::date_label(due_date, today),
+                    is_event: false,
                 });
             }
             (None, Some(due_date)) if due_date == today => {
                 today_lines.push(DigestLine {
                     title: row.title,
                     when: ru::ALL_DAY.to_owned(),
+                    is_event: false,
                 });
             }
             _ => {}
@@ -311,7 +406,14 @@ pub(crate) async fn digest_message(
     telegram_user_id: i64,
     now: DateTime<Utc>,
 ) -> Result<Option<String>, sqlx::Error> {
-    let content = content(conn, row.household_id, row.timezone(), now).await?;
+    let content = content(
+        conn,
+        row.household_id,
+        row.timezone(),
+        resolved_timezone(None, row.household_timezone.as_deref()),
+        now,
+    )
+    .await?;
     let ui = notify::digest_ui(
         &content.today,
         &content.overdue,
