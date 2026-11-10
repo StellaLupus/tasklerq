@@ -142,7 +142,7 @@ async fn list_and_item_crud_contract() {
     let (status, lists) =
         support::request(&app, Method::GET, "/api/v1/lists", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(lists.as_array().expect("lists").len(), 2);
+    assert_eq!(lists.as_array().expect("lists").len(), 3);
 
     let (status, created_list) = support::request(
         &app,
@@ -614,7 +614,7 @@ async fn search_and_snapshot_contract() {
     let (status, snapshot) =
         support::request(&app, Method::GET, "/api/v1/snapshot", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(snapshot["lists"].as_array().expect("lists").len(), 2);
+    assert_eq!(snapshot["lists"].as_array().expect("lists").len(), 3);
     assert!(snapshot["server_time"].is_string());
     let next_since = snapshot["next_since"]
         .as_str()

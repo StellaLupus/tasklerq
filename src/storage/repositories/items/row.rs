@@ -12,7 +12,7 @@ use crate::domain::recurrence::Due;
 use crate::storage::repositories::{subtasks, tags};
 
 pub(super) const ITEM_COLUMNS: &str = "i.id, i.household_id, i.list_id, i.title, i.notes, \
-    i.status, i.priority, i.due_at, i.due_date, i.assignee_user_id, \
+    i.status, i.priority, i.due_at, i.due_date, i.end_at, i.end_date, i.assignee_user_id, \
     i.created_by_user_id, i.source, i.capture_id, i.completed_at, \
     i.completed_by_user_id, i.quantity::float8 AS quantity, i.unit, i.position, \
     i.version, i.recurrence_freq, i.recurrence_interval, i.recurrence_byweekday, \
@@ -31,6 +31,8 @@ pub(super) struct ItemRow {
     pub(super) priority: ItemPriority,
     pub(super) due_at: Option<DateTime<Utc>>,
     pub(super) due_date: Option<NaiveDate>,
+    pub(super) end_at: Option<DateTime<Utc>>,
+    pub(super) end_date: Option<NaiveDate>,
     pub(super) assignee_user_id: Option<Uuid>,
     pub(super) created_by_user_id: Option<Uuid>,
     pub(super) source: ItemSource,
@@ -171,6 +173,8 @@ fn row_to_item(
         priority: row.priority,
         due_at: row.due_at,
         due_date: row.due_date,
+        end_at: row.end_at,
+        end_date: row.end_date,
         assignee_user_id: row.assignee_user_id,
         created_by_user_id: row.created_by_user_id,
         source: row.source,

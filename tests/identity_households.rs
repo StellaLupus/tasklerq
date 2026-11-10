@@ -71,7 +71,11 @@ async fn onboarding_creates_household_owner_and_default_lists() {
         .collect();
     assert_eq!(
         names,
-        vec![(ListKind::Tasks, "Задачи"), (ListKind::Shopping, "Покупки")]
+        vec![
+            (ListKind::Tasks, "Задачи"),
+            (ListKind::Shopping, "Покупки"),
+            (ListKind::Events, "Календарь"),
+        ]
     );
     tx.commit().await.expect("commit");
 

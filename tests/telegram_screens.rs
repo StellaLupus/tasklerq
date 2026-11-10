@@ -91,6 +91,7 @@ async fn household_for(pool: &PgPool, telegram_id: i64) -> TestHousehold {
         member_id: owner_id,
         tasks_list_id: list("tasks").await,
         shopping_list_id: list("shopping").await,
+        events_list_id: list("events").await,
     }
 }
 

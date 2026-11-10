@@ -1037,6 +1037,8 @@ fn merge(target: &mut ItemPatch, source: ItemPatch) {
         priority,
         due_at,
         due_date,
+        end_at,
+        end_date,
         assignee_user_id,
         quantity,
         unit,
@@ -1059,6 +1061,12 @@ fn merge(target: &mut ItemPatch, source: ItemPatch) {
     }
     if !due_date.is_missing() {
         target.due_date = due_date;
+    }
+    if !end_at.is_missing() {
+        target.end_at = end_at;
+    }
+    if !end_date.is_missing() {
+        target.end_date = end_date;
     }
     if !assignee_user_id.is_missing() {
         target.assignee_user_id = assignee_user_id;
@@ -1690,6 +1698,8 @@ mod tests {
             priority: ItemPriority::Normal,
             due_at: None,
             due_date: None,
+            end_at: None,
+            end_date: None,
             assignee_user_id: None,
             created_by_user_id: None,
             source: ItemSource::Telegram,

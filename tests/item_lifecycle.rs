@@ -2178,6 +2178,57 @@ async fn reopen_does_not_restore_a_slot_of_a_changed_rule() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undo_restores_the_previous_event_end() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let start = utc(2026, 11, 10, 9);
+    let end = utc(2026, 11, 10, 11);
+    let mut input = support::new_item(household.events_list_id, "Совещание");
+    input.due_at = Some(start);
+    input.end_at = Some(end);
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let new_end = utc(2026, 11, 10, 12);
+    let edited = items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        created.version,
+        ItemPatch {
+            end_at: Field::Value(new_end),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("move end");
+    assert_eq!(edited.end_at, Some(new_end));
+
+    let undone = items::undo_last(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        Utc::now(),
+    )
+    .await
+    .expect("undo end change");
+    assert_eq!(undone.due_at, Some(start));
+    assert_eq!(undone.end_at, Some(end));
+    assert_eq!(undone.end_date, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn soft_delete_is_reverted_by_undo() {
     let db = support::db().await;
     let household = support::create_household(&db.pool).await;

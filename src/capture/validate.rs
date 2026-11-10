@@ -312,6 +312,8 @@ fn validate_item_in(
                 priority,
                 due_at,
                 due_date,
+                end_at: None,
+                end_date: None,
                 assignee_user_id,
                 source,
                 quantity,

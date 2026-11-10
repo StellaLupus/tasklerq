@@ -6,8 +6,8 @@
   живут в тех же таблицах, что и домен.
 - **Один household на пользователя.** `household_id` — tenant-ключ всех
   запросов.
-- **Единая таблица `items`.** Задачи, покупки и чек-листы имеют общий жизненный
-  цикл; различия — в `lists.kind` и nullable-полях.
+- **Единая таблица `items`.** Задачи, покупки, чек-листы и события имеют общий
+  жизненный цикл; различия — в `lists.kind` и nullable-полях.
 - **UUIDv7.** Сортировка по времени, безопасные идентификаторы в URL.
 - **Мягкое удаление.** Элементы скрываются; вернуть удалённое можно только
   отменой (undo) в течение 10 минут, отдельного восстановления нет. Через
@@ -81,7 +81,7 @@ erDiagram
 | --- | --- | --- |
 | `id` | `uuid` | PK. |
 | `household_id` | `uuid` | FK → households. |
-| `kind` | `list_kind` | `tasks`/`shopping`/`checklist`. |
+| `kind` | `list_kind` | `tasks`/`shopping`/`checklist`/`events`. |
 | `name` | `text` | 1..64. |
 | `is_default` | `boolean` | Не более одного default на kind. |
 | `is_archived` | `boolean` | По умолчанию false. |
@@ -95,6 +95,10 @@ erDiagram
 - имя уникально в household без учёта регистра среди неудалённых;
 - не более 20 списков на household.
 
+Новый household получает три списка по умолчанию: «Задачи» (`tasks`),
+«Покупки» (`shopping`) и «Календарь» (`events`). «Календарь» — единственный
+default-список событий; миграция `0017` добавляет его существующим household.
+
 ### 3.4 `items`
 
 | Поле | Тип | Ограничения |
@@ -106,8 +110,10 @@ erDiagram
 | `notes` | `text` | NULL, до 2000. |
 | `status` | `item_status` | `open`/`done`. |
 | `priority` | `item_priority` | По умолчанию `normal`. |
-| `due_at` | `timestamptz` | NULL; взаимоисключающе с `due_date`. |
-| `due_date` | `date` | NULL; all-day. |
+| `due_at` | `timestamptz` | NULL; взаимоисключающе с `due_date`. У события — начало. |
+| `due_date` | `date` | NULL; all-day. У вседневного события — первый день. |
+| `end_at` | `timestamptz` | NULL; только вместе с `due_at`, строго позже него. |
+| `end_date` | `date` | NULL; только вместе с `due_date`, не раньше него; последний день события включительно. |
 | `assignee_user_id` | `uuid` | NULL, FK → users; приложение проверяет тот же household. |
 | `created_by_user_id` | `uuid` | NULL для системных источников; FK → users. |
 | `source` | `item_source` | `telegram`/`ha_todo`/`ha_voice`/`ha_automation`/`api`/`import`. |
@@ -135,6 +141,9 @@ Check-ограничения:
 
 ```sql
 CHECK (due_at IS NULL OR due_date IS NULL)
+CHECK (end_at IS NULL OR end_date IS NULL)
+CHECK (end_at IS NULL OR (due_at IS NOT NULL AND end_at > due_at))
+CHECK (end_date IS NULL OR (due_date IS NOT NULL AND end_date >= due_date))
 CHECK (quantity IS NULL OR (quantity > 0 AND quantity <= 9999.999))
 CHECK (char_length(unit) <= 16)
 CHECK (version >= 1)
@@ -173,6 +182,11 @@ CHECK (recurrence_until IS NULL
 
 Дополнительно приложение проверяет, что повторение допустимо только для
 `lists.kind = 'tasks'`, а `quantity`/`unit` — только для shopping/checklist.
+Для события `due_at`/`due_date` задают начало, а `end_at`/`end_date` — конец;
+конец должен быть того же вида, что начало, а `end_date` хранится
+включительно (последний день события). «Конец только у событий» и
+обязательное начало события проверяет домен: ограничение БД не видит
+`lists.kind`.
 
 ### 3.5 `subtasks`
 
@@ -397,7 +411,7 @@ household, созданные через `tasklerq admin`, попадают в �
 | Тип | Значения |
 | --- | --- |
 | `user_role` | `owner`, `member` |
-| `list_kind` | `tasks`, `shopping`, `checklist` |
+| `list_kind` | `tasks`, `shopping`, `checklist`, `events` |
 | `item_status` | `open`, `done` |
 | `item_priority` | `low`, `normal`, `high`, `urgent` |
 | `recurrence_freq` | `daily`, `weekly`, `monthly`, `yearly` |
@@ -419,15 +433,17 @@ household, созданные через `tasklerq admin`, попадают в �
 ## 5. Инварианты
 
 1. Элемент и его список принадлежат одному household.
-2. `due_at` и `due_date` не могут быть заполнены одновременно.
+2. `due_at` и `due_date` не могут быть заполнены одновременно; `end_at` и
+   `end_date` тоже взаимоисключающие и допустимы только при соответствующем
+   виде начала.
 3. Повторение допустимо только для `tasks`; `weekly` требует непустой
    `byweekday`; `interval` 1..365; `until` не раньше якоря и не позже +5 лет.
 4. `quantity` >0..9999.999; `unit` до 16 символов.
 5. `title` 1..200; `notes` до 2000; тегов ≤10; подзадач ≤50.
 6. Исполнитель — участник того же household; автор-пользователь, если указан,
    тоже участник. Для системного источника `created_by_user_id` может быть NULL.
-7. В household ровно один default-список `tasks` и один default-список
-   `shopping`; их нельзя удалить/архивировать.
+7. В household ровно один default-список каждого из `tasks`, `shopping` и
+   `events`; их нельзя удалить/архивировать.
 8. `done` требует `completed_at`; `completed_by_user_id` заполняется, если
    действие совершил пользователь, и остаётся NULL у системных источников.
 9. `version` монотонно растёт; конфликт версий не применяется.
@@ -669,7 +685,7 @@ Purge удаляет связанные подзадачи, теги, событ
 | Очистка выполненных | Все выбранные элементы + события. |
 | Удаление участника | Назначения + приглашения + доступ. |
 | Подтверждение приглашения | Использование кода + создание пользователя. |
-| Создание household | Household + owner + два списка. |
+| Создание household | Household + owner + три списка. |
 | Отправка уведомления | `notification_deliveries` + outbox. |
 
 ## 12. Индексы

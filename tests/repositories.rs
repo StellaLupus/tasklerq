@@ -6,7 +6,9 @@ use chrono::{NaiveDate, TimeZone, Utc};
 use tasklerq::config::TenancyMode;
 use tasklerq::domain::error::DomainError;
 use tasklerq::domain::identity::NewMember;
-use tasklerq::domain::models::{ItemPriority, ItemStatus, ListKind, RecurrenceFreq, SubtaskInput};
+use tasklerq::domain::models::{
+    Field, ItemPriority, ItemStatus, ListKind, RecurrenceFreq, SubtaskInput,
+};
 use tasklerq::storage::repositories::households::{self, NewOwner};
 use tasklerq::storage::repositories::{items, lists, tags, users};
 use uuid::Uuid;
@@ -20,7 +22,7 @@ async fn household_creation_creates_owner_and_default_lists() {
     let lists = lists::list(&mut conn, household.household_id)
         .await
         .expect("lists");
-    assert_eq!(lists.len(), 2);
+    assert_eq!(lists.len(), 3);
     assert!(
         lists
             .iter()
@@ -31,11 +33,183 @@ async fn household_creation_creates_owner_and_default_lists() {
             .iter()
             .any(|list| list.kind == ListKind::Shopping && list.is_default)
     );
+    assert!(
+        lists
+            .iter()
+            .any(|list| list.kind == ListKind::Events && list.is_default)
+    );
 
     let members = users::list_active(&mut conn, household.household_id)
         .await
         .expect("members");
     assert_eq!(members.len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn event_ends_are_stored_read_and_patched() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let actor = household.owner();
+
+    let start = Utc
+        .with_ymd_and_hms(2026, 11, 10, 9, 0, 0)
+        .single()
+        .expect("start");
+    let end = Utc
+        .with_ymd_and_hms(2026, 11, 10, 11, 30, 0)
+        .single()
+        .expect("end");
+    let mut timed = support::new_item(household.events_list_id, "Совещание");
+    timed.due_at = Some(start);
+    timed.end_at = Some(end);
+    let timed = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &actor,
+        timed,
+    )
+    .await;
+    assert_eq!(timed.due_at, Some(start));
+    assert_eq!(timed.end_at, Some(end));
+    assert_eq!(timed.end_date, None);
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let timed_read = items::get(&mut conn, household.household_id, timed.id)
+        .await
+        .expect("timed event");
+    assert_eq!(timed_read.due_at, Some(start));
+    assert_eq!(timed_read.end_at, Some(end));
+    assert_eq!(timed_read.end_date, None);
+
+    let first_day = NaiveDate::from_ymd_opt(2026, 11, 20).expect("first day");
+    let last_day = NaiveDate::from_ymd_opt(2026, 11, 22).expect("last day");
+    let mut all_day = support::new_item(household.events_list_id, "Поездка");
+    all_day.due_date = Some(first_day);
+    all_day.end_date = Some(last_day);
+    let all_day = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &actor,
+        all_day,
+    )
+    .await;
+    assert_eq!(all_day.due_date, Some(first_day));
+    assert_eq!(all_day.end_date, Some(last_day));
+    assert_eq!(all_day.end_at, None);
+
+    let all_day_read = items::get(&mut conn, household.household_id, all_day.id)
+        .await
+        .expect("all-day event");
+    assert_eq!(all_day_read.due_date, Some(first_day));
+    assert_eq!(all_day_read.end_date, Some(last_day));
+    assert_eq!(all_day_read.end_at, None);
+
+    let new_last_day = NaiveDate::from_ymd_opt(2026, 11, 23).expect("new last day");
+    let patch = tasklerq::domain::models::ItemPatch {
+        end_date: Field::Value(new_last_day),
+        ..Default::default()
+    };
+    let all_day_updated = items::update(
+        &mut conn,
+        household.household_id,
+        &actor,
+        all_day.id,
+        all_day.version,
+        patch,
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("move all-day end");
+    assert_eq!(all_day_updated.end_date, Some(new_last_day));
+    assert_eq!(all_day_updated.end_at, None);
+
+    let patch = tasklerq::domain::models::ItemPatch {
+        end_date: Field::Null,
+        ..Default::default()
+    };
+    let all_day_cleared = items::update(
+        &mut conn,
+        household.household_id,
+        &actor,
+        all_day.id,
+        all_day_updated.version,
+        patch,
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("clear all-day end");
+    assert_eq!(all_day_cleared.end_date, None);
+    assert_eq!(all_day_cleared.end_at, None);
+
+    let both_ends = tasklerq::domain::models::ItemPatch {
+        end_at: Field::Value(end),
+        end_date: Field::Value(new_last_day),
+        ..Default::default()
+    };
+    let error = items::update(
+        &mut conn,
+        household.household_id,
+        &actor,
+        all_day.id,
+        all_day_cleared.version,
+        both_ends,
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect_err("end_at and end_date cannot be patched together");
+    assert!(matches!(error, DomainError::Validation(_)), "{error:?}");
+
+    let new_end = Utc
+        .with_ymd_and_hms(2026, 11, 10, 12, 45, 0)
+        .single()
+        .expect("new end");
+    let patch = tasklerq::domain::models::ItemPatch {
+        end_at: Field::Value(new_end),
+        ..Default::default()
+    };
+    let updated = items::update(
+        &mut conn,
+        household.household_id,
+        &actor,
+        timed.id,
+        timed.version,
+        patch,
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("move end");
+    assert_eq!(updated.end_at, Some(new_end));
+
+    let patch = tasklerq::domain::models::ItemPatch {
+        end_at: Field::Null,
+        ..Default::default()
+    };
+    let cleared = items::update(
+        &mut conn,
+        household.household_id,
+        &actor,
+        timed.id,
+        updated.version,
+        patch,
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("clear end");
+    assert_eq!(cleared.end_at, None);
+    assert_eq!(cleared.end_date, None);
+
+    let cleared_read = items::get(&mut conn, household.household_id, timed.id)
+        .await
+        .expect("updated event");
+    assert_eq!(cleared_read.end_at, None);
+    assert_eq!(cleared_read.end_date, None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -88,7 +262,7 @@ async fn list_limit_defaults_and_duplicate_names() {
     let household = support::create_household(&db.pool).await;
     let mut conn = db.pool.acquire().await.expect("connection");
 
-    for index in 0..18 {
+    for index in 0..17 {
         lists::create(
             &mut conn,
             household.household_id,
@@ -272,8 +446,8 @@ async fn parallel_list_creates_respect_the_limit() {
     let db = support::db().await;
     let household = support::create_household(&db.pool).await;
 
-    // 2 списка по умолчанию + 17 дополнительных = 19: до лимита один слот.
-    for index in 0..17 {
+    // 3 списка по умолчанию + 16 дополнительных = 19: до лимита один слот.
+    for index in 0..16 {
         let mut conn = db.pool.acquire().await.expect("connection");
         lists::create(
             &mut conn,
@@ -343,8 +517,8 @@ async fn concurrent_list_creation_respects_the_limit() {
     let household = support::create_household(&db.pool).await;
     let mut conn = db.pool.acquire().await.expect("connection");
 
-    // Два списка по умолчанию + 17 = 19: остаётся ровно одно место.
-    for index in 0..17 {
+    // Три списка по умолчанию + 16 = 19: остаётся ровно одно место.
+    for index in 0..16 {
         lists::create(
             &mut conn,
             household.household_id,

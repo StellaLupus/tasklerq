@@ -211,7 +211,7 @@ async fn start_db() -> SharedDatabase {
     }
 }
 
-/// Household с owner, member и двумя списками по умолчанию.
+/// Household с owner, member и тремя списками по умолчанию.
 #[derive(Debug, Clone, Copy)]
 pub struct TestHousehold {
     pub household_id: Uuid,
@@ -219,6 +219,7 @@ pub struct TestHousehold {
     pub member_id: Uuid,
     pub tasks_list_id: Uuid,
     pub shopping_list_id: Uuid,
+    pub events_list_id: Uuid,
 }
 
 impl TestHousehold {
@@ -289,6 +290,11 @@ pub async fn create_household(pool: &PgPool) -> TestHousehold {
         .find(|list| list.kind == tasklerq::domain::models::ListKind::Shopping)
         .expect("shopping list")
         .id;
+    let events_list_id = all_lists
+        .iter()
+        .find(|list| list.kind == tasklerq::domain::models::ListKind::Events)
+        .expect("events list")
+        .id;
 
     TestHousehold {
         household_id: household.id,
@@ -296,6 +302,7 @@ pub async fn create_household(pool: &PgPool) -> TestHousehold {
         member_id,
         tasks_list_id,
         shopping_list_id,
+        events_list_id,
     }
 }
 
@@ -308,6 +315,8 @@ pub fn new_item(list_id: Uuid, title: &str) -> NewItem {
         priority: ItemPriority::Normal,
         due_at: None,
         due_date: None,
+        end_at: None,
+        end_date: None,
         assignee_user_id: None,
         source: ItemSource::Api,
         quantity: None,

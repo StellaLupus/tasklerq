@@ -287,6 +287,7 @@ async fn stand_household(pool: &sqlx::PgPool, chat: i64) -> support::TestHouseho
         member_id: owner_id,
         tasks_list_id: list("tasks").await.expect("default tasks list"),
         shopping_list_id: list("shopping").await.expect("default shopping list"),
+        events_list_id: list("events").await.expect("default events list"),
     }
 }
 

@@ -121,6 +121,49 @@ async fn search_trigram_indexes_are_created_for_notes_and_subtasks() {
     );
 }
 
+/// Household и список задач на схеме до появления kind `events` (0016).
+///
+/// `support::create_household` создаёт список «Календарь», которого в старой
+/// схеме ещё нет, поэтому миграционные тесты с данными до 0016 заводят
+/// минимальный household сами.
+async fn create_household_before_events(pool: &sqlx::PgPool) -> (Uuid, Uuid, Uuid) {
+    let household_id = Uuid::now_v7();
+    let owner_id = Uuid::now_v7();
+    let tasks_list_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO households (id, name, timezone)
+         VALUES ($1, 'Старый household', 'Europe/Moscow')",
+    )
+    .bind(household_id)
+    .execute(pool)
+    .await
+    .expect("household before 0016");
+    sqlx::query(
+        "INSERT INTO users (
+             id, household_id, telegram_user_id, telegram_chat_id, display_name,
+             role, settings
+         )
+         VALUES ($1, $2, 6500000001, 6500000001, 'Владелец', 'owner', '{}'::jsonb)",
+    )
+    .bind(owner_id)
+    .bind(household_id)
+    .execute(pool)
+    .await
+    .expect("owner before 0016");
+    sqlx::query(
+        "INSERT INTO lists (
+             id, household_id, kind, name, is_default, is_archived, position
+         )
+         VALUES ($1, $2, 'tasks', 'Задачи', true, false, 0)",
+    )
+    .bind(tasks_list_id)
+    .bind(household_id)
+    .execute(pool)
+    .await
+    .expect("tasks list before 0016");
+    (household_id, owner_id, tasks_list_id)
+}
+
 /// Скопировать встроенные миграции до версии `version` включительно.
 fn copy_migrations_through(version: i64, target: &std::path::Path) {
     let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
@@ -247,7 +290,7 @@ async fn capture_draft_parts_migration_adds_the_parts_column_and_keeps_old_rows(
         .context("migrations through 0012 should apply")
         .expect("migrations through 0012");
 
-    let household = support::create_household(&db.pool).await;
+    let (household_id, _, _) = create_household_before_events(&db.pool).await;
     let id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO capture_drafts (
@@ -256,7 +299,7 @@ async fn capture_draft_parts_migration_adds_the_parts_column_and_keeps_old_rows(
          VALUES ($1, $2, 'telegram', 'draft', 'старый текст', 'pending', now(), now())",
     )
     .bind(id)
-    .bind(household.household_id)
+    .bind(household_id)
     .execute(&db.pool)
     .await
     .expect("draft before the migration");
@@ -319,15 +362,20 @@ async fn snooze_origin_migration_keeps_existing_snooze_unbound() {
         .context("migrations through 0013 should apply")
         .expect("migrations through 0013");
 
-    let household = support::create_household(&db.pool).await;
-    let item = support::create_item(
-        &db.pool,
-        &household,
-        household.tasks_list_id,
-        &household.owner(),
-        support::new_item(household.tasks_list_id, "Отложенная задача"),
+    let (household_id, owner_id, tasks_list_id) = create_household_before_events(&db.pool).await;
+    let item_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO items (
+             id, household_id, list_id, title, status, priority, source, position, version
+         )
+         VALUES ($1, $2, $3, 'Отложенная задача', 'open', 'normal', 'api', 0, 1)",
     )
-    .await;
+    .bind(item_id)
+    .bind(household_id)
+    .bind(tasks_list_id)
+    .execute(&db.pool)
+    .await
+    .expect("item before 0014");
     let id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO notification_deliveries (
@@ -338,9 +386,9 @@ async fn snooze_origin_migration_keeps_existing_snooze_unbound() {
                  'pending', now(), now(), now())",
     )
     .bind(id)
-    .bind(household.household_id)
-    .bind(household.owner_id)
-    .bind(item.id)
+    .bind(household_id)
+    .bind(owner_id)
+    .bind(item_id)
     .execute(&db.pool)
     .await
     .expect("pending snooze before the migration");

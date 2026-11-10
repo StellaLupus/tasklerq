@@ -35,6 +35,10 @@ pub struct ValidatedItem {
     pub due_at: Option<DateTime<Utc>>,
     /// Вседневный срок.
     pub due_date: Option<NaiveDate>,
+    /// Конец события со временем.
+    pub end_at: Option<DateTime<Utc>>,
+    /// Последний день вседневного события включительно.
+    pub end_date: Option<NaiveDate>,
     /// Количество.
     pub quantity: Option<f64>,
     /// Единица.
@@ -115,6 +119,8 @@ pub fn validate_new_item(
         priority: item.priority,
         due_at,
         due_date,
+        end_at: item.end_at,
+        end_date: item.end_date,
         quantity,
         unit,
         tags,

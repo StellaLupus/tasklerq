@@ -1353,6 +1353,8 @@ impl ItemDraft {
             priority: self.priority,
             due_at,
             due_date,
+            end_at: None,
+            end_date: None,
             assignee_user_id: self.assignee,
             source: crate::domain::models::ItemSource::Telegram,
             quantity: shopping.then(|| self.quantity.unwrap_or(1.0)),

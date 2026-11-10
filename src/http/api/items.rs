@@ -55,6 +55,8 @@ pub async fn create(
         priority: request.priority.unwrap_or_default(),
         due_at: request.due_at,
         due_date: request.due_date,
+        end_at: None,
+        end_date: None,
         assignee_user_id: request.assignee_user_id,
         source,
         quantity: request.quantity,

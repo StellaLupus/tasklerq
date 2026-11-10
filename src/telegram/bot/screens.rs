@@ -246,7 +246,13 @@ async fn menu(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
             button("🔎 Поиск", Action::SearchStart),
             go("⚙️ Настройки", Screen::Settings),
         ]);
-    if visible.len() > 2 {
+    // 0009-events 8.1: список событий не считается дополнительным для
+    // кнопки «Все списки»; повестка и её счётчик появятся в 8.1.
+    let regular_lists = visible
+        .iter()
+        .filter(|list| list.kind != ListKind::Events)
+        .count();
+    if regular_lists > 2 {
         ui = ui.row(vec![go("🗂 Все списки", Screen::Lists)]);
     }
     Ok(ui)
