@@ -26,9 +26,12 @@ Assistant. Бот при этом не обязателен: задачи мож
   вхождения.
 - **Home Assistant.** Тонкий custom component: `todo`-сущность на каждый
   неархивированный список и read-only `calendar` для задач со сроком.
-- **LLM-capture.** Свободный текст → структурированный черновик через
-  `ai_task.generate_data` Home Assistant (Claude Haiku 5.5 через OpenRouter). LLM только разбирает;
-  в Telegram данные применяются после подтверждения.
+- **LLM-capture.** Свободный текст → структурированный черновик через прямой
+  вызов OpenAI-совместимого API: основной и резервный слоты (например, Claude
+  Haiku 5.5 через OpenRouter). LLM только разбирает; в Telegram данные
+  применяются после подтверждения. Нужные переменные — `LLM_PRIMARY_*` и
+  `LLM_FALLBACK_*`, полный список — в
+  [`docs/deployment.md`, раздел 6](docs/deployment.md#6-переменные-окружения).
 - **Capture без бота.** Голос через HA Assist, автоматизации и HTTP API:
   `POST /api/v1/capture`, сервис `tasklerq.capture`, режим `auto` с
   идемпотентностью, fallback и отменой. Telegram не требуется.
@@ -53,8 +56,8 @@ flowchart LR
     APP -->|RichMessage| TG
     APP -->|REST + Bearer| HA[Home Assistant<br/>custom component]
     HA -->|todo / calendar| HAU[HA UI / автоматизации]
-    APP -->|ai_task.generate_data| HAI[HA AI Task]
-    HAI -->|structured output| GEM[OpenRouter → Claude Haiku]
+    APP -->|chat/completions| LLM[Слоты LLM<br/>OpenAI-совместимый API]
+    LLM -->|structured output| GEM[OpenRouter / локальный llama.cpp]
     APP -->|snapshot / write| HA
 ```
 
@@ -68,7 +71,7 @@ flowchart LR
 | HTTP | axum + tower + tokio |
 | БД | PostgreSQL 18 (`postgres:18-alpine`), sqlx |
 | Telegram | webhook + собственный RichMessage-адаптер, типы `teloxide-core` |
-| LLM | Home Assistant `ai_task.generate_data`, AI Task `ai_task.anthropic_claude_haiku_5_5` (OpenRouter, Claude Haiku 5.5) |
+| LLM | OpenAI-совместимый API: основной и резервный слоты (`LLM_PRIMARY_*`, `LLM_FALLBACK_*`); например, Claude Haiku 5.5 через OpenRouter |
 | HA-интеграция | Python custom component, `DataUpdateCoordinator` |
 | Развёртывание | Docker Compose на Synology NAS, PostgreSQL 18 в сети `shared-db`, Synology Reverse Proxy |
 | Наблюдаемость | `tracing` JSON, health/readiness, метрики |
