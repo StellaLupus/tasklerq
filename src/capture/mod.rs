@@ -9,6 +9,7 @@ pub mod llm;
 pub mod prompt;
 pub mod schema;
 pub mod validate;
+pub mod wire;
 
 #[cfg(test)]
 mod test_support;
