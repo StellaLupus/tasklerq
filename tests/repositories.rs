@@ -2,7 +2,7 @@
 
 mod support;
 
-use chrono::{NaiveDate, TimeZone, Utc};
+use chrono::{Duration, NaiveDate, TimeZone, Utc};
 use tasklerq::config::TenancyMode;
 use tasklerq::domain::error::DomainError;
 use tasklerq::domain::identity::NewMember;
@@ -907,6 +907,61 @@ async fn menu_counts_include_all_day_and_ongoing_events_today() {
          a past and a future event do not"
     );
     assert_eq!(counts.overdue_tasks, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn event_counters_skip_events_older_than_the_sql_prefilter() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let actor = household.owner();
+    let moscow = chrono_tz::Europe::Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 16).expect("today");
+    let now = moscow
+        .with_ymd_and_hms(2027, 3, 16, 10, 0, 0)
+        .single()
+        .expect("local now")
+        .with_timezone(&Utc);
+
+    let mut ancient = support::new_item(household.events_list_id, "Давнее");
+    ancient.due_date = Some(today - Duration::days(7));
+    support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &actor,
+        ancient,
+    )
+    .await;
+
+    let mut current = support::new_item(household.events_list_id, "Сегодня");
+    current.due_date = Some(today);
+    support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &actor,
+        current,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let counts = items::menu_counts(&mut conn, household.household_id, "Europe/Moscow", now)
+        .await
+        .expect("menu counts");
+    assert_eq!(
+        counts.due_today_tasks, 1,
+        "an event a week in the past must not affect today's counter"
+    );
+
+    let by_list =
+        items::open_event_counts_by_list(&mut conn, household.household_id, "Europe/Moscow", now)
+            .await
+            .expect("event counts");
+    assert_eq!(
+        by_list.get(&household.events_list_id),
+        Some(&1),
+        "a week-old event must not be counted in «Все списки»"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

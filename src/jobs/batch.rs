@@ -23,6 +23,7 @@ use super::delivery::{
 };
 use super::digest;
 use super::notice::{NOTICE_ROW_COLUMNS, NOTICE_ROW_FROM, NoticeRow};
+use crate::domain::models::ListKind;
 use crate::storage::repositories::notifications;
 use crate::telegram::bot::notify;
 
@@ -241,9 +242,6 @@ async fn prepare_deferred_batch(
                 timezone: row.timezone(),
             });
         }
-        // 0009-events 7.3: событие в сводном сообщении пока рисуется общим
-        // блоком задачи, а «Выполнить все»/«Отложить все на час» его не
-        // пропускают. Отдельный блок события появится в 7.3.
         candidates.push(BatchCandidate {
             delivery_id: row.id,
             scheduled_at: row.scheduled_at,
@@ -260,7 +258,11 @@ async fn prepare_deferred_batch(
                     now,
                 ),
                 version: item.version,
-                state: notify::BatchEntryState::Open,
+                state: if list.kind == ListKind::Events {
+                    notify::BatchEntryState::Event
+                } else {
+                    notify::BatchEntryState::Open
+                },
             },
         });
     }

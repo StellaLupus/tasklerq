@@ -11,7 +11,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
-use crate::domain::models::{Item, ItemStatus, List};
+use crate::domain::models::{Item, ItemStatus, List, ListKind};
 use crate::domain::recurrence::resolve_local;
 use crate::jobs::keys::snooze_origin;
 use crate::storage::repositories::notifications::{self, NewDelivery, NotificationKind};
@@ -28,8 +28,8 @@ use super::{Ctx, Fail, issue_and_render};
 mod batch;
 
 pub use batch::{
-    BATCH_PAGE_SIZE, BatchEntry, BatchEntryState, batch_complete, batch_complete_all, batch_open,
-    batch_page, batch_snooze, batch_snooze_all, batch_ui,
+    BATCH_PAGE_SIZE, BatchEntry, BatchEntryState, batch_complete, batch_complete_all, batch_move,
+    batch_open, batch_page, batch_snooze, batch_snooze_all, batch_ui,
 };
 
 /// Час, на который переносится напоминание «до завтра».
@@ -58,6 +58,17 @@ pub(super) fn title_spans(title: &str) -> Vec<Span> {
     vec![Span::bold(clip(title, 120))]
 }
 
+/// Момент события строкой напоминания: «Сегодня, 14:00»; без значения —
+/// прочерк.
+fn event_moment(
+    at: Option<DateTime<Utc>>,
+    date: Option<NaiveDate>,
+    tz: Tz,
+    now: DateTime<Utc>,
+) -> String {
+    ru::due_label(at, date, tz, now).map_or_else(|| "—".to_owned(), |label| ru::capitalize(&label))
+}
+
 /// Напоминание о сроке.
 pub fn reminder_ui(
     item: &Item,
@@ -66,13 +77,33 @@ pub fn reminder_ui(
     now: DateTime<Utc>,
     lead_minutes: Option<i64>,
 ) -> Ui {
-    // 0009-events 7.2: у события здесь будут начало и конец, кнопки «Закрыть» и
-    // «📅 Перенести» вместо «✓ Выполнено» и snooze. До 7.2 событие рисуется
-    // этим общим рендером задачи.
     let heading = match lead_minutes {
         Some(minutes) if minutes > 0 => format!("⏰ Через {}", ru::minutes(minutes)),
         _ => "⏰ Пора".to_owned(),
     };
+    if list.kind == ListKind::Events {
+        // Событие не выполняется и не откладывается: у напоминания свои
+        // действия — закрыть, перенести начало или открыть карточку.
+        return Ui::new()
+            .heading(heading)
+            .spans(title_spans(&item.title))
+            .text(format!(
+                "📅 Начало: {}",
+                event_moment(item.due_at, item.due_date, tz, now)
+            ))
+            .text(format!(
+                "🏁 Конец: {}",
+                event_moment(item.end_at, item.end_date, tz, now)
+            ))
+            .row(vec![
+                button("Закрыть", Action::NoticeClose),
+                button("📅 Перенести", Action::NoticeMove { item_id: item.id }),
+            ])
+            .row(vec![button(
+                "📋 Открыть",
+                Action::NoticeOpen { item_id: item.id },
+            )]);
+    }
     Ui::new()
         .heading(heading)
         .spans(title_spans(&item.title))
@@ -386,6 +417,41 @@ pub(super) async fn open(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> R
         completion_id: None,
     })
     .await
+}
+
+/// «Закрыть» из напоминания о событии: удалить сообщение из чата.
+///
+/// Запись доставки не меняется и остаётся `sent`, поэтому напоминание о том же
+/// вхождении повторно не планируется; о следующем вхождении придёт по
+/// расписанию.
+pub async fn close(ctx: &mut Ctx<'_>, message_id: i64) -> Result<(), Fail> {
+    outbox::enqueue(
+        &mut *ctx.conn,
+        ctx.chat_id,
+        &Outgoing::Delete { message_id },
+        Some(&super::delete_dedupe_key(ctx.chat_id, message_id)),
+        ctx.now,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Открыть экран быстрого срока события из уведомления или сводного сообщения.
+pub(super) async fn open_due(ctx: &mut Ctx<'_>, item_id: Uuid) -> Result<(), Fail> {
+    ctx.present(Screen::Due {
+        item_id,
+        back: Box::new(Screen::Menu),
+    })
+    .await
+}
+
+/// «📅 Перенести» из напоминания о событии.
+pub async fn event_due(ctx: &mut Ctx<'_>, item_id: Uuid) -> Result<(), Fail> {
+    if load(ctx, item_id).await?.is_none() {
+        ctx.toast("Событие больше недоступно");
+        return Ok(());
+    }
+    open_due(ctx, item_id).await
 }
 
 pub(super) fn snooze_time(

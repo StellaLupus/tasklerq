@@ -10,7 +10,7 @@ use sqlx::PgPool;
 use support::notifications::{button_of, tick_and_deliver};
 use support::telegram::{Call, Harness, buttons};
 use support::{TestHousehold, create_item, isolated_db, new_item, next_telegram_id};
-use tasklerq::domain::models::{Actor, Item, RecurrenceFreq, UserRole};
+use tasklerq::domain::models::{Actor, Item, RecurrenceFreq, RecurrenceInput, UserRole};
 use tasklerq::storage::repositories::items;
 use tasklerq::storage::repositories::notifications::{self, NewDelivery, NotificationKind};
 use uuid::Uuid;
@@ -139,6 +139,29 @@ async fn create_task_without_due(pool: &PgPool, household: &TestHousehold, title
     .await
 }
 
+async fn create_event(
+    pool: &PgPool,
+    household: &TestHousehold,
+    title: &str,
+    due_at: DateTime<Utc>,
+    end_at: DateTime<Utc>,
+    recurrence: Option<RecurrenceInput>,
+) -> Item {
+    let mut item = new_item(household.events_list_id, title);
+    item.due_at = Some(due_at);
+    item.end_at = Some(end_at);
+    item.assignee_user_id = Some(household.owner_id);
+    item.recurrence = recurrence;
+    create_item(
+        pool,
+        household,
+        household.events_list_id,
+        &Actor::user(household.owner_id, UserRole::Owner),
+        item,
+    )
+    .await
+}
+
 fn message_count(bot: &Harness, needle: &str) -> usize {
     bot.fake
         .messages(bot.chat)
@@ -222,6 +245,29 @@ async fn completed_events(pool: &PgPool, item_id: Uuid) -> i64 {
     .fetch_one(pool)
     .await
     .expect("completed events")
+}
+
+async fn event_times(
+    pool: &PgPool,
+    item_id: Uuid,
+) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>, i32) {
+    sqlx::query_as("SELECT due_at, end_at, version FROM items WHERE id = $1")
+        .bind(item_id)
+        .fetch_one(pool)
+        .await
+        .expect("event state")
+}
+
+async fn reminder_rows(pool: &PgPool, item_id: Uuid) -> Vec<(String, String)> {
+    sqlx::query_as(
+        "SELECT status::text, occurrence_key FROM notification_deliveries
+         WHERE item_id = $1 AND kind = 'reminder'
+         ORDER BY created_at, id",
+    )
+    .bind(item_id)
+    .fetch_all(pool)
+    .await
+    .expect("reminder deliveries")
 }
 
 fn local_utc(timezone: Tz, date: NaiveDate, hour: u32, minute: u32) -> DateTime<Utc> {
@@ -1225,4 +1271,260 @@ async fn a_snooze_token_without_a_version_still_snoozes() {
         snooze_rows(&db.pool, item.id).await[0].3.as_deref(),
         Some(reminder_key.as_str())
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn event_reminder_shows_start_end_and_event_actions() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let start = rounded_now() + Duration::hours(3);
+    let end = start + Duration::minutes(90);
+    create_event(&db.pool, &household, "Маникюр", start, end, None).await;
+
+    tick_and_deliver(&mut bot, &db.pool, start - Duration::minutes(15)).await;
+
+    let (_, html) = bot.latest();
+    assert!(html.contains("⏰ Через 15 минут"), "{html}");
+    assert!(html.contains("Маникюр"), "{html}");
+    let local_start = start.with_timezone(&moscow).format("%H:%M").to_string();
+    let local_end = end.with_timezone(&moscow).format("%H:%M").to_string();
+    assert!(html.contains("📅 Начало:"), "{html}");
+    assert!(html.contains(&local_start), "{html}");
+    assert!(html.contains("🏁 Конец:"), "{html}");
+    assert!(html.contains(&local_end), "{html}");
+
+    let labels: Vec<String> = buttons(&html).into_iter().map(|(label, _)| label).collect();
+    assert_eq!(labels.len(), 3, "{labels:?}");
+    for expected in ["Закрыть", "📅 Перенести", "Открыть"] {
+        assert!(
+            labels.iter().any(|label| label.contains(expected)),
+            "button `{expected}` missing: {labels:?}"
+        );
+    }
+    for forbidden in ["Выполнено", "Отложить на час", "Завтра в 09:00"]
+    {
+        assert!(
+            !labels.iter().any(|label| label.contains(forbidden)),
+            "button `{forbidden}` must be absent: {labels:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closed_event_reminder_is_deleted_and_does_not_come_back_for_the_same_occurrence() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let start = rounded_now() + Duration::hours(3);
+    let end = start + Duration::hours(1);
+    let weekday = start.with_timezone(&moscow).weekday().number_from_monday() as i16;
+    let event = create_event(
+        &db.pool,
+        &household,
+        "Тренировка",
+        start,
+        end,
+        Some(support::recurrence(RecurrenceFreq::Weekly, vec![weekday])),
+    )
+    .await;
+
+    tick_and_deliver(&mut bot, &db.pool, start - Duration::minutes(15)).await;
+    let (message_id, html) = bot.latest();
+    let close = button_of(&html, "Закрыть");
+    let before = event_times(&db.pool, event.id).await;
+
+    bot.press_data(&close, message_id).await;
+
+    assert!(
+        bot.fake.calls().iter().any(|call| matches!(
+            call,
+            Call::Delete { chat, id } if *chat == bot.chat && *id == message_id
+        )),
+        "«Закрыть» must delete the reminder through the outbox"
+    );
+    assert!(
+        !bot.fake
+            .messages(bot.chat)
+            .into_iter()
+            .any(|(id, _)| id == message_id),
+        "the reminder must disappear from the chat"
+    );
+    assert_eq!(
+        event_times(&db.pool, event.id).await,
+        before,
+        "«Закрыть» must not change the event"
+    );
+    let rows = reminder_rows(&db.pool, event.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "sent", "{rows:?}");
+
+    // Тик того же вхождения ничего не планирует повторно.
+    tick_and_deliver(&mut bot, &db.pool, start - Duration::minutes(5)).await;
+    let rows = reminder_rows(&db.pool, event.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(message_count(&bot, "Тренировка"), 0, "{rows:?}");
+
+    // Следующее вхождение идёт по расписанию серии.
+    tick_and_deliver(&mut bot, &db.pool, end).await;
+    let (due_at, end_at, _) = event_times(&db.pool, event.id).await;
+    let next_start = start + Duration::days(7);
+    assert_eq!(due_at, Some(next_start));
+    assert_eq!(end_at, Some(next_start + Duration::hours(1)));
+
+    tick_and_deliver(&mut bot, &db.pool, next_start - Duration::minutes(15)).await;
+    assert_eq!(
+        message_count(&bot, "Тренировка"),
+        1,
+        "the next occurrence must get its own reminder"
+    );
+    let rows = reminder_rows(&db.pool, event.id).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[1].0, "sent", "{rows:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moving_an_event_from_the_reminder_keeps_the_duration_and_replans_the_reminder() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let start = rounded_now() + Duration::hours(3);
+    let end = start + Duration::minutes(90);
+    let event = create_event(&db.pool, &household, "Маникюр", start, end, None).await;
+
+    tick_and_deliver(&mut bot, &db.pool, start - Duration::minutes(15)).await;
+    let (message_id, html) = bot.latest();
+    let move_button = button_of(&html, "Перенести");
+    bot.press_data(&move_button, message_id).await;
+
+    bot.assert_screen_contains("Срок");
+    for label in ["Сегодня", "Завтра", "📅 Дата и время"] {
+        bot.assert_has_button(label);
+    }
+    assert!(
+        bot.find_button("Без срока").is_none(),
+        "an event must have no «Без срока» in the quick due screen:\n{}",
+        bot.screen()
+    );
+
+    bot.press("Завтра").await;
+
+    let local = start.with_timezone(&moscow);
+    let tomorrow = local.date_naive() + Duration::days(1);
+    let new_start = local_utc(moscow, tomorrow, local.hour(), local.minute());
+    let (due_at, end_at, version) = event_times(&db.pool, event.id).await;
+    assert_eq!(due_at, Some(new_start));
+    assert_eq!(end_at, Some(new_start + Duration::minutes(90)));
+    assert_eq!(version, event.version + 1);
+
+    tick_and_deliver(&mut bot, &db.pool, new_start - Duration::minutes(15)).await;
+    let (_, reminder) = bot.latest();
+    assert!(
+        reminder.contains("Маникюр") && reminder.contains("⏰ Через 15 минут"),
+        "a reminder for the new start must arrive at lead time: {reminder}"
+    );
+    let rows = reminder_rows(&db.pool, event.id).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[1].0, "sent", "{rows:?}");
+    assert_eq!(
+        rows[1].1,
+        tasklerq::jobs::scheduler::occurrence_key(new_start)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moving_a_recurring_event_from_the_reminder_changes_only_the_nearest_occurrence() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let start = rounded_now() + Duration::hours(3);
+    let end = start + Duration::hours(1);
+    let weekday = start.with_timezone(&moscow).weekday().number_from_monday() as i16;
+    let event = create_event(
+        &db.pool,
+        &household,
+        "Тренировка",
+        start,
+        end,
+        Some(support::recurrence(RecurrenceFreq::Weekly, vec![weekday])),
+    )
+    .await;
+
+    tick_and_deliver(&mut bot, &db.pool, start - Duration::minutes(15)).await;
+    let (message_id, html) = bot.latest();
+    bot.press_data(&button_of(&html, "Перенести"), message_id)
+        .await;
+    bot.press("Завтра").await;
+
+    let local = start.with_timezone(&moscow);
+    let tomorrow = local.date_naive() + Duration::days(1);
+    let moved_start = local_utc(moscow, tomorrow, local.hour(), local.minute());
+    assert_eq!(event_times(&db.pool, event.id).await.0, Some(moved_start));
+
+    // После конца перенесённого вхождения серия возвращается к своему дню.
+    tick_and_deliver(&mut bot, &db.pool, moved_start + Duration::hours(1)).await;
+    let (due_at, end_at, _) = event_times(&db.pool, event.id).await;
+    let next_start = start + Duration::days(7);
+    assert_eq!(
+        due_at,
+        Some(next_start),
+        "the following occurrence must follow the series"
+    );
+    assert_eq!(end_at, Some(next_start + Duration::hours(1)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moving_a_deleted_event_reports_unavailable_and_opens_nothing() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let start = rounded_now() + Duration::hours(3);
+    let event = create_event(
+        &db.pool,
+        &household,
+        "Маникюр",
+        start,
+        start + Duration::minutes(90),
+        None,
+    )
+    .await;
+
+    tick_and_deliver(&mut bot, &db.pool, start - Duration::minutes(15)).await;
+    let (message_id, html) = bot.latest();
+    let move_button = button_of(&html, "Перенести");
+
+    let mut conn = db.pool.acquire().await.expect("conn");
+    items::soft_delete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        event.id,
+        bot.now,
+    )
+    .await
+    .expect("delete event");
+
+    let before = bot.fake.calls().len();
+    bot.press_data(&move_button, message_id).await;
+
+    assert_eq!(
+        last_toast(&bot).as_deref(),
+        Some("Событие больше недоступно")
+    );
+    assert!(
+        !bot.fake.calls()[before..]
+            .iter()
+            .any(|call| matches!(call, Call::SendRich { .. })),
+        "a deleted event must not open the quick due screen"
+    );
+    assert!(snooze_rows(&db.pool, event.id).await.is_empty());
 }

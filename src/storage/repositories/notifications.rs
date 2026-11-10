@@ -11,7 +11,7 @@ use sqlx::{FromRow, PgConnection};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
-use crate::domain::models::{Actor, ItemStatus};
+use crate::domain::models::{Actor, ItemStatus, ListKind};
 
 /// Тип уведомления; совпадает с PostgreSQL-типом `notification_kind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
@@ -289,6 +289,8 @@ pub struct BatchDelivery {
     pub due_date: Option<NaiveDate>,
     /// Название списка.
     pub list_name: Option<String>,
+    /// Вид списка: у события свои действия в блоке.
+    pub list_kind: Option<ListKind>,
     /// Список удалён.
     pub list_deleted_at: Option<DateTime<Utc>>,
     /// Список в архиве.
@@ -316,7 +318,7 @@ pub async fn batch_deliveries(
                 i.deleted_at AS item_deleted_at, i.version AS item_version,
                 i.due_at, i.due_date,
                 l.name AS list_name, l.deleted_at AS list_deleted_at,
-                l.is_archived AS list_archived
+                l.is_archived AS list_archived, l.kind AS list_kind
          FROM notification_deliveries d
          LEFT JOIN items i ON i.id = d.item_id
          LEFT JOIN lists l ON l.id = i.list_id

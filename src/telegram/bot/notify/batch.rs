@@ -9,7 +9,7 @@ use chrono_tz::Tz;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
-use crate::domain::models::ItemStatus;
+use crate::domain::models::{ItemStatus, ListKind};
 use crate::jobs::keys::snooze_origin;
 use crate::storage::repositories::items;
 use crate::storage::repositories::notifications::{
@@ -49,6 +49,9 @@ fn is_assignment(kind: NotificationKind) -> bool {
 pub enum BatchEntryState {
     /// Задача открыта, действия доступны.
     Open,
+    /// Событие: не выполняется и не откладывается, действия — перенос и
+    /// открытие карточки.
+    Event,
     /// Задача завершена.
     Done,
     /// Задача отложена до указанного момента.
@@ -113,6 +116,23 @@ pub fn batch_ui(
                 "😴 Напомню в {}",
                 until.with_timezone(&tz).format("%H:%M")
             )),
+            BatchEntryState::Event => {
+                let open = button(
+                    "📋 Открыть",
+                    Action::BatchOpen {
+                        batch_id,
+                        item_id: entry.item_id,
+                    },
+                );
+                let move_button = button(
+                    "📅 Перенести",
+                    Action::BatchMove {
+                        batch_id,
+                        item_id: entry.item_id,
+                    },
+                );
+                head(ui).row(vec![move_button, open])
+            }
             BatchEntryState::Open => {
                 let done = button(
                     ru::DONE_BUTTON,
@@ -301,6 +321,28 @@ pub async fn batch_open(
     }
 }
 
+/// «📅 Перенести» в блоке события сводного сообщения.
+pub async fn batch_move(
+    ctx: &mut Ctx<'_>,
+    message_id: i64,
+    batch_id: Uuid,
+    item_id: Uuid,
+) -> Result<(), Fail> {
+    if load_batch(ctx, batch_id).await?.is_none() {
+        return Ok(());
+    }
+    let household_id = ctx.household()?.id;
+    match items::get(&mut *ctx.conn, household_id, item_id).await {
+        Ok(_) => super::open_due(ctx, item_id).await,
+        Err(DomainError::Database(error)) => Err(Fail::Infra(error)),
+        Err(_) => {
+            set_batch_missing(ctx, batch_id, item_id).await?;
+            ctx.toast("Событие больше недоступно");
+            render_batch(ctx, message_id, batch_id).await
+        }
+    }
+}
+
 /// «Выполнить все» в сводном сообщении.
 ///
 /// Завершает все ещё открытые задачи, включая блоки, уже отложенные «На час»:
@@ -326,6 +368,9 @@ pub async fn batch_complete_all(
     let mut completed = 0;
     let mut changed = 0;
     for (item_id, row) in unique_items(&rows) {
+        if row.list_kind == Some(ListKind::Events) {
+            continue;
+        }
         if !matches!(
             batch_entry(row, ctx.tz, ctx.now).state,
             BatchEntryState::Open | BatchEntryState::Snoozed(_)
@@ -397,6 +442,9 @@ pub async fn batch_snooze_all(
 
     let mut snoozed = 0;
     for (item_id, row) in unique_items(&rows) {
+        if row.list_kind == Some(ListKind::Events) {
+            continue;
+        }
         if batch_entry(row, ctx.tz, ctx.now).state != BatchEntryState::Open {
             continue;
         }
@@ -458,7 +506,7 @@ fn unique_items(rows: &[BatchDelivery]) -> Vec<(Uuid, &BatchDelivery)> {
 /// Подсказка для блока, по которому действие уже невозможно.
 fn blocked_toast(state: BatchEntryState) -> Option<&'static str> {
     match state {
-        BatchEntryState::Open => None,
+        BatchEntryState::Open | BatchEntryState::Event => None,
         BatchEntryState::Done => Some("Задача уже выполнена"),
         BatchEntryState::Snoozed(_) => Some("Задача уже отложена"),
         BatchEntryState::Missing => Some("Задача больше недоступна"),
@@ -620,6 +668,7 @@ fn batch_entry(row: &BatchDelivery, tz: Tz, now: DateTime<Utc>) -> BatchEntry {
     // исключение: оно остаётся актуальным, поэтому блок показывает задачу и
     // работает так же, как одиночное уведомление о назначении.
     let list_archived = !is_assignment(kind) && row.list_archived == Some(true);
+    let is_event = row.list_kind == Some(ListKind::Events);
     // Блок без собственного итога или с отменённым snooze показывает текущее
     // состояние задачи: отменённое «Напомню в …» больше ничего не обещает.
     let task_state = || {
@@ -633,6 +682,9 @@ fn batch_entry(row: &BatchDelivery, tz: Tz, now: DateTime<Utc>) -> BatchEntry {
         BatchEntryState::Missing
     } else if list_archived {
         BatchEntryState::ListArchived
+    } else if is_event {
+        // Событие не выполняется и не откладывается: у блока свои действия.
+        BatchEntryState::Event
     } else {
         match row.batch_state {
             Some(BatchState::Done) => BatchEntryState::Done,

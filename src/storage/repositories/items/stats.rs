@@ -110,7 +110,9 @@ pub async fn menu_counts_with_timezone(
     // 0009-events 8.1: событие на сегодня начинается сегодня или началось
     // раньше и ещё не прошло. Конец считает домен: у вседневных событий это
     // начало следующего дня в поясе household, включая переходы DST, которые
-    // SQL повторил бы неточно.
+    // SQL повторил бы неточно. SQL-предфильтр с запасом в двое суток отсекает
+    // давно прошедшие события до чтения: разовые события остаются `open`
+    // навсегда, и без него выборка росла бы на каждом показе меню.
     let events: Vec<EventTimes> = sqlx::query_as(
         "SELECT i.due_at, i.due_date, i.end_at, i.end_date
          FROM items i
@@ -120,9 +122,25 @@ pub async fn menu_counts_with_timezone(
            AND l.deleted_at IS NULL
            AND NOT l.is_archived
            AND l.kind = 'events'
-           AND i.status = 'open'",
+           AND i.status = 'open'
+           AND COALESCE(
+                 i.end_at,
+                 CASE WHEN i.end_date IS NOT NULL
+                      THEN ((i.end_date + 1)::timestamp AT TIME ZONE $5)
+                 END,
+                 CASE WHEN i.due_at IS NOT NULL
+                      THEN i.due_at + interval '1 hour'
+                 END,
+                 CASE WHEN i.due_date IS NOT NULL
+                      THEN ((i.due_date + 1)::timestamp AT TIME ZONE $5)
+                 END
+               ) > $2 - interval '2 days'",
     )
     .bind(household_id)
+    .bind(now)
+    .bind(today)
+    .bind(timezone)
+    .bind(household_timezone)
     .fetch_all(&mut *conn)
     .await?;
     let due_today_events = events
@@ -257,6 +275,9 @@ pub async fn open_event_counts_by_list(
     now: DateTime<Utc>,
 ) -> Result<HashMap<Uuid, i64>, DomainError> {
     let household_tz = parse_timezone(household_timezone)?;
+    // Тот же грубый предфильтр, что у счётчика «на сегодня»: он отсекает
+    // давно прошедшие разовые события, а точную границу по-прежнему считает
+    // домен ниже (`is_past`).
     let events: Vec<EventListTimes> = sqlx::query_as(
         "SELECT i.list_id, i.due_at, i.due_date, i.end_at, i.end_date
          FROM items i
@@ -266,9 +287,23 @@ pub async fn open_event_counts_by_list(
            AND l.deleted_at IS NULL
            AND NOT l.is_archived
            AND l.kind = 'events'
-           AND i.status = 'open'",
+           AND i.status = 'open'
+           AND COALESCE(
+                 i.end_at,
+                 CASE WHEN i.end_date IS NOT NULL
+                      THEN ((i.end_date + 1)::timestamp AT TIME ZONE $3)
+                 END,
+                 CASE WHEN i.due_at IS NOT NULL
+                      THEN i.due_at + interval '1 hour'
+                 END,
+                 CASE WHEN i.due_date IS NOT NULL
+                      THEN ((i.due_date + 1)::timestamp AT TIME ZONE $3)
+                 END
+               ) > $2 - interval '2 days'",
     )
     .bind(household_id)
+    .bind(now)
+    .bind(household_timezone)
     .fetch_all(&mut *conn)
     .await?;
 

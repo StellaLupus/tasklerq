@@ -5,10 +5,35 @@ mod support;
 use chrono::{DateTime, Duration, Utc};
 use support::notifications::*;
 use support::telegram::buttons;
-use tasklerq::domain::models::{Actor, RecurrenceFreq, UserRole};
+use tasklerq::domain::models::{Actor, Item, RecurrenceFreq, UserRole};
 use tasklerq::jobs::scheduler::occurrence_key;
 use tasklerq::storage::repositories::items;
 use uuid::Uuid;
+
+async fn create_event(
+    pool: &sqlx::PgPool,
+    household: &support::TestHousehold,
+    title: &str,
+    due_at: DateTime<Utc>,
+    end_at: DateTime<Utc>,
+) -> Item {
+    let mut item = support::new_item(household.events_list_id, title);
+    item.due_at = Some(due_at);
+    item.end_at = Some(end_at);
+    item.assignee_user_id = Some(household.owner_id);
+    support::create_item(
+        pool,
+        household,
+        household.events_list_id,
+        &Actor::user(household.owner_id, UserRole::Owner),
+        item,
+    )
+    .await
+}
+
+fn labels(html: &str) -> Vec<String> {
+    buttons(html).into_iter().map(|(label, _)| label).collect()
+}
 
 async fn snooze_origin_rows(
     pool: &sqlx::PgPool,
@@ -1254,4 +1279,148 @@ async fn complete_all_with_a_snoozed_recurring_block_cancels_the_snooze() {
         "the cancelled snooze must not arrive in an hour"
     );
     assert_eq!(snooze_rows(&db.pool, recurring.id).await[0].0, "cancelled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn complete_all_with_mixed_blocks_leaves_the_event_untouched() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = bot.now.with_timezone(&moscow).date_naive();
+    let morning = local_utc(moscow, day, 8, 0);
+    let due = local_utc(moscow, day, 9, 0);
+    let event_start = local_utc(moscow, day, 10, 0);
+    let first = create_task(&db.pool, &household, "Первая", due, None).await;
+    let second = create_task(&db.pool, &household, "Вторая", due, None).await;
+    let event = create_event(
+        &db.pool,
+        &household,
+        "Маникюр",
+        event_start,
+        event_start + Duration::hours(1),
+    )
+    .await;
+    deferred_reminder(&db.pool, &household, first.id, due, morning).await;
+    deferred_reminder(&db.pool, &household, second.id, due, morning).await;
+    deferred_reminder(&db.pool, &household, event.id, event_start, morning).await;
+
+    tick_and_deliver(&mut bot, &db.pool, morning).await;
+    let (message_id, html) = bot.latest();
+    assert!(html.contains("Маникюр"), "{html}");
+    let labels = labels(&html);
+    assert_eq!(
+        labels
+            .iter()
+            .filter(|label| label.contains("Перенести"))
+            .count(),
+        1,
+        "the event block has its own move button: {labels:?}"
+    );
+    assert_eq!(
+        labels
+            .iter()
+            .filter(|label| label.contains("Открыть"))
+            .count(),
+        3,
+        "{labels:?}"
+    );
+    assert_eq!(
+        labels
+            .iter()
+            .filter(|label| label.contains("Выполнено"))
+            .count(),
+        2,
+        "only task blocks offer «Выполнено»: {labels:?}"
+    );
+    assert_eq!(
+        labels
+            .iter()
+            .filter(|label| label.contains("На час"))
+            .count(),
+        2,
+        "only task blocks offer «На час»: {labels:?}"
+    );
+
+    let event_before = item_status(&db.pool, event.id).await;
+    bot.press_data(&button_of(&html, "Выполнить все"), message_id)
+        .await;
+
+    assert_eq!(item_status(&db.pool, first.id).await.0, "done");
+    assert_eq!(item_status(&db.pool, second.id).await.0, "done");
+    assert_eq!(
+        item_status(&db.pool, event.id).await,
+        event_before,
+        "«Выполнить все» must not touch an event"
+    );
+    assert_eq!(completed_events(&db.pool, event.id).await, 0);
+
+    let (_, edited) = bot.latest();
+    assert!(edited.contains("Выполнено 2"), "{edited}");
+    assert_eq!(block_count(&edited, "✅ Выполнено"), 2, "{edited}");
+    assert_eq!(block_count(&edited, "📅 Перенести"), 1, "{edited}");
+    assert!(edited.contains("Маникюр"), "{edited}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snooze_all_with_mixed_blocks_creates_no_event_snooze() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = bot.now.with_timezone(&moscow).date_naive();
+    let morning = local_utc(moscow, day, 8, 0);
+    let due = local_utc(moscow, day, 9, 0);
+    let event_start = local_utc(moscow, day, 10, 0);
+    let task = create_task(&db.pool, &household, "Позвонить маме", due, None).await;
+    let event = create_event(
+        &db.pool,
+        &household,
+        "Маникюр",
+        event_start,
+        event_start + Duration::hours(1),
+    )
+    .await;
+    deferred_reminder(&db.pool, &household, task.id, due, morning).await;
+    deferred_reminder(&db.pool, &household, event.id, event_start, morning).await;
+
+    tick_and_deliver(&mut bot, &db.pool, morning).await;
+    let (message_id, html) = bot.latest();
+    assert!(html.contains("Маникюр"), "{html}");
+    let event_before = item_status(&db.pool, event.id).await;
+
+    bot.press_data(&button_of(&html, "Отложить все на час"), message_id)
+        .await;
+
+    let task_rows = snooze_rows(&db.pool, task.id).await;
+    assert_eq!(task_rows.len(), 1, "{task_rows:?}");
+    assert_eq!(task_rows[0].0, "pending", "{task_rows:?}");
+    assert!(
+        snooze_rows(&db.pool, event.id).await.is_empty(),
+        "«Отложить все на час» must not snooze an event"
+    );
+    assert_eq!(item_status(&db.pool, event.id).await, event_before);
+
+    let (_, edited) = bot.latest();
+    assert_eq!(block_count(&edited, "😴 Напомню в"), 1, "{edited}");
+    assert_eq!(block_count(&edited, "📅 Перенести"), 1, "{edited}");
+    assert!(edited.contains("Маникюр"), "{edited}");
+
+    // Через час приходит обычное напоминание только о задаче.
+    let snoozed_at = task_rows[0].1;
+    assert_eq!(
+        tick_and_deliver(&mut bot, &db.pool, snoozed_at)
+            .await
+            .delivered,
+        1
+    );
+    let (_, next) = bot.latest();
+    assert!(next.contains("Позвонить маме"), "{next}");
+    assert!(
+        !next.contains("Маникюр"),
+        "a snoozed event reminder must not be created: {next}"
+    );
+    assert!(snooze_rows(&db.pool, event.id).await.is_empty());
 }
