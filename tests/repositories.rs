@@ -844,6 +844,72 @@ async fn menu_counts_do_not_count_event_lists_as_shopping() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn menu_counts_include_all_day_and_ongoing_events_today() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let actor = household.owner();
+    let moscow = chrono_tz::Europe::Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 16).expect("today");
+    let yesterday = today.pred_opt().expect("yesterday");
+    let tomorrow = today.succ_opt().expect("tomorrow");
+    let now = moscow
+        .with_ymd_and_hms(2027, 3, 16, 10, 0, 0)
+        .single()
+        .expect("local now")
+        .with_timezone(&Utc);
+
+    let mut all_day = support::new_item(household.events_list_id, "Весь день");
+    all_day.due_date = Some(today);
+    support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &actor,
+        all_day,
+    )
+    .await;
+
+    let mut ongoing = support::new_item(household.events_list_id, "Идёт со вчера");
+    ongoing.due_date = Some(yesterday);
+    ongoing.end_date = Some(today);
+    support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &actor,
+        ongoing,
+    )
+    .await;
+
+    let mut past = support::new_item(household.events_list_id, "Прошлое");
+    past.due_date = Some(yesterday);
+    support::create_item(&db.pool, &household, household.events_list_id, &actor, past).await;
+
+    let mut future = support::new_item(household.events_list_id, "Будущее");
+    future.due_date = Some(tomorrow);
+    support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &actor,
+        future,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let counts = items::menu_counts(&mut conn, household.household_id, "Europe/Moscow", now)
+        .await
+        .expect("menu counts");
+
+    assert_eq!(
+        counts.due_today_tasks, 2,
+        "an all-day event and an event started yesterday and still running count; \
+         a past and a future event do not"
+    );
+    assert_eq!(counts.overdue_tasks, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn open_assigned_tasks_counts_only_open_own_tasks_in_visible_task_lists() {
     let db = support::db().await;
     let household = support::create_household(&db.pool).await;

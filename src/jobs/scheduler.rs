@@ -442,16 +442,9 @@ fn plan_event_advance(
         let Some(next_due) = rule.next_after(current_due, current_moment)? else {
             // Серия закончилась. Если после простоя нашлись прошедшие
             // вхождения, событие должно остаться на последнем из них, а не на
-            // том, с которого начался пересчёт.
-            return Ok(match last_advance {
-                Some(advance)
-                    if advance.due_at != candidate.due_at
-                        || advance.due_date != candidate.due_date =>
-                {
-                    Some(advance)
-                }
-                _ => None,
-            });
+            // том, с которого начался пересчёт. `last_advance` всегда отличается
+            // от исходного срока: это уже следующее вхождение.
+            return Ok(last_advance);
         };
         let advance = shift_event(candidate, next_due)?;
         let end = effective_end(

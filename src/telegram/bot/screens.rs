@@ -25,6 +25,7 @@ pub async fn build(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
         Screen::Welcome => Ok(welcome()),
         Screen::FirstContact(contact) => Ok(super::onboarding::first_contact(contact)),
         Screen::Lists => lists_screen(ctx).await,
+        Screen::Agenda { list, page } => super::agenda::view(ctx, *list, *page).await,
         Screen::List {
             list_id,
             page,
@@ -154,7 +155,14 @@ fn priority_marker(item: &Item) -> &'static str {
 async fn menu(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
     let household = ctx.household()?.clone();
     let user_id = ctx.user()?.id;
-    let counts = items::menu_counts(&mut *ctx.conn, household.id, ctx.tz.name(), ctx.now).await?;
+    let counts = items::menu_counts_with_timezone(
+        &mut *ctx.conn,
+        household.id,
+        ctx.tz.name(),
+        &household.timezone,
+        ctx.now,
+    )
+    .await?;
     let mine_count = items::open_assigned_tasks(&mut *ctx.conn, household.id, user_id).await?;
     let all_lists = lists::list(&mut *ctx.conn, household.id).await?;
     let visible: Vec<&List> = all_lists.iter().filter(|list| !list.is_archived).collect();
@@ -243,16 +251,27 @@ async fn menu(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
             ),
         ])
         .row(vec![
+            go(
+                "🗓 Повестка",
+                Screen::Agenda {
+                    list: None,
+                    page: 0,
+                },
+            ),
             button("🔎 Поиск", Action::SearchStart),
-            go("⚙️ Настройки", Screen::Settings),
-        ]);
+        ])
+        .row(vec![go("⚙️ Настройки", Screen::Settings)]);
     // 0009-events 8.1: список событий не считается дополнительным для
-    // кнопки «Все списки»; повестка и её счётчик появятся в 8.1.
+    // кнопки «Все списки», но два и более списков событий показывают её сами.
     let regular_lists = visible
         .iter()
         .filter(|list| list.kind != ListKind::Events)
         .count();
-    if regular_lists > 2 {
+    let event_lists = visible
+        .iter()
+        .filter(|list| list.kind == ListKind::Events)
+        .count();
+    if regular_lists > 2 || event_lists >= 2 {
         ui = ui.row(vec![go("🗂 Все списки", Screen::Lists)]);
     }
     Ok(ui)

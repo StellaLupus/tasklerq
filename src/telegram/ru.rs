@@ -104,14 +104,19 @@ pub fn weekday_long(iso: u32) -> &'static str {
     .unwrap_or("")
 }
 
-/// Заголовок группы журнала: «Вторник, 4 ноя»; будущий день — с «(впереди)».
-pub fn planned_day_label(date: NaiveDate, today: NaiveDate) -> String {
-    let label = format!(
+/// Заголовок дня: «Вторник, 4 ноя».
+pub fn day_label(date: NaiveDate) -> String {
+    format!(
         "{}, {} {}",
         weekday_long(date.weekday().number_from_monday()),
         date.day(),
         month_short(date.month())
-    );
+    )
+}
+
+/// Заголовок группы журнала: «Вторник, 4 ноя»; будущий день — с «(впереди)».
+pub fn planned_day_label(date: NaiveDate, today: NaiveDate) -> String {
+    let label = day_label(date);
     if date > today {
         format!("{label} (впереди)")
     } else {

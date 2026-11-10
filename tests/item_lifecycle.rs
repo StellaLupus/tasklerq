@@ -827,6 +827,54 @@ async fn moving_a_last_day_event_keeps_its_length() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changing_only_the_month_rule_keeps_the_event_length() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let mut input = support::new_item(household.events_list_id, "Отчётный период");
+    input.due_date = Some(date(2026, 1, 15));
+    input.end_date = Some(date(2026, 1, 17));
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Monthly, Vec::new()));
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let mut rule = support::recurrence(RecurrenceFreq::Monthly, Vec::new());
+    rule.month_rule = Some(MonthRule::LastDay);
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let changed = items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        created.version,
+        ItemPatch {
+            recurrence: Field::Value(rule),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        utc(2026, 2, 10, 12),
+    )
+    .await
+    .expect("change only the month rule");
+
+    assert_eq!(
+        changed.due_date,
+        Some(date(2026, 1, 31)),
+        "the last-day rule moves the start without a due patch"
+    );
+    assert_eq!(
+        changed.end_date,
+        Some(date(2026, 2, 2)),
+        "the end follows the normalized start and keeps the length"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reschedule_occurrence_earlier_than_its_slot_keeps_the_slot() {
     let db = support::db().await;
     let household = support::create_household(&db.pool).await;

@@ -84,6 +84,7 @@ impl TextRoute {
             Screen::Welcome
             | Screen::FirstContact(_)
             | Screen::Lists
+            | Screen::Agenda { .. }
             | Screen::Item { .. }
             | Screen::Due { .. }
             | Screen::Deleted { .. }
@@ -242,6 +243,14 @@ mod tests {
                 None,
             ),
             (Screen::Lists, None, None),
+            (
+                Screen::Agenda {
+                    list: None,
+                    page: 0,
+                },
+                None,
+                None,
+            ),
             (
                 Screen::List {
                     list_id: tasks.id,
@@ -472,6 +481,7 @@ mod tests {
                 Screen::Welcome
                 | Screen::FirstContact(_)
                 | Screen::Lists
+                | Screen::Agenda { .. }
                 | Screen::Item { .. }
                 | Screen::Due { .. }
                 | Screen::Editor { .. }

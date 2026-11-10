@@ -7,6 +7,7 @@
 //! отправляется после коммита.
 
 pub(crate) mod additions;
+mod agenda;
 pub(crate) mod capture;
 mod card;
 mod forms;

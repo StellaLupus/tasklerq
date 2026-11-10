@@ -84,6 +84,13 @@ pub enum Screen {
     FirstContact(FirstContactScreen),
     /// Все списки.
     Lists,
+    /// Повестка: события и задачи по дням из календарной развёртки.
+    Agenda {
+        /// Список событий; без значения — общая повестка.
+        list: Option<Uuid>,
+        /// Страница-окно по семь дней с нуля.
+        page: u32,
+    },
     /// Список задач или покупок.
     List {
         /// Список.
@@ -267,6 +274,7 @@ impl Screen {
         match self {
             Self::Menu | Self::Welcome | Self::FirstContact(_) => 1,
             Self::Lists
+            | Self::Agenda { .. }
             | Self::Mine { .. }
             | Self::Results { .. }
             | Self::Settings
@@ -311,6 +319,7 @@ impl Screen {
             Self::Welcome => "Пространство создано",
             Self::FirstContact(_) => "Первый контакт",
             Self::Lists => "Все списки",
+            Self::Agenda { .. } => "Повестка",
             Self::List { .. } => "Список",
             Self::Item { .. } => "Карточка",
             Self::Due { .. } => "Срок",
@@ -349,6 +358,7 @@ impl Screen {
         match self {
             Self::Menu | Self::Welcome | Self::FirstContact(_) => Vec::new(),
             Self::Lists
+            | Self::Agenda { .. }
             | Self::Mine { .. }
             | Self::Results { .. }
             | Self::Settings

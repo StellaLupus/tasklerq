@@ -5786,3 +5786,451 @@ async fn task_list_from_all_lists_keeps_actions_and_navigation_on_separate_rows(
         "navigation must not share the action row: {rows:?}"
     );
 }
+
+// 0009-events 8.2: повестка строится из календарной развёртки по дням.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agenda_shows_a_mixed_day_in_spec_order_and_rows_open_cards() {
+    let db = db().await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(moscow, today, 10, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+
+    let mut manicure = new_item(household.events_list_id, "Маникюр");
+    manicure.due_at = Some(local_utc(moscow, today, 14, 0));
+    manicure.end_at = Some(local_utc(moscow, today, 15, 30));
+    let manicure = create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &actor,
+        manicure,
+    )
+    .await;
+
+    let mut call = new_item(household.tasks_list_id, "Позвонить в банк");
+    call.due_at = Some(local_utc(moscow, today, 16, 0));
+    let call = create_item(&db.pool, &household, household.tasks_list_id, &actor, call).await;
+
+    let mut internet = new_item(household.tasks_list_id, "Оплатить интернет");
+    internet.due_date = Some(today);
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        internet,
+    )
+    .await;
+
+    bot.press("Повестка").await;
+    bot.assert_screen_contains("Понедельник, 15 мар");
+    let labels: Vec<String> = support::telegram::buttons(&bot.screen())
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect();
+    assert_eq!(
+        &labels[..3],
+        [
+            "☐ весь день Оплатить интернет",
+            "14:00–15:30 Маникюр",
+            "☐ 16:00 Позвонить в банк",
+        ],
+        "{labels:?}"
+    );
+    assert!(
+        !labels
+            .iter()
+            .any(|label| label.contains("Маникюр") && label.contains('☐')),
+        "an event row must not carry the open-task mark: {labels:?}"
+    );
+
+    // Сценарий «Тап по строке»: карточка задачи открывается, задача остаётся
+    // открытой.
+    let before_task = item_state(&db.pool, call.id).await;
+    bot.press("Позвонить в банк").await;
+    bot.assert_screen_contains("Повестка › Позвонить в банк");
+    assert_eq!(
+        item_state(&db.pool, call.id).await,
+        before_task,
+        "opening the card from the agenda must not change the task"
+    );
+    bot.press("Назад").await;
+    bot.assert_screen_contains("14:00–15:30 Маникюр");
+
+    let before = item_state(&db.pool, manicure.id).await;
+    bot.press("Маникюр").await;
+    bot.assert_screen_contains("Повестка › Маникюр");
+    assert_eq!(
+        item_state(&db.pool, manicure.id).await,
+        before,
+        "opening the card from the agenda must not change the event"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agenda_hides_a_past_event_and_a_done_task() {
+    let db = db().await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(moscow, today, 16, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+
+    let mut manicure = new_item(household.events_list_id, "Маникюр");
+    manicure.due_at = Some(local_utc(moscow, today, 14, 0));
+    manicure.end_at = Some(local_utc(moscow, today, 15, 30));
+    create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &actor,
+        manicure,
+    )
+    .await;
+
+    let done = create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, "Уже сделано"),
+    )
+    .await;
+    sqlx::query("UPDATE items SET status = 'done', completed_at = $2 WHERE id = $1")
+        .bind(done.id)
+        .bind(now)
+        .execute(&db.pool)
+        .await
+        .expect("mark done");
+
+    bot.press("Повестка").await;
+    assert!(
+        !bot.screen().contains("Маникюр"),
+        "a past event must not be shown:\n{}",
+        bot.screen()
+    );
+    assert!(
+        !bot.screen().contains("Уже сделано"),
+        "a done task must not be shown:\n{}",
+        bot.screen()
+    );
+    bot.assert_screen_contains("ничего не запланировано");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agenda_first_page_has_no_earlier_button_and_an_empty_state() {
+    let db = db().await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let mut bot = onboarded_at(&db.pool, "Alice", local_utc(moscow, today, 10, 0)).await;
+
+    bot.press("Повестка").await;
+    bot.assert_screen_contains("ничего не запланировано");
+    assert!(
+        bot.find_button("Раньше").is_none(),
+        "the first page must not offer «◀ Раньше»:\n{}",
+        bot.screen()
+    );
+    bot.assert_has_button("Дальше");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agenda_pages_move_by_seven_days_and_stop_at_today() {
+    let db = db().await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let mut bot = onboarded_at(&db.pool, "Alice", local_utc(moscow, today, 10, 0)).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+
+    let first_day = today;
+    let last_first_page = today + Duration::days(6);
+    let first_second_page = today + Duration::days(7);
+    let last_second_page = today + Duration::days(13);
+    for (title, day) in [
+        ("Первый день", first_day),
+        ("Конец первой недели", last_first_page),
+        ("Начало второй недели", first_second_page),
+        ("Конец второй недели", last_second_page),
+    ] {
+        let mut task = new_item(household.tasks_list_id, title);
+        task.due_date = Some(day);
+        create_item(&db.pool, &household, household.tasks_list_id, &actor, task).await;
+    }
+
+    bot.press("Повестка").await;
+    bot.assert_screen_contains("Первый день");
+    bot.assert_screen_contains("Конец первой недели");
+    assert!(
+        !bot.screen().contains("Начало второй недели")
+            && !bot.screen().contains("Конец второй недели"),
+        "the first page is exactly seven days:\n{}",
+        bot.screen()
+    );
+
+    bot.press("Дальше").await;
+    bot.assert_screen_contains("Начало второй недели");
+    bot.assert_screen_contains("Конец второй недели");
+    assert!(
+        !bot.screen().contains("Первый день") && !bot.screen().contains("Конец первой недели"),
+        "the next page must not repeat the first window:\n{}",
+        bot.screen()
+    );
+    assert!(
+        !bot.screen().contains("(впереди)"),
+        "agenda day headings must not use the journal suffix:\n{}",
+        bot.screen()
+    );
+    bot.assert_has_button("Раньше");
+
+    bot.press("Раньше").await;
+    bot.assert_screen_contains("Первый день");
+    assert!(
+        !bot.screen().contains("Начало второй недели"),
+        "«◀ Раньше» must return to the first window:\n{}",
+        bot.screen()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agenda_shows_each_occurrence_of_a_weekly_event() {
+    let db = db().await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let mut bot = onboarded_at(&db.pool, "Alice", local_utc(moscow, today, 10, 0)).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+
+    let tuesday = today + Duration::days(1);
+    let mut training = new_item(household.events_list_id, "Тренировка");
+    training.due_at = Some(local_utc(moscow, tuesday, 18, 0));
+    training.end_at = Some(local_utc(moscow, tuesday, 19, 0));
+    training.recurrence = Some(support::recurrence(RecurrenceFreq::Weekly, vec![2, 4]));
+    create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &actor,
+        training,
+    )
+    .await;
+
+    bot.press("Повестка").await;
+    let labels: Vec<String> = support::telegram::buttons(&bot.screen())
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect();
+    let occurrences: Vec<&String> = labels
+        .iter()
+        .filter(|label| label.contains("Тренировка"))
+        .collect();
+    assert_eq!(
+        occurrences.len(),
+        2,
+        "Tuesday and Thursday occurrences: {labels:?}"
+    );
+    for label in occurrences {
+        assert_eq!(
+            label, "18:00–19:00 Тренировка 🔁",
+            "every occurrence carries the recurrence mark: {labels:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agenda_shows_a_multi_day_event_in_every_day_of_the_window() {
+    let db = db().await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 3).expect("date");
+    let mut bot = onboarded_at(&db.pool, "Alice", local_utc(moscow, today, 10, 0)).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+
+    let mut vacation = new_item(household.events_list_id, "Отпуск");
+    vacation.due_date = NaiveDate::from_ymd_opt(2027, 3, 5);
+    vacation.end_date = NaiveDate::from_ymd_opt(2027, 3, 10);
+    create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &actor,
+        vacation,
+    )
+    .await;
+
+    bot.press("Повестка").await;
+    let rows: Vec<String> = support::telegram::buttons(&bot.screen())
+        .into_iter()
+        .map(|(label, _)| label)
+        .filter(|label| label.contains("Отпуск"))
+        .collect();
+    assert_eq!(
+        rows,
+        vec!["весь день Отпуск".to_owned(); 5],
+        "March 5..9 are inside the March 3..9 window:\n{}",
+        bot.screen()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agenda_shows_thirty_rows_and_the_number_of_the_rest() {
+    let db = db().await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let mut bot = onboarded_at(&db.pool, "Alice", local_utc(moscow, today, 10, 0)).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+
+    for n in 0..35 {
+        let mut item = new_item(household.tasks_list_id, &format!("Задача {n:02}"));
+        item.due_date = Some(today);
+        create_item(&db.pool, &household, household.tasks_list_id, &actor, item).await;
+    }
+
+    bot.press("Повестка").await;
+    let rows = support::telegram::buttons(&bot.screen())
+        .into_iter()
+        .filter(|(label, _)| label.starts_with("☐ весь день Задача"))
+        .count();
+    assert_eq!(rows, 30, "only the first thirty rows are shown");
+    bot.assert_screen_contains("…и ещё 5");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn menu_has_the_agenda_button_and_counts_events_today() {
+    let db = db().await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(moscow, today, 10, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+
+    let mut task = new_item(household.tasks_list_id, "Задача на сегодня");
+    task.due_date = Some(today);
+    create_item(&db.pool, &household, household.tasks_list_id, &actor, task).await;
+
+    let mut event = new_item(household.events_list_id, "Маникюр");
+    event.due_at = Some(local_utc(moscow, today, 14, 0));
+    event.end_at = Some(local_utc(moscow, today, 15, 30));
+    create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &actor,
+        event,
+    )
+    .await;
+
+    bot.text("/start").await;
+    bot.assert_screen_contains("На сегодня: <b>2</b>");
+    bot.assert_has_button("🗓 Повестка");
+
+    bot.press("Повестка").await;
+    bot.assert_screen_contains("14:00–15:30 Маникюр");
+
+    // Событие прошло: в счётчик «на сегодня» оно больше не входит.
+    bot.set_now(local_utc(moscow, today, 16, 0));
+    bot.text("/start").await;
+    bot.assert_screen_contains("На сегодня: <b>1</b>");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn menu_hides_all_lists_for_the_default_lists_only() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+
+    bot.text("/start").await;
+    assert!(
+        bot.find_button("Все списки").is_none(),
+        "only the default lists must not offer «🗂 Все списки»:\n{}",
+        bot.screen()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn menu_shows_all_lists_for_two_event_lists() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+    lists::create(
+        &mut conn,
+        household.household_id,
+        ListKind::Events,
+        "Школа",
+        Utc::now(),
+    )
+    .await
+    .expect("second event list");
+    drop(conn);
+
+    bot.text("/start").await;
+    bot.assert_has_button("Все списки");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agenda_shows_each_occurrence_of_a_recurring_task() {
+    let db = db().await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let mut bot = onboarded_at(&db.pool, "Alice", local_utc(moscow, today, 10, 0)).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+
+    let mut watering = new_item(household.tasks_list_id, "Полить цветы");
+    watering.due_date = Some(today);
+    watering.recurrence = Some(support::recurrence(RecurrenceFreq::Daily, Vec::new()));
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        watering,
+    )
+    .await;
+
+    bot.press("Повестка").await;
+    let occurrences: Vec<String> = support::telegram::buttons(&bot.screen())
+        .into_iter()
+        .map(|(label, _)| label)
+        .filter(|label| label.contains("Полить цветы"))
+        .collect();
+    assert_eq!(
+        occurrences.len(),
+        7,
+        "a daily task is shown on every day of the window: {occurrences:?}"
+    );
+    for label in occurrences {
+        assert_eq!(label, "☐ весь день Полить цветы 🔁", "{label}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agenda_keeps_a_late_item_of_the_last_day_across_timezones() {
+    let db = db().await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let mut bot = onboarded_at(&db.pool, "Alice", local_utc(moscow, today, 10, 0)).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    // Пользователь остаётся в Москве, household — на Владивостоке: поздний
+    // вечер последнего дня окна попадает в следующий день по household.
+    sqlx::query("UPDATE households SET timezone = 'Asia/Vladivostok' WHERE id = $1")
+        .bind(household.household_id)
+        .execute(&db.pool)
+        .await
+        .expect("household timezone");
+
+    let last_day = today + Duration::days(6);
+    let mut task = new_item(household.tasks_list_id, "Поздняя задача");
+    task.due_at = Some(local_utc(moscow, last_day, 20, 0));
+    create_item(&db.pool, &household, household.tasks_list_id, &actor, task).await;
+
+    bot.press("Повестка").await;
+    bot.assert_screen_contains("Поздняя задача");
+}

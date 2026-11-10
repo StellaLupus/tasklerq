@@ -2,11 +2,12 @@
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
+use crate::domain::events::effective_end;
 use crate::domain::recurrence::parse_timezone;
 
 use super::completions;
@@ -18,12 +19,22 @@ pub struct MenuCounts {
     pub open_tasks: i64,
     /// Из них просроченные.
     pub overdue_tasks: i64,
-    /// Открытые задачи со сроком на текущий день, ещё не просроченные.
+    /// Открытые задачи и события на сегодня: задачи со сроком на текущий день
+    /// и ещё не просроченные, события, которые начинаются сегодня или ещё идут.
     pub due_today_tasks: i64,
     /// Невыполненные позиции в `shopping` и `checklist`.
     pub open_shopping: i64,
     /// Выполнения задач сегодня по правилу раздела «Выполнено сегодня».
     pub done_today: i64,
+}
+
+/// Начало и конец события для счётчика «на сегодня».
+#[derive(sqlx::FromRow)]
+struct EventTimes {
+    due_at: Option<DateTime<Utc>>,
+    due_date: Option<NaiveDate>,
+    end_at: Option<DateTime<Utc>>,
+    end_date: Option<NaiveDate>,
 }
 
 /// Счётчики меню на момент `now` в часовом поясе `timezone`.
@@ -33,8 +44,29 @@ pub async fn menu_counts(
     timezone: &str,
     now: DateTime<Utc>,
 ) -> Result<MenuCounts, DomainError> {
+    let household_timezone: String =
+        sqlx::query_scalar("SELECT timezone FROM households WHERE id = $1")
+            .bind(household_id)
+            .fetch_one(&mut *conn)
+            .await?;
+    menu_counts_with_timezone(conn, household_id, timezone, &household_timezone, now).await
+}
+
+/// Счётчики меню с уже известным поясом household.
+///
+/// Вызывающий экран уже держит household, поэтому не делает лишний `SELECT`.
+pub async fn menu_counts_with_timezone(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    timezone: &str,
+    household_timezone: &str,
+    now: DateTime<Utc>,
+) -> Result<MenuCounts, DomainError> {
     let tz = parse_timezone(timezone)?;
     let today = now.with_timezone(&tz).date_naive();
+    // Вседневный конец события считается в поясе household: так событие
+    // проходит для всех участников одновременно (design, решение 3).
+    let household_tz = parse_timezone(household_timezone)?;
 
     let (open_tasks, overdue_tasks, due_today_tasks, open_shopping): (i64, i64, i64, i64) =
         sqlx::query_as(
@@ -67,6 +99,47 @@ pub async fn menu_counts(
         .bind(timezone)
         .fetch_one(&mut *conn)
         .await?;
+
+    // 0009-events 8.1: событие на сегодня начинается сегодня или началось
+    // раньше и ещё не прошло. Конец считает домен: у вседневных событий это
+    // начало следующего дня в поясе household, включая переходы DST, которые
+    // SQL повторил бы неточно.
+    let events: Vec<EventTimes> = sqlx::query_as(
+        "SELECT i.due_at, i.due_date, i.end_at, i.end_date
+         FROM items i
+         JOIN lists l ON l.id = i.list_id
+         WHERE i.household_id = $1
+           AND i.deleted_at IS NULL
+           AND l.deleted_at IS NULL
+           AND NOT l.is_archived
+           AND l.kind = 'events'
+           AND i.status = 'open'",
+    )
+    .bind(household_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    let due_today_events = events
+        .iter()
+        .filter(|event| {
+            let starts_today = event.due_date.is_some_and(|date| date == today)
+                || event
+                    .due_at
+                    .is_some_and(|at| at.with_timezone(&tz).date_naive() == today);
+            let started = starts_today
+                || event.due_at.is_some_and(|at| at < now)
+                || event.due_date.is_some_and(|date| date < today);
+            started
+                && effective_end(
+                    event.due_at,
+                    event.due_date,
+                    event.end_at,
+                    event.end_date,
+                    household_tz,
+                )
+                .is_some_and(|end| end > now)
+        })
+        .count() as i64;
+    let due_today_tasks = due_today_tasks + due_today_events;
 
     // «Выполнено» — те же события, что попадают в разделы «Выполнено сегодня»,
     // и только по спискам задач.
