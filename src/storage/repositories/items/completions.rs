@@ -23,12 +23,18 @@ pub const JOURNAL_PAGE_SIZE: usize = 8;
 /// Общее условие отбора выполнения для журнала и раздела «Выполнено сегодня».
 ///
 /// Подставляется как фрагмент `WHERE` с `$1` — household. Список
-/// `item_events` уже алиасирован как `e`, элемент — как `i`.
+/// `item_events` уже алиасирован как `e`, элемент — как `i`. События не имеют
+/// состояния «выполнено» (0009-events, design решение 1), поэтому строка
+/// события не попадает в выборки выполненных даже при устаревшей или битой
+/// записи журнала.
 const COMPLETION_SELECTION: &str = "\
     e.household_id = $1
     AND e.event_type = 'completed'
     AND e.undo_of IS NULL
     AND i.deleted_at IS NULL
+    AND NOT EXISTS (
+        SELECT 1 FROM lists el WHERE el.id = i.list_id AND el.kind = 'events'
+    )
     AND NOT EXISTS (
         SELECT 1 FROM item_events undo WHERE undo.undo_of = e.id
     )

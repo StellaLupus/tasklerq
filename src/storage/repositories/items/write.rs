@@ -324,6 +324,24 @@ async fn update_inner(
             end_at = None;
         }
     }
+    // 0009-events 3.3: перенос начала события без конца в том же патче
+    // сохраняет длительность — конец сдвигается на ту же величину. Явно
+    // переданный конец (значение или очистка) применяется как есть. Смена вида
+    // начала не сдвигает конец другого вида: её отклонит проверка полей.
+    if target_list.kind == ListKind::Events
+        && due_changed
+        && patch.end_at.is_missing()
+        && patch.end_date.is_missing()
+    {
+        if let (Some(old_start), Some(new_start)) = (row.due_at, due_at) {
+            end_at = row.end_at.map(|old_end| old_end + (new_start - old_start));
+        }
+        if let (Some(old_start), Some(new_start)) = (row.due_date, due_date) {
+            end_date = row
+                .end_date
+                .map(|old_end| old_end + (new_start - old_start));
+        }
+    }
 
     let old_recurrence = row.recurrence();
     let mut recurrence = old_recurrence.clone();

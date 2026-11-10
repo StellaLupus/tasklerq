@@ -12,9 +12,9 @@ use super::{
     UNDO_WINDOW_EXPIRED, UNDO_WINDOW_MINUTES, local_today, recurrence_values, version_conflict,
 };
 use crate::domain::error::DomainError;
-use crate::domain::models::{Actor, EventType, Item, ItemStatus};
+use crate::domain::models::{Actor, EventType, Item, ItemStatus, ListKind};
 use crate::domain::recurrence::Due;
-use crate::storage::repositories::{events, notifications, subtasks, tags};
+use crate::storage::repositories::{events, lists, notifications, subtasks, tags};
 
 /// Завершить элемент.
 pub async fn complete(
@@ -27,6 +27,7 @@ pub async fn complete(
     now: DateTime<Utc>,
 ) -> Result<Item, DomainError> {
     let row = row_by_id(conn, household_id, item_id, false, true).await?;
+    ensure_not_event(conn, household_id, row.list_id).await?;
     let current = hydrate_one(conn, row.clone()).await?;
     if let Some(version) = version
         && version != row.version
@@ -139,6 +140,7 @@ pub async fn reopen(
     now: DateTime<Utc>,
 ) -> Result<Item, DomainError> {
     let row = row_by_id(conn, household_id, item_id, false, true).await?;
+    ensure_not_event(conn, household_id, row.list_id).await?;
     let current = hydrate_one(conn, row.clone()).await?;
     if let Some(version) = version
         && version != row.version
@@ -521,6 +523,20 @@ pub async fn undo_last(
     .await?;
 
     Ok(updated)
+}
+
+/// Событие не выполняется и не возвращается в работу (design, решение 1).
+async fn ensure_not_event(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    list_id: Uuid,
+) -> Result<(), DomainError> {
+    if lists::get(conn, household_id, list_id).await?.kind == ListKind::Events {
+        return Err(DomainError::Validation(
+            "events cannot be completed or reopened".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_can_modify(actor: &Actor, created_by_user_id: Option<Uuid>) -> Result<(), DomainError> {
