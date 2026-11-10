@@ -3606,19 +3606,23 @@ async fn action_labels_do_not_say_gotovo() {
     .expect("list");
     let tz: chrono_tz::Tz = "Europe/Moscow".parse().expect("tz");
     let reminder = notify::reminder_ui(&task, &list, tz, bot.now, Some(15));
+    let entries = [BatchEntry {
+        item_id: task.id,
+        kind: NotificationKind::Reminder,
+        title: task.title.clone(),
+        when: "Сегодня · Задачи".to_owned(),
+        version: task.version,
+        state: BatchEntryState::Open,
+        is_event: false,
+    }];
+    let actions = notify::BatchActions::of(&entries);
     let batch = notify::batch_ui(
         Uuid::now_v7(),
         0,
-        &[BatchEntry {
-            item_id: task.id,
-            kind: NotificationKind::Reminder,
-            title: task.title.clone(),
-            when: "Сегодня · Задачи".to_owned(),
-            version: task.version,
-            state: BatchEntryState::Open,
-        }],
-        1,
+        &entries,
+        entries.len(),
         None,
+        actions,
         tz,
     );
     {

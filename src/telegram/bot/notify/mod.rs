@@ -28,8 +28,8 @@ use super::{Ctx, Fail, issue_and_render};
 mod batch;
 
 pub use batch::{
-    BATCH_PAGE_SIZE, BatchEntry, BatchEntryState, batch_complete, batch_complete_all, batch_move,
-    batch_open, batch_page, batch_snooze, batch_snooze_all, batch_ui,
+    BATCH_PAGE_SIZE, BatchActions, BatchEntry, BatchEntryState, batch_complete, batch_complete_all,
+    batch_move, batch_open, batch_page, batch_snooze, batch_snooze_all, batch_ui,
 };
 
 /// Час, на который переносится напоминание «до завтра».

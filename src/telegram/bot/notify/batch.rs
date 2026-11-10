@@ -77,6 +77,35 @@ pub struct BatchEntry {
     pub version: i32,
     /// Состояние блока.
     pub state: BatchEntryState,
+    /// Блок события: у него свои подписи и нет общих действий.
+    pub is_event: bool,
+}
+
+/// Применимые ко всему сообщению общие действия.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BatchActions {
+    /// Есть открытые задачи или задача с отложенным напоминанием.
+    pub complete_all: bool,
+    /// Есть открытая задача, которую можно отложить.
+    pub snooze_all: bool,
+}
+
+impl BatchActions {
+    /// Посчитать действия по всем блокам сообщения, включая другие страницы.
+    pub fn of(entries: &[BatchEntry]) -> Self {
+        let mut actions = Self::default();
+        for entry in entries {
+            match entry.state {
+                BatchEntryState::Open => {
+                    actions.complete_all = true;
+                    actions.snooze_all = true;
+                }
+                BatchEntryState::Snoozed(_) => actions.complete_all = true,
+                _ => {}
+            }
+        }
+        actions
+    }
 }
 
 /// Сводное сообщение после тихих часов.
@@ -90,6 +119,7 @@ pub fn batch_ui(
     entries: &[BatchEntry],
     total: usize,
     summary: Option<(i32, i32)>,
+    actions: BatchActions,
     tz: Tz,
 ) -> Ui {
     let pages = page_count(total);
@@ -109,6 +139,7 @@ pub fn batch_ui(
         ui = ui.bold(kind_label(entry.kind));
         let head = |ui: Ui| ui.spans(title_spans(&entry.title)).text(&entry.when);
         ui = match entry.state {
+            BatchEntryState::Missing if entry.is_event => ui.text("Событие удалено"),
             BatchEntryState::Missing => ui.text("Задача удалена"),
             BatchEntryState::ListArchived => ui.text("Список в архиве"),
             BatchEntryState::Done => head(ui).text("✅ Выполнено"),
@@ -200,13 +231,24 @@ pub fn batch_ui(
         ui = ui.rule().row(row);
     }
 
-    ui.row(vec![
-        button(ru::DONE_ALL_BUTTON, Action::BatchCompleteAll { batch_id }),
-        button(
+    let mut common = Vec::new();
+    if actions.complete_all {
+        common.push(button(
+            ru::DONE_ALL_BUTTON,
+            Action::BatchCompleteAll { batch_id },
+        ));
+    }
+    if actions.snooze_all {
+        common.push(button(
             "😴 Отложить все на час",
             Action::BatchSnoozeAll { batch_id },
-        ),
-    ])
+        ));
+    }
+    if common.is_empty() {
+        ui
+    } else {
+        ui.row(common)
+    }
 }
 
 /// Перелистнуть сводное сообщение.
@@ -239,7 +281,15 @@ pub async fn batch_complete(
     item_id: Uuid,
     version: i32,
 ) -> Result<(), Fail> {
-    if !actionable(ctx, message_id, batch_id, item_id).await? {
+    if !actionable(
+        ctx,
+        message_id,
+        batch_id,
+        item_id,
+        "Событие нельзя выполнить",
+    )
+    .await?
+    {
         return Ok(());
     }
 
@@ -290,7 +340,15 @@ pub async fn batch_snooze(
     item_id: Uuid,
     version: Option<i32>,
 ) -> Result<(), Fail> {
-    if !actionable(ctx, message_id, batch_id, item_id).await? {
+    if !actionable(
+        ctx,
+        message_id,
+        batch_id,
+        item_id,
+        "Событие нельзя отложить",
+    )
+    .await?
+    {
         return Ok(());
     }
     if snooze_batch_item(ctx, batch_id, item_id, version, false).await? {
@@ -368,9 +426,6 @@ pub async fn batch_complete_all(
     let mut completed = 0;
     let mut changed = 0;
     for (item_id, row) in unique_items(&rows) {
-        if row.list_kind == Some(ListKind::Events) {
-            continue;
-        }
         if !matches!(
             batch_entry(row, ctx.tz, ctx.now).state,
             BatchEntryState::Open | BatchEntryState::Snoozed(_)
@@ -442,9 +497,6 @@ pub async fn batch_snooze_all(
 
     let mut snoozed = 0;
     for (item_id, row) in unique_items(&rows) {
-        if row.list_kind == Some(ListKind::Events) {
-            continue;
-        }
         if batch_entry(row, ctx.tz, ctx.now).state != BatchEntryState::Open {
             continue;
         }
@@ -467,6 +519,7 @@ async fn actionable(
     message_id: i64,
     batch_id: Uuid,
     item_id: Uuid,
+    event_refusal: &'static str,
 ) -> Result<bool, Fail> {
     let Some(rows) = batch_rows(ctx, batch_id).await? else {
         return Ok(false);
@@ -475,7 +528,7 @@ async fn actionable(
         render_batch(ctx, message_id, batch_id).await?;
         return Ok(false);
     };
-    if let Some(toast) = blocked_toast(batch_entry(&row, ctx.tz, ctx.now).state) {
+    if let Some(toast) = blocked_toast(batch_entry(&row, ctx.tz, ctx.now).state, event_refusal) {
         ctx.toast(toast);
         render_batch(ctx, message_id, batch_id).await?;
         return Ok(false);
@@ -504,9 +557,13 @@ fn unique_items(rows: &[BatchDelivery]) -> Vec<(Uuid, &BatchDelivery)> {
 }
 
 /// Подсказка для блока, по которому действие уже невозможно.
-fn blocked_toast(state: BatchEntryState) -> Option<&'static str> {
+///
+/// `event_refusal` — отказ для устаревшей кнопки на блоке события: событие не
+/// выполняется и не откладывается.
+fn blocked_toast(state: BatchEntryState, event_refusal: &'static str) -> Option<&'static str> {
     match state {
-        BatchEntryState::Open | BatchEntryState::Event => None,
+        BatchEntryState::Open => None,
+        BatchEntryState::Event => Some(event_refusal),
         BatchEntryState::Done => Some("Задача уже выполнена"),
         BatchEntryState::Snoozed(_) => Some("Задача уже отложена"),
         BatchEntryState::Missing => Some("Задача больше недоступна"),
@@ -653,7 +710,16 @@ async fn render_batch(ctx: &mut Ctx<'_>, message_id: i64, batch_id: Uuid) -> Res
         (Some(completed), Some(changed)) => Some((completed, changed)),
         _ => None,
     };
-    let ui = batch_ui(batch_id, page, &entries[start..end], total, summary, ctx.tz);
+    let actions = BatchActions::of(&entries);
+    let ui = batch_ui(
+        batch_id,
+        page,
+        &entries[start..end],
+        total,
+        summary,
+        actions,
+        ctx.tz,
+    );
     edit_notice(ctx, message_id, &ui).await
 }
 
@@ -707,5 +773,6 @@ fn batch_entry(row: &BatchDelivery, tz: Tz, now: DateTime<Utc>) -> BatchEntry {
         when,
         version: row.item_version.or(row.batch_version).unwrap_or(0),
         state,
+        is_event,
     }
 }

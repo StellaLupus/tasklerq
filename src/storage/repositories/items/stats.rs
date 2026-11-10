@@ -126,20 +126,18 @@ pub async fn menu_counts_with_timezone(
            AND COALESCE(
                  i.end_at,
                  CASE WHEN i.end_date IS NOT NULL
-                      THEN ((i.end_date + 1)::timestamp AT TIME ZONE $5)
+                      THEN ((i.end_date + 1)::timestamp AT TIME ZONE $3)
                  END,
                  CASE WHEN i.due_at IS NOT NULL
                       THEN i.due_at + interval '1 hour'
                  END,
                  CASE WHEN i.due_date IS NOT NULL
-                      THEN ((i.due_date + 1)::timestamp AT TIME ZONE $5)
+                      THEN ((i.due_date + 1)::timestamp AT TIME ZONE $3)
                  END
                ) > $2 - interval '2 days'",
     )
     .bind(household_id)
     .bind(now)
-    .bind(today)
-    .bind(timezone)
     .bind(household_timezone)
     .fetch_all(&mut *conn)
     .await?;

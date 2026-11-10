@@ -8,6 +8,8 @@ use support::telegram::buttons;
 use tasklerq::domain::models::{Actor, Item, RecurrenceFreq, UserRole};
 use tasklerq::jobs::scheduler::occurrence_key;
 use tasklerq::storage::repositories::items;
+use tasklerq::telegram::bot::model::Action;
+use tasklerq::telegram::callbacks::{self, NewToken, Scope};
 use uuid::Uuid;
 
 async fn create_event(
@@ -179,8 +181,10 @@ async fn snooze_all_creates_one_more_batch_and_repeat_adds_no_deliveries() {
     assert_eq!(snooze_rows(second.id).await.len(), 1);
 
     let (_, edited) = bot.latest();
-    let again = button_of(&edited, "Отложить все на час");
-    bot.press_data(&again, message_id).await;
+    assert!(
+        !edited.contains("Отложить все на час"),
+        "no open task blocks left: {edited}"
+    );
     assert_eq!(snooze_rows(first.id).await.len(), 1);
     assert_eq!(snooze_rows(second.id).await.len(), 1);
 
@@ -719,8 +723,10 @@ async fn complete_all_moves_a_recurring_task_by_one_occurrence_and_repeat_change
     assert_eq!(item_status(&db.pool, plain.id).await.0, "done");
 
     let (_, edited) = bot.latest();
-    let again = button_of(&edited, "Выполнить все");
-    bot.press_data(&again, message_id).await;
+    assert!(
+        !edited.contains("Выполнить все"),
+        "no actionable task blocks left: {edited}"
+    );
     assert_eq!(item_status(&db.pool, recurring.id).await.1, version);
     assert_eq!(item_status(&db.pool, recurring.id).await.2, next_due);
     assert_eq!(completed_events(&db.pool, recurring.id).await, 1);
@@ -907,8 +913,10 @@ async fn complete_all_keeps_done_missing_and_archived_blocks_unchanged() {
     assert!(after.contains("Задача удалена"), "{after}");
     assert!(after.contains("Список в архиве"), "{after}");
 
-    let again = button_of(&after, "Выполнить все");
-    bot.press_data(&again, message_id).await;
+    assert!(
+        !after.contains("Выполнить все"),
+        "no actionable task blocks left: {after}"
+    );
     // Кнопки получают новые callback-токены на каждую отрисовку: сравниваем
     // видимую часть сообщения.
     let visible = |html: &str| {
@@ -920,7 +928,7 @@ async fn complete_all_keeps_done_missing_and_archived_blocks_unchanged() {
     assert_eq!(
         visible(&batch_message(&bot, message_id)),
         visible(&after),
-        "a repeated «Выполнить все» must not change the message"
+        "a message without actionable blocks must not change"
     );
 }
 
@@ -1423,4 +1431,214 @@ async fn snooze_all_with_mixed_blocks_creates_no_event_snooze() {
         "a snoozed event reminder must not be created: {next}"
     );
     assert!(snooze_rows(&db.pool, event.id).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moving_an_event_block_opens_the_event_quick_due_screen() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = bot.now.with_timezone(&moscow).date_naive();
+    let morning = local_utc(moscow, day, 8, 0);
+    let due = local_utc(moscow, day, 9, 0);
+    let event_start = local_utc(moscow, day, 10, 0);
+    let task = create_task(&db.pool, &household, "Позвонить маме", due, None).await;
+    let event = create_event(
+        &db.pool,
+        &household,
+        "Маникюр",
+        event_start,
+        event_start + Duration::hours(1),
+    )
+    .await;
+    deferred_reminder(&db.pool, &household, task.id, due, morning).await;
+    deferred_reminder(&db.pool, &household, event.id, event_start, morning).await;
+
+    tick_and_deliver(&mut bot, &db.pool, morning).await;
+    let (message_id, html) = bot.latest();
+    bot.press_data(&button_of(&html, "Перенести"), message_id)
+        .await;
+
+    bot.assert_screen_contains("Срок");
+    for label in ["Сегодня", "Завтра", "📅 Дата и время"] {
+        bot.assert_has_button(label);
+    }
+    assert!(
+        bot.find_button("Без срока").is_none(),
+        "an event has no «Без срока» in the quick due screen:\n{}",
+        bot.screen()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moving_a_deleted_event_block_reports_it_as_an_event() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = bot.now.with_timezone(&moscow).date_naive();
+    let morning = local_utc(moscow, day, 8, 0);
+    let due = local_utc(moscow, day, 9, 0);
+    let event_start = local_utc(moscow, day, 10, 0);
+    let task = create_task(&db.pool, &household, "Позвонить маме", due, None).await;
+    let event = create_event(
+        &db.pool,
+        &household,
+        "Маникюр",
+        event_start,
+        event_start + Duration::hours(1),
+    )
+    .await;
+    deferred_reminder(&db.pool, &household, task.id, due, morning).await;
+    deferred_reminder(&db.pool, &household, event.id, event_start, morning).await;
+
+    tick_and_deliver(&mut bot, &db.pool, morning).await;
+    let (message_id, html) = bot.latest();
+    let move_button = button_of(&html, "Перенести");
+    let mut conn = db.pool.acquire().await.expect("conn");
+    items::soft_delete(
+        &mut conn,
+        household.household_id,
+        &Actor::user(household.owner_id, UserRole::Owner),
+        event.id,
+        bot.now,
+    )
+    .await
+    .expect("delete event");
+
+    bot.press_data(&move_button, message_id).await;
+    let toast = bot
+        .fake
+        .answers()
+        .last()
+        .expect("callback answer")
+        .1
+        .clone();
+    assert_eq!(toast.as_deref(), Some("Событие больше недоступно"));
+    let batch = batch_message(&bot, message_id);
+    assert!(batch.contains("Событие удалено"), "{batch}");
+    assert!(
+        !batch.contains("Задача удалена"),
+        "a deleted event must not be called a task: {batch}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn event_only_batch_hides_common_task_actions() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = bot.now.with_timezone(&moscow).date_naive();
+    let morning = local_utc(moscow, day, 8, 0);
+    let first_start = local_utc(moscow, day, 10, 0);
+    let second_start = local_utc(moscow, day, 11, 0);
+    let first = create_event(
+        &db.pool,
+        &household,
+        "Маникюр",
+        first_start,
+        first_start + Duration::hours(1),
+    )
+    .await;
+    let second = create_event(
+        &db.pool,
+        &household,
+        "Стрижка",
+        second_start,
+        second_start + Duration::hours(1),
+    )
+    .await;
+    deferred_reminder(&db.pool, &household, first.id, first_start, morning).await;
+    deferred_reminder(&db.pool, &household, second.id, second_start, morning).await;
+
+    tick_and_deliver(&mut bot, &db.pool, morning).await;
+    let (_, html) = bot.latest();
+    assert!(html.contains("Пока были тихие часы"), "{html}");
+    assert_eq!(block_count(&html, "📅 Перенести"), 2, "{html}");
+    let labels = labels(&html);
+    assert!(
+        !labels.iter().any(|label| label.contains("Выполнить все")),
+        "no task blocks: {labels:?}"
+    );
+    assert!(
+        !labels
+            .iter()
+            .any(|label| label.contains("Отложить все на час")),
+        "no task blocks: {labels:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_snooze_token_on_an_event_block_creates_no_delivery() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = bot.now.with_timezone(&moscow).date_naive();
+    let morning = local_utc(moscow, day, 8, 0);
+    let due = local_utc(moscow, day, 9, 0);
+    let event_start = local_utc(moscow, day, 10, 0);
+    let task = create_task(&db.pool, &household, "Позвонить маме", due, None).await;
+    let event = create_event(
+        &db.pool,
+        &household,
+        "Маникюр",
+        event_start,
+        event_start + Duration::hours(1),
+    )
+    .await;
+    deferred_reminder(&db.pool, &household, task.id, due, morning).await;
+    deferred_reminder(&db.pool, &household, event.id, event_start, morning).await;
+
+    tick_and_deliver(&mut bot, &db.pool, morning).await;
+    let (message_id, _) = bot.latest();
+    let batch_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM notification_batches WHERE chat_id = $1
+         ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("batch id");
+    let payload = serde_json::to_value(Action::BatchSnooze {
+        batch_id,
+        item_id: event.id,
+        version: None,
+    })
+    .expect("payload");
+    let specs = [NewToken {
+        telegram_user_id: bot.chat,
+        household_id: Some(household.household_id),
+        scope: Scope::Notice,
+        action: "batch_snooze".to_owned(),
+        payload,
+        version: None,
+    }];
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let tokens = callbacks::issue_many(&mut conn, &specs, bot.now)
+        .await
+        .expect("stale snooze token");
+    drop(conn);
+
+    bot.press_data(&tokens[0], message_id).await;
+    assert!(
+        snooze_rows(&db.pool, event.id).await.is_empty(),
+        "a stale «На час» on an event block must not create a snooze"
+    );
+    let toast = bot
+        .fake
+        .answers()
+        .last()
+        .expect("callback answer")
+        .1
+        .clone();
+    assert_eq!(toast.as_deref(), Some("Событие нельзя отложить"));
+    let batch = batch_message(&bot, message_id);
+    assert!(!batch.contains("Напомню в"), "{batch}");
 }

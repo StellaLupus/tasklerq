@@ -263,6 +263,7 @@ async fn prepare_deferred_batch(
                 } else {
                     notify::BatchEntryState::Open
                 },
+                is_event: list.kind == ListKind::Events,
             },
         });
     }
@@ -288,7 +289,16 @@ async fn prepare_deferred_batch(
 
     let batch_id = Uuid::now_v7();
     let page = &entries[..entries.len().min(notify::BATCH_PAGE_SIZE)];
-    let ui = notify::batch_ui(batch_id, 0, page, entries.len(), None, identity.timezone);
+    let actions = notify::BatchActions::of(&entries);
+    let ui = notify::batch_ui(
+        batch_id,
+        0,
+        page,
+        entries.len(),
+        None,
+        actions,
+        identity.timezone,
+    );
     let html = notify::render_notice(
         &mut *conn,
         identity.telegram_user_id,
