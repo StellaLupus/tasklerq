@@ -81,11 +81,13 @@ pub async fn build(ctx: &mut Ctx<'_>, screen: &Screen) -> Result<Ui, Fail> {
     // Маршрут нужен только экранам, у которых есть подсказка ввода: так
     // построение остальных экранов не делает лишних запросов.
     let hint = match screen {
-        Screen::Menu | Screen::Form | Screen::List { .. } | Screen::Results { .. } => {
-            super::routing::route(ctx, screen)
-                .await?
-                .hint(ctx.llm_capture)
-        }
+        Screen::Menu
+        | Screen::Form
+        | Screen::List { .. }
+        | Screen::Results { .. }
+        | Screen::Agenda { .. } => super::routing::route(ctx, screen)
+            .await?
+            .hint(ctx.llm_capture),
         _ => None,
     };
     if let Some(hint) = hint {
@@ -295,11 +297,34 @@ async fn lists_screen(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
 
     let mut ui = Ui::new().heading("Все списки");
     for list in all_lists.iter().filter(|list| !list.is_archived) {
-        // 0009-events 8.3: список событий откроет повестку со своим значком.
-        let icon = if list.kind == ListKind::Tasks {
-            "📋"
-        } else {
-            "🛒"
+        let (icon, target) = match list.kind {
+            ListKind::Tasks => (
+                "📋",
+                Screen::List {
+                    list_id: list.id,
+                    page: 0,
+                    edit: false,
+                    from_lists: true,
+                },
+            ),
+            // Список событий открывает повестку этого списка, а не список
+            // покупок.
+            ListKind::Events => (
+                "🗓",
+                Screen::Agenda {
+                    list: Some(list.id),
+                    page: 0,
+                },
+            ),
+            ListKind::Shopping | ListKind::Checklist => (
+                "🛒",
+                Screen::List {
+                    list_id: list.id,
+                    page: 0,
+                    edit: false,
+                    from_lists: true,
+                },
+            ),
         };
         ui = ui.row(vec![go(
             &format!(
@@ -307,12 +332,7 @@ async fn lists_screen(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
                 clip(&list.name, 30),
                 open.get(&list.id).copied().unwrap_or(0)
             ),
-            Screen::List {
-                list_id: list.id,
-                page: 0,
-                edit: false,
-                from_lists: true,
-            },
+            target,
         )]);
     }
     Ok(ui.row(nav_row(&Screen::Lists, Screen::Menu)))
@@ -360,7 +380,7 @@ fn section_of(item: &Item, tz: Tz, now: DateTime<Utc>) -> Section {
     }
 }
 
-fn sort_tasks(items: &mut [Item], tz: Tz, now: DateTime<Utc>) {
+pub(super) fn sort_tasks(items: &mut [Item], tz: Tz, now: DateTime<Utc>) {
     let priority_rank = |item: &Item| match item.priority {
         ItemPriority::Urgent => 0,
         ItemPriority::High => 1,
@@ -731,9 +751,10 @@ async fn results(
         );
         if hit.item.status == ItemStatus::Done {
             label.push_str(" · выполнено");
+        } else if hit.list_kind == ListKind::Events {
+            // У события нет отметки выполнения; название списка уже в
+            // подписи, количество и срок не добавляются.
         } else if hit.list_kind != ListKind::Tasks {
-            // 0009-events 8.4: событие в поиске будет строкой без отметки
-            // выполнения и без количества покупки.
             if let Some(quantity) = hit.item.quantity {
                 label.push_str(&format!(
                     " · {}",

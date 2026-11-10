@@ -43,6 +43,9 @@ pub enum TextRoute {
         /// Название списка для подсказки.
         list_name: String,
     },
+    /// Повестка: свободный текст уходит в общий разбор; подсказка как у
+    /// остальных экранов с общим разбором.
+    Agenda,
     /// Остальные экраны: общий разбор.
     General,
 }
@@ -81,10 +84,10 @@ impl TextRoute {
                 },
                 None => Self::General,
             },
+            Screen::Agenda { .. } => Self::Agenda,
             Screen::Welcome
             | Screen::FirstContact(_)
             | Screen::Lists
-            | Screen::Agenda { .. }
             | Screen::Item { .. }
             | Screen::Due { .. }
             | Screen::Deleted { .. }
@@ -118,7 +121,7 @@ impl TextRoute {
     /// объясняет ввод сам (поле редактора) или текст здесь ничего не делает.
     pub fn hint(&self, llm_capture: bool) -> Option<String> {
         match self {
-            Self::Menu => Some(
+            Self::Menu | Self::Agenda => Some(
                 if llm_capture {
                     ru::MENU_HINT
                 } else {
@@ -459,6 +462,14 @@ mod tests {
                     }
                     .to_owned(),
                 ),
+                Screen::Agenda { .. } => Some(
+                    if llm_capture {
+                        ru::MENU_HINT
+                    } else {
+                        ru::MENU_HINT_NO_LLM
+                    }
+                    .to_owned(),
+                ),
                 Screen::Results { .. } => Some(ru::SEARCH_HINT.to_owned()),
                 Screen::List { .. } => list.as_ref().map(|list| match list.kind {
                     ListKind::Shopping if !llm_capture => ru::split_list_hint(&list.name),
@@ -481,7 +492,6 @@ mod tests {
                 Screen::Welcome
                 | Screen::FirstContact(_)
                 | Screen::Lists
-                | Screen::Agenda { .. }
                 | Screen::Item { .. }
                 | Screen::Due { .. }
                 | Screen::Editor { .. }

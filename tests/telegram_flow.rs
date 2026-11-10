@@ -3148,3 +3148,24 @@ async fn back_from_card_returns_to_the_same_list_page_in_the_same_message() {
     assert!(bot.fake.sent().is_empty(), "{:?}", bot.fake.sent());
     assert_eq!(bot.fake.messages(bot.chat).len(), 1);
 }
+
+// 0009-events 8.4: свободный текст на повестке уходит в общий разбор.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn text_on_the_agenda_screen_starts_the_general_capture() {
+    let db = db().await;
+    let id = next_telegram_id();
+    let handler = Bot::new("tasklerqbot")
+        .with_llm_capture(true)
+        .with_tenancy(tasklerq::config::TenancyMode::Multi);
+    let mut bot = Harness::with_handler(&db.pool, id, Arc::new(handler), FakeTelegram::new());
+    bot.text("/start").await;
+    bot.text("Семья").await;
+    bot.press("Москва").await;
+    bot.press("меню").await;
+
+    bot.press("Повестка").await;
+    bot.assert_screen_contains("Напишите задачу или покупку — я разберу.");
+
+    bot.text("купить молоко").await;
+    bot.assert_screen_contains("Разбираю сообщение");
+}

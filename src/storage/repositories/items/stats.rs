@@ -8,9 +8,16 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::events::effective_end;
+use crate::domain::models::Item;
 use crate::domain::recurrence::parse_timezone;
 
 use super::completions;
+use super::row::{ITEM_COLUMNS, ItemRow, hydrate_many};
+
+/// Условие просроченной задачи: срок со временем прошёл или вседневный срок
+/// раньше сегодняшнего дня. Параметры — `$2` (сейчас) и `$3` (сегодня в поясе
+/// пользователя).
+const OVERDUE_TASKS_CONDITION: &str = "i.due_at < $2 OR i.due_date < $3";
 
 /// Счётчики главного меню.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -69,12 +76,12 @@ pub async fn menu_counts_with_timezone(
     let household_tz = parse_timezone(household_timezone)?;
 
     let (open_tasks, overdue_tasks, due_today_tasks, open_shopping): (i64, i64, i64, i64) =
-        sqlx::query_as(
+        sqlx::query_as(&format!(
             "SELECT
                  count(*) FILTER (WHERE l.kind = 'tasks' AND i.status = 'open'),
                  count(*) FILTER (
                      WHERE l.kind = 'tasks' AND i.status = 'open'
-                       AND (i.due_at < $2 OR i.due_date < $3)
+                       AND ({OVERDUE_TASKS_CONDITION})
                  ),
                  count(*) FILTER (
                      WHERE l.kind = 'tasks' AND i.status = 'open'
@@ -92,7 +99,7 @@ pub async fn menu_counts_with_timezone(
                AND i.deleted_at IS NULL
                AND l.deleted_at IS NULL
                AND NOT l.is_archived",
-        )
+        ))
         .bind(household_id)
         .bind(now)
         .bind(today)
@@ -169,6 +176,37 @@ pub async fn menu_counts_with_timezone(
         open_shopping,
         done_today,
     })
+}
+
+/// Открытые просроченные задачи всех списков household.
+///
+/// Отдельный запрос для раздела «Просрочено» повестки: календарная развёртка
+/// не возвращает прошлое. Условие то же, что у счётчика просроченных в меню.
+pub async fn overdue_tasks(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    today: NaiveDate,
+    now: DateTime<Utc>,
+) -> Result<Vec<Item>, DomainError> {
+    let rows = sqlx::query_as::<_, ItemRow>(&format!(
+        "SELECT {ITEM_COLUMNS}
+         FROM items i
+         JOIN lists l ON l.id = i.list_id
+         WHERE i.household_id = $1
+           AND i.deleted_at IS NULL
+           AND l.deleted_at IS NULL
+           AND NOT l.is_archived
+           AND l.kind = 'tasks'
+           AND i.status = 'open'
+           AND ({OVERDUE_TASKS_CONDITION})
+         ORDER BY i.due_at NULLS LAST, i.due_date NULLS LAST, i.id",
+    ))
+    .bind(household_id)
+    .bind(now)
+    .bind(today)
+    .fetch_all(&mut *conn)
+    .await?;
+    hydrate_many(conn, rows).await
 }
 
 /// Открытые задачи, назначенные участнику.

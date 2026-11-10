@@ -6234,3 +6234,179 @@ async fn agenda_keeps_a_late_item_of_the_last_day_across_timezones() {
     bot.press("Повестка").await;
     bot.assert_screen_contains("Поздняя задача");
 }
+
+// 0009-events 8.3: первая страница повестки начинается разделом «Просрочено».
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agenda_first_page_starts_with_overdue_tasks_and_hides_a_past_event() {
+    let db = db().await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(moscow, today, 10, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+
+    // Задача вчера — просрочена; событие вчера — просто прошло.
+    let mut overdue = new_item(household.tasks_list_id, "Сдать показания");
+    overdue.due_at = Some(local_utc(moscow, today - Duration::days(1), 18, 0));
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        overdue,
+    )
+    .await;
+
+    // Срок сегодняшнего утра уже прошёл: задача попадает только в
+    // «Просрочено», а не дублируется ещё и в сегодняшнем дне.
+    let mut morning = new_item(household.tasks_list_id, "Оплатить свет");
+    morning.due_at = Some(local_utc(moscow, today, 8, 0));
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        morning,
+    )
+    .await;
+
+    // Вседневная задача на сегодня не просрочена.
+    let mut all_day = new_item(household.tasks_list_id, "Полить цветы");
+    all_day.due_date = Some(today);
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        all_day,
+    )
+    .await;
+
+    let mut past = new_item(household.events_list_id, "Собрание");
+    past.due_at = Some(local_utc(moscow, today - Duration::days(1), 14, 0));
+    past.end_at = Some(local_utc(moscow, today - Duration::days(1), 15, 30));
+    create_item(&db.pool, &household, household.events_list_id, &actor, past).await;
+
+    bot.press("Повестка").await;
+    bot.assert_screen_contains("Просрочено");
+    let labels: Vec<String> = support::telegram::buttons(&bot.screen())
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect();
+    assert_eq!(
+        &labels[..2],
+        [
+            "☐ Сдать показания · вчера, 18:00",
+            "☐ Оплатить свет · сегодня, 08:00",
+        ],
+        "the overdue section goes first: {labels:?}"
+    );
+    assert_eq!(
+        labels
+            .iter()
+            .filter(|label| label.contains("Оплатить свет"))
+            .count(),
+        1,
+        "an overdue task must not repeat in today's day: {labels:?}"
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|label| label == "☐ весь день Полить цветы"),
+        "an all-day task due today is not overdue: {labels:?}"
+    );
+    assert!(
+        !bot.screen().contains("Собрание"),
+        "a past event must not reach the overdue section:\n{}",
+        bot.screen()
+    );
+}
+
+// 0009-events 8.3: список событий открывает повестку только этого списка.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agenda_of_a_single_event_list_shows_only_its_events() {
+    let db = db().await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(moscow, today, 10, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let school = lists::create(
+        &mut conn,
+        household.household_id,
+        ListKind::Events,
+        "Школа",
+        Utc::now(),
+    )
+    .await
+    .expect("school list");
+    drop(conn);
+
+    let mut class = new_item(school.id, "Родительское собрание");
+    class.due_at = Some(local_utc(moscow, today, 14, 0));
+    class.end_at = Some(local_utc(moscow, today, 15, 0));
+    create_item(&db.pool, &household, school.id, &actor, class).await;
+
+    let mut manicure = new_item(household.events_list_id, "Маникюр");
+    manicure.due_at = Some(local_utc(moscow, today, 16, 0));
+    manicure.end_at = Some(local_utc(moscow, today, 17, 0));
+    create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &actor,
+        manicure,
+    )
+    .await;
+
+    let mut call = new_item(household.tasks_list_id, "Позвонить в банк");
+    call.due_at = Some(local_utc(moscow, today, 18, 0));
+    create_item(&db.pool, &household, household.tasks_list_id, &actor, call).await;
+
+    let mut overdue = new_item(household.tasks_list_id, "Сдать показания");
+    overdue.due_at = Some(local_utc(moscow, today - Duration::days(1), 18, 0));
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        overdue,
+    )
+    .await;
+
+    bot.text("/start").await;
+    bot.press("Все списки").await;
+    let button = support::telegram::buttons(&bot.screen())
+        .into_iter()
+        .find(|(label, _)| label.contains("Школа"))
+        .expect("school list button");
+    assert!(
+        button.0.starts_with("🗓"),
+        "an event list must have its own icon, not the shopping cart: {:?}",
+        button.0
+    );
+
+    bot.press("Школа").await;
+    assert!(
+        bot.screen().contains("<h3>Школа</h3>"),
+        "the list name must be the agenda heading:\n{}",
+        bot.screen()
+    );
+    bot.assert_screen_contains("Родительское собрание");
+    assert!(
+        !bot.screen().contains("Маникюр") && !bot.screen().contains("Позвонить в банк"),
+        "the single-list agenda must not show other lists' items:\n{}",
+        bot.screen()
+    );
+    assert!(
+        !bot.screen().contains("Просрочено"),
+        "the single-list agenda must not have the overdue section:\n{}",
+        bot.screen()
+    );
+
+    bot.press("Назад").await;
+    bot.assert_screen_contains("<h3>Все списки</h3>");
+}

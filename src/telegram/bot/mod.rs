@@ -743,6 +743,7 @@ async fn on_text(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
         } => parse_shopping_text(ctx, text, list_id).await,
         routing::TextRoute::ShoppingList { direct: false, .. }
         | routing::TextRoute::Menu
+        | routing::TextRoute::Agenda
         | routing::TextRoute::General => parse_text(ctx, text, None).await,
     }
 }

@@ -10,14 +10,14 @@ use uuid::Uuid;
 
 use crate::domain::calendar::{self, CalendarEvent, CalendarTime};
 use crate::domain::events::start_of_day;
-use crate::domain::models::{ItemStatus, ListKind};
+use crate::domain::models::{Item, ItemStatus, ListKind};
 use crate::domain::recurrence::parse_timezone;
 use crate::storage::repositories::{items, lists};
 use crate::telegram::rich::button;
 use crate::telegram::ru;
 
 use super::model::{Action, Screen, Ui};
-use super::screens::{clip, nav_row};
+use super::screens::{clip, nav_row, sort_tasks, task_label};
 use super::{Ctx, Fail};
 
 /// Дней в окне повестки.
@@ -70,10 +70,19 @@ pub async fn view(ctx: &mut Ctx<'_>, list: Option<Uuid>, page: u32) -> Result<Ui
 
     let mut entries = items::calendar_items(&mut *ctx.conn, household_id).await?;
     if let Some(list_id) = list {
-        // 0009-events 8.3: повестка одного списка показывает только его события,
-        // без задач.
+        // Повестка одного списка показывает только его события, без задач.
         entries.retain(|entry| entry.item.list_id == list_id && entry.kind == ListKind::Events);
     }
+
+    // Раздел «Просрочено» есть только на первой странице общей повестки:
+    // календарная развёртка не возвращает прошлое, поэтому задачи берутся
+    // отдельным запросом.
+    let mut overdue = if list.is_none() && page == 0 {
+        items::overdue_tasks(&mut *ctx.conn, household_id, today, ctx.now).await?
+    } else {
+        Vec::new()
+    };
+    sort_tasks(&mut overdue, ctx.tz, ctx.now);
 
     let mut rows = Vec::new();
     let expansion_start = start - Duration::days(EXPANSION_MARGIN_DAYS);
@@ -112,14 +121,32 @@ pub async fn view(ctx: &mut Ctx<'_>, list: Option<Uuid>, page: u32) -> Result<Ui
     };
     let mut ui = Ui::new().heading(screen.trail(&title, None));
 
-    let shown = rows.len().min(MAX_ROWS);
-    if rows.is_empty() {
+    // Раздел «Просрочено» входит в общий лимит строк повестки: он идёт первым
+    // и при переполнении вытесняет дни окна, а счётчик «…и ещё» считает всё
+    // скрытое.
+    let mut budget = MAX_ROWS;
+    let total = overdue.len() + rows.len();
+    if total == 0 {
         // 0009-events 9.1: кнопка «➕ Событие» появится вместе с редактором
         // события; пока пустое состояние только предлагает его добавить.
         ui = ui.text("На эти дни ничего не запланировано — добавьте событие.");
     } else {
+        if !overdue.is_empty() {
+            ui = ui.bold("Просрочено");
+            for item in overdue.iter().take(budget) {
+                ui = ui.row(vec![go(
+                    &overdue_label(item, ctx.tz, ctx.now),
+                    Screen::Item {
+                        item_id: item.id,
+                        back: Box::new(screen.clone()),
+                        completion_id: None,
+                    },
+                )]);
+            }
+            budget -= overdue.len().min(budget);
+        }
         let mut current_day = None;
-        for row in &rows[..shown] {
+        for row in rows.iter().take(budget) {
             if current_day != Some(row.day) {
                 ui = ui.bold(ru::day_label(row.day));
                 current_day = Some(row.day);
@@ -137,8 +164,8 @@ pub async fn view(ctx: &mut Ctx<'_>, list: Option<Uuid>, page: u32) -> Result<Ui
                 },
             )]);
         }
-        if rows.len() > shown {
-            ui = ui.text(format!("…и ещё {}", rows.len() - shown));
+        if total > MAX_ROWS {
+            ui = ui.text(format!("…и ещё {}", total - MAX_ROWS));
         }
     }
 
@@ -159,7 +186,23 @@ pub async fn view(ctx: &mut Ctx<'_>, list: Option<Uuid>, page: u32) -> Result<Ui
             page: page + 1,
         },
     ));
-    Ok(ui.row(navigation).row(nav_row(&screen, Screen::Menu)))
+    // Повестка одного списка открывается из «Все списки» и возвращает туда.
+    let back = if list.is_some() {
+        Screen::Lists
+    } else {
+        Screen::Menu
+    };
+    Ok(ui.row(navigation).row(nav_row(&screen, back)))
+}
+
+/// Подпись строки просроченной задачи: отметка открытой задачи, срок и
+/// повторение — как у строк повестки.
+fn overdue_label(item: &Item, tz: Tz, now: DateTime<Utc>) -> String {
+    let mut label = format!("☐ {}", task_label(item, tz, now));
+    if item.recurrence.is_some() {
+        label.push_str(" 🔁");
+    }
+    label
 }
 
 fn go(label: &str, to: Screen) -> crate::telegram::rich::Button<Action> {
@@ -190,6 +233,9 @@ fn collect_rows(
         };
         if day >= window.start && day < window.end {
             let time = match event.start {
+                // Прошедшее вхождение уже показано в разделе «Просрочено»;
+                // будущие вхождения серии остаются на своих днях.
+                CalendarTime::DateTime(at) if at < window.now => return,
                 CalendarTime::DateTime(at) => Some(at),
                 CalendarTime::Date(_) => None,
             };
