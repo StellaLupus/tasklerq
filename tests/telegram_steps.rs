@@ -587,3 +587,63 @@ async fn event_end_before_start_is_rejected_and_creates_nothing() {
         "an event with a reversed interval must not be created"
     );
 }
+
+// 0009-events 9.2 (ревью 9.1): перенос только начала сдвигает конец доменом,
+// сохраняя длительность.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editing_only_the_start_of_an_event_shifts_the_end() {
+    use chrono::{DateTime, TimeZone};
+
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = stand_household(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let today = bot.now.with_timezone(&moscow).date_naive();
+    let tomorrow = today + Duration::days(1);
+    let after_tomorrow = today + Duration::days(2);
+    let at = |date: chrono::NaiveDate, hour: u32| {
+        moscow
+            .from_local_datetime(&date.and_hms_opt(hour, 0, 0).expect("time"))
+            .single()
+            .expect("local time")
+            .with_timezone(&Utc)
+    };
+
+    let mut event = support::new_item(household.events_list_id, "Маникюр");
+    event.due_at = Some(at(tomorrow, 14));
+    event.end_at = Some(at(tomorrow, 15));
+    let event = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        event,
+    )
+    .await;
+
+    bot.press("Повестка").await;
+    bot.press("Маникюр").await;
+    bot.press("Править").await;
+    bot.press("Начало").await;
+    bot.press("Дата и время").await;
+    bot.text("послезавтра 14:00").await;
+    bot.press("Сохранить").await;
+
+    bot.assert_screen_contains("Сохранено");
+    let (due_at, end_at): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) =
+        sqlx::query_as("SELECT due_at, end_at FROM items WHERE id = $1")
+            .bind(event.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("event");
+    assert_eq!(
+        due_at,
+        Some(at(after_tomorrow, 14)),
+        "the start moves to the day after tomorrow"
+    );
+    assert_eq!(
+        end_at,
+        Some(at(after_tomorrow, 15)),
+        "the end follows the start and keeps the one-hour duration"
+    );
+}

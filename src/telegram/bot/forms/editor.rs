@@ -502,14 +502,8 @@ async fn values(ctx: &mut Ctx<'_>, editor: &Editor, kind: ListKind) -> Result<Ve
             Some(start) => format!("Начало: {}", ru::capitalize(&start)),
             None => "Начало: без начала".to_owned(),
         });
-        // Дату без времени показываем датой, а не полуночью следующего дня.
-        let end_label = if let (Some(date), None) = (draft.end_date, draft.end_time) {
-            ru::due_label(None, Some(date), ctx.tz, ctx.now)
-        } else {
-            let (end_at, end_date) = draft.end(ctx.tz)?;
-            ru::due_label(end_at, end_date, ctx.tz, ctx.now)
-        };
-        lines.push(match end_label {
+        let (end_at, end_date) = draft.end(ctx.tz)?;
+        lines.push(match ru::due_label(end_at, end_date, ctx.tz, ctx.now) {
             Some(end) => format!("Конец: {}", ru::capitalize(&end)),
             None => "Конец: без конца".to_owned(),
         });
@@ -823,8 +817,9 @@ async fn save_item(
 /// Проблема черновика события, которую нужно объяснить до записи.
 ///
 /// У события обязательно начало, конец того же вида, что начало, и не раньше
-/// него. Проверка общая для создания и правки: домен отвергает те же значения,
-/// но отвечает общим сообщением, а редактор должен назвать причину.
+/// него, если конец в редакторе изменили. Проверка общая для создания и правки:
+/// домен отвергает те же значения, но отвечает общим сообщением, а редактор
+/// должен назвать причину.
 fn event_draft_problem(
     editor: &Editor,
     kind: ListKind,
@@ -853,6 +848,19 @@ fn event_draft_problem(
             "Для события со временем укажите время конца.".to_owned(),
             Some(Step::End),
         )));
+    }
+    // Конец не меняли — в патч уходит только начало, а домен сдвинет конец,
+    // сохранив длительность. Проверять «конец раньше начала» не на чем.
+    // Сравниваем со снимком, а не с `touched`: открытый и закрытый шаг «Конец»
+    // с прежним значением в патч не попадает. У создания снимка нет.
+    let end_changed = match &editor.target {
+        EditorTarget::Item { base, .. } => {
+            !value_eq(EditorField::End, draft, editor.list_id, base, timezone)?
+        }
+        EditorTarget::New { .. } | EditorTarget::DraftItem { .. } => true,
+    };
+    if !end_changed {
+        return Ok(None);
     }
     let (due_at, due_date) = draft.due(timezone)?;
     let (end_at, end_date) = draft.end(timezone)?;

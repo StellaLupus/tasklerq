@@ -3536,3 +3536,64 @@ async fn event_editor_rejects_a_date_only_end_for_a_timed_event() {
     .expect("count");
     assert_eq!(saved, 0);
 }
+
+// 0009-events 9.2 (ревью 9.1): открытый и закрытый шаг «Конец» с прежним
+// значением не блокирует перенос начала — конец сдвигает домен.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn event_editor_confirmed_end_does_not_block_a_later_start() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = test_household(&db.pool, bot.chat).await;
+    let tz = moscow();
+    let tomorrow = (bot.now + Duration::days(1))
+        .with_timezone(&tz)
+        .date_naive();
+    let at = |hour: u32| {
+        tz.with_ymd_and_hms(
+            tomorrow.year(),
+            tomorrow.month(),
+            tomorrow.day(),
+            hour,
+            0,
+            0,
+        )
+        .single()
+        .expect("local time")
+        .with_timezone(&Utc)
+    };
+    let mut event = new_item(household.events_list_id, "Маникюр");
+    event.due_at = Some(at(14));
+    event.end_at = Some(at(15));
+    let event = create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        event,
+    )
+    .await;
+
+    bot.press("Повестка").await;
+    bot.press("Маникюр").await;
+    bot.press("Править").await;
+    bot.press("Начало").await;
+    bot.press("Дата и время").await;
+    bot.text("завтра 16:00").await;
+    bot.press("Конец").await;
+    bot.press("Дата и время").await;
+    bot.text("завтра 15:00").await;
+    bot.press("Сохранить").await;
+
+    bot.assert_screen_contains("Сохранено");
+    let (due_at, end_at): (Option<chrono::DateTime<Utc>>, Option<chrono::DateTime<Utc>>) =
+        sqlx::query_as("SELECT due_at, end_at FROM items WHERE id = $1")
+            .bind(event.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("event");
+    assert_eq!(
+        (due_at, end_at),
+        (Some(at(16)), Some(at(17))),
+        "the end follows the moved start and keeps the one-hour duration"
+    );
+}

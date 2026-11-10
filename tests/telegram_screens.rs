@@ -5,7 +5,7 @@ mod support;
 use std::sync::Arc;
 
 use axum::http::{Method, StatusCode};
-use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
 use sqlx::PgPool;
 use support::telegram::{Call, FakeTelegram, Harness, button_rows};
 use support::{TestHousehold, create_item, db, new_item, next_telegram_id};
@@ -6493,5 +6493,309 @@ async fn all_lists_event_counter_skips_past_events() {
         bot.screen().contains("🗓 Школа · 1"),
         "the event list counter must skip a passed event:\n{}",
         bot.screen()
+    );
+}
+
+// 0009-events 9.2: карточка события показывает свои поля и действия.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn event_card_shows_the_event_fields_and_action_buttons() {
+    let db = db().await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(moscow, today, 10, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut event = new_item(household.events_list_id, "Маникюр");
+    event.due_at = Some(local_utc(moscow, today, 14, 0));
+    event.end_at = Some(local_utc(moscow, today, 15, 30));
+    event.tags = vec!["дом".into()];
+    event.assignee_user_id = Some(household.owner_id);
+    event.notes = Some("Записаться заранее".into());
+    event.recurrence = Some(support::recurrence(RecurrenceFreq::Daily, Vec::new()));
+    create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &actor,
+        event,
+    )
+    .await;
+
+    bot.press("Повестка").await;
+    bot.press("Маникюр").await;
+
+    for label in ["📅 Перенести", "✏️ Править", "🗑 Удалить", "Назад", "Меню"]
+    {
+        bot.assert_has_button(label);
+    }
+    for label in ["✓ Выполнено", "📅 Срок", "На час"] {
+        assert!(
+            bot.find_button(label).is_none(),
+            "the event card must not offer `{label}`:\n{}",
+            bot.screen()
+        );
+    }
+    assert!(
+        !bot.screen().contains("Приоритет"),
+        "an event has no priority:\n{}",
+        bot.screen()
+    );
+    bot.assert_screen_contains("📅 Начало: Сегодня, 14:00");
+    bot.assert_screen_contains("🏁 Конец: Сегодня, 15:30");
+    bot.assert_screen_contains("🏷 дом");
+    bot.assert_screen_contains("👤 Чьё событие: Alice");
+    bot.assert_screen_contains("🔁 Каждый день");
+    bot.assert_screen_contains("Список: Календарь");
+    bot.assert_screen_contains("Записаться заранее");
+}
+
+// 0009-events 9.2: перенос события на завтра сохраняет длительность.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn event_transfer_to_tomorrow_keeps_the_duration() {
+    let db = db().await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(moscow, today, 10, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut event = new_item(household.events_list_id, "Маникюр");
+    event.due_at = Some(local_utc(moscow, today, 14, 0));
+    event.end_at = Some(local_utc(moscow, today, 15, 30));
+    let event = create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &actor,
+        event,
+    )
+    .await;
+
+    bot.press("Повестка").await;
+    bot.press("Маникюр").await;
+    bot.press("Перенести").await;
+    bot.assert_has_button("Сегодня");
+    bot.assert_has_button("Завтра");
+    bot.assert_has_button("+1 неделя");
+    bot.assert_has_button("Дата и время");
+    bot.press("Завтра").await;
+
+    bot.assert_screen_contains("Начало: завтра, 14:00");
+    bot.assert_screen_contains("🏁 Конец: Завтра, 15:30");
+    bot.assert_has_button("📅 Перенести");
+    let (due_at, end_at): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) =
+        sqlx::query_as("SELECT due_at, end_at FROM items WHERE id = $1")
+            .bind(event.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("event");
+    assert_eq!(
+        (due_at, end_at),
+        (
+            Some(local_utc(moscow, today + Duration::days(1), 14, 0)),
+            Some(local_utc(moscow, today + Duration::days(1), 15, 30)),
+        ),
+        "the start moves to tomorrow and the duration stays the same"
+    );
+    assert_eq!(
+        saved_screen(&db.pool, bot.chat).await["t"],
+        serde_json::json!("item"),
+        "after the transfer the active screen is the card"
+    );
+}
+
+// 0009-events 9.2: у события нет варианта «Без срока».
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn event_quick_due_has_no_without_due_option() {
+    let db = db().await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(moscow, today, 10, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut event = new_item(household.events_list_id, "Маникюр");
+    event.due_at = Some(local_utc(moscow, today, 14, 0));
+    event.end_at = Some(local_utc(moscow, today, 15, 30));
+    create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &actor,
+        event,
+    )
+    .await;
+
+    bot.press("Повестка").await;
+    bot.press("Маникюр").await;
+    bot.press("Перенести").await;
+
+    assert!(
+        bot.find_button("Без срока").is_none(),
+        "an event must not lose its start:\n{}",
+        bot.screen()
+    );
+}
+
+// 0009-events 9.2: перенос повторяющегося события двигает только ближайшее
+// вхождение, серия остаётся на своём времени.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn event_transfer_moves_only_the_nearest_occurrence() {
+    let db = db().await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let tuesday = today + Duration::days(1);
+    let now = local_utc(moscow, today, 10, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut training = new_item(household.events_list_id, "Тренировка");
+    training.due_at = Some(local_utc(moscow, tuesday, 18, 0));
+    training.end_at = Some(local_utc(moscow, tuesday, 19, 0));
+    training.recurrence = Some(support::recurrence(RecurrenceFreq::Weekly, vec![2, 4]));
+    let training = create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &actor,
+        training,
+    )
+    .await;
+
+    bot.press("Повестка").await;
+    bot.press("Тренировка").await;
+    bot.press("Перенести").await;
+    bot.press("+1 неделя").await;
+
+    let moved = items::get(
+        &mut db.pool.acquire().await.expect("conn"),
+        household.household_id,
+        training.id,
+    )
+    .await
+    .expect("moved occurrence");
+    assert_eq!(
+        moved.due_at,
+        Some(local_utc(moscow, tuesday + Duration::days(7), 18, 0))
+    );
+    assert_eq!(
+        moved.end_at,
+        Some(local_utc(moscow, tuesday + Duration::days(7), 19, 0)),
+        "the duration of the moved occurrence stays the same"
+    );
+    let rule = moved.recurrence.as_ref().expect("rule");
+    assert_eq!(
+        rule.occurrence_date,
+        Some(tuesday),
+        "the original series slot stays in the rule"
+    );
+    assert_eq!(
+        rule.occurrence_time,
+        Some(NaiveTime::from_hms_opt(18, 0, 0).unwrap())
+    );
+    bot.assert_screen_contains("Начало: вт, 23 мар, 18:00");
+}
+
+// 0009-events 9.2: текстовый ввод даты в быстром сроке события сохраняет вид
+// начала и длительность.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn event_quick_due_text_keeps_the_time_and_duration() {
+    let db = db().await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(moscow, today, 10, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut event = new_item(household.events_list_id, "Маникюр");
+    event.due_at = Some(local_utc(moscow, today, 14, 0));
+    event.end_at = Some(local_utc(moscow, today, 15, 30));
+    let event = create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &actor,
+        event,
+    )
+    .await;
+
+    bot.press("Повестка").await;
+    bot.press("Маникюр").await;
+    bot.press("Перенести").await;
+    bot.press("Дата и время").await;
+    bot.text("завтра").await;
+
+    bot.assert_screen_contains("Начало: завтра, 14:00");
+    bot.assert_screen_contains("🏁 Конец: Завтра, 15:30");
+    let (due_at, end_at): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) =
+        sqlx::query_as("SELECT due_at, end_at FROM items WHERE id = $1")
+            .bind(event.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("event");
+    assert_eq!(
+        (due_at, end_at),
+        (
+            Some(local_utc(moscow, today + Duration::days(1), 14, 0)),
+            Some(local_utc(moscow, today + Duration::days(1), 15, 30)),
+        ),
+        "a date without time keeps the start time of a timed event"
+    );
+}
+
+// 0009-events 9.2: у вседневного события время начала отклоняется с
+// пояснением, форма остаётся открытой.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn event_quick_due_text_rejects_a_time_for_an_all_day_event() {
+    let db = db().await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let today = NaiveDate::from_ymd_opt(2027, 3, 15).expect("date");
+    let now = local_utc(moscow, today, 10, 0);
+    let mut bot = onboarded_at(&db.pool, "Alice", now).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let tomorrow = today + Duration::days(1);
+    let mut event = new_item(household.events_list_id, "Отпуск");
+    event.due_date = Some(tomorrow);
+    event.end_date = Some(tomorrow + Duration::days(2));
+    let event = create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &actor,
+        event,
+    )
+    .await;
+
+    bot.press("Повестка").await;
+    bot.press("Отпуск").await;
+    bot.press("Перенести").await;
+    bot.press("Дата и время").await;
+    bot.text("завтра 15:00").await;
+
+    bot.assert_screen_contains("У события без времени начало задаётся датой.");
+    bot.assert_screen_contains("Введите срок");
+    let start: (Option<DateTime<Utc>>, Option<NaiveDate>) =
+        sqlx::query_as("SELECT due_at, due_date FROM items WHERE id = $1")
+            .bind(event.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("event start");
+    let end: (Option<DateTime<Utc>>, Option<NaiveDate>) =
+        sqlx::query_as("SELECT end_at, end_date FROM items WHERE id = $1")
+            .bind(event.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("event end");
+    assert_eq!(
+        start,
+        (None, Some(tomorrow)),
+        "the refused input must not move the start"
+    );
+    assert_eq!(
+        end,
+        (None, Some(tomorrow + Duration::days(2))),
+        "the refused input must not move the end"
     );
 }

@@ -149,8 +149,6 @@ pub async fn view(ctx: &mut Ctx<'_>, list: Option<Uuid>, page: u32) -> Result<Ui
                 ui = ui.bold(ru::day_label(row.day));
                 current_day = Some(row.day);
             }
-            // 0009-events 9.2: строка события откроет карточку события;
-            // пока открывается существующая карточка элемента.
             ui = ui.row(vec![button(
                 &row.label,
                 Action::Go {

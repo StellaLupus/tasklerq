@@ -1382,9 +1382,10 @@ impl ItemDraft {
     /// Конец события для домена: (со временем, на весь день).
     ///
     /// Время без даты относится ко дню начала, а если оно не позже времени
-    /// начала — к следующему дню (design, решение 7). Дата без времени у
-    /// события со временем означает конец того дня. Без начала конца тоже нет:
-    /// сохранение события без начала отклоняется отдельно.
+    /// начала — к следующему дню (design, решение 7). Дату без времени у
+    /// события со временем редактор отклоняет до записи, поэтому здесь она
+    /// остаётся датой и показывается датой, а не полуночью. Без начала конца
+    /// тоже нет: сохранение события без начала отклоняется отдельно.
     #[allow(clippy::type_complexity)]
     pub fn end(
         &self,
@@ -1394,23 +1395,16 @@ impl ItemDraft {
             return Ok((None, None));
         }
         match (self.date, self.time) {
-            (Some(start_date), Some(start_time)) => match (self.end_date, self.end_time) {
-                (end_date, Some(end_time)) => {
-                    let mut date = end_date.unwrap_or(start_date);
-                    if end_date.is_none() && end_time <= start_time {
-                        date += chrono::Duration::days(1);
-                    }
-                    Ok((Some(resolve_local(timezone, date, end_time)?), None))
+            (Some(start_date), Some(start_time)) => {
+                let Some(end_time) = self.end_time else {
+                    return Ok((None, self.end_date));
+                };
+                let mut date = self.end_date.unwrap_or(start_date);
+                if self.end_date.is_none() && end_time <= start_time {
+                    date += chrono::Duration::days(1);
                 }
-                (Some(end_date), None) => Ok((
-                    Some(crate::domain::events::start_of_day(
-                        timezone,
-                        end_date + chrono::Duration::days(1),
-                    )),
-                    None,
-                )),
-                (None, None) => Ok((None, None)),
-            },
+                Ok((Some(resolve_local(timezone, date, end_time)?), None))
+            }
             // У вседневного начала конец тоже вседневный: время без даты
             // относится к дню начала.
             (Some(start_date), None) => Ok((None, Some(self.end_date.unwrap_or(start_date)))),
