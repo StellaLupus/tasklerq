@@ -68,6 +68,8 @@ pub fn validate_new_item(
         ));
     }
 
+    // 0009-events 3.1: у события не будет количества и единицы; пока оно
+    // попадает в ветку не-задачи вместе с покупками.
     let (quantity, unit) = if matches!(list_kind, ListKind::Tasks) {
         (None, None)
     } else {
@@ -82,6 +84,7 @@ pub fn validate_new_item(
 
     let recurrence = match item.recurrence {
         Some(input) => {
+            // 0009-events 5.1: повторение станет доступно и спискам событий.
             if list_kind != ListKind::Tasks {
                 return Err(DomainError::Validation(
                     "recurrence is only allowed for task lists".into(),

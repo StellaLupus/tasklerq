@@ -252,6 +252,8 @@ fn kind_icon(kind: ListKind) -> &'static str {
         ListKind::Tasks => "📋",
         ListKind::Shopping => "🛒",
         ListKind::Checklist => "☑️",
+        // 0009-events 8.1: у списка событий появится свой значок в меню.
+        ListKind::Events => "☑️",
     }
 }
 
@@ -950,6 +952,8 @@ fn to_raw(draft: &ItemDraft, kind: ListKind, list_name: &str, until: Option<Stri
         weekdays: rule.weekdays.iter().map(|day| i64::from(*day)).collect(),
         until,
     });
+    // 0009-events 6.1: разбор не должен видеть списки событий; пока событие
+    // попадает в ветку не-задачи.
     let shopping = kind != ListKind::Tasks;
 
     RawItem {

@@ -170,6 +170,8 @@ pub async fn view(
 ) -> Result<Ui, Fail> {
     let (item, list) = load(ctx, item_id).await?;
     let names = names(ctx).await?;
+    // 0009-events 9.2: карточка события получит свои поля и кнопки; пока
+    // событие идёт по ветке не-задачи.
     let shopping = list.kind != ListKind::Tasks;
     let completions = if shopping {
         Vec::new()

@@ -1343,6 +1343,8 @@ impl ItemDraft {
         kind: ListKind,
     ) -> Result<NewItem, DomainError> {
         let (due_at, due_date) = self.due(timezone)?;
+        // 0009-events 9.1: у события не будет количества и единицы; пока оно
+        // попадает в ветку не-задачи.
         let shopping = kind != ListKind::Tasks;
         Ok(NewItem {
             list_id,

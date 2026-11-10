@@ -367,6 +367,8 @@ pub async fn clear_undo(
     }
     let kind_ok = lists::get_visible(&mut *ctx.conn, household_id, list_id)
         .await
+        // 0009-events 8.3: экран списка событий будет повесткой, а не списком
+        // покупок; пока он попадает в не-задачи.
         .map(|list| list.kind != ListKind::Tasks)
         .unwrap_or(false);
     let target = if kind_ok {

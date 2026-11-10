@@ -1110,6 +1110,9 @@ pub(super) fn applied_speech(items: &[CaptureItem]) -> String {
                 ListKind::Shopping => format!("Добавил покупку: {titles}."),
                 ListKind::Tasks => format!("Добавил задачу: {titles}."),
                 ListKind::Checklist => format!("Добавил позицию: {titles}."),
+                // 0009-events 6.1: списки событий исключаются из разбора;
+                // до этого у события нейтральный текст, не задача и не покупка.
+                ListKind::Events => format!("Добавил элемент: {titles}."),
             }
         }
         Some(kind) if count <= 3 => {
@@ -1134,6 +1137,12 @@ fn kind_noun(kind: ListKind, count: usize) -> String {
         ListKind::Shopping => crate::telegram::ru::purchases(count as i64),
         ListKind::Tasks => crate::telegram::ru::tasks(count as i64),
         ListKind::Checklist => crate::telegram::ru::positions(count as i64),
+        // 0009-events 6.1: списки событий исключаются из разбора;
+        // до этого — нейтральное «элементы», не задачи и не покупки.
+        ListKind::Events => format!(
+            "{count} {}",
+            crate::telegram::ru::plural(count as i64, "элемент", "элемента", "элементов")
+        ),
     }
 }
 

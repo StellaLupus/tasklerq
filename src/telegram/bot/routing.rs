@@ -456,7 +456,9 @@ mod tests {
                     ListKind::Shopping | ListKind::Tasks => ru::list_hint(&list.name),
                     // Чек-лист уходит в общий разбор, поэтому обещает то же,
                     // что остальные экраны с общим разбором.
-                    ListKind::Checklist => if llm_capture {
+                    // 0009-events 8.2: список событий откроет повестку; пока
+                    // текст на его экране уходит в общий разбор, как у чек-листа.
+                    ListKind::Checklist | ListKind::Events => if llm_capture {
                         ru::MENU_HINT
                     } else {
                         ru::MENU_HINT_NO_LLM

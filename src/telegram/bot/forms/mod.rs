@@ -381,6 +381,7 @@ pub async fn finish(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
 
 async fn lists_of_kind(ctx: &mut Ctx<'_>, kind: ListKind) -> Result<Vec<List>, Fail> {
     let household_id = ctx.household()?.id;
+    // 0009-events 9.1: у списка событий будет свой выбор списка в редакторе.
     let wanted_shopping = kind != ListKind::Tasks;
     Ok(lists::list(&mut *ctx.conn, household_id)
         .await?

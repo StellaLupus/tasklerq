@@ -197,6 +197,8 @@ async fn list_of_editor(
 
 async fn main_view(ctx: &mut Ctx<'_>, editor: &Editor) -> Result<Ui, Fail> {
     let list = list_of_editor(ctx, editor).await?;
+    // 0009-events 9.1: у события будет свой набор полей редактора, без
+    // количества и единицы; пока оно попадает в ветку не-задачи.
     let shopping = list.kind != ListKind::Tasks;
     let screen = editor.screen();
     let title = if editor.draft.title.trim().is_empty() {
@@ -260,6 +262,7 @@ async fn main_view(ctx: &mut Ctx<'_>, editor: &Editor) -> Result<Ui, Fail> {
 
 async fn field_view(ctx: &mut Ctx<'_>, editor: &Editor, step: Step) -> Result<Ui, Fail> {
     let list = list_of_editor(ctx, editor).await?;
+    // 0009-events 9.1: поля события добавит редактор события.
     let shopping = list.kind != ListKind::Tasks;
     let screen = editor.screen();
     let mut ui = Ui::new();
@@ -287,6 +290,8 @@ async fn field_view(ctx: &mut Ctx<'_>, editor: &Editor, step: Step) -> Result<Ui
                 let household_id = ctx.household()?.id;
                 let mut lists = lists::list(&mut *ctx.conn, household_id).await?;
                 lists.retain(|list| !list.is_archived);
+                // 0009-events 9.1: список событий получит свой значок и место
+                // в выборе; пока он сортируется вместе с покупками.
                 lists.sort_by_key(|list| list.kind != ListKind::Tasks);
                 for list in lists {
                     let icon = if list.kind == ListKind::Tasks {
@@ -741,6 +746,7 @@ async fn save_new(
         editor.duplicate = None;
     }
     let list = lists::get_visible(&mut *ctx.conn, household.id, editor.list_id).await?;
+    // 0009-events 9.1: у события не будет полей покупки при сохранении.
     let shopping = list.kind != ListKind::Tasks;
 
     if editor.draft.title.trim().is_empty() {
@@ -1465,6 +1471,7 @@ fn switch_list(editor: &mut Editor, list: &crate::domain::models::List) {
         EditorTarget::New { kind, .. } | EditorTarget::DraftItem { kind, .. } => *kind,
         EditorTarget::Item { .. } => return,
     };
+    // 0009-events 9.1: переключение на список событий будет отдельной веткой.
     let was_shopping = old_kind != ListKind::Tasks;
     let shopping = list.kind != ListKind::Tasks;
     if was_shopping != shopping {

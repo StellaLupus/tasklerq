@@ -53,6 +53,8 @@ pub fn build_instructions(context: &CaptureContext, text: &str) -> String {
                 ListKind::Tasks => "tasks",
                 ListKind::Shopping => "shopping",
                 ListKind::Checklist => "checklist",
+                // 0009-events 6.1: списки событий исключаются из контекста разбора.
+                ListKind::Events => "events",
             }
         )
     }));

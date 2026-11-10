@@ -27,6 +27,8 @@ pub enum ListKind {
     Shopping,
     /// Чек-лист.
     Checklist,
+    /// События.
+    Events,
 }
 
 /// Статус элемента или подзадачи.

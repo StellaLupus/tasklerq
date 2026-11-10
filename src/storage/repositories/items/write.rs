@@ -312,6 +312,7 @@ async fn update_inner(
         }
         Field::Null => recurrence = None,
         Field::Value(input) => {
+            // 0009-events 5.1: повторение станет доступно и спискам событий.
             if target_list.kind != ListKind::Tasks {
                 return Err(DomainError::Validation(
                     "recurrence is only allowed for task lists".into(),
@@ -406,6 +407,8 @@ async fn update_inner(
         }
     }
 
+    // 0009-events 3.1: у события не будет количества и единицы; пока оно
+    // попадает в ветку не-задачи вместе с покупками.
     let (quantity, unit) = if target_list.kind == ListKind::Tasks {
         (None, None)
     } else {

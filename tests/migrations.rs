@@ -365,6 +365,239 @@ async fn snooze_origin_migration_keeps_existing_snooze_unbound() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_migration_adds_one_default_calendar_list_and_keeps_existing_lists() {
+    let db = support::empty_db().await;
+    let dir = std::env::temp_dir().join(format!(
+        "tasklerq-migrations-0017-{}",
+        Uuid::now_v7().simple()
+    ));
+    std::fs::create_dir_all(&dir).expect("temporary migration directory");
+    copy_migrations_through(16, &dir);
+
+    let before = Migrator::new(dir.as_path())
+        .await
+        .expect("a migrator through 0016 should resolve");
+    before
+        .run(&db.pool)
+        .await
+        .context("migrations through 0016 should apply")
+        .expect("migrations through 0016");
+
+    // Household и его списки созданы до 0017: два списка по умолчанию и
+    // дополнительный чек-лист, чтобы позиция «Календаря» была после них.
+    let household_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO households (id, name, timezone)
+         VALUES ($1, 'Старый household', 'Europe/Moscow')",
+    )
+    .bind(household_id)
+    .execute(&db.pool)
+    .await
+    .expect("household before the migration");
+    for (kind, name, is_default, position) in [
+        ("tasks", "Задачи", true, 0),
+        ("shopping", "Покупки", true, 1),
+        ("checklist", "Дача", false, 2),
+    ] {
+        sqlx::query(
+            "INSERT INTO lists (
+                 id, household_id, kind, name, is_default, is_archived, position
+             )
+             VALUES ($1, $2, $3::list_kind, $4, $5, false, $6)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(household_id)
+        .bind(kind)
+        .bind(name)
+        .bind(is_default)
+        .bind(position)
+        .execute(&db.pool)
+        .await
+        .expect("list before the migration");
+    }
+    let before_lists: Vec<(Uuid, String, bool, i32)> = sqlx::query_as(
+        "SELECT id, kind::text, is_default, position
+         FROM lists
+         WHERE household_id = $1 AND deleted_at IS NULL
+         ORDER BY position, id",
+    )
+    .bind(household_id)
+    .fetch_all(&db.pool)
+    .await
+    .expect("lists before the migration");
+    assert_eq!(before_lists.len(), 3);
+
+    MIGRATOR
+        .run(&db.pool)
+        .await
+        .expect("0017 must apply over an existing household");
+
+    let after_lists: Vec<(Uuid, String, bool, i32)> = sqlx::query_as(
+        "SELECT id, kind::text, is_default, position
+         FROM lists
+         WHERE household_id = $1 AND deleted_at IS NULL
+         ORDER BY position, id",
+    )
+    .bind(household_id)
+    .fetch_all(&db.pool)
+    .await
+    .expect("lists after the migration");
+
+    let events: Vec<&(Uuid, String, bool, i32)> = after_lists
+        .iter()
+        .filter(|(_, kind, _, _)| kind == "events")
+        .collect();
+    assert_eq!(
+        events.len(),
+        1,
+        "0017 must create exactly one events list: {after_lists:?}"
+    );
+    let (event_id, _, is_default, position) = events[0];
+    assert!(*is_default, "the events list must be the default one");
+    assert_eq!(
+        *position,
+        before_lists
+            .iter()
+            .map(|(_, _, _, position)| *position)
+            .max()
+            .expect("existing lists")
+            + 1,
+        "the events list must go after the existing lists"
+    );
+    let name: String = sqlx::query_scalar("SELECT name FROM lists WHERE id = $1")
+        .bind(event_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("events list name");
+    assert_eq!(name, "Календарь");
+
+    let after_without_events: Vec<(Uuid, String, bool, i32)> = after_lists
+        .into_iter()
+        .filter(|(_, kind, _, _)| kind != "events")
+        .collect();
+    assert_eq!(
+        after_without_events, before_lists,
+        "the migration must keep the existing lists and their positions"
+    );
+
+    // sqlx не запускает применённую миграцию второй раз, поэтому проверяем
+    // сам запрос вставки: его `NOT EXISTS` не должен создать второй список.
+    let migration = include_str!("../migrations/0017_events.sql");
+    let insert = migration
+        .split_once("INSERT INTO lists")
+        .expect("0017 must contain the list insertion")
+        .1
+        .trim()
+        .trim_end_matches(';');
+    sqlx::query(&format!("INSERT INTO lists {insert}"))
+        .execute(&db.pool)
+        .await
+        .expect("the list insertion must be repeatable");
+    let events_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM lists
+         WHERE household_id = $1 AND kind = 'events' AND deleted_at IS NULL",
+    )
+    .bind(household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("events list count");
+    assert_eq!(
+        events_count, 1,
+        "a repeated list insertion must not create a second events list"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_migration_uses_a_free_name_when_calendar_is_taken() {
+    let db = support::empty_db().await;
+    let dir = std::env::temp_dir().join(format!(
+        "tasklerq-migrations-0017-name-{}",
+        Uuid::now_v7().simple()
+    ));
+    std::fs::create_dir_all(&dir).expect("temporary migration directory");
+    copy_migrations_through(16, &dir);
+
+    let before = Migrator::new(dir.as_path())
+        .await
+        .expect("a migrator through 0016 should resolve");
+    before
+        .run(&db.pool)
+        .await
+        .context("migrations through 0016 should apply")
+        .expect("migrations through 0016");
+
+    let household_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO households (id, name, timezone)
+         VALUES ($1, 'Household с занятым именем', 'Europe/Moscow')",
+    )
+    .bind(household_id)
+    .execute(&db.pool)
+    .await
+    .expect("household before the migration");
+    for (kind, name, is_default, position) in [
+        ("tasks", "Задачи", true, 0),
+        ("shopping", "Покупки", true, 1),
+        ("checklist", "календарь", false, 2),
+    ] {
+        sqlx::query(
+            "INSERT INTO lists (
+                 id, household_id, kind, name, is_default, is_archived, position
+             )
+             VALUES ($1, $2, $3::list_kind, $4, $5, false, $6)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(household_id)
+        .bind(kind)
+        .bind(name)
+        .bind(is_default)
+        .bind(position)
+        .execute(&db.pool)
+        .await
+        .expect("list before the migration");
+    }
+
+    MIGRATOR
+        .run(&db.pool)
+        .await
+        .expect("0017 must apply when the household already has «календарь»");
+
+    let events: Vec<(String, bool, i32)> = sqlx::query_as(
+        "SELECT name, is_default, position
+         FROM lists
+         WHERE household_id = $1 AND kind = 'events' AND deleted_at IS NULL
+         ORDER BY position, id",
+    )
+    .bind(household_id)
+    .fetch_all(&db.pool)
+    .await
+    .expect("events lists after the migration");
+    assert_eq!(
+        events,
+        vec![("Календарь (события)".to_owned(), true, 3)],
+        "the migration must pick a free name and keep the old lists"
+    );
+
+    let calendar: (String, i32) = sqlx::query_as(
+        "SELECT name, position FROM lists
+         WHERE household_id = $1 AND kind = 'checklist' AND deleted_at IS NULL",
+    )
+    .bind(household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("the existing checklist");
+    assert_eq!(
+        calendar,
+        ("календарь".to_owned(), 2),
+        "the existing list must keep its name and position"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_migration_reports_its_version_rolls_back_and_blocks_readiness() {
     let db = support::empty_db().await;
     let dir = std::env::temp_dir().join(format!("tasklerq-migrations-{}", Uuid::now_v7().simple()));

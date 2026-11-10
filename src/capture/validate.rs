@@ -524,6 +524,7 @@ fn validate_recurrence(
     let Schedule { start, .. } = schedule;
     let errors_before = errors.len();
 
+    // 0009-events 5.1: повторение станет доступно и спискам событий.
     if list_kind != ListKind::Tasks {
         fail(
             errors,

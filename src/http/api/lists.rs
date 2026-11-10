@@ -31,7 +31,8 @@ pub async fn create(
     Json(request): Json<CreateListRequest>,
 ) -> Result<(StatusCode, Json<List>), ApiError> {
     require_write(&state, &auth).await?;
-    if request.kind == ListKind::Tasks {
+    if matches!(request.kind, ListKind::Tasks | ListKind::Events) {
+        // 0009-events 4.1: разрешить kind events в POST /lists.
         return Err(ApiError::validation(
             "additional lists must have kind shopping or checklist",
         ));

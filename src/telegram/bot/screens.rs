@@ -270,6 +270,7 @@ async fn lists_screen(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
 
     let mut ui = Ui::new().heading("Все списки");
     for list in all_lists.iter().filter(|list| !list.is_archived) {
+        // 0009-events 8.3: список событий откроет повестку со своим значком.
         let icon = if list.kind == ListKind::Tasks {
             "📋"
         } else {
@@ -706,6 +707,8 @@ async fn results(
         if hit.item.status == ItemStatus::Done {
             label.push_str(" · выполнено");
         } else if hit.list_kind != ListKind::Tasks {
+            // 0009-events 8.4: событие в поиске будет строкой без отметки
+            // выполнения и без количества покупки.
             if let Some(quantity) = hit.item.quantity {
                 label.push_str(&format!(
                     " · {}",
