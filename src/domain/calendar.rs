@@ -1,4 +1,4 @@
-//! Календарные вхождения задач.
+//! Календарные вхождения задач и событий.
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use chrono_tz::Tz;
@@ -6,8 +6,18 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use super::error::DomainError;
-use super::models::{Item, ItemStatus};
+use super::events::start_of_day;
+use super::models::{Item, ItemStatus, ListKind};
 use super::recurrence::{Due, MAX_CALENDAR_DAYS, MAX_CALENDAR_OCCURRENCES, parse_timezone};
+
+/// Элемент, который разворачивается в календарные вхождения.
+#[derive(Debug, Clone)]
+pub struct CalendarItem {
+    /// Строка элемента.
+    pub item: Item,
+    /// Тип списка элемента.
+    pub kind: ListKind,
+}
 
 /// Время события календаря: дата для all-day, момент UTC для timed.
 #[derive(Debug, Clone, Serialize)]
@@ -19,13 +29,15 @@ pub enum CalendarTime {
     DateTime(DateTime<Utc>),
 }
 
-/// Вхождение задачи в календаре.
+/// Вхождение задачи или события в календаре.
 #[derive(Debug, Clone, Serialize)]
 pub struct CalendarEvent {
     /// Идентификатор задачи.
     pub item_id: Uuid,
     /// Список.
     pub list_id: Uuid,
+    /// Тип списка элемента.
+    pub kind: ListKind,
     /// Детерминированный ключ вхождения.
     pub occurrence_key: String,
     /// Начало.
@@ -73,15 +85,30 @@ pub fn validate_range(start: NaiveDate, end: NaiveDate) -> Result<(), DomainErro
     Ok(())
 }
 
-/// Развернуть вхождения одной задачи в интервале `[start, end)`.
+/// Развернуть вхождения одного элемента в интервале `[start, end)`.
+///
+/// У события `due_*` — начало, а конец берётся из `end_*`; длительность
+/// повторяющегося события сохраняется в каждом вхождении. Чтобы вхождение,
+/// начавшееся до интервала и ещё идущее в нём, попало в ответ, развёртка
+/// событий запрашивается с началом, сдвинутым назад на длительность, а лишние
+/// вхождения отбрасываются проверкой пересечения с интервалом.
 pub fn expand_item(
-    item: &Item,
+    entry: &CalendarItem,
     start: NaiveDate,
     end: NaiveDate,
     household_timezone: Tz,
 ) -> Result<Vec<CalendarEvent>, DomainError> {
+    let item = &entry.item;
+    let (all_day_span, timed_span) = spans(item, entry.kind);
     let Some(recurrence) = &item.recurrence else {
-        return Ok(single_event(item, start, end, household_timezone));
+        return Ok(single_event(
+            entry,
+            start,
+            end,
+            household_timezone,
+            all_day_span,
+            timed_span,
+        ));
     };
 
     let timezone = parse_timezone(&recurrence.timezone)?;
@@ -91,7 +118,8 @@ pub fn expand_item(
         _ => recurrence.first_due(start)?,
     };
 
-    let occurrences = recurrence.occurrences_between(current, start, end)?;
+    let expansion_start = expansion_start(entry.kind, start, all_day_span, timed_span);
+    let occurrences = recurrence.occurrences_between(current, expansion_start, end)?;
 
     // Перенесённое вхождение — исключение из правила. Показываем его на новом
     // сроке, а вхождения правила не позже слота и нового срока не дублируем.
@@ -112,7 +140,15 @@ pub fn expand_item(
             .into_iter()
             .filter(|occurrence| occurrence.local_date(timezone) > cutoff)
             .collect();
-        if current_date >= start && current_date < end {
+        if included(
+            current,
+            entry.kind,
+            all_day_span,
+            timed_span,
+            start,
+            end,
+            timezone,
+        ) {
             occurrences.push(current);
         }
         occurrences.sort_by_key(|occurrence| match *occurrence {
@@ -121,6 +157,23 @@ pub fn expand_item(
         });
         occurrences
     };
+
+    // Развёртка событий начата раньше интервала: оставляем только вхождения,
+    // которые пересекаются с `[start, end)`, чтобы не отдавать прошлое.
+    let mut occurrences = occurrences;
+    if entry.kind == ListKind::Events {
+        occurrences.retain(|occurrence| {
+            overlaps(
+                *occurrence,
+                entry.kind,
+                all_day_span,
+                timed_span,
+                start,
+                end,
+                household_timezone,
+            )
+        });
+    }
 
     if occurrences.len() > MAX_CALENDAR_OCCURRENCES {
         return Err(DomainError::Validation(format!(
@@ -135,9 +188,10 @@ pub fn expand_item(
                 events.push(CalendarEvent {
                     item_id: item.id,
                     list_id: item.list_id,
+                    kind: entry.kind,
                     occurrence_key: format!("{}:{}", item.id, date),
                     start: CalendarTime::Date(date),
-                    end: CalendarTime::Date(date + Duration::days(1)),
+                    end: CalendarTime::Date(date + Duration::days(all_day_span)),
                     all_day: true,
                     title: item.title.clone(),
                     status: item.status,
@@ -148,9 +202,10 @@ pub fn expand_item(
                 events.push(CalendarEvent {
                     item_id: item.id,
                     list_id: item.list_id,
+                    kind: entry.kind,
                     occurrence_key: format!("{}:{}", item.id, local.format("%Y-%m-%dT%H:%M:%S%:z")),
                     start: CalendarTime::DateTime(at),
-                    end: CalendarTime::DateTime(at + Duration::hours(1)),
+                    end: CalendarTime::DateTime(at + timed_span),
                     all_day: false,
                     title: item.title.clone(),
                     status: item.status,
@@ -162,20 +217,119 @@ pub fn expand_item(
     Ok(events)
 }
 
+/// Длительность элемента: вседневная в днях (включительно) и со временем.
+///
+/// У задачи конца нет, поэтому берутся прежние значения по умолчанию: один
+/// день и один час. У события без конца — те же умолчания.
+fn spans(item: &Item, kind: ListKind) -> (i64, Duration) {
+    if kind != ListKind::Events {
+        return (1, Duration::hours(1));
+    }
+    let all_day = item
+        .end_date
+        .and_then(|end| item.due_date.map(|start| (end - start).num_days() + 1))
+        .unwrap_or(1);
+    let timed = item
+        .end_at
+        .and_then(|end| item.due_at.map(|start| end - start))
+        .unwrap_or_else(|| Duration::hours(1));
+    (all_day, timed)
+}
+
+/// Начало развёртки: для событий — сдвинутое назад на длительность.
+fn expansion_start(
+    kind: ListKind,
+    start: NaiveDate,
+    all_day_span: i64,
+    timed_span: Duration,
+) -> NaiveDate {
+    if kind != ListKind::Events {
+        return start;
+    }
+    let seconds = timed_span.num_seconds().max(0);
+    let timed_days = (seconds + 86_399) / 86_400;
+    start - Duration::days(all_day_span.max(timed_days))
+}
+
+/// Попадает ли вхождение в интервал `[start, end)`.
+///
+/// У события учитывается пересечение: вхождение могло начаться до интервала и
+/// ещё идти в нём. У задачи — прежнее правило: локальная дата начала внутри
+/// интервала.
+fn included(
+    occurrence: Due,
+    kind: ListKind,
+    all_day_span: i64,
+    timed_span: Duration,
+    start: NaiveDate,
+    end: NaiveDate,
+    timezone: Tz,
+) -> bool {
+    if kind == ListKind::Events {
+        return overlaps(
+            occurrence,
+            kind,
+            all_day_span,
+            timed_span,
+            start,
+            end,
+            timezone,
+        );
+    }
+    let date = occurrence.local_date(timezone);
+    date >= start && date < end
+}
+
+/// Пересекается ли вхождение с интервалом `[start, end)`.
+///
+/// Для задач проверка не нужна: развёртка уже ограничена интервалом.
+fn overlaps(
+    occurrence: Due,
+    kind: ListKind,
+    all_day_span: i64,
+    timed_span: Duration,
+    start: NaiveDate,
+    end: NaiveDate,
+    timezone: Tz,
+) -> bool {
+    if kind != ListKind::Events {
+        return true;
+    }
+    match occurrence {
+        Due::AllDay(date) => date < end && date + Duration::days(all_day_span) > start,
+        Due::Timed(at) => {
+            at < start_of_day(timezone, end) && at + timed_span > start_of_day(timezone, start)
+        }
+    }
+}
+
 fn single_event(
-    item: &Item,
+    entry: &CalendarItem,
     start: NaiveDate,
     end: NaiveDate,
     household_timezone: Tz,
+    all_day_span: i64,
+    timed_span: Duration,
 ) -> Vec<CalendarEvent> {
+    let item = &entry.item;
+
     if let Some(date) = item.due_date {
-        if date >= start && date < end {
+        if included(
+            Due::AllDay(date),
+            entry.kind,
+            all_day_span,
+            timed_span,
+            start,
+            end,
+            household_timezone,
+        ) {
             return vec![CalendarEvent {
                 item_id: item.id,
                 list_id: item.list_id,
+                kind: entry.kind,
                 occurrence_key: format!("{}:{}", item.id, date),
                 start: CalendarTime::Date(date),
-                end: CalendarTime::Date(date + Duration::days(1)),
+                end: CalendarTime::Date(date + Duration::days(all_day_span)),
                 all_day: true,
                 title: item.title.clone(),
                 status: item.status,
@@ -184,20 +338,28 @@ fn single_event(
         return Vec::new();
     }
 
-    if let Some(at) = item.due_at {
-        let date = at.with_timezone(&household_timezone).date_naive();
-        if date >= start && date < end {
-            return vec![CalendarEvent {
-                item_id: item.id,
-                list_id: item.list_id,
-                occurrence_key: format!("{}:{}", item.id, at.format("%Y-%m-%dT%H:%M:%SZ")),
-                start: CalendarTime::DateTime(at),
-                end: CalendarTime::DateTime(at + Duration::hours(1)),
-                all_day: false,
-                title: item.title.clone(),
-                status: item.status,
-            }];
-        }
+    if let Some(at) = item.due_at
+        && included(
+            Due::Timed(at),
+            entry.kind,
+            all_day_span,
+            timed_span,
+            start,
+            end,
+            household_timezone,
+        )
+    {
+        return vec![CalendarEvent {
+            item_id: item.id,
+            list_id: item.list_id,
+            kind: entry.kind,
+            occurrence_key: format!("{}:{}", item.id, at.format("%Y-%m-%dT%H:%M:%SZ")),
+            start: CalendarTime::DateTime(at),
+            end: CalendarTime::DateTime(at + timed_span),
+            all_day: false,
+            title: item.title.clone(),
+            status: item.status,
+        }];
     }
 
     Vec::new()
@@ -215,6 +377,7 @@ mod tests {
         CalendarEvent {
             item_id: Uuid::nil(),
             list_id: Uuid::nil(),
+            kind: ListKind::Tasks,
             occurrence_key: title.to_owned(),
             end: start.clone(),
             start,
