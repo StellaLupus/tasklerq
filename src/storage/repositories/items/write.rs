@@ -15,7 +15,7 @@ use crate::domain::recurrence::{Due, parse_timezone, resolve_local, rule_changed
 use crate::domain::validation::{
     MAX_NOTES, MAX_TITLE, ValidatedItem, normalize_due_for_recurrence, normalize_recurrence,
     normalize_subtasks, normalize_tags, normalize_text, normalize_text_allow_empty, normalize_unit,
-    validate_quantity,
+    validate_fields_for_kind, validate_quantity,
 };
 use crate::storage::repositories::{active_member, events, lists, notifications, subtasks, tags};
 
@@ -440,23 +440,25 @@ async fn update_inner(
         }
     }
 
-    // 0009-events 3.1: у события не будет количества и единицы; пока оно
-    // попадает в ветку не-задачи вместе с покупками.
-    let (quantity, unit) = if target_list.kind == ListKind::Tasks {
-        (None, None)
-    } else {
-        let quantity = match patch.quantity {
-            Field::Missing => row.quantity.unwrap_or(1.0),
-            Field::Null => 1.0,
-            Field::Value(value) => value,
-        };
-        let quantity = validate_quantity(Some(quantity))?;
-        let unit = match patch.unit {
-            Field::Missing => row.unit.clone().unwrap_or_else(|| "шт".into()),
-            Field::Null => "шт".into(),
-            Field::Value(value) => normalize_unit(Some(value)),
-        };
-        (Some(quantity), Some(unit))
+    // У события нет полей покупки: количество и единица не поддерживаются.
+    let quantity_supplied = matches!(&patch.quantity, Field::Value(_));
+    let unit_supplied = matches!(&patch.unit, Field::Value(_));
+    let (quantity, unit) = match target_list.kind {
+        ListKind::Tasks | ListKind::Events => (None, None),
+        _ => {
+            let quantity = match patch.quantity {
+                Field::Missing => row.quantity.unwrap_or(1.0),
+                Field::Null => 1.0,
+                Field::Value(value) => value,
+            };
+            let quantity = validate_quantity(Some(quantity))?;
+            let unit = match patch.unit {
+                Field::Missing => row.unit.clone().unwrap_or_else(|| "шт".into()),
+                Field::Null => "шт".into(),
+                Field::Value(value) => normalize_unit(Some(value)),
+            };
+            (Some(quantity), Some(unit))
+        }
     };
 
     let assignee_user_id = match patch.assignee_user_id {
@@ -481,6 +483,18 @@ async fn update_inner(
             })
             .collect(),
     };
+
+    validate_fields_for_kind(
+        target_list.kind,
+        due_at,
+        due_date,
+        end_at,
+        end_date,
+        priority,
+        quantity_supplied,
+        unit_supplied,
+        !subtask_inputs.is_empty(),
+    )?;
 
     let (
         recurrence_freq,

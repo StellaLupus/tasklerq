@@ -1343,9 +1343,8 @@ impl ItemDraft {
         kind: ListKind,
     ) -> Result<NewItem, DomainError> {
         let (due_at, due_date) = self.due(timezone)?;
-        // 0009-events 9.1: у события не будет количества и единицы; пока оно
-        // попадает в ветку не-задачи.
-        let shopping = kind != ListKind::Tasks;
+        // У события нет количества и единицы: это поля покупки.
+        let shopping = !matches!(kind, ListKind::Tasks | ListKind::Events);
         Ok(NewItem {
             list_id,
             title: self.title.clone(),

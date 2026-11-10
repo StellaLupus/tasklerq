@@ -1740,3 +1740,95 @@ async fn search_over_http_treats_sql_as_text_and_returns_200() {
     .expect("items table must still exist");
     assert_eq!(count, 1);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn patch_rejects_event_ends_that_the_database_would_reject() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let token =
+        support::issue_token(&db.pool, household.household_id, &["ha:read", "ha:write"]).await;
+    let app = support::app(&db.pool);
+
+    let (status, event) = support::request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/lists/{}/items", household.events_list_id),
+        Some(&token),
+        Some(json!({"title": "Маникюр", "due_at": "2026-11-11T14:00:00Z"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create event: {event}");
+    let event_id = event["id"].as_str().expect("event id").to_owned();
+    let event_uri = format!("/api/v1/items/{event_id}");
+
+    let (status, body) = support::request(
+        &app,
+        Method::PATCH,
+        &event_uri,
+        Some(&token),
+        Some(json!({"version": 1, "end_at": "2026-11-11T13:00:00Z"})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "end before start: {body}"
+    );
+    assert_eq!(body["error"]["code"], "validation_error");
+
+    // Конец без начала: база отклонила бы это ограничением `end_at`.
+    let (status, body) = support::request(
+        &app,
+        Method::PATCH,
+        &event_uri,
+        Some(&token),
+        Some(json!({
+            "version": 1,
+            "due_at": null,
+            "end_at": "2026-11-11T15:00:00Z"
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "end without start: {body}"
+    );
+    assert_eq!(body["error"]["code"], "validation_error");
+
+    let (status, task) = support::request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/lists/{}/items", household.tasks_list_id),
+        Some(&token),
+        Some(json!({"title": "Задача", "due_date": "2026-11-11"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create task: {task}");
+    let task_id = task["id"].as_str().expect("task id").to_owned();
+
+    // Конец у задачи: ограничение базы о нём ничего не знает, проверяет домен.
+    let (status, body) = support::request(
+        &app,
+        Method::PATCH,
+        &format!("/api/v1/items/{task_id}"),
+        Some(&token),
+        Some(json!({"version": 1, "end_date": "2026-11-12"})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "end for a task: {body}"
+    );
+    assert_eq!(body["error"]["code"], "validation_error");
+
+    let (status, fetched) =
+        support::request(&app, Method::GET, &event_uri, Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
+    assert_eq!(
+        fetched["version"], 1,
+        "a rejected patch must not change the event"
+    );
+    assert_eq!(fetched["end_at"], Value::Null);
+}
