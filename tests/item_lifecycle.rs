@@ -5220,3 +5220,204 @@ async fn changing_the_start_kind_of_an_event_with_an_end_is_rejected() {
     assert_eq!(current.due_date, None);
     assert_eq!(current.end_at, Some(end));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_weekly_event_keeps_its_duration_and_local_start_in_the_series() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    // Вторник 10 ноября 2026, 18:00–19:00 по Москве.
+    let start = utc(2026, 11, 10, 15);
+    let end = utc(2026, 11, 10, 16);
+    let mut input = support::new_item(household.events_list_id, "Тренировка");
+    input.due_at = Some(start);
+    input.end_at = Some(end);
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Weekly, vec![2]));
+
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    assert_eq!(created.due_at, Some(start));
+    assert_eq!(created.end_at, Some(end));
+    let rule = created.recurrence.as_ref().expect("weekly recurrence");
+    let next = rule
+        .next_after(Due::Timed(start), end)
+        .expect("next occurrence")
+        .expect("the series continues");
+    let Due::Timed(next_start) = next else {
+        panic!("a timed series must produce a timed occurrence");
+    };
+    assert_eq!(
+        next_start,
+        start + Duration::days(7),
+        "the next occurrence is the following Tuesday at the same time"
+    );
+    assert_eq!(
+        next_start + (end - start),
+        utc(2026, 11, 17, 16),
+        "each occurrence keeps the 18:00–19:00 duration"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_monthly_multi_day_event_keeps_its_inclusive_length() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let start = date(2027, 3, 1);
+    let end = date(2027, 3, 3);
+    let mut input = support::new_item(household.events_list_id, "Отчётный период");
+    input.due_date = Some(start);
+    input.end_date = Some(end);
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Monthly, Vec::new()));
+
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    assert_eq!(created.due_date, Some(start));
+    assert_eq!(created.end_date, Some(end));
+    let rule = created.recurrence.as_ref().expect("monthly recurrence");
+    let next = rule
+        .next_after(Due::AllDay(start), utc(2027, 3, 4, 0))
+        .expect("next occurrence")
+        .expect("the series continues");
+    let Due::AllDay(next_start) = next else {
+        panic!("an all-day series must produce an all-day occurrence");
+    };
+    assert_eq!(next_start, date(2027, 4, 1));
+    assert_eq!(
+        next_start + (end - start),
+        date(2027, 4, 3),
+        "the next occurrence also occupies three days"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rescheduling_an_event_occurrence_keeps_its_local_time_after_the_offset_changes() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    sqlx::query("UPDATE households SET timezone = 'America/New_York' WHERE id = $1")
+        .bind(household.household_id)
+        .execute(&db.pool)
+        .await
+        .expect("household timezone");
+    let new_york: chrono_tz::Tz = "America/New_York".parse().expect("timezone");
+    // Вторник 27 октября 2026, 18:00–19:00 по Нью-Йорку, ещё летнее время
+    // (UTC−4). Следующее вхождение переносится на среду 4 ноября, уже зимнее
+    // время (UTC−5).
+    let start = utc(2026, 10, 27, 22);
+    let end = utc(2026, 10, 27, 23);
+    let mut input = support::new_item(household.events_list_id, "Тренировка");
+    input.due_at = Some(start);
+    input.end_at = Some(end);
+    let mut rule = support::recurrence(RecurrenceFreq::Weekly, vec![2]);
+    rule.timezone = Some("America/New_York".into());
+    input.recurrence = Some(rule);
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let moved_start = utc(2026, 11, 5, 0); // 4 ноября, 19:00 EST
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let moved = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        created.version,
+        Due::Timed(moved_start),
+        "America/New_York",
+        utc(2026, 11, 4, 20),
+    )
+    .await
+    .expect("move the nearest occurrence");
+
+    let moved_end = moved.end_at.expect("the end follows the start");
+    let local_start = moved_start.with_timezone(&new_york);
+    let local_end = moved_end.with_timezone(&new_york);
+    assert_eq!(local_start.date_naive(), date(2026, 11, 4));
+    assert_eq!(
+        local_start.time(),
+        NaiveTime::from_hms_opt(19, 0, 0).unwrap()
+    );
+    assert_eq!(local_end.date_naive(), date(2026, 11, 4));
+    assert_eq!(local_end.time(), NaiveTime::from_hms_opt(20, 0, 0).unwrap());
+    assert_eq!(
+        moved_end - moved_start,
+        end - start,
+        "the absolute duration is preserved"
+    );
+
+    let rule = moved.recurrence.as_ref().expect("the series is kept");
+    assert_eq!(rule.occurrence_date, Some(date(2026, 10, 27)));
+    let next = rule
+        .next_after(Due::Timed(moved_start), moved_end)
+        .expect("next occurrence")
+        .expect("the series continues");
+    let Due::Timed(next_start) = next else {
+        panic!("a timed series must produce a timed occurrence");
+    };
+    let local_next = next_start.with_timezone(&new_york);
+    assert_eq!(
+        local_next.date_naive(),
+        date(2026, 11, 10),
+        "after the moved Wednesday the series returns to Tuesday"
+    );
+    assert_eq!(
+        local_next.time(),
+        NaiveTime::from_hms_opt(18, 0, 0).unwrap(),
+        "the next occurrence uses the series time, not the moved one"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rescheduling_a_multi_day_event_occurrence_keeps_its_length() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let start = date(2027, 3, 1);
+    let end = date(2027, 3, 3);
+    let mut input = support::new_item(household.events_list_id, "Отчётный период");
+    input.due_date = Some(start);
+    input.end_date = Some(end);
+    input.recurrence = Some(support::recurrence(RecurrenceFreq::Monthly, Vec::new()));
+    let created = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let moved = items::reschedule_occurrence(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        created.id,
+        created.version,
+        Due::AllDay(date(2027, 3, 10)),
+        "Europe/Moscow",
+        utc(2027, 3, 10, 8),
+    )
+    .await
+    .expect("move the multi-day occurrence");
+
+    assert_eq!(moved.due_date, Some(date(2027, 3, 10)));
+    assert_eq!(moved.end_date, Some(date(2027, 3, 12)));
+}

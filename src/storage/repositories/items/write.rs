@@ -377,10 +377,10 @@ async fn update_inner(
         }
         Field::Null => recurrence = None,
         Field::Value(input) => {
-            // 0009-events 5.1: повторение станет доступно и спискам событий.
-            if target_list.kind != ListKind::Tasks {
+            // Повторение доступно задачам и событиям по одним правилам.
+            if !matches!(target_list.kind, ListKind::Tasks | ListKind::Events) {
                 return Err(DomainError::Validation(
-                    "recurrence is only allowed for task lists".into(),
+                    "recurrence is only allowed for task and event lists".into(),
                 ));
             }
             let mut normalized =

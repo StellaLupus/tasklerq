@@ -99,10 +99,10 @@ pub fn validate_new_item(
 
     let recurrence = match item.recurrence {
         Some(input) => {
-            // 0009-events 5.1: повторение станет доступно и спискам событий.
-            if list_kind != ListKind::Tasks {
+            // Повторение доступно задачам и событиям по одним правилам.
+            if !matches!(list_kind, ListKind::Tasks | ListKind::Events) {
                 return Err(DomainError::Validation(
-                    "recurrence is only allowed for task lists".into(),
+                    "recurrence is only allowed for task and event lists".into(),
                 ));
             }
             Some(normalize_recurrence(
