@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
-use crate::config::SecretString;
+use crate::config::{SecretString, SlotConfig, loggable_url};
 
 /// Верхняя граница ответа модели: черновик из двадцати элементов и уточнений
 /// укладывается с запасом.
@@ -26,6 +26,9 @@ pub const MAX_COMPLETION_TOKENS: u32 = 4096;
 
 /// Ключи тела запроса, которые дополнительные параметры слота заменить не
 /// могут.
+///
+/// `max_tokens` в список не входит намеренно: reasoning-моделям нужен запас, и
+/// слот увеличивает верхнюю границу через `LLM_*_EXTRA_JSON`.
 const RESERVED_KEYS: [&str; 4] = ["model", "messages", "response_format", "temperature"];
 
 /// Роль сообщения в чате.
@@ -193,6 +196,18 @@ impl OpenAiBackend {
         })
     }
 
+    /// Создать клиент из слота конфигурации: адрес, модель, токен и
+    /// дополнительные параметры уже разобраны из `LLM_*` переменных.
+    pub fn from_slot(slot: &SlotConfig, connect_timeout: Duration) -> Result<Self, LlmError> {
+        Self::new(
+            slot.url.as_str(),
+            &slot.model,
+            slot.token.clone(),
+            connect_timeout,
+            slot.extra.clone(),
+        )
+    }
+
     /// Тело запроса: обязательные поля и дополнительные параметры слота.
     fn request_body(&self, request: &ChatRequest<'_>) -> Value {
         let mut body = Map::new();
@@ -224,14 +239,17 @@ impl OpenAiBackend {
 }
 
 impl fmt::Debug for OpenAiBackend {
-    /// Печатает адрес и модель, но не токен.
+    /// Печатает адрес без учётных данных и query, модель, признак токена и
+    /// только имена дополнительных параметров: их значения могут быть ключами
+    /// провайдера.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let extra_keys: Vec<&str> = self.extra.keys().map(String::as_str).collect();
         formatter
             .debug_struct("OpenAiBackend")
-            .field("endpoint", &self.endpoint)
+            .field("endpoint", &loggable_url(&self.endpoint))
             .field("model", &self.model)
             .field("has_token", &self.token.is_some())
-            .field("extra", &self.extra)
+            .field("extra_keys", &extra_keys)
             .finish()
     }
 }
@@ -299,8 +317,26 @@ struct ChoiceMessage {
 
 #[derive(Deserialize)]
 struct Usage {
+    #[serde(default, deserialize_with = "token_count")]
     prompt_tokens: Option<u32>,
+    #[serde(default, deserialize_with = "token_count")]
     completion_tokens: Option<u32>,
+}
+
+/// Число токенов из `usage`.
+///
+/// Провайдер иногда присылает строку, отрицательное или дробное значение.
+/// Неверный тип не отменяет принятый ответ: токены просто остаются
+/// неизвестными, и разбор не уходит на резервный слот зря.
+fn token_count<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value
+        .as_ref()
+        .and_then(Value::as_u64)
+        .and_then(|count| u32::try_from(count).ok()))
 }
 
 /// Достать текст, токены и модель из ответа `chat/completions`.
@@ -353,6 +389,72 @@ mod tests {
         assert!(!rendered.contains("llm-SECRET-token"));
         assert!(rendered.contains("has_token: true"));
         assert!(rendered.contains("local/model"));
+    }
+
+    #[test]
+    fn debug_hides_url_credentials_query_and_extra_values() {
+        let mut extra = Map::new();
+        extra.insert(
+            "api_key".to_owned(),
+            Value::String("SECRET-extra-key".to_owned()),
+        );
+        extra.insert("reasoning".to_owned(), json!({"effort": "minimal"}));
+        let backend = OpenAiBackend::new(
+            "http://user:password@llm.local:8080/v1?token=SECRET-query",
+            "local/model",
+            None,
+            Duration::from_millis(1000),
+            extra,
+        )
+        .expect("backend");
+
+        let rendered = format!("{backend:?}");
+        assert!(!rendered.contains("user"));
+        assert!(!rendered.contains("password"));
+        assert!(!rendered.contains("SECRET"));
+        assert!(rendered.contains("llm.local"));
+        assert!(rendered.contains("api_key"));
+        assert!(rendered.contains("reasoning"));
+        assert!(!rendered.contains("minimal"));
+    }
+
+    #[test]
+    fn wrong_token_types_do_not_cancel_the_answer() {
+        let bodies = [
+            json!({"prompt_tokens": "12", "completion_tokens": -1}),
+            json!({"prompt_tokens": 12.5, "completion_tokens": -1}),
+            json!({"prompt_tokens": null, "completion_tokens": true}),
+        ];
+
+        for usage in bodies {
+            let body = json!({
+                "model": "m",
+                "choices": [{"message": {"content": "{\"items\":[]}"}}],
+                "usage": usage,
+            });
+            let completion =
+                extract_completion(&body.to_string()).expect("answer with bad usage is accepted");
+
+            assert_eq!(completion.content, r#"{"items":[]}"#);
+            assert_eq!(completion.input_tokens, None);
+            assert_eq!(completion.output_tokens, None);
+        }
+    }
+
+    #[test]
+    fn slot_builds_a_backend() {
+        let slot = SlotConfig {
+            url: "http://llm.local:8080/v1".parse().expect("url"),
+            model: "local/model".to_owned(),
+            token: Some(SecretString::new("slot-token")),
+            timeout: Duration::from_secs(10),
+            extra: Map::new(),
+        };
+
+        let backend = OpenAiBackend::from_slot(&slot, Duration::from_millis(500)).expect("backend");
+        let rendered = format!("{backend:?}");
+        assert!(rendered.contains("local/model"));
+        assert!(!rendered.contains("slot-token"));
     }
 
     #[test]

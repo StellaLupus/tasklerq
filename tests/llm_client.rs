@@ -130,6 +130,9 @@ async fn extra_parameters_cannot_replace_reserved_keys() {
     );
     extra.insert("response_format".to_owned(), json!({"type": "text"}));
     extra.insert("temperature".to_owned(), json!(1));
+    // `max_tokens` намеренно не зарезервирован: reasoning-моделям нужен запас,
+    // и слот переопределяет верхнюю границу через `extra`.
+    extra.insert("max_tokens".to_owned(), json!(2048));
     extra.insert("reasoning".to_owned(), json!({"effort": "minimal"}));
 
     Mock::given(method("POST"))
@@ -142,6 +145,7 @@ async fn extra_parameters_cannot_replace_reserved_keys() {
             ],
             "response_format": response_format(&schema),
             "temperature": 0,
+            "max_tokens": 2048,
             "reasoning": {"effort": "minimal"},
         })))
         .respond_with(answered(ANSWER))
@@ -307,6 +311,42 @@ async fn connection_refused_is_reported_as_transport() {
 }
 
 #[tokio::test]
+async fn connection_closed_without_a_response_is_reported_as_transport() {
+    // Сервер принимает соединение, читает начало запроса и закрывает сокет
+    // без ответа: это обрыв, а не отказ в соединении.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.expect("accept");
+        socket.readable().await.expect("request bytes");
+        let mut buffer = [0u8; 1024];
+        let _ = socket.try_read(&mut buffer);
+        drop(socket);
+    });
+
+    let schema = schema();
+    let messages = messages();
+    let backend = OpenAiBackend::new(
+        &format!("http://{address}/v1"),
+        MODEL,
+        Some(SecretString::new(TOKEN)),
+        Duration::from_millis(500),
+        Map::new(),
+    )
+    .expect("backend");
+
+    let error = backend
+        .complete(&request(&messages, &schema), Duration::from_secs(2))
+        .await
+        .expect_err("error");
+
+    server.await.expect("server task");
+    assert_eq!(error.code(), "transport");
+}
+
+#[tokio::test]
 async fn slow_response_times_out_at_requested_limit() {
     let server = MockServer::start().await;
     let schema = schema();
@@ -378,6 +418,37 @@ async fn response_without_usage_has_no_token_counts() {
     assert_eq!(completion.input_tokens, None);
     assert_eq!(completion.output_tokens, None);
     assert_eq!(completion.model, "local/qwen");
+}
+
+#[tokio::test]
+async fn wrong_usage_types_do_not_discard_a_valid_answer() {
+    let usages = [
+        json!({"prompt_tokens": "12", "completion_tokens": -1}),
+        json!({"prompt_tokens": -1, "completion_tokens": 12.5}),
+    ];
+    let schema = schema();
+    let messages = messages();
+
+    for usage in usages {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "local/qwen",
+                "choices": [{"message": {"role": "assistant", "content": ANSWER}}],
+                "usage": usage,
+            })))
+            .mount(&server)
+            .await;
+
+        let completion = backend(&server)
+            .complete(&request(&messages, &schema), Duration::from_secs(5))
+            .await
+            .expect("valid answer with bad usage is accepted");
+
+        assert_eq!(completion.content, ANSWER);
+        assert_eq!(completion.input_tokens, None, "usage {usage}");
+        assert_eq!(completion.output_tokens, None, "usage {usage}");
+    }
 }
 
 #[test]

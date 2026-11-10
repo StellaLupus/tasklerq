@@ -9,7 +9,7 @@ use url::Url;
 
 use crate::capture::breaker::CircuitBreaker;
 use crate::config::{Config, LlmConfig, TelegramMode};
-use crate::home_assistant::{AiTask, HttpAiTask};
+use crate::home_assistant::AiTask;
 use crate::jobs::scheduler::Scheduler;
 use crate::security_audit::Audit;
 
@@ -140,41 +140,56 @@ pub async fn start_with_update_limit(
     Ok(Some(Runtime { ingress, tasks }))
 }
 
-/// Клиент Home Assistant для разбора текста; `None`, если разбор выключен или
-/// настроен неверно (тогда свободный текст идёт в быстрое добавление).
-pub fn build_ai(llm: &LlmConfig) -> Option<Arc<dyn AiTask>> {
-    if !llm.enabled {
-        return None;
-    }
-    let (Some(url), Some(token), Some(entity)) =
-        (&llm.base_url, &llm.token, &llm.ai_task_entity_id)
-    else {
-        return None;
-    };
-    match HttpAiTask::new(url.as_str(), token.clone(), entity) {
-        Ok(client) => Some(Arc::new(client)),
-        Err(error) => {
-            tracing::warn!(
-                error = error.code(),
-                "LLM capture is disabled: bad HA settings"
-            );
-            None
-        }
-    }
+/// Клиент разбора текста; `None`, если разбор выключен или ещё не подключён к
+/// слотам.
+///
+/// Подключение цепочки слотов — пункт 7.1. До него разбор не вызывает LLM:
+/// свободный текст идёт в быстрое добавление, как при выключенном LLM. Модуль
+/// [`crate::home_assistant`] и его тесты остаются до 7.1.
+pub fn build_ai(_llm: &LlmConfig) -> Option<Arc<dyn AiTask>> {
+    None
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use serde_json::Map;
+
     use super::*;
-    use crate::config::SecretString;
+    use crate::config::{SecretString, SlotConfig};
+
+    fn slot() -> SlotConfig {
+        SlotConfig {
+            url: "http://127.0.0.1:8080/v1".parse().expect("url"),
+            model: "local/model".to_owned(),
+            token: Some(SecretString::new("token")),
+            timeout: Duration::from_secs(10),
+            extra: Map::new(),
+        }
+    }
 
     #[test]
     fn disabled_llm_capture_builds_no_client() {
         let llm = LlmConfig {
             enabled: false,
-            base_url: Some("http://127.0.0.1:8123".parse().expect("url")),
-            token: Some(SecretString::new("token")),
-            ai_task_entity_id: Some("ai_task.google_ai_task_2".into()),
+            primary: Some(slot()),
+            fallback: None,
+            connect_timeout: Duration::from_millis(1000),
+            daily_quota: 200,
+        };
+        assert!(build_ai(&llm).is_none());
+    }
+
+    #[test]
+    fn configured_slot_builds_no_client_until_the_chain_lands() {
+        // 7.1 подключит цепочку слотов; до тех пор даже настроенный слот не
+        // даёт клиента, и разбор идёт в быстрое добавление.
+        let llm = LlmConfig {
+            enabled: true,
+            primary: Some(slot()),
+            fallback: Some(slot()),
+            connect_timeout: Duration::from_millis(1000),
             daily_quota: 200,
         };
         assert!(build_ai(&llm).is_none());

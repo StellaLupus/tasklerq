@@ -1,6 +1,5 @@
 //! Точка входа Tasklerq.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -10,11 +9,9 @@ use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tasklerq::admin;
 use tasklerq::app::build_application;
-use tasklerq::capture::{eval, prompt};
-use tasklerq::config::{self, Config, DatabaseConfig, LlmConfig, TenancyConfig};
+use tasklerq::config::{self, Config, DatabaseConfig, TenancyConfig};
 use tasklerq::domain::error::DomainError;
 use tasklerq::domain::models::UserRole;
-use tasklerq::home_assistant::{AiTask, GenerateData, HttpAiTask, MAX_GENERATE_TIMEOUT};
 use tasklerq::http::server;
 use tasklerq::redaction;
 use tasklerq::storage;
@@ -295,7 +292,7 @@ async fn run() -> Result<()> {
         Command::Seed => seed().await,
         Command::Admin { command } => run_admin(command).await,
         Command::Healthcheck { url } => healthcheck(&url).await,
-        Command::CaptureEval(args) => capture_eval(args).await,
+        Command::CaptureEval(args) => capture_eval(args),
     }
 }
 
@@ -789,143 +786,13 @@ fn explain(error: DomainError) -> anyhow::Error {
     anyhow::anyhow!(admin::describe(&error))
 }
 
-/// Прогнать golden set через настоящий путь разбора: тот же промпт, парсер,
-/// валидация и клиент Home Assistant, что и в проде.
-async fn capture_eval(args: CaptureEvalArgs) -> Result<()> {
-    let text = std::fs::read_to_string(&args.golden)
-        .with_context(|| format!("не удалось прочитать {}", args.golden.display()))?;
-    let set = eval::GoldenSet::parse(&text).context("некорректный golden set")?;
-
-    let llm = LlmConfig::from_env().context("некорректная конфигурация LLM")?;
-    if !llm.enabled {
-        bail!("LLM_CAPTURE_ENABLED=false: для capture-eval нужен включённый разбор");
-    }
-    let (Some(url), Some(token), Some(entity)) =
-        (&llm.base_url, &llm.token, &llm.ai_task_entity_id)
-    else {
-        bail!("задайте HA_BASE_URL, HA_TOKEN и HA_AI_TASK_ENTITY_ID");
-    };
-    let ai = HttpAiTask::new(url.as_str(), token.clone(), entity)
-        .context("некорректный клиент Home Assistant")?;
-
-    let structure = prompt::response_structure();
-    let mut responses = BTreeMap::new();
-    for phrase in &set.phrases {
-        let context = phrase
-            .effective_context(&set.context)
-            .to_context()
-            .map_err(|error| anyhow::anyhow!("фраза {}: {error}", phrase.id))?;
-        let instructions = prompt::build_instructions(&context, &phrase.text);
-        let request = GenerateData {
-            task_name: prompt::TASK_NAME,
-            instructions: &instructions,
-            structure: &structure,
-        };
-        let mut retried = false;
-        let data = loop {
-            match ai.generate_data(&request, MAX_GENERATE_TIMEOUT).await {
-                Ok(data) => break data,
-                // Один повтор для тех же ошибок, что очередь повторяет в проде:
-                // иначе один 503 из 36 вызовов выбрасывает весь прогон.
-                Err(error) if error.is_retryable() && !retried => {
-                    retried = true;
-                    tracing::warn!(
-                        error = error.code(),
-                        phrase = %phrase.id,
-                        "retrying capture eval request"
-                    );
-                }
-                Err(error) => {
-                    return Err(anyhow::Error::new(error)).with_context(|| {
-                        format!("Home Assistant не разобрал фразу {}", phrase.id)
-                    });
-                }
-            }
-        };
-        responses.insert(phrase.id.clone(), data);
-    }
-
-    let report = eval::evaluate(&set, &responses);
-    println!(
-        "Golden set: {} фраз, промпт {}",
-        set.phrases.len(),
-        prompt::PROMPT_VERSION
-    );
-    print_report(&report);
-
-    let accuracy = report.overall().accuracy();
-    let mut baseline = eval::Baseline::load(&args.baseline)
-        .with_context(|| format!("не удалось прочитать {}", args.baseline.display()))?;
-    baseline.record(
-        prompt::PROMPT_VERSION,
-        eval::BaselineEntry {
-            accuracy,
-            prompt_hash: eval::prompt_hash(),
-            date: Utc::now().to_rfc3339(),
-            phrases: set.phrases.len(),
-            passed: report.passed(),
-        },
-    );
-    baseline
-        .save(&args.baseline)
-        .with_context(|| format!("не удалось записать {}", args.baseline.display()))?;
-
-    if accuracy < eval::MIN_ACCURACY {
-        bail!(
-            "точность {accuracy:.3} ниже минимальной {}: версия {} не годится",
-            eval::MIN_ACCURACY,
-            prompt::PROMPT_VERSION
-        );
-    }
-    Ok(())
-}
-
-fn print_report(report: &eval::Report) {
-    let overall = report.overall();
-    println!(
-        "Точность: {:.1}% (совпало {} из {}; ожидалось {}, лишних {})",
-        overall.accuracy() * 100.0,
-        overall.matched,
-        overall.expected + overall.extra,
-        overall.expected,
-        overall.extra
-    );
-    println!(
-        "Фраз пройдено: {} из {}",
-        report.passed(),
-        report.results.len()
-    );
-    println!("По категориям:");
-    for (category, totals) in report.by_category() {
-        println!(
-            "  {:<22} {:>6.1}% ({} из {})",
-            category.label(),
-            totals.accuracy() * 100.0,
-            totals.matched,
-            totals.expected + totals.extra
-        );
-    }
-
-    let failed: Vec<_> = report.failed().collect();
-    if failed.is_empty() {
-        println!("Все фразы прошли.");
-        return;
-    }
-    println!("Провалились:");
-    for result in failed {
-        println!(
-            "  {} ({}): точность {:.0}%",
-            result.id,
-            result.category.label(),
-            result.accuracy() * 100.0
-        );
-        if let Some(error) = &result.error {
-            println!("    ошибка: {error}");
-        }
-        for problem in &result.problems {
-            println!("    - {problem}");
-        }
-    }
+/// Прогнать golden set через настоящий путь разбора.
+///
+/// Команда переводится на слоты в пункте 9.3 (`capture-eval --slot <имя>`).
+/// До этого она не может обратиться к LLM и завершается понятной ошибкой, а не
+/// читает удалённые переменные Home Assistant.
+fn capture_eval(_args: CaptureEvalArgs) -> Result<()> {
+    bail!("capture-eval переводится на слоты в пункте 9.3 и пока недоступен")
 }
 
 async fn healthcheck(url: &str) -> Result<()> {

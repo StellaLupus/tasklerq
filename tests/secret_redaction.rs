@@ -30,15 +30,19 @@ const BOT_TOKEN: &str = "123456:SECRET-bot-token-redaction";
 const WEBHOOK_SECRET: &str = "SECRET-webhook-redaction";
 const PROVIDED_WEBHOOK_SECRET: &str = "SECRET-provided-webhook-redaction";
 const HA_TOKEN: &str = "SECRET-ha-token-redaction";
+const PRIMARY_TOKEN: &str = "SECRET-primary-slot-redaction";
+const FALLBACK_TOKEN: &str = "SECRET-fallback-slot-redaction";
 const DB_PASSWORD: &str = "S3cretPassw0rd";
 const API_TOKEN: &str = "tlq_SECRET-bearer-redaction";
 
 /// Все значения, которые не должны появляться в выводе.
-const SECRETS: [&str; 6] = [
+const SECRETS: [&str; 8] = [
     BOT_TOKEN,
     WEBHOOK_SECRET,
     PROVIDED_WEBHOOK_SECRET,
     HA_TOKEN,
+    PRIMARY_TOKEN,
+    FALLBACK_TOKEN,
     DB_PASSWORD,
     API_TOKEN,
 ];
@@ -74,6 +78,24 @@ fn config_env() -> BTreeMap<String, String> {
             "http://127.0.0.1:8080/webhooks/telegram".to_owned(),
         ),
         ("LLM_CAPTURE_ENABLED".to_owned(), "true".to_owned()),
+        (
+            "LLM_PRIMARY_URL".to_owned(),
+            "https://llm.example.com/v1".to_owned(),
+        ),
+        (
+            "LLM_PRIMARY_MODEL".to_owned(),
+            "anthropic/claude-haiku-5.5".to_owned(),
+        ),
+        ("LLM_PRIMARY_TOKEN".to_owned(), PRIMARY_TOKEN.to_owned()),
+        (
+            "LLM_FALLBACK_URL".to_owned(),
+            "https://llm-backup.example.com/v1".to_owned(),
+        ),
+        (
+            "LLM_FALLBACK_MODEL".to_owned(),
+            "google/gemini-3.5-flash".to_owned(),
+        ),
+        ("LLM_FALLBACK_TOKEN".to_owned(), FALLBACK_TOKEN.to_owned()),
         ("HA_BASE_URL".to_owned(), "http://127.0.0.1:8123".to_owned()),
         ("HA_TOKEN".to_owned(), HA_TOKEN.to_owned()),
         (
@@ -108,7 +130,21 @@ fn config_debug_display_and_startup_log_hide_every_secret() {
         Some("<redacted>".to_owned())
     );
     assert_eq!(
-        config.llm.token.as_ref().map(ToString::to_string),
+        config
+            .llm
+            .primary
+            .as_ref()
+            .and_then(|slot| slot.token.as_ref())
+            .map(ToString::to_string),
+        Some("<redacted>".to_owned())
+    );
+    assert_eq!(
+        config
+            .llm
+            .fallback
+            .as_ref()
+            .and_then(|slot| slot.token.as_ref())
+            .map(ToString::to_string),
         Some("<redacted>".to_owned())
     );
 
@@ -120,6 +156,32 @@ fn config_debug_display_and_startup_log_hide_every_secret() {
     tracing::subscriber::with_default(subscriber, || config.log_startup());
 
     assert_no_secret(&logs.contents(), "startup log");
+}
+
+#[test]
+fn legacy_home_assistant_variables_are_reported_without_values() {
+    let config = config_from(config_env()).expect("config should be valid");
+    assert_eq!(
+        config.deprecated_env,
+        vec!["HA_BASE_URL", "HA_TOKEN", "HA_AI_TASK_ENTITY_ID"]
+    );
+
+    let logs = LogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(logs.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || config.log_startup());
+
+    let logs = logs.contents();
+    for name in ["HA_BASE_URL", "HA_TOKEN", "HA_AI_TASK_ENTITY_ID"] {
+        assert!(
+            logs.contains(name),
+            "startup log must name the unused variable {name}:\n{logs}"
+        );
+    }
+    assert!(logs.contains("no longer used"));
+    assert_no_secret(&logs, "startup log");
 }
 
 #[test]
@@ -137,7 +199,10 @@ fn config_validation_errors_do_not_echo_secret_values() {
             "TELEGRAM_WEBHOOK_URL",
             format!("http://tasklerq:{DB_PASSWORD}@[::1"),
         ),
-        ("HA_BASE_URL", format!("http://tasklerq:{DB_PASSWORD}@[::1")),
+        (
+            "LLM_PRIMARY_URL",
+            format!("http://tasklerq:{DB_PASSWORD}@[::1"),
+        ),
     ];
 
     for (name, value) in cases {
