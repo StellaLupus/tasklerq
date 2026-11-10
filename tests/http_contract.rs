@@ -5,10 +5,12 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
-use chrono::DateTime;
+use chrono::{DateTime, TimeZone, Utc};
 use http_body_util::BodyExt;
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
+use tasklerq::domain::models::{Item, ItemPriority, ItemSource, ItemStatus};
+use tasklerq::http::api::dto::ItemResponse;
 use tasklerq::http::router::{AppState, build_router};
 use tasklerq::security_audit::Audit;
 use tower::ServiceExt;
@@ -147,5 +149,56 @@ async fn health_ready_reports_unavailable_database() {
     assert!(
         !json.to_string().contains("password"),
         "error must not leak the database URL"
+    );
+}
+
+#[test]
+fn item_object_exposes_event_end_fields() {
+    let moment = |hour: u32, minute: u32| {
+        Utc.with_ymd_and_hms(2026, 11, 11, hour, minute, 0)
+            .single()
+            .expect("fixed moment")
+    };
+    let now = moment(10, 0);
+    let item = Item {
+        id: Uuid::nil(),
+        household_id: Uuid::nil(),
+        list_id: Uuid::nil(),
+        title: "Маникюр".into(),
+        notes: None,
+        status: ItemStatus::Open,
+        priority: ItemPriority::Normal,
+        due_at: Some(moment(14, 0)),
+        due_date: None,
+        end_at: Some(moment(15, 30)),
+        end_date: None,
+        assignee_user_id: None,
+        created_by_user_id: None,
+        source: ItemSource::Api,
+        capture_id: None,
+        completed_at: None,
+        completed_by_user_id: None,
+        quantity: None,
+        unit: None,
+        position: 0,
+        version: 1,
+        recurrence: None,
+        created_at: now,
+        updated_at: now,
+        deleted_at: None,
+        tags: Vec::new(),
+        subtasks: Vec::new(),
+    };
+
+    let json = serde_json::to_value(ItemResponse::from(item)).expect("item response serializes");
+
+    assert_eq!(json["due_at"], "2026-11-11T14:00:00Z");
+    assert_eq!(json["end_at"], "2026-11-11T15:30:00Z");
+    assert_eq!(json["end_date"], Value::Null);
+    assert!(
+        json.as_object()
+            .expect("item object")
+            .contains_key("end_date"),
+        "the Item object must always expose end_date"
     );
 }

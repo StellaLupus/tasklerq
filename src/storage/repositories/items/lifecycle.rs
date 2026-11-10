@@ -188,6 +188,7 @@ pub async fn revert_completion(
     now: DateTime<Utc>,
 ) -> Result<Item, DomainError> {
     let row = row_by_id(conn, household_id, item_id, false, true).await?;
+    ensure_not_event(conn, household_id, row.list_id).await?;
     let current = hydrate_one(conn, row.clone()).await?;
 
     let completion = completions::latest_for_item(conn, household_id, item_id)

@@ -75,10 +75,14 @@ pub struct CreateItemRequest {
     pub notes: Option<String>,
     /// Приоритет.
     pub priority: Option<ItemPriority>,
-    /// Срок со временем.
+    /// Срок со временем; у события — начало.
     pub due_at: Option<DateTime<Utc>>,
-    /// Вседневный срок.
+    /// Вседневный срок; у события — начало.
     pub due_date: Option<NaiveDate>,
+    /// Конец события со временем.
+    pub end_at: Option<DateTime<Utc>>,
+    /// Последний день вседневного события включительно.
+    pub end_date: Option<NaiveDate>,
     /// Исполнитель.
     pub assignee_user_id: Option<Uuid>,
     /// Количество.

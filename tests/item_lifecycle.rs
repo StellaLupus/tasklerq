@@ -2,7 +2,7 @@
 
 mod support;
 
-use chrono::{Datelike, Duration, NaiveDate, NaiveTime, SubsecRound, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, SubsecRound, TimeZone, Utc};
 use tasklerq::domain::error::DomainError;
 use tasklerq::domain::models::{
     EventType, Field, ItemPatch, ItemStatus, ListKind, MonthRule, RecurrenceFreq,
@@ -5001,4 +5001,222 @@ async fn completions_never_include_events() {
 
     let page = journal(&mut conn, &household, 0).await;
     assert!(page.entries.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reverting_a_completion_of_an_event_is_rejected() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let start = utc(2026, 11, 10, 14);
+    let mut input = support::new_item(household.events_list_id, "Маникюр");
+    input.due_at = Some(start);
+    input.end_at = Some(start + Duration::minutes(90));
+    let event = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    // Выполнения у события быть не может, поэтому отказ обязан идти от типа
+    // элемента, а не от отсутствия записи выполнения.
+    let error = items::revert_completion(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        event.id,
+        uuid::Uuid::now_v7(),
+        Utc::now(),
+    )
+    .await
+    .expect_err("a completion of an event cannot be reverted");
+    assert!(matches!(error, DomainError::Validation(_)), "{error:?}");
+
+    let current = items::get(&mut conn, household.household_id, event.id)
+        .await
+        .expect("event stays");
+    assert_eq!(current.status, ItemStatus::Open);
+    assert_eq!(current.version, event.version);
+    assert_eq!(current.due_at, Some(start));
+    assert_eq!(current.end_at, Some(start + Duration::minutes(90)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shifting_an_event_start_past_the_datetime_limit_is_rejected() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let end = DateTime::<Utc>::MAX_UTC - Duration::hours(1);
+    let start = end - Duration::days(1);
+    let mut input = support::new_item(household.events_list_id, "Край времени");
+    input.due_at = Some(start);
+    input.end_at = Some(end);
+    let event = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let error = items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        event.id,
+        event.version,
+        ItemPatch {
+            due_at: Field::Value(end),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect_err("an end beyond the representable range must be rejected");
+    assert!(matches!(error, DomainError::Validation(_)), "{error:?}");
+
+    let current = items::get(&mut conn, household.household_id, event.id)
+        .await
+        .expect("event stays");
+    assert_eq!(current.version, event.version);
+    assert_eq!(current.due_at, event.due_at);
+    assert_eq!(current.end_at, event.end_at);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shifting_an_all_day_event_start_past_the_date_limit_is_rejected() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let end = NaiveDate::MAX;
+    let start = end - Duration::days(1);
+    let mut input = support::new_item(household.events_list_id, "Крайний день");
+    input.due_date = Some(start);
+    input.end_date = Some(end);
+    let event = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let error = items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        event.id,
+        event.version,
+        ItemPatch {
+            due_date: Field::Value(end),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect_err("an end beyond the representable range must be rejected");
+    assert!(matches!(error, DomainError::Validation(_)), "{error:?}");
+
+    let current = items::get(&mut conn, household.household_id, event.id)
+        .await
+        .expect("event stays");
+    assert_eq!(current.version, event.version);
+    assert_eq!(current.due_date, Some(start));
+    assert_eq!(current.end_date, Some(end));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_explicit_null_end_clears_it_when_the_start_moves() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let start = utc(2026, 11, 10, 14);
+    let mut input = support::new_item(household.events_list_id, "Маникюр");
+    input.due_at = Some(start);
+    input.end_at = Some(start + Duration::minutes(90));
+    let event = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let moved_start = utc(2026, 11, 11, 16);
+    let moved = items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        event.id,
+        event.version,
+        ItemPatch {
+            due_at: Field::Value(moved_start),
+            end_at: Field::Null,
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("move the start and clear the end");
+
+    assert_eq!(moved.due_at, Some(moved_start));
+    assert_eq!(
+        moved.end_at, None,
+        "an explicit null end must be cleared, not shifted"
+    );
+    assert_eq!(moved.end_date, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changing_the_start_kind_of_an_event_with_an_end_is_rejected() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let start = utc(2026, 11, 10, 14);
+    let end = start + Duration::minutes(90);
+    let mut input = support::new_item(household.events_list_id, "Маникюр");
+    input.due_at = Some(start);
+    input.end_at = Some(end);
+    let event = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        input,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let error = items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        event.id,
+        event.version,
+        ItemPatch {
+            due_date: Field::Value(date(2026, 11, 10)),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect_err("a timed end does not fit an all-day start");
+    assert!(matches!(error, DomainError::Validation(_)), "{error:?}");
+
+    let current = items::get(&mut conn, household.household_id, event.id)
+        .await
+        .expect("event stays");
+    assert_eq!(current.version, event.version);
+    assert_eq!(current.due_at, Some(start));
+    assert_eq!(current.due_date, None);
+    assert_eq!(current.end_at, Some(end));
 }

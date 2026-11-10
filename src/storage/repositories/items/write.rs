@@ -334,12 +334,26 @@ async fn update_inner(
         && patch.end_date.is_missing()
     {
         if let (Some(old_start), Some(new_start)) = (row.due_at, due_at) {
-            end_at = row.end_at.map(|old_end| old_end + (new_start - old_start));
+            let shift = new_start - old_start;
+            end_at = row
+                .end_at
+                .map(|old_end| {
+                    old_end
+                        .checked_add_signed(shift)
+                        .ok_or_else(|| DomainError::Validation("event end is out of range".into()))
+                })
+                .transpose()?;
         }
         if let (Some(old_start), Some(new_start)) = (row.due_date, due_date) {
+            let shift = new_start - old_start;
             end_date = row
                 .end_date
-                .map(|old_end| old_end + (new_start - old_start));
+                .map(|old_end| {
+                    old_end
+                        .checked_add_signed(shift)
+                        .ok_or_else(|| DomainError::Validation("event end is out of range".into()))
+                })
+                .transpose()?;
         }
     }
 
