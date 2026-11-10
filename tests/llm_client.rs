@@ -8,7 +8,7 @@ use tasklerq::config::SecretString;
 use tasklerq::llm::{
     ChatBackend, ChatMessage, ChatRequest, LlmError, MAX_COMPLETION_TOKENS, OpenAiBackend,
 };
-use wiremock::matchers::{body_partial_json, header, method, path};
+use wiremock::matchers::{body_partial_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const TOKEN: &str = "llm-SECRET-token";
@@ -251,6 +251,35 @@ async fn base_url_with_trailing_slash_is_accepted() {
 }
 
 #[tokio::test]
+async fn base_url_with_query_keeps_the_query_after_the_path() {
+    let server = MockServer::start().await;
+    let schema = schema();
+    let messages = messages();
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(query_param("api-version", "1"))
+        .respond_with(answered(ANSWER))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let backend = OpenAiBackend::new(
+        &format!("{}/v1?api-version=1", server.uri()),
+        MODEL,
+        None,
+        Duration::from_millis(500),
+        Map::new(),
+    )
+    .expect("backend");
+
+    backend
+        .complete(&request(&messages, &schema), Duration::from_secs(5))
+        .await
+        .expect("completion");
+}
+
+#[tokio::test]
 async fn http_statuses_map_to_distinct_error_codes() {
     let cases = [
         (401, "unauthorized"),
@@ -449,6 +478,32 @@ async fn wrong_usage_types_do_not_discard_a_valid_answer() {
         assert_eq!(completion.input_tokens, None, "usage {usage}");
         assert_eq!(completion.output_tokens, None, "usage {usage}");
     }
+}
+
+#[tokio::test]
+async fn non_object_usage_and_numeric_model_keep_a_valid_answer() {
+    let server = MockServer::start().await;
+    let schema = schema();
+    let messages = messages();
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": 5,
+            "choices": [{"message": {"role": "assistant", "content": ANSWER}}],
+            "usage": "n/a",
+        })))
+        .mount(&server)
+        .await;
+
+    let completion = backend(&server)
+        .complete(&request(&messages, &schema), Duration::from_secs(5))
+        .await
+        .expect("a valid answer with bad metadata is accepted");
+
+    assert_eq!(completion.content, ANSWER);
+    assert_eq!(completion.input_tokens, None);
+    assert_eq!(completion.output_tokens, None);
+    assert_eq!(completion.model, "");
 }
 
 #[test]

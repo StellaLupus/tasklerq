@@ -11,11 +11,18 @@ use url::Url;
 pub const REDACTED: &str = "<redacted>";
 
 /// Переменные окружения, значения которых считаются секретами целиком.
-const SECRET_ENV: [&str; 3] = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET", "HA_TOKEN"];
+const SECRET_ENV: [&str; 5] = [
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_WEBHOOK_SECRET",
+    "HA_TOKEN",
+    "LLM_PRIMARY_TOKEN",
+    "LLM_FALLBACK_TOKEN",
+];
 
 /// Порог только для пароля из `DATABASE_URL`: слишком короткое значение
 /// заменило бы обычные слова. Значения `TELEGRAM_BOT_TOKEN`,
-/// `TELEGRAM_WEBHOOK_SECRET` и `HA_TOKEN` вырезаются при любой непустой длине.
+/// `TELEGRAM_WEBHOOK_SECRET`, `HA_TOKEN` и токенов слотов LLM вырезаются при
+/// любой непустой длине.
 const MIN_SECRET_CHARS: usize = 6;
 
 /// Убрать учётные данные из одного URL, сохранив остальные части.
@@ -363,6 +370,8 @@ mod tests {
             ("TELEGRAM_BOT_TOKEN", "123456:secret-token-value"),
             ("HA_TOKEN", "abc"),
             ("TELEGRAM_WEBHOOK_SECRET", "s3c"),
+            ("LLM_PRIMARY_TOKEN", "prim"),
+            ("LLM_FALLBACK_TOKEN", "fbck"),
         ]);
 
         assert!(secrets.iter().any(|secret| secret == "p%40ssword"));
@@ -383,9 +392,17 @@ mod tests {
             secrets.iter().any(|secret| secret == "s3c"),
             "a short webhook secret must still be collected: {secrets:?}"
         );
+        assert!(
+            secrets.iter().any(|secret| secret == "prim"),
+            "the primary slot token must be collected at any length: {secrets:?}"
+        );
+        assert!(
+            secrets.iter().any(|secret| secret == "fbck"),
+            "the fallback slot token must be collected at any length: {secrets:?}"
+        );
 
-        let text =
-            "db p%40ssword, decoded p@ssword, token 123456:secret-token-value, ha abc, hook s3c";
+        let text = "db p%40ssword, decoded p@ssword, token 123456:secret-token-value, \
+                    ha abc, hook s3c, primary prim, fallback fbck";
         let redacted = replace_known_secrets(text, &secrets);
         assert!(!redacted.contains("p%40ssword"), "{redacted}");
         assert!(!redacted.contains("p@ssword"), "{redacted}");
@@ -395,6 +412,8 @@ mod tests {
         );
         assert!(!redacted.contains(" abc"), "{redacted}");
         assert!(!redacted.contains(" s3c"), "{redacted}");
+        assert!(!redacted.contains(" prim"), "{redacted}");
+        assert!(!redacted.contains(" fbck"), "{redacted}");
     }
 
     #[test]

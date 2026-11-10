@@ -3,6 +3,8 @@
 //! [`ChatBackend`] — граница, за которой скрыт транспорт слота. Оркестрация
 //! разбора работает только с этим trait, поэтому в тестах слот заменяется
 //! двойником, а [`OpenAiBackend`] остаётся единственной рабочей реализацией.
+//! [`Slot`] добавляет к клиенту таймаут и предохранитель, а [`Chain`] исполняет
+//! разбор по основному и резервному слоту в пределах бюджета источника.
 //! Клиент ничего не знает о промпте: он отправляет сообщения и схему ответа,
 //! возвращает текст, число токенов и модель.
 //!
@@ -17,8 +19,16 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
+use url::Url;
 
 use crate::config::{SecretString, SlotConfig, loggable_url};
+
+mod chain;
+
+pub use chain::{
+    Attempt, Chain, ChainError, ChainOutcome, Clock, FALLBACK_SLOT, PRIMARY_SLOT, ResponseFailure,
+    Slot, SystemClock,
+};
 
 /// Верхняя граница ответа модели: черновик из двадцати элементов и уточнений
 /// укладывается с запасом.
@@ -180,6 +190,7 @@ impl OpenAiBackend {
         if url.is_empty() {
             return Err(LlmError::Config("url must not be empty"));
         }
+        let endpoint = completions_endpoint(url)?;
         // Токен уходит в Bearer-заголовке: на редирект не идём, чтобы он не
         // попал на другой адрес.
         let client = reqwest::Client::builder()
@@ -189,7 +200,7 @@ impl OpenAiBackend {
             .map_err(|_| LlmError::Config("http client"))?;
         Ok(Self {
             client,
-            endpoint: format!("{}/chat/completions", url.trim_end_matches('/')),
+            endpoint,
             model: model.into(),
             token,
             extra,
@@ -236,6 +247,21 @@ impl OpenAiBackend {
         }
         Value::Object(body)
     }
+}
+
+/// Адрес `chat/completions` от базового адреса слота.
+///
+/// Сегменты пути добавляются через [`Url::path_segments_mut`]: query и fragment
+/// базового адреса остаются после пути, а не попадают в него.
+fn completions_endpoint(raw: &str) -> Result<String, LlmError> {
+    let mut url = Url::parse(raw).map_err(|_| LlmError::Config("url"))?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| LlmError::Config("url must have a path"))?;
+        segments.pop_if_empty().push("chat").push("completions");
+    }
+    Ok(url.to_string())
 }
 
 impl fmt::Debug for OpenAiBackend {
@@ -301,8 +327,8 @@ fn classify_status(status: u16) -> Option<LlmError> {
 struct CompletionBody {
     #[serde(default)]
     choices: Vec<Choice>,
-    usage: Option<Usage>,
-    model: Option<String>,
+    usage: Option<Value>,
+    model: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -315,28 +341,26 @@ struct ChoiceMessage {
     content: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct Usage {
-    #[serde(default, deserialize_with = "token_count")]
-    prompt_tokens: Option<u32>,
-    #[serde(default, deserialize_with = "token_count")]
-    completion_tokens: Option<u32>,
-}
-
 /// Число токенов из `usage`.
 ///
 /// Провайдер иногда присылает строку, отрицательное или дробное значение.
 /// Неверный тип не отменяет принятый ответ: токены просто остаются
 /// неизвестными, и разбор не уходит на резервный слот зря.
-fn token_count<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<Value>::deserialize(deserializer)?;
-    Ok(value
-        .as_ref()
+fn token_count(value: Option<&Value>) -> Option<u32> {
+    value
         .and_then(Value::as_u64)
-        .and_then(|count| u32::try_from(count).ok()))
+        .and_then(|count| u32::try_from(count).ok())
+}
+
+/// Входные и выходные токены из `usage`, если это объект с числовыми полями.
+fn usage_tokens(usage: Option<&Value>) -> (Option<u32>, Option<u32>) {
+    let Some(usage) = usage.and_then(Value::as_object) else {
+        return (None, None);
+    };
+    (
+        token_count(usage.get("prompt_tokens")),
+        token_count(usage.get("completion_tokens")),
+    )
 }
 
 /// Достать текст, токены и модель из ответа `chat/completions`.
@@ -353,17 +377,17 @@ fn extract_completion(body: &str) -> Result<ChatCompletion, LlmError> {
     if content.trim().is_empty() {
         return Err(LlmError::EmptyResponse);
     }
+    let (input_tokens, output_tokens) = usage_tokens(response.usage.as_ref());
     Ok(ChatCompletion {
         content,
-        input_tokens: response
-            .usage
+        input_tokens,
+        output_tokens,
+        model: response
+            .model
             .as_ref()
-            .and_then(|usage| usage.prompt_tokens),
-        output_tokens: response
-            .usage
-            .as_ref()
-            .and_then(|usage| usage.completion_tokens),
-        model: response.model.unwrap_or_default(),
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
     })
 }
 
@@ -439,6 +463,39 @@ mod tests {
             assert_eq!(completion.input_tokens, None);
             assert_eq!(completion.output_tokens, None);
         }
+    }
+
+    #[test]
+    fn non_object_usage_and_numeric_model_do_not_discard_a_valid_answer() {
+        let body = json!({
+            "model": 5,
+            "choices": [{"message": {"content": "{\"items\":[]}"}}],
+            "usage": "n/a",
+        });
+
+        let completion =
+            extract_completion(&body.to_string()).expect("a valid answer with bad metadata");
+
+        assert_eq!(completion.content, r#"{"items":[]}"#);
+        assert_eq!(completion.input_tokens, None);
+        assert_eq!(completion.output_tokens, None);
+        assert_eq!(completion.model, "");
+    }
+
+    #[test]
+    fn completions_endpoint_keeps_query_after_the_path() {
+        assert_eq!(
+            completions_endpoint("https://host.example/v1?api-version=1").expect("endpoint"),
+            "https://host.example/v1/chat/completions?api-version=1"
+        );
+        assert_eq!(
+            completions_endpoint("http://llm.local:8080/v1/").expect("endpoint"),
+            "http://llm.local:8080/v1/chat/completions"
+        );
+        assert_eq!(
+            completions_endpoint("http://llm.local:8080").expect("endpoint"),
+            "http://llm.local:8080/chat/completions"
+        );
     }
 
     #[test]
