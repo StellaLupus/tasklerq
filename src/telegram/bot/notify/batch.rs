@@ -528,7 +528,8 @@ async fn actionable(
         render_batch(ctx, message_id, batch_id).await?;
         return Ok(false);
     };
-    if let Some(toast) = blocked_toast(batch_entry(&row, ctx.tz, ctx.now).state, event_refusal) {
+    let entry = batch_entry(&row, ctx.tz, ctx.now);
+    if let Some(toast) = blocked_toast(entry.state, entry.is_event, event_refusal) {
         ctx.toast(toast);
         render_batch(ctx, message_id, batch_id).await?;
         return Ok(false);
@@ -559,13 +560,18 @@ fn unique_items(rows: &[BatchDelivery]) -> Vec<(Uuid, &BatchDelivery)> {
 /// Подсказка для блока, по которому действие уже невозможно.
 ///
 /// `event_refusal` — отказ для устаревшей кнопки на блоке события: событие не
-/// выполняется и не откладывается.
-fn blocked_toast(state: BatchEntryState, event_refusal: &'static str) -> Option<&'static str> {
+/// выполняется и не откладывается. Удалённое событие тоже называется событием.
+fn blocked_toast(
+    state: BatchEntryState,
+    is_event: bool,
+    event_refusal: &'static str,
+) -> Option<&'static str> {
     match state {
         BatchEntryState::Open => None,
         BatchEntryState::Event => Some(event_refusal),
         BatchEntryState::Done => Some("Задача уже выполнена"),
         BatchEntryState::Snoozed(_) => Some("Задача уже отложена"),
+        BatchEntryState::Missing if is_event => Some("Событие больше недоступно"),
         BatchEntryState::Missing => Some("Задача больше недоступна"),
         BatchEntryState::ListArchived => Some("Список в архиве"),
     }
