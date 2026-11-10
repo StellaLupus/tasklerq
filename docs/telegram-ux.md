@@ -1654,11 +1654,11 @@ https://t.me/tasklerq_example_bot?start=AbCdEf123456
 Сейчас пишутся метрики Prometheus из `src/metrics.rs`:
 
 - счётчики: `capture_total{source,status}`, `capture_fallback_total{source}`,
-  `llm_requests_total{status}`, `llm_validation_failures_total`,
+  `llm_requests_total{slot,status}`, `llm_validation_failures_total`,
   `telegram_updates_total{status}`, `outbox_dead_total`,
   `http_requests_total{route,status}`, `webhook_auth_failures_total`,
   `webhook_rate_limited_total`, `webhook_auth_failure_threshold_exceeded_total`;
-- гистограмма `llm_latency_seconds`;
+- гистограмма `llm_latency_seconds{slot}`;
 - gauges: `telegram_queue_lag_seconds`, `outbox_pending`, `db_pool_in_use`.
 
 Планируемые продуктовые метрики: время до создания задачи, доля

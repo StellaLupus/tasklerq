@@ -628,18 +628,27 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
     );
 }
 
+/// Значение серии из рендера `/metrics`; 0, если серии ещё нет.
+fn series_value(text: &str, series: &str) -> u64 {
+    text.lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(' ')?;
+            if name != series {
+                return None;
+            }
+            value.parse::<u64>().ok()
+        })
+        .unwrap_or(0)
+}
+
 #[tokio::test]
 async fn chain_reports_llm_metrics_with_slot_labels() {
-    let primary = Slot::new(
-        "primary",
-        Arc::new(TimeoutBackend),
-        StdDuration::from_secs(1),
-    );
-    let fallback = Slot::new(
-        "fallback",
-        Arc::new(AnswerBackend),
-        StdDuration::from_secs(1),
-    );
+    // Уникальные имена слотов: соседние тесты в общем реестре пишут те же
+    // серии, и разницу значений можно считать только для своих слотов.
+    const PRIMARY: &str = "metrics-test-primary";
+    const FALLBACK: &str = "metrics-test-fallback";
+    let primary = Slot::new(PRIMARY, Arc::new(TimeoutBackend), StdDuration::from_secs(1));
+    let fallback = Slot::new(FALLBACK, Arc::new(AnswerBackend), StdDuration::from_secs(1));
     let chain = Chain::new(primary, Some(fallback));
     let schema = json!({"type": "object"});
     let messages = vec![ChatMessage::user("купить молоко")];
@@ -649,6 +658,7 @@ async fn chain_reports_llm_metrics_with_slot_labels() {
         schema: &schema,
     };
 
+    let before = tasklerq::metrics::render();
     let outcome = chain
         .run(
             &request,
@@ -660,22 +670,24 @@ async fn chain_reports_llm_metrics_with_slot_labels() {
         .await;
     assert!(outcome.result.is_ok());
 
-    let text = tasklerq::metrics::render();
+    let after = tasklerq::metrics::render();
+    for (slot, status) in [(PRIMARY, "failure"), (FALLBACK, "success")] {
+        let series = format!("llm_requests_total{{slot=\"{slot}\",status=\"{status}\"}}");
+        assert_eq!(
+            series_value(&after, &series),
+            series_value(&before, &series) + 1,
+            "Chain must record the request:\n{after}"
+        );
+        let count = format!("llm_latency_seconds_count{{slot=\"{slot}\"}}");
+        assert_eq!(
+            series_value(&after, &count),
+            series_value(&before, &count) + 1,
+            "Chain must record the latency:\n{after}"
+        );
+    }
     assert!(
-        text.contains("llm_requests_total{slot=\"primary\",status=\"failure\"}"),
-        "{text}"
-    );
-    assert!(
-        text.contains("llm_requests_total{slot=\"fallback\",status=\"success\"}"),
-        "{text}"
-    );
-    assert!(
-        text.contains("llm_latency_seconds_count{slot=\"primary\"}"),
-        "{text}"
-    );
-    assert!(
-        text.contains("llm_latency_seconds_bucket{slot=\"fallback\",le=\""),
-        "{text}"
+        after.contains("llm_latency_seconds_bucket{slot=\"metrics-test-fallback\",le=\""),
+        "{after}"
     );
 }
 
