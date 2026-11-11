@@ -30,16 +30,14 @@
                  │ (bridge)       │  -db   │ shared-db    │
                  └──┬──────────┬──┘        └──────────────┘
                     │          │
-        host.docker │          │ HTTPS
-        .internal   │          ▼
-                    ▼    ┌──────────────┐
-             ┌──────────┐│ Telegram API │
-             │ HA host  │└──────────────┘
+        127.0.0.1   │          │ HTTPS
+        :18080      │          ├──────────────▶ Telegram API
+                    │          │
+                    ▲          └──────────────▶ LLM slots
+             ┌──────┴───┐                       OpenRouter / llama.cpp
+             │ HA host  │
              │ :8123    │
-             └────┬─────┘
-                  │ ai_task.generate_data
-                  ▼
-             OpenRouter → Claude Haiku
+             └──────────┘
 ```
 
 Принципы:
@@ -60,7 +58,7 @@
 | Reverse Proxy | `HTTPS tasklerq.example.com:443` → `http://127.0.0.1:18080`; отвечает `200` | Ничего; при `502` проверить приложение. |
 | PostgreSQL | `postgres:18-alpine` (18.6), сеть `shared-db`, порт `15433`; роль `tasklerq` (не суперпользователь) и БД `tasklerq` с `pg_trgm 1.6` | Ничего. |
 | Home Assistant | `2026.10.4`, host network, HACS; интеграция установлена | Ничего; обновления по [`home-assistant.md`](home-assistant.md). |
-| AI Task | `ai_task.anthropic_claude_haiku_5_5` | Ничего; проверять при смене модели. |
+| LLM | Слоты LLM (OpenAI-совместимый API) настраиваются в env Tasklerq: основной и при необходимости резервный; AI Task в Home Assistant для разбора больше не используется | Задать `LLM_PRIMARY_*` и `LLM_FALLBACK_*` по разделу 6. |
 | Telegram | Бот `@tasklerq_example_bot`, webhook зарегистрирован | Ничего; токен и секрет в `.env`. |
 | Tasklerq | Контейнер `tasklerq`, образ `stellalupus/tasklerq:<тег>` (на 2026-11-03 — `0.1.0`), healthy | Обновления по разделу 12. |
 
@@ -281,20 +279,28 @@ curl -sS -X POST \
 | `TELEGRAM_WEBHOOK_SECRET` | при `webhook` | `hex` | Секрет webhook. |
 | `TELEGRAM_WEBHOOK_URL` | при `webhook` | `https://tasklerq.example.com/webhooks/telegram` | Регистрация webhook. |
 | `TELEGRAM_BOT_USERNAME` | нет | `tasklerqbot` | Имя бота без `@` для ссылок-приглашений. |
-| `HTTPS_PROXY`, `NO_PROXY` | нет | — | Стандартные переменные HTTP-клиента: исходящие HTTPS-запросы (Bot API, HA) идут через указанный прокси, кроме адресов из `NO_PROXY` (например, `localhost,127.0.0.1,host.docker.internal`). Нужны, только если прямой доступ к Telegram из сети сервера закрыт; прокси должен быть достижим из сети контейнера. |
+| `HTTPS_PROXY`, `NO_PROXY` | нет | — | Стандартные переменные HTTP-клиента: исходящие HTTPS-запросы (Bot API, слоты LLM) идут через указанный прокси, кроме адресов из `NO_PROXY` (например, `localhost,127.0.0.1,host.docker.internal`). Нужны, только если прямой доступ к Telegram или провайдеру LLM из сети сервера закрыт; прокси должен быть достижим из сети контейнера. |
 | `TELEGRAM_API_BASE_URL` | нет | `https://api.telegram.org` | Служебный базовый адрес Bot API; вне `ENV=development` допускается только `https`. Подменяется на mock-сервер в тестах. |
 | `TELEGRAM_MODE` | нет | `webhook` | `webhook`/`polling` (dev)/`disabled` (headless). |
 | `TENANCY_MODE` | нет | `single` | `single` (по умолчанию) — один household на инсталляцию; `multi` — несколько. |
 | `BOOTSTRAP_OWNER_TELEGRAM_ID` | нет | не задано | Положительный Telegram ID первого владельца. При включённом Telegram рекомендуется задать: иначе первым владельцем станет первый написавший боту. |
 | `CAPTURE_API_ENABLED` | нет | `true` | Включить `POST /api/v1/capture`. |
-| `CAPTURE_VOICE_TIMEOUT_MS` | нет | `8000` | Таймаут LLM для `source=ha_voice`. |
+| `CAPTURE_VOICE_TIMEOUT_MS` | нет | `8000` | Бюджет разбора LLM для `source=ha_voice`, от 1000 до 60000 мс; по умолчанию 8000, то есть 8 с. Для остальных источников бюджет — 20 с. |
 | `CAPTURE_VOICE_FALLBACK_RAW` | нет | `true` | Создавать позицию из текста при сбое LLM, таймауте, исчерпанной квоте или открытом предохранителе. Действует на весь внешний `auto`, не только на `ha_voice`; в `draft` fallback не применяется. |
 | `CAPTURE_RATE_LIMIT_PER_MIN` | нет | `10` | Capture в минуту на токен. |
 | `CAPTURE_MAX_TEXT_CHARS` | нет | `2000` | Максимальная длина текста, от 100 до 2000. |
-| `HA_BASE_URL` | при LLM | `http://host.docker.internal:8123` | Home Assistant из контейнера Tasklerq. |
-| `HA_TOKEN` | при LLM | `eyJ...` | Long-lived token HA. |
-| `HA_AI_TASK_ENTITY_ID` | при LLM | `ai_task.anthropic_claude_haiku_5_5` | AI Task. |
 | `LLM_CAPTURE_ENABLED` | нет | `true` | Включить разбор. |
+| `LLM_PRIMARY_URL` | при LLM | `https://openrouter.ai/api/v1` | Базовый адрес OpenAI-совместимого API, включая `/v1`. |
+| `LLM_PRIMARY_MODEL` | при LLM | `anthropic/claude-haiku-5.5` | Имя модели основного слота. |
+| `LLM_PRIMARY_TOKEN` | нет | `sk-or-...` | Токен доступа; локальному серверу без авторизации не нужен. |
+| `LLM_PRIMARY_TIMEOUT_MS` | нет | `10000` | Таймаут запроса модели, от 100 до 600000 мс; по умолчанию 10000. |
+| `LLM_PRIMARY_EXTRA_JSON` | нет | `{"reasoning":{"effort":"minimal"}}` | Дополнительные параметры тела запроса. Невалидный JSON-объект — ошибка запуска; `model`, `messages`, `response_format` и `temperature` не заменяются. `max_tokens` по умолчанию 4096; его можно переопределить здесь — запас нужен рассуждающим моделям. |
+| `LLM_FALLBACK_URL` | нет | `http://192.168.1.10:8081/v1` | Адрес резервного слота, включая `/v1`; задаётся вместе с `LLM_FALLBACK_MODEL`, иначе — ошибка запуска. |
+| `LLM_FALLBACK_MODEL` | нет | `qwen3.8-4b` | Модель резервного слота. |
+| `LLM_FALLBACK_TOKEN` | нет | — | Токен резервного слота; локальному серверу не нужен. |
+| `LLM_FALLBACK_TIMEOUT_MS` | нет | `10000` | Таймаут запроса резервного слота, от 100 до 600000 мс. |
+| `LLM_FALLBACK_EXTRA_JSON` | нет | — | Дополнительные параметры резервного слота; как у основного, включая переопределение `max_tokens`. |
+| `LLM_CONNECT_TIMEOUT_MS` | нет | `1000` | Таймаут установки соединения, общий для слотов, от 10 до 60000 мс; по умолчанию 1000. |
 | `LLM_DAILY_QUOTA` | нет | `200` | Разборов в сутки на household. |
 | `QUEUE_MAX_ATTEMPTS` | нет | `10` | Попытки обработки update. |
 | `QUEUE_READY_LAG_SECONDS` | нет | `300` | Порог readiness: `/health/ready` отвечает 503, если обновление Telegram ждёт обработки дольше. Проверка нужна для healthcheck контейнера и мониторинга; не используйте её, чтобы убирать инстанс из маршрутизации webhook: при лаге это остановит приём обновлений и усугубит задержку. |
@@ -312,10 +318,56 @@ curl -sS -X POST \
 конфигурациях могли остаться значения 2001–16000: теперь они не проходят
 проверку, и сервис не стартует. Уменьшите значение до 2000 или ниже.
 
-`HA_BASE_URL` — это адрес **Home Assistant для Tasklerq**, а не наоборот.
-Поскольку HA работает в host-режиме, из bridge-контейнера Tasklerq используйте
-`http://host.docker.internal:8123` (нужен `extra_hosts`) или
-`http://192.168.1.10:8123`.
+`LLM_PRIMARY_URL` и `LLM_FALLBACK_URL` — базовые адреса OpenAI-совместимого
+API **включая `/v1`**: клиент добавляет `/chat/completions`. Токен нужен не
+всем: локальному серверу без авторизации `LLM_*_TOKEN` не задают. Резервный
+слот настраивается целиком или отсутствует: адрес и модель задаются вместе,
+половина пары — ошибка запуска. Невалидный `LLM_*_EXTRA_JSON` (не JSON-объект)
+тоже останавливает запуск. Дополнительные параметры не заменяют `model`,
+`messages`, `response_format` и `temperature`; `max_tokens` по умолчанию 4096 и
+переопределяется через `LLM_*_EXTRA_JSON`.
+
+Бюджет разбора для `source=ha_voice` задаёт `CAPTURE_VOICE_TIMEOUT_MS`
+(по умолчанию `8000`, то есть 8 секунд); для остальных источников бюджет —
+20 секунд. При настроенном резервном слоте основной получает не больше
+половины бюджета, а резервный — оставшееся время; каждый слот дополнительно
+ограничен своим `LLM_*_TIMEOUT_MS`. Без резервного слота основной получает весь
+бюджет в пределах своего таймаута. Установка соединения ограничена
+`LLM_CONNECT_TIMEOUT_MS`.
+
+Пример пары «облачный основной и локальный резервный»:
+
+```bash
+# Основной: OpenRouter, Claude Haiku 5.5.
+LLM_PRIMARY_URL=https://openrouter.ai/api/v1
+LLM_PRIMARY_MODEL=anthropic/claude-haiku-5.5
+LLM_PRIMARY_TOKEN=sk-or-...
+LLM_PRIMARY_TIMEOUT_MS=10000
+
+# Резервный: llama.cpp в локальной сети, без токена.
+LLM_FALLBACK_URL=http://192.168.1.10:8081/v1
+LLM_FALLBACK_MODEL=qwen3.8-4b
+LLM_FALLBACK_TIMEOUT_MS=8000
+
+LLM_CONNECT_TIMEOUT_MS=1000
+```
+
+Если исходящий трафик сервиса идёт через прокси (`HTTPS_PROXY`), адрес
+локального слота добавьте в `NO_PROXY`: иначе запросы к нему уйдут через
+прокси.
+
+Пару по умолчанию документ не утверждает: состав слотов выбирается по
+результатам `capture-eval` (design, Open Questions).
+
+У Gemini 3.5 Flash рассуждения нельзя отключить, но `reasoning.effort =
+minimal` сокращает задержку (в спайке — 2.3 с вместо 5.2 с):
+
+```bash
+LLM_PRIMARY_EXTRA_JSON='{"reasoning":{"effort":"minimal"}}'
+```
+
+Не добавляйте `provider.require_parameters`: у Haiku через OpenRouter этот
+параметр приводит к отказу маршрутизации. Клиент его сам не отправляет.
 
 Если Telegram не нужен, установите `TELEGRAM_MODE=disabled`; `TELEGRAM_BOT_TOKEN`
 и webhook-секрет в этом режиме не требуются. HTTP API, HA-компонент и внешний
@@ -413,10 +465,11 @@ networks:
   занят Zigbee2MQTT.
 - Сеть `shared-db` уже существует; в ней работает `postgres`.
 - Сеть `ha` не нужна: HA в `network_mode: host`.
-- `extra_hosts` нужен, чтобы Tasklerq мог обращаться к HA по
-  `host.docker.internal:8123`. Если Synology не поддерживает
-  `host-gateway`, используйте `http://192.168.1.10:8123` и удалите
-  `extra_hosts`.
+- `extra_hosts` больше не нужен для Home Assistant: Tasklerq не обращается к
+  HA (раздел 10). Он оставлен как запасной путь до локального слота LLM,
+  запущенного на хосте NAS: `http://host.docker.internal:<порт>/v1`. Если
+  Synology не поддерживает `host-gateway`, используйте адрес NAS в локальной
+  сети (например, `http://192.168.1.10:8081/v1`) и удалите `extra_hosts`.
 
 Проверка:
 
@@ -620,9 +673,12 @@ HA работает в `network_mode: host`, Tasklerq — в bridge-сети:
 | Направление | Адрес | Комментарий |
 | --- | --- | --- |
 | HA → Tasklerq | `http://127.0.0.1:18080` | HA в host-режиме видит loopback NAS. |
-| Tasklerq → HA | `http://host.docker.internal:8123` | Через `extra_hosts`; альтернатива — `http://192.168.1.10:8123`. |
 | Tasklerq → PostgreSQL | `postgres:5432` | Общая сеть `shared-db`. |
 | Telegram → Tasklerq | `https://tasklerq.example.com` | Synology Reverse Proxy → `127.0.0.1:18080`. |
+
+Разбор текста идёт напрямую в слоты LLM (раздел 6), поэтому исходящий доступ
+из контейнера Tasklerq к Home Assistant больше не нужен: остаётся только
+направление HA → Tasklerq для компонента.
 
 Если HA переедет в bridge-сеть, добавьте общую сеть `ha` и используйте
 `http://tasklerq:8080`; но текущая конфигурация — host.
@@ -633,16 +689,6 @@ HA работает в `network_mode: host`, Tasklerq — в bridge-сети:
 sudo /usr/local/bin/docker exec -it homeassistant sh
 wget -qO- http://127.0.0.1:18080/health/live
 ```
-
-Проверка из Tasklerq к HA:
-
-```bash
-sudo /usr/local/bin/docker compose exec tasklerq \
-  tasklerq healthcheck --url http://host.docker.internal:8123/manifest.json
-```
-
-В образе Tasklerq нет `curl`/`wget`; встроенная команда `healthcheck` делает
-GET и завершается успешно на `2xx`.
 
 ## 11. Резервное копирование
 
@@ -848,6 +894,61 @@ LC_ALL=C comm -23 /tmp/tag-migrations.txt /tmp/db-migrations.txt
 Непустой — эти версии будут применены при `migrate`, и откат тегом не пройдёт.
 `git ls-tree` выполняется на машине с клоном репозитория; `psql` — на NAS.
 
+### Переход на слоты LLM
+
+Разбор больше не вызывает Home Assistant AI Task: Tasklerq сам обращается к
+OpenAI-совместимому API основного и резервного слотов (раздел 6).
+
+1. В env-файл добавьте `LLM_CAPTURE_ENABLED=true`, `LLM_PRIMARY_URL` и
+   `LLM_PRIMARY_MODEL`, при необходимости — `LLM_FALLBACK_*`. `HA_*` пока
+   оставьте: они больше не читаются, но и не мешают запуску, поэтому
+   предыдущий образ с тем же env-файлом продолжит работать.
+2. Разверните образ по общему порядку из начала раздела 12. Черновики,
+   созданные до обновления, истекают за 15 минут.
+3. Проверьте слоты встроенной командой в контейнере. Нужен `DATABASE_URL`;
+   набор фраз (`src/capture/prompts/smoke-v4.json`) встроен в бинарник, сеть
+   нужна только до слота:
+
+   ```bash
+   sudo /usr/local/bin/docker compose exec tasklerq \
+     tasklerq capture-eval --slot primary
+   sudo /usr/local/bin/docker compose exec tasklerq \
+     tasklerq capture-eval --slot fallback
+   ```
+
+   Код `0` — все фразы пройдены, `1` — слот не прошёл проверку (отчёт печатает
+   причину и фактическое время), `2` — ошибка конфигурации, слота, набора или
+   базы. `--slot fallback` выполняйте, только если резервный слот задан.
+   Результат с отпечатком пишется в `llm_slot_checks`; повторный прогон заменяет
+   предыдущую запись.
+
+   Отпечаток — SHA-256 вида слота (`openai`), модели, хоста адреса (без пути,
+   учётных данных и query), хеша контракта, хеша smoke-набора и таймаута слота;
+   токен и квота в него не входят. Статус считается сравнением текущего
+   отпечатка с сохранённым:
+
+   - «не проверен» — записи в `llm_slot_checks` нет;
+   - «устарел» — отпечаток другой (изменились модель, адрес, контракт, набор
+     или таймаут);
+   - «прошёл» — отпечаток совпал, пройдены все фразы;
+   - «не прошёл» — отпечаток совпал, пройдены не все фразы; отчёт показывает,
+     сколько и какие.
+
+   Статус не блокирует работу. При старте для каждого слота пишется строка в
+   лог; слот со статусом не «прошёл» даёт предупреждение с именем слота и
+   статусом (без адреса, модели и токена). Метрика
+   `llm_slot_verified{slot}` равна `1` только для «прошёл», иначе `0`.
+   В `/health/ready` статус перечитывается не чаще раза в минуту; при статусе
+   не «прошёл» появляется предупреждение `llm_slot_unverified:<slot>`, а если
+   предохранители всех слотов разомкнуты — `llm_unavailable`; readiness при
+   этом остаётся `200`. При «устарел» повторите `capture-eval` после изменения
+   настроек; при «не прошёл» разберите причины в отчёте и повторите проверку.
+4. После подтверждения работы удалите из env-файла `HA_BASE_URL`, `HA_TOKEN` и
+   `HA_AI_TASK_ENTITY_ID` и отзовите long-lived token в Home Assistant. Если
+   `HA_*` остались, сервис пишет предупреждение в лог, а не ошибку.
+
+Откат: предыдущий образ с тем же env-файлом, пока `HA_*` не удалены на шаге 4.
+
 ### Развёртывание с нуля
 
 Развёртывание новой инсталляции на `v0.1.0` не отличается от общего порядка:
@@ -877,6 +978,19 @@ curl -fsS http://127.0.0.1:18080/health/ready
 старте сервис пишет в лог `error` с числом активных household — без названий и
 идентификаторов.
 
+При включённом LLM предупреждения readiness дополняются:
+
+- `llm_unavailable` — предохранители всех настроенных слотов разомкнуты;
+- `llm_slot_unverified:<slot>` — слот со статусом не «прошёл» («не проверен»,
+  «устарел» или «не прошёл»).
+
+Предупреждения идут одним массивом `warnings` (например,
+`["multiple_households", "llm_unavailable", "llm_slot_unverified:primary"]`) и
+не делают readiness неуспешным: без LLM сервис работает с деградацией. Адрес,
+модель и токен в предупреждения не попадают. Статус слотов перечитывается из
+`llm_slot_checks` не чаще раза в минуту, чтобы скрейп не опрашивал базу на
+каждый запрос.
+
 Метрики — `GET /metrics` в формате Prometheus exposition 0.0.4. Эндпоинт не
 публичный: нужен Bearer-токен со scope `metrics:read` (токен в query не
 принимается). Без токена — `401`, без scope — `403`. Токен выпускается
@@ -904,8 +1018,10 @@ curl -fsS \
 - `outbox_dead_total`;
 - `capture_total{source,status}`;
 - `capture_fallback_total{source}`;
-- `llm_requests_total{status}`;
-- `llm_latency_seconds` (гистограмма);
+- `llm_requests_total{slot,status}` — вызовы слотов LLM;
+- `llm_latency_seconds{slot}` (гистограмма) — длительность вызова слота;
+- `llm_slot_verified{slot}` — `1`, если слот прошёл проверку
+  `capture-eval --slot`, иначе `0`;
 - `llm_validation_failures_total`;
 - `http_requests_total{route,status}` — `route` — шаблон маршрута, а не сырой
   путь;
@@ -925,7 +1041,8 @@ curl -fsS \
 | --- | --- |
 | `/health/ready` ≠ 200 > 2 мин | Проверить БД, очередь, логи. |
 | queue lag > 5 мин | Проверить воркеры и БД. |
-| LLM errors > 20% за 15 мин | Проверить HA AI Task, квоту, OpenRouter. |
+| LLM errors > 20% за 15 мин | Проверить слоты LLM (лог старта, `llm_runs`), квоту и провайдеров. |
+| `llm_slot_verified == 0` > 1 ч | Прогнать `tasklerq capture-eval --slot <slot>`; при «устарел» — после смены настроек, при «не прошёл» — разобрать причины в отчёте. |
 | webhook 401 > 50 за 5 мин | Проверить секрет и источник запросов. |
 | Бот не отвечает: в логах `setWebhook failed` и `outbox` c `error: transient` | Исходящие в Bot API не доходят до Telegram. Проверить доступ к `api.telegram.org` из контейнера; если исходящий трафик идёт через прокси — `HTTPS_PROXY` и доступность прокси из сети контейнера. |
 | backup failed | Проверить диск, права, PostgreSQL. |
@@ -1023,7 +1140,7 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 | IDOR | Действия capture с чужим/неизвестным id не раскрывают данные | `tests/capture_api.rs::capture_actions_hide_foreign_telegram_and_unknown_captures` | пройдено |
 | IDOR | Ответ capture содержит только элементы, созданные этим запросом | `tests/capture_api.rs::the_response_contains_only_the_items_created_by_this_capture` | пройдено |
 | LLM | Пользовательский текст в делимитерах; закрыть делимитер или подставить плейсхолдер нельзя | `src/capture/prompt.rs::user_text_cannot_close_its_delimiter`, `placeholders_inside_user_text_are_not_expanded`, `hostile_names_stay_inside_their_json_string` | пройдено |
-| LLM | Ответ только по схеме `ai_task.generate_data`; инструментов, базы и API у LLM нет | `src/capture/prompt.rs::response_structure`, `structure_declares_all_item_fields`; `src/home_assistant/mod.rs` (только `generate_data`); AI Task без инструментов — 15.2 | пройдено (код) |
+| LLM | Ответ только по JSON Schema в `response_format`; инструментов, базы и API у LLM нет | `src/capture/prompt.rs::prompt_version_is_pinned_to_the_contract_hash`, `rendered_request_matches_snapshot`; `src/capture/contract.rs::every_object_is_strict_and_requires_all_properties` | пройдено (код) |
 | LLM | Идентификаторы и действия из ответа игнорируются, включая чужой `household_id` | `src/capture/schema.rs::unknown_fields_and_identifiers_are_ignored` (поля `household_id`, `list_id`, `action: delete_all`) | пройдено |
 | LLM | Ответ проходит серверную доменную валидацию, частичной записи нет | `src/capture/validate/tests.rs::valid_task_becomes_new_item_with_source` и набор тестов валидации; `tests/capture_api.rs::auto_rejects_the_whole_capture_when_one_item_is_invalid` | пройдено |
 | LLM | Массовое создание ограничено 20 элементами и не создаёт частичные данные | `src/capture/schema.rs::exactly_twenty_items_pass_and_twenty_one_do_not`; `tests/telegram_capture.rs::too_many_items_asks_to_split_the_text`, `too_many_items_do_not_open_the_circuit_breaker`; `tests/capture_api.rs::too_many_items_is_a_rejected_input_and_does_not_open_the_breaker` | пройдено |
@@ -1044,7 +1161,7 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 | Внешний capture | Ошибки не раскрывают существование чужого household или capture | `tests/capture_api.rs::capture_actions_hide_foreign_telegram_and_unknown_captures` | пройдено |
 | Секреты | `Config` не печатает секреты в `Debug`, `Display` и стартовом логе | `tests/secret_redaction.rs::config_debug_display_and_startup_log_hide_every_secret` | пройдено |
 | Секреты | Ошибки валидации конфигурации не повторяют значения секретов | `tests/secret_redaction.rs::config_validation_errors_do_not_echo_secret_values` | пройдено |
-| Секреты | Ошибки и логи Telegram и Home Assistant скрывают токены | `tests/secret_redaction.rs::telegram_network_error_and_log_hide_the_bot_token`, `home_assistant_error_and_log_hide_the_token` | пройдено |
+| Секреты | Ошибки и логи Telegram и слотов LLM скрывают токены | `tests/secret_redaction.rs::telegram_network_error_and_log_hide_the_bot_token`, `config_debug_display_and_startup_log_hide_every_secret`; `tests/llm_client.rs::connection_refused_is_reported_as_transport` | пройдено |
 | Секреты | Ошибка старта и CLI скрывают пароль БД и токен бота | `tests/secret_redaction.rs::startup_error_from_an_unreachable_database_hides_the_password`, `admin_cli_errors_hide_the_database_password_and_bot_token` | пройдено |
 | Секреты | URL с учётными данными очищается в ошибках healthcheck | `tests/secret_redaction.rs::healthcheck_error_hides_credentials_in_the_url`, `healthcheck_error_hides_credentials_when_the_url_cannot_be_parsed`; `src/redaction.rs::redact_url_credentials` | пройдено |
 | Секреты | Неверный Bearer-токен не отражается в ответе и логе | `tests/secret_redaction.rs::an_invalid_bearer_token_is_not_reflected_in_the_body_or_log` | пройдено |
@@ -1081,7 +1198,7 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 исправлен `deadlock detected`, а в прогонах 2026-11-10 рост очереди во втором
 сценарии прошёл проверку после исправления поиска (разделы 18 и 20). Пункты,
 которые нельзя проверить в коде (права файлов, роль PostgreSQL, TLS, reverse
-proxy, AI Task без инструментов, backup), остаются в 15.2 и отмечаются на
+proxy, проверка слотов LLM, backup), остаются в 15.2 и отмечаются на
 живой системе.
 
 ### 15.2. Чек-лист развёртывания
@@ -1121,8 +1238,17 @@ proxy, AI Task без инструментов, backup), остаются в 15.
   `TELEGRAM_BOT_TOKEN`.
 - [ ] `TELEGRAM_API_BASE_URL` не задан в production (используется официальный
   Telegram Bot API).
-- [ ] AI Task `ai_task.anthropic_claude_haiku_5_5` не имеет Assist-инструментов.
+- [ ] `LLM_PRIMARY_URL`, `LLM_PRIMARY_MODEL` заданы; `LLM_FALLBACK_*` — вместе
+  или не заданы.
+- [ ] Слот проверен `tasklerq capture-eval --slot primary` (и `fallback`, если
+  он задан); `llm_slot_verified{slot}` равен `1`, а `/health/ready` не содержит
+  `llm_slot_unverified:<slot>`.
 - [ ] `LLM_CAPTURE_ENABLED` соответствует политике семьи.
+- [ ] Владелец знает, что текст для разбора уходит на настроенные слоты LLM и
+  их провайдерам, и сообщил об этом household. Чтобы текст не покидал
+  локальную сеть, задан один основной слот с локальным адресом и нет
+  резервного; при `LLM_CAPTURE_ENABLED=false` текст не отправляется. Подробно
+  — [`llm-capture.md`, раздел 11](llm-capture.md#11-приватность).
 - [ ] Логи не содержат текст сообщений и токены; для capture — только `source`,
   `status`, `capture_id`.
 - [ ] Аудио голосового capture не передаётся в Tasklerq и не хранится.
@@ -1132,7 +1258,7 @@ proxy, AI Task без инструментов, backup), остаются в 15.
   каталога); доступ есть только у администратора.
 - [ ] Обновления зависимостей и образов регулярны; CI-аудит уязвимостей
   проходит.
-- [ ] HA long-lived token хранится в секретах, не в шаблонах.
+- [ ] Токены слотов LLM хранятся в секретах, не в шаблонах.
 - [ ] Diagnostics Home Assistant не содержит токенов и пароля БД; URL в нём без
   учётных данных.
 - [ ] Reverse proxy не логирует тело webhook.
@@ -1359,36 +1485,54 @@ proxy, AI Task без инструментов, backup), остаются в 15.
 6. Diagnostics: последняя ошибка.
 7. Перезагрузите интеграцию (или перезапустите HA) и проверьте сущности.
 
-### 16.7. Tasklerq не видит HA
+### 16.7. Tasklerq не видит слот LLM
 
-1. Проверьте `HA_BASE_URL` — это адрес HA из Tasklerq.
-2. Для host-режима HA используйте `http://host.docker.internal:8123` или
-   `http://192.168.1.10:8123`.
-3. Проверьте `extra_hosts` в compose.
-4. Проверьте доступность HA из контейнера Tasklerq:
+1. Проверьте `LLM_PRIMARY_URL` (или `LLM_FALLBACK_URL`): это базовый адрес
+   OpenAI-совместимого API **вместе с `/v1`**, например
+   `https://openrouter.ai/api/v1` или `http://192.168.1.10:8081/v1`.
+2. Для локального слота проверьте, что хост и порт достижимы из контейнера
+   Tasklerq и сервер слушает не только loopback. Адрес можно проверить
+   встроенной командой (в образе нет `curl`/`wget`):
 
    ```bash
    sudo /usr/local/bin/docker compose exec tasklerq \
-     tasklerq healthcheck --url http://host.docker.internal:8123/manifest.json
+     tasklerq healthcheck --url http://192.168.1.10:8081/v1/models
    ```
 
-   Код `0` — HA отвечает; ошибка подключения означает сеть/DNS, а не токен.
-   В образе Tasklerq нет `curl`/`wget`, поэтому проверка идёт встроенной
-   командой.
-5. Проверьте `HA_TOKEN`: неверный или отозванный токен даёт `401` от HA, в
-   логах — `llm capture request failed` с кодом ошибки. Строка
-   `LLM capture is disabled: bad HA settings` при старте означает, что
-   `HA_AI_TASK_ENTITY_ID` не похож на `ai_task.<name>` или не удалось создать
-   HTTP-клиент, а не сетевую ошибку.
-6. Вызовите `ai_task.generate_data` в Developer Tools — это проверяет AI Task
-   независимо от Tasklerq.
+   `2xx` — сервер отвечает; `401`/`404` — сеть есть, но нужен другой путь или
+   токен; ошибка подключения — сеть/DNS или закрытый порт.
+3. Проверьте `LLM_CONNECT_TIMEOUT_MS` (по умолчанию `1000`): при медленном
+   канале до локального сервера увеличьте его.
+4. Если исходящий трафик идёт через прокси, проверьте `HTTPS_PROXY` и
+   `NO_PROXY`; адрес локального слота добавьте в `NO_PROXY`.
+5. В логах ищите ошибку запроса к слоту: поле `error` содержит код транспорта,
+   таймаута или HTTP-статус, токена в строке нет.
 
 ### 16.8. LLM не работает
 
-1. Проверьте `HA_AI_TASK_ENTITY_ID=ai_task.anthropic_claude_haiku_5_5`.
-2. Вызовите `ai_task.generate_data` в Developer Tools.
-3. Проверьте `HA_TOKEN`; для диагностики сети и адреса — шаги 4–5 раздела 16.7.
-4. Проверьте баланс и лимиты OpenRouter.
+1. Проверьте `LLM_CAPTURE_ENABLED=true`, `LLM_PRIMARY_URL` и
+   `LLM_PRIMARY_MODEL`; резервный слот — `LLM_FALLBACK_*` вместе или не задан.
+2. Проверьте слот командой в контейнере (набор
+   `src/capture/prompts/smoke-v4.json` встроен, `DATABASE_URL` нужен):
+
+   ```bash
+   sudo /usr/local/bin/docker compose exec tasklerq \
+     tasklerq capture-eval --slot primary
+   sudo /usr/local/bin/docker compose exec tasklerq \
+     tasklerq capture-eval --slot fallback
+   ```
+
+   Код `0` — все фразы пройдены, `1` — слот не прошёл проверку с причиной и
+   фактическим временем в отчёте, `2` — ошибка конфигурации, слота, набора или
+   базы. `--slot fallback` выполняйте, только если резервный слот задан.
+   Результат пишется в `llm_slot_checks`. Статус «устарел» означает, что
+   изменились модель, адрес, контракт, набор или таймаут: повторите проверку.
+   Статус «не прошёл» показывает, сколько фраз пройдено и почему упали
+   остальные. В `llm_slot_verified{slot}` тогда `0`, а в `/health/ready` —
+   `llm_slot_unverified:<slot>`; на работу разбора это не влияет.
+3. Проверьте токен слота: `401`/`403` от провайдера означает неверный или
+   отозванный `LLM_*_TOKEN`; такая ошибка пишется в лог уровнем `error`.
+4. Проверьте баланс и лимиты провайдера (OpenRouter, локальный сервер).
 5. Посмотрите `llm_runs` (без текста):
 
    ```sql
@@ -1396,9 +1540,8 @@ proxy, AI Task без инструментов, backup), остаются в 15.
      FROM llm_runs ORDER BY created_at DESC LIMIT 20;
    ```
 
-   В логах ищите `llm capture request failed` (поле `error` — код) и
-   `llm capture response rejected` (ответ не прошёл схему). Текста запроса в
-   этих строках нет.
+   В логах ищите ошибку запроса к слоту (поле `error` — код) и отказ разбора
+   ответа по схеме. Текста запроса в этих строках нет.
 6. При необходимости `LLM_CAPTURE_ENABLED=false`: в Telegram откроется ручная
    форма, а внешний `auto` при `CAPTURE_VOICE_FALLBACK_RAW=true` создаст
    fallback-позицию (в `draft` — `503`).
@@ -1562,7 +1705,7 @@ sudo /usr/local/bin/docker exec postgres psql -U postgres -d tasklerq \
 | 16.3 | `ps`, `pg_isready` | PostgreSQL доступен. |
 | 16.4 | `_sqlx_migrations` | Все миграции применены (`success`). |
 | 16.5 | Токен бота: `/revoke` в BotFather, новый токен в `.env`, пересоздание контейнера; API-токен: выпуск, запрос, отзыв, повтор | Webhook перерегистрирован без ошибок. API-токен: `200`; токен в query — `401`; после отзыва — `401`. |
-| 16.6/16.7 | Интеграция HA и сущности; `tasklerq healthcheck` к HA | Интеграция загружена, сущности доступны; HA отвечает. |
+| 16.6/16.7 (на 2026-11-03) | Интеграция HA и сущности; `tasklerq healthcheck` к HA | Интеграция загружена, сущности доступны; HA отвечал. |
 | 16.8 | `llm_runs` | Последние разборы успешны. |
 | 16.9 | `tasklerq.capture` → `tasklerq.undo_last_capture` → повтор undo | Позиция создана и отменена (`count: 1`); повтор — `count: 0`. |
 | 16.10 | backup → предыдущий тег → проверка → обратно `0.1.0` | Оба переключения прошли, сервис healthy, webhook без ошибок. |
@@ -1798,8 +1941,9 @@ staging у проекта нет. Период: 2026-10-31 — 2026-11-03, вр�
 
 ## 20. Что осталось уточнить
 
-- Бюджет LLM при квоте `200` разборов в сутки; модель AI Task выбирается в
-  HA (сейчас Claude Haiku 5.5 через OpenRouter, ~$0.0003 за разбор).
+- Бюджет LLM при квоте `200` разборов в сутки; модель основного слота
+  выбирается по результатам `capture-eval` (сейчас Claude Haiku 5.5 через
+  OpenRouter, ~$0.0003 за разбор).
 - Инфраструктура готова: домен, reverse proxy, сертификат, роль и БД `tasklerq`.
   Блокирующих вопросов нет.
 - Копия backup за пределами NAS не настроена: Hyper Backup пишет на отдельный
@@ -1809,7 +1953,7 @@ staging у проекта нет. Период: 2026-10-31 — 2026-11-03, вр�
   не найдено. Найденный нагрузкой `deadlock detected` объяснён и исправлен
   2026-11-09 (пункт ниже), `failed=0` в двух прогонах подряд. Не отмеченные
   пункты 15.2 проверяются на NAS: DNS/TLS, reverse proxy, права `.env`, роль
-  PostgreSQL, AI Task без инструментов, токен метрик, доверенные прокси, алерт
+  PostgreSQL, слоты LLM, токен метрик, доверенные прокси, алерт
   по отказам webhook и отсутствие `TELEGRAM_API_BASE_URL` в production.
 - `make load` после исправления deadlock и поиска прогнан 2026-11-10 дважды на
   релизной сборке; `failed=0`, `dead=0` и ни одного `deadlock detected` в обоих

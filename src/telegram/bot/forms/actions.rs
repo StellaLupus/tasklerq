@@ -38,6 +38,8 @@ pub async fn on_text(ctx: &mut Ctx<'_>, form: Form, text: &str) -> Result<(), Fa
         Form::DeleteHousehold => delete_household(ctx, text).await,
         Form::Lead => set_lead(ctx, text).await,
         Form::Time { field } => set_time(ctx, field, text).await,
+        Form::DraftTime { draft_id, index } => draft_time(ctx, draft_id, index, text).await,
+        Form::DraftDue { draft_id, index } => draft_due(ctx, draft_id, index, text).await,
     }
 }
 
@@ -176,6 +178,67 @@ fn time_error(field: TimeField, value: &str) -> &'static str {
     }
 }
 
+/// Время из ответа на вопрос о времени: строго `HH:MM`, как ввод настроек.
+async fn draft_time(
+    ctx: &mut Ctx<'_>,
+    draft_id: Uuid,
+    index: usize,
+    text: &str,
+) -> Result<(), Fail> {
+    let time = match parse_hhmm(text.trim(), "time") {
+        Ok(time) => time,
+        Err(_) => {
+            ctx.banner("Введите время в формате HH:MM, например 08:30.");
+            return ctx.present(Screen::Form).await;
+        }
+    };
+    match crate::telegram::bot::capture::due_time(ctx, draft_id, index, time).await {
+        // Ответ уже показал карточку черновика: второй отрисовки не нужно.
+        Ok(()) => clear(ctx).await,
+        Err(Fail::User(message)) => {
+            // Вопрос больше не актуален: закрываем форму, чтобы следующий текст
+            // не был снова принят за время.
+            clear(ctx).await?;
+            ctx.banner(message);
+            ctx.present(Screen::Draft { draft_id }).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Дата начала из экрана выбора даты для события без редактора элемента.
+async fn draft_due(
+    ctx: &mut Ctx<'_>,
+    draft_id: Uuid,
+    index: usize,
+    text: &str,
+) -> Result<(), Fail> {
+    let today = today(ctx);
+    let now_time = ctx.now.with_timezone(&ctx.tz).time();
+    let Some(parsed) = ru::parse_due(text.trim(), today) else {
+        ctx.banner(format!("Не понял срок. {}", ru::DUE_HINT));
+        return ctx.present(Screen::Form).await;
+    };
+    let date = parsed.date.unwrap_or(today);
+    if date < today {
+        ctx.banner("Дата уже прошла.");
+        return ctx.present(Screen::Form).await;
+    }
+    if date == today && parsed.time.is_some_and(|time| time < now_time) {
+        ctx.banner("Это время сегодня уже прошло.");
+        return ctx.present(Screen::Form).await;
+    }
+    match crate::telegram::bot::capture::due_text(ctx, draft_id, index, date, parsed.time).await {
+        Ok(()) => clear(ctx).await,
+        Err(Fail::User(message)) => {
+            clear(ctx).await?;
+            ctx.banner(message);
+            ctx.present(Screen::Draft { draft_id }).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
 async fn delete_household(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
     let household = ctx.household()?.clone();
     let actor = ctx.actor()?;
@@ -270,6 +333,10 @@ pub async fn on_action(ctx: &mut Ctx<'_>, act: FormAct) -> Result<(), Fail> {
                 completion_id: None,
             })
             .await
+        }
+        Form::DraftTime { draft_id, .. } | Form::DraftDue { draft_id, .. } => {
+            clear(ctx).await?;
+            ctx.present(Screen::Draft { draft_id }).await
         }
         Form::Onboarding { .. }
         | Form::Search

@@ -6,8 +6,8 @@ mod support;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use sqlx::{Acquire, PgPool};
 use tasklerq::capture::draft::{self, DraftError, DueChoice, ItemEdit, NewCapture};
-use tasklerq::capture::schema::{ParsedResponse, RawItem};
-use tasklerq::capture::validate::ASSIGNEE_AMBIGUOUS;
+use tasklerq::capture::schema::{Clarification, ClarificationTopic, ParsedResponse, RawItem};
+use tasklerq::capture::validate::{ASSIGNEE_AMBIGUOUS, DATE_MISSING};
 use tasklerq::domain::error::DomainError;
 use tasklerq::domain::models::{CaptureMode, CaptureSource, DraftStatus, Field, ListKind};
 use tasklerq::storage::repositories::drafts;
@@ -23,6 +23,10 @@ fn raw(title: &str, kind: ListKind) -> RawItem {
         notes: None,
         due_date: None,
         due_time: None,
+        all_day: false,
+        end_date: None,
+        end_time: None,
+        date_error: Vec::new(),
         priority: None,
         assignee: None,
         assignee_id: None,
@@ -176,6 +180,128 @@ async fn confirm_creates_every_item_once_and_links_them_to_the_capture() {
     .await
     .expect("events");
     assert_eq!(events, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_event_from_the_capture_is_stored_and_created_on_confirm() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let mut event = raw("Маникюр", ListKind::Events);
+    event.due_date = Some(date_in_days(now, 1));
+    event.due_time = Some("14:00".into());
+    event.end_time = Some("15:30".into());
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let id = draft::create(&mut conn, capture(&household, vec![event]), now)
+        .await
+        .expect("draft")
+        .id;
+
+    let view = draft::view(&mut conn, household.household_id, id, now)
+        .await
+        .expect("view");
+    assert!(
+        view.validated.is_valid(),
+        "{:?}",
+        view.validated.items[0].errors
+    );
+    let item = view.validated.items[0].item.as_ref().expect("valid event");
+    assert_eq!(item.list_id, household.events_list_id);
+    assert!(item.due_at.is_some());
+    assert!(item.end_at.is_some());
+    assert_eq!(item_count(&db.pool, &household).await, 0);
+
+    let confirmed = draft::confirm(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        id,
+        now + Duration::minutes(1),
+    )
+    .await
+    .expect("confirm");
+
+    assert_eq!(confirmed.items.len(), 1);
+    assert_eq!(confirmed.items[0].list_id, household.events_list_id);
+    assert!(confirmed.items[0].end_at.is_some());
+    assert_eq!(item_count(&db.pool, &household).await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_event_without_a_start_stays_a_draft_with_a_date_question() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let event = raw("Встреча с Петей", ListKind::Events);
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let id = draft::create(&mut conn, capture(&household, vec![event]), now)
+        .await
+        .expect("draft")
+        .id;
+
+    let view = draft::view(&mut conn, household.household_id, id, now)
+        .await
+        .expect("view");
+    let item = &view.validated.items[0];
+    assert_eq!(
+        item.errors
+            .iter()
+            .map(|error| error.code)
+            .collect::<Vec<_>>(),
+        [DATE_MISSING]
+    );
+    assert!(item.has_date_question());
+    assert!(item.item.is_none(), "the event must not be created yet");
+    assert_eq!(item_count(&db.pool, &household).await, 0);
+    assert!(matches!(
+        draft::confirm(
+            &mut conn,
+            household.household_id,
+            &household.owner(),
+            id,
+            now + Duration::minutes(1),
+        )
+        .await,
+        Err(DraftError::Invalid(ref invalid)) if invalid == &vec![0]
+    ));
+    assert_eq!(item_count(&db.pool, &household).await, 0);
+
+    // Ответ на вопрос о дате делает событие валидным; только после него его
+    // можно создать.
+    let view = draft::answer_due_date(
+        &mut conn,
+        household.household_id,
+        id,
+        0,
+        DueChoice::Tomorrow,
+        now + Duration::minutes(2),
+    )
+    .await
+    .expect("answer");
+    assert!(
+        view.validated.is_valid(),
+        "{:?}",
+        view.validated.items[0].errors
+    );
+    assert!(!view.validated.items[0].has_date_question());
+    assert_eq!(
+        view.validated.items[0].list_id,
+        Some(household.events_list_id)
+    );
+
+    let confirmed = draft::confirm(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        id,
+        now + Duration::minutes(3),
+    )
+    .await
+    .expect("confirm");
+    assert_eq!(confirmed.items.len(), 1);
+    assert_eq!(confirmed.items[0].list_id, household.events_list_id);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -954,6 +1080,297 @@ async fn assignee_clarification_stops_after_three_answers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clarification_about_a_filled_field_is_dropped() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+
+    let mut dated = raw("Позвонить", ListKind::Tasks);
+    dated.due_date = Some(date_in_days(now, 1));
+    let mut timed = raw("Купить молоко", ListKind::Shopping);
+    timed.due_time = Some("18:00".into());
+    let mut assigned = raw("Помыть посуду", ListKind::Tasks);
+    assigned.assignee_id = Some(household.member_id);
+    let mut listed = raw("Прочитать книгу", ListKind::Tasks);
+    listed.target_list = Some("Задачи".into());
+    let plain = raw("Полить цветы", ListKind::Tasks);
+
+    let mut call = capture(&household, vec![dated, timed, assigned, listed, plain]);
+    call.parsed.clarifications = vec![
+        Clarification {
+            item: 0,
+            topic: ClarificationTopic::Date,
+        },
+        Clarification {
+            item: 1,
+            topic: ClarificationTopic::Time,
+        },
+        Clarification {
+            item: 2,
+            topic: ClarificationTopic::Assignee,
+        },
+        Clarification {
+            item: 3,
+            topic: ClarificationTopic::List,
+        },
+        Clarification {
+            item: 4,
+            topic: ClarificationTopic::Date,
+        },
+    ];
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let id = draft::create(&mut conn, call, now).await.expect("draft").id;
+
+    let view = draft::view(&mut conn, household.household_id, id, now)
+        .await
+        .expect("view");
+
+    assert_eq!(
+        view.clarifications,
+        [Clarification {
+            item: 4,
+            topic: ClarificationTopic::Date,
+        }],
+        "only the unanswered field of the plain item stays open"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editing_a_filled_field_closes_its_clarification() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+
+    let mut call = capture(&household, vec![raw("Позвонить", ListKind::Tasks)]);
+    call.parsed.clarifications = vec![Clarification {
+        item: 0,
+        topic: ClarificationTopic::Date,
+    }];
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let id = draft::create(&mut conn, call, now).await.expect("draft").id;
+
+    let view = draft::edit_item(
+        &mut conn,
+        household.household_id,
+        id,
+        0,
+        ItemEdit {
+            due_date: Field::Value(date_in_days(now, 1)),
+            ..ItemEdit::default()
+        },
+        now,
+    )
+    .await
+    .expect("edit");
+
+    assert!(
+        view.clarifications.is_empty(),
+        "the user filled the date, the question is closed: {:?}",
+        view.clarifications
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clarification_about_a_missing_item_is_dropped() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+
+    let mut call = capture(&household, vec![raw("Позвонить", ListKind::Tasks)]);
+    call.parsed.clarifications = vec![
+        Clarification {
+            item: 7,
+            topic: ClarificationTopic::Date,
+        },
+        Clarification {
+            item: 0,
+            topic: ClarificationTopic::Date,
+        },
+    ];
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let id = draft::create(&mut conn, call, now).await.expect("draft").id;
+
+    let view = draft::view(&mut conn, household.household_id, id, now)
+        .await
+        .expect("view");
+
+    assert_eq!(
+        view.clarifications,
+        [Clarification {
+            item: 0,
+            topic: ClarificationTopic::Date,
+        }]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_draft_has_at_most_three_clarifications() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+
+    let items = (0..5)
+        .map(|n| raw(&format!("Дело {n}"), ListKind::Tasks))
+        .collect();
+    let mut call = capture(&household, items);
+    call.parsed.clarifications = (0..5)
+        .map(|item| Clarification {
+            item,
+            topic: ClarificationTopic::Date,
+        })
+        .collect();
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let id = draft::create(&mut conn, call, now).await.expect("draft").id;
+
+    let view = draft::view(&mut conn, household.household_id, id, now)
+        .await
+        .expect("view");
+
+    assert_eq!(view.clarifications.len(), 3);
+    assert_eq!(
+        view.clarifications
+            .iter()
+            .map(|clarification| clarification.item)
+            .collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn appended_clarifications_point_at_the_appended_items() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let chat = 4_100_007_i64;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let first = {
+        let mut tx = conn.begin().await.expect("transaction");
+        let draft = draft::append_or_create(
+            &mut tx,
+            telegram_capture(
+                &household,
+                chat,
+                household.owner_id,
+                "два дела",
+                vec![
+                    raw("Первое", ListKind::Tasks),
+                    raw("Второе", ListKind::Tasks),
+                ],
+            ),
+            now,
+        )
+        .await
+        .expect("first draft");
+        tx.commit().await.expect("commit");
+        draft
+    };
+    let mut appended = telegram_capture(
+        &household,
+        chat,
+        household.owner_id,
+        "третье",
+        vec![raw("Третье", ListKind::Tasks)],
+    );
+    appended.parsed.clarifications = vec![Clarification {
+        item: 0,
+        topic: ClarificationTopic::Date,
+    }];
+    let second = {
+        let mut tx = conn.begin().await.expect("transaction");
+        let draft = draft::append_or_create(&mut tx, appended, now + Duration::minutes(1))
+            .await
+            .expect("appended draft");
+        tx.commit().await.expect("commit");
+        draft
+    };
+
+    assert_eq!(second.id, first.id);
+    let view = draft::view(
+        &mut conn,
+        household.household_id,
+        first.id,
+        now + Duration::minutes(1),
+    )
+    .await
+    .expect("view");
+    assert_eq!(
+        view.clarifications,
+        [Clarification {
+            item: 2,
+            topic: ClarificationTopic::Date,
+        }],
+        "the appended item is the third one in the draft"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_old_draft_with_string_clarifications_still_reads() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    // Черновик прежнего вида: у элемента ещё нет полей события и ошибок дат, а
+    // уточнения — строки вопросов.
+    let item = serde_json::json!({
+        "target_kind": "tasks",
+        "target_list": null,
+        "title": "Позвонить маме",
+        "notes": null,
+        "due_date": null,
+        "due_time": null,
+        "priority": null,
+        "assignee": null,
+        "assignee_id": null,
+        "tags": [],
+        "quantity": null,
+        "unit": null,
+        "subtasks": [],
+        "recurrence": null,
+    });
+    let parsed = serde_json::json!({
+        "items": [item],
+        "clarifications": ["Когда?", "Кому поручить?"],
+        "clarifications_answered": 1,
+    });
+    let draft = drafts::insert(
+        &mut conn,
+        drafts::NewDraft {
+            id: Uuid::now_v7(),
+            household_id: household.household_id,
+            user_id: Some(household.owner_id),
+            chat_id: Some(1),
+            source: CaptureSource::Telegram,
+            mode: CaptureMode::Draft,
+            idempotency_key: None,
+            request_hash: None,
+            raw_text: "позвонить маме".to_owned(),
+            raw_parts: vec!["позвонить маме".to_owned()],
+            parsed,
+            fallback: false,
+            prompt_version: Some("capture-v3".into()),
+        },
+        now,
+    )
+    .await
+    .expect("old draft is stored");
+
+    let view = draft::view(&mut conn, household.household_id, draft.id, now)
+        .await
+        .expect("old draft reads");
+
+    assert_eq!(view.raw.len(), 1);
+    assert_eq!(view.raw[0].title, "Позвонить маме");
+    assert_eq!(view.clarifications_answered, 1);
+    assert!(
+        view.clarifications.is_empty(),
+        "questions of the old format are dropped: {:?}",
+        view.clarifications
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn date_answer_keeps_the_time_and_reports_it_when_it_has_passed() {
     let db = support::db().await;
     let household = support::create_household(&db.pool).await;
@@ -1534,4 +1951,175 @@ async fn an_invalid_appended_item_does_not_break_the_existing_draft() {
     assert_eq!(view.validated.items.len(), 2);
     assert!(view.validated.items[0].is_valid());
     assert_eq!(view.validated.items[1].errors[0].code, "date_past");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_clarifications_are_one_question() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+
+    let mut call = capture(&household, vec![raw("Позвонить", ListKind::Tasks)]);
+    call.parsed.clarifications = vec![
+        Clarification {
+            item: 0,
+            topic: ClarificationTopic::Date,
+        },
+        Clarification {
+            item: 0,
+            topic: ClarificationTopic::Date,
+        },
+        Clarification {
+            item: 0,
+            topic: ClarificationTopic::Date,
+        },
+    ];
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let id = draft::create(&mut conn, call, now).await.expect("draft").id;
+
+    let view = draft::view(&mut conn, household.household_id, id, now)
+        .await
+        .expect("view");
+
+    assert_eq!(
+        view.clarifications,
+        [Clarification {
+            item: 0,
+            topic: ClarificationTopic::Date,
+        }],
+        "three identical questions must not take the whole limit"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn appended_clarifications_fit_after_stale_ones_are_dropped() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let chat = 4_100_011_i64;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    // Три вопроса о списке при уже названном существующем списке: при создании
+    // без контекста они считаются открытыми и занимают весь лимит.
+    let mut items = Vec::new();
+    for title in ["Первое", "Второе", "Третье"] {
+        let mut item = raw(title, ListKind::Tasks);
+        item.target_list = Some("Задачи".into());
+        items.push(item);
+    }
+    let mut first = telegram_capture(&household, chat, household.owner_id, "три дела", items);
+    first.parsed.clarifications = vec![
+        Clarification {
+            item: 0,
+            topic: ClarificationTopic::List,
+        },
+        Clarification {
+            item: 1,
+            topic: ClarificationTopic::List,
+        },
+        Clarification {
+            item: 2,
+            topic: ClarificationTopic::List,
+        },
+    ];
+    let draft = {
+        let mut tx = conn.begin().await.expect("transaction");
+        let draft = draft::append_or_create(&mut tx, first, now)
+            .await
+            .expect("first draft");
+        tx.commit().await.expect("commit");
+        draft
+    };
+
+    let mut appended = telegram_capture(
+        &household,
+        chat,
+        household.owner_id,
+        "четвёртое",
+        vec![raw("Четвёртое", ListKind::Tasks)],
+    );
+    appended.parsed.clarifications = vec![Clarification {
+        item: 0,
+        topic: ClarificationTopic::Date,
+    }];
+    {
+        let mut tx = conn.begin().await.expect("transaction");
+        let second = draft::append_or_create(&mut tx, appended, now + Duration::minutes(1))
+            .await
+            .expect("appended draft");
+        tx.commit().await.expect("commit");
+        assert_eq!(second.id, draft.id);
+    }
+
+    let view = draft::view(
+        &mut conn,
+        household.household_id,
+        draft.id,
+        now + Duration::minutes(1),
+    )
+    .await
+    .expect("view");
+    assert_eq!(
+        view.clarifications,
+        [Clarification {
+            item: 3,
+            topic: ClarificationTopic::Date,
+        }],
+        "stale list questions must free the limit for the appended one"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_list_name_does_not_close_the_list_question() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+
+    let mut item = raw("Позвонить", ListKind::Tasks);
+    item.target_list = Some("Несуществующий".into());
+    let mut call = capture(&household, vec![item]);
+    call.parsed.clarifications = vec![Clarification {
+        item: 0,
+        topic: ClarificationTopic::List,
+    }];
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let id = draft::create(&mut conn, call, now).await.expect("draft").id;
+
+    let view = draft::view(&mut conn, household.household_id, id, now)
+        .await
+        .expect("view");
+    assert_eq!(
+        view.clarifications,
+        [Clarification {
+            item: 0,
+            topic: ClarificationTopic::List,
+        }],
+        "an unknown list name must leave the question open"
+    );
+
+    let view = draft::answer_list(
+        &mut conn,
+        household.household_id,
+        id,
+        0,
+        household.tasks_list_id,
+        now,
+    )
+    .await
+    .expect("list answer");
+
+    assert!(
+        view.clarifications.is_empty(),
+        "the chosen list closes the question: {:?}",
+        view.clarifications
+    );
+    assert_eq!(
+        view.raw[0].target_list.as_deref(),
+        Some("Задачи"),
+        "the answer replaces the unknown name"
+    );
+    assert!(
+        !view.validated.items[0].list_auto_selected,
+        "the chosen list is not an automatic fallback"
+    );
 }

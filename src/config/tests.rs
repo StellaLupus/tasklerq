@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use super::env_source::parse_url;
 use super::*;
@@ -99,9 +100,8 @@ fn defaults_match_documented_values() {
             "TELEGRAM_WEBHOOK_URL",
             "http://127.0.0.1:8080/webhooks/telegram",
         ),
-        ("HA_BASE_URL", "http://127.0.0.1:8123"),
-        ("HA_TOKEN", "home-assistant-token"),
-        ("HA_AI_TASK_ENTITY_ID", "ai_task.test"),
+        ("LLM_PRIMARY_URL", "https://llm.example.com/v1"),
+        ("LLM_PRIMARY_MODEL", "anthropic/claude-haiku-5.5"),
     ] {
         vars.insert(name.to_owned(), value.to_owned());
     }
@@ -117,6 +117,11 @@ fn defaults_match_documented_values() {
     assert_eq!(config.capture.rate_limit_per_min, 10);
     assert_eq!(config.capture.max_text_chars, 2_000);
     assert_eq!(config.llm.daily_quota, 200);
+    assert_eq!(config.llm.connect_timeout, Duration::from_secs(1));
+    let primary = config.llm.primary.expect("primary slot");
+    assert_eq!(primary.timeout, Duration::from_secs(10));
+    assert!(config.llm.fallback.is_none());
+    assert!(config.deprecated_env.is_empty());
     assert_eq!(config.queue.max_attempts, 10);
     assert_eq!(config.queue.ready_lag_seconds, 300);
     assert_eq!(config.retention.updates_days, 7);
@@ -539,115 +544,244 @@ fn telegram_config_covers_modes_and_required_values() {
     }
 }
 
-#[derive(Debug)]
-enum LlmExpected {
-    Ok(bool),
-    Missing(&'static str),
-    Invalid(&'static str),
+const PRIMARY_URL: &str = "https://llm.example.com/v1";
+const PRIMARY_MODEL: &str = "anthropic/claude-haiku-5.5";
+
+/// Собрать конфигурацию из базового окружения и перечисленных пар.
+fn config_with(pairs: &[(&str, &str)]) -> Result<Config, ConfigError> {
+    let mut vars = base_env();
+    for (name, value) in pairs {
+        vars.insert((*name).to_owned(), (*value).to_owned());
+    }
+    config(vars)
 }
 
-fn llm_case(
-    enabled: Option<&str>,
-    base_url: Option<&str>,
-    token: Option<&str>,
-    entity_id: Option<&str>,
-) -> Result<LlmConfig, ConfigError> {
-    let mut vars = base_env();
+fn llm_with(pairs: &[(&str, &str)]) -> Result<LlmConfig, ConfigError> {
+    config_with(pairs).map(|config| config.llm)
+}
 
-    match enabled {
-        Some(enabled) => {
-            vars.insert("LLM_CAPTURE_ENABLED".to_owned(), enabled.to_owned());
-        }
-        None => {
-            vars.remove("LLM_CAPTURE_ENABLED");
-        }
-    }
-
-    for (name, value) in [
-        ("HA_BASE_URL", base_url),
-        ("HA_TOKEN", token),
-        ("HA_AI_TASK_ENTITY_ID", entity_id),
-    ] {
-        match value {
-            Some(value) => {
-                vars.insert(name.to_owned(), value.to_owned());
-            }
-            None => {
-                vars.remove(name);
-            }
-        }
-    }
-
-    config(vars).map(|config| config.llm)
+/// Включённый разбор с полностью заданным основным слотом.
+fn enabled_primary() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("LLM_CAPTURE_ENABLED", "true"),
+        ("LLM_PRIMARY_URL", PRIMARY_URL),
+        ("LLM_PRIMARY_MODEL", PRIMARY_MODEL),
+    ]
 }
 
 #[test]
-fn llm_config_covers_defaults_and_required_values() {
+fn llm_requires_primary_slot_when_enabled() {
     let cases = [
-        (None, None, None, None, LlmExpected::Missing("HA_BASE_URL")),
-        (Some("false"), None, None, None, LlmExpected::Ok(false)),
+        (vec![("LLM_CAPTURE_ENABLED", "true")], "LLM_PRIMARY_URL"),
         (
-            Some("true"),
-            None,
-            None,
-            None,
-            LlmExpected::Missing("HA_BASE_URL"),
-        ),
-        (
-            Some("true"),
-            Some("http://127.0.0.1:8123"),
-            None,
-            None,
-            LlmExpected::Missing("HA_TOKEN"),
-        ),
-        (
-            Some("true"),
-            Some("http://127.0.0.1:8123"),
-            Some("home-assistant-token"),
-            None,
-            LlmExpected::Missing("HA_AI_TASK_ENTITY_ID"),
-        ),
-        (
-            Some("true"),
-            Some("http://127.0.0.1:8123"),
-            Some("home-assistant-token"),
-            Some("ai_task.test"),
-            LlmExpected::Ok(true),
-        ),
-        (
-            Some("false"),
-            Some("http://127.0.0.1:8123"),
-            None,
-            None,
-            LlmExpected::Ok(false),
-        ),
-        (
-            Some("true"),
-            Some("ftp://127.0.0.1:8123"),
-            Some("home-assistant-token"),
-            Some("ai_task.test"),
-            LlmExpected::Invalid("HA_BASE_URL"),
-        ),
-        (
-            Some("sometimes"),
-            None,
-            None,
-            None,
-            LlmExpected::Invalid("LLM_CAPTURE_ENABLED"),
+            vec![
+                ("LLM_CAPTURE_ENABLED", "true"),
+                ("LLM_PRIMARY_URL", PRIMARY_URL),
+            ],
+            "LLM_PRIMARY_MODEL",
         ),
     ];
 
-    for (enabled, base_url, token, entity_id, expected) in cases {
-        let result = llm_case(enabled, base_url, token, entity_id);
-        match expected {
-            LlmExpected::Ok(enabled) => {
-                let config = result.expect("LLM config should be valid");
-                assert_eq!(config.enabled, enabled);
-            }
-            LlmExpected::Missing(name) => assert_missing(result.unwrap_err(), name),
-            LlmExpected::Invalid(name) => assert_invalid(result.unwrap_err(), name),
-        }
+    for (pairs, expected) in cases {
+        let error = llm_with(&pairs).expect_err("primary slot is required");
+        assert_missing(error, expected);
     }
+}
+
+#[test]
+fn fallback_slot_must_be_configured_completely() {
+    let mut pairs = enabled_primary();
+    pairs.push(("LLM_FALLBACK_URL", "https://backup.example.com/v1"));
+    assert_missing(
+        llm_with(&pairs).expect_err("half fallback is rejected"),
+        "LLM_FALLBACK_MODEL",
+    );
+
+    let mut pairs = enabled_primary();
+    pairs.push(("LLM_FALLBACK_MODEL", "local/qwen3.8-4b"));
+    assert_missing(
+        llm_with(&pairs).expect_err("half fallback is rejected"),
+        "LLM_FALLBACK_URL",
+    );
+}
+
+#[test]
+fn primary_slot_alone_means_no_fallback() {
+    let llm = llm_with(&enabled_primary()).expect("primary slot is enough");
+    let primary = llm.primary.expect("primary slot");
+
+    assert_eq!(primary.url.as_str(), PRIMARY_URL);
+    assert_eq!(primary.model, PRIMARY_MODEL);
+    assert!(primary.token.is_none());
+    assert!(primary.extra.is_empty());
+    assert!(llm.fallback.is_none());
+}
+
+#[test]
+fn both_slots_are_loaded_with_token_and_extra() {
+    let pairs = [
+        ("LLM_CAPTURE_ENABLED", "true"),
+        ("LLM_PRIMARY_URL", PRIMARY_URL),
+        ("LLM_PRIMARY_MODEL", PRIMARY_MODEL),
+        ("LLM_PRIMARY_TOKEN", "primary-token"),
+        (
+            "LLM_PRIMARY_EXTRA_JSON",
+            r#"{"reasoning":{"effort":"minimal"}}"#,
+        ),
+        ("LLM_FALLBACK_URL", "https://backup.example.com/v1"),
+        ("LLM_FALLBACK_MODEL", "local/qwen3.8-4b"),
+        ("LLM_FALLBACK_TOKEN", "fallback-token"),
+    ];
+    let llm = llm_with(&pairs).expect("both slots are configured");
+
+    let primary = llm.primary.expect("primary slot");
+    assert_eq!(
+        primary.token.as_ref().map(SecretString::expose),
+        Some("primary-token")
+    );
+    assert_eq!(
+        primary.extra.get("reasoning"),
+        Some(&serde_json::json!({"effort": "minimal"}))
+    );
+
+    let fallback = llm.fallback.expect("fallback slot");
+    assert_eq!(fallback.url.as_str(), "https://backup.example.com/v1");
+    assert_eq!(fallback.model, "local/qwen3.8-4b");
+    assert_eq!(
+        fallback.token.as_ref().map(SecretString::expose),
+        Some("fallback-token")
+    );
+}
+
+#[test]
+fn llm_slot_timeouts_have_defaults_and_are_configurable() {
+    let llm = llm_with(&enabled_primary()).expect("defaults");
+    assert_eq!(
+        llm.primary.expect("primary slot").timeout,
+        Duration::from_secs(10)
+    );
+    assert_eq!(llm.connect_timeout, Duration::from_secs(1));
+
+    let mut pairs = enabled_primary();
+    pairs.push(("LLM_PRIMARY_TIMEOUT_MS", "2500"));
+    pairs.push(("LLM_CONNECT_TIMEOUT_MS", "200"));
+    let llm = llm_with(&pairs).expect("configured timeouts");
+    assert_eq!(
+        llm.primary.expect("primary slot").timeout,
+        Duration::from_millis(2_500)
+    );
+    assert_eq!(llm.connect_timeout, Duration::from_millis(200));
+
+    let mut pairs = enabled_primary();
+    pairs.push(("LLM_PRIMARY_TIMEOUT_MS", "99"));
+    assert_invalid(
+        llm_with(&pairs).expect_err("too small slot timeout"),
+        "LLM_PRIMARY_TIMEOUT_MS",
+    );
+
+    let mut vars = base_env();
+    vars.insert("LLM_CONNECT_TIMEOUT_MS".to_owned(), "60001".to_owned());
+    assert_invalid(
+        config(vars).expect_err("too large connect timeout"),
+        "LLM_CONNECT_TIMEOUT_MS",
+    );
+}
+
+#[test]
+fn extra_json_must_be_a_json_object() {
+    let mut pairs = enabled_primary();
+    pairs.push((
+        "LLM_PRIMARY_EXTRA_JSON",
+        r#"{"reasoning":{"effort":"minimal"}}"#,
+    ));
+    let llm = llm_with(&pairs).expect("JSON object is accepted");
+    let extra = llm.primary.expect("primary slot").extra;
+    assert_eq!(
+        extra.get("reasoning"),
+        Some(&serde_json::json!({"effort": "minimal"}))
+    );
+    assert_eq!(extra.len(), 1);
+
+    for raw in ["[1,2]", "\"text\"", "{not json", "{\"key\": }"] {
+        let mut pairs = enabled_primary();
+        pairs.push(("LLM_PRIMARY_EXTRA_JSON", raw));
+
+        let error = llm_with(&pairs).expect_err("not a JSON object is rejected");
+        let message = error.to_string();
+        assert_invalid(error, "LLM_PRIMARY_EXTRA_JSON");
+        assert!(
+            !message.contains(raw),
+            "error must not echo the value {raw}: {message}"
+        );
+    }
+}
+
+#[test]
+fn disabled_llm_does_not_require_slots_but_validates_given_ones() {
+    let llm = llm_with(&[]).expect("no slots are fine when LLM is off");
+    assert!(!llm.enabled);
+    assert!(llm.primary.is_none());
+    assert!(llm.fallback.is_none());
+
+    let pairs = [
+        ("LLM_PRIMARY_URL", PRIMARY_URL),
+        ("LLM_PRIMARY_MODEL", PRIMARY_MODEL),
+        ("LLM_PRIMARY_TOKEN", "primary-token"),
+    ];
+    let llm = llm_with(&pairs).expect("configured slot is loaded while LLM is off");
+    assert!(!llm.enabled);
+    assert!(llm.primary.is_some());
+
+    assert_invalid(
+        llm_with(&[("LLM_PRIMARY_URL", "ftp://llm.example.com/v1")])
+            .expect_err("URL is validated even when LLM is off"),
+        "LLM_PRIMARY_URL",
+    );
+    assert_missing(
+        llm_with(&[("LLM_PRIMARY_URL", PRIMARY_URL)])
+            .expect_err("half slot is rejected even when LLM is off"),
+        "LLM_PRIMARY_MODEL",
+    );
+}
+
+#[test]
+fn legacy_home_assistant_variables_are_collected() {
+    let mut pairs = enabled_primary();
+    pairs.push(("HA_BASE_URL", "http://127.0.0.1:8123"));
+    pairs.push(("HA_TOKEN", "home-assistant-secret-token"));
+    pairs.push(("HA_AI_TASK_ENTITY_ID", "legacy.entity"));
+
+    let config = config_with(&pairs).expect("legacy variables must not stop startup");
+    assert_eq!(
+        config.deprecated_env,
+        vec!["HA_BASE_URL", "HA_TOKEN", "HA_AI_TASK_ENTITY_ID"]
+    );
+
+    // Значения устаревших переменных не читаются и не сохраняются.
+    let debug = format!("{config:?}");
+    assert!(!debug.contains("home-assistant-secret-token"));
+    let llm = &config.llm;
+    assert!(llm.fallback.is_none());
+    assert!(llm.primary.is_some());
+}
+
+#[test]
+fn slot_debug_hides_token_and_extra_values() {
+    let mut pairs = enabled_primary();
+    pairs.push(("LLM_PRIMARY_TOKEN", "SECRET-slot-token"));
+    pairs.push((
+        "LLM_PRIMARY_EXTRA_JSON",
+        r#"{"api_key":"SECRET-extra-value","reasoning":{"effort":"minimal"}}"#,
+    ));
+    let config = config_with(&pairs).expect("config");
+
+    let debug = format!("{config:?}");
+    assert!(!debug.contains("SECRET-slot-token"));
+    assert!(!debug.contains("SECRET-extra-value"));
+    assert!(debug.contains("has_token: true"));
+    assert!(debug.contains("extra_keys"));
+    assert!(debug.contains("api_key"));
+    assert!(debug.contains("reasoning"));
 }
 
 #[test]
@@ -725,14 +859,31 @@ fn env_with_secrets() -> BTreeMap<String, String> {
         "http://127.0.0.1:8080/webhooks/telegram".to_owned(),
     );
     vars.insert("LLM_CAPTURE_ENABLED".to_owned(), "true".to_owned());
-    vars.insert("HA_BASE_URL".to_owned(), "http://127.0.0.1:8123".to_owned());
+    vars.insert("LLM_PRIMARY_URL".to_owned(), PRIMARY_URL.to_owned());
+    vars.insert("LLM_PRIMARY_MODEL".to_owned(), PRIMARY_MODEL.to_owned());
+    vars.insert(
+        "LLM_PRIMARY_TOKEN".to_owned(),
+        "primary-slot-secret-token".to_owned(),
+    );
+    vars.insert(
+        "LLM_PRIMARY_EXTRA_JSON".to_owned(),
+        r#"{"api_key":"primary-extra-secret"}"#.to_owned(),
+    );
+    vars.insert(
+        "LLM_FALLBACK_URL".to_owned(),
+        "https://backup.example.com/v1".to_owned(),
+    );
+    vars.insert(
+        "LLM_FALLBACK_MODEL".to_owned(),
+        "local/qwen3.8-4b".to_owned(),
+    );
+    vars.insert(
+        "LLM_FALLBACK_TOKEN".to_owned(),
+        "fallback-slot-secret-token".to_owned(),
+    );
     vars.insert(
         "HA_TOKEN".to_owned(),
         "home-assistant-secret-token".to_owned(),
-    );
-    vars.insert(
-        "HA_AI_TASK_ENTITY_ID".to_owned(),
-        "ai_task.google_ai_task_2".to_owned(),
     );
     vars
 }
@@ -754,6 +905,9 @@ fn secrets_are_not_exposed_in_debug_or_startup_log() {
         "db-password",
         "telegram-secret-token",
         "telegram-webhook-secret",
+        "primary-slot-secret-token",
+        "primary-extra-secret",
+        "fallback-slot-secret-token",
         "home-assistant-secret-token",
     ] {
         assert!(!debug.contains(secret), "Debug leaked {secret}");
@@ -763,6 +917,8 @@ fn secrets_are_not_exposed_in_debug_or_startup_log() {
     assert!(debug.contains("<redacted>"));
     assert!(logs.contains("configuration loaded"));
     assert!(logs.contains("<redacted>"));
+    // Устаревшая переменная Home Assistant названа, но её значение скрыто.
+    assert!(logs.contains("HA_TOKEN"));
 }
 
 #[test]

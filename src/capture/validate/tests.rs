@@ -11,6 +11,10 @@ fn raw(kind: ListKind, title: &str) -> RawItem {
         notes: None,
         due_date: None,
         due_time: None,
+        all_day: false,
+        end_date: None,
+        end_time: None,
+        date_error: Vec::new(),
         priority: None,
         assignee: None,
         assignee_id: None,
@@ -643,10 +647,9 @@ fn list_of_another_kind_is_not_used_by_name() {
 
 #[test]
 fn event_list_name_from_the_llm_is_not_a_target_list() {
-    // Имя «Календарь» из ответа модели остаётся неизвестным, потому что
-    // `resolve_list` ищет список только того же kind, что и элемент, а не
-    // потому что списки событий отфильтрованы из контекста. Такой элемент всё
-    // равно получает список по умолчанию с отметкой.
+    // Имя «Календарь» из ответа модели не подходит задаче: `resolve_list` ищет
+    // список только того же kind, что и элемент, поэтому задача получает
+    // список задач по умолчанию с отметкой о подстановке.
     let lists = vec![
         model_list("Задачи", ListKind::Tasks, true),
         model_list("Календарь", ListKind::Events, true),
@@ -667,24 +670,22 @@ fn event_list_name_from_the_llm_is_not_a_target_list() {
 }
 
 #[test]
-fn event_kind_without_event_lists_in_the_context_has_no_target() {
-    // Парсер ответа LLM не принимает kind `events`, но `validate_item` —
-    // публичная граница проверки, и защита не должна зависеть от парсера.
-    // Без фильтра контекста «Календарь» нашёлся бы по имени и kind, поэтому
-    // тест падает, если списки событий снова попадут в `CaptureContext`.
+fn event_kind_uses_the_named_or_default_events_list() {
     let lists = vec![
         model_list("Задачи", ListKind::Tasks, true),
         model_list("Календарь", ListKind::Events, true),
     ];
     let context = CaptureContext::new("Europe/Moscow", now(), &lists, &[]).expect("context");
     let mut raw = raw(ListKind::Events, "Маникюр");
+    raw.due_date = Some("2026-10-31".to_owned());
     raw.target_list = Some("Календарь".to_owned());
 
     let draft = validate_item(&context, ItemSource::Api, raw);
 
-    assert_eq!(codes(&draft), ["list_missing"]);
-    assert!(draft.list_id.is_none());
-    assert!(draft.item.is_none());
+    assert!(draft.is_valid(), "{:?}", draft.errors);
+    assert_eq!(draft.list_id, Some(lists[1].id));
+    assert!(!draft.list_auto_selected);
+    assert!(draft.item.is_some());
 }
 
 #[test]
@@ -760,7 +761,10 @@ fn one_invalid_item_blocks_the_whole_draft_but_keeps_the_rest_visible() {
     bad.due_date = Some("2026-10-29".to_owned());
     let parsed = ParsedResponse {
         items: vec![raw(ListKind::Shopping, "Молоко"), bad],
-        clarifications: vec!["Когда?".to_owned()],
+        clarifications: vec![crate::capture::schema::Clarification {
+            item: 0,
+            topic: crate::capture::schema::ClarificationTopic::Date,
+        }],
     };
 
     let draft = validate_items(&context(), ItemSource::HaVoice, parsed);
@@ -768,6 +772,33 @@ fn one_invalid_item_blocks_the_whole_draft_but_keeps_the_rest_visible() {
     assert!(!draft.is_valid());
     assert!(draft.items[0].is_valid());
     assert!(!draft.items[1].is_valid());
+    assert_eq!(draft.clarifications, ["Когда?"]);
+}
+
+#[test]
+fn clarifications_about_filled_fields_are_dropped() {
+    let mut dated = task();
+    dated.due_date = Some("2026-10-30".to_owned());
+    let parsed = ParsedResponse {
+        items: vec![dated, task()],
+        clarifications: vec![
+            crate::capture::schema::Clarification {
+                item: 0,
+                topic: crate::capture::schema::ClarificationTopic::Date,
+            },
+            crate::capture::schema::Clarification {
+                item: 1,
+                topic: crate::capture::schema::ClarificationTopic::Date,
+            },
+            crate::capture::schema::Clarification {
+                item: 9,
+                topic: crate::capture::schema::ClarificationTopic::Date,
+            },
+        ],
+    };
+
+    let draft = validate_items(&context(), ItemSource::Telegram, parsed);
+
     assert_eq!(draft.clarifications, ["Когда?"]);
 }
 
@@ -1198,4 +1229,22 @@ fn quantity_precision_has_its_own_message() {
 
 fn raw_shopping() -> RawItem {
     raw(ListKind::Shopping, "Молоко")
+}
+
+#[test]
+fn an_all_day_item_ignores_a_stale_time() {
+    let mut item = task();
+    item.due_date = Some("2026-11-01".to_owned());
+    item.due_time = Some("18:00".to_owned());
+    item.all_day = true;
+
+    let checked = check(item);
+
+    assert!(checked.is_valid(), "{:?}", checked.errors);
+    let item = checked.item.expect("all-day item is valid");
+    assert_eq!(
+        item.due_date,
+        Some(chrono::NaiveDate::from_ymd_opt(2026, 11, 1).unwrap())
+    );
+    assert_eq!(item.due_at, None, "all-day means no time");
 }

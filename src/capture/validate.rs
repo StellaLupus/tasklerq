@@ -11,7 +11,10 @@ use chrono::{DateTime, Months, NaiveDate, NaiveTime, Utc};
 use uuid::Uuid;
 
 use super::context::{CaptureContext, ListRef};
-use super::schema::{ParsedResponse, RawItem, RawRecurrence};
+use super::schema::{
+    ParsedResponse, RawDateError, RawItem, RawRecurrence, normalize_clarifications,
+};
+use crate::domain::events::end_day;
 use crate::domain::models::{
     ItemPriority, ItemSource, ListKind, MonthRule, NewItem, RecurrenceFreq, RecurrenceInput,
     SubtaskInput,
@@ -45,6 +48,10 @@ pub const ASSIGNEE_AMBIGUOUS: &str = "assignee_ambiguous";
 pub const DATE_PAST: &str = "date_past";
 /// Код ошибки «дата не разобрана».
 pub const DATE_INVALID: &str = "date_invalid";
+/// Код ошибки «у события не названо начало».
+pub const DATE_MISSING: &str = "date_missing";
+/// Код ошибки «конец события раньше начала».
+pub const END_BEFORE_START: &str = "event_end_before_start";
 
 /// Элемент черновика после проверки.
 #[derive(Debug, Clone)]
@@ -87,13 +94,23 @@ impl DraftItem {
                 .any(|error| error.code == ASSIGNEE_AMBIGUOUS)
     }
 
-    /// Карточка должна предложить другой срок: дата не разобрана или прошла.
-    /// `time_past` сюда не входит: это отдельная ошибка времени.
+    /// Карточка должна предложить другой срок: дата не разобрана, не названа у
+    /// события или прошла. `time_past` сюда не входит: это отдельная ошибка
+    /// времени.
     pub fn has_date_question(&self) -> bool {
         self.errors.iter().any(|error| {
-            error.field == "due_date" && (error.code == DATE_PAST || error.code == DATE_INVALID)
+            error.field == "due_date"
+                && matches!(error.code, DATE_PAST | DATE_INVALID | DATE_MISSING)
         })
     }
+}
+
+/// У события нет начала: в режиме `auto` такой элемент не создаётся, а разбор
+/// деградирует, как при отказе LLM.
+pub fn event_without_start(item: &DraftItem) -> bool {
+    item.kind == ListKind::Events
+        && item.effective_due_at.is_none()
+        && item.effective_due_date.is_none()
 }
 
 /// Проверенный черновик.
@@ -142,13 +159,21 @@ pub fn validate_items_in(
     parsed: ParsedResponse,
     mode: ValidationMode,
 ) -> ValidatedDraft {
+    let ParsedResponse {
+        items,
+        clarifications,
+    } = parsed;
+    let clarifications = normalize_clarifications(&items, clarifications, Some(context));
     ValidatedDraft {
-        items: parsed
-            .items
+        items: items
             .into_iter()
             .map(|raw| validate_item_in(context, source, raw, mode))
             .collect(),
-        clarifications: parsed.clarifications,
+        // Карточка и внешний capture показывают короткий текст по теме.
+        clarifications: clarifications
+            .iter()
+            .map(|clarification| clarification.topic.question().to_owned())
+            .collect(),
     }
 }
 
@@ -194,6 +219,10 @@ fn validate_item_in(
     }
 
     let priority = parse_priority(raw.priority.as_deref(), &mut errors);
+
+    for date_error in &raw.date_error {
+        fail_date_error(&mut errors, date_error);
+    }
 
     let (list, list_auto_selected) = resolve_list(context, &raw);
     if list.is_none() {
@@ -252,6 +281,27 @@ fn validate_item_in(
     };
 
     let (due_at, due_date) = resolve_due(context, &raw, &mut errors);
+
+    // Начало события обязательно; без него черновик задаёт вопрос о дате, а
+    // домен 0009 отказал бы в создании общим «элемент не прошёл проверку».
+    if raw.target_kind == ListKind::Events
+        && due_at.is_none()
+        && due_date.is_none()
+        && !errors.iter().any(|error| error.field == "due_date")
+    {
+        fail(
+            &mut errors,
+            "due_date",
+            DATE_MISSING,
+            "Укажите дату события",
+        );
+    }
+
+    let (end_at, end_date) = if raw.target_kind == ListKind::Events {
+        resolve_event_end(context, &raw, due_at, due_date, &mut errors)
+    } else {
+        (None, None)
+    };
 
     let tags = clean_tags(&raw.tags, &mut errors);
     let subtasks = clean_subtasks(&raw.subtasks, &mut errors);
@@ -312,8 +362,8 @@ fn validate_item_in(
                 priority,
                 due_at,
                 due_date,
-                end_at: None,
-                end_date: None,
+                end_at,
+                end_date,
                 assignee_user_id,
                 source,
                 quantity,
@@ -402,19 +452,162 @@ fn fail(
     });
 }
 
-/// Список по имени среди списков нужного типа; иначе список по умолчанию.
-fn resolve_list<'a>(context: &'a CaptureContext, raw: &RawItem) -> (Option<&'a ListRef>, bool) {
-    let named = raw.target_list.as_deref().map(fold);
-    if let Some(name) = &named {
-        let found = context
-            .lists
-            .iter()
-            .find(|list| list.kind == raw.target_kind && fold(&list.name) == *name);
-        if found.is_some() {
-            return (found, false);
-        }
+/// Есть ли у элемента ошибка выражения для этого поля.
+fn has_date_error(raw: &RawItem, field: &str) -> bool {
+    raw.date_error.iter().any(|error| error.field == field)
+}
+
+/// Показать ошибку выражения даты тем полем, к которому оно относится.
+fn fail_date_error(errors: &mut Vec<ItemError>, error: &RawDateError) {
+    match error.field.as_str() {
+        "end_date" => fail(
+            errors,
+            "end_date",
+            "end_date_invalid",
+            "Неверная дата конца",
+        ),
+        "recurrence" => fail(
+            errors,
+            "recurrence",
+            "recurrence_until",
+            "Неверная дата окончания",
+        ),
+        "note_date" => fail(
+            errors,
+            "notes",
+            "note_date_invalid",
+            "Неверная дата в заметке",
+        ),
+        _ => fail(errors, "due_date", DATE_INVALID, "Неверная дата"),
     }
-    (context.default_list(raw.target_kind), named.is_some())
+}
+
+/// Конец события из строк `end_date` и `end_time`.
+///
+/// Начало со временем даёт конец моментом, вседневное начало — последним днём
+/// включительно. Время конца без даты относится ко дню начала, а если оно не
+/// позже времени начала — к следующему дню. Здесь считаются значения для
+/// черновика и показываются ошибки полей; те же правила окончательно проверяет
+/// домен 0009 при применении (7.2).
+fn resolve_event_end(
+    context: &CaptureContext,
+    raw: &RawItem,
+    due_at: Option<DateTime<Utc>>,
+    due_date: Option<NaiveDate>,
+    errors: &mut Vec<ItemError>,
+) -> (Option<DateTime<Utc>>, Option<NaiveDate>) {
+    let date = Parsed::of(raw.end_date.as_deref(), parse_date);
+    let time = Parsed::of(raw.end_time.as_deref(), parse_time);
+    let date_invalid = matches!(date, Parsed::Invalid);
+    let time_invalid = matches!(time, Parsed::Invalid);
+    if date_invalid {
+        fail(
+            errors,
+            "end_date",
+            "end_date_invalid",
+            "Неверная дата конца",
+        );
+    }
+    if time_invalid {
+        fail(
+            errors,
+            "end_time",
+            "end_time_invalid",
+            "Неверное время конца",
+        );
+    }
+    if date_invalid || time_invalid {
+        return (None, None);
+    }
+
+    match (due_at, due_date) {
+        (Some(start_at), _) => {
+            let start_local = start_at.with_timezone(&context.timezone);
+            let end_time = match time {
+                Parsed::Valid(time) => time,
+                Parsed::Absent => {
+                    if matches!(date, Parsed::Valid(_)) {
+                        fail(
+                            errors,
+                            "end_time",
+                            "end_time_missing",
+                            "Укажите время конца события",
+                        );
+                    }
+                    return (None, None);
+                }
+                Parsed::Invalid => return (None, None),
+            };
+            let end_date = match date {
+                Parsed::Valid(date) => date,
+                Parsed::Absent => {
+                    end_day(start_local.date_naive(), Some(start_local.time()), end_time)
+                }
+                Parsed::Invalid => return (None, None),
+            };
+            match resolve_local(context.timezone, end_date, end_time) {
+                Ok(at) => {
+                    if at <= start_at {
+                        fail(
+                            errors,
+                            "end_date",
+                            END_BEFORE_START,
+                            "Конец события раньше начала",
+                        );
+                    }
+                    (Some(at), None)
+                }
+                Err(_) => {
+                    fail(errors, "end_time", "time_invalid", "Неверное время конца");
+                    (None, None)
+                }
+            }
+        }
+        (None, Some(start_date)) => {
+            // Без названного конца его нет, как и в редакторе события.
+            // Время без даты у вседневного начала относится ко дню начала;
+            // само время у вседневного события смысла не имеет и не хранится.
+            let end_date = match (&date, &time) {
+                (Parsed::Valid(date), _) => Some(*date),
+                (Parsed::Absent, Parsed::Absent) => None,
+                (Parsed::Absent, _) => Some(start_date),
+                (Parsed::Invalid, _) => None,
+            };
+            if let Some(date) = end_date
+                && date < start_date
+            {
+                fail(
+                    errors,
+                    "end_date",
+                    END_BEFORE_START,
+                    "Конец события раньше начала",
+                );
+            }
+            (None, end_date)
+        }
+        (None, None) => (None, None),
+    }
+}
+
+/// Список по имени среди списков нужного типа; иначе список по умолчанию.
+///
+/// Пустое значение и название списка по умолчанию дают одно и то же: список по
+/// умолчанию без отметки «выбран автоматически». Отметка остаётся только у
+/// действительно неизвестного названия: её показывает карточка, а в режиме
+/// `auto` неизвестное имя невозможно — парсер принимает только перечень.
+fn resolve_list<'a>(context: &'a CaptureContext, raw: &RawItem) -> (Option<&'a ListRef>, bool) {
+    let named = raw
+        .target_list
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    if let Some(name) = named
+        && let Some(found) = context.find_list(raw.target_kind, name)
+    {
+        return (Some(found), false);
+    }
+    let default = context.default_list(raw.target_kind);
+    (default, named.is_some())
 }
 
 enum Assignee {
@@ -526,13 +719,13 @@ fn validate_recurrence(
     let Schedule { start, .. } = schedule;
     let errors_before = errors.len();
 
-    // 0009-events 5.1: повторение станет доступно и спискам событий.
-    if list_kind != ListKind::Tasks {
+    // Повторение доступно задачам и событиям по одним правилам домена.
+    if !matches!(list_kind, ListKind::Tasks | ListKind::Events) {
         fail(
             errors,
             "recurrence",
             "recurrence_kind",
-            "Повторение доступно только для задач",
+            "Повторение доступно только для задач и событий",
         );
     }
 
@@ -756,7 +949,13 @@ fn resolve_due(
 ) -> (Option<DateTime<Utc>>, Option<NaiveDate>) {
     let today = context.today();
     let date = Parsed::of(raw.due_date.as_deref(), parse_date);
-    let time = Parsed::of(raw.due_time.as_deref(), parse_time);
+    // «Весь день» — это отсутствие времени: даже если время осталось в
+    // черновике прежнего формата, вседневный элемент его не использует.
+    let time = if raw.all_day {
+        Parsed::Absent
+    } else {
+        Parsed::of(raw.due_time.as_deref(), parse_time)
+    };
 
     let date = match (date, &time) {
         (Parsed::Valid(date), _) => date,
@@ -772,12 +971,16 @@ fn resolve_due(
             return (None, None);
         }
         (Parsed::Absent, Parsed::Valid(_)) => {
-            fail(
-                errors,
-                "due_time",
-                "time_without_date",
-                "Укажите дату для времени",
-            );
+            // Дата не разобралась — об этом уже сказано ошибкой выражения;
+            // «укажите дату для времени» было бы второй, вводящей в заблуждение.
+            if !has_date_error(raw, "due_date") {
+                fail(
+                    errors,
+                    "due_time",
+                    "time_without_date",
+                    "Укажите дату для времени",
+                );
+            }
             return (None, None);
         }
         (Parsed::Absent, Parsed::Absent) => return (None, None),

@@ -1,8 +1,9 @@
 //! Внешний capture: `POST /api/v1/capture`.
 //!
 //! Текст приходит от Home Assistant, ярлыка или интеграции, разбирается тем же
-//! промптом и валидацией, что Telegram-путь, и синхронно возвращает результат.
-//! Telegram здесь не нужен: запись в `outbox` не создаётся.
+//! промптом `capture-v4` и валидацией, что Telegram-путь, и синхронно
+//! возвращает результат. Telegram здесь не нужен: запись в `outbox` не
+//! создаётся.
 
 mod idempotency;
 mod rate_limit;
@@ -25,23 +26,24 @@ use idempotency::{ReservationGuard, header_key, request_hash, resolve_idempotenc
 pub use rate_limit::{RateDecision, RateLimiter};
 
 use crate::auth::tokens::AuthContext;
-use crate::capture::breaker::CircuitBreaker;
 use crate::capture::draft::{self, Applied, NewCapture, Responder};
 use crate::capture::llm::{self, Failure};
 use crate::capture::prompt::PROMPT_VERSION;
 use crate::capture::schema::{ParseError, ParsedResponse, RawItem};
-use crate::capture::validate::{DraftItem, ValidationMode, validate_items_in};
+use crate::capture::validate::{DraftItem, ValidationMode, event_without_start, validate_items_in};
 use crate::config::CaptureConfig;
 use crate::domain::error::DomainError;
 use crate::domain::models::{CaptureMode, CaptureSource, Item, List, ListKind};
 use crate::domain::validation::{MAX_TITLE, sanitize};
-use crate::home_assistant::{AiTask, MAX_GENERATE_TIMEOUT};
+use crate::llm::Chain;
 use crate::security_audit::{self, LimitKey, LlmValidation, RateLimitEvent};
 use crate::storage::repositories::capture_requests;
 use crate::storage::repositories::capture_requests::Reserved;
 use crate::storage::repositories::drafts::Draft;
 use crate::storage::repositories::lists;
-use crate::storage::repositories::llm_runs::{self, FAILURE, NewRun, SUCCESS};
+use crate::storage::repositories::llm_runs::{
+    self, FAILURE, NewRun, RunFields, runs_from_attempts,
+};
 
 use super::super::error::ApiError;
 use super::super::router::AppState;
@@ -55,10 +57,8 @@ pub const BODY_LIMIT_BYTES: usize = 16 * 1024;
 pub struct CaptureState {
     /// Параметры внешнего capture.
     pub config: CaptureConfig,
-    /// Клиент LLM; `None`, если разбор выключен или настроен неверно.
-    pub ai: Option<Arc<dyn AiTask>>,
-    /// Общий с Telegram предохранитель вызовов LLM.
-    pub breaker: Arc<CircuitBreaker>,
+    /// Цепочка слотов LLM; `None`, если разбор выключен или настроен неверно.
+    pub llm: Option<Arc<Chain>>,
     /// Суточная квота разборов на household.
     pub quota: u32,
     /// Лимит частоты на токен.
@@ -67,16 +67,10 @@ pub struct CaptureState {
 
 impl CaptureState {
     /// Создать состояние маршрута.
-    pub fn new(
-        config: CaptureConfig,
-        ai: Option<Arc<dyn AiTask>>,
-        breaker: Arc<CircuitBreaker>,
-        quota: u32,
-    ) -> Self {
+    pub fn new(config: CaptureConfig, llm: Option<Arc<Chain>>, quota: u32) -> Self {
         Self {
             config,
-            ai,
-            breaker,
+            llm,
             quota,
             rate: Arc::new(RateLimiter::new(config.rate_limit_per_min)),
         }
@@ -224,6 +218,12 @@ pub struct CaptureItem {
     pub due_date: Option<NaiveDate>,
     /// Срок со временем.
     pub due_at: Option<DateTime<Utc>>,
+    /// Последний день вседневного события включительно.
+    #[serde(default)]
+    pub end_date: Option<NaiveDate>,
+    /// Конец события со временем.
+    #[serde(default)]
+    pub end_at: Option<DateTime<Utc>>,
 }
 
 /// Ответ `POST /api/v1/capture`.
@@ -253,9 +253,6 @@ const IN_PROGRESS_RETRY_AFTER: u64 = 2;
 /// Точный момент смены суток зависит от часового пояса household, поэтому
 /// используется консервативный час: раньше квота не восстановится.
 const QUOTA_RETRY_AFTER: u64 = 3_600;
-/// Минимальный остаток бюджета, при котором повтор разбора имеет смысл:
-/// второй вызов с меньшим бюджетом почти наверняка упадёт таймаутом.
-const MIN_RETRY_BUDGET: StdDuration = StdDuration::from_secs(1);
 
 /// Обработать внешний capture.
 pub async fn capture(
@@ -411,14 +408,13 @@ async fn capture_inner(
         }
     }
 
-    // Конкретный список проверяется после резерва: чужой, отсутствующий,
-    // архивный и список событий дают один и тот же 422, чтобы не раскрывать
-    // чужие данные. Список событий отклоняется до квоты и LLM (0009-events
-    // 6.1): разбор не создаёт события.
+    // Конкретный список проверяется после резерва: чужой, отсутствующий и
+    // архивный список дают один и тот же 422, чтобы не раскрывать чужие
+    // данные. Список событий допустим: разбор создаёт события (7.2).
     let target_list = match request.list_id {
         Some(list_id) => match lists::get_visible(&mut conn, auth.household_id, list_id).await {
-            Ok(list) if list.kind != ListKind::Events => Some(list),
-            Ok(_) | Err(DomainError::NotFound) => {
+            Ok(list) => Some(list),
+            Err(DomainError::NotFound) => {
                 log_capture(source, "invalid", capture_id);
                 return Err(ApiError::validation("Unknown list"));
             }
@@ -447,7 +443,7 @@ async fn capture_inner(
 
     // Выключенная или не настроенная LLM — это недоступность LLM: `auto` с
     // включённым fallback создаёт позицию из исходного текста, `draft` — 503.
-    let Some(ai) = capture.ai.as_deref() else {
+    let Some(chain) = capture.llm.as_deref() else {
         if fallback_allowed {
             return apply_fallback(&mut conn, fallback, now, "llm_disabled", reservation).await;
         }
@@ -479,119 +475,67 @@ async fn capture_inner(
             "Automatic capture quota is exhausted",
         ));
     }
-    if !capture.breaker.allow(now) {
-        tracing::warn!(
-            metric = "capture_circuit_open",
-            "llm circuit breaker is open"
-        );
-        if fallback_allowed {
-            return apply_fallback(&mut conn, fallback, now, "circuit_open", reservation).await;
-        }
-        log_capture(source, "unavailable", capture_id);
-        return Err(ApiError::service_unavailable(
-            "Automatic capture is temporarily unavailable",
-        ));
-    }
 
-    // Вызов LLM не держит соединение пула.
+    // Вызов LLM не держит соединение пула. Предохранители слотов проверяет
+    // сама цепочка: разомкнутые все слоты дают деградацию без сетевых вызовов.
     drop(conn);
 
-    // Некорректный ответ можно повторить один раз, но только внутри того же
-    // общего таймаута: голосовой pipeline не должен ждать больше бюджета
-    // источника. Ошибки HA (сеть, таймаут, 401, 5xx) не повторяются.
-    let timeout = llm_timeout(&capture.config, source);
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut attempt = 0u8;
-    let mut runs: Vec<PendingRun> = Vec::new();
-
-    let outcome = loop {
-        attempt += 1;
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let attempt_timeout = if attempt == 1 { timeout } else { remaining };
-        let result = llm::generate(
-            ai,
-            capture.breaker.as_ref(),
-            &context,
-            &text,
-            Utc::now(),
-            attempt_timeout,
-        )
-        .await;
-        match result {
-            Ok(generated) => {
-                runs.push(pending_run(
-                    auth.household_id,
-                    source,
-                    request.mode,
-                    RunOutcome::Success,
-                    None,
-                    generated.latency_ms,
-                    generated.finished_at,
-                ));
-                break Ok(generated);
-            }
-            Err(failed) => {
-                let retry = attempt == 1 && failed.failure.is_parse_retryable();
-                let time_left = deadline.saturating_duration_since(tokio::time::Instant::now());
-                let code = failed.failure.code();
-                runs.push(pending_run(
-                    auth.household_id,
-                    source,
-                    request.mode,
-                    RunOutcome::Failure,
-                    Some(code),
-                    failed.latency_ms,
-                    failed.finished_at,
-                ));
-                if retry && time_left >= MIN_RETRY_BUDGET {
-                    continue;
-                }
-                break Err((failed.failure, failed.finished_at));
-            }
-        }
+    let budget = llm_timeout(&capture.config, source);
+    let outcome = llm::generate(chain, &context, &text, Utc::now(), budget).await;
+    let llm::Outcome { result, attempts } = outcome;
+    let finished_at = match &result {
+        Ok(generated) => generated.finished_at,
+        Err(failed) => failed.finished_at,
     };
 
     let mut conn = connection(state).await?;
-    for pending in runs {
-        match pending.outcome {
-            RunOutcome::Success => {
-                llm_runs::record(&mut conn, pending.run, pending.at)
-                    .await
-                    .map_err(database_error)?;
-            }
-            RunOutcome::Failure => record_failure(&mut conn, pending.run, pending.at).await,
+    // Предохранители всех слотов разомкнуты — попыток нет, и строки `llm_runs`
+    // не пишется: LLM не вызывалась, а квота считает вызовы. Так же было до
+    // перехода на слоты.
+    let fields = RunFields {
+        household_id: auth.household_id,
+        user_id: None,
+        source,
+        mode: request.mode,
+        prompt_version: Some(PROMPT_VERSION),
+    };
+    for run in runs_from_attempts(fields, &attempts) {
+        if run.status == FAILURE {
+            record_failure(&mut conn, run, finished_at).await;
+        } else {
+            llm_runs::record(&mut conn, run, finished_at)
+                .await
+                .map_err(database_error)?;
         }
     }
 
-    let generated = match outcome {
+    let generated = match result {
         Ok(generated) => generated,
-        Err((failure, last_finished_at)) => {
-            match &failure {
-                Failure::Ai(error) => {
-                    tracing::warn!(error = error.code(), "llm capture request failed");
-                }
-                Failure::Parse(error) => {
-                    tracing::warn!(error = error.code(), "llm capture response rejected");
-                    state
-                        .audit
-                        .llm_validation_failed(
-                            LlmValidation {
-                                source: security_audit::capture_source_label(source),
-                                stage: "parse",
-                                code: error.code(),
-                                prompt_version: PROMPT_VERSION,
-                                household_id: auth.household_id,
-                                actor: integration_actor(draft::item_source(source)),
-                                capture_id: Some(capture_id),
-                                job_id: None,
-                            },
-                            last_finished_at,
-                        )
-                        .await;
-                }
+        Err(failed) => {
+            let failure = failed.failure;
+            if let Some(code) = failure.validation_code() {
+                tracing::warn!(error = code, "llm capture response rejected");
+                state
+                    .audit
+                    .llm_validation_failed(
+                        LlmValidation {
+                            source: security_audit::capture_source_label(source),
+                            stage: "parse",
+                            code,
+                            prompt_version: PROMPT_VERSION,
+                            household_id: auth.household_id,
+                            actor: integration_actor(draft::item_source(source)),
+                            capture_id: Some(capture_id),
+                            job_id: None,
+                        },
+                        failed.finished_at,
+                    )
+                    .await;
+            } else {
+                tracing::warn!(error = failure.code(), "llm capture request failed");
             }
 
-            if matches!(failure, Failure::Parse(ParseError::TooManyItems { .. })) {
+            if matches!(&failure, Failure::User(ParseError::TooManyItems { .. })) {
                 return reject(
                     &mut conn,
                     reservation,
@@ -599,7 +543,7 @@ async fn capture_inner(
                     source,
                     TOO_MANY_ITEMS_SPEECH.to_owned(),
                     Vec::new(),
-                    last_finished_at,
+                    failed.finished_at,
                 )
                 .await;
             }
@@ -608,7 +552,7 @@ async fn capture_inner(
                 return apply_fallback(
                     &mut conn,
                     fallback,
-                    last_finished_at,
+                    failed.finished_at,
                     failure.code(),
                     reservation,
                 )
@@ -631,6 +575,26 @@ async fn capture_inner(
         CaptureMode::Draft => ValidationMode::Strict,
     };
     let validated = validate_items_in(&context, item_source, parsed.clone(), validation);
+
+    // Событие без начала в `auto` не создаётся: весь ответ деградирует так же,
+    // как при отказе LLM — одна позиция из исходного текста. Это правило
+    // сильнее общего отказа невалидного ответа, поэтому проверяется до него.
+    if request.mode == CaptureMode::Auto && validated.items.iter().any(event_without_start) {
+        if fallback_allowed {
+            return apply_fallback(
+                &mut conn,
+                fallback,
+                finished_at,
+                "event_without_start",
+                reservation,
+            )
+            .await;
+        }
+        log_capture(source, "unavailable", capture_id);
+        return Err(ApiError::service_unavailable(
+            "Automatic capture is temporarily unavailable",
+        ));
+    }
 
     // Пустой разбор отклоняется в обоих режимах, невалидный — только в `auto`:
     // черновик покажет ошибки пользователю.
@@ -794,61 +758,15 @@ fn draft_response(
     }
 }
 
-/// Таймаут LLM для источника.
+/// Бюджет LLM для источника.
 ///
-/// `ha_voice` укладывается в восьмисекундный бюджет Home Assistant; остальные
-/// источники получают общий предел вызова. Telegram-путь сюда не попадает: он
-/// всегда использует [`MAX_GENERATE_TIMEOUT`].
+/// `ha_voice` укладывается в восьмисекундный бюджет Home Assistant (по
+/// умолчанию, настраивается `CAPTURE_VOICE_TIMEOUT_MS`); остальные источники
+/// получают общий предел вызова. Делит бюджет между слотами цепочка.
 fn llm_timeout(config: &CaptureConfig, source: CaptureSource) -> StdDuration {
     match source {
         CaptureSource::HaVoice => StdDuration::from_millis(u64::from(config.voice_timeout_ms)),
-        _ => MAX_GENERATE_TIMEOUT,
-    }
-}
-
-/// Итог одного вызова LLM, ожидающий записи в журнал.
-struct PendingRun {
-    run: NewRun,
-    at: DateTime<Utc>,
-    outcome: RunOutcome,
-}
-
-/// Чем закончился вызов LLM.
-#[derive(Debug, Clone, Copy)]
-enum RunOutcome {
-    Success,
-    Failure,
-}
-
-/// Собрать запись журнала для одного вызова LLM.
-fn pending_run(
-    household_id: Uuid,
-    source: CaptureSource,
-    mode: CaptureMode,
-    outcome: RunOutcome,
-    error_code: Option<&'static str>,
-    latency_ms: i64,
-    at: DateTime<Utc>,
-) -> PendingRun {
-    let status = match outcome {
-        RunOutcome::Success => SUCCESS,
-        RunOutcome::Failure => FAILURE,
-    };
-    PendingRun {
-        run: NewRun {
-            household_id,
-            user_id: None,
-            source,
-            mode,
-            prompt_version: Some(PROMPT_VERSION),
-            status,
-            error_code,
-            latency_ms,
-            input_tokens: None,
-            output_tokens: None,
-        },
-        at,
-        outcome,
+        _ => llm::DEFAULT_BUDGET,
     }
 }
 
@@ -879,9 +797,13 @@ async fn apply_fallback(
     reason: &'static str,
     reservation: &mut Option<capture_requests::Reservation>,
 ) -> Result<Json<CaptureResponse>, ApiError> {
+    // Событие без начала создать нельзя, поэтому список событий в fallback не
+    // используется: позиция из исходного текста идёт в список задач или в
+    // подсказанный тип, как при обычной деградации.
     let requested_kind = input
         .target_list
         .map(|list| list.kind)
+        .filter(|kind| *kind != ListKind::Events)
         .or_else(|| input.hint.map(ListKind::from))
         .unwrap_or(ListKind::Tasks);
     // Подсказка могла указать тип, для которого в household нет списка
@@ -895,11 +817,18 @@ async fn apply_fallback(
     let parsed = ParsedResponse {
         items: vec![RawItem {
             target_kind: kind,
-            target_list: input.target_list.map(|list| list.name.clone()),
+            target_list: input
+                .target_list
+                .filter(|list| list.kind != ListKind::Events)
+                .map(|list| list.name.clone()),
             title,
             notes,
             due_date: None,
             due_time: None,
+            all_day: false,
+            end_date: None,
+            end_time: None,
+            date_error: Vec::new(),
             priority: None,
             assignee: None,
             assignee_id: None,
@@ -1088,6 +1017,8 @@ pub(super) fn item_response(item: &Item, kind: ListKind) -> CaptureItem {
         kind,
         due_date: item.due_date,
         due_at: item.due_at,
+        end_date: item.end_date,
+        end_at: item.end_at,
     }
 }
 
@@ -1100,6 +1031,8 @@ fn draft_item_response(item: &DraftItem) -> CaptureItem {
         kind: item.kind,
         due_date: item.effective_due_date,
         due_at: item.effective_due_at,
+        end_date: item.item.as_ref().and_then(|item| item.end_date),
+        end_at: item.item.as_ref().and_then(|item| item.end_at),
     }
 }
 
@@ -1112,9 +1045,7 @@ pub(super) fn applied_speech(items: &[CaptureItem]) -> String {
                 ListKind::Shopping => format!("Добавил покупку: {titles}."),
                 ListKind::Tasks => format!("Добавил задачу: {titles}."),
                 ListKind::Checklist => format!("Добавил позицию: {titles}."),
-                // 0009-events 6.1: списки событий исключаются из разбора;
-                // до этого у события нейтральный текст, не задача и не покупка.
-                ListKind::Events => format!("Добавил элемент: {titles}."),
+                ListKind::Events => format!("Добавил событие: {titles}."),
             }
         }
         Some(kind) if count <= 3 => {
@@ -1133,17 +1064,15 @@ fn draft_speech(items: &[CaptureItem]) -> String {
     }
 }
 
-/// «2 покупки», «3 задачи», «2 позиции» — число с существительным по типу списка.
+/// «2 покупки», «3 задачи», «2 события» — число с существительным по типу списка.
 fn kind_noun(kind: ListKind, count: usize) -> String {
     match kind {
         ListKind::Shopping => crate::telegram::ru::purchases(count as i64),
         ListKind::Tasks => crate::telegram::ru::tasks(count as i64),
         ListKind::Checklist => crate::telegram::ru::positions(count as i64),
-        // 0009-events 6.1: списки событий исключаются из разбора;
-        // до этого — нейтральное «элементы», не задачи и не покупки.
         ListKind::Events => format!(
             "{count} {}",
-            crate::telegram::ru::plural(count as i64, "элемент", "элемента", "элементов")
+            crate::telegram::ru::plural(count as i64, "событие", "события", "событий")
         ),
     }
 }
@@ -1295,6 +1224,8 @@ mod tests {
             kind,
             due_date: None,
             due_at: None,
+            end_date: None,
+            end_at: None,
         };
         assert_eq!(
             applied_speech(&[item(ListKind::Shopping, "молоко")]),
@@ -1321,6 +1252,22 @@ mod tests {
                 item(ListKind::Tasks, "позвонить")
             ]),
             "Добавил 2 элемента."
+        );
+        assert_eq!(
+            applied_speech(
+                &(0..4)
+                    .map(|n| item(ListKind::Events, &format!("встреча {n}")))
+                    .collect::<Vec<_>>()
+            ),
+            "Добавил 4 элемента."
+        );
+        assert_eq!(
+            draft_speech(
+                &(0..5)
+                    .map(|n| item(ListKind::Events, &format!("встреча {n}")))
+                    .collect::<Vec<_>>()
+            ),
+            "Сохранил черновик: 5 элементов."
         );
     }
 

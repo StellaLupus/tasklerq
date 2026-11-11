@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::capture::draft::DueChoice;
 use crate::domain::error::DomainError;
+use crate::domain::events::end_day;
 use crate::domain::first_contact::FirstContact;
 use crate::domain::models::{
     Field, Item, ItemPatch, ItemPriority, ItemStatus, ListKind, MonthRule, NewItem, Recurrence,
@@ -1199,6 +1200,29 @@ pub enum Action {
         /// Номер элемента с нуля.
         index: usize,
     },
+    /// Выбрать список в ответ на уточняющий вопрос.
+    DraftList {
+        /// Черновик.
+        draft_id: Uuid,
+        /// Номер элемента с нуля.
+        index: usize,
+        /// Выбранный список.
+        list_id: Uuid,
+    },
+    /// Ответить «Весь день» на вопрос о времени.
+    DraftAllDay {
+        /// Черновик.
+        draft_id: Uuid,
+        /// Номер элемента с нуля.
+        index: usize,
+    },
+    /// Открыть ввод времени текстом в ответ на вопрос о времени.
+    DraftTime {
+        /// Черновик.
+        draft_id: Uuid,
+        /// Номер элемента с нуля.
+        index: usize,
+    },
     /// Сохранить все элементы черновика.
     DraftSave {
         /// Черновик.
@@ -1413,10 +1437,12 @@ impl ItemDraft {
                 let Some(end_time) = self.end_time else {
                     return Ok((None, self.end_date));
                 };
-                let mut date = self.end_date.unwrap_or(start_date);
-                if self.end_date.is_none() && end_time <= start_time {
-                    date += chrono::Duration::days(1);
-                }
+                // Правило времени конца без даты общее с разбором и доменом:
+                // время относится ко дню начала, а не позже начала — к
+                // следующему дню.
+                let date = self
+                    .end_date
+                    .unwrap_or_else(|| end_day(start_date, Some(start_time), end_time));
                 Ok((Some(resolve_local(timezone, date, end_time)?), None))
             }
             // У вседневного начала конец тоже вседневный: время без даты
@@ -1582,6 +1608,21 @@ pub enum Form {
     Time {
         /// Какое время редактируется.
         field: TimeField,
+    },
+    /// Ввод времени для уточнения в черновике, формат `HH:MM`.
+    DraftTime {
+        /// Черновик.
+        draft_id: Uuid,
+        /// Номер элемента с нуля.
+        index: usize,
+    },
+    /// Ввод даты начала для уточнения в черновике: экран выбора даты события
+    /// без формы правки элемента (полноценный редактор события — 8.3).
+    DraftDue {
+        /// Черновик.
+        draft_id: Uuid,
+        /// Номер элемента с нуля.
+        index: usize,
     },
 }
 
@@ -1915,6 +1956,8 @@ impl Form {
             Self::DeleteHousehold => "delete_household",
             Self::Lead => "lead",
             Self::Time { .. } => "time",
+            Self::DraftTime { .. } => "draft_time",
+            Self::DraftDue { .. } => "draft_due",
         }
     }
 }

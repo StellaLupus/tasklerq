@@ -475,7 +475,7 @@ fn monday_of(date: NaiveDate) -> NaiveDate {
 }
 
 /// Последний день месяца.
-pub(super) fn last_day_of_month(year: i32, month: u32) -> NaiveDate {
+pub(crate) fn last_day_of_month(year: i32, month: u32) -> NaiveDate {
     let (next_year, next_month) = if month == 12 {
         (year + 1, 1)
     } else {

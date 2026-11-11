@@ -2,9 +2,8 @@
 
 mod support;
 
-use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
 
 use async_trait::async_trait;
@@ -14,11 +13,12 @@ use axum::http::{HeaderMap, Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use tasklerq::capture::breaker::CircuitBreaker;
 use tasklerq::config::CaptureConfig;
-use tasklerq::home_assistant::{AiTask, GenerateData, HaError};
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
+use tasklerq::llm::{
+    Chain, ChatBackend, ChatCompletion, ChatRequest, LlmError, PRIMARY_SLOT, Slot,
+};
 use tasklerq::security_audit::Audit;
 use tokio::sync::Notify;
 use tower::ServiceExt;
@@ -26,44 +26,8 @@ use uuid::Uuid;
 
 use support::{db, issue_token};
 
-/// Подмена Home Assistant: отдаёт заготовленные ответы по очереди.
-struct StubAi {
-    answers: Mutex<VecDeque<Result<Value, HaError>>>,
-    calls: AtomicUsize,
-}
-
-impl StubAi {
-    fn new(answers: Vec<Result<Value, HaError>>) -> Arc<Self> {
-        Arc::new(Self {
-            answers: Mutex::new(answers.into()),
-            calls: AtomicUsize::new(0),
-        })
-    }
-
-    fn calls(&self) -> usize {
-        self.calls.load(Ordering::SeqCst)
-    }
-}
-
-#[async_trait]
-impl AiTask for StubAi {
-    async fn check_entity(&self) -> Result<(), HaError> {
-        Ok(())
-    }
-
-    async fn generate_data(
-        &self,
-        _request: &GenerateData<'_>,
-        _timeout: StdDuration,
-    ) -> Result<Value, HaError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        self.answers
-            .lock()
-            .expect("lock")
-            .pop_front()
-            .unwrap_or(Err(HaError::Unreachable))
-    }
-}
+/// Двойник слота: отдаёт заготовленные ответы по очереди.
+type StubAi = support::llm::BackendDouble;
 
 /// Заглушка, которая держит первый вызов LLM до сигнала: нужна для проверки
 /// повтора, пока запрос ещё обрабатывается.
@@ -90,20 +54,25 @@ impl GatedAi {
 }
 
 #[async_trait]
-impl AiTask for GatedAi {
-    async fn check_entity(&self) -> Result<(), HaError> {
-        Ok(())
-    }
-
-    async fn generate_data(
+impl ChatBackend for GatedAi {
+    async fn complete(
         &self,
-        _request: &GenerateData<'_>,
+        _request: &ChatRequest<'_>,
         _timeout: StdDuration,
-    ) -> Result<Value, HaError> {
+    ) -> Result<ChatCompletion, LlmError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.started.notify_one();
         self.release.notified().await;
-        Ok(self.answer.clone())
+        Ok(completion(&self.answer))
+    }
+}
+
+fn completion(answer: &Value) -> ChatCompletion {
+    ChatCompletion {
+        content: answer.to_string(),
+        input_tokens: Some(10),
+        output_tokens: Some(5),
+        model: "stub/model".to_owned(),
     }
 }
 
@@ -132,22 +101,18 @@ impl TakeoverAi {
 }
 
 #[async_trait]
-impl AiTask for TakeoverAi {
-    async fn check_entity(&self) -> Result<(), HaError> {
-        Ok(())
-    }
-
-    async fn generate_data(
+impl ChatBackend for TakeoverAi {
+    async fn complete(
         &self,
-        _request: &GenerateData<'_>,
+        _request: &ChatRequest<'_>,
         _timeout: StdDuration,
-    ) -> Result<Value, HaError> {
+    ) -> Result<ChatCompletion, LlmError> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         if call == 1 {
             self.started.notify_one();
             self.release.notified().await;
         }
-        Ok(self.answer.clone())
+        Ok(completion(&self.answer))
     }
 }
 
@@ -161,27 +126,33 @@ fn config() -> CaptureConfig {
     }
 }
 
-fn app(pool: &PgPool, ai: Arc<dyn AiTask>) -> Router {
-    build_router(
-        AppState::new(pool.clone(), Audit::new(pool.clone())).with_capture(CaptureState::new(
-            config(),
-            Some(ai),
-            Arc::new(CircuitBreaker::default()),
-            200,
-        )),
-    )
+fn app(pool: &PgPool, ai: Arc<dyn ChatBackend>) -> Router {
+    let chain = Chain::new(
+        Slot::new(PRIMARY_SLOT, ai, StdDuration::from_secs(20)),
+        None,
+    );
+    app_chain(pool, Some(Arc::new(chain)), config(), 200)
 }
 
 fn app_with(
     pool: &PgPool,
-    ai: Option<Arc<dyn AiTask>>,
+    ai: Option<Arc<dyn ChatBackend>>,
     config: CaptureConfig,
-    breaker: Arc<CircuitBreaker>,
     quota: u32,
 ) -> Router {
+    let llm = ai.map(|backend| {
+        Arc::new(Chain::new(
+            Slot::new(PRIMARY_SLOT, backend, StdDuration::from_secs(20)),
+            None,
+        ))
+    });
+    app_chain(pool, llm, config, quota)
+}
+
+fn app_chain(pool: &PgPool, llm: Option<Arc<Chain>>, config: CaptureConfig, quota: u32) -> Router {
     build_router(
         AppState::new(pool.clone(), Audit::new(pool.clone()))
-            .with_capture(CaptureState::new(config, ai, breaker, quota)),
+            .with_capture(CaptureState::new(config, llm, quota)),
     )
 }
 
@@ -207,15 +178,15 @@ async fn wait_for_release(pool: &PgPool, household_id: Uuid) {
 
 /// Один ответ LLM: валидная покупка.
 fn shopping(title: &str) -> Value {
-    json!({"items": [{"target_kind": "shopping", "title": title}]})
+    support::llm::v4::response(vec![support::llm::v4::shopping(title)])
 }
 
 /// Ответ LLM: две валидные покупки.
 fn two_purchases() -> Value {
-    json!({"items": [
-        {"target_kind": "shopping", "title": "молоко"},
-        {"target_kind": "shopping", "title": "хлеб"}
-    ]})
+    support::llm::v4::response(vec![
+        support::llm::v4::shopping("молоко"),
+        support::llm::v4::shopping("хлеб"),
+    ])
 }
 
 fn body(text: &str, source: &str, mode: &str) -> Value {
@@ -377,9 +348,13 @@ async fn a_rejected_repeat_returns_the_first_rejection() {
     let db = db().await;
     let household = support::create_household(&db.pool).await;
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
-    let ai = StubAi::new(vec![Ok(json!({"items": [
-        {"target_kind": "shopping", "title": "хлеб", "due_date": "2000-01-01"}
-    ]}))]);
+    let ai = StubAi::new(vec![Ok(support::llm::v4::response(vec![
+        support::llm::v4::with(
+            support::llm::v4::shopping("хлеб"),
+            "date",
+            support::llm::v4::date(1, 1, 2000),
+        ),
+    ]))]);
     let app = app(&db.pool, ai.clone());
     let key = Uuid::now_v7().to_string();
     let payload = keyed(body("купить хлеб", "ha_voice", "auto"), &key);
@@ -635,7 +610,7 @@ async fn a_failed_first_request_releases_the_key_for_a_retry() {
     let db = db().await;
     let household = support::create_household(&db.pool).await;
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
-    let ai = StubAi::new(vec![Err(HaError::BadResponse), Ok(shopping("молоко"))]);
+    let ai = StubAi::new(vec![Err(LlmError::EmptyResponse), Ok(shopping("молоко"))]);
     let app = app(&db.pool, ai.clone());
     let key = Uuid::now_v7().to_string();
     let payload = keyed(body("купить молоко", "ha_voice", "auto"), &key);
@@ -721,13 +696,7 @@ async fn an_invalid_key_still_uses_the_rate_limit() {
     let mut config = config();
     config.rate_limit_per_min = 2;
     let ai = StubAi::new(vec![Ok(shopping("молоко"))]);
-    let app = app_with(
-        &db.pool,
-        Some(ai as Arc<dyn AiTask>),
-        config,
-        Arc::new(CircuitBreaker::default()),
-        200,
-    );
+    let app = app_with(&db.pool, Some(ai as Arc<dyn ChatBackend>), config, 200);
     let payload = body("купить молоко", "ha_voice", "auto");
 
     for _ in 0..2 {
@@ -871,13 +840,7 @@ async fn a_quota_503_releases_the_key() {
     let household = support::create_household(&db.pool).await;
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
     let ai = StubAi::new(vec![Ok(shopping("молоко")), Ok(shopping("молоко"))]);
-    let app = app_with(
-        &db.pool,
-        Some(ai as Arc<dyn AiTask>),
-        config(),
-        Arc::new(CircuitBreaker::default()),
-        0,
-    );
+    let app = app_with(&db.pool, Some(ai as Arc<dyn ChatBackend>), config(), 0);
     let key = Uuid::now_v7().to_string();
     let payload = keyed(body("купить молоко", "api", "auto"), &key);
 
@@ -895,18 +858,10 @@ async fn an_open_breaker_503_releases_the_key() {
     let db = db().await;
     let household = support::create_household(&db.pool).await;
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
-    let breaker = Arc::new(CircuitBreaker::default());
-    for _ in 0..5 {
-        breaker.record_failure(chrono::Utc::now());
-    }
     let ai = StubAi::new(vec![Ok(shopping("молоко")), Ok(shopping("молоко"))]);
-    let app = app_with(
-        &db.pool,
-        Some(ai as Arc<dyn AiTask>),
-        config(),
-        breaker,
-        200,
-    );
+    let chain = support::llm::chain(ai.clone(), None);
+    support::llm::open_primary(&chain, chrono::Utc::now());
+    let app = app_chain(&db.pool, Some(Arc::new(chain)), config(), 200);
     let key = Uuid::now_v7().to_string();
     let payload = keyed(body("купить молоко", "api", "auto"), &key);
 
@@ -1038,9 +993,11 @@ async fn a_taken_over_reservation_does_not_overwrite_the_new_response() {
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
     // Дата в прошлом делает ответ `rejected`, поэтому проверяется запись
     // ответа вне транзакции элементов (`store_response`), а не `apply_auto`.
-    let ai = TakeoverAi::new(json!({"items": [
-        {"target_kind": "shopping", "title": "хлеб", "due_date": "2000-01-01"}
-    ]}));
+    let ai = TakeoverAi::new(support::llm::v4::response(vec![support::llm::v4::with(
+        support::llm::v4::shopping("хлеб"),
+        "date",
+        support::llm::v4::date(1, 1, 2000),
+    )]));
     let app = app(&db.pool, ai.clone());
     let key = Uuid::now_v7().to_string();
     let payload = keyed(body("купить хлеб", "ha_voice", "auto"), &key);

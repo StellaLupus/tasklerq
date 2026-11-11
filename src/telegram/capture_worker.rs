@@ -1,11 +1,11 @@
 //! Воркер разбора текста через LLM.
 //!
-//! Вызов Home Assistant занимает до 20 секунд, поэтому он идёт вне транзакции
-//! и не держит ни соединение пула, ни блокировки: задание захватывается
-//! арендой (`capture_jobs`), контекст читается коротким запросом, затем идёт
-//! вызов, и только результат — черновик, завершение задания и экран в
-//! `outbox` — фиксируется одной транзакцией. Если воркер упал посреди вызова,
-//! аренда истечёт и задание подберёт другой проход.
+//! Разбор через цепочку слотов занимает до 20 секунд, поэтому он идёт вне
+//! транзакции и не держит ни соединение пула, ни блокировки: задание
+//! захватывается арендой (`capture_jobs`), контекст читается коротким запросом,
+//! затем идёт вызов, и только результат — черновик, завершение задания и экран
+//! в `outbox` — фиксируется одной транзакцией. Если воркер упал посреди
+//! вызова, аренда истечёт и задание подберёт другой проход.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -16,21 +16,20 @@ use futures_util::FutureExt;
 use sqlx::{PgConnection, PgPool};
 use tokio::sync::{Notify, watch};
 
-use crate::capture::breaker::CircuitBreaker;
 use crate::capture::context::CaptureContext;
 use crate::capture::draft::{self, NewCapture};
 use crate::capture::llm::{self, Failure as LlmFailure};
 use crate::capture::prompt::PROMPT_VERSION;
-use crate::capture::schema::{MAX_ITEMS, ParseError, ParsedResponse};
+use crate::capture::schema::{Clarification, MAX_ITEMS, ParseError, ParsedResponse, RawItem};
 use crate::capture::validate::validate_item;
 use crate::domain::error::DomainError;
 use crate::domain::models::{Actor, CaptureMode, Household, Item, ItemSource, ListKind, User};
 use crate::domain::validation::validate_new_item;
-use crate::home_assistant::{AiTask, MAX_GENERATE_TIMEOUT};
+use crate::llm::Chain;
 use crate::metrics;
 use crate::security_audit::{Audit, LlmValidation};
 use crate::storage::repositories::capture_jobs::{self, Failure, Job};
-use crate::storage::repositories::llm_runs::{self, FAILURE, NewRun, SUCCESS};
+use crate::storage::repositories::llm_runs::{self, NewRun, RunFields, runs_from_attempts};
 use crate::storage::repositories::{households, items, users};
 use crate::telegram::ru;
 
@@ -44,7 +43,7 @@ use super::bot::{Banner, Bot, Recipient, into_sqlx};
 use super::views;
 use crate::telegram::rich::button;
 
-/// Попыток на задание: повторяются только сбои на стороне HA и сети.
+/// Попыток на задание: повторяются только сбои транспорта и сервера слота.
 pub const MAX_ATTEMPTS: u32 = 3;
 
 /// Сколько разборов household может запустить за сутки по умолчанию.
@@ -76,12 +75,11 @@ pub enum Pass {
 /// Воркер очереди `capture_jobs`.
 pub struct CaptureWorker {
     pool: PgPool,
-    ai: Arc<dyn AiTask>,
+    llm: Arc<Chain>,
     bot: Bot,
     wake_outbox: Arc<Notify>,
     only_chat: Option<i64>,
     quota: u32,
-    breaker: Arc<CircuitBreaker>,
     audit: Audit,
 }
 
@@ -102,8 +100,8 @@ struct Issue<'a> {
     retryable: bool,
     /// Объяснение пользователю.
     message: &'a str,
-    /// Запись журнала, если LLM уже вызывалась.
-    run: Option<NewRun>,
+    /// Записи журнала по выполненным попыткам; пусто, если LLM не вызывалась.
+    runs: Vec<NewRun>,
 }
 
 impl Prepared {
@@ -160,6 +158,32 @@ fn apply_default_list(
             _ => item.target_list = Some(list.name.clone()),
         }
     }
+}
+
+/// Пересчитать номера уточнений после прямого добавления.
+///
+/// Часть элементов разбора создаётся сразу, а остальные попадают в черновик в
+/// другом порядке; вопросы о созданных элементах отбрасываются, а номера
+/// оставшихся указывают на новый порядок.
+fn reindex_clarifications(
+    parsed_len: usize,
+    draft_items: &[(usize, RawItem)],
+    clarifications: Vec<Clarification>,
+) -> Vec<Clarification> {
+    let mut positions = vec![None; parsed_len];
+    for (new_index, (old_index, _)) in draft_items.iter().enumerate() {
+        positions[*old_index] = Some(new_index);
+    }
+    clarifications
+        .into_iter()
+        .filter_map(|clarification| {
+            let item = positions.get(clarification.item).copied().flatten()?;
+            Some(Clarification {
+                item,
+                ..clarification
+            })
+        })
+        .collect()
 }
 
 /// Сравнение названий списков без регистра и «ё».
@@ -280,7 +304,7 @@ impl CaptureWorker {
     /// общий журнал событий процесса.
     pub fn new(
         pool: PgPool,
-        ai: Arc<dyn AiTask>,
+        llm: Arc<Chain>,
         bot: Bot,
         wake_outbox: Arc<Notify>,
         audit: Audit,
@@ -288,12 +312,11 @@ impl CaptureWorker {
         Self {
             audit,
             pool,
-            ai,
+            llm,
             bot,
             wake_outbox,
             only_chat: None,
             quota: DEFAULT_DAILY_QUOTA,
-            breaker: Arc::new(CircuitBreaker::default()),
         }
     }
 
@@ -308,13 +331,6 @@ impl CaptureWorker {
     #[must_use]
     pub fn with_quota(mut self, quota: u32) -> Self {
         self.quota = quota;
-        self
-    }
-
-    /// Общий предохранитель вызовов LLM.
-    #[must_use]
-    pub fn with_breaker(mut self, breaker: Arc<CircuitBreaker>) -> Self {
-        self.breaker = breaker;
         self
     }
 
@@ -356,27 +372,7 @@ impl CaptureWorker {
                         code: "quota_exhausted",
                         retryable: false,
                         message: QUOTA_EXHAUSTED,
-                        run: None,
-                    },
-                    now,
-                )
-                .await;
-        }
-        if !self.breaker.allow(now) {
-            tracing::warn!(
-                metric = "capture_circuit_open",
-                "llm circuit breaker is open"
-            );
-            return self
-                .fail(
-                    &job,
-                    &prepared,
-                    Issue {
-                        text: &text,
-                        code: "circuit_open",
-                        retryable: false,
-                        message: CIRCUIT_OPEN,
-                        run: None,
+                        runs: Vec::new(),
                     },
                     now,
                 )
@@ -384,20 +380,23 @@ impl CaptureWorker {
         }
 
         let outcome = llm::generate(
-            self.ai.as_ref(),
-            &self.breaker,
+            self.llm.as_ref(),
             &prepared.context,
             &text,
             now,
-            MAX_GENERATE_TIMEOUT,
+            llm::DEFAULT_BUDGET,
         )
         .await;
-        match outcome {
+        let llm::Outcome { result, attempts } = outcome;
+
+        // Предохранители всех слотов разомкнуты — попыток нет, и строки
+        // `llm_runs` не пишется: LLM не вызывалась, а квота считает вызовы.
+        let runs = runs_from_attempts(self.run_fields(&job, &prepared), &attempts);
+
+        match result {
             Ok(generated) => {
                 let now = generated.finished_at;
-                let latency_ms = generated.latency_ms;
                 let parsed = generated.parsed;
-                let run = self.run_record(&job, &prepared, SUCCESS, None, latency_ms);
                 if parsed.items.is_empty() {
                     self.fail(
                         &job,
@@ -407,7 +406,7 @@ impl CaptureWorker {
                             code: "no_items",
                             retryable: false,
                             message: NOTHING,
-                            run: Some(run),
+                            runs,
                         },
                         now,
                     )
@@ -421,51 +420,51 @@ impl CaptureWorker {
                             })
                         })
                 {
-                    self.finish_direct(&job, &prepared, &text, parsed, target.list_id, now, run)
+                    self.finish_direct(&job, &prepared, &text, parsed, target.list_id, now, runs)
                         .await
                 } else {
-                    self.finish(&job, &prepared, &text, parsed, now, run).await
+                    self.finish(&job, &prepared, &text, parsed, now, runs).await
                 }
             }
             Err(failed) => {
                 let now = failed.finished_at;
                 let failure = failed.failure;
-                match &failure {
-                    LlmFailure::Ai(error) => tracing::warn!(
-                        error = error.code(),
+                if let Some(code) = failure.validation_code() {
+                    tracing::warn!(error = code, "llm capture response rejected");
+                    self.audit
+                        .llm_validation_failed(
+                            LlmValidation {
+                                source: "telegram",
+                                stage: "parse",
+                                code,
+                                prompt_version: PROMPT_VERSION,
+                                household_id: job.household_id,
+                                actor: crate::domain::models::Actor::user(
+                                    prepared.user.id,
+                                    prepared.user.role,
+                                ),
+                                capture_id: None,
+                                job_id: Some(job.id),
+                            },
+                            now,
+                        )
+                        .await;
+                } else {
+                    tracing::warn!(
+                        error = failure.code(),
                         attempt = job.attempts,
                         "llm capture request failed"
-                    ),
-                    LlmFailure::Parse(error) => {
-                        tracing::warn!(error = error.code(), "llm capture response rejected");
-                        self.audit
-                            .llm_validation_failed(
-                                LlmValidation {
-                                    source: "telegram",
-                                    stage: "parse",
-                                    code: error.code(),
-                                    prompt_version: PROMPT_VERSION,
-                                    household_id: job.household_id,
-                                    actor: crate::domain::models::Actor::user(
-                                        prepared.user.id,
-                                        prepared.user.role,
-                                    ),
-                                    capture_id: None,
-                                    job_id: Some(job.id),
-                                },
-                                now,
-                            )
-                            .await;
-                    }
+                    );
                 }
-                let message =
-                    if matches!(failure, LlmFailure::Parse(ParseError::TooManyItems { .. })) {
-                        TOO_MANY
-                    } else {
-                        FAILED
-                    };
+                let message = match &failure {
+                    LlmFailure::User(ParseError::TooManyItems { .. }) => TOO_MANY,
+                    LlmFailure::Degraded {
+                        reason: "circuit_open",
+                        ..
+                    } => CIRCUIT_OPEN,
+                    _ => FAILED,
+                };
                 let code = failure.code();
-                let run = self.run_record(&job, &prepared, FAILURE, Some(code), failed.latency_ms);
                 self.fail(
                     &job,
                     &prepared,
@@ -474,7 +473,7 @@ impl CaptureWorker {
                         code,
                         retryable: failure.is_retryable(),
                         message,
-                        run: Some(run),
+                        runs,
                     },
                     now,
                 )
@@ -495,26 +494,14 @@ impl CaptureWorker {
         Ok(used >= i64::from(self.quota))
     }
 
-    /// Запись журнала об одном вызове LLM.
-    fn run_record(
-        &self,
-        job: &Job,
-        prepared: &Prepared,
-        status: &'static str,
-        error_code: Option<&'static str>,
-        latency_ms: i64,
-    ) -> NewRun {
-        NewRun {
+    /// Общие поля журнала одного разбора.
+    fn run_fields(&self, job: &Job, prepared: &Prepared) -> RunFields {
+        RunFields {
             household_id: job.household_id,
             user_id: Some(prepared.user.id),
             source: job.source,
             mode: CaptureMode::Draft,
             prompt_version: Some(PROMPT_VERSION),
-            status,
-            error_code,
-            latency_ms,
-            input_tokens: None,
-            output_tokens: None,
         }
     }
 
@@ -558,12 +545,14 @@ impl CaptureWorker {
         text: &str,
         parsed: ParsedResponse,
         now: DateTime<Utc>,
-        run: NewRun,
+        runs: Vec<NewRun>,
     ) -> Result<Pass, sqlx::Error> {
         let mut parsed = parsed;
         apply_default_list(job, &prepared.context, text, &mut parsed);
         let mut tx = self.pool.begin().await?;
-        llm_runs::record(&mut tx, run, now).await?;
+        for run in runs {
+            llm_runs::record(&mut tx, run, now).await?;
+        }
         let created = draft::append_or_create(
             &mut tx,
             NewCapture {
@@ -630,7 +619,7 @@ impl CaptureWorker {
         parsed: ParsedResponse,
         target_list_id: uuid::Uuid,
         now: DateTime<Utc>,
-        run: NewRun,
+        runs: Vec<NewRun>,
     ) -> Result<Pass, sqlx::Error> {
         let context = &prepared.context;
         let target_name = context
@@ -643,22 +632,26 @@ impl CaptureWorker {
         let ParsedResponse {
             items: parsed_items,
             clarifications,
+            ..
         } = parsed;
+        let parsed_len = parsed_items.len();
         let mut direct = Vec::new();
         let mut draft_items = Vec::new();
-        for mut item in parsed_items {
+        for (index, mut item) in parsed_items.into_iter().enumerate() {
             if item.target_kind == ListKind::Shopping {
                 // Экран задаёт целевой список: разбор не должен уводить
                 // покупку в другой список.
                 item.target_list = Some(target_name.clone());
-                direct.push(item);
+                direct.push((index, item));
             } else {
-                draft_items.push(item);
+                draft_items.push((index, item));
             }
         }
 
         let mut tx = self.pool.begin().await?;
-        llm_runs::record(&mut tx, run, now).await?;
+        for run in runs {
+            llm_runs::record(&mut tx, run, now).await?;
+        }
         let actor = Actor::user(prepared.user.id, prepared.user.role);
         let timezone = context.timezone.name();
         let today = context.today();
@@ -667,11 +660,11 @@ impl CaptureWorker {
             .map_err(into_sqlx)?;
 
         let mut new_items = Vec::new();
-        for raw in direct {
+        for (index, raw) in direct {
             let checked = validate_item(context, ItemSource::Telegram, raw.clone());
             let Some(mut new_item) = checked.item else {
                 // Невалидную покупку не теряем: её можно поправить в черновике.
-                draft_items.push(raw);
+                draft_items.push((index, raw));
                 continue;
             };
             // Имя списка могло совпасть с другим: экран задаёт идентификатор.
@@ -711,6 +704,11 @@ impl CaptureWorker {
         let draft = if draft_items.is_empty() {
             None
         } else {
+            let clarifications = reindex_clarifications(parsed_len, &draft_items, clarifications);
+            let draft_items = draft_items
+                .into_iter()
+                .map(|(_, item)| item)
+                .collect::<Vec<_>>();
             let draft = draft::append_or_create(
                 &mut tx,
                 NewCapture {
@@ -882,7 +880,7 @@ impl CaptureWorker {
         now: DateTime<Utc>,
     ) -> Result<Pass, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        if let Some(run) = issue.run {
+        for run in issue.runs {
             llm_runs::record(&mut tx, run, now).await?;
         }
         let failure = capture_jobs::record_failure(
@@ -1008,5 +1006,70 @@ impl CaptureWorker {
                 () = tokio::time::sleep(Duration::from_millis(500)) => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture::schema::ClarificationTopic;
+
+    fn raw(title: &str) -> RawItem {
+        RawItem {
+            target_kind: ListKind::Tasks,
+            target_list: None,
+            title: title.to_owned(),
+            notes: None,
+            due_date: None,
+            due_time: None,
+            all_day: false,
+            end_date: None,
+            end_time: None,
+            date_error: Vec::new(),
+            priority: None,
+            assignee: None,
+            assignee_id: None,
+            tags: Vec::new(),
+            quantity: None,
+            unit: None,
+            subtasks: Vec::new(),
+            recurrence: None,
+        }
+    }
+
+    #[test]
+    fn clarifications_follow_items_that_stay_in_the_draft() {
+        let draft_items = vec![(1, raw("Второе")), (2, raw("Третье"))];
+        let clarifications = vec![
+            Clarification {
+                item: 0,
+                topic: ClarificationTopic::Date,
+            },
+            Clarification {
+                item: 1,
+                topic: ClarificationTopic::Time,
+            },
+            Clarification {
+                item: 2,
+                topic: ClarificationTopic::List,
+            },
+        ];
+
+        let reindexed = reindex_clarifications(3, &draft_items, clarifications);
+
+        assert_eq!(
+            reindexed,
+            [
+                Clarification {
+                    item: 0,
+                    topic: ClarificationTopic::Time,
+                },
+                Clarification {
+                    item: 1,
+                    topic: ClarificationTopic::List,
+                },
+            ],
+            "the item created directly loses its question, the rest are renumbered"
+        );
     }
 }

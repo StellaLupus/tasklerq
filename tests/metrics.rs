@@ -13,14 +13,20 @@ use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{HeaderMap, Method, Request, StatusCode};
 use chrono::{DateTime, Duration, Utc};
 use http_body_util::BodyExt;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sqlx::PgConnection;
-use tasklerq::capture::breaker::CircuitBreaker;
-use tasklerq::config::{CaptureConfig, SecretString};
-use tasklerq::home_assistant::{AiTask, GenerateData, HaError};
+use tasklerq::capture::prompt;
+use tasklerq::capture::slot_check;
+use tasklerq::capture::slot_status::LlmSlotHealth;
+use tasklerq::config::{CaptureConfig, LlmConfig, SecretString, SlotConfig};
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
+use tasklerq::llm::{
+    Chain, ChatBackend, ChatCompletion, ChatMessage, ChatRequest, LlmError, ResponseFailure, Slot,
+    SystemClock,
+};
 use tasklerq::security_audit::Audit;
+use tasklerq::storage::repositories::llm_slot_checks::{self, NewCheck};
 use tasklerq::telegram::api::TelegramError;
 use tasklerq::telegram::bot::{Bot, Outcome};
 use tasklerq::telegram::capture_worker::{CaptureWorker, Pass as CapturePass};
@@ -57,38 +63,11 @@ fn fallback_capture_config() -> CaptureConfig {
     }
 }
 
-struct StubAi;
-
-#[async_trait]
-impl AiTask for StubAi {
-    async fn check_entity(&self) -> Result<(), HaError> {
-        Ok(())
-    }
-
-    async fn generate_data(
-        &self,
-        _request: &GenerateData<'_>,
-        _timeout: StdDuration,
-    ) -> Result<Value, HaError> {
-        Ok(json!({"items": [{"target_kind": "shopping", "title": "Молоко"}]}))
-    }
-}
-
-struct BadAi;
-
-#[async_trait]
-impl AiTask for BadAi {
-    async fn check_entity(&self) -> Result<(), HaError> {
-        Ok(())
-    }
-
-    async fn generate_data(
-        &self,
-        _request: &GenerateData<'_>,
-        _timeout: StdDuration,
-    ) -> Result<Value, HaError> {
-        Ok(json!({}))
-    }
+fn chain_always(answer: Result<Value, LlmError>) -> Arc<tasklerq::llm::Chain> {
+    Arc::new(support::llm::chain(
+        support::llm::BackendDouble::always(answer),
+        None,
+    ))
 }
 
 struct Noop;
@@ -119,21 +98,36 @@ impl UpdateHandler for Failing {
     }
 }
 
-/// LLM недоступна: capture уходит в fallback из исходного текста.
-struct UnavailableAi;
+/// Слот, который всегда отвечает таймаутом.
+struct TimeoutBackend;
 
 #[async_trait]
-impl AiTask for UnavailableAi {
-    async fn check_entity(&self) -> Result<(), HaError> {
-        Ok(())
-    }
-
-    async fn generate_data(
+impl ChatBackend for TimeoutBackend {
+    async fn complete(
         &self,
-        _request: &GenerateData<'_>,
+        _request: &ChatRequest<'_>,
         _timeout: StdDuration,
-    ) -> Result<Value, HaError> {
-        Err(HaError::Unreachable)
+    ) -> Result<ChatCompletion, LlmError> {
+        Err(LlmError::Timeout)
+    }
+}
+
+/// Слот, который всегда отвечает корректным текстом.
+struct AnswerBackend;
+
+#[async_trait]
+impl ChatBackend for AnswerBackend {
+    async fn complete(
+        &self,
+        _request: &ChatRequest<'_>,
+        _timeout: StdDuration,
+    ) -> Result<ChatCompletion, LlmError> {
+        Ok(ChatCompletion {
+            content: r#"{"items":[]}"#.to_owned(),
+            input_tokens: Some(7),
+            output_tokens: Some(3),
+            model: "stub/model".to_owned(),
+        })
     }
 }
 
@@ -223,8 +217,9 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
     let state = AppState::new(db.pool.clone(), Audit::new(db.pool.clone()))
         .with_capture(CaptureState::new(
             capture_config(),
-            Some(Arc::new(StubAi)),
-            Arc::new(CircuitBreaker::default()),
+            Some(chain_always(Ok(support::llm::v4::response(vec![
+                support::llm::v4::shopping("Молоко"),
+            ])))),
             200,
         ))
         .with_telegram(ingress)
@@ -266,12 +261,7 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
     // Сбой валидации ответа LLM считается отдельной метрикой.
     let bad_app = build_router(
         AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_capture(
-            CaptureState::new(
-                capture_config(),
-                Some(Arc::new(BadAi)),
-                Arc::new(CircuitBreaker::default()),
-                200,
-            ),
+            CaptureState::new(capture_config(), Some(chain_always(Ok(json!({})))), 200),
         ),
     );
     let (status, _, _) = send(
@@ -290,8 +280,7 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
         AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_capture(
             CaptureState::new(
                 fallback_capture_config(),
-                Some(Arc::new(UnavailableAi)),
-                Arc::new(CircuitBreaker::default()),
+                Some(chain_always(Err(LlmError::Transport))),
                 200,
             ),
         ),
@@ -428,7 +417,9 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
     telegram.press("меню").await;
     let capture_worker = CaptureWorker::new(
         db.pool.clone(),
-        Arc::new(StubAi),
+        chain_always(Ok(support::llm::v4::response(vec![
+            support::llm::v4::shopping("Молоко"),
+        ]))),
         handler,
         Arc::new(Notify::new()),
         Audit::new(db.pool.clone()),
@@ -556,10 +547,18 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
         "capture_total{source=\"telegram\",status=\"drafted\"}",
         1.0,
     );
-    assert_metric_at_least(&text, "llm_requests_total{status=\"success\"}", 1.0);
-    assert_metric_at_least(&text, "llm_requests_total{status=\"failure\"}", 1.0);
+    assert_metric_at_least(
+        &text,
+        "llm_requests_total{slot=\"primary\",status=\"success\"}",
+        1.0,
+    );
+    assert_metric_at_least(
+        &text,
+        "llm_requests_total{slot=\"primary\",status=\"failure\"}",
+        1.0,
+    );
     assert_metric_at_least(&text, "llm_validation_failures_total", 1.0);
-    assert_metric_at_least(&text, "llm_latency_seconds_count", 2.0);
+    assert_metric_at_least(&text, "llm_latency_seconds_count{slot=\"primary\"}", 2.0);
     assert_metric_at_least(
         &text,
         "http_requests_total{route=\"/webhooks/telegram\",status=\"401\"}",
@@ -580,6 +579,141 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
     assert!(
         !text.contains(&item_id.to_string()),
         "the raw path must not become a metric label:\n{text}"
+    );
+}
+
+/// Значение серии из рендера `/metrics`; 0, если серии ещё нет.
+fn series_value(text: &str, series: &str) -> u64 {
+    text.lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(' ')?;
+            if name != series {
+                return None;
+            }
+            value.parse::<u64>().ok()
+        })
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn chain_reports_llm_metrics_with_slot_labels() {
+    // Уникальные имена слотов: соседние тесты в общем реестре пишут те же
+    // серии, и разницу значений можно считать только для своих слотов.
+    const PRIMARY: &str = "metrics-test-primary";
+    const FALLBACK: &str = "metrics-test-fallback";
+    let primary = Slot::new(PRIMARY, Arc::new(TimeoutBackend), StdDuration::from_secs(1));
+    let fallback = Slot::new(FALLBACK, Arc::new(AnswerBackend), StdDuration::from_secs(1));
+    let chain = Chain::new(primary, Some(fallback));
+    let schema = json!({"type": "object"});
+    let messages = vec![ChatMessage::user("купить молоко")];
+    let request = ChatRequest {
+        messages: &messages,
+        schema_name: "capture_v4",
+        schema: &schema,
+    };
+
+    let before = tasklerq::metrics::render();
+    let outcome = chain
+        .run(
+            &request,
+            StdDuration::from_secs(2),
+            Utc::now(),
+            &SystemClock::new(),
+            |text| Ok::<_, ResponseFailure<()>>(text.to_owned()),
+        )
+        .await;
+    assert!(outcome.result.is_ok());
+
+    let after = tasklerq::metrics::render();
+    for (slot, status) in [(PRIMARY, "failure"), (FALLBACK, "success")] {
+        let series = format!("llm_requests_total{{slot=\"{slot}\",status=\"{status}\"}}");
+        assert_eq!(
+            series_value(&after, &series),
+            series_value(&before, &series) + 1,
+            "Chain must record the request:\n{after}"
+        );
+        let count = format!("llm_latency_seconds_count{{slot=\"{slot}\"}}");
+        assert_eq!(
+            series_value(&after, &count),
+            series_value(&before, &count) + 1,
+            "Chain must record the latency:\n{after}"
+        );
+    }
+    assert!(
+        after.contains("llm_latency_seconds_bucket{slot=\"metrics-test-fallback\",le=\""),
+        "{after}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn llm_slot_verified_is_one_only_for_a_passed_slot() {
+    let db = support::isolated_db().await;
+    let primary = SlotConfig {
+        url: "https://api.example.test/v1".parse().expect("url"),
+        model: "vendor/primary".to_owned(),
+        token: Some(SecretString::new("SECRET-slot-token")),
+        timeout: StdDuration::from_secs(10),
+        extra: Map::new(),
+    };
+    let chain = support::llm::chain(
+        support::llm::BackendDouble::always(Ok(support::llm::v4::response(vec![]))),
+        None,
+    );
+    let llm = LlmConfig {
+        enabled: true,
+        primary: Some(primary.clone()),
+        fallback: None,
+        connect_timeout: StdDuration::from_millis(1_000),
+        daily_quota: 200,
+    };
+    let health = LlmSlotHealth::new(Arc::new(chain), &llm).expect("llm health");
+    let now = Utc::now();
+
+    // Нет строки проверки — слот не прошёл.
+    health.refresh(&db.pool, now).await.expect("refresh");
+    assert_eq!(
+        metric_value(
+            &tasklerq::metrics::render(),
+            "llm_slot_verified{slot=\"primary\"}"
+        ),
+        Some(0.0),
+        "an unchecked slot must be 0"
+    );
+
+    let fingerprint = slot_check::fingerprint(
+        &primary,
+        &prompt::contract_hash(),
+        &slot_check::set_hash(slot_check::BUILTIN_SET),
+    );
+    let parts = fingerprint.parts.to_json();
+    let report = json!({"total": 22, "passed": 22});
+    let mut conn = db.pool.acquire().await.expect("connection");
+    llm_slot_checks::upsert(
+        &mut conn,
+        NewCheck {
+            slot: "primary",
+            fingerprint: &fingerprint.value,
+            fingerprint_parts: &parts,
+            passed: 22,
+            total: 22,
+            p95_ms: 1_000,
+            report: &report,
+        },
+        now,
+    )
+    .await
+    .expect("slot check should be stored");
+    drop(conn);
+
+    health.invalidate();
+    health.refresh(&db.pool, now).await.expect("refresh");
+    assert_eq!(
+        metric_value(
+            &tasklerq::metrics::render(),
+            "llm_slot_verified{slot=\"primary\"}"
+        ),
+        Some(1.0),
+        "a passed slot must be 1"
     );
 }
 

@@ -187,6 +187,56 @@ pub fn fixed_date_label(date: NaiveDate, today: NaiveDate) -> String {
     }
 }
 
+/// Интервал события: «ср, 11 ноя 14:00–15:30»; многодневное событие —
+/// «ср, 11 ноя 14:00 — пт, 13 ноя 10:00», вседневное — «ср, 11 ноя, весь день»
+/// или диапазон дат. `None` — у события нет начала.
+///
+/// Даты берутся из того же [`date_label`], что и срок в карточке события:
+/// «завтра» рядом, «ср, 11 ноя» — дальше.
+pub fn event_interval(
+    start_at: Option<DateTime<Utc>>,
+    start_date: Option<NaiveDate>,
+    end_at: Option<DateTime<Utc>>,
+    end_date: Option<NaiveDate>,
+    timezone: Tz,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    let today = now.with_timezone(&timezone).date_naive();
+    match (start_at, start_date) {
+        (Some(start_at), _) => {
+            let start = start_at.with_timezone(&timezone);
+            let start_day = start.date_naive();
+            let date = date_label(start_day, today);
+            let Some(end_at) = end_at else {
+                return Some(format!("{date}, {}", start.format("%H:%M")));
+            };
+            let end = end_at.with_timezone(&timezone);
+            if end.date_naive() == start_day {
+                Some(format!(
+                    "{date} {}–{}",
+                    start.format("%H:%M"),
+                    end.format("%H:%M")
+                ))
+            } else {
+                Some(format!(
+                    "{date} {} — {} {}",
+                    start.format("%H:%M"),
+                    date_label(end.date_naive(), today),
+                    end.format("%H:%M")
+                ))
+            }
+        }
+        (None, Some(start_date)) => {
+            let date = date_label(start_date, today);
+            match end_date.filter(|end| *end > start_date) {
+                Some(end_date) => Some(format!("{date} — {}", date_label(end_date, today))),
+                None => Some(format!("{date}, {ALL_DAY}")),
+            }
+        }
+        (None, None) => None,
+    }
+}
+
 /// Отклонение факта выполнения от плана: «+2 дня», «+3 ч», «раньше».
 ///
 /// Срок без времени сравнивается по местным датам: тот же день — без пометки.
@@ -544,6 +594,63 @@ mod tests {
         assert_eq!(date_label(date(2026, 11, 1), today), "послезавтра");
         assert_eq!(date_label(date(2026, 11, 3), today), "вт, 3 ноя");
         assert_eq!(date_label(date(2027, 1, 5), today), "5 янв 2027");
+    }
+
+    #[test]
+    fn event_interval_shows_one_day_multi_day_and_all_day() {
+        let tz: Tz = "Europe/Moscow".parse().expect("tz");
+        let now = Utc.with_ymd_and_hms(2026, 11, 10, 9, 0, 0).unwrap();
+        let at = |d: u32, h: u32, m: u32| {
+            tz.with_ymd_and_hms(2026, 11, d, h, m, 0)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+
+        assert_eq!(
+            event_interval(
+                Some(at(11, 14, 0)),
+                None,
+                Some(at(11, 15, 30)),
+                None,
+                tz,
+                now,
+            )
+            .as_deref(),
+            Some("завтра 14:00–15:30")
+        );
+        assert_eq!(
+            event_interval(
+                Some(at(16, 14, 0)),
+                None,
+                Some(at(18, 10, 0)),
+                None,
+                tz,
+                now,
+            )
+            .as_deref(),
+            Some("пн, 16 ноя 14:00 — ср, 18 ноя 10:00")
+        );
+        assert_eq!(
+            event_interval(None, Some(date(2026, 11, 11)), None, None, tz, now).as_deref(),
+            Some("завтра, весь день")
+        );
+        assert_eq!(
+            event_interval(
+                None,
+                Some(date(2026, 11, 16)),
+                None,
+                Some(date(2026, 11, 18)),
+                tz,
+                now,
+            )
+            .as_deref(),
+            Some("пн, 16 ноя — ср, 18 ноя")
+        );
+        assert_eq!(
+            event_interval(None, None, None, None, tz, now),
+            None,
+            "an event without a start has no interval"
+        );
     }
 
     #[test]

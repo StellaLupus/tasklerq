@@ -1238,6 +1238,11 @@ GET /api/v1/calendar?start=2026-11-01&end=2027-04-01
 регистрируются и дают `404 not_found` (включая `undo-last`), без вызова LLM и
 разбора тела.
 
+Разбор создаёт задачи, покупки, пункты чек-листа и события. Список событий
+задаётся `list_id`; без него событие идёт в список событий по умолчанию.
+Событие без начала в `auto` не создаётся: ответ деградирует до одной
+fallback-позиции (см. §7.1).
+
 ### 7.1 `POST /api/v1/capture`
 
 Scope: `capture:write`. `Content-Type: application/json`. Лимит тела —
@@ -1259,8 +1264,8 @@ Scope: `capture:write`. `Content-Type: application/json`. Лимит тела �
 | `text` | string | да | После trim 1..`CAPTURE_MAX_TEXT_CHARS` (по умолчанию 2000). |
 | `source` | string | да | `ha_voice`, `ha_automation`, `api`, `shortcut`. `telegram` запрещён. |
 | `mode` | string | да | `auto` или `draft`. |
-| `hint` | string | нет | `tasks`, `shopping`, `checklist` — тип списка по умолчанию для всех элементов. |
-| `list_id` | uuid | нет | Конкретный список household; приоритетнее `hint`. Неизвестный, чужой, архивный список или список событий → `422` (`Unknown list`). |
+| `hint` | string | нет | `tasks`, `shopping`, `checklist` — тип списка по умолчанию для всех элементов. `events` не принимается: список событий задаётся через `list_id`. |
+| `list_id` | uuid | нет | Конкретный список household; приоритетнее `hint`. Неизвестный, чужой или архивный список → `422` (`Unknown list`). Список `events` допустим: разбор создаёт события. |
 | `idempotency_key` | string | нет | 1..128 видимых ASCII (`0x21..0x7E`, без пробелов). Пустая строка = без ключа. |
 
 ```json
@@ -1286,9 +1291,11 @@ Scope: `capture:write`. `Content-Type: application/json`. Лимит тела �
 | `items[].id` | uuid | да | Id созданной позиции; у черновика `null`. |
 | `items[].title` | string | нет | Название. |
 | `items[].list_id` | uuid | да | Список; у черновика может быть `null`, если список ещё не выбран. |
-| `items[].kind` | string | нет | `tasks`, `shopping`, `checklist`. |
-| `items[].due_date` | string | да | `YYYY-MM-DD`. |
-| `items[].due_at` | string | да | RFC 3339 UTC. |
+| `items[].kind` | string | нет | `tasks`, `shopping`, `checklist`, `events`. |
+| `items[].due_date` | string | да | `YYYY-MM-DD`; у события — начало (вседневное). |
+| `items[].due_at` | string | да | RFC 3339 UTC; у события — начало. |
+| `items[].end_date` | string | да | `YYYY-MM-DD`, последний день вседневного события включительно; у остальных `null`. |
+| `items[].end_at` | string | да | RFC 3339 UTC, конец события со временем; у остальных `null`. |
 | `draft_id` | uuid | да | Id черновика при `status=draft`; иначе `null`. |
 | `expires_at` | string | да | TTL черновика (15 минут) при `status=draft`; иначе `null`. |
 | `clarifications` | array[string] | нет | Вопросы модели, до 3; может быть непустым и у `applied`. |
@@ -1308,7 +1315,9 @@ Scope: `capture:write`. `Content-Type: application/json`. Лимит тела �
       "list_id": "019a1b2c-6c7d-7e8f-9a0b-2b3c4d5e6f70",
       "kind": "shopping",
       "due_date": null,
-      "due_at": null
+      "due_at": null,
+      "end_date": null,
+      "end_at": null
     },
     {
       "id": "019a1b2c-d4e5-7f6a-9b7c-8192a3b4c5d6",
@@ -1316,7 +1325,9 @@ Scope: `capture:write`. `Content-Type: application/json`. Лимит тела �
       "list_id": "019a1b2c-6c7d-7e8f-9a0b-2b3c4d5e6f70",
       "kind": "shopping",
       "due_date": null,
-      "due_at": null
+      "due_at": null,
+      "end_date": null,
+      "end_at": null
     }
   ],
   "draft_id": null,
@@ -1340,7 +1351,9 @@ Scope: `capture:write`. `Content-Type: application/json`. Лимит тела �
       "list_id": "019a1b2c-6c7d-7e8f-9a0b-2b3c4d5e6f70",
       "kind": "shopping",
       "due_date": null,
-      "due_at": null
+      "due_at": null,
+      "end_date": null,
+      "end_at": null
     }
   ],
   "draft_id": "019a1b2c-e5f6-7a7b-8c8d-92a3b4c5d6e7",
@@ -1364,14 +1377,58 @@ Scope: `capture:write`. `Content-Type: application/json`. Лимит тела �
 }
 ```
 
+Пример `applied` с событием: `list_id` указывает на список `events`
+(«Школа» из §3), разбор возвращает форму `events`:
+
+```json
+{
+  "text": "собрание в школе в четверг в 18:30",
+  "source": "ha_voice",
+  "mode": "auto",
+  "list_id": "019a1b2c-7e9f-7a0b-9c1d-4d5e6f7081a2"
+}
+```
+
+```json
+{
+  "capture_id": "019a1b2c-a7b8-7c9d-8e0f-b4c5d6e7f809",
+  "status": "applied",
+  "fallback": false,
+  "speech": "Добавил событие: Собрание в школе.",
+  "items": [
+    {
+      "id": "019a1b2c-b8c9-7d0e-9f1a-c5d6e7f8091a",
+      "title": "Собрание в школе",
+      "list_id": "019a1b2c-7e9f-7a0b-9c1d-4d5e6f7081a2",
+      "kind": "events",
+      "due_date": null,
+      "due_at": "2026-11-12T15:30:00Z",
+      "end_date": null,
+      "end_at": null
+    }
+  ],
+  "draft_id": null,
+  "expires_at": null,
+  "clarifications": []
+}
+```
+
+Если начало не названо, элемента события нет: в `auto` создаётся
+fallback-позиция из исходного текста (см. ниже), а в `draft` событие остаётся в
+черновике с уточнением даты. Конец события приходит в `end_at`/`end_date`, как
+у `ItemResponse`; без конца оба поля `null`.
+
 Режимы:
 
 - `auto` — валидный разбор применяется сразу одной транзакцией. Любая
   жёсткая ошибка отклоняет весь capture (`status=rejected`). Неизвестный
   список заменяется списком по умолчанию, неизвестный/неоднозначный
-  исполнитель снимается, пустые необязательные поля отбрасываются.
+  исполнитель снимается, пустые необязательные поля отбрасываются. Событие без
+  начала — исключение: вместо `rejected` весь ответ деградирует до одной
+  fallback-позиции из исходного текста, как при отказе всех слотов.
 - `draft` — сохраняется черновик с TTL 15 минут; элементы не создаются.
-  Черновик подтверждается/отменяется через `/captures/{id}/*`.
+  Черновик подтверждается/отменяется через `/captures/{id}/*`. Событие без
+  начала остаётся в черновике с уточнением даты.
 
 Созданные позиции получают `source`: `ha_voice` → `ha_voice`,
 `ha_automation` → `ha_automation`, `api` и `shortcut` → `api`.
@@ -1379,9 +1436,16 @@ Scope: `capture:write`. `Content-Type: application/json`. Лимит тела �
 Разбор ограничен 20 элементами. Если модель вернула больше, ответ —
 `status=rejected` (`200`), ничего не создаётся.
 
+Событие создаётся в списке `events`: явный `list_id` списка событий или список
+событий по умолчанию, если модель не назвала список. У `hint` нет значения
+`events`: список событий задаётся через `list_id` или пустым `list` в ответе
+модели.
+
 Fallback (`fallback=true`, `status=applied`): одна позиция из исходного
 текста, без срока/тегов/исполнителя. Список выбирается по `list_id`, затем
-`hint` (список по умолчанию типа), затем список задач по умолчанию. Работает
+`hint` (список по умолчанию типа), затем список задач по умолчанию. Список
+событий в fallback не используется: событие без начала создать нельзя,
+поэтому позиция уходит в список задач или в подсказанный тип. Работает
 в `auto`, если включён `CAPTURE_VOICE_FALLBACK_RAW` (по умолчанию `true`);
 имя настройки не ограничивает её источником `ha_voice`.
 
@@ -1399,10 +1463,12 @@ Fallback (`fallback=true`, `status=applied`): одна позиция из ис�
 | `422` | Битый JSON, неизвестное поле, пустой/длинный `text`, неверные `source`/`mode`/`hint`, неизвестный/чужой/архивный `list_id`, неверный `Idempotency-Key`, разные значения `Idempotency-Key` в заголовке и поле, тот же ключ с другим телом. |
 | `429` | Больше `CAPTURE_RATE_LIMIT_PER_MIN` (по умолчанию 10) запросов в минуту на токен, либо квота LLM исчерпана в `draft`. Всегда с `Retry-After`. |
 | `500` | Внутренняя ошибка/БД. |
-| `503` | LLM не настроена, сбой/таймаут LLM, открыт предохранитель или исчерпана квота, когда fallback запрещён. |
+| `503` | LLM не настроена, сбой/таймаут всех слотов, открыты предохранители или исчерпана квота, когда fallback запрещён. |
 
 Таймаут LLM: 8 секунд для `source=ha_voice` (`CAPTURE_VOICE_TIMEOUT_MS`),
-20 секунд для остальных. HTTP-таймаут клиента должен быть больше.
+20 секунд для остальных. Это общий бюджет разбора: он делится между
+основным и резервным слотом, каждый слот вызывается не больше одного раза.
+HTTP-таймаут клиента должен быть больше.
 
 #### Идемпотентность
 
@@ -1423,12 +1489,14 @@ Fallback (`fallback=true`, `status=applied`): одна позиция из ис�
 - Лимит частоты — скользящее окно 60 секунд на токен,
   `CAPTURE_RATE_LIMIT_PER_MIN` (по умолчанию 10, конфиг 1..1000).
   `429 rate_limited`, `Retry-After` — секунды до освобождения окна.
-- Квота LLM — `LLM_DAILY_QUOTA` (по умолчанию 200) вызовов на household за
-  скользящие 24 часа. При исчерпании:
+- Квота LLM — `LLM_DAILY_QUOTA` (по умолчанию 200) разборов на household за
+  скользящие 24 часа. Разбор, в котором вызывались оба слота, расходует одну
+  единицу; fallback без вызова LLM — ни одной. При исчерпании:
   - `auto` + fallback разрешён → `200` с `fallback=true`;
   - `auto` + fallback запрещён → `503 service_unavailable`;
   - `draft` → `429 rate_limited` с `Retry-After: 3600`.
-- LLM выключена/не настроена, предохранитель открыт, сбой или таймаут LLM:
+- LLM выключена/не настроена, предохранители слотов открыты, сбой или таймаут
+  всех слотов:
   - `auto` + fallback разрешён → `200` с `fallback=true`;
   - иначе → `503 service_unavailable`.
 

@@ -646,6 +646,160 @@ async fn events_migration_uses_a_free_name_when_calendar_is_taken() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn llm_slots_migration_applies_on_a_clean_database() {
+    let db = support::empty_db().await;
+    migrations::run(&db.pool)
+        .await
+        .expect("migrations should apply on a clean database");
+
+    let columns: Vec<(String, String)> = sqlx::query_as(
+        "SELECT column_name, is_nullable
+         FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'llm_runs'
+           AND column_name IN ('slot', 'attempt')
+         ORDER BY column_name",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("llm_runs columns");
+
+    assert_eq!(
+        columns,
+        vec![
+            ("attempt".to_owned(), "YES".to_owned()),
+            ("slot".to_owned(), "YES".to_owned()),
+        ],
+        "both columns must be nullable for rows written before 0018"
+    );
+
+    let check_columns: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT column_name, data_type, is_nullable
+         FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'llm_slot_checks'
+         ORDER BY ordinal_position",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("llm_slot_checks columns");
+    let names: Vec<&str> = check_columns
+        .iter()
+        .map(|(name, _, _)| name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "slot",
+            "fingerprint",
+            "fingerprint_parts",
+            "passed",
+            "total",
+            "p95_ms",
+            "report",
+            "checked_at",
+        ],
+        "llm_slot_checks must keep the fingerprint, the counters, p95 and the report"
+    );
+
+    let primary_key: Vec<String> = sqlx::query_scalar(
+        "SELECT a.attname
+         FROM pg_index i
+         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey)
+         WHERE i.indrelid = 'public.llm_slot_checks'::regclass AND i.indisprimary",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("llm_slot_checks primary key");
+    assert_eq!(
+        primary_key,
+        vec!["slot".to_owned()],
+        "one row per slot: the slot is the primary key"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn llm_slots_migration_keeps_existing_runs_without_a_slot() {
+    let db = support::empty_db().await;
+    let dir = std::env::temp_dir().join(format!(
+        "tasklerq-migrations-0018-{}",
+        Uuid::now_v7().simple()
+    ));
+    std::fs::create_dir_all(&dir).expect("temporary migration directory");
+    copy_migrations_through(17, &dir);
+
+    let before = Migrator::new(dir.as_path())
+        .await
+        .expect("a migrator through 0017 should resolve");
+    before
+        .run(&db.pool)
+        .await
+        .context("migrations through 0017 should apply")
+        .expect("migrations through 0017");
+
+    let (household_id, owner_id, _) = create_household_before_events(&db.pool).await;
+    for (source, mode, status) in [
+        ("telegram", "auto", "success"),
+        ("ha_voice", "draft", "failure"),
+    ] {
+        sqlx::query(
+            "INSERT INTO llm_runs (
+                 id, household_id, user_id, source, mode, prompt_version,
+                 status, error_code, latency_ms, input_tokens, output_tokens,
+                 created_at
+             )
+             VALUES ($1, $2, $3, $4::capture_source, $5::capture_mode, 'capture-v3',
+                     $6, NULL, 1200, 100, 20, now())",
+        )
+        .bind(Uuid::now_v7())
+        .bind(household_id)
+        .bind(owner_id)
+        .bind(source)
+        .bind(mode)
+        .bind(status)
+        .execute(&db.pool)
+        .await
+        .expect("llm run before 0018");
+    }
+
+    MIGRATOR
+        .run(&db.pool)
+        .await
+        .expect("0018 must apply over existing llm_runs rows");
+
+    let rows_with_slot: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM llm_runs WHERE slot IS NOT NULL OR attempt IS NOT NULL",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("old runs after the migration");
+    assert_eq!(
+        rows_with_slot, 0,
+        "rows written before 0018 must keep NULL slot and attempt"
+    );
+
+    let table_exists: bool =
+        sqlx::query_scalar("SELECT to_regclass('public.llm_slot_checks') IS NOT NULL")
+            .fetch_one(&db.pool)
+            .await
+            .expect("llm_slot_checks existence");
+    assert!(table_exists, "0018 must create llm_slot_checks");
+
+    sqlx::query(
+        "INSERT INTO llm_slot_checks (
+             slot, fingerprint, fingerprint_parts, passed, total, p95_ms,
+             report, checked_at
+         )
+         VALUES ('primary', 'abc', '{\"model\":\"m\"}'::jsonb, 20, 22, 3100,
+                 '{\"phrases\":[]}'::jsonb, now())",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("llm_slot_checks must accept a check result");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_migration_reports_its_version_rolls_back_and_blocks_readiness() {
     let db = support::empty_db().await;
     let dir = std::env::temp_dir().join(format!("tasklerq-migrations-{}", Uuid::now_v7().simple()));

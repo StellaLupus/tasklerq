@@ -9,8 +9,10 @@ mod tests;
 
 use std::fmt;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use serde::Serialize;
+use serde_json::{Map, Value};
 use thiserror::Error;
 use url::Url;
 
@@ -152,6 +154,21 @@ impl fmt::Display for SecretString {
     }
 }
 
+/// Адрес для журнала и `Debug`: без учётных данных, query и fragment.
+///
+/// Неразбираемый адрес заменяется заглушкой: в нём может оказаться секрет,
+/// который нельзя выводить.
+pub(crate) fn loggable_url(raw: &str) -> String {
+    let Ok(mut url) = Url::parse(raw) else {
+        return "<invalid url>".to_owned();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
+}
+
 /// Ошибка конфигурации. Сообщение содержит имя параметра, но не его значение.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigError {
@@ -280,17 +297,49 @@ pub struct CaptureConfig {
     pub max_text_chars: u32,
 }
 
-/// Параметры LLM-capture через Home Assistant.
+/// Параметры одного слота LLM: OpenAI-совместимый адрес и модель.
+#[derive(Clone)]
+pub struct SlotConfig {
+    /// Базовый адрес API, включая `/v1`.
+    pub url: Url,
+    /// Имя модели.
+    pub model: String,
+    /// Токен доступа; локальный слот работает без авторизации.
+    pub token: Option<SecretString>,
+    /// Таймаут одного запроса модели.
+    pub timeout: Duration,
+    /// Дополнительные параметры тела запроса из `LLM_*_EXTRA_JSON`.
+    pub extra: Map<String, Value>,
+}
+
+impl fmt::Debug for SlotConfig {
+    /// Печатает адрес без учётных данных и query, модель, признак токена и
+    /// только имена дополнительных параметров: их значения могут быть ключами
+    /// провайдера.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let extra_keys: Vec<&str> = self.extra.keys().map(String::as_str).collect();
+        formatter
+            .debug_struct("SlotConfig")
+            .field("url", &loggable_url(self.url.as_str()))
+            .field("model", &self.model)
+            .field("has_token", &self.token.is_some())
+            .field("timeout", &self.timeout)
+            .field("extra_keys", &extra_keys)
+            .finish()
+    }
+}
+
+/// Параметры LLM-capture: слоты, таймаут соединения и квота.
 #[derive(Clone, Debug)]
 pub struct LlmConfig {
     /// Включён ли разбор текста.
     pub enabled: bool,
-    /// Базовый URL Home Assistant.
-    pub base_url: Option<Url>,
-    /// Long-lived token Home Assistant.
-    pub token: Option<SecretString>,
-    /// Сущность AI Task.
-    pub ai_task_entity_id: Option<String>,
+    /// Основной слот; обязателен при включённом разборе.
+    pub primary: Option<SlotConfig>,
+    /// Резервный слот; настраивается целиком или отсутствует.
+    pub fallback: Option<SlotConfig>,
+    /// Таймаут установки соединения, общий для слотов.
+    pub connect_timeout: Duration,
     /// Суточная квота разборов на household.
     pub daily_quota: u32,
 }
@@ -299,7 +348,8 @@ impl LlmConfig {
     /// Загрузить только параметры LLM-capture из окружения.
     ///
     /// Нужно подкоманде `capture-eval`: остальная конфигурация сервиса ей не
-    /// требуется.
+    /// требуется. Слоты читаются и при `LLM_CAPTURE_ENABLED=false`: проверка
+    /// слота работает до включения разбора, если запрошенный слот задан.
     pub fn from_env() -> Result<Self, ConfigError> {
         Config::llm_config(&EnvSource::from_process())
     }
@@ -352,6 +402,9 @@ pub struct Config {
     pub capture: CaptureConfig,
     /// LLM-capture.
     pub llm: LlmConfig,
+    /// Заданные устаревшие переменные окружения (Home Assistant): они больше
+    /// не читаются, но и не мешают запуску.
+    pub deprecated_env: Vec<&'static str>,
     /// Очереди.
     pub queue: QueueConfig,
     /// Retention.
@@ -409,6 +462,7 @@ impl Config {
         };
 
         let llm = Self::llm_config(source)?;
+        let deprecated_env = deprecated_env(source);
 
         let queue = QueueConfig {
             max_attempts: source.u32("QUEUE_MAX_ATTEMPTS", 10, 1, 100)?,
@@ -437,6 +491,7 @@ impl Config {
             tenancy,
             capture,
             llm,
+            deprecated_env,
             queue,
             retention,
             log_filter,
@@ -545,33 +600,30 @@ impl Config {
 
     fn llm_config(source: &EnvSource) -> Result<LlmConfig, ConfigError> {
         let enabled = source.bool("LLM_CAPTURE_ENABLED", true)?;
-        let base_url = source.url("HA_BASE_URL", false)?;
-        let token = source.secret("HA_TOKEN");
-        let ai_task_entity_id = source.get("HA_AI_TASK_ENTITY_ID").map(ToOwned::to_owned);
+        let primary = read_slot(source, &PRIMARY_SLOT)?;
+        let fallback = read_slot(source, &FALLBACK_SLOT)?;
 
-        if enabled {
-            if base_url.is_none() {
-                return Err(ConfigError::Missing {
-                    name: "HA_BASE_URL",
-                });
-            }
-            if token.is_none() {
-                return Err(ConfigError::Missing { name: "HA_TOKEN" });
-            }
-            if ai_task_entity_id.is_none() {
-                return Err(ConfigError::Missing {
-                    name: "HA_AI_TASK_ENTITY_ID",
-                });
-            }
+        if enabled && primary.is_none() {
+            // Наполовину заданный слот уже дал бы ошибку с именем недостающей
+            // переменной, значит здесь не задано ничего.
+            return Err(ConfigError::Missing {
+                name: PRIMARY_SLOT.url,
+            });
         }
 
+        let connect_timeout = Duration::from_millis(u64::from(source.u32(
+            "LLM_CONNECT_TIMEOUT_MS",
+            1_000,
+            10,
+            60_000,
+        )?));
         let daily_quota = source.u32("LLM_DAILY_QUOTA", 200, 1, 100_000)?;
 
         Ok(LlmConfig {
             enabled,
-            base_url,
-            token,
-            ai_task_entity_id,
+            primary,
+            fallback,
+            connect_timeout,
             daily_quota,
         })
     }
@@ -580,11 +632,104 @@ impl Config {
     ///
     /// `SecretString` скрывает значения в `Debug`, поэтому печатать всю
     /// структуру безопасно и не нужно поддерживать отдельную копию полей.
+    /// Оставшиеся переменные Home Assistant дают предупреждение без значений:
+    /// это упрощает откат на предыдущий образ с тем же env-файлом.
     pub fn log_startup(&self) {
+        for name in &self.deprecated_env {
+            tracing::warn!(
+                variable = *name,
+                "environment variable is no longer used and can be removed"
+            );
+        }
         tracing::info!(
             version = VERSION,
             config = ?self,
             "configuration loaded"
         );
     }
+}
+
+/// Имена переменных одного слота LLM.
+struct SlotEnv {
+    url: &'static str,
+    model: &'static str,
+    token: &'static str,
+    timeout_ms: &'static str,
+    extra_json: &'static str,
+}
+
+const PRIMARY_SLOT: SlotEnv = SlotEnv {
+    url: "LLM_PRIMARY_URL",
+    model: "LLM_PRIMARY_MODEL",
+    token: "LLM_PRIMARY_TOKEN",
+    timeout_ms: "LLM_PRIMARY_TIMEOUT_MS",
+    extra_json: "LLM_PRIMARY_EXTRA_JSON",
+};
+
+const FALLBACK_SLOT: SlotEnv = SlotEnv {
+    url: "LLM_FALLBACK_URL",
+    model: "LLM_FALLBACK_MODEL",
+    token: "LLM_FALLBACK_TOKEN",
+    timeout_ms: "LLM_FALLBACK_TIMEOUT_MS",
+    extra_json: "LLM_FALLBACK_EXTRA_JSON",
+};
+
+/// Таймаут запроса слота по умолчанию, миллисекунды.
+const DEFAULT_SLOT_TIMEOUT_MS: u32 = 10_000;
+
+/// Переменные Home Assistant, которые больше не читаются.
+const LEGACY_ENV: [&str; 3] = ["HA_BASE_URL", "HA_TOKEN", "HA_AI_TASK_ENTITY_ID"];
+
+/// Прочитать слот: адрес и модель задаются только вместе.
+///
+/// Резервный слот настраивается целиком или отсутствует, поэтому половина
+/// пары — ошибка запуска с именем недостающей переменной. Основной слот при
+/// выключенном разборе не обязателен, но заданный так же проверяется.
+fn read_slot(source: &EnvSource, env: &SlotEnv) -> Result<Option<SlotConfig>, ConfigError> {
+    let url = source.url(env.url, false)?;
+    let model = source.get(env.model).map(ToOwned::to_owned);
+
+    match (url, model) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(ConfigError::Missing { name: env.url }),
+        (Some(_), None) => Err(ConfigError::Missing { name: env.model }),
+        (Some(url), Some(model)) => Ok(Some(SlotConfig {
+            url,
+            model,
+            token: source.secret(env.token),
+            timeout: Duration::from_millis(u64::from(source.u32(
+                env.timeout_ms,
+                DEFAULT_SLOT_TIMEOUT_MS,
+                100,
+                600_000,
+            )?)),
+            extra: extra_params(source, env.extra_json)?,
+        })),
+    }
+}
+
+/// Разобрать `LLM_*_EXTRA_JSON`: принимается только JSON-объект.
+///
+/// Текст ошибки называет переменную, но не повторяет её значение: в параметрах
+/// слота могут быть ключи провайдера.
+fn extra_params(source: &EnvSource, name: &'static str) -> Result<Map<String, Value>, ConfigError> {
+    let Some(raw) = source.get(name) else {
+        return Ok(Map::new());
+    };
+
+    match serde_json::from_str::<Value>(raw) {
+        Ok(Value::Object(extra)) => Ok(extra),
+        _ => Err(ConfigError::invalid(
+            name,
+            "expected a JSON object, for example {\"reasoning\":{\"effort\":\"minimal\"}}",
+        )),
+    }
+}
+
+/// Список заданных переменных, которые сервис больше не читает.
+fn deprecated_env(source: &EnvSource) -> Vec<&'static str> {
+    LEGACY_ENV
+        .into_iter()
+        .filter(|name| source.get(name).is_some())
+        .collect()
 }

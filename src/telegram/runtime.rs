@@ -7,10 +7,9 @@ use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 use url::Url;
 
-use crate::capture::breaker::CircuitBreaker;
 use crate::config::{Config, LlmConfig, TelegramMode};
-use crate::home_assistant::{AiTask, HttpAiTask};
 use crate::jobs::scheduler::Scheduler;
+use crate::llm::Chain;
 use crate::security_audit::Audit;
 
 use super::api::{DEFAULT_BASE_URL, HttpTelegramApi, TelegramApi};
@@ -42,11 +41,10 @@ pub async fn start(
     config: &Config,
     pool: &PgPool,
     shutdown: watch::Receiver<bool>,
-    ai: Option<Arc<dyn AiTask>>,
-    breaker: Arc<CircuitBreaker>,
+    llm: Option<Arc<Chain>>,
     audit: Audit,
 ) -> Result<Option<Runtime>, StartError> {
-    start_with_update_limit(config, pool, shutdown, ai, breaker, audit, None).await
+    start_with_update_limit(config, pool, shutdown, llm, audit, None).await
 }
 
 /// Запустить Telegram-часть с явным лимитом обновлений на пользователя.
@@ -57,8 +55,7 @@ pub async fn start_with_update_limit(
     config: &Config,
     pool: &PgPool,
     shutdown: watch::Receiver<bool>,
-    ai: Option<Arc<dyn AiTask>>,
-    breaker: Arc<CircuitBreaker>,
+    llm: Option<Arc<Chain>>,
     audit: Audit,
     update_limit: Option<u32>,
 ) -> Result<Option<Runtime>, StartError> {
@@ -105,19 +102,18 @@ pub async fn start_with_update_limit(
     }
 
     let bot = Bot::new(telegram.bot_username.clone())
-        .with_llm_capture(ai.is_some())
+        .with_llm_capture(llm.is_some())
         .with_tenancy_config(config.tenancy)
         .with_audit(audit.clone());
-    if let Some(ai) = ai {
+    if let Some(llm) = llm {
         let capture = CaptureWorker::new(
             pool.clone(),
-            ai,
+            llm,
             bot.clone(),
             wake_outbox.clone(),
             audit.clone(),
         )
-        .with_quota(config.llm.daily_quota)
-        .with_breaker(breaker);
+        .with_quota(config.llm.daily_quota);
         tasks.push(tokio::spawn(capture.run(shutdown.clone())));
     }
     let updates = UpdateWorker::new(
@@ -140,23 +136,19 @@ pub async fn start_with_update_limit(
     Ok(Some(Runtime { ingress, tasks }))
 }
 
-/// Клиент Home Assistant для разбора текста; `None`, если разбор выключен или
-/// настроен неверно (тогда свободный текст идёт в быстрое добавление).
-pub fn build_ai(llm: &LlmConfig) -> Option<Arc<dyn AiTask>> {
-    if !llm.enabled {
-        return None;
-    }
-    let (Some(url), Some(token), Some(entity)) =
-        (&llm.base_url, &llm.token, &llm.ai_task_entity_id)
-    else {
-        return None;
-    };
-    match HttpAiTask::new(url.as_str(), token.clone(), entity) {
-        Ok(client) => Some(Arc::new(client)),
+/// Клиент разбора текста; `None`, если разбор выключен.
+///
+/// Ошибка построения бэкенда не роняет сервис: слоты не настроены — разбор
+/// выключен, а свободный текст идёт в быстрое добавление. Текст предупреждения
+/// не содержит адрес и токен слота.
+pub fn build_llm(llm: &LlmConfig) -> Option<Arc<Chain>> {
+    match Chain::from_config(llm) {
+        Ok(Some(chain)) => Some(Arc::new(chain)),
+        Ok(None) => None,
         Err(error) => {
             tracing::warn!(
                 error = error.code(),
-                "LLM capture is disabled: bad HA settings"
+                "LLM capture is disabled: slot configuration is invalid"
             );
             None
         }
@@ -165,18 +157,47 @@ pub fn build_ai(llm: &LlmConfig) -> Option<Arc<dyn AiTask>> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use serde_json::Map;
+
     use super::*;
-    use crate::config::SecretString;
+    use crate::config::{SecretString, SlotConfig};
+
+    fn slot() -> SlotConfig {
+        SlotConfig {
+            url: "http://127.0.0.1:8080/v1".parse().expect("url"),
+            model: "local/model".to_owned(),
+            token: Some(SecretString::new("token")),
+            timeout: Duration::from_secs(10),
+            extra: Map::new(),
+        }
+    }
 
     #[test]
-    fn disabled_llm_capture_builds_no_client() {
+    fn disabled_llm_capture_builds_no_chain() {
         let llm = LlmConfig {
             enabled: false,
-            base_url: Some("http://127.0.0.1:8123".parse().expect("url")),
-            token: Some(SecretString::new("token")),
-            ai_task_entity_id: Some("ai_task.google_ai_task_2".into()),
+            primary: Some(slot()),
+            fallback: None,
+            connect_timeout: Duration::from_millis(1000),
             daily_quota: 200,
         };
-        assert!(build_ai(&llm).is_none());
+        assert!(build_llm(&llm).is_none());
+    }
+
+    #[test]
+    fn configured_slots_build_a_chain() {
+        let llm = LlmConfig {
+            enabled: true,
+            primary: Some(slot()),
+            fallback: Some(slot()),
+            connect_timeout: Duration::from_millis(1000),
+            daily_quota: 200,
+        };
+
+        let chain = build_llm(&llm).expect("configured slots build a chain");
+        assert_eq!(chain.primary().name(), "primary");
+        assert_eq!(chain.fallback().map(|slot| slot.name()), Some("fallback"));
     }
 }

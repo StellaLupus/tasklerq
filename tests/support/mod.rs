@@ -2,6 +2,7 @@
 
 #![allow(dead_code)]
 
+pub mod llm;
 pub mod logs;
 pub mod notifications;
 pub mod telegram;

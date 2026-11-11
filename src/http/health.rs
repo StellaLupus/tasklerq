@@ -23,9 +23,10 @@ pub struct HealthResponse {
     /// Время проверки в UTC.
     pub time: DateTime<Utc>,
     /// Необязательные предупреждения о деградации; поле отсутствует, когда их
-    /// нет.
+    /// нет. Имена предупреждений фиксированы: `multiple_households`,
+    /// `llm_unavailable`, `llm_slot_unverified:<slot>`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub warnings: Option<Vec<&'static str>>,
+    pub warnings: Option<Vec<String>>,
 }
 
 /// `GET /health/live`: процесс отвечает.
@@ -63,7 +64,7 @@ pub async fn ready(State(state): State<AppState>) -> Result<Json<HealthResponse>
     }
 
     let now = Utc::now();
-    let mut warnings = None;
+    let mut warnings: Vec<String> = Vec::new();
     // Очередь и счёт household делят одно соединение. Счёт идёт после проверки
     // очереди: при 503 из-за лага он уже не нужен.
     if state.queue_lag_limit.is_some() || state.tenancy_mode == TenancyMode::Single {
@@ -95,7 +96,21 @@ pub async fn ready(State(state): State<AppState>) -> Result<Json<HealthResponse>
                 ApiError::service_unavailable("Database is unavailable")
             })?;
             if active > 1 {
-                warnings = Some(vec!["multiple_households"]);
+                warnings.push("multiple_households".to_owned());
+            }
+        }
+    }
+
+    // Статус слотов LLM — предупреждение, а не отказ: без LLM сервис работает с
+    // деградацией, и падение readiness вывело бы из работы то, что от него не
+    // зависит.
+    if let Some(llm_slots) = &state.llm_slots {
+        if llm_slots.all_breakers_open(now) {
+            warnings.push("llm_unavailable".to_owned());
+        }
+        for report in llm_slots.statuses(&state.pool, now).await {
+            if !report.status.is_passed() {
+                warnings.push(format!("llm_slot_unverified:{}", report.slot));
             }
         }
     }
@@ -104,6 +119,6 @@ pub async fn ready(State(state): State<AppState>) -> Result<Json<HealthResponse>
         status: "ok",
         version: VERSION,
         time: now,
-        warnings,
+        warnings: (!warnings.is_empty()).then_some(warnings),
     }))
 }

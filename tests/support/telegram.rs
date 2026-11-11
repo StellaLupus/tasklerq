@@ -359,6 +359,7 @@ pub struct Harness {
     pub chat: i64,
     pub now: DateTime<Utc>,
     skew: Duration,
+    frozen: bool,
     pub name: String,
     screen_id: Option<i64>,
     updates: UpdateWorker,
@@ -396,6 +397,7 @@ impl Harness {
             chat: telegram_id,
             now: Utc::now(),
             skew: Duration::zero(),
+            frozen: false,
             name: "Alice".to_owned(),
             screen_id: None,
             updates: UpdateWorker::new(
@@ -421,19 +423,37 @@ impl Harness {
 
     /// Сдвинуть время стенда вперёд относительно реального.
     pub fn advance(&mut self, by: Duration) {
-        self.skew += by;
-        self.tick();
+        if self.frozen {
+            self.now += by;
+        } else {
+            self.skew += by;
+            self.tick();
+        }
     }
 
     /// Поставить время стенда на заданный момент.
     pub fn set_now(&mut self, at: DateTime<Utc>) {
+        self.frozen = false;
         self.skew = at - Utc::now();
         self.tick();
     }
 
+    /// Заморозить часы стенда на заданном моменте.
+    ///
+    /// `now` перестаёт следовать за реальным временем и меняется только через
+    /// [`Self::advance`]. Нужно тестам, которые проверяют точное время,
+    /// вычисленное обработчиком от «сейчас»: иначе между нажатиями проходит
+    /// реальная секунда и ожидание уезжает.
+    pub fn freeze_at(&mut self, at: DateTime<Utc>) {
+        self.now = at;
+        self.frozen = true;
+    }
+
     /// Время стенда следует за реальным плюс накопленный сдвиг.
     fn tick(&mut self) {
-        self.now = Utc::now() + self.skew;
+        if !self.frozen {
+            self.now = Utc::now() + self.skew;
+        }
     }
 
     fn update_id(&mut self) -> i64 {
