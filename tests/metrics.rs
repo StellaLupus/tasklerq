@@ -13,9 +13,12 @@ use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{HeaderMap, Method, Request, StatusCode};
 use chrono::{DateTime, Duration, Utc};
 use http_body_util::BodyExt;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sqlx::PgConnection;
-use tasklerq::config::{CaptureConfig, SecretString};
+use tasklerq::capture::prompt;
+use tasklerq::capture::slot_check;
+use tasklerq::capture::slot_status::LlmSlotHealth;
+use tasklerq::config::{CaptureConfig, LlmConfig, SecretString, SlotConfig};
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
 use tasklerq::llm::{
@@ -23,6 +26,7 @@ use tasklerq::llm::{
     SystemClock,
 };
 use tasklerq::security_audit::Audit;
+use tasklerq::storage::repositories::llm_slot_checks::{self, NewCheck};
 use tasklerq::telegram::api::TelegramError;
 use tasklerq::telegram::bot::{Bot, Outcome};
 use tasklerq::telegram::capture_worker::{CaptureWorker, Pass as CapturePass};
@@ -638,6 +642,78 @@ async fn chain_reports_llm_metrics_with_slot_labels() {
     assert!(
         after.contains("llm_latency_seconds_bucket{slot=\"metrics-test-fallback\",le=\""),
         "{after}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn llm_slot_verified_is_one_only_for_a_passed_slot() {
+    let db = support::isolated_db().await;
+    let primary = SlotConfig {
+        url: "https://api.example.test/v1".parse().expect("url"),
+        model: "vendor/primary".to_owned(),
+        token: Some(SecretString::new("SECRET-slot-token")),
+        timeout: StdDuration::from_secs(10),
+        extra: Map::new(),
+    };
+    let chain = support::llm::chain(
+        support::llm::BackendDouble::always(Ok(support::llm::v4::response(vec![]))),
+        None,
+    );
+    let llm = LlmConfig {
+        enabled: true,
+        primary: Some(primary.clone()),
+        fallback: None,
+        connect_timeout: StdDuration::from_millis(1_000),
+        daily_quota: 200,
+    };
+    let health = LlmSlotHealth::new(Arc::new(chain), &llm).expect("llm health");
+    let now = Utc::now();
+
+    // Нет строки проверки — слот не прошёл.
+    health.refresh(&db.pool, now).await.expect("refresh");
+    assert_eq!(
+        metric_value(
+            &tasklerq::metrics::render(),
+            "llm_slot_verified{slot=\"primary\"}"
+        ),
+        Some(0.0),
+        "an unchecked slot must be 0"
+    );
+
+    let fingerprint = slot_check::fingerprint(
+        &primary,
+        &prompt::contract_hash(),
+        &slot_check::set_hash(slot_check::BUILTIN_SET),
+    );
+    let parts = fingerprint.parts.to_json();
+    let report = json!({"total": 22, "passed": 22});
+    let mut conn = db.pool.acquire().await.expect("connection");
+    llm_slot_checks::upsert(
+        &mut conn,
+        NewCheck {
+            slot: "primary",
+            fingerprint: &fingerprint.value,
+            fingerprint_parts: &parts,
+            passed: 22,
+            total: 22,
+            p95_ms: 1_000,
+            report: &report,
+        },
+        now,
+    )
+    .await
+    .expect("slot check should be stored");
+    drop(conn);
+
+    health.invalidate();
+    health.refresh(&db.pool, now).await.expect("refresh");
+    assert_eq!(
+        metric_value(
+            &tasklerq::metrics::render(),
+            "llm_slot_verified{slot=\"primary\"}"
+        ),
+        Some(1.0),
+        "a passed slot must be 1"
     );
 }
 

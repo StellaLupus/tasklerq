@@ -12,6 +12,7 @@ pub mod prompt;
 pub mod render;
 pub mod schema;
 pub mod slot_check;
+pub mod slot_status;
 pub mod validate;
 pub mod wire;
 

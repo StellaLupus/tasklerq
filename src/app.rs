@@ -8,6 +8,7 @@ use sqlx::PgPool;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use crate::capture::slot_status::{LlmSlotHealth, SlotStatus, SlotStatusReport};
 use crate::config::{Config, TelegramMode, TenancyMode};
 use crate::http::api::capture::CaptureState;
 use crate::http::router::{AppState, build_router};
@@ -52,6 +53,14 @@ pub async fn build_application_with_update_limit(
     warn_if_multiple_households(config, &pool).await;
 
     let llm = runtime::build_llm(&config.llm);
+    let llm_slots = llm
+        .as_ref()
+        .and_then(|chain| LlmSlotHealth::new(chain.clone(), &config.llm))
+        .map(std::sync::Arc::new);
+    if let Some(health) = &llm_slots {
+        warn_if_llm_slots_unverified(health, &pool).await;
+    }
+
     // Один журнал событий на процесс: вебхук, воркеры, бот и capture-воркер
     // делят состояние подавления и счётчики отказов.
     let audit = Audit::new(pool.clone());
@@ -66,6 +75,9 @@ pub async fn build_application_with_update_limit(
     .await?;
 
     let mut state = AppState::new(pool.clone(), audit).with_tenancy_mode(config.tenancy.mode);
+    if let Some(health) = llm_slots {
+        state = state.with_llm_slots(health);
+    }
     let mut workers = Vec::new();
     if let Some(runtime) = telegram {
         if let Some(ingress) = runtime.ingress {
@@ -136,6 +148,54 @@ async fn warn_if_multiple_households(config: &Config, pool: &PgPool) {
                 error = %error,
                 "could not count active households at startup"
             );
+        }
+    }
+}
+
+/// Записать в лог статус проверки каждого настроенного слота LLM.
+///
+/// Статус не блокирует работу: предупреждение помогает заметить непроверенный
+/// или устаревший слот до первых разборов. Ошибка чтения базы — тоже только
+/// предупреждение. В строках нет адреса, модели и токена: только имя слота и
+/// статус.
+async fn warn_if_llm_slots_unverified(health: &LlmSlotHealth, pool: &PgPool) {
+    match health.refresh(pool, chrono::Utc::now()).await {
+        Ok(statuses) => log_llm_slot_statuses(&statuses),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "could not read llm slot check status at startup"
+            );
+        }
+    }
+}
+
+fn log_llm_slot_statuses(statuses: &[SlotStatusReport]) {
+    for report in statuses {
+        match report.status {
+            SlotStatus::Passed => {
+                tracing::info!(
+                    slot = report.slot,
+                    status = report.status.code(),
+                    "llm slot passed the smoke-set check"
+                );
+            }
+            SlotStatus::Failed { passed, total } => {
+                tracing::warn!(
+                    slot = report.slot,
+                    status = report.status.code(),
+                    passed,
+                    total,
+                    "llm slot check has not passed; capture keeps working with this slot"
+                );
+            }
+            other => {
+                tracing::warn!(
+                    slot = report.slot,
+                    status = other.code(),
+                    "llm slot check has not passed; capture keeps working with this slot"
+                );
+            }
         }
     }
 }

@@ -111,6 +111,14 @@ pub fn llm_latency(slot: &'static str, seconds: f64) {
     observe("llm_latency_seconds", &[("slot", slot)], seconds.max(0.0));
 }
 
+/// Слот прошёл проверку smoke-набором: 1 — статус «прошёл», 0 — любой другой.
+pub fn llm_slot_verified(slot: &'static str, verified: bool) {
+    let value = if verified { 1.0 } else { 0.0 };
+    lock()
+        .gauges
+        .insert(key("llm_slot_verified", &[("slot", slot)]), value);
+}
+
 /// Ответ LLM не прошёл разбор схемы.
 pub fn llm_validation_failure() {
     add_counter("llm_validation_failures_total", &[]);
@@ -275,6 +283,7 @@ fn help(name: &str) -> &'static str {
         "capture_fallback_total" => "Captures created from raw text without the LLM.",
         "llm_requests_total" => "LLM slot capture requests by slot and outcome.",
         "llm_latency_seconds" => "LLM slot capture request latency by slot.",
+        "llm_slot_verified" => "LLM slot passed the latest smoke-set check (1) or not (0).",
         "llm_validation_failures_total" => "LLM responses rejected by schema validation.",
         "http_requests_total" => "HTTP requests by matched route template and status.",
         "db_pool_in_use" => "Database pool connections currently checked out.",

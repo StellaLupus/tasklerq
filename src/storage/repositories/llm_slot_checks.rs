@@ -8,6 +8,17 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::PgConnection;
 
+/// Сохранённый результат проверки слота, нужный для статуса.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredCheck {
+    /// Отпечаток конфигурации, контракта и набора на момент проверки.
+    pub fingerprint: String,
+    /// Сколько фраз пройдено.
+    pub passed: i32,
+    /// Сколько фраз всего.
+    pub total: i32,
+}
+
 /// Результат проверки слота.
 #[derive(Debug, Clone, Copy)]
 pub struct NewCheck<'a> {
@@ -25,6 +36,26 @@ pub struct NewCheck<'a> {
     pub p95_ms: u64,
     /// Отчёт проверки в JSON.
     pub report: &'a Value,
+}
+
+/// Последняя проверка слота; `None`, если слот ещё не проверялся.
+///
+/// `checked_at` не читается: статус зависит только от отпечатка и числа
+/// пройденных фраз, а срок давности проверки в требованиях не задан.
+pub async fn latest(
+    conn: &mut PgConnection,
+    slot: &str,
+) -> Result<Option<StoredCheck>, sqlx::Error> {
+    let row: Option<(String, i32, i32)> =
+        sqlx::query_as("SELECT fingerprint, passed, total FROM llm_slot_checks WHERE slot = $1")
+            .bind(slot)
+            .fetch_optional(conn)
+            .await?;
+    Ok(row.map(|(fingerprint, passed, total)| StoredCheck {
+        fingerprint,
+        passed,
+        total,
+    }))
 }
 
 /// Записать результат проверки, заменив предыдущий для этого слота.

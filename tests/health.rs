@@ -2,19 +2,26 @@
 
 mod support;
 
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use axum::Router;
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{Method, Request, StatusCode};
 use chrono::{DateTime, Utc};
 use http_body_util::BodyExt;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sqlx::PgPool;
 use tasklerq::app::build_application;
-use tasklerq::config::{Config, TenancyMode};
+use tasklerq::capture::prompt;
+use tasklerq::capture::slot_check;
+use tasklerq::capture::slot_status::LlmSlotHealth;
+use tasklerq::config::{CaptureConfig, Config, LlmConfig, SecretString, SlotConfig, TenancyMode};
+use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
+use tasklerq::llm::Chain;
 use tasklerq::security_audit::Audit;
+use tasklerq::storage::repositories::llm_slot_checks::{self, NewCheck};
 use tokio::sync::watch;
 use tower::ServiceExt;
 
@@ -47,6 +54,81 @@ async fn get(app: &Router, uri: &str) -> (StatusCode, Value) {
         .to_bytes();
     let body = serde_json::from_slice(&bytes).expect("JSON");
     (status, body)
+}
+
+fn slot_config(model: &str) -> SlotConfig {
+    SlotConfig {
+        url: "https://api.example.test/v1".parse().expect("url"),
+        model: model.to_owned(),
+        token: Some(SecretString::new("SECRET-slot-token")),
+        timeout: StdDuration::from_secs(10),
+        extra: Map::new(),
+    }
+}
+
+/// Цепочка из двойников и состояние проверки слотов для readiness.
+fn llm_health(
+    primary: &SlotConfig,
+    fallback: Option<&SlotConfig>,
+) -> (Arc<Chain>, Arc<LlmSlotHealth>) {
+    let answer = || {
+        support::llm::BackendDouble::always(Ok(support::llm::v4::response(vec![
+            support::llm::v4::shopping("Молоко"),
+        ])))
+    };
+    let chain = Arc::new(support::llm::chain(answer(), fallback.map(|_| answer())));
+    let llm = LlmConfig {
+        enabled: true,
+        primary: Some(primary.clone()),
+        fallback: fallback.cloned(),
+        connect_timeout: StdDuration::from_millis(1_000),
+        daily_quota: 200,
+    };
+    let health = Arc::new(LlmSlotHealth::new(chain.clone(), &llm).expect("llm health"));
+    (chain, health)
+}
+
+async fn store_check(pool: &PgPool, slot: &str, config: &SlotConfig, passed: usize, total: usize) {
+    let fingerprint = slot_check::fingerprint(
+        config,
+        &prompt::contract_hash(),
+        &slot_check::set_hash(slot_check::BUILTIN_SET),
+    );
+    let parts = fingerprint.parts.to_json();
+    let report = json!({"total": total, "passed": passed});
+    let mut conn = pool.acquire().await.expect("connection");
+    llm_slot_checks::upsert(
+        &mut conn,
+        NewCheck {
+            slot,
+            fingerprint: &fingerprint.value,
+            fingerprint_parts: &parts,
+            passed,
+            total,
+            p95_ms: 1_000,
+            report: &report,
+        },
+        Utc::now(),
+    )
+    .await
+    .expect("slot check should be stored");
+}
+
+async fn ready_with_llm(pool: &PgPool, health: Arc<LlmSlotHealth>) -> (StatusCode, Value) {
+    let state = AppState::new(pool.clone(), Audit::new(pool.clone()))
+        .with_tenancy_mode(TenancyMode::Single)
+        .with_llm_slots(health);
+    get(&build_router(state), "/health/ready").await
+}
+
+fn capture_config() -> CaptureConfig {
+    CaptureConfig {
+        enabled: true,
+        voice_timeout_ms: 8_000,
+        voice_fallback_raw: false,
+        rate_limit_per_min: 10,
+        max_text_chars: 2_000,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -240,5 +322,180 @@ async fn production_build_wires_the_tenancy_mode_into_readiness() {
                 .expect("worker must stop on shutdown")
                 .expect("worker task must join");
         }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_llm_slots_unavailable_is_a_warning_not_a_failure() {
+    let db = support::isolated_db().await;
+    let primary = slot_config("vendor/primary");
+    let fallback = slot_config("vendor/fallback");
+    let (chain, health) = llm_health(&primary, Some(&fallback));
+    store_check(&db.pool, "primary", &primary, 22, 22).await;
+    store_check(&db.pool, "fallback", &fallback, 22, 22).await;
+    let now = Utc::now();
+    support::llm::open_primary(&chain, now);
+    support::llm::open_fallback(&chain, now);
+
+    let (status, body) = ready_with_llm(&db.pool, health).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["warnings"], json!(["llm_unavailable"]), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unchecked_primary_slot_is_reported_in_readiness() {
+    let db = support::isolated_db().await;
+    let primary = slot_config("vendor/primary");
+    let (_chain, health) = llm_health(&primary, None);
+
+    let (status, body) = ready_with_llm(&db.pool, health).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["warnings"],
+        json!(["llm_slot_unverified:primary"]),
+        "{body}"
+    );
+    let response = body.to_string();
+    assert!(!response.contains("vendor/primary"), "{response}");
+    assert!(!response.contains("api.example.test"), "{response}");
+    assert!(!response.contains("SECRET-slot-token"), "{response}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unchecked_slot_does_not_block_capture() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = support::issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let primary = slot_config("vendor/primary");
+    let (chain, health) = llm_health(&primary, None);
+    let state = AppState::new(db.pool.clone(), Audit::new(db.pool.clone()))
+        .with_tenancy_mode(TenancyMode::Single)
+        .with_llm_slots(health)
+        .with_capture(CaptureState::new(capture_config(), Some(chain), 200));
+    let app = build_router(state);
+
+    let (status, body) = support::request(
+        &app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(json!({"text": "Молоко", "source": "api", "mode": "auto"})),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "applied", "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_passed_slot_has_no_readiness_warning() {
+    let db = support::isolated_db().await;
+    let primary = slot_config("vendor/primary");
+    let (_chain, health) = llm_health(&primary, None);
+    store_check(&db.pool, "primary", &primary, 22, 22).await;
+
+    let (status, body) = ready_with_llm(&db.pool, health).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.get("warnings").is_none(),
+        "a passed slot must not warn:\n{body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_readiness_status_is_cached_for_a_minute() {
+    let db = support::isolated_db().await;
+    let primary = slot_config("vendor/primary");
+    let (_chain, health) = llm_health(&primary, None);
+    store_check(&db.pool, "primary", &primary, 22, 22).await;
+
+    let (status, body) = ready_with_llm(&db.pool, health.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.get("warnings").is_none(), "{body}");
+
+    // Проверка изменилась, но readiness ещё смотрит в кеш.
+    store_check(&db.pool, "primary", &primary, 17, 22).await;
+    let (status, body) = ready_with_llm(&db.pool, health.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.get("warnings").is_none(),
+        "the cached status must hide the new row:\n{body}"
+    );
+
+    // Явный сброс кеша заменяет ожидание минуты.
+    health.invalidate();
+    let (status, body) = ready_with_llm(&db.pool, health).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["warnings"],
+        json!(["llm_slot_unverified:primary"]),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn startup_warns_about_an_unchecked_primary_slot_without_secrets() {
+    let db = support::isolated_db().await;
+    let database_url = support::database_url().await;
+    let config = Config::from_map([
+        ("ENV", "development"),
+        ("PUBLIC_BASE_URL", "http://127.0.0.1:18080"),
+        ("DATABASE_URL", database_url.as_str()),
+        ("TELEGRAM_MODE", "disabled"),
+        ("TENANCY_MODE", "single"),
+        ("LLM_CAPTURE_ENABLED", "true"),
+        ("LLM_PRIMARY_URL", "https://api.example.test/v1"),
+        ("LLM_PRIMARY_MODEL", "vendor/primary"),
+        ("LLM_PRIMARY_TOKEN", "SECRET-slot-token"),
+    ])
+    .expect("test config should be valid");
+
+    // current_thread: подписчик `set_default` живёт на потоке теста, и все
+    // записи старта попадают в буфер.
+    let logs = support::logs::LogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(logs.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let application = build_application(&config, db.pool.clone(), shutdown_rx)
+        .await
+        .expect("an unchecked slot must not stop startup");
+
+    let (status, body) = get(&application.router, "/health/ready").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["warnings"],
+        json!(["llm_slot_unverified:primary"]),
+        "{body}"
+    );
+
+    let text = logs.contents();
+    assert!(
+        text.contains("primary"),
+        "the slot name is missing:\n{text}"
+    );
+    assert!(
+        text.contains("unverified"),
+        "the status is missing:\n{text}"
+    );
+    assert!(!text.contains("SECRET-slot-token"), "token leaked:\n{text}");
+    assert!(
+        !text.contains("api.example.test"),
+        "slot address leaked:\n{text}"
+    );
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    for worker in application.workers {
+        tokio::time::timeout(StdDuration::from_secs(5), worker)
+            .await
+            .expect("worker must stop on shutdown")
+            .expect("worker task must join");
     }
 }

@@ -10,6 +10,7 @@ use super::error::ApiError;
 use super::health;
 use super::metrics;
 use super::middleware::request_id;
+use crate::capture::slot_status::LlmSlotHealth;
 use crate::config::TenancyMode;
 use crate::security_audit::Audit;
 use crate::telegram::webhook::{self, Ingress};
@@ -31,6 +32,8 @@ pub struct AppState {
     pub tenancy_mode: TenancyMode,
     /// Внешний capture; `None`, если маршрут выключен.
     pub capture: Option<CaptureState>,
+    /// Статус проверки слотов LLM; `None`, если разбор выключен.
+    pub llm_slots: Option<std::sync::Arc<LlmSlotHealth>>,
 }
 
 impl AppState {
@@ -47,12 +50,19 @@ impl AppState {
             queue_lag_limit: None,
             tenancy_mode: TenancyMode::Single,
             capture: None,
+            llm_slots: None,
         }
     }
 
     /// Включить `POST /api/v1/capture`.
     pub fn with_capture(mut self, capture: CaptureState) -> Self {
         self.capture = Some(capture);
+        self
+    }
+
+    /// Включить проверку статуса слотов в `/health/ready`.
+    pub fn with_llm_slots(mut self, llm_slots: std::sync::Arc<LlmSlotHealth>) -> Self {
+        self.llm_slots = Some(llm_slots);
         self
     }
 
