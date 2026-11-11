@@ -15,8 +15,10 @@ Tasklerq — семейный сервис, который работает на
 Сервис не является SaaS: по умолчанию один экземпляр обслуживает один household
 (семью), режим `TENANCY_MODE=multi` допускает несколько. Данные хранятся в
 PostgreSQL, который уже есть на сервере пользователя.
-LLM-разбор выполняет Home Assistant через `ai_task.generate_data` (сейчас
-Claude Haiku 5.5 через OpenRouter); Tasklerq не вызывает LLM напрямую. Задачу можно создать из Telegram
+LLM-разбор выполняет сам Tasklerq: текст уходит по OpenAI-совместимому API в
+основной и необязательный резервный слот (например, Claude Haiku 5.5 через
+OpenRouter или локальный llama.cpp). Home Assistant в разборе не участвует:
+он передаёт текст голосовой команды и получает готовый `speech`. Задачу можно создать из Telegram
 или без него — голосом, автоматизацией или прямым HTTP-запросом.
 
 ### Ограничения
@@ -28,7 +30,7 @@ Claude Haiku 5.5 через OpenRouter); Tasklerq не вызывает LLM на
 | Telegram webhook | Нужен публичный HTTPS и reverse proxy. |
 | RichMessage — молодой API | Собственный адаптер и contract-тесты. |
 | HA Container | Custom component, без add-on/ingress. |
-| LLM через HA | LLM-клиент — HA REST, не прямой API. |
+| LLM через OpenAI-совместимый API | Основной и резервный слоты; Home Assistant AI Task не используется. |
 | Capture без Telegram | Отдельный API, HA-сервис и auto-режим; бот не обязателен. |
 | Семейный масштаб | Монолит, один экземпляр, без шардирования. |
 
@@ -38,7 +40,7 @@ Claude Haiku 5.5 через OpenRouter); Tasklerq не вызывает LLM на
 flowchart TB
     subgraph Internet
         TG[Telegram Bot API]
-        GEM[OpenRouter → Claude Haiku]
+        LLM[OpenRouter / локальный llama.cpp<br/>OpenAI-совместимый API]
     end
 
     subgraph Host["Synology NAS 192.168.1.10"]
@@ -56,8 +58,7 @@ flowchart TB
     APP -->|sendRichMessage| TG
     APP -->|REST snapshot/write| HAC
     HAC -->|todo/calendar| HA
-    APP -->|ai_task.generate_data| HA
-    HA -->|structured prompt| GEM
+    APP -->|chat/completions| LLM
     APP -->|SQL| DB
 ```
 
@@ -67,7 +68,7 @@ flowchart TB
 | **Telegram adapter** | RichMessage, вызовы Bot API | reqwest, teloxide-core types |
 | **PostgreSQL** | Source of truth, очередь обновлений, outbox, черновики | PostgreSQL 18 (`postgres:18-alpine`) |
 | **HA custom component** | Мост между REST API и сущностями HA | Python, aiohttp, HA integration |
-| **HA AI Task** | Структурированный вызов LLM (Claude Haiku 5.5 через OpenRouter) | `ai_task.anthropic_claude_haiku_5_5`, `ai_task.generate_data` |
+| **LLM slots** | Разбор текста через OpenAI-совместимый API: основной и необязательный резервный эндпоинты | `src/llm/`, reqwest, JSON Schema `response_format` |
 | **Reverse proxy** | TLS, публикация webhook | Synology DSM Reverse Proxy |
 
 ## 3. Потоки данных
@@ -112,17 +113,14 @@ sequenceDiagram
     participant U as Пользователь
     participant B as Bot
     participant C as Capture service
-    participant HA as Home Assistant
-    participant LLM as LLM (OpenRouter)
+    participant L as Слоты LLM
     participant DB as PostgreSQL
 
     U->>B: «завтра купить молоко и позвонить маме»
     B->>C: raw text + household context
-    C->>HA: ai_task.generate_data(structure)
-    HA->>LLM: prompt + schema
-    LLM-->>HA: structured JSON
-    HA-->>C: data
-    C->>C: schema + domain validation
+    C->>L: chat/completions (основной, при отказе — резервный)
+    L-->>C: structured JSON по схеме
+    C->>C: wire + dates + domain validation
     alt valid
         C->>DB: INSERT capture_draft (TTL 15 min)
         C-->>B: draft card + buttons
@@ -146,13 +144,13 @@ sequenceDiagram
     participant A as HA Assist / automation
     participant S as tasklerq.capture
     participant C as Capture service
-    participant HA as AI Task
+    participant L as Слоты LLM
     participant DB as PostgreSQL
 
     A->>S: text + hint + source=ha_voice
     S->>C: POST /api/v1/capture {mode=auto}
-    C->>HA: ai_task.generate_data
-    HA-->>C: structured data
+    C->>L: chat/completions (основной → резервный в бюджете)
+    L-->>C: structured data
     C->>C: validation + normalization
     C->>DB: transaction: items + capture + events
     C-->>S: status, speech, capture_id
@@ -288,14 +286,19 @@ src/
 │   └── validation.rs    # доменная валидация полей
 ├── capture/
 │   ├── draft.rs         # черновики и применение capture
-│   ├── schema.rs        # JSON schema
-│   ├── prompt.rs        # версионированный промпт
+│   ├── schema.rs        # RawItem, ParseError и лимиты разбора
+│   ├── wire.rs          # разбор ответа v4: три формы, уточнения
+│   ├── contract.rs      # таблица полей и JSON Schema ответа
+│   ├── prompt.rs        # версионированный промпт и сборка запроса
+│   ├── dates.rs         # выражения дат → календарные значения
+│   ├── convert.rs       # элемент v4 → RawItem
 │   ├── validate.rs      # доменная валидация
-│   ├── llm.rs           # вызов AI Task и классификация ошибок
+│   ├── llm.rs           # разбор через цепочку слотов
 │   ├── context.rs       # контекст household для разбора
 │   └── breaker.rs       # предохранитель вызовов LLM
-├── home_assistant/
-│   └── mod.rs           # REST + ai_task
+├── llm/
+│   ├── mod.rs           # ChatBackend и OpenAI-совместимый клиент
+│   └── chain.rs         # Slot, Chain, бюджет, резервный слот
 ├── storage/
 │   ├── repositories/    # sqlx-репозитории
 │   ├── migrations.rs
@@ -319,7 +322,9 @@ src/
 - `domain` не знает про Telegram и HA; он работает с household, списками и
   элементами.
 - `telegram` зависит от `domain` и `capture`, но не наоборот.
-- `capture` зависит от `home_assistant` и `domain`.
+- `capture` зависит от `llm` и `domain`.
+- `llm` — транспорт и цепочка слотов; он не знает про Telegram, домен и
+  хранение.
 - `storage` — конкретные sqlx-репозитории и миграции, без trait-портов;
   домен не зависит от Telegram и Home Assistant.
 
@@ -500,14 +505,14 @@ Telegram ──443──▶ Synology Reverse Proxy ──▶ 127.0.0.1:18080 tas
                     ▲                               │
                     └──────── SQL ─────────────────┤
                                                     ▼
-                                             HA AI Task → OpenRouter
+                                      LLM slots → OpenRouter / llama.cpp
 ```
 
 - Tasklerq — bridge-контейнер; host-порт `18080` публикуется только на
   loopback (`8080` занят Zigbee2MQTT).
 - HA работает в `network_mode: host`; HA → Tasklerq:
-  `http://127.0.0.1:18080`, Tasklerq → HA:
-  `http://host.docker.internal:8123` (или `http://192.168.1.10:8123`).
+  `http://127.0.0.1:18080`. Tasklerq обращается к слотам LLM по адресам
+  `LLM_PRIMARY_URL`/`LLM_FALLBACK_URL`, а не к Home Assistant.
 - PostgreSQL — контейнер `postgres:18-alpine`; в dev compose он публикует
   `127.0.0.1:15433`, на NAS живёт в сети `shared-db`. Tasklerq не управляет
   сервером БД.
@@ -553,7 +558,7 @@ Telegram ──443──▶ Synology Reverse Proxy ──▶ 127.0.0.1:18080 tas
 | --- | --- |
 | Unit | Валидация, повторения, timezone/DST, RichMessage, callback-токены. |
 | Integration | PostgreSQL через testcontainers, транзакции, очередь, миграции. |
-| Contract | Mock Telegram и mock HA, схема `ai_task.generate_data`. |
+| Contract | Mock Telegram и локальный HTTP-сервер слота LLM; JSON Schema `response_format`, снимок промпта и хеш контракта. |
 | Python | Config flow, todo, calendar, diagnostics, конфликты. |
 | E2E | Fake Telegram и fake HA в интеграционных тестах; staging-приёмка. |
 | LLM eval | ≥30 фраз, точность извлечения ≥90%. |
@@ -593,5 +598,6 @@ Proxy, домен `tasklerq.example.com`, бот `@tasklerq_example_bot`, час
 
 Осталось уточнить:
 
-- бюджет LLM при квоте 200 разборов в сутки (AI Task настроен на Claude Haiku
-  5.5 через OpenRouter, сущность задаётся в HA).
+- бюджет LLM при квоте 200 разборов в сутки (основной и резервный слот
+  выбираются по результатам `capture-eval`; разбор идёт напрямую в
+  OpenAI-совместимый API).

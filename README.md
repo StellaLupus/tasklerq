@@ -92,7 +92,7 @@ tasklerq/
 │   ├── telegram/        # webhook, worker, queue, outbox, callbacks, rich, bot/
 │   ├── domain/
 │   ├── capture/
-│   ├── home_assistant/
+│   ├── llm/             # OpenAI-совместимый клиент и цепочка слотов
 │   ├── storage/         # db, migrations, seed, repositories/
 │   ├── jobs/            # scheduler, delivery, digest, batch, retention
 │   ├── admin/
@@ -188,6 +188,10 @@ Production-развёртывание — через webhook и HTTPS; гото�
 - Пользовательский текст экранируется; SQL — только параметризованный.
 - LLM не имеет доступа к инструментам и базе; результат валидируется и
   подтверждается.
+- Текст для разбора уходит только на настроенные слоты LLM и их провайдерам;
+  разбор можно ограничить локальной сетью (один основной локальный слот без
+  резервного) или выключить `LLM_CAPTURE_ENABLED=false` — тогда текст никуда
+  не отправляется.
 - Текст сообщений не попадает в логи; секреты — только в env/secret files.
 
 ## Лицензия

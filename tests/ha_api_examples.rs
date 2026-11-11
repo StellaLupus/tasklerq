@@ -1,16 +1,42 @@
-//! Примеры запросов из `docs/ha-api.md`, разделы 4.2, 4.4 и 6.
+//! Примеры запросов из `docs/ha-api.md`, разделы 4.2, 4.4, 6 и 7.1.
 //!
 //! Каждый пример отправляется тестовому серверу, чтобы документ не разошёлся с
 //! кодом. Проверяются статус и ключевые поля ответа, описанные в документе.
 
 mod support;
 
+use std::sync::Arc;
+
+use axum::Router;
 use axum::http::{Method, StatusCode};
 use chrono::{Timelike, Utc};
 use serde_json::{Value, json};
+use sqlx::PgPool;
+use tasklerq::config::CaptureConfig;
 use tasklerq::domain::models::{ListKind, RecurrenceFreq};
+use tasklerq::http::api::capture::CaptureState;
+use tasklerq::http::router::{AppState, build_router};
+use tasklerq::security_audit::Audit;
+use uuid::Uuid;
 
 use support::{date, utc};
+
+fn capture_app(pool: &PgPool, ai: Arc<support::llm::BackendDouble>) -> Router {
+    let config = CaptureConfig {
+        enabled: true,
+        voice_timeout_ms: 8_000,
+        voice_fallback_raw: true,
+        rate_limit_per_min: 10,
+        max_text_chars: 2_000,
+    };
+    build_router(
+        AppState::new(pool.clone(), Audit::new(pool.clone())).with_capture(CaptureState::new(
+            config,
+            Some(Arc::new(support::llm::chain(ai, None))),
+            200,
+        )),
+    )
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_lists_creates_an_events_list() {
@@ -175,6 +201,61 @@ async fn patch_item_shifts_the_event_end_with_its_start() {
         "the end is shifted by the same two hours"
     );
     assert_eq!(body["version"], 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_capture_creates_the_documented_event_example() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = support::issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let school = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO lists (id, household_id, kind, name, is_default, position, created_at, updated_at)
+         VALUES ($1, $2, 'events', 'Школа', false, 10, now(), now())",
+    )
+    .bind(school)
+    .bind(household.household_id)
+    .execute(&db.pool)
+    .await
+    .expect("school list");
+    let ai = support::llm::BackendDouble::new(vec![Ok(support::llm::v4::response(vec![
+        support::llm::v4::with(
+            support::llm::v4::with(
+                support::llm::v4::event("Собрание в школе"),
+                "date",
+                support::llm::v4::date_weekday("thursday", false),
+            ),
+            "time",
+            json!("18:30"),
+        ),
+    ]))]);
+    let app = capture_app(&db.pool, ai);
+
+    let (status, body) = support::request(
+        &app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(json!({
+            "text": "собрание в школе в четверг в 18:30",
+            "source": "ha_voice",
+            "mode": "auto",
+            "list_id": school
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "applied");
+    assert_eq!(body["fallback"], false);
+    assert_eq!(body["speech"], "Добавил событие: Собрание в школе.");
+    assert_eq!(body["items"][0]["title"], "Собрание в школе");
+    assert_eq!(body["items"][0]["list_id"], school.to_string());
+    assert_eq!(body["items"][0]["kind"], "events");
+    assert_eq!(body["items"][0]["due_date"], Value::Null);
+    assert!(body["items"][0]["due_at"].is_string(), "{body}");
+    assert_eq!(body["items"][0]["end_date"], Value::Null);
+    assert_eq!(body["items"][0]["end_at"], Value::Null);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -58,7 +58,7 @@
 | Reverse Proxy | `HTTPS tasklerq.example.com:443` → `http://127.0.0.1:18080`; отвечает `200` | Ничего; при `502` проверить приложение. |
 | PostgreSQL | `postgres:18-alpine` (18.6), сеть `shared-db`, порт `15433`; роль `tasklerq` (не суперпользователь) и БД `tasklerq` с `pg_trgm 1.6` | Ничего. |
 | Home Assistant | `2026.10.4`, host network, HACS; интеграция установлена | Ничего; обновления по [`home-assistant.md`](home-assistant.md). |
-| AI Task | `ai_task.anthropic_claude_haiku_5_5` | Больше не используется: разбор идёт через слоты LLM (раздел 6). |
+| LLM | Слоты LLM (OpenAI-совместимый API) настраиваются в env Tasklerq: основной и при необходимости резервный; AI Task в Home Assistant для разбора больше не используется | Задать `LLM_PRIMARY_*` и `LLM_FALLBACK_*` по разделу 6. |
 | Telegram | Бот `@tasklerq_example_bot`, webhook зарегистрирован | Ничего; токен и секрет в `.env`. |
 | Tasklerq | Контейнер `tasklerq`, образ `stellalupus/tasklerq:<тег>` (на 2026-11-03 — `0.1.0`), healthy | Обновления по разделу 12. |
 
@@ -901,17 +901,10 @@ OpenAI-совместимому API основного и резервного �
    предыдущий образ с тем же env-файлом продолжит работать.
 2. Разверните образ по общему порядку из начала раздела 12. Черновики,
    созданные до обновления, истекают за 15 минут.
-3. Проверьте слоты в контейнере:
-
-   ```bash
-   sudo /usr/local/bin/docker compose exec tasklerq \
-     tasklerq capture-eval --slot primary
-   sudo /usr/local/bin/docker compose exec tasklerq \
-     tasklerq capture-eval --slot fallback
-   ```
-
-   Статус «не прошёл» означает смену модели или параметров слота и повторную
-   проверку.
+3. Проверьте слоты пробным разбором: отправьте тестовую фразу в бот или
+   Assist и убедитесь, что ответ не `fallback`. Отдельная команда проверки
+   слота и её статус появятся в пунктах 9.3–9.4; до них автоматической
+   проверки слота нет.
 4. После подтверждения работы удалите из env-файла `HA_BASE_URL`, `HA_TOKEN` и
    `HA_AI_TASK_ENTITY_ID` и отзовите long-lived token в Home Assistant. Если
    `HA_*` остались, сервис пишет предупреждение в лог, а не ошибку.
@@ -995,7 +988,7 @@ curl -fsS \
 | --- | --- |
 | `/health/ready` ≠ 200 > 2 мин | Проверить БД, очередь, логи. |
 | queue lag > 5 мин | Проверить воркеры и БД. |
-| LLM errors > 20% за 15 мин | Проверить слоты LLM (`capture-eval`, лог старта), квоту и провайдеров. |
+| LLM errors > 20% за 15 мин | Проверить слоты LLM (лог старта, `llm_runs`), квоту и провайдеров. |
 | webhook 401 > 50 за 5 мин | Проверить секрет и источник запросов. |
 | Бот не отвечает: в логах `setWebhook failed` и `outbox` c `error: transient` | Исходящие в Bot API не доходят до Telegram. Проверить доступ к `api.telegram.org` из контейнера; если исходящий трафик идёт через прокси — `HTTPS_PROXY` и доступность прокси из сети контейнера. |
 | backup failed | Проверить диск, права, PostgreSQL. |
@@ -1093,7 +1086,7 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 | IDOR | Действия capture с чужим/неизвестным id не раскрывают данные | `tests/capture_api.rs::capture_actions_hide_foreign_telegram_and_unknown_captures` | пройдено |
 | IDOR | Ответ capture содержит только элементы, созданные этим запросом | `tests/capture_api.rs::the_response_contains_only_the_items_created_by_this_capture` | пройдено |
 | LLM | Пользовательский текст в делимитерах; закрыть делимитер или подставить плейсхолдер нельзя | `src/capture/prompt.rs::user_text_cannot_close_its_delimiter`, `placeholders_inside_user_text_are_not_expanded`, `hostile_names_stay_inside_their_json_string` | пройдено |
-| LLM | Ответ только по схеме `ai_task.generate_data`; инструментов, базы и API у LLM нет | `src/capture/prompt.rs::response_structure`, `structure_declares_all_item_fields`; `src/home_assistant/mod.rs` (только `generate_data`) | пройдено (код) |
+| LLM | Ответ только по JSON Schema в `response_format`; инструментов, базы и API у LLM нет | `src/capture/prompt.rs::prompt_version_is_pinned_to_the_contract_hash`, `rendered_request_matches_snapshot`; `src/capture/contract.rs::every_object_is_strict_and_requires_all_properties` | пройдено (код) |
 | LLM | Идентификаторы и действия из ответа игнорируются, включая чужой `household_id` | `src/capture/schema.rs::unknown_fields_and_identifiers_are_ignored` (поля `household_id`, `list_id`, `action: delete_all`) | пройдено |
 | LLM | Ответ проходит серверную доменную валидацию, частичной записи нет | `src/capture/validate/tests.rs::valid_task_becomes_new_item_with_source` и набор тестов валидации; `tests/capture_api.rs::auto_rejects_the_whole_capture_when_one_item_is_invalid` | пройдено |
 | LLM | Массовое создание ограничено 20 элементами и не создаёт частичные данные | `src/capture/schema.rs::exactly_twenty_items_pass_and_twenty_one_do_not`; `tests/telegram_capture.rs::too_many_items_asks_to_split_the_text`, `too_many_items_do_not_open_the_circuit_breaker`; `tests/capture_api.rs::too_many_items_is_a_rejected_input_and_does_not_open_the_breaker` | пройдено |
@@ -1114,7 +1107,7 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 | Внешний capture | Ошибки не раскрывают существование чужого household или capture | `tests/capture_api.rs::capture_actions_hide_foreign_telegram_and_unknown_captures` | пройдено |
 | Секреты | `Config` не печатает секреты в `Debug`, `Display` и стартовом логе | `tests/secret_redaction.rs::config_debug_display_and_startup_log_hide_every_secret` | пройдено |
 | Секреты | Ошибки валидации конфигурации не повторяют значения секретов | `tests/secret_redaction.rs::config_validation_errors_do_not_echo_secret_values` | пройдено |
-| Секреты | Ошибки и логи Telegram и Home Assistant скрывают токены | `tests/secret_redaction.rs::telegram_network_error_and_log_hide_the_bot_token`, `home_assistant_error_and_log_hide_the_token` | пройдено |
+| Секреты | Ошибки и логи Telegram и слотов LLM скрывают токены | `tests/secret_redaction.rs::telegram_network_error_and_log_hide_the_bot_token`, `config_debug_display_and_startup_log_hide_every_secret`; `tests/llm_client.rs::connection_refused_is_reported_as_transport` | пройдено |
 | Секреты | Ошибка старта и CLI скрывают пароль БД и токен бота | `tests/secret_redaction.rs::startup_error_from_an_unreachable_database_hides_the_password`, `admin_cli_errors_hide_the_database_password_and_bot_token` | пройдено |
 | Секреты | URL с учётными данными очищается в ошибках healthcheck | `tests/secret_redaction.rs::healthcheck_error_hides_credentials_in_the_url`, `healthcheck_error_hides_credentials_when_the_url_cannot_be_parsed`; `src/redaction.rs::redact_url_credentials` | пройдено |
 | Секреты | Неверный Bearer-токен не отражается в ответе и логе | `tests/secret_redaction.rs::an_invalid_bearer_token_is_not_reflected_in_the_body_or_log` | пройдено |
@@ -1193,8 +1186,14 @@ proxy, проверка слотов LLM, backup), остаются в 15.2 и �
   Telegram Bot API).
 - [ ] `LLM_PRIMARY_URL`, `LLM_PRIMARY_MODEL` заданы; `LLM_FALLBACK_*` — вместе
   или не заданы.
-- [ ] `tasklerq capture-eval --slot primary` (и `--slot fallback`) пройдена.
+- [ ] Слот проверен пробным разбором; отдельная команда проверки слота
+  появится в пункте 9.3.
 - [ ] `LLM_CAPTURE_ENABLED` соответствует политике семьи.
+- [ ] Владелец знает, что текст для разбора уходит на настроенные слоты LLM и
+  их провайдерам, и сообщил об этом household. Чтобы текст не покидал
+  локальную сеть, задан один основной слот с локальным адресом и нет
+  резервного; при `LLM_CAPTURE_ENABLED=false` текст не отправляется. Подробно
+  — [`llm-capture.md`, раздел 11](llm-capture.md#11-приватность).
 - [ ] Логи не содержат текст сообщений и токены; для capture — только `source`,
   `status`, `capture_id`.
 - [ ] Аудио голосового capture не передаётся в Tasklerq и не хранится.
@@ -1458,9 +1457,9 @@ proxy, проверка слотов LLM, backup), остаются в 15.2 и �
 
 1. Проверьте `LLM_CAPTURE_ENABLED=true`, `LLM_PRIMARY_URL` и
    `LLM_PRIMARY_MODEL`; резервный слот — `LLM_FALLBACK_*` вместе или не задан.
-2. Проверьте слоты командой `tasklerq capture-eval --slot primary` (и
-   `--slot fallback`). При статусе «не прошёл» смените модель или параметры
-   слота и повторите проверку.
+2. Проверьте слот пробным разбором: отправьте тестовую фразу в бот или
+   Assist. Отдельная команда проверки слота появится в пункте 9.3; до неё
+   автоматической проверки нет.
 3. Проверьте токен слота: `401`/`403` от провайдера означает неверный или
    отозванный `LLM_*_TOKEN`; такая ошибка пишется в лог уровнем `error`.
 4. Проверьте баланс и лимиты провайдера (OpenRouter, локальный сервер).

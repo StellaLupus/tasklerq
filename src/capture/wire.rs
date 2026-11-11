@@ -1231,27 +1231,12 @@ mod tests {
 
     /// Полный ответ v4 из `docs/llm-capture.md` проходит разбор формы для
     /// контекста с теми списками и участниками, что в нём названы. Документ и
-    /// тест связаны маркерами: пример нельзя поменять, не проверив его.
+    /// тест связаны маркерами: каждый пример нельзя поменять, не проверив его.
     #[test]
     fn documented_example_parses() {
         const DOC: &str = include_str!("../../docs/llm-capture.md");
         const START: &str = "<!-- capture-v4-example:start -->";
         const END: &str = "<!-- capture-v4-example:end -->";
-
-        let start = DOC
-            .find(START)
-            .expect("the example start marker is present")
-            + START.len();
-        let end = DOC[start..]
-            .find(END)
-            .expect("the example end marker is present")
-            + start;
-        let block = DOC[start..end].trim();
-        let example = block
-            .strip_prefix("```json")
-            .and_then(|block| block.strip_suffix("```"))
-            .map(str::trim)
-            .expect("the example is a json code block");
 
         let mut context = context();
         context.lists.push(crate::capture::test_support::list(
@@ -1265,17 +1250,45 @@ mod tests {
             true,
         ));
 
-        let parsed =
-            parse_capture_response(example, &context).expect("the documented example parses");
+        let mut examples = Vec::new();
+        let mut rest = DOC;
+        while let Some(start) = rest.find(START) {
+            let block_start = start + START.len();
+            let block_end = rest[block_start..]
+                .find(END)
+                .expect("the example end marker is present")
+                + block_start;
+            let block = rest[block_start..block_end].trim();
+            let example = block
+                .strip_prefix("```json")
+                .and_then(|block| block.strip_suffix("```"))
+                .map(str::trim)
+                .expect("the example is a json code block");
 
-        assert_eq!(parsed.items.len(), 5, "{example}");
-        assert_eq!(parsed.items[0].form(), Form::Shopping);
-        assert_eq!(parsed.items[1].form(), Form::Task);
-        assert_eq!(parsed.items[2].kind(), ListKind::Checklist);
-        assert_eq!(parsed.items[3].form(), Form::Event);
-        assert_eq!(parsed.items[4].form(), Form::Event);
+            examples.push(
+                parse_capture_response(example, &context)
+                    .unwrap_or_else(|error| panic!("documented example does not parse: {error}")),
+            );
+            rest = &rest[block_end + END.len()..];
+        }
+
+        assert_eq!(examples.len(), 4, "every documented example is marked");
         assert_eq!(
-            parsed.clarifications,
+            examples
+                .iter()
+                .map(|example| example.items.len())
+                .collect::<Vec<_>>(),
+            [5, 1, 1, 1]
+        );
+
+        let first = &examples[0];
+        assert_eq!(first.items[0].form(), Form::Shopping);
+        assert_eq!(first.items[1].form(), Form::Task);
+        assert_eq!(first.items[2].kind(), ListKind::Checklist);
+        assert_eq!(first.items[3].form(), Form::Event);
+        assert_eq!(first.items[4].form(), Form::Event);
+        assert_eq!(
+            first.clarifications,
             [Clarification {
                 item: 4,
                 topic: ClarificationTopic::Date

@@ -22,7 +22,7 @@
 | Покупки | Позиции, количество, единицы, отметка, очистка, дубликаты | P0 |
 | Повторения | daily/weekly/monthly/yearly, interval, weekdays, until | P1 |
 | Календарь | Вхождения задач, all-day/timed | P1 |
-| LLM-capture | HA AI Task, схема, валидация, черновик, подтверждение, fallback | P1 |
+| LLM-capture | HA AI Task (пересмотрено в 0011: разбор через слоты LLM), схема, валидация, черновик, подтверждение, fallback | P1 |
 | Capture без бота | `POST /api/v1/capture`, `tasklerq.capture`, HA Assist, auto-режим, идемпотентность, undo | P0 |
 | Home Assistant | `todo` по спискам, read-only `calendar`, polling, конфликты | P1 |
 | Семья | Household, owner/member, приглашения, общие списки | P0 |
@@ -319,9 +319,11 @@ Telegram; конфликт версий обрабатывается; голос
 
 Среда определена: Synology NAS, Synology Reverse Proxy, домен
 `tasklerq.example.com`, PostgreSQL 18 в сети `shared-db`, HA Container
-`2026.10.4` в `network_mode: host`, HACS, AI Task
-`ai_task.anthropic_claude_haiku_5_5`, бот `@tasklerq_example_bot`, часовой пояс `Europe/Moscow`,
-хранение `raw_text` 30 дней, backup — Hyper Backup на внешний диск.
+`2026.10.4` в `network_mode: host`, HACS, бот `@tasklerq_example_bot`, часовой
+пояс `Europe/Moscow`, хранение `raw_text` 30 дней, backup — Hyper Backup на
+внешний диск. AI Task `ai_task.anthropic_claude_haiku_5_5` упоминалась в
+прежней среде; в 0011 разбор переведён на слоты LLM, HA AI Task больше не
+используется.
 
 Осталось уточнить:
 

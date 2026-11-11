@@ -27,7 +27,7 @@ discovery. Шаблонные сенсоры и `rest`-интеграция да
 | HACS | Установлен |
 | Tasklerq | 0.1.0+ |
 | Интеграция `tasklerq-ha` | 0.2.0+ — списки событий без `todo`-сущности |
-| Сеть | HA → Tasklerq: `http://127.0.0.1:18080`; Tasklerq → HA: `http://host.docker.internal:8123` |
+| Сеть | HA → Tasklerq: `http://127.0.0.1:18080`; Tasklerq → слоты LLM по адресам из `LLM_*_URL` |
 
 Минимум `2026.10.0` задан в `hacs.json` ключом `homeassistant` и
 проверяется при установке компонента в репозитории
@@ -340,54 +340,60 @@ HA coordinator ──GET /api/v1/snapshot?since=cursor──▶ Tasklerq
   бот показывает их при следующем открытии экрана;
 - календарь: обновляется вместе с координатором.
 
-## 7. LLM через Home Assistant
+## 7. LLM-разбор и слоты
 
-Tasklerq вызывает `ai_task.generate_data` в HA. В этой инсталляции уже есть:
+Tasklerq разбирает текст сам: вызывает OpenAI-совместимый API основного и
+необязательного резервного слота (`LLM_PRIMARY_*`, `LLM_FALLBACK_*`). Home
+Assistant AI Task для разбора не нужен: ни сущность `ai_task.*`, ни
+Assist-инструменты, ни токен HA сервису Tasklerq. Ключи провайдеров LLM
+хранятся в окружении Tasklerq, а не в HA.
 
-- интеграция **OpenRouter**;
-- AI Task `ai_task.anthropic_claude_haiku_5_5` (подынтеграция `ai_task_data`,
-  модель `anthropic/claude-haiku-5.5`);
-- запасная интеграция **Google Generative AI** с AI Task
-  `ai_task.google_ai_task_2` (Gemini 3.7 Flash): точная, но медленнее
-  голосового таймаута 8 с.
+Что нужно от Home Assistant теперь:
 
-Модель AI Task выбирается в HA, а не в Tasklerq. Убедитесь, что у
-подынтеграции `ai_task_data` **не включены Assist-инструменты**
-(`llm_hass_api`): LLM-capture не должна управлять устройствами HA.
+- компонент Tasklerq — `todo`/`calendar` и сервисы `tasklerq.capture`,
+  `tasklerq.undo_last_capture`;
+- голосовой pipeline Assist с пользовательскими предложениями и
+  `intent_script`: Assist распознаёт речь и вызывает `tasklerq.capture`;
+- Tasklerq разбирает полученный текст своими слотами и возвращает `speech`,
+  который Assist озвучивает.
 
-Настройка:
+Настройка разбора — в Tasklerq, а не в HA:
 
-1. Проверьте сущность `ai_task.anthropic_claude_haiku_5_5` в **Developer Tools → States**.
-2. Проверьте действие **Developer Tools → Actions → `ai_task.generate_data`**.
-3. Создайте long-lived token HA.
-4. Укажите в Tasklerq:
+1. Задайте `LLM_CAPTURE_ENABLED=true`, `LLM_PRIMARY_URL` и
+   `LLM_PRIMARY_MODEL`, при необходимости — `LLM_FALLBACK_*`.
+2. Перезапустите Tasklerq и отправьте боту или в Assist тестовую фразу,
+   проверьте черновик или созданные элементы.
 
-```dotenv
-HA_BASE_URL=http://host.docker.internal:8123
-HA_TOKEN=eyJ...
-HA_AI_TASK_ENTITY_ID=ai_task.anthropic_claude_haiku_5_5
-LLM_CAPTURE_ENABLED=true
-```
+Если LLM выключена или все слоты недоступны, Tasklerq продолжает работать:
+свободный текст в Telegram открывает редактор, внешний `auto` создаёт
+fallback-позицию из исходного текста, Assist озвучивает «Записал как есть».
+При `LLM_CAPTURE_ENABLED=false` запросов к слотам нет, редактор открывается
+так же.
 
-`HA_BASE_URL` — это адрес HA **из контейнера Tasklerq**. Так как HA работает в
-`network_mode: host`, используйте `http://host.docker.internal:8123` (нужен
-`extra_hosts`) или `http://192.168.1.10:8123`.
+Подробно о промпте, слотах и деградации: [`llm-capture.md`](llm-capture.md).
+Переменные окружения — [`deployment.md`, раздел 6](deployment.md#6-переменные-окружения).
 
-5. Отправьте боту тестовую фразу и проверьте черновик.
+### Переход со старой версии (AI Task)
 
-Если AI Task нет в HA или она недоступна, Tasklerq продолжает работать:
-свободный текст открывает редактор. При `LLM_CAPTURE_ENABLED=false`
-запросов в HA нет, редактор открывается так же.
+В прежней версии Tasklerq вызывал `ai_task.generate_data` в Home Assistant.
+Теперь разбор идёт напрямую через слоты, поэтому:
 
-Подробно о промпте и схеме: [`llm-capture.md`](llm-capture.md).
+1. Удалите из env-файла Tasklerq `HA_BASE_URL`, `HA_TOKEN` и
+   `HA_AI_TASK_ENTITY_ID`.
+2. Отзовите long-lived token, который Tasklerq использовал для HA.
+3. Оставьте в HA только компонент Tasklerq и голосовой сценарий Assist;
+   сущность AI Task для разбора Tasklerq больше не нужна.
+
+Порядок обновления и откат — в
+[`deployment.md`, раздел 12](deployment.md#переход-на-слоты-llm).
 
 ## 7.1. Голосовой capture через Assist
 
 Tasklerq можно использовать голосом без Telegram. HA Assist распознаёт речь,
-вызывает сервис `tasklerq.capture`, а Tasklerq разбирает текст через AI Task и
-создаёт задачи или покупки. Ответ озвучивается. Это основной голосовой сценарий;
-если Assist уже настроен, добавьте только пользовательские предложения (custom
-sentences) и `intent_script` ниже.
+вызывает сервис `tasklerq.capture`, а Tasklerq разбирает текст своими слотами
+LLM и создаёт задачи, покупки или события. Ответ озвучивается. Это основной
+голосовой сценарий; если Assist уже настроен, добавьте только пользовательские
+предложения (custom sentences) и `intent_script` ниже.
 
 ### Сервис
 
@@ -537,8 +543,9 @@ intent_script:
 - Сценарий с пользовательскими предложениями (custom sentences) использует
   встроенный распознаватель намерений Home Assistant. Если в Assist выбран
   LLM-агент, создайте отдельный pipeline с агентом Home Assistant или добавьте
-  вызов `tasklerq.capture` как действие, доступное агенту. AI Task разбора при
-  этом остаётся без `llm_hass_api`.
+  вызов `tasklerq.capture` как действие, доступное агенту. Разбор Tasklerq при
+  этом не использует AI Task и не получает инструментов HA; агент нужен только
+  для понимания голосовой фразы.
 
 ### Другие клиенты
 
@@ -643,7 +650,7 @@ action:
 
 Токен, названия задач и имена участников в diagnostics не попадают.
 
-### 10.1. Проверка на живой установке
+### 10.1. Проверка на живой установке (прежняя версия)
 
 Проверено 2026-10-31: Home Assistant 2026.10.4, HA Container, amd64, Python
 3.14.9; сервер — образ `stellalupus/tasklerq:pr-3` в Docker на том же NAS, URL
@@ -652,10 +659,14 @@ action:
 `TELEGRAM_MODE=disabled`: бот выключен, токена бота в окружении сервера не
 было.
 
+Записи ниже относятся к прежней версии разбора через Home Assistant AI Task.
+После перехода на слоты LLM (change `0011`) сценарий capture и Assist нужно
+проверить заново; обновление отчёта — пункт 10.2.
+
 - [x] Интеграция добавлена через UI (URL и токен), состояние `loaded`, заголовок — имя household.
 - [x] Сущности `todo.zadachi`, `todo.pokupki` и `calendar.tasklerq` созданы и доступны.
 - [x] HA → Tasklerq: создание задачи со сроком-датой и описанием (позиция получила id сервера), переименование, перенос на дату со временем (10:30 МСК сохранено как 07:30Z), завершение и возврат, удаление.
-- [x] Tasklerq → HA: `tasklerq.capture` «купить молоко и хлеб» через LLM (AI Task, без fallback) создал две позиции в `todo.pokupki`; после `undo_last_capture` для capture с `source: ha_voice` удалённая на сервере позиция исчезла из HA.
+- [x] Tasklerq → HA: `tasklerq.capture` «купить молоко и хлеб» через LLM (в прежней версии — AI Task, без fallback) создал две позиции в `todo.pokupki`; после `undo_last_capture` для capture с `source: ha_voice` удалённая на сервере позиция исчезла из HA.
 - [x] Календарь: all-day событие для срока-даты, timed-событие 10:30–11:30 после переноса на время.
 - [x] Diagnostics: URL, интервал 60 с, горизонт 30 дней, время синхронизации, `last_sync_error: null`; токена, названий задач и имён нет.
 - [x] Логи HA: ошибок компонента нет.
@@ -674,8 +685,7 @@ action:
 | Сущности `unavailable` | Tasklerq недоступен | Проверить `/health/ready`, логи, сеть. |
 | Нет событий в календаре | Нет задач со сроком и событий или горизонт мал | Добавить срок или событие, увеличить горизонт. |
 | Дубли `unique_id` | Старая интеграция не удалена | Удалить старую запись, перезапустить HA. |
-| Нет `ai_task` | Подынтеграция OpenRouter `ai_task_data` не настроена | Проверить `ai_task.anthropic_claude_haiku_5_5` в Developer Tools. |
-| LLM всегда fallback | `HA_AI_TASK_ENTITY_ID` или `HA_BASE_URL` неверный | Проверить `ai_task.anthropic_claude_haiku_5_5`, `http://host.docker.internal:8123` и `HA_TOKEN`. |
+| LLM всегда fallback | Неверный адрес, модель или токен слота; LLM выключена; исчерпана квота; открыты предохранители слотов | Проверить `LLM_CAPTURE_ENABLED`, `LLM_PRIMARY_URL`, `LLM_PRIMARY_MODEL` и `LLM_*_TOKEN` (при резервном слоте — `LLM_FALLBACK_*`); посмотреть лог с именем слота и причиной отказа и `/health/ready`. Статус проверки слота в readiness пока не выводится — он появится вместе с проверкой слота (пункт 9.4). |
 | Время сдвинуто | Разные timezone HA и Tasklerq | Проверить timezone household/пользователя и HA. |
 | Нет priority/tags в карточке | Ограничение HA | Использовать `tasklerq_items`. |
 | Конфликт при записи | Позиция изменена в Telegram | Обновить и повторить. |
