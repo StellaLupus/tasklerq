@@ -87,8 +87,9 @@ pub async fn generate(
     now: DateTime<Utc>,
     timeout: Duration,
 ) -> Result<Generated, Failed> {
-    let instructions = prompt::build_instructions(context, text);
-    let structure = prompt::response_structure();
+    // Временный переходник до 7.1: HA-путь ещё разбирает ответ v3.
+    let instructions = prompt::legacy_instructions(context, text);
+    let structure = prompt::legacy_response_structure();
     let request = GenerateData {
         task_name: prompt::TASK_NAME,
         instructions: &instructions,

@@ -978,7 +978,7 @@ fn to_raw(draft: &ItemDraft, kind: ListKind, list_name: &str, until: Option<Stri
             .map(|time| time.format("%H:%M").to_string()),
         end_date: None,
         end_time: None,
-        date_error: None,
+        date_error: Vec::new(),
         priority: Some(priority.to_owned()),
         assignee: None,
         assignee_id: draft.assignee,

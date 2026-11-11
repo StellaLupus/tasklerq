@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use tasklerq::capture::breaker::CircuitBreaker;
 use tasklerq::capture::draft;
+use tasklerq::capture::prompt::PROMPT_VERSION;
 use tasklerq::config::CaptureConfig;
 use tasklerq::home_assistant::{AiTask, GenerateData, HaError};
 use tasklerq::http::api::capture::CaptureState;
@@ -870,7 +871,7 @@ async fn auto_applies_two_purchases_and_returns_the_full_contract() {
     assert_eq!(draft_status, "applied");
     assert_eq!(draft_mode, "auto");
     assert!(applied_at.is_some(), "applied capture must have applied_at");
-    assert_eq!(parser_version.as_deref(), Some("capture-v3"));
+    assert_eq!(parser_version.as_deref(), Some(PROMPT_VERSION));
 
     assert_eq!(
         created_event_count(&db.pool, household.household_id).await,

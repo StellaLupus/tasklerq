@@ -850,6 +850,10 @@ pub fn check_baseline(
 
 /// Канонический контекст для хеша: значения фиксированы, поэтому хеш зависит
 /// только от промпта, а не от текущей даты или household.
+///
+/// Это контекст старого HA-пути до 9.1. Хеш контракта v4 считает
+/// [`prompt::contract_hash`] по своему каноническому контексту (со списком
+/// событий).
 fn canonical_context() -> CaptureContext {
     let spec = ContextSpec {
         now: "2026-10-30T11:05:00Z".to_owned(),
@@ -894,11 +898,12 @@ fn canonical_context() -> CaptureContext {
 /// кавычки, нейтрализацию текста): правка любого из них меняет промпт и должна
 /// требовать нового замера. Именно этот хеш пишется в baseline.
 pub fn prompt_hash() -> String {
-    let rendered = prompt::build_instructions(&canonical_context(), "проверка промпта");
+    // Временный переходник до 9.1: старый путь считает хеш по v3-промпту.
+    let rendered = prompt::legacy_instructions(&canonical_context(), "проверка промпта");
     let mut digest = Sha256::new();
     digest.update(rendered.as_bytes());
     digest.update(b"\n--response-structure--\n");
-    digest.update(prompt::response_structure().to_string().as_bytes());
+    digest.update(prompt::legacy_response_structure().to_string().as_bytes());
     digest
         .finalize()
         .iter()

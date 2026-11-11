@@ -418,10 +418,15 @@ fn member_names(context: &CaptureContext) -> Vec<String> {
     )
 }
 
-/// Уникальные значения в порядке появления плюс пустая строка — «не названо».
+/// Уникальные непустые значения в порядке появления плюс пустая строка — «не
+/// названо». Пустые имена отбрасываются: два `""` в `enum` нарушают
+/// `uniqueItems`.
 fn dedup_of(values: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for value in values {
+        if value.is_empty() {
+            continue;
+        }
         if !names.contains(&value) {
             names.push(value);
         }
@@ -768,6 +773,22 @@ mod tests {
                 ["Анна", "Пётр", "Оля", ""]
             );
         }
+    }
+
+    #[test]
+    fn empty_list_and_member_names_are_dropped() {
+        let mut context = crate::capture::test_support::context();
+        context.lists = vec![
+            list("", ListKind::Tasks, true),
+            list("Задачи", ListKind::Tasks, false),
+        ];
+        context.members = vec![member("", None), member("Анна", None)];
+
+        let schema = schema(&context);
+        let forms = form_schemas(&schema);
+
+        assert_eq!(enum_values(&field(forms[0], "list")), ["Задачи", ""]);
+        assert_eq!(enum_values(&field(forms[0], "assignee")), ["Анна", ""]);
     }
 
     #[test]

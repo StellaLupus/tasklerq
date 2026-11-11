@@ -52,12 +52,19 @@ fn resolve_start(expr: &DateExpr, time: Option<&str>, context: &CaptureContext) 
             raw_time: time.map(ToOwned::to_owned),
             error: None,
         },
-        Err(_) => Start {
-            date: None,
-            time: parsed,
-            raw_time: time.map(ToOwned::to_owned),
-            error: Some(date_error("due_date")),
-        },
+        Err(error) => {
+            tracing::debug!(
+                code = error.code(),
+                field = "due_date",
+                "date expression rejected"
+            );
+            Start {
+                date: None,
+                time: parsed,
+                raw_time: time.map(ToOwned::to_owned),
+                error: Some(date_error("due_date")),
+            }
+        }
     }
 }
 
@@ -65,7 +72,10 @@ fn convert_task(item: &TaskItem, context: &CaptureContext) -> RawItem {
     let mut start = resolve_start(&item.date, item.time.as_deref(), context);
     let (repeat, repeat_error) = convert_repeat(item.repeat.as_ref(), &mut start, context);
     let (second_date, note_error) = convert_note_date(&item.note_date, context);
-    let error = start.error.take().or(repeat_error).or(note_error);
+    let mut error = Vec::new();
+    error.extend(start.error.take());
+    error.extend(repeat_error);
+    error.extend(note_error);
 
     RawItem {
         target_kind: ListKind::Tasks,
@@ -100,7 +110,7 @@ fn convert_shopping(item: &ShoppingItem, kind: ListKind, context: &CaptureContex
         due_time: start.raw_time,
         end_date: None,
         end_time: None,
-        date_error: start.error,
+        date_error: start.error.into_iter().collect(),
         priority: item.priority.map(priority_name).map(ToOwned::to_owned),
         assignee: item.assignee.clone(),
         assignee_id: None,
@@ -116,7 +126,10 @@ fn convert_event(item: &EventItem, context: &CaptureContext) -> RawItem {
     let mut start = resolve_start(&item.date, item.time.as_deref(), context);
     let (repeat, repeat_error) = convert_repeat(item.repeat.as_ref(), &mut start, context);
     let (end_date, end_time, end_error) = convert_end(item, &start, context);
-    let error = start.error.take().or(repeat_error).or(end_error);
+    let mut error = Vec::new();
+    error.extend(start.error.take());
+    error.extend(repeat_error);
+    error.extend(end_error);
 
     RawItem {
         target_kind: ListKind::Events,
@@ -157,7 +170,14 @@ fn convert_end(
         context.now,
         context.timezone,
     ) {
-        Err(_) => (None, raw_end_time, Some(date_error("end_date"))),
+        Err(error) => {
+            tracing::debug!(
+                code = error.code(),
+                field = "end_date",
+                "date expression rejected"
+            );
+            (None, raw_end_time, Some(date_error("end_date")))
+        }
         Ok(Some(date)) => (Some(format_date(date)), raw_end_time, None),
         Ok(None) => match (start.date, end_time) {
             // Время без даты конца относится ко дню начала, а если оно не позже
@@ -196,7 +216,14 @@ fn convert_repeat(
         context.timezone,
     ) {
         Ok(date) => (date, None),
-        Err(_) => (None, Some(date_error("recurrence"))),
+        Err(error) => {
+            tracing::debug!(
+                code = error.code(),
+                field = "recurrence",
+                "date expression rejected"
+            );
+            (None, Some(date_error("recurrence")))
+        }
     };
 
     if start.error.is_none() {
@@ -270,7 +297,14 @@ fn convert_note_date(
     match dates::resolve(expr, DateRole::Start, None, context.now, context.timezone) {
         Ok(Some(date)) => (Some(note_date_text(date, context.today().year())), None),
         Ok(None) => (None, None),
-        Err(_) => (None, Some(date_error("note_date"))),
+        Err(error) => {
+            tracing::debug!(
+                code = error.code(),
+                field = "note_date",
+                "date expression rejected"
+            );
+            (None, Some(date_error("note_date")))
+        }
     }
 }
 
@@ -544,6 +578,17 @@ mod tests {
         let item = convert(&context, value);
 
         assert_eq!(item.due_date.as_deref(), Some("2026-11-16"));
+
+        // Вторник 10 ноября не входит в правило «понедельник и четверг»:
+        // берётся ближайшее вхождение не раньше названной даты — четверг.
+        let value = with(
+            with(task(), "date", weekday("tuesday", 0)),
+            "repeat",
+            weekly(&[1, 4], date_none()),
+        );
+        let item = convert(&context, value);
+
+        assert_eq!(item.due_date.as_deref(), Some("2026-11-12"));
     }
 
     #[test]
@@ -707,7 +752,7 @@ mod tests {
 
         assert_eq!(raw.due_date, None);
         assert_eq!(
-            raw.date_error.as_ref().map(|error| error.field.as_str()),
+            raw.date_error.first().map(|error| error.field.as_str()),
             Some("due_date")
         );
 
@@ -735,7 +780,7 @@ mod tests {
             .map(|item| convert_item(item, &context))
             .collect();
 
-        assert!(raws[0].date_error.is_some());
+        assert!(!raws[0].date_error.is_empty());
         assert_eq!(raws[1].due_date.as_deref(), Some("2026-11-11"));
 
         let first = validate_item(&context, ItemSource::Telegram, raws[0].clone());
@@ -879,7 +924,7 @@ mod tests {
         let value = with(with(event(), "date", offset(1)), "end", date(31, 2, 0));
         let raw = convert(&context, value.clone());
         assert_eq!(
-            raw.date_error.as_ref().map(|error| error.field.as_str()),
+            raw.date_error.first().map(|error| error.field.as_str()),
             Some("end_date")
         );
 
@@ -898,7 +943,7 @@ mod tests {
         );
         let raw = convert(&context, value.clone());
         assert_eq!(
-            raw.date_error.as_ref().map(|error| error.field.as_str()),
+            raw.date_error.first().map(|error| error.field.as_str()),
             Some("recurrence")
         );
 
@@ -912,12 +957,33 @@ mod tests {
         let value = with(with(task(), "date", offset(1)), "note_date", date(31, 2, 0));
         let raw = convert(&context, value.clone());
         assert_eq!(
-            raw.date_error.as_ref().map(|error| error.field.as_str()),
+            raw.date_error.first().map(|error| error.field.as_str()),
             Some("note_date")
         );
 
         let item = check(&context, value);
         assert_eq!(codes(&item), ["note_date_invalid"]);
         assert_eq!(item.errors[0].field, "notes");
+    }
+
+    #[test]
+    fn a_bad_start_and_a_bad_note_date_keep_both_errors() {
+        let context = spec_context();
+        let value = with(
+            with(task(), "date", date(31, 2, 0)),
+            "note_date",
+            date(31, 2, 0),
+        );
+        let raw = convert(&context, value.clone());
+
+        let fields = raw
+            .date_error
+            .iter()
+            .map(|error| error.field.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(fields, ["due_date", "note_date"]);
+
+        let item = check(&context, value);
+        assert_eq!(codes(&item), ["date_invalid", "note_date_invalid"]);
     }
 }

@@ -198,7 +198,7 @@ fn validate_item_in(
 
     let priority = parse_priority(raw.priority.as_deref(), &mut errors);
 
-    if let Some(date_error) = &raw.date_error {
+    for date_error in &raw.date_error {
         fail_date_error(&mut errors, date_error);
     }
 
@@ -417,9 +417,7 @@ fn fail(
 
 /// Есть ли у элемента ошибка выражения для этого поля.
 fn has_date_error(raw: &RawItem, field: &str) -> bool {
-    raw.date_error
-        .as_ref()
-        .is_some_and(|error| error.field == field)
+    raw.date_error.iter().any(|error| error.field == field)
 }
 
 /// Показать ошибку выражения даты тем полем, к которому оно относится.

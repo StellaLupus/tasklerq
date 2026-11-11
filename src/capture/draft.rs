@@ -1008,13 +1008,7 @@ fn set<T>(target: &mut Option<T>, field: Field<T>) {
 /// Ошибку конца события пока снять нельзя: полей конца у [`ItemEdit`] нет,
 /// редактирование события в черновике — пункт 8.3.
 fn clear_date_error(raw: &mut RawItem, field: &str) {
-    if raw
-        .date_error
-        .as_ref()
-        .is_some_and(|error| error.field == field)
-    {
-        raw.date_error = None;
-    }
+    raw.date_error.retain(|error| error.field != field);
 }
 
 /// Убрать управляющие символы: `\u{0}` не принимает ни `text`, ни `jsonb`.
@@ -1057,9 +1051,9 @@ mod tests {
             due_time: None,
             end_date: None,
             end_time: None,
-            date_error: Some(RawDateError {
+            date_error: vec![RawDateError {
                 field: field.to_owned(),
-            }),
+            }],
             priority: None,
             assignee: None,
             assignee_id: None,
@@ -1081,7 +1075,7 @@ mod tests {
                 ..ItemEdit::default()
             },
         );
-        assert_eq!(item.date_error, None);
+        assert!(item.date_error.is_empty());
 
         let mut item = raw_with_date_error("recurrence");
         apply(
@@ -1092,7 +1086,7 @@ mod tests {
             },
         );
         assert!(
-            item.date_error.is_some(),
+            !item.date_error.is_empty(),
             "editing another field must keep the error"
         );
 
@@ -1104,7 +1098,30 @@ mod tests {
                 ..ItemEdit::default()
             },
         );
-        assert_eq!(item.date_error, None);
+        assert!(item.date_error.is_empty());
+    }
+
+    #[test]
+    fn fixing_the_start_keeps_the_note_date_error() {
+        let mut item = raw_with_date_error("due_date");
+        item.date_error.push(RawDateError {
+            field: "note_date".to_owned(),
+        });
+
+        apply(
+            &mut item,
+            ItemEdit {
+                due_date: Field::Value("2026-11-11".to_owned()),
+                ..ItemEdit::default()
+            },
+        );
+
+        let fields = item
+            .date_error
+            .iter()
+            .map(|error| error.field.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(fields, ["note_date"]);
     }
 
     #[test]
@@ -1117,6 +1134,6 @@ mod tests {
                 ..ItemEdit::default()
             },
         );
-        assert_eq!(item.date_error, None);
+        assert!(item.date_error.is_empty());
     }
 }

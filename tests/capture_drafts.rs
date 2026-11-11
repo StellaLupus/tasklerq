@@ -25,7 +25,7 @@ fn raw(title: &str, kind: ListKind) -> RawItem {
         due_time: None,
         end_date: None,
         end_time: None,
-        date_error: None,
+        date_error: Vec::new(),
         priority: None,
         assignee: None,
         assignee_id: None,
