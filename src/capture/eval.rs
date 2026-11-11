@@ -1,6 +1,6 @@
 //! Оценка smoke-набора `capture-v4` для проверки слота.
 //!
-//! Набор (`tests/golden/smoke-v4.json`, пункт 9.2) хранит версию контракта,
+//! Набор (`src/capture/prompts/smoke-v4.json`, пункт 9.2) хранит версию контракта,
 //! дату заморозки, фиксированное «сейчас» и фразы с контекстом в формате
 //! `capture-render`. Эталон — полный ответ `capture-v4`; он проходит тот же
 //! путь, что и ответ слота: [`wire`] → [`convert`] → [`validate`]. Поэтому
@@ -1955,7 +1955,7 @@ mod tests {
         assert!(error.contains("«сейчас»"), "{error}");
     }
 
-    const FROZEN_SMOKE_SET: &str = include_str!("../../tests/golden/smoke-v4.json");
+    const FROZEN_SMOKE_SET: &str = include_str!("prompts/smoke-v4.json");
 
     fn frozen_set() -> SmokeSet {
         SmokeSet::parse(FROZEN_SMOKE_SET).expect("набор разбирается")

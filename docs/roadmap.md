@@ -117,6 +117,7 @@ Telegram и без него.
 - `POST /api/v1/capture`: `auto`/`draft`, `Idempotency-Key`, undo.
 - Fallback, circuit breaker, квоты, голосовой таймаут 8 с.
 - Golden set и метрики по источникам.
+- Пересмотрено в 0011: слоты LLM, smoke-набор и проверка слота.
 
 **Выход:** ≥90% точности на golden set; подтверждение идемпотентно; голосовой
 capture создаёт элементы без Telegram; fallback работает.

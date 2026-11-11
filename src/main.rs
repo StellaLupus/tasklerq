@@ -61,10 +61,10 @@ enum Command {
     /// Прогнать smoke-набор `capture-v4` через один слот.
     ///
     /// Читает конфигурацию слотов из окружения `LLM_*` и `DATABASE_URL`.
-    /// Набор по умолчанию встроен в бинарник: в образе Docker нет каталога
-    /// `tests/`, а проверка идёт в контейнере. `--set PATH` — другой набор для
-    /// разработки; набор с версией контракта, отличной от действующей, —
-    /// ошибка до вызовов LLM.
+    /// Набор по умолчанию (`src/capture/prompts/smoke-v4.json`) встроен в
+    /// бинарник: в образе Docker нет исходников `tests/`, а проверка идёт в
+    /// контейнере. `--set PATH` — другой набор для разработки; набор с версией
+    /// контракта, отличной от действующей, — ошибка до вызовов LLM.
     ///
     /// Каждая фраза уходит в бэкенд выбранного слота напрямую: без цепочки,
     /// перехода на резервный слот и предохранителя. Ожидание — до 20 секунд,
@@ -921,13 +921,14 @@ async fn run_capture_eval(args: CaptureEvalArgs) -> Result<tasklerq::capture::ev
     let prepared = prepare_check(&args)?;
 
     // База проверяется до вызовов LLM: недоступная база не должна стоить
-    // платных запросов. Соединение держится до записи результата — это
-    // отдельный CLI-процесс, и других потребителей пула у него нет.
+    // платных запросов. Соединение сразу отпускается: прогон длится до
+    // нескольких минут, и серверный idle timeout мог бы оборвать его к моменту
+    // записи. Для записи результата берём соединение заново.
     let database = DatabaseConfig::from_env().context("invalid database configuration")?;
     let pool = storage::db::connect(&database)
         .await
         .context("database connection failed")?;
-    let mut conn = pool.acquire().await.context("database connection failed")?;
+    drop(pool.acquire().await.context("database connection failed")?);
 
     let report = slot_check::run_set(&prepared.backend, &prepared.set, prepared.slot.timeout)
         .await
@@ -946,6 +947,7 @@ async fn run_capture_eval(args: CaptureEvalArgs) -> Result<tasklerq::capture::ev
 
     let report_json = report.to_json();
     let parts_json = fingerprint.parts.to_json();
+    let mut conn = pool.acquire().await.context("database connection failed")?;
     llm_slot_checks::upsert(
         &mut conn,
         NewCheck {

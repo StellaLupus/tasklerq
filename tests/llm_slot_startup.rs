@@ -1,15 +1,22 @@
 //! Метрика статуса слота, когда база не читается при старте.
 //!
-//! Отдельный тестовый бинарник: метрики — глобальные серии процесса, и соседние
-//! сценарии этого файла не могут перезаписать `llm_slot_verified{slot="primary"}`.
+//! Метрики — глобальные серии процесса. Тесты этого файла выставляют
+//! `llm_slot_verified{slot="primary"}` в 1 под общим мьютексом, поэтому 0 после
+//! действия может появиться только от проверяемого кода.
 
 mod support;
 
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use tasklerq::app::build_application;
-use tasklerq::config::Config;
+use tasklerq::capture::slot_status::{LlmSlotHealth, SlotStatus};
+use tasklerq::config::{Config, LlmConfig, SecretString, SlotConfig};
 use tokio::sync::watch;
+
+/// Сериализует тесты, которые читают или пишут `llm_slot_verified`: реестр
+/// метрик общий на процесс.
+static SLOT_METRIC: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn metric_value(text: &str, series: &str) -> Option<f64> {
     text.lines().find_map(|line| {
@@ -23,6 +30,10 @@ fn metric_value(text: &str, series: &str) -> Option<f64> {
 
 #[tokio::test]
 async fn a_database_error_at_startup_publishes_an_unverified_metric() {
+    let _gauge = SLOT_METRIC.lock().await;
+    // Исходное значение 1: 0 ниже может выставить только проверяемый код.
+    tasklerq::metrics::llm_slot_verified("primary", true);
+
     let db = support::isolated_db().await;
     let database_url = support::database_url().await;
     sqlx::query("DROP TABLE llm_slot_checks")
@@ -63,4 +74,50 @@ async fn a_database_error_at_startup_publishes_an_unverified_metric() {
             .expect("worker must stop on shutdown")
             .expect("worker task must join");
     }
+}
+
+#[tokio::test]
+async fn an_unreadable_database_without_a_cache_marks_slots_unverified() {
+    let _gauge = SLOT_METRIC.lock().await;
+    // Исходное значение 1: 0 ниже может выставить только проверяемый код.
+    tasklerq::metrics::llm_slot_verified("primary", true);
+
+    let primary = SlotConfig {
+        url: "https://api.example.test/v1".parse().expect("url"),
+        model: "vendor/primary".to_owned(),
+        token: Some(SecretString::new("SECRET-slot-token")),
+        timeout: StdDuration::from_secs(10),
+        extra: Default::default(),
+    };
+    let chain = support::llm::chain(
+        support::llm::BackendDouble::always(Ok(support::llm::v4::response(vec![]))),
+        None,
+    );
+    let llm = LlmConfig {
+        enabled: true,
+        primary: Some(primary),
+        fallback: None,
+        connect_timeout: StdDuration::from_millis(1_000),
+        daily_quota: 200,
+    };
+    let health = LlmSlotHealth::new(Arc::new(chain), &llm).expect("llm health");
+
+    let broken = sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(StdDuration::from_millis(500))
+        .connect_lazy("postgres://tasklerq:secret@127.0.0.1:1/tasklerq")
+        .expect("lazy pool");
+
+    // Кеша ещё нет: ошибка чтения не должна оставить статус без метрики.
+    let statuses = health.statuses(&broken, chrono::Utc::now()).await;
+
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].status, SlotStatus::Unverified);
+    assert_eq!(
+        metric_value(
+            &tasklerq::metrics::render(),
+            "llm_slot_verified{slot=\"primary\"}"
+        ),
+        Some(0.0),
+        "a failed read without a cache must publish the alertable zero"
+    );
 }

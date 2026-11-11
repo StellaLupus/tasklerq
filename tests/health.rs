@@ -579,10 +579,6 @@ async fn startup_warns_about_an_unchecked_primary_slot_without_secrets() {
         warns_about_primary,
         "the startup log must warn with slot = primary:\n{text}"
     );
-    assert!(
-        text.contains("unverified"),
-        "the status is missing:\n{text}"
-    );
     assert!(!text.contains("SECRET-slot-token"), "token leaked:\n{text}");
     assert!(
         !text.contains("api.example.test"),

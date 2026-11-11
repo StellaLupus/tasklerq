@@ -902,7 +902,8 @@ OpenAI-совместимому API основного и резервного �
 2. Разверните образ по общему порядку из начала раздела 12. Черновики,
    созданные до обновления, истекают за 15 минут.
 3. Проверьте слоты встроенной командой в контейнере. Нужен `DATABASE_URL`;
-   набор фраз встроен в бинарник, сеть нужна только до слота:
+   набор фраз (`src/capture/prompts/smoke-v4.json`) встроен в бинарник, сеть
+   нужна только до слота:
 
    ```bash
    sudo /usr/local/bin/docker compose exec tasklerq \
@@ -1507,7 +1508,8 @@ proxy, проверка слотов LLM, backup), остаются в 15.2 и �
 
 1. Проверьте `LLM_CAPTURE_ENABLED=true`, `LLM_PRIMARY_URL` и
    `LLM_PRIMARY_MODEL`; резервный слот — `LLM_FALLBACK_*` вместе или не задан.
-2. Проверьте слот командой в контейнере (набор встроен, `DATABASE_URL` нужен):
+2. Проверьте слот командой в контейнере (набор
+   `src/capture/prompts/smoke-v4.json` встроен, `DATABASE_URL` нужен):
 
    ```bash
    sudo /usr/local/bin/docker compose exec tasklerq \
