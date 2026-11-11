@@ -142,13 +142,102 @@ pub struct RawItem {
     pub recurrence: Option<RawRecurrence>,
 }
 
+/// Уточнение: номер элемента `items` и тема вопроса.
+///
+/// Сервер сам решает, задавать ли вопрос: уточнение о несуществующем элементе
+/// или о уже заполненном поле отбрасывается при сохранении черновика.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Clarification {
+    /// Номер элемента `items` с нуля.
+    pub item: usize,
+    /// Тема вопроса.
+    pub topic: ClarificationTopic,
+}
+
+/// Тема уточняющего вопроса; значения совпадают с
+/// [`super::contract::CLARIFICATION_TOPICS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClarificationTopic {
+    /// Дата.
+    Date,
+    /// Время.
+    Time,
+    /// Исполнитель или участник.
+    Assignee,
+    /// Список.
+    List,
+}
+
+impl ClarificationTopic {
+    /// Короткий текст вопроса на русском: его показывают Telegram и внешний
+    /// capture. Полноценные экраны по темам — пункт 8.2.
+    pub fn question(self) -> &'static str {
+        match self {
+            Self::Date => "Когда?",
+            Self::Time => "Во сколько?",
+            Self::Assignee => "Кому поручить?",
+            Self::List => "В какой список?",
+        }
+    }
+
+    /// Поле элемента уже заполнено, поэтому уточнение закрыто.
+    ///
+    /// У `RawItem` нет отдельного признака «весь день»: вседневное событие
+    /// отличается отсутствием времени, а не отдельным полем, поэтому вопрос о
+    /// времени закрыт только названным временем.
+    pub fn is_filled(self, item: &RawItem) -> bool {
+        let named = |value: &Option<String>| {
+            value
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+        };
+        match self {
+            Self::Date => item.due_date.is_some(),
+            Self::Time => item.due_time.is_some(),
+            Self::Assignee => named(&item.assignee) || item.assignee_id.is_some(),
+            Self::List => named(&item.target_list),
+        }
+    }
+}
+
+/// Оставить уточнения только о существующих элементах с незаполненным полем и
+/// не больше [`MAX_CLARIFICATIONS`] штук.
+///
+/// Одна и та же проверка нужна и ответу внешнего capture (до сохранения
+/// черновика), и самому черновику при создании, дописывании и правке.
+pub fn normalize_clarifications(
+    items: &[RawItem],
+    clarifications: Vec<Clarification>,
+) -> Vec<Clarification> {
+    let mut kept = Vec::new();
+    for clarification in clarifications {
+        if kept.len() == MAX_CLARIFICATIONS {
+            break;
+        }
+        let Some(item) = items.get(clarification.item) else {
+            continue;
+        };
+        if clarification.topic.is_filled(item) {
+            continue;
+        }
+        kept.push(clarification);
+    }
+    kept
+}
+
 /// Разобранный ответ LLM.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ParsedResponse {
     /// Элементы, не более [`MAX_ITEMS`].
     pub items: Vec<RawItem>,
-    /// Вопросы, не более [`MAX_CLARIFICATIONS`].
-    pub clarifications: Vec<String>,
+    /// Уточнения, не более [`MAX_CLARIFICATIONS`].
+    pub clarifications: Vec<Clarification>,
+    /// Вопросы прежнего ответа v3 свободным текстом. Заполняет только
+    /// [`parse_response`]; боевой путь v4 их не создаёт, а в 9.1 поле исчезает
+    /// вместе с парсером v3.
+    pub legacy_questions: Vec<String>,
 }
 
 /// Разобрать объект `data` ответа v3. Боевой путь сюда не заходит: парсер
@@ -178,18 +267,19 @@ pub fn parse_response(data: &Value) -> Result<ParsedResponse, ParseError> {
 
     // Вопросы — вторичное поле: испорченное значение не должно отбрасывать
     // валидные элементы и запускать повтор запроса к LLM.
-    let mut clarifications = text_list(
+    let mut legacy_questions = text_list(
         root.get("clarifications"),
         None,
         "clarifications",
         "question",
     )
     .unwrap_or_default();
-    clarifications.truncate(MAX_CLARIFICATIONS);
+    legacy_questions.truncate(MAX_CLARIFICATIONS);
 
     Ok(ParsedResponse {
         items,
-        clarifications,
+        clarifications: Vec::new(),
+        legacy_questions,
     })
 }
 
@@ -688,7 +778,10 @@ mod tests {
 
         let parsed = parse_response(&data).unwrap();
 
-        assert_eq!(parsed.clarifications, ["Какой Алексей?", "Когда?", "Где?"]);
+        assert_eq!(
+            parsed.legacy_questions,
+            ["Какой Алексей?", "Когда?", "Где?"]
+        );
     }
 
     #[test]
@@ -702,7 +795,7 @@ mod tests {
             let parsed = parse_response(&data).unwrap();
 
             assert_eq!(parsed.items.len(), 1);
-            assert!(parsed.clarifications.is_empty());
+            assert!(parsed.legacy_questions.is_empty());
         }
     }
 
@@ -710,6 +803,7 @@ mod tests {
     fn absent_clarifications_are_empty() {
         let parsed = parse_response(&json!({"items": []})).unwrap();
 
+        assert!(parsed.legacy_questions.is_empty());
         assert!(parsed.clarifications.is_empty());
     }
 

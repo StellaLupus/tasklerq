@@ -11,7 +11,10 @@ use chrono::{DateTime, Months, NaiveDate, NaiveTime, Utc};
 use uuid::Uuid;
 
 use super::context::{CaptureContext, ListRef};
-use super::schema::{ParsedResponse, RawDateError, RawItem, RawRecurrence};
+use super::schema::{
+    MAX_CLARIFICATIONS, ParsedResponse, RawDateError, RawItem, RawRecurrence,
+    normalize_clarifications,
+};
 use crate::domain::events::end_day;
 use crate::domain::models::{
     ItemPriority, ItemSource, ListKind, MonthRule, NewItem, RecurrenceFreq, RecurrenceInput,
@@ -157,13 +160,26 @@ pub fn validate_items_in(
     parsed: ParsedResponse,
     mode: ValidationMode,
 ) -> ValidatedDraft {
+    let ParsedResponse {
+        items,
+        clarifications,
+        legacy_questions,
+    } = parsed;
+    let clarifications = normalize_clarifications(&items, clarifications);
     ValidatedDraft {
-        items: parsed
-            .items
+        items: items
             .into_iter()
             .map(|raw| validate_item_in(context, source, raw, mode))
             .collect(),
-        clarifications: parsed.clarifications,
+        // Карточка и внешний capture показывают короткий текст по теме. Вопросы
+        // прежнего ответа v3 приходят готовыми строками: их читает только eval
+        // до переписывания в 9.1.
+        clarifications: clarifications
+            .iter()
+            .map(|clarification| clarification.topic.question().to_owned())
+            .chain(legacy_questions)
+            .take(MAX_CLARIFICATIONS)
+            .collect(),
     }
 }
 
@@ -601,10 +617,7 @@ fn resolve_list<'a>(context: &'a CaptureContext, raw: &RawItem) -> (Option<&'a L
         }
     }
     let default = context.default_list(raw.target_kind);
-    let is_default_name = named
-        .as_deref()
-        .is_some_and(|name| default.is_some_and(|list| fold(&list.name) == name));
-    (default, named.is_some() && !is_default_name)
+    (default, named.is_some())
 }
 
 enum Assignee {

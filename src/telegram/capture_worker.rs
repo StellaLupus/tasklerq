@@ -20,7 +20,7 @@ use crate::capture::context::CaptureContext;
 use crate::capture::draft::{self, NewCapture};
 use crate::capture::llm::{self, Failure as LlmFailure};
 use crate::capture::prompt::PROMPT_VERSION;
-use crate::capture::schema::{MAX_ITEMS, ParseError, ParsedResponse};
+use crate::capture::schema::{Clarification, MAX_ITEMS, ParseError, ParsedResponse, RawItem};
 use crate::capture::validate::validate_item;
 use crate::domain::error::DomainError;
 use crate::domain::models::{Actor, CaptureMode, Household, Item, ItemSource, ListKind, User};
@@ -158,6 +158,32 @@ fn apply_default_list(
             _ => item.target_list = Some(list.name.clone()),
         }
     }
+}
+
+/// Пересчитать номера уточнений после прямого добавления.
+///
+/// Часть элементов разбора создаётся сразу, а остальные попадают в черновик в
+/// другом порядке; вопросы о созданных элементах отбрасываются, а номера
+/// оставшихся указывают на новый порядок.
+fn reindex_clarifications(
+    parsed_len: usize,
+    draft_items: &[(usize, RawItem)],
+    clarifications: Vec<Clarification>,
+) -> Vec<Clarification> {
+    let mut positions = vec![None; parsed_len];
+    for (new_index, (old_index, _)) in draft_items.iter().enumerate() {
+        positions[*old_index] = Some(new_index);
+    }
+    clarifications
+        .into_iter()
+        .filter_map(|clarification| {
+            let item = positions.get(clarification.item).copied().flatten()?;
+            Some(Clarification {
+                item,
+                ..clarification
+            })
+        })
+        .collect()
 }
 
 /// Сравнение названий списков без регистра и «ё».
@@ -606,17 +632,19 @@ impl CaptureWorker {
         let ParsedResponse {
             items: parsed_items,
             clarifications,
+            ..
         } = parsed;
+        let parsed_len = parsed_items.len();
         let mut direct = Vec::new();
         let mut draft_items = Vec::new();
-        for mut item in parsed_items {
+        for (index, mut item) in parsed_items.into_iter().enumerate() {
             if item.target_kind == ListKind::Shopping {
                 // Экран задаёт целевой список: разбор не должен уводить
                 // покупку в другой список.
                 item.target_list = Some(target_name.clone());
-                direct.push(item);
+                direct.push((index, item));
             } else {
-                draft_items.push(item);
+                draft_items.push((index, item));
             }
         }
 
@@ -632,11 +660,11 @@ impl CaptureWorker {
             .map_err(into_sqlx)?;
 
         let mut new_items = Vec::new();
-        for raw in direct {
+        for (index, raw) in direct {
             let checked = validate_item(context, ItemSource::Telegram, raw.clone());
             let Some(mut new_item) = checked.item else {
                 // Невалидную покупку не теряем: её можно поправить в черновике.
-                draft_items.push(raw);
+                draft_items.push((index, raw));
                 continue;
             };
             // Имя списка могло совпасть с другим: экран задаёт идентификатор.
@@ -676,6 +704,11 @@ impl CaptureWorker {
         let draft = if draft_items.is_empty() {
             None
         } else {
+            let clarifications = reindex_clarifications(parsed_len, &draft_items, clarifications);
+            let draft_items = draft_items
+                .into_iter()
+                .map(|(_, item)| item)
+                .collect::<Vec<_>>();
             let draft = draft::append_or_create(
                 &mut tx,
                 NewCapture {
@@ -691,6 +724,7 @@ impl CaptureWorker {
                     parsed: ParsedResponse {
                         items: draft_items,
                         clarifications,
+                        legacy_questions: Vec::new(),
                     },
                     fallback: false,
                     prompt_version: Some(PROMPT_VERSION.to_owned()),
@@ -973,5 +1007,69 @@ impl CaptureWorker {
                 () = tokio::time::sleep(Duration::from_millis(500)) => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture::schema::ClarificationTopic;
+
+    fn raw(title: &str) -> RawItem {
+        RawItem {
+            target_kind: ListKind::Tasks,
+            target_list: None,
+            title: title.to_owned(),
+            notes: None,
+            due_date: None,
+            due_time: None,
+            end_date: None,
+            end_time: None,
+            date_error: Vec::new(),
+            priority: None,
+            assignee: None,
+            assignee_id: None,
+            tags: Vec::new(),
+            quantity: None,
+            unit: None,
+            subtasks: Vec::new(),
+            recurrence: None,
+        }
+    }
+
+    #[test]
+    fn clarifications_follow_items_that_stay_in_the_draft() {
+        let draft_items = vec![(1, raw("Второе")), (2, raw("Третье"))];
+        let clarifications = vec![
+            Clarification {
+                item: 0,
+                topic: ClarificationTopic::Date,
+            },
+            Clarification {
+                item: 1,
+                topic: ClarificationTopic::Time,
+            },
+            Clarification {
+                item: 2,
+                topic: ClarificationTopic::List,
+            },
+        ];
+
+        let reindexed = reindex_clarifications(3, &draft_items, clarifications);
+
+        assert_eq!(
+            reindexed,
+            [
+                Clarification {
+                    item: 0,
+                    topic: ClarificationTopic::Time,
+                },
+                Clarification {
+                    item: 1,
+                    topic: ClarificationTopic::List,
+                },
+            ],
+            "the item created directly loses its question, the rest are renumbered"
+        );
     }
 }

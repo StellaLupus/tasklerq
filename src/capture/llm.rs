@@ -15,7 +15,7 @@ use super::context::CaptureContext;
 use super::convert;
 use super::prompt;
 use super::schema::{ParseError, ParsedResponse};
-use super::wire::{self, Clarification, ClarificationTopic};
+use super::wire;
 use crate::llm::{Attempt, Chain, ChainError, ChatRequest, ResponseFailure, SystemClock};
 use crate::metrics;
 
@@ -184,11 +184,8 @@ fn parse(
                 .iter()
                 .map(|item| convert::convert_item(item, context))
                 .collect(),
-            clarifications: response
-                .clarifications
-                .iter()
-                .map(clarification_question)
-                .collect(),
+            clarifications: response.clarifications,
+            legacy_questions: Vec::new(),
         }),
         Err(error) => {
             metrics::llm_validation_failure();
@@ -202,19 +199,4 @@ fn parse(
             }
         }
     }
-}
-
-/// Текст вопроса по теме уточнения.
-///
-/// Черновик хранит уточнения строками до пункта 8.1, а кнопочные экраны для тем
-/// `date` и `assignee` строятся из ошибок валидатора. Эта функция лишь
-/// сохраняет прежний вид вопросов модели; в 8.2 вопросы строятся по теме.
-fn clarification_question(clarification: &Clarification) -> String {
-    match clarification.topic {
-        ClarificationTopic::Date => "Когда?",
-        ClarificationTopic::Time => "Во сколько?",
-        ClarificationTopic::Assignee => "Кому поручить?",
-        ClarificationTopic::List => "В какой список?",
-    }
-    .to_owned()
 }

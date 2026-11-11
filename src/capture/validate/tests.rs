@@ -760,7 +760,11 @@ fn one_invalid_item_blocks_the_whole_draft_but_keeps_the_rest_visible() {
     bad.due_date = Some("2026-10-29".to_owned());
     let parsed = ParsedResponse {
         items: vec![raw(ListKind::Shopping, "Молоко"), bad],
-        clarifications: vec!["Когда?".to_owned()],
+        clarifications: vec![crate::capture::schema::Clarification {
+            item: 0,
+            topic: crate::capture::schema::ClarificationTopic::Date,
+        }],
+        ..ParsedResponse::default()
     };
 
     let draft = validate_items(&context(), ItemSource::HaVoice, parsed);
@@ -768,6 +772,34 @@ fn one_invalid_item_blocks_the_whole_draft_but_keeps_the_rest_visible() {
     assert!(!draft.is_valid());
     assert!(draft.items[0].is_valid());
     assert!(!draft.items[1].is_valid());
+    assert_eq!(draft.clarifications, ["Когда?"]);
+}
+
+#[test]
+fn clarifications_about_filled_fields_are_dropped() {
+    let mut dated = task();
+    dated.due_date = Some("2026-10-30".to_owned());
+    let parsed = ParsedResponse {
+        items: vec![dated, task()],
+        clarifications: vec![
+            crate::capture::schema::Clarification {
+                item: 0,
+                topic: crate::capture::schema::ClarificationTopic::Date,
+            },
+            crate::capture::schema::Clarification {
+                item: 1,
+                topic: crate::capture::schema::ClarificationTopic::Date,
+            },
+            crate::capture::schema::Clarification {
+                item: 9,
+                topic: crate::capture::schema::ClarificationTopic::Date,
+            },
+        ],
+        ..ParsedResponse::default()
+    };
+
+    let draft = validate_items(&context(), ItemSource::Telegram, parsed);
+
     assert_eq!(draft.clarifications, ["Когда?"]);
 }
 
@@ -789,6 +821,7 @@ fn mixed_valid_draft_passes() {
     let parsed = ParsedResponse {
         items: vec![milk, raw(ListKind::Shopping, "Хлеб"), call],
         clarifications: Vec::new(),
+        legacy_questions: Vec::new(),
     };
 
     let draft = validate_items(&context(), ItemSource::Telegram, parsed);

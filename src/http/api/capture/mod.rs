@@ -838,6 +838,7 @@ async fn apply_fallback(
             recurrence: None,
         }],
         clarifications: Vec::new(),
+        legacy_questions: Vec::new(),
     };
     let item_source = draft::item_source(input.source);
     let validated = validate_items_in(
@@ -1051,10 +1052,6 @@ pub(super) fn applied_speech(items: &[CaptureItem]) -> String {
             let titles = titles(items);
             format!("Добавил {}: {titles}.", kind_noun(kind, count))
         }
-        Some(ListKind::Events) => {
-            let titles = titles(items);
-            format!("Добавил {}: {titles}.", kind_noun(ListKind::Events, count))
-        }
         _ => format!("Добавил {}.", elements(count)),
     }
 }
@@ -1063,9 +1060,6 @@ fn draft_speech(items: &[CaptureItem]) -> String {
     let count = items.len();
     match common_kind(items) {
         Some(kind) if count <= 3 => format!("Сохранил черновик: {}.", kind_noun(kind, count)),
-        Some(ListKind::Events) => {
-            format!("Сохранил черновик: {}.", kind_noun(ListKind::Events, count))
-        }
         _ => format!("Сохранил черновик: {}.", elements(count)),
     }
 }
@@ -1258,6 +1252,22 @@ mod tests {
                 item(ListKind::Tasks, "позвонить")
             ]),
             "Добавил 2 элемента."
+        );
+        assert_eq!(
+            applied_speech(
+                &(0..4)
+                    .map(|n| item(ListKind::Events, &format!("встреча {n}")))
+                    .collect::<Vec<_>>()
+            ),
+            "Добавил 4 элемента."
+        );
+        assert_eq!(
+            draft_speech(
+                &(0..5)
+                    .map(|n| item(ListKind::Events, &format!("встреча {n}")))
+                    .collect::<Vec<_>>()
+            ),
+            "Сохранил черновик: 5 элементов."
         );
     }
 

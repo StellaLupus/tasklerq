@@ -238,8 +238,8 @@ async fn a_phrase_in_a_wrong_typed_field_does_not_reach_stderr() {
     assert!(!output.status.success(), "{output:?}");
     let errors = stderr(&output);
     assert!(
-        errors.contains("context"),
-        "the field path is named: {errors}"
+        errors.contains("неверная запись"),
+        "the message names the kind of error: {errors}"
     );
     assert!(
         !errors.contains(PHRASE),

@@ -76,11 +76,12 @@ pub(super) fn clarification(mut ui: Ui, view: &DraftView) -> Ui {
     }
 
     // Вопросы модели без готовых вариантов: показать их можно, но ответ
-    // придётся внести через форму. Новый разбор текста не запускаем.
-    for question in view.validated.clarifications.iter().take(remaining) {
-        ui = ui.text(format!("❓ {question}"));
+    // придётся внести через форму. Карточка строит текст из темы, а не хранит
+    // готовые строки. Новый разбор текста не запускаем.
+    for clarification in view.clarifications.iter().take(remaining) {
+        ui = ui.text(format!("❓ {}", clarification.topic.question()));
     }
-    if !view.validated.clarifications.is_empty() {
+    if !view.clarifications.is_empty() {
         ui = ui.text("Поправьте элемент через «Изменить».");
     }
     ui

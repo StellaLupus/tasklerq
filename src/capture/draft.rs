@@ -12,6 +12,7 @@
 //! подтверждения выстраиваются в очередь и второе видит результат первого.
 
 use chrono::{DateTime, Days, Utc};
+use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Connection, PgConnection};
@@ -19,7 +20,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use super::context::CaptureContext;
-use super::schema::{MAX_CLARIFICATIONS, MAX_ITEMS, ParsedResponse, RawItem, RawRecurrence};
+use super::schema::{
+    Clarification, MAX_CLARIFICATIONS, MAX_ITEMS, ParsedResponse, RawItem, RawRecurrence,
+    normalize_clarifications,
+};
 use super::validate::{DraftItem, ValidatedDraft, validate_items};
 use crate::domain::error::DomainError;
 use crate::domain::models::{
@@ -141,21 +145,47 @@ impl From<capture_requests::CompleteError> for StoreError {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Stored {
     items: Vec<RawItem>,
-    clarifications: Vec<String>,
+    /// Уточнения хранятся парами «номер элемента, тема». Черновик прежнего
+    /// формата держал здесь строки вопросов: они отбрасываются при чтении, а
+    /// элементы и счётчик ответов читаются как обычно.
+    #[serde(default, deserialize_with = "read_clarifications")]
+    clarifications: Vec<Clarification>,
     /// Сколько уточняющих вопросов пользователь уже закрыл. Счётчик живёт в
     /// `parsed`, поэтому переживает перерисовку карточки и не требует миграции.
     #[serde(default)]
     clarifications_answered: u8,
 }
 
+/// Прочитать уточнения, пропуская записи прежнего формата (строки) и
+/// испорченные значения. Остальное содержимое черновика не страдает.
+fn read_clarifications<'de, D>(deserializer: D) -> Result<Vec<Clarification>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    let Value::Array(entries) = value else {
+        return Ok(Vec::new());
+    };
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| serde_json::from_value(entry).ok())
+        .collect())
+}
+
 impl Stored {
     fn from_parsed(parsed: ParsedResponse) -> Self {
+        let ParsedResponse {
+            items,
+            clarifications,
+            ..
+        } = parsed;
         let mut stored = Self {
-            items: parsed.items,
-            clarifications: parsed.clarifications,
+            items,
+            clarifications: Vec::new(),
             clarifications_answered: 0,
         };
         stored.items.iter_mut().for_each(scrub);
+        stored.clarifications = normalize_clarifications(&stored.items, clarifications);
         stored
     }
 
@@ -219,6 +249,9 @@ pub struct DraftView {
     /// Те же элементы без проверки, в том же порядке: по ним форма правки
     /// заполняется и для невалидного элемента.
     pub raw: Vec<RawItem>,
+    /// Уточнения модели парами «номер элемента, тема»; закрытые и устаревшие
+    /// отброшены при сохранении.
+    pub clarifications: Vec<Clarification>,
     /// Контекст, по которому шла проверка.
     pub context: CaptureContext,
     /// Сколько уточняющих вопросов уже закрыто.
@@ -443,12 +476,22 @@ async fn try_append(
         return Ok(None);
     }
 
+    let offset = stored.items.len();
     stored.items.append(&mut added.items);
-    // Вопросы при дописывании копятся: сверх потолка новые отбрасываются.
+    // Вопросы при дописывании копятся: сверх потолка новые отбрасываются, а
+    // номера элементов сдвигаются на число уже имевшихся.
     let capacity = MAX_CLARIFICATIONS.saturating_sub(stored.clarifications.len());
-    stored
-        .clarifications
-        .extend(added.clarifications.into_iter().take(capacity));
+    stored.clarifications.extend(
+        added
+            .clarifications
+            .into_iter()
+            .map(|clarification| Clarification {
+                item: clarification.item + offset,
+                ..clarification
+            })
+            .take(capacity),
+    );
+    stored.clarifications = normalize_clarifications(&stored.items, stored.clarifications);
     let parsed = stored.to_value();
     let expires_at = now + chrono::Duration::minutes(drafts::DRAFT_TTL_MINUTES);
     drafts::append(
@@ -490,6 +533,7 @@ async fn build_view(
     let context = load_context_for(conn, draft.household_id, draft.user_id, now).await?;
     let stored = Stored::read(&draft)?;
     let clarifications_answered = stored.clarifications_answered;
+    let clarifications = stored.clarifications.clone();
     let raw = stored.items.clone();
     let validated = validate_items(
         &context,
@@ -497,12 +541,14 @@ async fn build_view(
         ParsedResponse {
             items: stored.items,
             clarifications: stored.clarifications,
+            legacy_questions: Vec::new(),
         },
     );
     Ok(DraftView {
         draft,
         validated,
         raw,
+        clarifications,
         context,
         clarifications_answered,
     })
@@ -546,6 +592,7 @@ pub async fn remove_item(
         return Err(DraftError::NoSuchItem(index));
     }
     stored.items.remove(index);
+    drop_item_clarifications(&mut stored.clarifications, index);
     let view = save_and_view(&mut tx, draft, stored, now).await?;
     tx.commit().await?;
     Ok(view)
@@ -680,11 +727,16 @@ fn ensure_clarification_left(stored: &Stored) -> Result<(), DraftError> {
 
 /// Записать изменённое содержимое и вернуть черновик с ним же, чтобы не
 /// сериализовать `parsed` повторно.
+///
+/// Перед записью уточнения нормализуются: ответ или правка пользователя могли
+/// заполнить поле, и тогда вопрос закрыт.
 async fn persist(
     conn: &mut PgConnection,
     draft: Draft,
-    stored: &Stored,
+    stored: &mut Stored,
 ) -> Result<Draft, DraftError> {
+    stored.clarifications =
+        normalize_clarifications(&stored.items, std::mem::take(&mut stored.clarifications));
     let parsed = stored.to_value();
     drafts::set_parsed(conn, draft.household_id, draft.id, &parsed).await?;
     Ok(Draft {
@@ -696,11 +748,25 @@ async fn persist(
 async fn save_and_view(
     conn: &mut PgConnection,
     draft: Draft,
-    stored: Stored,
+    mut stored: Stored,
     now: DateTime<Utc>,
 ) -> Result<DraftView, DraftError> {
-    let draft = persist(conn, draft, &stored).await?;
+    let draft = persist(conn, draft, &mut stored).await?;
     Ok(build_view(conn, draft, now).await?)
+}
+
+/// Удалённый элемент больше не существует: его уточнения отбрасываются, а
+/// номера следующих элементов сдвигаются.
+fn drop_item_clarifications(clarifications: &mut Vec<Clarification>, index: usize) {
+    clarifications.retain_mut(|clarification| {
+        if clarification.item == index {
+            return false;
+        }
+        if clarification.item > index {
+            clarification.item -= 1;
+        }
+        true
+    });
 }
 
 /// Подтвердить черновик: все элементы создаются одной транзакцией.

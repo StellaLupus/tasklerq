@@ -18,6 +18,7 @@ use serde_json::{Map, Value};
 
 use super::context::CaptureContext;
 use super::contract::{FIELD_ORDER, FORMS, Field, Form, FormSpec};
+pub use super::schema::{Clarification, ClarificationTopic};
 use super::schema::{MAX_CLARIFICATIONS, MAX_ITEMS, ParseError};
 use crate::domain::models::{ItemPriority, ListKind, MonthRule, RecurrenceFreq};
 
@@ -272,31 +273,6 @@ pub enum Weekday {
     /// Воскресенье.
     #[serde(rename = "sunday")]
     Sunday,
-}
-
-/// Уточнение: номер элемента и тема вопроса.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Clarification {
-    /// Номер элемента `items` с нуля.
-    pub item: usize,
-    /// Тема вопроса.
-    pub topic: ClarificationTopic,
-}
-
-/// Тема уточняющего вопроса; значения совпадают с
-/// [`CLARIFICATION_TOPICS`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ClarificationTopic {
-    /// Дата.
-    Date,
-    /// Время.
-    Time,
-    /// Исполнитель или участник.
-    Assignee,
-    /// Список.
-    List,
 }
 
 /// Разобрать текст ответа `capture-v4`.
@@ -1287,6 +1263,13 @@ mod tests {
         assert_eq!(first.items[2].kind(), ListKind::Checklist);
         assert_eq!(first.items[3].form(), Form::Event);
         assert_eq!(first.items[4].form(), Form::Event);
+        match &first.items[3] {
+            Item::Event(event) => assert_eq!(
+                event.assignee, None,
+                "встреча из примера не называет исполнителя"
+            ),
+            other => panic!("not an event: {other:?}"),
+        }
         assert_eq!(
             first.clarifications,
             [Clarification {

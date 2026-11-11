@@ -3714,7 +3714,9 @@ async fn appended_clarifications_stop_at_the_limit() {
         3,
         "new questions over the limit must be dropped: {clarifications:?}"
     );
-    assert_eq!(clarifications[0], json!("В какой список?"));
+    assert_eq!(clarifications[0], json!({"item": 0, "topic": "list"}));
+    assert_eq!(clarifications[1], json!({"item": 0, "topic": "date"}));
+    assert_eq!(clarifications[2], json!({"item": 0, "topic": "time"}));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
