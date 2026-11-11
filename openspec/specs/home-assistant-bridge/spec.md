@@ -177,8 +177,9 @@ MUST не позволять создать две интеграции для �
 предложения Assist (custom sentences) вызывают `intent_script`, который вызывает
 `tasklerq.capture` и озвучивает `speech` из ответа сервиса. Пример конфигурации
 MUST поставляться в документации и примере пакета. Сценарий MUST работать без
-Telegram и MUST NOT требовать включения Assist-инструментов (`llm_hass_api`) у
-AI Task.
+Telegram и MUST NOT требовать ни сущности AI Task в Home Assistant, ни
+включения Assist-инструментов (`llm_hass_api`): разбор выполняет Tasklerq через
+собственные слоты LLM.
 
 #### Scenario: Покупка голосом
 
@@ -195,13 +196,13 @@ AI Task.
 
 #### Scenario: LLM недоступна
 
-- **WHEN** AI Task не отвечает
+- **WHEN** ни один слот LLM Tasklerq не отвечает
 - **THEN** Tasklerq создаёт одну позицию из исходного текста
 - **AND** Assist озвучивает «Записал как есть»
 
 #### Scenario: Без Assist-инструментов
 
-- **WHEN** у AI Task не включён `llm_hass_api`
+- **WHEN** в Home Assistant нет ни одной сущности AI Task
 - **THEN** голосовой capture всё равно работает
 - **AND** LLM не получает инструментов управления HA
 
