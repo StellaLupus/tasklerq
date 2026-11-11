@@ -81,6 +81,23 @@ impl SmokeSet {
     }
 }
 
+/// Версия контракта набора — та же, что у действующего разбора.
+///
+/// Набор с другой версией не проверяет слот: эталоны относятся к прежнему
+/// контракту, поэтому команда обязана ошибиться до вызовов LLM, а не сообщить
+/// ложный провал слота. Проверка живёт в продуктовом коде, а не только в
+/// тестах: её используют и `capture-eval`, и тест замороженного набора.
+pub fn check_prompt_version(set: &SmokeSet) -> Result<(), String> {
+    if set.prompt_version != super::prompt::PROMPT_VERSION {
+        return Err(format!(
+            "набор составлен для контракта {}, действующий — {}",
+            set.prompt_version,
+            super::prompt::PROMPT_VERSION
+        ));
+    }
+    Ok(())
+}
+
 /// Один и тот же момент, даже если записан с другим смещением.
 fn same_moment(left: &str, right: &str) -> bool {
     match (
@@ -412,7 +429,8 @@ impl Report {
         })
     }
 
-    /// Читаемый отчёт.
+    /// Читаемый отчёт: итог, каждая фраза с фактическим временем и причиной
+    /// провала, вердикт по слоту.
     pub fn to_text(&self) -> String {
         let mut text = format!(
             "Набор {} от {}: пройдено {} из {}\nЗадержка p95: {} — {}\n",
@@ -423,12 +441,22 @@ impl Report {
             seconds(self.p95()),
             self.grade().label(),
         );
-        for result in self.failed() {
+        for result in &self.results {
             text.push_str(&format!(
-                "{} ({}): {}\n",
+                "{} ({}): {} — {}\n",
                 result.id,
                 result.category.label(),
+                seconds(result.duration),
                 failure_text(result.failure.as_ref()),
+            ));
+        }
+        if self.passed() {
+            text.push_str("Слот прошёл проверку\n");
+        } else {
+            text.push_str(&format!(
+                "Слот не прошёл проверку: пройдено {} из {}\n",
+                self.passed_count(),
+                self.total()
             ));
         }
         text
@@ -483,15 +511,23 @@ pub fn judge(
         failure: None,
     };
 
-    // Ошибка клиента важнее длительности: код транспорта объясняет провал.
-    // Исключение — клиентский таймаут: это и есть причина `timeout`, и она
-    // должна нести фактическое время ожидания.
-    if let SlotAnswer::Error { code } = &run.answer
-        && code != "timeout"
-    {
-        result.failure = Some(Failure::Transport { code: code.clone() });
-        return Ok(result);
-    }
+    // Ошибка клиента важнее длительности, кроме собственного таймаута клиента:
+    // это и есть причина `timeout`, и она несёт фактическое время ожидания.
+    // Клиентский `timeout` — таймаут, даже если ожидание оказалось короче
+    // таймаута слота: ответа всё равно нет, а причина провала — время.
+    let text = match &run.answer {
+        SlotAnswer::Error { code } => {
+            result.failure = Some(if code == "timeout" {
+                Failure::Timeout {
+                    actual_ms: result.duration_ms(),
+                }
+            } else {
+                Failure::Transport { code: code.clone() }
+            });
+            return Ok(result);
+        }
+        SlotAnswer::Text(text) => text,
+    };
 
     if run.duration > timeout {
         result.failure = Some(Failure::Timeout {
@@ -499,14 +535,6 @@ pub fn judge(
         });
         return Ok(result);
     }
-
-    let text = match &run.answer {
-        SlotAnswer::Error { code } => {
-            result.failure = Some(Failure::Transport { code: code.clone() });
-            return Ok(result);
-        }
-        SlotAnswer::Text(text) => text,
-    };
     let response = match wire::parse_capture_response(text, &context) {
         Ok(response) => response,
         Err(error) => {
@@ -1686,6 +1714,19 @@ mod tests {
     }
 
     #[test]
+    fn a_client_timeout_before_the_slot_timeout_is_still_a_timeout() {
+        let phrase = phrase("client-timeout", Category::Simple, json!({"items": []}));
+        let context: InputContext = serde_json::from_value(context_value()).expect("context");
+        // Клиент оборвал ожидание раньше таймаута слота: верного ответа нет,
+        // значит причина — таймаут, а не транспорт с кодом.
+        let run = SlotRun::error("timeout", Duration::from_millis(300));
+
+        let result = judge(&phrase, &context, &run, Duration::from_secs(4)).expect("judged");
+
+        assert_eq!(result.failure, Some(Failure::Timeout { actual_ms: 300 }));
+    }
+
+    #[test]
     fn an_unparsed_answer_is_a_schema_failure_with_the_parse_code() {
         let phrase = phrase("schema", Category::Simple, json!({"items": []}));
 
@@ -1806,8 +1847,44 @@ mod tests {
         assert_eq!(report.grade(), LatencyGrade::Good);
         assert_eq!(report.failed().count(), 1);
         assert_eq!(report.p95(), Duration::from_secs(3));
-        assert!(report.to_text().contains("пройдено 1 из 2"));
-        assert!(report.to_text().contains("ожидали «Купить молоко»"));
+        let text = report.to_text();
+        assert!(text.contains("пройдено 1 из 2"), "{text}");
+        assert!(text.contains("ожидали «Купить молоко»"), "{text}");
+        assert!(
+            text.contains("good (простые задачи): 1.0 с — пройдено"),
+            "{text}"
+        );
+        assert!(
+            text.contains("bad (простые задачи): 3.0 с — mismatch"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Слот не прошёл проверку: пройдено 1 из 2"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_passed_slot_is_reported_as_passed() {
+        let phrase = phrase(
+            "good",
+            Category::Simple,
+            json!({"items": [task("Позвонить маме", date_none())], "clarifications": []}),
+        );
+        let runs = BTreeMap::from([(
+            "good".to_owned(),
+            SlotRun::text(
+                response(vec![task("Позвонить маме", date_none())]),
+                Duration::from_secs(1),
+            ),
+        )]);
+        let mut set = set();
+        set.phrases = vec![phrase];
+
+        let report = evaluate(&set, &runs, Duration::from_secs(20)).expect("evaluated");
+
+        assert!(report.passed());
+        assert!(report.to_text().contains("Слот прошёл проверку"));
     }
 
     #[test]
@@ -1882,17 +1959,6 @@ mod tests {
 
     fn frozen_set() -> SmokeSet {
         SmokeSet::parse(FROZEN_SMOKE_SET).expect("набор разбирается")
-    }
-
-    /// Версия контракта набора — та же, что у действующего разбора.
-    fn check_prompt_version(set: &SmokeSet) -> Result<(), String> {
-        if set.prompt_version != PROMPT_VERSION {
-            return Err(format!(
-                "набор составлен для контракта {}, действующий — {}",
-                set.prompt_version, PROMPT_VERSION
-            ));
-        }
-        Ok(())
     }
 
     #[test]

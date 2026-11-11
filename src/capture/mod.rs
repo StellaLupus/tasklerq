@@ -11,6 +11,7 @@ pub mod llm;
 pub mod prompt;
 pub mod render;
 pub mod schema;
+pub mod slot_check;
 pub mod validate;
 pub mod wire;
 

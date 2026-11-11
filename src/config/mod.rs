@@ -348,7 +348,8 @@ impl LlmConfig {
     /// Загрузить только параметры LLM-capture из окружения.
     ///
     /// Нужно подкоманде `capture-eval`: остальная конфигурация сервиса ей не
-    /// требуется.
+    /// требуется. Слоты читаются и при `LLM_CAPTURE_ENABLED=false`: проверка
+    /// слота работает до включения разбора, если запрошенный слот задан.
     pub fn from_env() -> Result<Self, ConfigError> {
         Config::llm_config(&EnvSource::from_process())
     }

@@ -4,17 +4,21 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tasklerq::admin;
 use tasklerq::app::build_application;
-use tasklerq::config::{self, Config, DatabaseConfig, TenancyConfig};
+use tasklerq::capture::eval::SmokeSet;
+use tasklerq::capture::slot_check;
+use tasklerq::config::{self, Config, DatabaseConfig, LlmConfig, SlotConfig, TenancyConfig};
 use tasklerq::domain::error::DomainError;
 use tasklerq::domain::models::UserRole;
 use tasklerq::http::server;
+use tasklerq::llm::OpenAiBackend;
 use tasklerq::redaction;
 use tasklerq::storage;
+use tasklerq::storage::repositories::llm_slot_checks::{self, NewCheck};
 use tokio::net::TcpListener;
 use tokio::signal;
 use tracing_subscriber::EnvFilter;
@@ -54,7 +58,26 @@ enum Command {
         )]
         url: String,
     },
-    /// Прогнать smoke-набор `capture-v4` через слот (пункт 9.3).
+    /// Прогнать smoke-набор `capture-v4` через один слот.
+    ///
+    /// Читает конфигурацию слотов из окружения `LLM_*` и `DATABASE_URL`.
+    /// Набор по умолчанию встроен в бинарник: в образе Docker нет каталога
+    /// `tests/`, а проверка идёт в контейнере. `--set PATH` — другой набор для
+    /// разработки; набор с версией контракта, отличной от действующей, —
+    /// ошибка до вызовов LLM.
+    ///
+    /// Каждая фраза уходит в бэкенд выбранного слота напрямую: без цепочки,
+    /// перехода на резервный слот и предохранителя. Ожидание — до 20 секунд,
+    /// судейство — по таймауту слота, поэтому верный, но медленный ответ
+    /// попадает в отчёт с фактическим временем. Фразы идут по очереди.
+    ///
+    /// Проверка доступна и при `LLM_CAPTURE_ENABLED=false`, если запрошенный
+    /// слот задан: так слот проверяют до включения разбора.
+    ///
+    /// Коды возврата: 0 — все фразы пройдены; 1 — слот не прошёл проверку;
+    /// 2 — ошибка конфигурации, слота или набора (версия контракта проверяется
+    /// до вызовов LLM), а также недоступная база; результат в `llm_slot_checks`
+    /// не записан.
     CaptureEval(CaptureEvalArgs),
     /// Отрисовать запросы разбора `capture-v4` из JSONL в JSONL.
     ///
@@ -85,13 +108,39 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct CaptureEvalArgs {
-    /// Файл smoke-набора `capture-v4`.
-    #[arg(
-        long,
-        default_value = "tests/golden/smoke-v4.json",
-        value_name = "PATH"
-    )]
-    golden: PathBuf,
+    /// Слот для проверки.
+    #[arg(long, value_enum)]
+    slot: SlotArg,
+    /// Файл smoke-набора; без значения — встроенный набор `capture-v4`.
+    #[arg(long, value_name = "PATH")]
+    set: Option<PathBuf>,
+}
+
+/// Слот, который проверяет `capture-eval`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SlotArg {
+    /// Основной слот.
+    Primary,
+    /// Резервный слот.
+    Fallback,
+}
+
+impl SlotArg {
+    /// Имя слота для отчёта и `llm_slot_checks`.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Primary => tasklerq::llm::PRIMARY_SLOT,
+            Self::Fallback => tasklerq::llm::FALLBACK_SLOT,
+        }
+    }
+
+    /// Конфигурация слота; `None`, если слот не настроен.
+    fn pick(self, llm: &LlmConfig) -> Option<&SlotConfig> {
+        match self {
+            Self::Primary => llm.primary.as_ref(),
+            Self::Fallback => llm.fallback.as_ref(),
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -296,7 +345,7 @@ async fn main() -> ExitCode {
     dotenvy::dotenv().ok();
 
     match run().await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(error) => {
             let message = redaction::sanitize(&format!("{error:#}"));
             eprintln!("tasklerq: {message}");
@@ -305,17 +354,35 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run() -> Result<()> {
+async fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
 
     match cli.command.unwrap_or(Command::Serve) {
-        Command::Serve => serve().await,
-        Command::Migrate => migrate().await,
-        Command::Seed => seed().await,
-        Command::Admin { command } => run_admin(command).await,
-        Command::Healthcheck { url } => healthcheck(&url).await,
-        Command::CaptureEval(args) => capture_eval(args),
-        Command::CaptureRender => capture_render(),
+        Command::Serve => {
+            serve().await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Migrate => {
+            migrate().await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Seed => {
+            seed().await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Admin { command } => {
+            run_admin(command).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Healthcheck { url } => {
+            healthcheck(&url).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::CaptureEval(args) => capture_eval(args).await,
+        Command::CaptureRender => {
+            capture_render()?;
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 
@@ -809,12 +876,124 @@ fn explain(error: DomainError) -> anyhow::Error {
     anyhow::anyhow!(admin::describe(&error))
 }
 
+/// Код возврата `capture-eval`, когда проверка не выполнена: конфигурация,
+/// слот, набор или запись результата.
+const CAPTURE_EVAL_ERROR_EXIT: u8 = 2;
+
+/// Всё, что нужно проверке слота, собранное до первого запроса к LLM.
+struct PreparedCheck {
+    /// Имя слота.
+    slot_name: &'static str,
+    /// Конфигурация слота.
+    slot: SlotConfig,
+    /// Клиент выбранного слота.
+    backend: OpenAiBackend,
+    /// Разобранный набор.
+    set: SmokeSet,
+    /// Исходный текст набора: из него считается хеш.
+    set_text: String,
+}
+
 /// Прогнать smoke-набор через слот.
 ///
-/// Команда переводится на слоты в пункте 9.3 (`capture-eval --slot <имя>`).
-/// До этого она не может обратиться к LLM и завершается понятной ошибкой.
-fn capture_eval(_args: CaptureEvalArgs) -> Result<()> {
-    bail!("capture-eval переводится на слоты в пункте 9.3 и пока недоступен")
+/// Коды возврата: 0 — пройдены все фразы, 1 — слот не прошёл проверку,
+/// 2 — проверка не выполнена (конфигурация, слот, набор, база). Ошибка
+/// конфигурации печатается здесь же, чтобы отличить её от провала слота.
+async fn capture_eval(args: CaptureEvalArgs) -> Result<ExitCode> {
+    init_cli_tracing();
+
+    match run_capture_eval(args).await {
+        Ok(report) => Ok(if report.passed() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        }),
+        Err(error) => {
+            let message = redaction::sanitize(&format!("{error:#}"));
+            eprintln!("tasklerq: {message}");
+            Ok(ExitCode::from(CAPTURE_EVAL_ERROR_EXIT))
+        }
+    }
+}
+
+/// Собрать проверку, прогнать набор и записать результат в `llm_slot_checks`.
+async fn run_capture_eval(args: CaptureEvalArgs) -> Result<tasklerq::capture::eval::Report> {
+    let prepared = prepare_check(&args)?;
+
+    // База проверяется до вызовов LLM: недоступная база не должна стоить
+    // платных запросов. Соединение держится до записи результата — это
+    // отдельный CLI-процесс, и других потребителей пула у него нет.
+    let database = DatabaseConfig::from_env().context("invalid database configuration")?;
+    let pool = storage::db::connect(&database)
+        .await
+        .context("database connection failed")?;
+    let mut conn = pool.acquire().await.context("database connection failed")?;
+
+    let report = slot_check::run_set(&prepared.backend, &prepared.set, prepared.slot.timeout)
+        .await
+        .map_err(anyhow::Error::msg)
+        .context("invalid smoke set")?;
+
+    let set_hash = slot_check::set_hash(&prepared.set_text);
+    let contract_hash = tasklerq::capture::prompt::contract_hash();
+    let fingerprint = slot_check::fingerprint(&prepared.slot, &contract_hash, &set_hash);
+
+    // Отчёт печатается до записи: если база откажет, результат проверки всё
+    // равно виден, а код возврата останется «проверка не выполнена».
+    println!("Слот: {} ({})", prepared.slot_name, prepared.slot.model);
+    println!("Отпечаток: {}", fingerprint.value);
+    print!("{}", report.to_text());
+
+    let report_json = report.to_json();
+    let parts_json = fingerprint.parts.to_json();
+    llm_slot_checks::upsert(
+        &mut conn,
+        NewCheck {
+            slot: prepared.slot_name,
+            fingerprint: &fingerprint.value,
+            fingerprint_parts: &parts_json,
+            passed: report.passed_count(),
+            total: report.total(),
+            p95_ms: u64::try_from(report.p95().as_millis()).unwrap_or(u64::MAX),
+            report: &report_json,
+        },
+        Utc::now(),
+    )
+    .await
+    .context("failed to save the slot check")?;
+    drop(conn);
+
+    Ok(report)
+}
+
+/// Проверить конфигурацию и прочитать набор до любых обращений к LLM.
+fn prepare_check(args: &CaptureEvalArgs) -> Result<PreparedCheck> {
+    let llm = LlmConfig::from_env().context("invalid llm configuration")?;
+    let slot_name = args.slot.name();
+    let slot = args.slot.pick(&llm).cloned().ok_or_else(|| {
+        let prefix = slot_name.to_ascii_uppercase();
+        anyhow!("слот {slot_name} не настроен: задайте LLM_{prefix}_URL и LLM_{prefix}_MODEL")
+    })?;
+
+    let set_text = match &args.set {
+        Some(path) => std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read the smoke set {}", path.display()))?,
+        None => slot_check::BUILTIN_SET.to_owned(),
+    };
+    let set = slot_check::load_set(&set_text)
+        .map_err(anyhow::Error::msg)
+        .context("invalid smoke set")?;
+
+    let backend = OpenAiBackend::from_slot(&slot, llm.connect_timeout)
+        .map_err(|error| anyhow!("invalid slot configuration: {error}"))?;
+
+    Ok(PreparedCheck {
+        slot_name,
+        slot,
+        backend,
+        set,
+        set_text,
+    })
 }
 
 /// Отрисовать запросы `capture-v4` для проекта дообучения.
