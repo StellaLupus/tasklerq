@@ -9,6 +9,7 @@ pub mod draft;
 pub mod eval;
 pub mod llm;
 pub mod prompt;
+pub mod render;
 pub mod schema;
 pub mod validate;
 pub mod wire;

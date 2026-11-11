@@ -56,6 +56,26 @@ enum Command {
     },
     /// Прогнать golden set LLM-capture и записать baseline.
     CaptureEval(CaptureEvalArgs),
+    /// Отрисовать запросы разбора `capture-v4` из JSONL в JSONL.
+    ///
+    /// Вход (stdin), одна запись на строку:
+    /// {"id": "строка или число", "context": {...}, "text": "фраза"}.
+    ///
+    /// context: now — момент RFC 3339 с поясом; timezone — пояс IANA
+    /// household; lists — массив {"name", "kind":
+    /// "tasks|shopping|checklist|events", "default": bool}; members — массив
+    /// имён; author — имя или null. Идентификаторы не нужны: в запрос попадают
+    /// только имена.
+    ///
+    /// Выход (stdout), одна запись на строку: {"id", "messages", "schema",
+    /// "prompt_version", "contract_hash"} — сообщения и схема в том же виде, в
+    /// каком они уходят в тело chat/completions. База, сеть и LLM не
+    /// используются.
+    ///
+    /// При первой ошибочной строке команда останавливается: сообщение с
+    /// номером строки и id пишется в stderr, код возврата ненулевой, уже
+    /// выведенные строки остаются в stdout.
+    CaptureRender,
 }
 
 #[derive(Debug, Args)]
@@ -293,6 +313,7 @@ async fn run() -> Result<()> {
         Command::Admin { command } => run_admin(command).await,
         Command::Healthcheck { url } => healthcheck(&url).await,
         Command::CaptureEval(args) => capture_eval(args),
+        Command::CaptureRender => capture_render(),
     }
 }
 
@@ -793,6 +814,45 @@ fn explain(error: DomainError) -> anyhow::Error {
 /// читает удалённые переменные Home Assistant.
 fn capture_eval(_args: CaptureEvalArgs) -> Result<()> {
     bail!("capture-eval переводится на слоты в пункте 9.3 и пока недоступен")
+}
+
+/// Отрисовать запросы `capture-v4` для проекта дообучения.
+///
+/// Читает JSONL из stdin, пишет JSONL в stdout. База, сеть и LLM не нужны.
+/// При первой ошибочной строке останавливается: уже выведенные строки
+/// остаются, код возврата ненулевой.
+fn capture_render() -> Result<()> {
+    use std::io::{BufRead, BufWriter, Write};
+
+    let stdin = std::io::stdin();
+    let mut stdout = BufWriter::new(std::io::stdout().lock());
+
+    for (index, line) in stdin.lock().lines().enumerate() {
+        let number = index + 1;
+        let line = match line {
+            Ok(line) => line,
+            Err(error) => {
+                stdout.flush().ok();
+                return Err(error).context("failed to read stdin");
+            }
+        };
+        match tasklerq::capture::render::render_line(&line) {
+            Ok(rendered) => {
+                writeln!(stdout, "{rendered}").context("failed to write stdout")?;
+            }
+            Err(error) => {
+                stdout.flush().ok();
+                let id = error
+                    .id
+                    .map(|id| format!(" (id: {id})"))
+                    .unwrap_or_default();
+                bail!("строка {number}{id}: {}", error.message);
+            }
+        }
+    }
+
+    stdout.flush().context("failed to write stdout")?;
+    Ok(())
 }
 
 async fn healthcheck(url: &str) -> Result<()> {

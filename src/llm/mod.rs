@@ -80,6 +80,28 @@ impl ChatMessage {
     }
 }
 
+/// Части тела `chat/completions`, которые задаёт контракт разбора:
+/// сообщения и схема ответа.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RequestPayload {
+    /// Массив `{role, content}` для поля `messages`.
+    pub messages: Value,
+    /// Схема ответа для `response_format.json_schema.schema`.
+    pub schema: Value,
+}
+
+/// Сериализовать сообщения и схему в том виде, в каком они уходят в тело
+/// запроса.
+///
+/// Одна функция для боевого клиента и `capture-render`: отрисованный запрос не
+/// может разойтись с тем, что получает LLM.
+pub fn request_payload(messages: &[ChatMessage], schema: &Value) -> RequestPayload {
+    RequestPayload {
+        messages: serde_json::to_value(messages).expect("chat messages serialize"),
+        schema: schema.clone(),
+    }
+}
+
 /// Параметры одного вызова модели.
 #[derive(Debug, Clone, Copy)]
 pub struct ChatRequest<'a> {
@@ -221,12 +243,10 @@ impl OpenAiBackend {
 
     /// Тело запроса: обязательные поля и дополнительные параметры слота.
     fn request_body(&self, request: &ChatRequest<'_>) -> Value {
+        let payload = request_payload(request.messages, request.schema);
         let mut body = Map::new();
         body.insert("model".to_owned(), Value::String(self.model.clone()));
-        body.insert(
-            "messages".to_owned(),
-            serde_json::to_value(request.messages).expect("chat messages serialize"),
-        );
+        body.insert("messages".to_owned(), payload.messages);
         body.insert(
             "response_format".to_owned(),
             json!({
@@ -234,7 +254,7 @@ impl OpenAiBackend {
                 "json_schema": {
                     "name": request.schema_name,
                     "strict": true,
-                    "schema": request.schema,
+                    "schema": payload.schema,
                 },
             }),
         );
