@@ -28,7 +28,7 @@ use super::context::CaptureContext;
 use super::convert::{convert_item, second_date_text};
 use super::render::InputContext;
 use super::schema::{Clarification, ClarificationTopic, RawItem, normalize_clarifications};
-use super::validate::{DraftItem, ItemError, validate_item};
+use super::validate::{DATE_MISSING, DraftItem, ItemError, validate_item};
 use super::wire;
 use crate::domain::models::{ItemSource, ListKind, MonthRule, RecurrenceFreq, RecurrenceInput};
 
@@ -463,6 +463,10 @@ pub fn evaluate(
 /// Сначала проверяется таймаут слота: верный, но медленный ответ — провал с
 /// причиной [`Failure::Timeout`] и фактическим временем. Ошибка набора или
 /// эталона — ошибка вызывающего кода, а не причина провала слота.
+///
+/// Ошибка валидации, которую объясняет уточнение ответа (событие без начала и
+/// вопрос о дате), провалом не считается: контракт предписывает именно такой
+/// ответ, а поле дозаполняется ответом на вопрос.
 pub fn judge(
     phrase: &SmokePhrase,
     default_context: &InputContext,
@@ -513,7 +517,7 @@ pub fn judge(
         }
     };
     let actual = into_draft(&context, response);
-    if let Some((index, error)) = first_error(&actual.items) {
+    if let Some((index, error)) = first_error(&actual.items, &actual.clarifications) {
         result.failure = Some(Failure::Validation {
             item: index,
             field: error.field.to_owned(),
@@ -543,7 +547,7 @@ fn reference(context: &CaptureContext, value: &Value) -> Result<Draft, String> {
     let response = wire::parse_capture_value(value, context)
         .map_err(|error| format!("ответ не разобран: {}", error.code()))?;
     let draft = into_draft(context, response);
-    if let Some((index, error)) = first_error(&draft.items) {
+    if let Some((index, error)) = first_error(&draft.items, &draft.clarifications) {
         return Err(format!(
             "элемент {index}: поле {} ({})",
             error.field, error.code
@@ -578,12 +582,33 @@ fn into_draft(context: &CaptureContext, response: wire::CaptureResponse) -> Draf
     }
 }
 
-/// Первая ошибка валидации: номер элемента и поле.
-fn first_error(items: &[DraftItem]) -> Option<(usize, ItemError)> {
-    items
-        .iter()
-        .enumerate()
-        .find_map(|(index, item)| item.errors.first().map(|error| (index, *error)))
+/// Первая ошибка валидации, которую не объясняет уточнение: номер элемента и
+/// поле.
+fn first_error(
+    items: &[DraftItem],
+    clarifications: &[Clarification],
+) -> Option<(usize, ItemError)> {
+    items.iter().enumerate().find_map(|(index, item)| {
+        item.errors
+            .iter()
+            .find(|error| !answered_by_clarification(clarifications, index, error))
+            .map(|error| (index, *error))
+    })
+}
+
+/// Незаполненное поле, о котором ответ задаёт вопрос, — не провал валидации:
+/// контракт предписывает отвечать на событие без начала `date=none` и
+/// уточнением `date`, а поле дозаполняется ответом на вопрос.
+fn answered_by_clarification(
+    clarifications: &[Clarification],
+    item: usize,
+    error: &ItemError,
+) -> bool {
+    error.field == "due_date"
+        && error.code == DATE_MISSING
+        && clarifications.iter().any(|clarification| {
+            clarification.item == item && clarification.topic == ClarificationTopic::Date
+        })
 }
 
 /// Поля элемента, по которым идёт сравнение с эталоном.
@@ -1489,6 +1514,28 @@ mod tests {
     }
 
     #[test]
+    fn an_event_without_a_date_and_a_date_question_is_not_a_validation_failure() {
+        let expected = json!({
+            "items": [event("Встреча с Петей", date_none())],
+            "clarifications": [{"item": 0, "topic": "date"}],
+        });
+        let phrase = phrase("event-question", Category::Ambiguity, expected);
+        let same = phrase.expect.to_string();
+
+        let result = judge_one(&phrase, &same, Duration::from_secs(1));
+        assert!(result.passed(), "{:?}", result.failure);
+
+        let without_question = response(vec![event("Встреча с Петей", date_none())]);
+        let result = judge_one(&phrase, &without_question, Duration::from_secs(1));
+        let Some(Failure::Validation { item, field, code }) = result.failure else {
+            panic!("not a validation failure: {:?}", result.failure);
+        };
+        assert_eq!(item, 0);
+        assert_eq!(field, "due_date");
+        assert_eq!(code, DATE_MISSING);
+    }
+
+    #[test]
     fn a_clarification_about_an_extra_item_does_not_hide_a_missing_one() {
         let expected = json!({
             "items": [
@@ -1829,6 +1876,108 @@ mod tests {
         let error = SmokeSet::parse(&set("2026-11-11T09:00:00+03:00"))
             .expect_err("another now in a phrase context is an error");
         assert!(error.contains("«сейчас»"), "{error}");
+    }
+
+    const FROZEN_SMOKE_SET: &str = include_str!("../../tests/golden/smoke-v4.json");
+
+    fn frozen_set() -> SmokeSet {
+        SmokeSet::parse(FROZEN_SMOKE_SET).expect("набор разбирается")
+    }
+
+    /// Версия контракта набора — та же, что у действующего разбора.
+    fn check_prompt_version(set: &SmokeSet) -> Result<(), String> {
+        if set.prompt_version != PROMPT_VERSION {
+            return Err(format!(
+                "набор составлен для контракта {}, действующий — {}",
+                set.prompt_version, PROMPT_VERSION
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_frozen_smoke_set_matches_the_contract() {
+        let set = frozen_set();
+        check_prompt_version(&set).expect("версия контракта набора");
+        assert_eq!(set.frozen_at, "2026-11-11");
+        assert_eq!(set.phrases.len(), 22);
+
+        let mut referenced_clarifications = 0;
+        let mut expected_kinds = BTreeSet::new();
+        let mut broken = Vec::new();
+        for phrase in &set.phrases {
+            let context = match phrase.context(&set.context) {
+                Ok(context) => context,
+                Err(error) => {
+                    broken.push(format!("фраза {}: {error}", phrase.id));
+                    continue;
+                }
+            };
+            let draft = match reference(&context, &phrase.expect) {
+                Ok(draft) => draft,
+                Err(error) => {
+                    broken.push(format!("фраза {}: {error}", phrase.id));
+                    continue;
+                }
+            };
+            referenced_clarifications += draft.clarifications.len();
+            for item in phrase.expect["items"]
+                .as_array()
+                .expect("у эталона есть перечень элементов")
+            {
+                expected_kinds.insert(item["kind"].as_str().expect("вид элемента").to_owned());
+            }
+        }
+        assert!(
+            broken.is_empty(),
+            "нужно решение: эталоны не проходят разбор формы и валидацию: {broken:#?}"
+        );
+
+        let categories: BTreeSet<Category> =
+            set.phrases.iter().map(|phrase| phrase.category).collect();
+        for category in Category::ALL {
+            assert!(
+                categories.contains(&category),
+                "нет фразы категории {}",
+                category.label()
+            );
+        }
+
+        assert!(
+            expected_kinds.contains("events"),
+            "нет эталона события: {expected_kinds:?}"
+        );
+        let direct_shopping = set.phrases.iter().any(|phrase| {
+            phrase.category == Category::Shopping
+                && !phrase.text.to_lowercase().contains("купить")
+                && phrase.expect["items"].as_array().is_some_and(|items| {
+                    !items.is_empty() && items.iter().all(|item| item["kind"] == json!("shopping"))
+                })
+        });
+        assert!(
+            direct_shopping,
+            "нет прямого добавления покупки без глагола «купить»"
+        );
+        assert!(referenced_clarifications > 0, "нет эталона с уточнением");
+        assert!(
+            set.phrases.iter().any(|phrase| phrase.expect["items"]
+                .as_array()
+                .is_some_and(|items| items.is_empty())),
+            "нет мусорной фразы с пустым ответом"
+        );
+    }
+
+    #[test]
+    fn a_smoke_set_for_another_contract_fails_the_version_check() {
+        let mut value: Value = serde_json::from_str(FROZEN_SMOKE_SET).expect("набор — JSON");
+        value["prompt_version"] = json!("capture-v3");
+        let set = SmokeSet::parse(&value.to_string()).expect("набор разбирается");
+
+        let error =
+            check_prompt_version(&set).expect_err("версия другого контракта — ошибка проверки");
+
+        assert!(error.contains("capture-v3"), "{error}");
+        assert!(error.contains(PROMPT_VERSION), "{error}");
     }
 
     #[test]
