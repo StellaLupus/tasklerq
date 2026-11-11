@@ -52,7 +52,6 @@ fn capture(household: &TestHousehold, items: Vec<RawItem>) -> NewCapture {
         parsed: ParsedResponse {
             items,
             clarifications: Vec::new(),
-            legacy_questions: Vec::new(),
         },
         fallback: false,
         prompt_version: Some("capture-v1".into()),
@@ -79,7 +78,6 @@ fn telegram_capture(
         parsed: ParsedResponse {
             items,
             clarifications: Vec::new(),
-            legacy_questions: Vec::new(),
         },
         fallback: false,
         prompt_version: Some("capture-v1".into()),

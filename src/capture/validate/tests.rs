@@ -765,7 +765,6 @@ fn one_invalid_item_blocks_the_whole_draft_but_keeps_the_rest_visible() {
             item: 0,
             topic: crate::capture::schema::ClarificationTopic::Date,
         }],
-        ..ParsedResponse::default()
     };
 
     let draft = validate_items(&context(), ItemSource::HaVoice, parsed);
@@ -796,7 +795,6 @@ fn clarifications_about_filled_fields_are_dropped() {
                 topic: crate::capture::schema::ClarificationTopic::Date,
             },
         ],
-        ..ParsedResponse::default()
     };
 
     let draft = validate_items(&context(), ItemSource::Telegram, parsed);
@@ -822,7 +820,6 @@ fn mixed_valid_draft_passes() {
     let parsed = ParsedResponse {
         items: vec![milk, raw(ListKind::Shopping, "Хлеб"), call],
         clarifications: Vec::new(),
-        legacy_questions: Vec::new(),
     };
 
     let draft = validate_items(&context(), ItemSource::Telegram, parsed);

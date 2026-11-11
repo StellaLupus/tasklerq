@@ -558,7 +558,6 @@ fn build_view_with(draft: Draft, context: CaptureContext) -> Result<DraftView, D
         ParsedResponse {
             items: stored.items,
             clarifications: stored.clarifications,
-            legacy_questions: Vec::new(),
         },
     );
     Ok(DraftView {

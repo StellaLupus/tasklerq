@@ -12,8 +12,7 @@ use uuid::Uuid;
 
 use super::context::{CaptureContext, ListRef};
 use super::schema::{
-    MAX_CLARIFICATIONS, ParsedResponse, RawDateError, RawItem, RawRecurrence,
-    normalize_clarifications,
+    ParsedResponse, RawDateError, RawItem, RawRecurrence, normalize_clarifications,
 };
 use crate::domain::events::end_day;
 use crate::domain::models::{
@@ -163,7 +162,6 @@ pub fn validate_items_in(
     let ParsedResponse {
         items,
         clarifications,
-        legacy_questions,
     } = parsed;
     let clarifications = normalize_clarifications(&items, clarifications, Some(context));
     ValidatedDraft {
@@ -171,14 +169,10 @@ pub fn validate_items_in(
             .into_iter()
             .map(|raw| validate_item_in(context, source, raw, mode))
             .collect(),
-        // Карточка и внешний capture показывают короткий текст по теме. Вопросы
-        // прежнего ответа v3 приходят готовыми строками: их читает только eval
-        // до переписывания в 9.1.
+        // Карточка и внешний capture показывают короткий текст по теме.
         clarifications: clarifications
             .iter()
             .map(|clarification| clarification.topic.question().to_owned())
-            .chain(legacy_questions)
-            .take(MAX_CLARIFICATIONS)
             .collect(),
     }
 }

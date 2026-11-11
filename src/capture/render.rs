@@ -61,10 +61,10 @@ struct InputRecord {
     text: String,
 }
 
-/// Контекст записи.
-#[derive(Debug, Deserialize)]
+/// Контекст записи; тот же формат у smoke-набора (`eval.rs`).
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct InputContext {
+pub struct InputContext {
     /// Момент RFC 3339 с поясом.
     now: String,
     /// Пояс IANA household.
@@ -81,9 +81,9 @@ struct InputContext {
 }
 
 /// Список в описании контекста.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct InputList {
+pub struct InputList {
     /// Название.
     name: String,
     /// Вид списка: `tasks`, `shopping`, `checklist` или `events`.
@@ -143,7 +143,21 @@ fn safe_error(error: &serde_json::Error) -> String {
 }
 
 impl InputContext {
-    fn into_context(self) -> Result<CaptureContext, String> {
+    /// Момент контекста в исходной записи RFC 3339.
+    ///
+    /// Нужен smoke-набору: «сейчас» у набора одно, и контекст фразы не может
+    /// задать другое.
+    pub fn now(&self) -> &str {
+        &self.now
+    }
+
+    /// Собрать [`CaptureContext`] с детерминированными идентификаторами.
+    ///
+    /// Идентификаторы не попадают ни в промпт, ни в схему: в `capture-render`
+    /// они не нужны. Их читает оценка набора (`eval.rs`), которая по ним
+    /// восстанавливает названия списка и исполнителя, поэтому каждому списку и
+    /// участнику достаётся свой номер, а не общий `nil`.
+    pub fn into_context(self) -> Result<CaptureContext, String> {
         let now = DateTime::parse_from_rfc3339(&self.now)
             .map(|moment| moment.with_timezone(&Utc))
             .map_err(|_| "context.now должен быть моментом RFC 3339 с поясом".to_owned())?;
@@ -151,26 +165,32 @@ impl InputContext {
         let lists = self
             .lists
             .into_iter()
-            .map(|list| ListRef {
-                id: Uuid::nil(),
+            .enumerate()
+            .map(|(index, list)| ListRef {
+                id: Uuid::from_u128(index as u128 + 1),
                 name: list.name,
                 kind: list.kind,
                 is_default: list.default,
             })
             .collect();
-        let members = self
+        let members: Vec<MemberRef> = self
             .members
             .iter()
-            .map(|name| member(name))
-            .collect::<Vec<_>>();
+            .enumerate()
+            .map(|(index, name)| MemberRef {
+                id: Uuid::from_u128(1_000 + index as u128),
+                display_name: name.clone(),
+                username: None,
+            })
+            .collect();
         let author = match self.author {
             None => None,
-            Some(name) if self.members.iter().any(|member_name| member_name == &name) => {
-                Some(member(&name))
-            }
-            Some(_) => {
-                return Err("context.author должен быть среди context.members".to_owned());
-            }
+            Some(name) => members
+                .iter()
+                .find(|member| member.display_name == name)
+                .cloned()
+                .ok_or_else(|| "context.author должен быть среди context.members".to_owned())
+                .map(Some)?,
         };
 
         Ok(CaptureContext {
@@ -185,14 +205,6 @@ impl InputContext {
 
 fn parse_household_timezone(value: &str) -> Result<Tz, String> {
     parse_timezone(value).map_err(|_| "context.timezone должен быть поясом IANA".to_owned())
-}
-
-fn member(name: &str) -> MemberRef {
-    MemberRef {
-        id: Uuid::nil(),
-        display_name: name.to_owned(),
-        username: None,
-    }
 }
 
 /// Идентификатор записи: строка или число, возвращается как есть.

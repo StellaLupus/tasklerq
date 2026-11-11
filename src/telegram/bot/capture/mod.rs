@@ -1027,7 +1027,10 @@ fn seed(raw: &RawItem, view: &DraftView) -> ItemDraft {
         quantity: raw.quantity,
         unit: raw.unit.clone(),
         end_date: raw.end_date.as_deref().and_then(parse_date),
-        end_time: raw.end_time.as_deref().and_then(parse_time),
+        // Время конца имеет смысл только у начала со временем: вседневное
+        // событие хранит конец датой, и время, оставшееся от ответа модели,
+        // форма не должна принимать за заполненный конец.
+        end_time: time.and(raw.end_time.as_deref().and_then(parse_time)),
     }
 }
 

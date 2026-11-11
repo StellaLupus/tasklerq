@@ -284,6 +284,17 @@ pub fn parse_capture_response(
     context: &CaptureContext,
 ) -> Result<CaptureResponse, ParseError> {
     let value: Value = serde_json::from_str(text).map_err(|_| ParseError::NotAnObject)?;
+    parse_capture_value(&value, context)
+}
+
+/// Разобрать уже прочитанный JSON ответа `capture-v4`.
+///
+/// Нужен smoke-набору: эталон хранится JSON-значением и проходит тот же путь,
+/// что и ответ слота.
+pub fn parse_capture_value(
+    value: &Value,
+    context: &CaptureContext,
+) -> Result<CaptureResponse, ParseError> {
     let root = value.as_object().ok_or(ParseError::NotAnObject)?;
 
     let items = match root.get("items") {

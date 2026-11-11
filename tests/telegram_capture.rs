@@ -322,7 +322,7 @@ async fn an_event_from_the_parse_is_saved_by_save_all() {
     stand.bot.assert_screen_contains("Список: Календарь");
     stand.bot.assert_screen_contains("14:00–15:30");
     assert!(
-        !stand.bot.screen().contains("Срок: завтра, 14:00"),
+        !stand.bot.screen().contains("Срок:"),
         "an event must not be shown as a plain due:\n{}",
         stand.bot.screen()
     );
@@ -436,6 +436,60 @@ async fn the_event_editor_changes_the_draft_end_without_calling_the_llm() {
     assert_eq!(end.date_naive().to_string(), "2026-11-11");
     assert_eq!(end.format("%H:%M").to_string(), "16:00");
     assert_eq!(stand.ai.calls(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_all_day_event_with_an_end_time_from_the_llm_saves_without_changes() {
+    let db = db().await;
+    // Модель назвала время конца вседневного события, а дату конца — нет:
+    // валидатор время отбрасывает, и форма не должна получить «конец без
+    // времени начала».
+    let answer = json!({"items": [
+        support::llm::v4::with(
+            support::llm::v4::with(
+                support::llm::v4::event("Маникюр"),
+                "date",
+                support::llm::v4::date_offset(1, "days"),
+            ),
+            "end_time",
+            json!("15:30"),
+        )
+    ]});
+    let mut stand = stand(&db.pool, vec![Ok(answer)]).await;
+    stand
+        .bot
+        .set_now("2026-11-10T09:00:00Z".parse().expect("time"));
+
+    stand.capture("маникюр завтра").await;
+
+    stand.bot.press("Изменить 1").await;
+    stand.bot.press("Сохранить").await;
+
+    stand.bot.assert_screen_contains("Маникюр");
+    assert!(
+        !stand
+            .bot
+            .screen()
+            .contains("У события без времени конец задаётся датой"),
+        "saving without changes must not be refused:\n{}",
+        stand.bot.screen()
+    );
+
+    stand.bot.press("Сохранить всё").await;
+
+    let household = household_id(&db.pool, stand.bot.chat).await;
+    let (due_at, end_at, due_date): (Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>) =
+        sqlx::query_as(
+            "SELECT due_at, end_at, due_date::text FROM items
+             WHERE household_id = $1 AND title = 'Маникюр'",
+        )
+        .bind(household)
+        .fetch_one(&db.pool)
+        .await
+        .expect("saved event");
+    assert_eq!(due_at, None);
+    assert_eq!(end_at, None);
+    assert_eq!(due_date.as_deref(), Some("2026-11-11"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

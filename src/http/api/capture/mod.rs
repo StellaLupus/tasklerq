@@ -839,7 +839,6 @@ async fn apply_fallback(
             recurrence: None,
         }],
         clarifications: Vec::new(),
-        legacy_questions: Vec::new(),
     };
     let item_source = draft::item_source(input.source);
     let validated = validate_items_in(

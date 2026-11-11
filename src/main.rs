@@ -54,7 +54,7 @@ enum Command {
         )]
         url: String,
     },
-    /// Прогнать golden set LLM-capture и записать baseline.
+    /// Прогнать smoke-набор `capture-v4` через слот (пункт 9.3).
     CaptureEval(CaptureEvalArgs),
     /// Отрисовать запросы разбора `capture-v4` из JSONL в JSONL.
     ///
@@ -85,16 +85,13 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct CaptureEvalArgs {
-    /// Файл golden set.
-    #[arg(long, default_value = "tests/golden/capture.json", value_name = "PATH")]
-    golden: PathBuf,
-    /// Baseline по версиям промпта.
+    /// Файл smoke-набора `capture-v4`.
     #[arg(
         long,
-        default_value = "tests/golden/baseline.json",
+        default_value = "tests/golden/smoke-v4.json",
         value_name = "PATH"
     )]
-    baseline: PathBuf,
+    golden: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -812,11 +809,10 @@ fn explain(error: DomainError) -> anyhow::Error {
     anyhow::anyhow!(admin::describe(&error))
 }
 
-/// Прогнать golden set через настоящий путь разбора.
+/// Прогнать smoke-набор через слот.
 ///
 /// Команда переводится на слоты в пункте 9.3 (`capture-eval --slot <имя>`).
-/// До этого она не может обратиться к LLM и завершается понятной ошибкой, а не
-/// читает удалённые переменные Home Assistant.
+/// До этого она не может обратиться к LLM и завершается понятной ошибкой.
 fn capture_eval(_args: CaptureEvalArgs) -> Result<()> {
     bail!("capture-eval переводится на слоты в пункте 9.3 и пока недоступен")
 }

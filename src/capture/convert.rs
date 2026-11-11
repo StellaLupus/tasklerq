@@ -292,6 +292,18 @@ fn first_occurrence(
     }
 }
 
+/// Вторая дата фразы в том виде, в каком [`convert_item`] дописывает её в
+/// заметку.
+///
+/// Нужна оценке (`eval.rs`): сравнение идёт по дате, а свободный текст заметки
+/// модели не сравнивается. `None` — второй даты нет или элемент её не несёт.
+pub fn second_date_text(item: &Item, context: &CaptureContext) -> Option<String> {
+    match item {
+        Item::Task(task) => convert_note_date(&task.note_date, context).0,
+        _ => None,
+    }
+}
+
 /// Вторая дата фразы в виде «20 ноября» (с годом, если он не текущий).
 fn convert_note_date(
     expr: &DateExpr,

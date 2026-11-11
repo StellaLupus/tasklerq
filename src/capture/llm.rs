@@ -185,7 +185,6 @@ fn parse(
                 .map(|item| convert::convert_item(item, context))
                 .collect(),
             clarifications: response.clarifications,
-            legacy_questions: Vec::new(),
         }),
         Err(error) => {
             metrics::llm_validation_failure();

@@ -724,7 +724,6 @@ impl CaptureWorker {
                     parsed: ParsedResponse {
                         items: draft_items,
                         clarifications,
-                        legacy_questions: Vec::new(),
                     },
                     fallback: false,
                     prompt_version: Some(PROMPT_VERSION.to_owned()),
