@@ -93,29 +93,6 @@ pub struct RawDateError {
     pub field: String,
 }
 
-/// Прочитать ошибки дат из нового массива или из одиночного объекта старого
-/// черновика: поле сменило тип с `Option<RawDateError>` на список.
-fn date_errors<'de, D>(deserializer: D) -> Result<Vec<RawDateError>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Stored {
-        // Массив проверяется первым: serde умеет разбирать структуру и из
-        // последовательности, поэтому пустой `[]` иначе стал бы одной ошибкой
-        // с пустым полем.
-        Many(Vec<RawDateError>),
-        One(RawDateError),
-    }
-
-    Ok(match Option::<Stored>::deserialize(deserializer)? {
-        Some(Stored::Many(errors)) => errors,
-        Some(Stored::One(error)) => vec![error],
-        None => Vec::new(),
-    })
-}
-
 /// Элемент черновика «как сказала LLM». Хранится в `capture_drafts.parsed`,
 /// поэтому новые поля должны иметь `#[serde(default)]`: черновик, записанный до
 /// обновления, не должен переставать читаться.
@@ -141,7 +118,7 @@ pub struct RawItem {
     pub end_time: Option<String>,
     /// Ошибки выражений дат, если их не удалось посчитать. Хранятся все:
     /// исправление срока не должно молча терять ошибку второй даты.
-    #[serde(default, deserialize_with = "date_errors")]
+    #[serde(default)]
     pub date_error: Vec<RawDateError>,
     /// Приоритет.
     pub priority: Option<String>,
@@ -812,9 +789,8 @@ mod tests {
     }
 
     #[test]
-    fn a_draft_with_the_old_single_date_error_still_reads() {
-        // До v4 ошибка даты хранилась одним объектом, а не массивом.
-        let old = json!({
+    fn a_draft_without_date_errors_reads() {
+        let draft = json!({
             "target_kind": "tasks",
             "target_list": null,
             "title": "Позвонить маме",
@@ -823,7 +799,6 @@ mod tests {
             "due_time": null,
             "end_date": null,
             "end_time": null,
-            "date_error": {"field": "due_date"},
             "priority": null,
             "assignee": null,
             "assignee_id": null,
@@ -834,13 +809,8 @@ mod tests {
             "recurrence": null,
         });
 
-        let item: RawItem = serde_json::from_value(old).expect("old draft reads");
+        let item: RawItem = serde_json::from_value(draft).expect("draft reads");
 
-        assert_eq!(
-            item.date_error,
-            vec![RawDateError {
-                field: "due_date".to_owned()
-            }]
-        );
+        assert!(item.date_error.is_empty());
     }
 }

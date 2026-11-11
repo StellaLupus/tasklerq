@@ -26,8 +26,6 @@ use support::{db, issue_token};
 /// Двойник слота: отдаёт заготовленные ответы по очереди и запоминает таймаут.
 type StubAi = support::llm::BackendDouble;
 
-type RunRow = (Option<String>, Option<i16>, String, Option<String>);
-
 fn config() -> CaptureConfig {
     CaptureConfig {
         enabled: true,
@@ -143,7 +141,7 @@ fn assert_error_envelope(json: &Value, code: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ha_unavailability_in_auto_creates_one_fallback_item() {
+async fn llm_unavailability_in_auto_creates_one_fallback_item() {
     let db = db().await;
     let household = support::create_household(&db.pool).await;
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
@@ -312,16 +310,17 @@ async fn the_voice_budget_is_split_between_two_slots() {
     let household = support::create_household(&db.pool).await;
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
     let mut config = config();
-    // Восьмисекундный бюджет голоса уменьшен в десять раз: та же доля
-    // основного слота и тот же остаток резервному, но тест не ждёт секунды.
+    // Бюджет голоса уменьшен в десять раз: та же доля основного слота и тот же
+    // остаток резервному, но тест не ждёт секунды. Таймауты слотов намеренно
+    // больше бюджета: иначе деление пополам не отличить от таймаута слота.
     config.voice_timeout_ms = 800;
     let primary = StubAi::hanging();
     let fallback = StubAi::hanging();
     let chain = support::llm::chain_with_timeouts(
         primary.clone(),
-        StdDuration::from_millis(400),
+        StdDuration::from_secs(20),
         Some(fallback.clone()),
-        StdDuration::from_millis(400),
+        StdDuration::from_secs(20),
     );
     let app = app_chain(&db.pool, Some(Arc::new(chain)), config, 200);
 
@@ -334,12 +333,20 @@ async fn the_voice_budget_is_split_between_two_slots() {
     assert_eq!(
         primary.timeouts(),
         vec![StdDuration::from_millis(400)],
-        "the primary gets at most half of the voice budget"
+        "the primary gets half of the voice budget, not its own timeout"
     );
-    assert_eq!(
-        fallback.timeouts(),
-        vec![StdDuration::from_millis(400)],
-        "the fallback gets the rest of the voice budget"
+    let fallback_timeout = fallback
+        .timeouts()
+        .first()
+        .copied()
+        .expect("the fallback slot must be called");
+    assert!(
+        fallback_timeout <= StdDuration::from_millis(400),
+        "the fallback gets no more than the rest of the voice budget: {fallback_timeout:?}"
+    );
+    assert!(
+        fallback_timeout > StdDuration::ZERO,
+        "the fallback must get the remaining budget: {fallback_timeout:?}"
     );
     assert!(
         elapsed < StdDuration::from_secs(3),
@@ -518,25 +525,24 @@ async fn an_open_breaker_falls_back_in_auto_and_is_503_in_draft() {
         0
     );
     assert_eq!(ai.calls(), 0);
-    let runs: Vec<RunRow> = sqlx::query_as(
-        "SELECT slot, attempt, status, error_code FROM llm_runs
-         WHERE household_id = $1 ORDER BY created_at",
-    )
-    .bind(household.household_id)
-    .fetch_all(&db.pool)
-    .await
-    .expect("llm runs");
+    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM llm_runs WHERE household_id = $1")
+        .bind(household.household_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("llm runs");
+    assert_eq!(runs, 0, "an open circuit must not write an llm run");
+    let mut conn = db.pool.acquire().await.expect("connection");
     assert_eq!(
-        runs.len(),
-        2,
-        "each open-circuit attempt is logged: {runs:?}"
+        tasklerq::storage::repositories::llm_runs::count_since(
+            &mut conn,
+            household.household_id,
+            Utc::now() - chrono::Duration::hours(24),
+        )
+        .await
+        .expect("quota"),
+        0,
+        "a skipped LLM call must not spend quota"
     );
-    for run in runs {
-        assert_eq!(run.0, None, "a run without a slot call has no slot");
-        assert_eq!(run.1, None, "a run without a slot call has no attempt");
-        assert_eq!(run.2, "failure");
-        assert_eq!(run.3.as_deref(), Some("circuit_open"));
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1211,7 +1217,7 @@ mod telegram_split {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_unavailable_home_assistant_falls_back_to_splitting() {
+    async fn an_unavailable_llm_falls_back_to_splitting() {
         let db = db().await;
         let answers = (0..MAX_ATTEMPTS)
             .map(|_| Err(LlmError::Transport))

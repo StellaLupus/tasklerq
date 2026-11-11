@@ -7,7 +7,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -512,62 +512,320 @@ async fn invalid_request_fields_are_rejected_before_the_llm() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_explicit_events_list_is_rejected_before_the_llm_and_quota() {
+async fn an_explicit_events_list_creates_an_event() {
     let db = db().await;
     let household = support::create_household(&db.pool).await;
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
-    let ai = StubAi::new(vec![Ok(shopping("молоко"))]);
+    let ai = StubAi::new(vec![Ok(support::llm::v4::response(vec![
+        support::llm::v4::with(
+            support::llm::v4::with(
+                support::llm::v4::event("Маникюр"),
+                "date",
+                support::llm::v4::date_offset(1, "days"),
+            ),
+            "time",
+            json!("14:00"),
+        ),
+    ]))]);
     let app = app(&db.pool, ai.clone(), config());
 
-    // Отказ такой же, как у неизвестного списка: резерв ключа уже взят, но
-    // ошибка освобождает его, а квота и LLM не трогаются.
-    let body = json!({
-        "text": "маникюр завтра с 14 до 15:30",
-        "source": "api",
-        "mode": "auto",
-        "list_id": household.events_list_id,
-        "idempotency_key": "events-list"
-    });
     let (status, _, json) = call(
         &app,
         Method::POST,
         "/api/v1/capture",
         Some(&token),
-        Some(body.clone()),
+        Some(json!({
+            "text": "маникюр завтра с 14 до 15:30",
+            "source": "api",
+            "mode": "auto",
+            "list_id": household.events_list_id,
+            "idempotency_key": "events-list"
+        })),
     )
     .await;
 
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{json}");
-    assert_error_envelope(&json, "validation_error");
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["status"], "applied");
+    assert_eq!(json["fallback"], false);
+    assert_eq!(json["items"][0]["kind"], "events");
     assert_eq!(
-        ai.calls(),
-        0,
-        "the LLM must not be called for an events list"
+        json["items"][0]["list_id"],
+        household.events_list_id.to_string()
     );
-    assert_eq!(item_count(&db.pool, household.household_id).await, 0);
-    assert_eq!(draft_count(&db.pool, household.household_id).await, 0);
-    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM llm_runs WHERE household_id = $1")
-        .bind(household.household_id)
-        .fetch_one(&db.pool)
-        .await
-        .expect("llm runs");
-    assert_eq!(runs, 0, "no LLM run must be recorded and the quota stays");
+    assert_eq!(json["items"][0]["title"], "Маникюр");
+    let speech = json["speech"].as_str().expect("speech");
+    assert!(speech.contains("событие"), "{speech}");
+    assert!(!speech.contains("элемент"), "{speech}");
 
-    // Резерв ключа освобождён отказом: повтор с тем же ключом снова проходит
-    // проверку списка и даёт тот же `422`, а не `409` «in progress».
+    let (list_id, due_at): (Uuid, Option<DateTime<Utc>>) =
+        sqlx::query_as("SELECT list_id, due_at FROM items WHERE id = $1")
+            .bind(Uuid::parse_str(json["items"][0]["id"].as_str().expect("id")).expect("uuid"))
+            .fetch_one(&db.pool)
+            .await
+            .expect("item row");
+    assert_eq!(
+        list_id, household.events_list_id,
+        "the event must be created in the requested events list"
+    );
+    assert!(due_at.is_some());
+    assert_eq!(ai.calls(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_interval_phrase_with_an_event_answer_creates_an_event() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(support::llm::v4::response(vec![
+        support::llm::v4::with(
+            support::llm::v4::with(
+                support::llm::v4::with(
+                    support::llm::v4::event("Маникюр"),
+                    "date",
+                    support::llm::v4::date_offset(1, "days"),
+                ),
+                "time",
+                json!("14:00"),
+            ),
+            "end_time",
+            json!("15:30"),
+        ),
+    ]))]);
+    let app = app(&db.pool, ai.clone(), config());
+
     let (status, _, json) = call(
         &app,
         Method::POST,
         "/api/v1/capture",
         Some(&token),
-        Some(body),
+        Some(body("маникюр завтра с 14 до 15:30", "api", "auto")),
     )
     .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{json}");
-    assert_error_envelope(&json, "validation_error");
-    assert_eq!(ai.calls(), 0, "the repeat must not reach the LLM either");
-    assert_eq!(item_count(&db.pool, household.household_id).await, 0);
-    assert_eq!(draft_count(&db.pool, household.household_id).await, 0);
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["status"], "applied");
+    assert_eq!(json["items"][0]["kind"], "events");
+    assert_eq!(
+        json["items"][0]["list_id"],
+        household.events_list_id.to_string(),
+        "an unnamed list must use the default events list"
+    );
+
+    let today = Utc::now()
+        .with_timezone(&chrono_tz::Europe::Moscow)
+        .date_naive();
+    let tomorrow = today.succ_opt().expect("tomorrow");
+    let (due_at, end_at): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) =
+        sqlx::query_as("SELECT due_at, end_at FROM items WHERE id = $1")
+            .bind(Uuid::parse_str(json["items"][0]["id"].as_str().expect("id")).expect("uuid"))
+            .fetch_one(&db.pool)
+            .await
+            .expect("item row");
+    assert_eq!(
+        due_at,
+        Some(
+            tomorrow
+                .and_hms_opt(14, 0, 0)
+                .and_then(|local| {
+                    chrono::TimeZone::from_local_datetime(&chrono_tz::Europe::Moscow, &local)
+                        .single()
+                })
+                .expect("local start")
+                .with_timezone(&Utc)
+        )
+    );
+    assert_eq!(
+        end_at,
+        Some(
+            tomorrow
+                .and_hms_opt(15, 30, 0)
+                .and_then(|local| {
+                    chrono::TimeZone::from_local_datetime(&chrono_tz::Europe::Moscow, &local)
+                        .single()
+                })
+                .expect("local end")
+                .with_timezone(&Utc)
+        )
+    );
+    assert_eq!(
+        json["items"][0]["end_at"],
+        end_at.map(|at| json!(at)).unwrap_or(Value::Null),
+        "the response must carry the event end"
+    );
+    assert_eq!(json["speech"], "Добавил событие: Маникюр.");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_multi_day_event_keeps_the_last_day() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(support::llm::v4::response(vec![
+        support::llm::v4::with(
+            support::llm::v4::with(
+                support::llm::v4::event("Отпуск"),
+                "date",
+                support::llm::v4::date(5, 3, 2027),
+            ),
+            "end",
+            support::llm::v4::date(10, 3, 2027),
+        ),
+    ]))]);
+    let app = app(&db.pool, ai.clone(), config());
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(body("отпуск с 5 по 10 марта", "api", "auto")),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["status"], "applied");
+    assert_eq!(json["items"][0]["kind"], "events");
+    assert_eq!(json["items"][0]["due_date"], "2027-03-05");
+    assert_eq!(json["items"][0]["end_date"], "2027-03-10");
+
+    let (due_date, end_date): (Option<NaiveDate>, Option<NaiveDate>) =
+        sqlx::query_as("SELECT due_date, end_date FROM items WHERE id = $1")
+            .bind(Uuid::parse_str(json["items"][0]["id"].as_str().expect("id")).expect("uuid"))
+            .fetch_one(&db.pool)
+            .await
+            .expect("item row");
+    assert_eq!(
+        due_date,
+        Some(NaiveDate::from_ymd_opt(2027, 3, 5).expect("date"))
+    );
+    assert_eq!(
+        end_date,
+        Some(NaiveDate::from_ymd_opt(2027, 3, 10).expect("date")),
+        "the last day of an all-day event is inclusive"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_event_without_a_start_degrades_in_auto_to_one_fallback_item() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(support::llm::v4::response(vec![
+        support::llm::v4::event("Встреча с Петей"),
+    ]))]);
+    let mut config = config();
+    config.voice_fallback_raw = true;
+    let app = app(&db.pool, ai.clone(), config);
+    let text = "встреча с Петей";
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(body(text, "ha_voice", "auto")),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["status"], "applied");
+    assert_eq!(json["fallback"], true);
+    assert_eq!(json["items"].as_array().expect("items").len(), 1);
+    assert_eq!(json["items"][0]["title"], text);
+    assert_eq!(json["items"][0]["kind"], "tasks");
+    assert_eq!(
+        json["items"][0]["list_id"],
+        household.tasks_list_id.to_string(),
+        "the fallback item goes to the default task list"
+    );
+    let items: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM items WHERE household_id = $1 AND list_id = $2")
+            .bind(household.household_id)
+            .bind(household.events_list_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("events");
+    assert_eq!(items, 0, "the event must not be created");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_valid_task_with_an_event_without_a_start_degrades_the_whole_answer() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(support::llm::v4::response(vec![
+        support::llm::v4::with(
+            support::llm::v4::task("позвонить маме"),
+            "date",
+            support::llm::v4::date_offset(1, "days"),
+        ),
+        support::llm::v4::event("Встреча с Петей"),
+    ]))]);
+    let mut config = config();
+    config.voice_fallback_raw = true;
+    let app = app(&db.pool, ai.clone(), config);
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(body("позвонить маме, встреча с Петей", "ha_voice", "auto")),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["status"], "applied");
+    assert_eq!(json["fallback"], true);
+    assert_eq!(
+        json["items"].as_array().expect("items").len(),
+        1,
+        "the whole answer degrades to one fallback item"
+    );
+    assert_eq!(json["items"][0]["kind"], "tasks");
+    assert_eq!(item_count(&db.pool, household.household_id).await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_named_events_list_receives_the_event() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let school = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO lists (id, household_id, kind, name, is_default, position, created_at, updated_at)
+         VALUES ($1, $2, 'events', 'Школа', false, 10, now(), now())",
+    )
+    .bind(school)
+    .bind(household.household_id)
+    .execute(&db.pool)
+    .await
+    .expect("school list");
+    let ai = StubAi::new(vec![Ok(support::llm::v4::response(vec![
+        support::llm::v4::with(
+            support::llm::v4::with(support::llm::v4::event("Собрание"), "list", json!("Школа")),
+            "date",
+            support::llm::v4::date_weekday("thursday", false),
+        ),
+    ]))]);
+    let app = app(&db.pool, ai.clone(), config());
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(body("собрание в школе в четверг в 18:30", "api", "draft")),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["status"], "draft");
+    assert_eq!(json["items"][0]["kind"], "events");
+    assert_eq!(json["items"][0]["list_id"], school.to_string());
+    let speech = json["speech"].as_str().expect("speech");
+    assert!(speech.contains("событие"), "{speech}");
+    assert!(!speech.contains("элемент"), "{speech}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -630,6 +888,71 @@ async fn an_empty_list_falls_back_to_the_kind_default() {
         household.tasks_list_id.to_string(),
         "an empty list must use the default list of the kind"
     );
+
+    let capture_id =
+        Uuid::parse_str(json["capture_id"].as_str().expect("capture_id")).expect("uuid");
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let view = draft::view(&mut conn, household.household_id, capture_id, Utc::now())
+        .await
+        .expect("view");
+    assert_eq!(view.validated.items.len(), 1);
+    assert!(
+        !view.validated.items[0].list_auto_selected,
+        "an empty list must not be marked as auto-selected"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_default_list_name_behaves_like_an_empty_list() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+
+    let unnamed = StubAi::new(vec![Ok(support::llm::v4::response(vec![
+        support::llm::v4::shopping("молоко"),
+    ]))]);
+    let unnamed_app = app(&db.pool, unnamed, config());
+    let (status, _, json) = call(
+        &unnamed_app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(body("купить молоко", "api", "draft")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let unnamed_id = Uuid::parse_str(json["capture_id"].as_str().expect("id")).expect("uuid");
+
+    let named = StubAi::new(vec![Ok(support::llm::v4::response(vec![
+        support::llm::v4::with(
+            support::llm::v4::shopping("молоко"),
+            "list",
+            json!("Покупки"),
+        ),
+    ]))]);
+    let named_app = app(&db.pool, named, config());
+    let (status, _, json) = call(
+        &named_app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(body("купить молоко", "api", "draft")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let named_id = Uuid::parse_str(json["capture_id"].as_str().expect("id")).expect("uuid");
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let unnamed = draft::view(&mut conn, household.household_id, unnamed_id, Utc::now())
+        .await
+        .expect("unnamed view");
+    let named = draft::view(&mut conn, household.household_id, named_id, Utc::now())
+        .await
+        .expect("named view");
+    let (unnamed, named) = (&unnamed.validated.items[0], &named.validated.items[0]);
+    assert_eq!(named.list_id, unnamed.list_id);
+    assert_eq!(named.list_auto_selected, unnamed.list_auto_selected);
+    assert!(!named.list_auto_selected);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -792,7 +1115,9 @@ async fn auto_applies_two_purchases_and_returns_the_full_contract() {
     assert_eq!(json["items"].as_array().expect("items").len(), 2);
 
     for item in json["items"].as_array().expect("items") {
-        for key in ["id", "title", "list_id", "kind", "due_date", "due_at"] {
+        for key in [
+            "id", "title", "list_id", "kind", "due_date", "due_at", "end_date", "end_at",
+        ] {
             assert!(item.get(key).is_some(), "missing {key}: {item}");
         }
         assert!(item["id"].is_string());

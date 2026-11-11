@@ -290,6 +290,49 @@ async fn text_is_queued_and_the_card_replaces_the_waiting_screen() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_event_from_the_parse_is_saved_by_save_all() {
+    let db = db().await;
+    let answer = json!({"items": [
+        support::llm::v4::with(
+            support::llm::v4::with(
+                support::llm::v4::with(
+                    support::llm::v4::event("Маникюр"),
+                    "date",
+                    support::llm::v4::date_ymd(&date_in_days(2)),
+                ),
+                "time",
+                json!("14:00"),
+            ),
+            "end_time",
+            json!("15:30"),
+        )
+    ]});
+    let mut stand = stand(&db.pool, vec![Ok(answer)]).await;
+
+    stand.bot.text("маникюр через два дня с 14 до 15:30").await;
+    assert_eq!(stand.work().await, Pass::Drafted);
+
+    stand.bot.assert_screen_contains("Маникюр");
+    stand.bot.assert_has_button("Сохранить всё");
+    assert_eq!(stand.household_items().await, 0);
+
+    stand.bot.press("Сохранить всё").await;
+
+    let household = household_id(&db.pool, stand.bot.chat).await;
+    let (list_kind, end_at): (String, Option<chrono::DateTime<Utc>>) = sqlx::query_as(
+        "SELECT l.kind::text, i.end_at
+         FROM items i JOIN lists l ON l.id = i.list_id
+         WHERE i.household_id = $1 AND i.title = 'Маникюр'",
+    )
+    .bind(household)
+    .fetch_one(&db.pool)
+    .await
+    .expect("saved event");
+    assert_eq!(list_kind, "events");
+    assert!(end_at.is_some(), "saving must keep the event end");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn text_on_a_tasks_list_defaults_capture_to_that_list() {
     let db = db().await;
     let mut stand = stand(
@@ -860,6 +903,59 @@ async fn both_slots_bad_json_open_manual_editing_and_count_validation_failures()
     assert!(
         validation_failures() >= failures_before + 2.0,
         "both rejected answers must count as validation failures"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bad_json_answer_without_a_fallback_degrades_after_one_call() {
+    let db = db().await;
+    let mut stand = stand(&db.pool, vec![Ok(json!({"unexpected": true}))]).await;
+    let text = "секретная заметка";
+
+    stand.bot.text(text).await;
+    assert_eq!(stand.work().await, Pass::Dead);
+
+    stand.bot.assert_screen_contains("Не получилось разобрать");
+    stand.bot.assert_screen_contains(text);
+    assert_eq!(
+        stand.ai.calls(),
+        1,
+        "the only slot must not be called twice"
+    );
+    assert_eq!(stand.household_items().await, 0);
+
+    let household = household_id(&db.pool, stand.bot.chat).await;
+    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM llm_runs WHERE household_id = $1")
+        .bind(household)
+        .fetch_one(&db.pool)
+        .await
+        .expect("llm runs");
+    assert_eq!(runs, 1, "the rejected answer is logged once");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_open_breaker_does_not_call_the_llm_or_write_an_llm_run() {
+    let db = db().await;
+    let mut stand = stand(&db.pool, vec![Ok(two_items())]).await;
+    support::llm::open_primary(&stand.chain, stand.bot.now);
+
+    stand.bot.text("позвонить маме").await;
+    assert_eq!(stand.work().await, Pass::Dead);
+
+    assert_eq!(stand.ai.calls(), 0, "the LLM must not be called while open");
+    stand.bot.assert_screen_contains("временно недоступен");
+    stand.bot.assert_screen_contains("позвонить маме");
+    assert_eq!(stand.household_items().await, 0);
+
+    let household = household_id(&db.pool, stand.bot.chat).await;
+    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM llm_runs WHERE household_id = $1")
+        .bind(household)
+        .fetch_one(&db.pool)
+        .await
+        .expect("llm runs");
+    assert_eq!(
+        runs, 0,
+        "a skipped LLM call must not write a run and must not spend quota"
     );
 }
 

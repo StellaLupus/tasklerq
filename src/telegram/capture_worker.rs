@@ -29,9 +29,7 @@ use crate::llm::Chain;
 use crate::metrics;
 use crate::security_audit::{Audit, LlmValidation};
 use crate::storage::repositories::capture_jobs::{self, Failure, Job};
-use crate::storage::repositories::llm_runs::{
-    self, FAILURE, NewRun, RunFields, runs_from_attempts,
-};
+use crate::storage::repositories::llm_runs::{self, NewRun, RunFields, runs_from_attempts};
 use crate::storage::repositories::{households, items, users};
 use crate::telegram::ru;
 
@@ -365,29 +363,9 @@ impl CaptureWorker {
         .await;
         let llm::Outcome { result, attempts } = outcome;
 
-        let runs = if attempts.is_empty() {
-            // Предохранители всех слотов разомкнуты: LLM не вызывалась, но
-            // разбор всё равно учитывается строкой без слота и попытки.
-            match &result {
-                Err(failed) => vec![NewRun {
-                    household_id: job.household_id,
-                    user_id: Some(prepared.user.id),
-                    source: job.source,
-                    mode: CaptureMode::Draft,
-                    prompt_version: Some(PROMPT_VERSION),
-                    slot: None,
-                    attempt: None,
-                    status: FAILURE,
-                    error_code: Some(failed.failure.code()),
-                    latency_ms: failed.latency_ms,
-                    input_tokens: None,
-                    output_tokens: None,
-                }],
-                Ok(_) => Vec::new(),
-            }
-        } else {
-            runs_from_attempts(self.run_fields(&job, &prepared), &attempts)
-        };
+        // Предохранители всех слотов разомкнуты — попыток нет, и строки
+        // `llm_runs` не пишется: LLM не вызывалась, а квота считает вызовы.
+        let runs = runs_from_attempts(self.run_fields(&job, &prepared), &attempts);
 
         match result {
             Ok(generated) => {

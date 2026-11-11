@@ -817,9 +817,9 @@ pub(super) async fn save_draft_item(
 ) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
     let list = lists::get_visible(&mut *ctx.conn, household_id, list_id).await?;
-    // События не входят в контекст разбора (6.1) и не предлагаются в выборе
-    // списка. Если список всё же оказался списком событий, отказ объясняется,
-    // а не приходит как `list_missing`.
+    // Редактор события появится в 8.3; до него форма элемента не предлагает
+    // списки событий. Если список всё же оказался списком событий, отказ
+    // объясняется, а не приходит как `list_missing`.
     if list.kind == ListKind::Events {
         return Err(Fail::User(
             "Событие нельзя сохранить из разбора: выберите список задач или покупок.".into(),
@@ -962,8 +962,7 @@ fn to_raw(draft: &ItemDraft, kind: ListKind, list_name: &str, until: Option<Stri
         weekdays: rule.weekdays.iter().map(|day| i64::from(*day)).collect(),
         until,
     });
-    // Поля покупки есть только у `shopping` и `checklist`; в списках событий
-    // разбор не работает.
+    // Поля покупки есть только у `shopping` и `checklist`; у события их нет.
     let shopping = !matches!(kind, ListKind::Tasks | ListKind::Events);
 
     RawItem {

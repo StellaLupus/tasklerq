@@ -327,6 +327,48 @@ async fn unreachable_primary_gives_the_remaining_budget_to_the_fallback() {
 }
 
 #[tokio::test]
+async fn a_parse_rejection_is_marked_for_a_new_code_too() {
+    let clock = Arc::new(FakeClock::default());
+    let (primary, _) = slot(
+        "primary",
+        &clock,
+        Duration::from_secs(10),
+        Duration::from_secs(1),
+        Reply::Content("ответ"),
+    );
+    let chain = Chain::new(primary, None);
+    let schema = schema();
+    let messages = messages();
+    let request = request(&messages, &schema);
+
+    let outcome = chain
+        .run(
+            &request,
+            Duration::from_secs(20),
+            now(),
+            clock.as_ref(),
+            |_| -> Result<String, ResponseFailure<UserError>> {
+                Err(ResponseFailure::Shape {
+                    // Кода нет в прежнем списке строк: аудит обязан определять
+                    // отказ по виду, а не по перечню.
+                    code: "brand_new_validation_code",
+                })
+            },
+        )
+        .await;
+
+    assert!(outcome.result.is_err());
+    assert_eq!(
+        outcome.attempts[0].error_code,
+        Some("brand_new_validation_code")
+    );
+    assert!(
+        outcome.attempts[0].rejected_by_parse,
+        "a shape rejection must be flagged for the validation audit"
+    );
+}
+
+#[tokio::test]
 async fn invalid_primary_response_calls_the_fallback_once() {
     let clock = Arc::new(FakeClock::default());
     let (primary, primary_backend) = slot(

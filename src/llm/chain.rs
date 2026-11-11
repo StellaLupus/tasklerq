@@ -164,6 +164,10 @@ pub struct Attempt {
     pub number: u16,
     /// Код ошибки; `None` у успешного вызова.
     pub error_code: Option<&'static str>,
+    /// Ответ слота не прошёл разбор (форма или ошибка пользователя). Признак
+    /// ведётся по виду отказа, а не по списку кодов: новый вариант разбора тоже
+    /// попадёт в журнал `llm_validation_failed`.
+    pub rejected_by_parse: bool,
     /// Длительность вызова.
     pub duration: Duration,
     /// Входные токены, если провайдер их вернул.
@@ -388,68 +392,80 @@ where
     };
     let finished_at = now + chrono::Duration::from_std(duration).unwrap_or_default();
 
-    let (error_code, input_tokens, output_tokens, model, outcome) = match completed {
-        Err(_) => {
-            slot.breaker.record_failure(finished_at);
-            (
-                Some(LlmError::Timeout.code()),
-                None,
-                None,
-                None,
-                AttemptResult::Failed,
-            )
-        }
-        Ok(Err(error)) => {
-            if matches!(&error, LlmError::Unauthorized) {
-                tracing::error!(
-                    slot = slot.name,
-                    code = error.code(),
-                    "llm slot rejected the token"
-                );
+    let (error_code, rejected_by_parse, input_tokens, output_tokens, model, outcome) =
+        match completed {
+            Err(_) => {
+                slot.breaker.record_failure(finished_at);
+                (
+                    Some(LlmError::Timeout.code()),
+                    false,
+                    None,
+                    None,
+                    None,
+                    AttemptResult::Failed,
+                )
             }
-            slot.breaker.record_failure(finished_at);
-            (Some(error.code()), None, None, None, AttemptResult::Failed)
-        }
-        Ok(Ok(completion)) => {
-            let input_tokens = completion.input_tokens;
-            let output_tokens = completion.output_tokens;
-            let model = (!completion.model.is_empty()).then_some(completion.model);
-            match parse(&completion.content) {
-                Ok(value) => {
-                    slot.breaker.record_success(finished_at);
-                    (
-                        None,
-                        input_tokens,
-                        output_tokens,
-                        model,
-                        AttemptResult::Success(value),
-                    )
+            Ok(Err(error)) => {
+                if matches!(&error, LlmError::Unauthorized) {
+                    tracing::error!(
+                        slot = slot.name,
+                        code = error.code(),
+                        "llm slot rejected the token"
+                    );
                 }
-                Err(ResponseFailure::Shape { code }) => {
-                    slot.breaker.record_failure(finished_at);
-                    (
-                        Some(code),
-                        input_tokens,
-                        output_tokens,
-                        model,
-                        AttemptResult::Failed,
-                    )
-                }
-                Err(ResponseFailure::User { code, error }) => {
-                    // Ошибка пользователя не размыкает предохранитель: слот
-                    // ответил, повтор не исправит ввод.
-                    slot.breaker.record_success(finished_at);
-                    (
-                        Some(code),
-                        input_tokens,
-                        output_tokens,
-                        model,
-                        AttemptResult::User(error),
-                    )
+                slot.breaker.record_failure(finished_at);
+                (
+                    Some(error.code()),
+                    false,
+                    None,
+                    None,
+                    None,
+                    AttemptResult::Failed,
+                )
+            }
+            Ok(Ok(completion)) => {
+                let input_tokens = completion.input_tokens;
+                let output_tokens = completion.output_tokens;
+                let model = (!completion.model.is_empty()).then_some(completion.model);
+                match parse(&completion.content) {
+                    Ok(value) => {
+                        slot.breaker.record_success(finished_at);
+                        (
+                            None,
+                            false,
+                            input_tokens,
+                            output_tokens,
+                            model,
+                            AttemptResult::Success(value),
+                        )
+                    }
+                    Err(ResponseFailure::Shape { code }) => {
+                        slot.breaker.record_failure(finished_at);
+                        (
+                            Some(code),
+                            true,
+                            input_tokens,
+                            output_tokens,
+                            model,
+                            AttemptResult::Failed,
+                        )
+                    }
+                    Err(ResponseFailure::User { code, error }) => {
+                        // Ошибка пользователя не размыкает предохранитель: слот
+                        // ответил, повтор не исправит ввод.
+                        slot.breaker.record_success(finished_at);
+                        (
+                            Some(code),
+                            true,
+                            input_tokens,
+                            output_tokens,
+                            model,
+                            AttemptResult::User(error),
+                        )
+                    }
                 }
             }
-        }
-    };
+        };
 
     let status = if error_code.is_none() {
         "success"
@@ -464,6 +480,7 @@ where
             slot: slot.name,
             number,
             error_code,
+            rejected_by_parse,
             duration,
             input_tokens,
             output_tokens,

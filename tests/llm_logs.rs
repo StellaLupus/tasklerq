@@ -25,7 +25,7 @@ use support::logs::LogBuffer;
 use support::telegram::{FakeTelegram, Harness};
 use support::{db, next_telegram_id};
 
-/// Цепочка, которая всегда отвечает ошибкой транспорта.
+/// Цепочка, которая всегда отвечает пустым ответом.
 fn failing_chain() -> Arc<Chain> {
     Arc::new(support::llm::chain(
         support::llm::BackendDouble::new(vec![Err(LlmError::EmptyResponse)]),
@@ -97,6 +97,7 @@ fn attempt(
         slot,
         number,
         error_code,
+        rejected_by_parse: false,
         duration,
         input_tokens,
         output_tokens,

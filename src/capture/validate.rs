@@ -46,6 +46,8 @@ pub const ASSIGNEE_AMBIGUOUS: &str = "assignee_ambiguous";
 pub const DATE_PAST: &str = "date_past";
 /// Код ошибки «дата не разобрана».
 pub const DATE_INVALID: &str = "date_invalid";
+/// Код ошибки «у события не названо начало».
+pub const DATE_MISSING: &str = "date_missing";
 /// Код ошибки «конец события раньше начала».
 pub const END_BEFORE_START: &str = "event_end_before_start";
 
@@ -90,13 +92,23 @@ impl DraftItem {
                 .any(|error| error.code == ASSIGNEE_AMBIGUOUS)
     }
 
-    /// Карточка должна предложить другой срок: дата не разобрана или прошла.
-    /// `time_past` сюда не входит: это отдельная ошибка времени.
+    /// Карточка должна предложить другой срок: дата не разобрана, не названа у
+    /// события или прошла. `time_past` сюда не входит: это отдельная ошибка
+    /// времени.
     pub fn has_date_question(&self) -> bool {
         self.errors.iter().any(|error| {
-            error.field == "due_date" && (error.code == DATE_PAST || error.code == DATE_INVALID)
+            error.field == "due_date"
+                && matches!(error.code, DATE_PAST | DATE_INVALID | DATE_MISSING)
         })
     }
+}
+
+/// У события нет начала: в режиме `auto` такой элемент не создаётся, а разбор
+/// деградирует, как при отказе LLM.
+pub fn event_without_start(item: &DraftItem) -> bool {
+    item.kind == ListKind::Events
+        && item.effective_due_at.is_none()
+        && item.effective_due_date.is_none()
 }
 
 /// Проверенный черновик.
@@ -259,6 +271,21 @@ fn validate_item_in(
     };
 
     let (due_at, due_date) = resolve_due(context, &raw, &mut errors);
+
+    // Начало события обязательно; без него черновик задаёт вопрос о дате, а
+    // домен 0009 отказал бы в создании общим «элемент не прошёл проверку».
+    if raw.target_kind == ListKind::Events
+        && due_at.is_none()
+        && due_date.is_none()
+        && !errors.iter().any(|error| error.field == "due_date")
+    {
+        fail(
+            &mut errors,
+            "due_date",
+            DATE_MISSING,
+            "Укажите дату события",
+        );
+    }
 
     let (end_at, end_date) = if raw.target_kind == ListKind::Events {
         resolve_event_end(context, &raw, due_at, due_date, &mut errors)
@@ -449,9 +476,9 @@ fn fail_date_error(errors: &mut Vec<ItemError>, error: &RawDateError) {
 ///
 /// Начало со временем даёт конец моментом, вседневное начало — последним днём
 /// включительно. Время конца без даты относится ко дню начала, а если оно не
-/// позже времени начала — к следующему дню. Правила полей события целиком
-/// проверяет домен 0009 при применении (7.2); здесь — то, что нужно черновику,
-/// чтобы показать ошибку и не сохранить элемент.
+/// позже времени начала — к следующему дню. Здесь считаются значения для
+/// черновика и показываются ошибки полей; те же правила окончательно проверяет
+/// домен 0009 при применении (7.2).
 fn resolve_event_end(
     context: &CaptureContext,
     raw: &RawItem,
@@ -553,8 +580,17 @@ fn resolve_event_end(
 }
 
 /// Список по имени среди списков нужного типа; иначе список по умолчанию.
+///
+/// Пустое значение и название списка по умолчанию дают одно и то же: список по
+/// умолчанию без отметки «выбран автоматически». Отметка остаётся только у
+/// действительно неизвестного названия: её показывает карточка, а в режиме
+/// `auto` неизвестное имя невозможно — парсер принимает только перечень.
 fn resolve_list<'a>(context: &'a CaptureContext, raw: &RawItem) -> (Option<&'a ListRef>, bool) {
-    let named = raw.target_list.as_deref().map(fold);
+    let named = raw
+        .target_list
+        .as_deref()
+        .map(fold)
+        .filter(|name| !name.is_empty());
     if let Some(name) = &named {
         let found = context
             .lists
@@ -564,7 +600,11 @@ fn resolve_list<'a>(context: &'a CaptureContext, raw: &RawItem) -> (Option<&'a L
             return (found, false);
         }
     }
-    (context.default_list(raw.target_kind), named.is_some())
+    let default = context.default_list(raw.target_kind);
+    let is_default_name = named
+        .as_deref()
+        .is_some_and(|name| default.is_some_and(|list| fold(&list.name) == name));
+    (default, named.is_some() && !is_default_name)
 }
 
 enum Assignee {

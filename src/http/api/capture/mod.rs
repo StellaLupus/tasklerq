@@ -30,7 +30,7 @@ use crate::capture::draft::{self, Applied, NewCapture, Responder};
 use crate::capture::llm::{self, Failure};
 use crate::capture::prompt::PROMPT_VERSION;
 use crate::capture::schema::{ParseError, ParsedResponse, RawItem};
-use crate::capture::validate::{DraftItem, ValidationMode, validate_items_in};
+use crate::capture::validate::{DraftItem, ValidationMode, event_without_start, validate_items_in};
 use crate::config::CaptureConfig;
 use crate::domain::error::DomainError;
 use crate::domain::models::{CaptureMode, CaptureSource, Item, List, ListKind};
@@ -218,6 +218,12 @@ pub struct CaptureItem {
     pub due_date: Option<NaiveDate>,
     /// Срок со временем.
     pub due_at: Option<DateTime<Utc>>,
+    /// Последний день вседневного события включительно.
+    #[serde(default)]
+    pub end_date: Option<NaiveDate>,
+    /// Конец события со временем.
+    #[serde(default)]
+    pub end_at: Option<DateTime<Utc>>,
 }
 
 /// Ответ `POST /api/v1/capture`.
@@ -402,14 +408,13 @@ async fn capture_inner(
         }
     }
 
-    // Конкретный список проверяется после резерва: чужой, отсутствующий,
-    // архивный и список событий дают один и тот же 422, чтобы не раскрывать
-    // чужие данные. Список событий отклоняется до квоты и LLM (0009-events
-    // 6.1): разбор не создаёт события.
+    // Конкретный список проверяется после резерва: чужой, отсутствующий и
+    // архивный список дают один и тот же 422, чтобы не раскрывать чужие
+    // данные. Список событий допустим: разбор создаёт события (7.2).
     let target_list = match request.list_id {
         Some(list_id) => match lists::get_visible(&mut conn, auth.household_id, list_id).await {
-            Ok(list) if list.kind != ListKind::Events => Some(list),
-            Ok(_) | Err(DomainError::NotFound) => {
+            Ok(list) => Some(list),
+            Err(DomainError::NotFound) => {
                 log_capture(source, "invalid", capture_id);
                 return Err(ApiError::validation("Unknown list"));
             }
@@ -484,6 +489,9 @@ async fn capture_inner(
     };
 
     let mut conn = connection(state).await?;
+    // Предохранители всех слотов разомкнуты — попыток нет, и строки `llm_runs`
+    // не пишется: LLM не вызывалась, а квота считает вызовы. Так же было до
+    // перехода на слоты.
     let fields = RunFields {
         household_id: auth.household_id,
         user_id: None,
@@ -491,35 +499,13 @@ async fn capture_inner(
         mode: request.mode,
         prompt_version: Some(PROMPT_VERSION),
     };
-    if attempts.is_empty() {
-        // Предохранители всех слотов разомкнуты: LLM не вызывалась, но разбор
-        // учитывается строкой без слота и попытки.
-        if let Err(failed) = &result {
-            let run = NewRun {
-                household_id: fields.household_id,
-                user_id: fields.user_id,
-                source: fields.source,
-                mode: fields.mode,
-                prompt_version: fields.prompt_version,
-                slot: None,
-                attempt: None,
-                status: FAILURE,
-                error_code: Some(failed.failure.code()),
-                latency_ms: failed.latency_ms,
-                input_tokens: None,
-                output_tokens: None,
-            };
-            record_failure(&mut conn, run, failed.finished_at).await;
-        }
-    } else {
-        for run in runs_from_attempts(fields, &attempts) {
-            if run.status == FAILURE {
-                record_failure(&mut conn, run, finished_at).await;
-            } else {
-                llm_runs::record(&mut conn, run, finished_at)
-                    .await
-                    .map_err(database_error)?;
-            }
+    for run in runs_from_attempts(fields, &attempts) {
+        if run.status == FAILURE {
+            record_failure(&mut conn, run, finished_at).await;
+        } else {
+            llm_runs::record(&mut conn, run, finished_at)
+                .await
+                .map_err(database_error)?;
         }
     }
 
@@ -589,6 +575,26 @@ async fn capture_inner(
         CaptureMode::Draft => ValidationMode::Strict,
     };
     let validated = validate_items_in(&context, item_source, parsed.clone(), validation);
+
+    // Событие без начала в `auto` не создаётся: весь ответ деградирует так же,
+    // как при отказе LLM — одна позиция из исходного текста. Это правило
+    // сильнее общего отказа невалидного ответа, поэтому проверяется до него.
+    if request.mode == CaptureMode::Auto && validated.items.iter().any(event_without_start) {
+        if fallback_allowed {
+            return apply_fallback(
+                &mut conn,
+                fallback,
+                finished_at,
+                "event_without_start",
+                reservation,
+            )
+            .await;
+        }
+        log_capture(source, "unavailable", capture_id);
+        return Err(ApiError::service_unavailable(
+            "Automatic capture is temporarily unavailable",
+        ));
+    }
 
     // Пустой разбор отклоняется в обоих режимах, невалидный — только в `auto`:
     // черновик покажет ошибки пользователю.
@@ -791,9 +797,13 @@ async fn apply_fallback(
     reason: &'static str,
     reservation: &mut Option<capture_requests::Reservation>,
 ) -> Result<Json<CaptureResponse>, ApiError> {
+    // Событие без начала создать нельзя, поэтому список событий в fallback не
+    // используется: позиция из исходного текста идёт в список задач или в
+    // подсказанный тип, как при обычной деградации.
     let requested_kind = input
         .target_list
         .map(|list| list.kind)
+        .filter(|kind| *kind != ListKind::Events)
         .or_else(|| input.hint.map(ListKind::from))
         .unwrap_or(ListKind::Tasks);
     // Подсказка могла указать тип, для которого в household нет списка
@@ -807,7 +817,10 @@ async fn apply_fallback(
     let parsed = ParsedResponse {
         items: vec![RawItem {
             target_kind: kind,
-            target_list: input.target_list.map(|list| list.name.clone()),
+            target_list: input
+                .target_list
+                .filter(|list| list.kind != ListKind::Events)
+                .map(|list| list.name.clone()),
             title,
             notes,
             due_date: None,
@@ -1003,6 +1016,8 @@ pub(super) fn item_response(item: &Item, kind: ListKind) -> CaptureItem {
         kind,
         due_date: item.due_date,
         due_at: item.due_at,
+        end_date: item.end_date,
+        end_at: item.end_at,
     }
 }
 
@@ -1015,6 +1030,8 @@ fn draft_item_response(item: &DraftItem) -> CaptureItem {
         kind: item.kind,
         due_date: item.effective_due_date,
         due_at: item.effective_due_at,
+        end_date: item.item.as_ref().and_then(|item| item.end_date),
+        end_at: item.item.as_ref().and_then(|item| item.end_at),
     }
 }
 
@@ -1027,14 +1044,16 @@ pub(super) fn applied_speech(items: &[CaptureItem]) -> String {
                 ListKind::Shopping => format!("Добавил покупку: {titles}."),
                 ListKind::Tasks => format!("Добавил задачу: {titles}."),
                 ListKind::Checklist => format!("Добавил позицию: {titles}."),
-                // 0009-events 6.1: списки событий исключаются из разбора;
-                // до этого у события нейтральный текст, не задача и не покупка.
-                ListKind::Events => format!("Добавил элемент: {titles}."),
+                ListKind::Events => format!("Добавил событие: {titles}."),
             }
         }
         Some(kind) if count <= 3 => {
             let titles = titles(items);
             format!("Добавил {}: {titles}.", kind_noun(kind, count))
+        }
+        Some(ListKind::Events) => {
+            let titles = titles(items);
+            format!("Добавил {}: {titles}.", kind_noun(ListKind::Events, count))
         }
         _ => format!("Добавил {}.", elements(count)),
     }
@@ -1044,21 +1063,22 @@ fn draft_speech(items: &[CaptureItem]) -> String {
     let count = items.len();
     match common_kind(items) {
         Some(kind) if count <= 3 => format!("Сохранил черновик: {}.", kind_noun(kind, count)),
+        Some(ListKind::Events) => {
+            format!("Сохранил черновик: {}.", kind_noun(ListKind::Events, count))
+        }
         _ => format!("Сохранил черновик: {}.", elements(count)),
     }
 }
 
-/// «2 покупки», «3 задачи», «2 позиции» — число с существительным по типу списка.
+/// «2 покупки», «3 задачи», «2 события» — число с существительным по типу списка.
 fn kind_noun(kind: ListKind, count: usize) -> String {
     match kind {
         ListKind::Shopping => crate::telegram::ru::purchases(count as i64),
         ListKind::Tasks => crate::telegram::ru::tasks(count as i64),
         ListKind::Checklist => crate::telegram::ru::positions(count as i64),
-        // 0009-events 6.1: списки событий исключаются из разбора;
-        // до этого — нейтральное «элементы», не задачи и не покупки.
         ListKind::Events => format!(
             "{count} {}",
-            crate::telegram::ru::plural(count as i64, "элемент", "элемента", "элементов")
+            crate::telegram::ru::plural(count as i64, "событие", "события", "событий")
         ),
     }
 }
@@ -1210,6 +1230,8 @@ mod tests {
             kind,
             due_date: None,
             due_at: None,
+            end_date: None,
+            end_at: None,
         };
         assert_eq!(
             applied_speech(&[item(ListKind::Shopping, "молоко")]),

@@ -138,7 +138,8 @@ pub async fn generate(
         .attempts
         .iter()
         .rev()
-        .find_map(|attempt| attempt.error_code.filter(|code| is_validation_code(code)));
+        .find(|attempt| attempt.rejected_by_parse)
+        .and_then(|attempt| attempt.error_code);
 
     let result = match outcome.result {
         Ok(parsed) => Ok(Generated {
@@ -201,14 +202,6 @@ fn parse(
             }
         }
     }
-}
-
-/// Коды ошибок разбора формы ответа.
-fn is_validation_code(code: &str) -> bool {
-    matches!(
-        code,
-        "not_an_object" | "missing_items" | "too_many_items" | "missing_field" | "invalid_field"
-    )
 }
 
 /// Текст вопроса по теме уточнения.

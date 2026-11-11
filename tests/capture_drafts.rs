@@ -7,7 +7,7 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use sqlx::{Acquire, PgPool};
 use tasklerq::capture::draft::{self, DraftError, DueChoice, ItemEdit, NewCapture};
 use tasklerq::capture::schema::{ParsedResponse, RawItem};
-use tasklerq::capture::validate::ASSIGNEE_AMBIGUOUS;
+use tasklerq::capture::validate::{ASSIGNEE_AMBIGUOUS, DATE_MISSING};
 use tasklerq::domain::error::DomainError;
 use tasklerq::domain::models::{CaptureMode, CaptureSource, DraftStatus, Field, ListKind};
 use tasklerq::storage::repositories::drafts;
@@ -179,6 +179,128 @@ async fn confirm_creates_every_item_once_and_links_them_to_the_capture() {
     .await
     .expect("events");
     assert_eq!(events, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_event_from_the_capture_is_stored_and_created_on_confirm() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let mut event = raw("Маникюр", ListKind::Events);
+    event.due_date = Some(date_in_days(now, 1));
+    event.due_time = Some("14:00".into());
+    event.end_time = Some("15:30".into());
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let id = draft::create(&mut conn, capture(&household, vec![event]), now)
+        .await
+        .expect("draft")
+        .id;
+
+    let view = draft::view(&mut conn, household.household_id, id, now)
+        .await
+        .expect("view");
+    assert!(
+        view.validated.is_valid(),
+        "{:?}",
+        view.validated.items[0].errors
+    );
+    let item = view.validated.items[0].item.as_ref().expect("valid event");
+    assert_eq!(item.list_id, household.events_list_id);
+    assert!(item.due_at.is_some());
+    assert!(item.end_at.is_some());
+    assert_eq!(item_count(&db.pool, &household).await, 0);
+
+    let confirmed = draft::confirm(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        id,
+        now + Duration::minutes(1),
+    )
+    .await
+    .expect("confirm");
+
+    assert_eq!(confirmed.items.len(), 1);
+    assert_eq!(confirmed.items[0].list_id, household.events_list_id);
+    assert!(confirmed.items[0].end_at.is_some());
+    assert_eq!(item_count(&db.pool, &household).await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_event_without_a_start_stays_a_draft_with_a_date_question() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let event = raw("Встреча с Петей", ListKind::Events);
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let id = draft::create(&mut conn, capture(&household, vec![event]), now)
+        .await
+        .expect("draft")
+        .id;
+
+    let view = draft::view(&mut conn, household.household_id, id, now)
+        .await
+        .expect("view");
+    let item = &view.validated.items[0];
+    assert_eq!(
+        item.errors
+            .iter()
+            .map(|error| error.code)
+            .collect::<Vec<_>>(),
+        [DATE_MISSING]
+    );
+    assert!(item.has_date_question());
+    assert!(item.item.is_none(), "the event must not be created yet");
+    assert_eq!(item_count(&db.pool, &household).await, 0);
+    assert!(matches!(
+        draft::confirm(
+            &mut conn,
+            household.household_id,
+            &household.owner(),
+            id,
+            now + Duration::minutes(1),
+        )
+        .await,
+        Err(DraftError::Invalid(ref invalid)) if invalid == &vec![0]
+    ));
+    assert_eq!(item_count(&db.pool, &household).await, 0);
+
+    // Ответ на вопрос о дате делает событие валидным; только после него его
+    // можно создать.
+    let view = draft::answer_due_date(
+        &mut conn,
+        household.household_id,
+        id,
+        0,
+        DueChoice::Tomorrow,
+        now + Duration::minutes(2),
+    )
+    .await
+    .expect("answer");
+    assert!(
+        view.validated.is_valid(),
+        "{:?}",
+        view.validated.items[0].errors
+    );
+    assert!(!view.validated.items[0].has_date_question());
+    assert_eq!(
+        view.validated.items[0].list_id,
+        Some(household.events_list_id)
+    );
+
+    let confirmed = draft::confirm(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        id,
+        now + Duration::minutes(3),
+    )
+    .await
+    .expect("confirm");
+    assert_eq!(confirmed.items.len(), 1);
+    assert_eq!(confirmed.items[0].list_id, household.events_list_id);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

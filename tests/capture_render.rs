@@ -201,6 +201,12 @@ async fn bad_lines_stop_the_command_with_a_line_number_and_no_phrase_text() {
             !errors.contains("купить хлеб"),
             "{case}: another phrase must not reach stderr: {errors}"
         );
+        if case == "не JSON" {
+            assert!(
+                errors.contains("не является JSON"),
+                "{case}: the message must name the reason: {errors}"
+            );
+        }
         assert!(
             stdout(&output).lines().count() == 1,
             "{case}: the command stops after the first bad line"
@@ -215,6 +221,46 @@ async fn bad_lines_stop_the_command_with_a_line_number_and_no_phrase_text() {
         stderr(&output).contains("\"bad-id\""),
         "the id is reported: {}",
         stderr(&output)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_phrase_in_a_wrong_typed_field_does_not_reach_stderr() {
+    const PHRASE: &str = "секретная фраза про молоко и хлеб";
+
+    let bad = json!({
+        "id": "bad-type",
+        "context": PHRASE,
+        "text": "купить молоко",
+    });
+    let output = render(&format!("{}\n", bad)).await;
+
+    assert!(!output.status.success(), "{output:?}");
+    let errors = stderr(&output);
+    assert!(
+        errors.contains("context"),
+        "the field path is named: {errors}"
+    );
+    assert!(
+        !errors.contains(PHRASE),
+        "a phrase in a wrong-typed field must not reach stderr: {errors}"
+    );
+
+    let bad = json!({
+        "id": "bad-kind",
+        "context": {
+            "now": "2026-10-30T11:05:00+03:00",
+            "timezone": "Europe/Moscow",
+            "lists": [{"name": PHRASE, "kind": PHRASE}],
+        },
+        "text": "купить молоко",
+    });
+    let output = render(&format!("{}\n", bad)).await;
+    assert!(!output.status.success(), "{output:?}");
+    let errors = stderr(&output);
+    assert!(
+        !errors.contains(PHRASE),
+        "an invalid list kind must not echo the value: {errors}"
     );
 }
 
