@@ -17,12 +17,11 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use tasklerq::admin;
 use tasklerq::auth::tokens::hash_token;
-use tasklerq::capture::breaker::CircuitBreaker;
 use tasklerq::capture::prompt::PROMPT_VERSION;
 use tasklerq::config::{CaptureConfig, SecretString, TenancyMode};
-use tasklerq::home_assistant::{AiTask, GenerateData, HaError};
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
+use tasklerq::llm::Chain;
 use tasklerq::security_audit::Audit;
 use tasklerq::storage::repositories::capture_jobs::{self, NewJob};
 use tasklerq::storage::repositories::members;
@@ -284,9 +283,8 @@ async fn rate_limits_are_audited_for_webhook_and_capture() {
     let mut config = capture_config();
     config.rate_limit_per_min = 1;
     let app = build_router(
-        AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_capture(
-            CaptureState::new(config, None, Arc::new(CircuitBreaker::default()), 200),
-        ),
+        AppState::new(db.pool.clone(), Audit::new(db.pool.clone()))
+            .with_capture(CaptureState::new(config, None, 200)),
     );
     let body = json!({"text": "Купить лекарство", "source": "api", "mode": "draft"});
     let (first, _) = support::request(
@@ -518,24 +516,12 @@ async fn the_invite_limit_is_audited() {
     assert_eq!(stored_household, Some(household_id));
 }
 
-/// Home Assistant с заготовленным ответом.
-struct StubAi {
-    answer: Value,
-}
-
-#[async_trait]
-impl AiTask for StubAi {
-    async fn check_entity(&self) -> Result<(), HaError> {
-        Ok(())
-    }
-
-    async fn generate_data(
-        &self,
-        _request: &GenerateData<'_>,
-        _timeout: StdDuration,
-    ) -> Result<Value, HaError> {
-        Ok(self.answer.clone())
-    }
+/// Цепочка с заготовленным ответом модели.
+fn chain(answer: Value) -> Arc<Chain> {
+    Arc::new(support::llm::chain(
+        support::llm::BackendDouble::always(Ok(answer)),
+        None,
+    ))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -548,18 +534,10 @@ async fn llm_validation_failures_are_audited_for_api_and_telegram() {
 
     // HTTP API: ответ модели не прошёл разбор схемы.
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
-    let ai: Arc<dyn AiTask> = Arc::new(StubAi {
-        answer: json!({"items": LLM_RESPONSE}),
-    });
+    let ai = chain(json!({"items": LLM_RESPONSE}));
     let app = build_router(
-        AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_capture(
-            CaptureState::new(
-                capture_config(),
-                Some(ai),
-                Arc::new(CircuitBreaker::default()),
-                200,
-            ),
-        ),
+        AppState::new(db.pool.clone(), Audit::new(db.pool.clone()))
+            .with_capture(CaptureState::new(capture_config(), Some(ai), 200)),
     );
     let (status, _) = support::request(
         &app,
@@ -601,9 +579,7 @@ async fn llm_validation_failures_are_audited_for_api_and_telegram() {
 
     let worker = CaptureWorker::new(
         db.pool.clone(),
-        Arc::new(StubAi {
-            answer: json!({"items": LLM_RESPONSE}),
-        }),
+        chain(json!({"items": LLM_RESPONSE})),
         Bot::new("tasklerqbot"),
         Arc::new(Notify::new()),
         Audit::new(db.pool.clone()),
@@ -732,18 +708,10 @@ async fn no_secret_or_user_content_reaches_audit_payloads() {
     .await;
 
     // Capture с ответом модели, который не прошёл валидацию.
-    let ai: Arc<dyn AiTask> = Arc::new(StubAi {
-        answer: json!({"items": LLM_RESPONSE}),
-    });
+    let ai = chain(json!({"items": LLM_RESPONSE}));
     let app = build_router(
-        AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_capture(
-            CaptureState::new(
-                capture_config(),
-                Some(ai),
-                Arc::new(CircuitBreaker::default()),
-                200,
-            ),
-        ),
+        AppState::new(db.pool.clone(), Audit::new(db.pool.clone()))
+            .with_capture(CaptureState::new(capture_config(), Some(ai), 200)),
     );
     let _ = support::request(
         &app,

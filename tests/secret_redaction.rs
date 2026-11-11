@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::connect_info::MockConnectInfo;
@@ -18,7 +17,6 @@ use http_body_util::BodyExt;
 use serde_json::json;
 use support::logs::LogBuffer;
 use tasklerq::config::{Config, SecretString};
-use tasklerq::home_assistant::{AiTask, GenerateData, HttpAiTask};
 use tasklerq::http::router::{AppState, build_router};
 use tasklerq::security_audit::Audit;
 use tasklerq::telegram::api::{HttpTelegramApi, TelegramApi};
@@ -100,7 +98,7 @@ fn config_env() -> BTreeMap<String, String> {
         ("HA_TOKEN".to_owned(), HA_TOKEN.to_owned()),
         (
             "HA_AI_TASK_ENTITY_ID".to_owned(),
-            "ai_task.google_ai_task_2".to_owned(),
+            "legacy.entity".to_owned(),
         ),
     ])
 }
@@ -239,47 +237,6 @@ fn telegram_network_error_and_log_hide_the_bot_token() {
     let rendered = format!("{error} {error:?}");
     assert_no_secret(&rendered, "Telegram error");
     assert_no_secret(&logs.contents(), "Telegram log");
-}
-
-#[test]
-fn home_assistant_error_and_log_hide_the_token() {
-    let logs = LogBuffer::default();
-    let subscriber = tracing_subscriber::fmt()
-        .json()
-        .with_max_level(tracing::Level::TRACE)
-        .with_writer(logs.clone())
-        .finish();
-    let structure = json!({});
-
-    let error = tracing::subscriber::with_default(subscriber, || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        runtime.block_on(async {
-            let ai = HttpAiTask::new(
-                "http://127.0.0.1:1",
-                SecretString::new(HA_TOKEN),
-                "ai_task.google_ai_task_2",
-            )
-            .expect("client");
-            let request = GenerateData {
-                task_name: "test",
-                instructions: "текст пользователя",
-                structure: &structure,
-            };
-            let error = ai
-                .generate_data(&request, Duration::from_secs(2))
-                .await
-                .expect_err("network error");
-            tracing::error!(%error, "home assistant request failed");
-            error
-        })
-    });
-
-    let rendered = format!("{error} {error:?}");
-    assert_no_secret(&rendered, "Home Assistant error");
-    assert_no_secret(&logs.contents(), "Home Assistant log");
 }
 
 fn bin() -> Command {

@@ -2,12 +2,8 @@
 
 mod support;
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration as StdDuration;
+use std::sync::Arc;
 
-use async_trait::async_trait;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode};
@@ -15,57 +11,20 @@ use chrono::{DateTime, Duration, Utc};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use tasklerq::capture::breaker::CircuitBreaker;
 use tasklerq::capture::draft;
 use tasklerq::capture::prompt::PROMPT_VERSION;
 use tasklerq::config::CaptureConfig;
-use tasklerq::home_assistant::{AiTask, GenerateData, HaError};
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
+use tasklerq::llm::{Chain, LlmError};
 use tasklerq::security_audit::Audit;
 use tower::ServiceExt;
 use uuid::Uuid;
 
 use support::{db, issue_token};
 
-/// Подмена Home Assistant: отдаёт заготовленные ответы по очереди.
-struct StubAi {
-    answers: Mutex<VecDeque<Result<Value, HaError>>>,
-    calls: AtomicUsize,
-}
-
-impl StubAi {
-    fn new(answers: Vec<Result<Value, HaError>>) -> Arc<Self> {
-        Arc::new(Self {
-            answers: Mutex::new(answers.into()),
-            calls: AtomicUsize::new(0),
-        })
-    }
-
-    fn calls(&self) -> usize {
-        self.calls.load(Ordering::SeqCst)
-    }
-}
-
-#[async_trait]
-impl AiTask for StubAi {
-    async fn check_entity(&self) -> Result<(), HaError> {
-        Ok(())
-    }
-
-    async fn generate_data(
-        &self,
-        _request: &GenerateData<'_>,
-        _timeout: StdDuration,
-    ) -> Result<Value, HaError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        self.answers
-            .lock()
-            .expect("lock")
-            .pop_front()
-            .unwrap_or(Err(HaError::Unreachable))
-    }
-}
+/// Двойник слота: отдаёт заготовленные ответы по очереди.
+type StubAi = support::llm::BackendDouble;
 
 fn config() -> CaptureConfig {
     CaptureConfig {
@@ -78,40 +37,32 @@ fn config() -> CaptureConfig {
 }
 
 fn app(pool: &PgPool, ai: Arc<StubAi>, config: CaptureConfig) -> Router {
-    app_with(
-        pool,
-        Some(ai),
-        config,
-        Arc::new(CircuitBreaker::default()),
-        200,
-    )
+    app_with(pool, Some(ai), config, 200)
 }
 
-fn app_with(
-    pool: &PgPool,
-    ai: Option<Arc<StubAi>>,
-    config: CaptureConfig,
-    breaker: Arc<CircuitBreaker>,
-    quota: u32,
-) -> Router {
-    let ai: Option<Arc<dyn AiTask>> = ai.map(|ai| ai as Arc<dyn AiTask>);
+fn app_with(pool: &PgPool, ai: Option<Arc<StubAi>>, config: CaptureConfig, quota: u32) -> Router {
+    let llm = ai.map(|backend| Arc::new(support::llm::chain(backend, None)));
+    app_chain(pool, llm, config, quota)
+}
+
+fn app_chain(pool: &PgPool, llm: Option<Arc<Chain>>, config: CaptureConfig, quota: u32) -> Router {
     build_router(
         AppState::new(pool.clone(), Audit::new(pool.clone()))
-            .with_capture(CaptureState::new(config, ai, breaker, quota)),
+            .with_capture(CaptureState::new(config, llm, quota)),
     )
 }
 
 /// Один ответ LLM: валидная покупка.
 fn shopping(title: &str) -> Value {
-    json!({"items": [{"target_kind": "shopping", "title": title}]})
+    support::llm::v4::response(vec![support::llm::v4::shopping(title)])
 }
 
 /// Ответ LLM: две валидные покупки.
 fn two_purchases() -> Value {
-    json!({"items": [
-        {"target_kind": "shopping", "title": "молоко"},
-        {"target_kind": "shopping", "title": "хлеб"}
-    ]})
+    support::llm::v4::response(vec![
+        support::llm::v4::shopping("молоко"),
+        support::llm::v4::shopping("хлеб"),
+    ])
 }
 
 fn body(text: &str, source: &str, mode: &str) -> Value {
@@ -624,9 +575,9 @@ async fn an_interval_phrase_stays_a_task_and_never_becomes_an_event() {
     let db = db().await;
     let household = support::create_household(&db.pool).await;
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
-    let ai = StubAi::new(vec![Ok(json!({"items": [
-        {"target_kind": "tasks", "title": "маникюр"}
-    ]}))]);
+    let ai = StubAi::new(vec![Ok(support::llm::v4::response(vec![
+        support::llm::v4::task("маникюр"),
+    ]))]);
     let app = app(&db.pool, ai.clone(), config());
 
     let (status, _, json) = call(
@@ -653,13 +604,13 @@ async fn an_interval_phrase_stays_a_task_and_never_becomes_an_event() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_event_list_name_from_the_llm_falls_back_to_the_kind_default() {
+async fn an_empty_list_falls_back_to_the_kind_default() {
     let db = db().await;
     let household = support::create_household(&db.pool).await;
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
-    let ai = StubAi::new(vec![Ok(json!({"items": [
-        {"target_kind": "tasks", "target_list": "Календарь", "title": "маникюр"}
-    ]}))]);
+    let ai = StubAi::new(vec![Ok(support::llm::v4::response(vec![
+        support::llm::v4::task("маникюр"),
+    ]))]);
     let app = app(&db.pool, ai.clone(), config());
 
     let (status, _, json) = call(
@@ -677,12 +628,37 @@ async fn an_event_list_name_from_the_llm_falls_back_to_the_kind_default() {
     assert_eq!(
         json["items"][0]["list_id"],
         household.tasks_list_id.to_string(),
-        "the events list with that name must not become the target list"
+        "an empty list must use the default list of the kind"
     );
-    assert_ne!(
-        json["items"][0]["list_id"],
-        household.events_list_id.to_string()
-    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_list_of_another_kind_is_a_schema_error() {
+    let db = db().await;
+    let household = support::create_household(&db.pool).await;
+    let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let ai = StubAi::new(vec![Ok(support::llm::v4::response(vec![
+        support::llm::v4::with(
+            support::llm::v4::task("маникюр"),
+            "list",
+            json!("Календарь"),
+        ),
+    ]))]);
+    let app = app(&db.pool, ai.clone(), config());
+
+    let (status, _, json) = call(
+        &app,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(body("маникюр завтра", "api", "draft")),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+    assert_error_envelope(&json, "service_unavailable");
+    assert_eq!(item_count(&db.pool, household.household_id).await, 0);
+    assert_eq!(draft_count(&db.pool, household.household_id).await, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -739,7 +715,7 @@ async fn the_eleventh_capture_in_a_minute_is_rate_limited_per_token() {
     let household = support::create_household(&db.pool).await;
     let first = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
     let second = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
-    let mut answers: Vec<Result<Value, HaError>> =
+    let mut answers: Vec<Result<Value, LlmError>> =
         (0..11).map(|_| Ok(shopping("молоко"))).collect();
     answers.push(Ok(shopping("хлеб")));
     let ai = StubAi::new(answers);
@@ -925,10 +901,14 @@ async fn auto_rejects_the_whole_capture_when_one_item_is_invalid() {
     let db = db().await;
     let household = support::create_household(&db.pool).await;
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
-    let ai = StubAi::new(vec![Ok(json!({"items": [
-        {"target_kind": "shopping", "title": "молоко"},
-        {"target_kind": "shopping", "title": "хлеб", "due_date": "2000-01-01"}
-    ]}))]);
+    let ai = StubAi::new(vec![Ok(support::llm::v4::response(vec![
+        support::llm::v4::shopping("молоко"),
+        support::llm::v4::with(
+            support::llm::v4::shopping("хлеб"),
+            "date",
+            support::llm::v4::date(1, 1, 2000),
+        ),
+    ]))]);
     let app = app(&db.pool, ai.clone(), config());
 
     let (status, _, json) = call(
@@ -991,10 +971,10 @@ async fn auto_rolls_back_items_events_and_the_capture_row_on_a_midway_failure() 
     .await
     .expect("trigger");
 
-    let ai = StubAi::new(vec![Ok(json!({"items": [
-        {"target_kind": "shopping", "title": "молоко"},
-        {"target_kind": "shopping", "title": marker}
-    ]}))]);
+    let ai = StubAi::new(vec![Ok(support::llm::v4::response(vec![
+        support::llm::v4::shopping("молоко"),
+        support::llm::v4::shopping(&marker),
+    ]))]);
     let app = app(&db.pool, ai.clone(), config());
 
     let (status, _, json) = call(
@@ -1026,13 +1006,13 @@ async fn auto_rolls_back_items_events_and_the_capture_row_on_a_midway_failure() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn auto_creates_an_item_without_an_assignee_when_the_name_is_unknown() {
+async fn auto_creates_an_item_without_an_assignee() {
     let db = db().await;
     let household = support::create_household(&db.pool).await;
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
-    let ai = StubAi::new(vec![Ok(json!({"items": [
-        {"target_kind": "tasks", "title": "позвонить маме", "assignee": "Мария"}
-    ]}))]);
+    let ai = StubAi::new(vec![Ok(support::llm::v4::response(vec![
+        support::llm::v4::task("позвонить маме"),
+    ]))]);
     let app = app(&db.pool, ai.clone(), config());
 
     let (status, _, json) = call(
@@ -1055,7 +1035,7 @@ async fn auto_creates_an_item_without_an_assignee_when_the_name_is_unknown() {
             .fetch_one(&db.pool)
             .await
             .expect("item assignee");
-    assert!(assignee.is_none(), "unknown assignee must be dropped");
+    assert!(assignee.is_none(), "an empty assignee must stay empty");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1068,9 +1048,13 @@ async fn auto_creates_an_item_without_an_assignee_when_the_name_is_ambiguous() {
         .execute(&db.pool)
         .await
         .expect("same-named members");
-    let ai = StubAi::new(vec![Ok(json!({"items": [
-        {"target_kind": "tasks", "title": "позвонить маме", "assignee": "Алексей"}
-    ]}))]);
+    let ai = StubAi::new(vec![Ok(support::llm::v4::response(vec![
+        support::llm::v4::with(
+            support::llm::v4::task("позвонить маме"),
+            "assignee",
+            json!("Алексей"),
+        ),
+    ]))]);
     let app = app(&db.pool, ai.clone(), config());
 
     let (status, _, json) = call(
@@ -1100,9 +1084,18 @@ async fn draft_mode_keeps_the_strict_assignee_check() {
     let db = db().await;
     let household = support::create_household(&db.pool).await;
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
-    let ai = StubAi::new(vec![Ok(json!({"items": [
-        {"target_kind": "tasks", "title": "позвонить маме", "assignee": "Мария"}
-    ]}))]);
+    sqlx::query("UPDATE users SET display_name = 'Алексей' WHERE household_id = $1")
+        .bind(household.household_id)
+        .execute(&db.pool)
+        .await
+        .expect("same-named members");
+    let ai = StubAi::new(vec![Ok(support::llm::v4::response(vec![
+        support::llm::v4::with(
+            support::llm::v4::task("позвонить маме"),
+            "assignee",
+            json!("Алексей"),
+        ),
+    ]))]);
     let app = app(&db.pool, ai.clone(), config());
 
     let (status, _, json) = call(
@@ -1123,7 +1116,7 @@ async fn draft_mode_keeps_the_strict_assignee_check() {
     let view = draft::view(&mut conn, household.household_id, capture_id, Utc::now())
         .await
         .expect("draft view");
-    assert_eq!(view.validated.items[0].errors[0].code, "assignee_unknown");
+    assert_eq!(view.validated.items[0].errors[0].code, "assignee_ambiguous");
     assert!(!view.validated.is_valid());
     assert_eq!(item_count(&db.pool, household.household_id).await, 0);
 }
@@ -1133,16 +1126,14 @@ async fn auto_drops_empty_optionals_and_returns_clarifications_without_blocking(
     let db = db().await;
     let household = support::create_household(&db.pool).await;
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
-    let ai = StubAi::new(vec![Ok(json!({
-        "items": [{
-            "target_kind": "shopping",
-            "title": "молоко",
-            "notes": "   ",
-            "tags": ["", "  "],
-            "subtasks": [" ", ""]
-        }],
-        "clarifications": ["Какой объём?"]
-    }))]);
+    let ai = StubAi::new(vec![Ok(support::llm::v4::response_with(
+        vec![support::llm::v4::with(
+            support::llm::v4::shopping("молоко"),
+            "notes",
+            json!("   "),
+        )],
+        json!([{"item": 0, "topic": "list"}]),
+    ))]);
     let app = app(&db.pool, ai.clone(), config());
 
     let (status, _, json) = call(
@@ -1156,19 +1147,22 @@ async fn auto_drops_empty_optionals_and_returns_clarifications_without_blocking(
 
     assert_eq!(status, StatusCode::OK, "{json}");
     assert_eq!(json["status"], "applied");
-    assert_eq!(json["clarifications"], json!(["Какой объём?"]));
+    assert_eq!(json["clarifications"], json!(["В какой список?"]));
     assert_eq!(json["items"].as_array().expect("items").len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn auto_puts_an_item_into_the_default_list_when_the_named_list_is_unknown() {
+async fn an_unknown_list_name_is_a_schema_error() {
     let db = db().await;
     let household = support::create_household(&db.pool).await;
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
-    let ai = StubAi::new(vec![Ok(json!({"items": [
-        {"target_kind": "tasks", "target_list": "Несуществующий список",
-         "title": "позвонить маме"}
-    ]}))]);
+    let ai = StubAi::new(vec![Ok(support::llm::v4::response(vec![
+        support::llm::v4::with(
+            support::llm::v4::task("позвонить маме"),
+            "list",
+            json!("Несуществующий список"),
+        ),
+    ]))]);
     let app = app(&db.pool, ai.clone(), config());
 
     let (status, _, json) = call(
@@ -1180,12 +1174,9 @@ async fn auto_puts_an_item_into_the_default_list_when_the_named_list_is_unknown(
     )
     .await;
 
-    assert_eq!(status, StatusCode::OK, "{json}");
-    assert_eq!(json["status"], "applied");
-    assert_eq!(
-        json["items"][0]["list_id"],
-        household.tasks_list_id.to_string()
-    );
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+    assert_error_envelope(&json, "service_unavailable");
+    assert_eq!(item_count(&db.pool, household.household_id).await, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1195,9 +1186,9 @@ async fn a_five_item_capture_speaks_only_the_count() {
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
     let items: Vec<Value> = ["молоко", "хлеб", "сыр", "яйца", "масло"]
         .into_iter()
-        .map(|title| json!({"target_kind": "shopping", "title": title}))
+        .map(support::llm::v4::shopping)
         .collect();
-    let ai = StubAi::new(vec![Ok(json!({"items": items}))]);
+    let ai = StubAi::new(vec![Ok(support::llm::v4::response(items))]);
     let app = app(&db.pool, ai.clone(), config());
 
     let (status, _, json) = call(
@@ -1225,16 +1216,16 @@ async fn too_many_items_is_a_rejected_input_and_does_not_open_the_breaker() {
     let household = support::create_household(&db.pool).await;
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
     let items: Vec<Value> = (0..21)
-        .map(|n| json!({"target_kind": "tasks", "title": format!("задача {n}")}))
+        .map(|n| support::llm::v4::task(&format!("задача {n}")))
         .collect();
-    let ai = StubAi::new(vec![Ok(json!({"items": items}))]);
-    let breaker = Arc::new(CircuitBreaker::default());
+    let ai = StubAi::new(vec![Ok(support::llm::v4::response(items))]);
+    let chain = Arc::new(support::llm::chain(ai.clone(), None));
     // Один сбой до порога: если ошибка ввода считалась бы сбоем LLM,
     // предохранитель разомкнулся бы этим вызовом.
     for _ in 0..4 {
-        breaker.record_failure(Utc::now());
+        chain.primary().breaker().record_failure(Utc::now());
     }
-    let app = app_with(&db.pool, Some(ai.clone()), config(), breaker.clone(), 200);
+    let app = app_chain(&db.pool, Some(chain.clone()), config(), 200);
 
     let (status, _, json) = call(
         &app,
@@ -1260,7 +1251,7 @@ async fn too_many_items_is_a_rejected_input_and_does_not_open_the_breaker() {
     assert_eq!(item_count(&db.pool, household.household_id).await, 0);
     assert_eq!(draft_count(&db.pool, household.household_id).await, 0);
     assert!(
-        breaker.allow(Utc::now()),
+        chain.primary().breaker().allow(Utc::now()),
         "an input error must not open the breaker"
     );
 
@@ -1335,7 +1326,7 @@ async fn an_llm_failure_returns_service_unavailable_without_leaking_text() {
     let db = db().await;
     let household = support::create_household(&db.pool).await;
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
-    let ai = StubAi::new(vec![Err(HaError::BadResponse)]);
+    let ai = StubAi::new(vec![Err(LlmError::EmptyResponse)]);
     let app = app(&db.pool, ai.clone(), config());
 
     let (status, _, json) = call(
@@ -1385,10 +1376,14 @@ async fn draft_keeps_invalid_items_for_later_correction() {
     let db = db().await;
     let household = support::create_household(&db.pool).await;
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
-    let ai = StubAi::new(vec![Ok(json!({"items": [
-        {"target_kind": "shopping", "title": "молоко"},
-        {"target_kind": "shopping", "title": "хлеб", "due_date": "2000-01-01"}
-    ]}))]);
+    let ai = StubAi::new(vec![Ok(support::llm::v4::response(vec![
+        support::llm::v4::shopping("молоко"),
+        support::llm::v4::with(
+            support::llm::v4::shopping("хлеб"),
+            "date",
+            support::llm::v4::date(1, 1, 2000),
+        ),
+    ]))]);
     let app = app(&db.pool, ai.clone(), config());
 
     let (status, _, json) = call(
@@ -1413,11 +1408,11 @@ async fn a_long_applied_speech_is_still_cut_to_two_hundred_characters() {
     let household = support::create_household(&db.pool).await;
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
     let long = "очень длинное название покупки ".repeat(5);
-    let ai = StubAi::new(vec![Ok(json!({"items": [
-        {"target_kind": "shopping", "title": format!("{long}1")},
-        {"target_kind": "shopping", "title": format!("{long}2")},
-        {"target_kind": "shopping", "title": format!("{long}3")}
-    ]}))]);
+    let ai = StubAi::new(vec![Ok(support::llm::v4::response(vec![
+        support::llm::v4::shopping(&format!("{long}1")),
+        support::llm::v4::shopping(&format!("{long}2")),
+        support::llm::v4::shopping(&format!("{long}3")),
+    ]))]);
     let app = app(&db.pool, ai.clone(), config());
 
     let (status, _, json) = call(
@@ -1538,9 +1533,9 @@ async fn hint_sets_the_type_of_every_item() {
     let household = support::create_household(&db.pool).await;
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
     // Модель ошиблась с типом: подсказка вызывающей стороны сильнее.
-    let ai = StubAi::new(vec![Ok(json!({"items": [
-        {"target_kind": "tasks", "title": "позвонить маме"}
-    ]}))]);
+    let ai = StubAi::new(vec![Ok(support::llm::v4::response(vec![
+        support::llm::v4::task("позвонить маме"),
+    ]))]);
     let app = app(&db.pool, ai.clone(), config());
 
     let (status, _, json) = call(
@@ -1584,13 +1579,7 @@ async fn quota_exhaustion_and_an_open_breaker_return_503_without_calling_the_llm
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
 
     let quota_ai = StubAi::new(vec![Ok(two_purchases())]);
-    let app = app_with(
-        &db.pool,
-        Some(quota_ai.clone()),
-        config(),
-        Arc::new(CircuitBreaker::default()),
-        0,
-    );
+    let app = app_with(&db.pool, Some(quota_ai.clone()), config(), 0);
     let (status, _, json) = call(
         &app,
         Method::POST,
@@ -1603,12 +1592,10 @@ async fn quota_exhaustion_and_an_open_breaker_return_503_without_calling_the_llm
     assert_error_envelope(&json, "service_unavailable");
     assert_eq!(quota_ai.calls(), 0);
 
-    let breaker = Arc::new(CircuitBreaker::default());
-    for _ in 0..5 {
-        breaker.record_failure(Utc::now());
-    }
     let breaker_ai = StubAi::new(vec![Ok(two_purchases())]);
-    let app = app_with(&db.pool, Some(breaker_ai.clone()), config(), breaker, 200);
+    let chain = support::llm::chain(breaker_ai.clone(), None);
+    support::llm::open_primary(&chain, Utc::now());
+    let app = app_chain(&db.pool, Some(Arc::new(chain)), config(), 200);
     let (status, _, json) = call(
         &app,
         Method::POST,
@@ -1628,13 +1615,7 @@ async fn a_missing_llm_client_returns_503() {
     let db = db().await;
     let household = support::create_household(&db.pool).await;
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
-    let app = app_with(
-        &db.pool,
-        None,
-        config(),
-        Arc::new(CircuitBreaker::default()),
-        200,
-    );
+    let app = app_with(&db.pool, None, config(), 200);
 
     let (status, _, json) = call(
         &app,
@@ -1677,7 +1658,7 @@ async fn control_characters_are_removed_from_the_stored_capture_text_and_items()
     let household = support::create_household(&db.pool).await;
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
     let ai = StubAi::new(vec![Ok(json!({
-        "items": [{"target_kind": "shopping", "title": "молоко\u{7}"}]
+        "items": [support::llm::v4::shopping("молоко\u{7}")]
     }))]);
     let app = app(&db.pool, ai.clone(), config());
 
@@ -1935,10 +1916,14 @@ async fn confirming_an_invalid_draft_returns_validation_error() {
     let db = db().await;
     let household = support::create_household(&db.pool).await;
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
-    let ai = StubAi::new(vec![Ok(json!({"items": [
-        {"target_kind": "shopping", "title": "молоко"},
-        {"target_kind": "shopping", "title": "хлеб", "due_date": "2000-01-01"}
-    ]}))]);
+    let ai = StubAi::new(vec![Ok(support::llm::v4::response(vec![
+        support::llm::v4::shopping("молоко"),
+        support::llm::v4::with(
+            support::llm::v4::shopping("хлеб"),
+            "date",
+            support::llm::v4::date(1, 1, 2000),
+        ),
+    ]))]);
     let app = app(&db.pool, ai.clone(), config());
     let capture_id = draft_capture(&app, &token).await;
 
@@ -2409,7 +2394,7 @@ async fn undo_last_undoes_a_voice_fallback_capture() {
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
     let mut config = config();
     config.voice_fallback_raw = true;
-    let ai = StubAi::new(vec![Err(HaError::Unreachable)]);
+    let ai = StubAi::new(vec![Err(LlmError::Transport)]);
     let app = app(&db.pool, ai.clone(), config);
     let capture_id = voice_auto_capture(&app, &token, "купить молоко").await;
 
@@ -2586,7 +2571,7 @@ async fn confirming_a_fallback_capture_returns_its_fallback_flag() {
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
     let mut config = config();
     config.voice_fallback_raw = true;
-    let ai = StubAi::new(vec![Err(HaError::Unreachable)]);
+    let ai = StubAi::new(vec![Err(LlmError::Transport)]);
     let app = app(&db.pool, ai.clone(), config);
     let capture_id = voice_auto_capture(&app, &token, "купить молоко").await;
 

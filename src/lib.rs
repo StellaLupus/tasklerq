@@ -6,7 +6,6 @@ pub mod auth;
 pub mod capture;
 pub mod config;
 pub mod domain;
-pub mod home_assistant;
 pub mod http;
 pub mod jobs;
 pub mod llm;

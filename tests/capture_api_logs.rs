@@ -7,39 +7,26 @@
 mod support;
 
 use std::sync::Arc;
-use std::time::Duration as StdDuration;
 
-use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use tasklerq::capture::breaker::CircuitBreaker;
 use tasklerq::config::CaptureConfig;
-use tasklerq::home_assistant::{AiTask, GenerateData, HaError};
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
+use tasklerq::llm::{Chain, LlmError};
 use tasklerq::security_audit::Audit;
 use tower::ServiceExt;
 
 use support::logs::LogBuffer;
 use support::{db, issue_token};
 
-struct StubAi;
-
-#[async_trait]
-impl AiTask for StubAi {
-    async fn check_entity(&self) -> Result<(), HaError> {
-        Ok(())
-    }
-
-    async fn generate_data(
-        &self,
-        _request: &GenerateData<'_>,
-        _timeout: StdDuration,
-    ) -> Result<Value, HaError> {
-        Ok(json!({"items": [{"target_kind": "shopping", "title": "секретный заголовок"}]}))
-    }
+fn chain(answer: Result<Value, LlmError>) -> Arc<Chain> {
+    Arc::new(support::llm::chain(
+        support::llm::BackendDouble::always(answer),
+        None,
+    ))
 }
 
 #[test]
@@ -69,8 +56,9 @@ fn capture_logs_have_metadata_but_not_the_text() {
                         rate_limit_per_min: 10,
                         max_text_chars: 2_000,
                     },
-                    Some(Arc::new(StubAi)),
-                    Arc::new(CircuitBreaker::default()),
+                    Some(chain(Ok(support::llm::v4::response(vec![
+                        support::llm::v4::shopping("секретный заголовок"),
+                    ])))),
                     200,
                 ),
             );
@@ -141,7 +129,6 @@ fn a_disabled_llm_logs_the_fallback_reason_without_the_text() {
                         max_text_chars: 2_000,
                     },
                     None,
-                    Arc::new(CircuitBreaker::default()),
                     200,
                 ),
             );
@@ -178,7 +165,7 @@ fn a_disabled_llm_logs_the_fallback_reason_without_the_text() {
 }
 
 /// Выполнить capture и вернуть его статус и журнал, собранный за вызов.
-fn capture_logs(ai: Option<Arc<dyn AiTask>>, text: &str) -> (StatusCode, String) {
+fn capture_logs(ai: Option<Arc<Chain>>, text: &str) -> (StatusCode, String) {
     capture_logs_for(
         ai,
         vec![(
@@ -196,7 +183,7 @@ fn capture_logs(ai: Option<Arc<dyn AiTask>>, text: &str) -> (StatusCode, String)
 /// Выполнить несколько capture подряд на одном стенде и вернуть статус
 /// последнего запроса и весь собранный журнал.
 fn capture_logs_for(
-    ai: Option<Arc<dyn AiTask>>,
+    ai: Option<Arc<Chain>>,
     requests: Vec<(Value, Vec<(String, String)>)>,
     rate_limit_per_min: u32,
 ) -> (StatusCode, String) {
@@ -226,7 +213,6 @@ fn capture_logs_for(
                         max_text_chars: 2_000,
                     },
                     ai,
-                    Arc::new(CircuitBreaker::default()),
                     200,
                 ),
             );
@@ -273,25 +259,8 @@ fn assert_capture_log(captured: &str, status: &str, text: &str) {
 
 #[test]
 fn an_llm_failure_logs_the_status_without_the_text() {
-    struct FailingAi;
-
-    #[async_trait]
-    impl AiTask for FailingAi {
-        async fn check_entity(&self) -> Result<(), HaError> {
-            Ok(())
-        }
-
-        async fn generate_data(
-            &self,
-            _request: &GenerateData<'_>,
-            _timeout: StdDuration,
-        ) -> Result<Value, HaError> {
-            Err(HaError::Unreachable)
-        }
-    }
-
     let (status, captured) = capture_logs(
-        Some(Arc::new(FailingAi) as Arc<dyn AiTask>),
+        Some(chain(Err(LlmError::Transport))),
         "секретная заметка про подарок",
     );
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -330,7 +299,9 @@ fn an_idempotency_mismatch_is_logged_as_a_conflict_without_the_text() {
     let key = "019-test-key".to_owned();
     let headers = vec![("idempotency-key".to_owned(), key)];
     let (status, captured) = capture_logs_for(
-        Some(Arc::new(StubAi) as Arc<dyn AiTask>),
+        Some(chain(Ok(support::llm::v4::response(vec![
+            support::llm::v4::shopping("секретный заголовок"),
+        ])))),
         vec![
             (
                 json!({
@@ -384,7 +355,9 @@ fn a_rate_limited_capture_is_logged_without_the_text() {
         })
     };
     let (status, captured) = capture_logs_for(
-        Some(Arc::new(StubAi) as Arc<dyn AiTask>),
+        Some(chain(Ok(support::llm::v4::response(vec![
+            support::llm::v4::shopping("секретный заголовок"),
+        ])))),
         vec![(payload(), Vec::new()), (payload(), Vec::new())],
         1,
     );

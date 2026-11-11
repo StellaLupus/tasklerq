@@ -3,17 +3,12 @@
 
 mod support;
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration as StdDuration;
+use std::sync::Arc;
 
-use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use tasklerq::capture::breaker::CircuitBreaker;
-use tasklerq::home_assistant::{AiTask, GenerateData, HaError};
+use tasklerq::llm::{Chain, LlmError};
 use tasklerq::security_audit::Audit;
 use tasklerq::telegram::bot::Bot;
 use tasklerq::telegram::capture_worker::{CaptureWorker, DEFAULT_DAILY_QUOTA, MAX_ATTEMPTS, Pass};
@@ -22,49 +17,19 @@ use tokio::sync::Notify;
 use support::telegram::{FakeTelegram, Harness, button_rows};
 use support::{db, next_telegram_id};
 
-/// Подмена Home Assistant: отдаёт заготовленные ответы по очереди.
-struct StubAi {
-    answers: Mutex<VecDeque<Result<Value, HaError>>>,
-    calls: AtomicUsize,
-    prompts: Mutex<Vec<String>>,
-}
+/// Двойник слота: отдаёт заготовленные ответы по очереди.
+type StubAi = support::llm::BackendDouble;
 
-impl StubAi {
-    fn new(answers: Vec<Result<Value, HaError>>) -> Arc<Self> {
-        Arc::new(Self {
-            answers: Mutex::new(answers.into()),
-            calls: AtomicUsize::new(0),
-            prompts: Mutex::new(Vec::new()),
+fn validation_failures() -> f64 {
+    tasklerq::metrics::render()
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(' ')?;
+            (name == "llm_validation_failures_total")
+                .then(|| value.parse::<f64>().ok())
+                .flatten()
         })
-    }
-
-    fn calls(&self) -> usize {
-        self.calls.load(Ordering::SeqCst)
-    }
-}
-
-#[async_trait]
-impl AiTask for StubAi {
-    async fn check_entity(&self) -> Result<(), HaError> {
-        Ok(())
-    }
-
-    async fn generate_data(
-        &self,
-        request: &GenerateData<'_>,
-        _timeout: StdDuration,
-    ) -> Result<Value, HaError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        self.prompts
-            .lock()
-            .expect("lock")
-            .push(request.instructions.to_owned());
-        self.answers
-            .lock()
-            .expect("lock")
-            .pop_front()
-            .unwrap_or(Err(HaError::Unreachable))
-    }
+        .unwrap_or(0.0)
 }
 
 fn date_in_days(days: i64) -> String {
@@ -76,16 +41,15 @@ fn date_in_days(days: i64) -> String {
 /// Ответ LLM: задача со сроком и покупка.
 fn two_items() -> Value {
     json!({"items": [
-        {"target_kind": "tasks", "title": "Позвонить маме",
-         "due_date": date_in_days(2), "due_time": "18:00"},
-        {"target_kind": "shopping", "title": "Молоко", "quantity": 2, "unit": "л"}
+        support::llm::v4::with(support::llm::v4::with(support::llm::v4::task("Позвонить маме"), "date", support::llm::v4::date_ymd(&date_in_days(2))), "time", json!("18:00")),
+        support::llm::v4::with(support::llm::v4::with(support::llm::v4::shopping("Молоко"), "quantity", json!(2)), "unit", json!("л"))
     ]})
 }
 
 /// Ответ LLM: больше 20 элементов, пользователя просят разделить текст.
 fn too_many_items() -> Value {
     let items: Vec<Value> = (0..21)
-        .map(|n| json!({"target_kind": "tasks", "title": format!("Дело {n}")}))
+        .map(|n| json!(support::llm::v4::task(&format!("Дело {n}"))))
         .collect();
     json!({"items": items})
 }
@@ -94,68 +58,73 @@ struct Stand {
     bot: Harness,
     worker: CaptureWorker,
     ai: Arc<StubAi>,
+    chain: Arc<Chain>,
 }
 
 /// Сколько разборов в минуту допускает бот.
 const PARSES_PER_MINUTE: i64 = 10;
 
-async fn stand(pool: &PgPool, answers: Vec<Result<Value, HaError>>) -> Stand {
+async fn stand(pool: &PgPool, answers: Vec<Result<Value, LlmError>>) -> Stand {
     stand_with(pool, answers, DEFAULT_DAILY_QUOTA, true).await
 }
 
 async fn stand_with(
     pool: &PgPool,
-    answers: Vec<Result<Value, HaError>>,
+    answers: Vec<Result<Value, LlmError>>,
     quota: u32,
     llm_capture: bool,
 ) -> Stand {
-    stand_full(pool, answers, quota, llm_capture, None).await
-}
-
-async fn stand_with_breaker(
-    pool: &PgPool,
-    answers: Vec<Result<Value, HaError>>,
-    breaker: Arc<CircuitBreaker>,
-) -> Stand {
-    stand_full(pool, answers, DEFAULT_DAILY_QUOTA, true, Some(breaker)).await
+    stand_full(pool, answers, quota, llm_capture).await
 }
 
 async fn stand_full(
     pool: &PgPool,
-    answers: Vec<Result<Value, HaError>>,
+    answers: Vec<Result<Value, LlmError>>,
     quota: u32,
     llm_capture: bool,
-    breaker: Option<Arc<CircuitBreaker>>,
+) -> Stand {
+    let ai = StubAi::new(answers);
+    let chain = Arc::new(support::llm::chain(ai.clone(), None));
+    stand_with_chain(pool, ai, chain, quota, llm_capture).await
+}
+
+async fn stand_with_chain(
+    pool: &PgPool,
+    ai: Arc<StubAi>,
+    chain: Arc<Chain>,
+    quota: u32,
+    llm_capture: bool,
 ) -> Stand {
     let id = next_telegram_id();
     let handler = Bot::new("tasklerqbot")
         .with_llm_capture(llm_capture)
         .with_tenancy(tasklerq::config::TenancyMode::Multi);
-    let ai = StubAi::new(answers);
     let mut bot = Harness::with_handler(pool, id, Arc::new(handler.clone()), FakeTelegram::new());
     bot.text("/start").await;
     bot.text("Семья").await;
     bot.press("Москва").await;
     bot.press("меню").await;
 
-    let mut worker = CaptureWorker::new(
+    let worker = CaptureWorker::new(
         pool.clone(),
-        ai.clone(),
+        chain.clone(),
         handler,
         Arc::new(Notify::new()),
         Audit::new(pool.clone()),
     )
     .only_chat(id)
     .with_quota(quota);
-    if let Some(breaker) = breaker {
-        worker = worker.with_breaker(breaker);
+    Stand {
+        bot,
+        worker,
+        ai,
+        chain,
     }
-    Stand { bot, worker, ai }
 }
 
 async fn stand_with_quota(
     pool: &PgPool,
-    answers: Vec<Result<Value, HaError>>,
+    answers: Vec<Result<Value, LlmError>>,
     quota: u32,
 ) -> Stand {
     stand_with(pool, answers, quota, true).await
@@ -310,8 +279,14 @@ async fn text_is_queued_and_the_card_replaces_the_waiting_screen() {
         "nothing before confirming"
     );
 
-    let prompts = stand.ai.prompts.lock().expect("lock");
-    assert!(prompts[0].contains("позвонить маме"));
+    let requests = stand.ai.requests();
+    assert!(
+        requests[0]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("позвонить маме")),
+        "the user text must reach the LLM as data"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -320,7 +295,7 @@ async fn text_on_a_tasks_list_defaults_capture_to_that_list() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "tasks", "title": "Покрасить забор", "target_list": "Задачи"}
+            support::llm::v4::with(support::llm::v4::task("Покрасить забор"), "list", json!("Задачи"))
         ]}))],
     )
     .await;
@@ -371,7 +346,7 @@ async fn an_ordinary_word_tasks_does_not_select_the_default_list_on_another_list
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "tasks", "title": "Полить цветы", "target_list": "Задачи"}
+            support::llm::v4::with(support::llm::v4::task("Полить цветы"), "list", json!("Задачи"))
         ]}))],
     )
     .await;
@@ -408,7 +383,7 @@ async fn an_explicit_list_selection_keeps_the_default_list() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "tasks", "title": "Полить цветы", "target_list": "Задачи"}
+            support::llm::v4::with(support::llm::v4::task("Полить цветы"), "list", json!("Задачи"))
         ]}))],
     )
     .await;
@@ -441,7 +416,7 @@ async fn a_short_text_with_a_multiword_default_list_does_not_panic() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "tasks", "title": "Полить", "target_list": "Домашние дела"}
+            support::llm::v4::with(support::llm::v4::task("Полить"), "list", json!("Домашние дела"))
         ]}))],
     )
     .await;
@@ -472,7 +447,7 @@ async fn text_on_a_tasks_list_keeps_an_explicitly_named_other_list() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "tasks", "title": "Покрасить забор", "target_list": "Работа"}
+            support::llm::v4::with(support::llm::v4::task("Покрасить забор"), "list", json!("Работа"))
         ]}))],
     )
     .await;
@@ -673,7 +648,7 @@ async fn leaving_the_edit_form_returns_to_the_unchanged_card() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn draft_item_without_a_list_requires_the_list_field() {
     let db = db().await;
-    let items = json!({"items": [{"target_kind": "checklist", "title": "Проверка"}]});
+    let items = json!({"items": [support::llm::v4::checklist("Проверка")]});
     let mut stand = stand(&db.pool, vec![Ok(items)]).await;
     stand.capture("сделать проверку").await;
 
@@ -722,8 +697,8 @@ async fn expired_draft_editor_returns_to_the_draft_without_a_card_promise() {
 async fn invalid_item_blocks_saving_until_it_is_removed() {
     let db = db().await;
     let past = json!({"items": [
-        {"target_kind": "tasks", "title": "Оплатить счёт", "due_date": date_in_days(-5)},
-        {"target_kind": "shopping", "title": "Хлеб"}
+        support::llm::v4::with(support::llm::v4::task("Оплатить счёт"), "date", support::llm::v4::date_ymd(&date_in_days(-5))),
+        support::llm::v4::shopping("Хлеб")
     ]});
     let mut stand = stand(&db.pool, vec![Ok(past)]).await;
     stand.capture("оплатить счёт вчера, купить хлеб").await;
@@ -779,7 +754,7 @@ async fn too_long_text_is_not_queued() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rejected_request_ends_the_job_with_an_explanation() {
     let db = db().await;
-    let mut stand = stand(&db.pool, vec![Err(HaError::Rejected(400))]).await;
+    let mut stand = stand(&db.pool, vec![Err(LlmError::Rejected(400))]).await;
 
     stand.bot.text("позвонить маме").await;
     assert_eq!(stand.work().await, Pass::Dead);
@@ -792,7 +767,7 @@ async fn rejected_request_ends_the_job_with_an_explanation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn timeout_is_not_retried() {
     let db = db().await;
-    let mut stand = stand(&db.pool, vec![Err(HaError::Timeout)]).await;
+    let mut stand = stand(&db.pool, vec![Err(LlmError::Timeout)]).await;
 
     stand.bot.text("позвонить маме").await;
     assert_eq!(stand.work().await, Pass::Dead);
@@ -804,7 +779,7 @@ async fn timeout_is_not_retried() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_error_is_retried_with_backoff_and_then_succeeds() {
     let db = db().await;
-    let mut stand = stand(&db.pool, vec![Err(HaError::Server(503)), Ok(two_items())]).await;
+    let mut stand = stand(&db.pool, vec![Err(LlmError::Server(503)), Ok(two_items())]).await;
 
     stand.bot.text("позвонить маме и купить молоко").await;
     let first = stand.work().await;
@@ -823,7 +798,7 @@ async fn server_error_is_retried_with_backoff_and_then_succeeds() {
 async fn persistent_server_errors_exhaust_attempts() {
     let db = db().await;
     let answers = (0..MAX_ATTEMPTS)
-        .map(|_| Err(HaError::Unreachable))
+        .map(|_| Err(LlmError::Transport))
         .collect();
     let mut stand = stand(&db.pool, answers).await;
 
@@ -837,6 +812,107 @@ async fn persistent_server_errors_exhaust_attempts() {
     assert_eq!(last, Pass::Dead);
     assert_eq!(stand.ai.calls(), MAX_ATTEMPTS as usize);
     stand.bot.assert_screen_contains("Не получилось разобрать");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_slots_unavailable_open_the_editor_with_the_source_text() {
+    let db = db().await;
+    let primary = StubAi::new(vec![Err(LlmError::Transport)]);
+    let fallback = StubAi::new(vec![Err(LlmError::Transport)]);
+    let chain = Arc::new(support::llm::chain(primary.clone(), Some(fallback.clone())));
+    let mut stand =
+        stand_with_chain(&db.pool, primary.clone(), chain, DEFAULT_DAILY_QUOTA, true).await;
+    let text = "позвонить маме и купить молоко";
+
+    stand.bot.text(text).await;
+    let mut last = Pass::Idle;
+    for _ in 0..MAX_ATTEMPTS {
+        stand.bot.advance(Duration::minutes(5));
+        last = stand.work().await;
+    }
+    assert_eq!(last, Pass::Dead, "all transport attempts are exhausted");
+
+    stand.bot.assert_screen_contains("Не получилось разобрать");
+    stand.bot.assert_screen_contains(text);
+    assert_eq!(primary.calls(), MAX_ATTEMPTS as usize);
+    assert_eq!(fallback.calls(), MAX_ATTEMPTS as usize);
+    assert_eq!(stand.household_items().await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn both_slots_bad_json_open_manual_editing_and_count_validation_failures() {
+    let db = db().await;
+    let primary = StubAi::new(vec![Ok(json!({"unexpected": true}))]);
+    let fallback = StubAi::new(vec![Ok(json!({"nope": []}))]);
+    let chain = Arc::new(support::llm::chain(primary.clone(), Some(fallback.clone())));
+    let mut stand =
+        stand_with_chain(&db.pool, primary.clone(), chain, DEFAULT_DAILY_QUOTA, true).await;
+    let failures_before = validation_failures();
+
+    stand.bot.text("секретная заметка").await;
+    assert_eq!(stand.work().await, Pass::Dead);
+
+    stand.bot.assert_screen_contains("Не получилось разобрать");
+    stand.bot.assert_screen_contains("секретная заметка");
+    assert_eq!(primary.calls(), 1, "the same slot must not be called twice");
+    assert_eq!(fallback.calls(), 1);
+    assert_eq!(stand.household_items().await, 0);
+    assert!(
+        validation_failures() >= failures_before + 2.0,
+        "both rejected answers must count as validation failures"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rescuing_fallback_creates_a_normal_draft_and_spends_one_quota_unit() {
+    let db = db().await;
+    let primary = StubAi::new(vec![Err(LlmError::Transport)]);
+    let fallback = StubAi::new(vec![Ok(two_items())]);
+    let chain = Arc::new(support::llm::chain(primary.clone(), Some(fallback.clone())));
+    let mut stand =
+        stand_with_chain(&db.pool, primary.clone(), chain, DEFAULT_DAILY_QUOTA, true).await;
+
+    stand.bot.text("позвонить маме и купить молоко").await;
+    assert_eq!(stand.work().await, Pass::Drafted);
+
+    stand.bot.assert_screen_contains("Разобрал: 2 позиции");
+    stand.bot.assert_screen_contains("Позвонить маме");
+    stand.bot.assert_screen_contains("Молоко");
+    let screen = stand.bot.screen();
+    assert!(
+        !screen.contains("недоступен") && !screen.contains("Не получилось"),
+        "a rescued parse must not report an unavailable LLM: {screen}"
+    );
+    assert_eq!(primary.calls(), 1);
+    assert_eq!(fallback.calls(), 1);
+
+    let household = household_id(&db.pool, stand.bot.chat).await;
+    let runs: Vec<(Option<String>, Option<i16>)> = sqlx::query_as(
+        "SELECT slot, attempt FROM llm_runs WHERE household_id = $1 ORDER BY attempt",
+    )
+    .bind(household)
+    .fetch_all(&db.pool)
+    .await
+    .expect("llm runs");
+    assert_eq!(
+        runs,
+        vec![
+            (Some("primary".to_owned()), Some(1)),
+            (Some("fallback".to_owned()), Some(2)),
+        ]
+    );
+    let mut conn = db.pool.acquire().await.expect("connection");
+    assert_eq!(
+        tasklerq::storage::repositories::llm_runs::count_since(
+            &mut conn,
+            household,
+            Utc::now() - Duration::hours(24),
+        )
+        .await
+        .expect("quota"),
+        1,
+        "a run through two slots spends one quota unit"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -854,7 +930,7 @@ async fn too_many_items_asks_to_split_the_text() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn too_many_items_do_not_open_the_circuit_breaker() {
     let db = db().await;
-    let mut answers: Vec<Result<Value, HaError>> = (0..5).map(|_| Ok(too_many_items())).collect();
+    let mut answers: Vec<Result<Value, LlmError>> = (0..5).map(|_| Ok(too_many_items())).collect();
     answers.push(Ok(two_items()));
     let mut stand = stand(&db.pool, answers).await;
 
@@ -904,8 +980,7 @@ async fn user_text_does_not_outlive_the_job() {
 async fn card_shows_the_due_date_the_domain_will_assign_to_a_series() {
     let db = db().await;
     let series = json!({"items": [
-        {"target_kind": "tasks", "title": "Выгулять собаку",
-         "recurrence": {"freq": "daily"}}
+        support::llm::v4::with(support::llm::v4::task("Выгулять собаку"), "repeat", support::llm::v4::repeat("daily", Vec::new()))
     ]});
     let mut stand = stand(&db.pool, vec![Ok(series)]).await;
     stand.capture("каждый день выгуливать собаку").await;
@@ -932,7 +1007,7 @@ async fn ambiguous_assignee_asks_and_the_choice_updates_the_draft_without_llm() 
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Торт", "assignee": "Алексей"}
+            support::llm::v4::with(support::llm::v4::shopping("Торт"), "assignee", json!("Алексей"))
         ]}))],
     )
     .await;
@@ -980,7 +1055,7 @@ async fn ambiguous_date_stand(db: &support::TestDb) -> (Stand, chrono::NaiveDate
     let today = Utc::now().with_timezone(&timezone).date_naive();
     let past = (today - Duration::days(2)).format("%Y-%m-%d").to_string();
     let answer = json!({"items": [
-        {"target_kind": "tasks", "title": "Оплатить счёт", "due_date": past}
+        support::llm::v4::with(support::llm::v4::task("Оплатить счёт"), "date", support::llm::v4::date_ymd(&past))
     ]});
     let mut stand = stand(&db.pool, vec![Ok(answer)]).await;
     stand.capture("оплатить счёт позавчера").await;
@@ -1065,7 +1140,11 @@ async fn after_three_clarifications_the_bot_offers_manual_editing() {
     let db = db().await;
     let items: Vec<Value> = (0..4)
         .map(|n| {
-            json!({"target_kind": "tasks", "title": format!("Дело {n}"), "assignee": "Алексей"})
+            json!(support::llm::v4::with(
+                support::llm::v4::task(&format!("Дело {n}")),
+                "assignee",
+                json!("Алексей")
+            ))
         })
         .collect();
     let mut stand = stand(&db.pool, vec![Ok(json!({"items": items}))]).await;
@@ -1095,7 +1174,7 @@ async fn after_three_clarifications_the_bot_offers_manual_editing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_parse_opens_the_manual_form_with_the_source_text() {
     let db = db().await;
-    let mut stand = stand(&db.pool, vec![Err(HaError::Rejected(400))]).await;
+    let mut stand = stand(&db.pool, vec![Err(LlmError::Rejected(400))]).await;
 
     stand.bot.text("купить молоко").await;
     assert_eq!(stand.work().await, Pass::Dead);
@@ -1119,8 +1198,8 @@ async fn failed_parse_opens_the_manual_form_with_the_source_text() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn circuit_breaker_skips_the_llm_after_five_failures_and_recovers() {
     let db = db().await;
-    let mut answers: Vec<Result<Value, HaError>> =
-        (0..5).map(|_| Err(HaError::Rejected(400))).collect();
+    let mut answers: Vec<Result<Value, LlmError>> =
+        (0..5).map(|_| Err(LlmError::Rejected(400))).collect();
     answers.push(Ok(two_items()));
     let mut stand = stand(&db.pool, answers).await;
 
@@ -1154,12 +1233,12 @@ async fn circuit_breaker_skips_the_llm_after_five_failures_and_recovers() {
 async fn a_successful_parse_resets_the_breaker_failure_count() {
     let db = db().await;
     let answers = vec![
-        Err(HaError::Rejected(400)),
-        Err(HaError::Rejected(400)),
-        Err(HaError::Rejected(400)),
-        Err(HaError::Rejected(400)),
+        Err(LlmError::Rejected(400)),
+        Err(LlmError::Rejected(400)),
+        Err(LlmError::Rejected(400)),
+        Err(LlmError::Rejected(400)),
         Ok(two_items()),
-        Err(HaError::Rejected(400)),
+        Err(LlmError::Rejected(400)),
         Ok(two_items()),
     ];
     let mut stand = stand(&db.pool, answers).await;
@@ -1362,10 +1441,8 @@ async fn time_that_passes_while_the_draft_waits_is_shown_as_an_error() {
     // Срок через пять минут: при разборе он в будущем.
     let soon = Utc::now().with_timezone(&chrono_tz::Europe::Moscow) + Duration::minutes(5);
     let answer = json!({"items": [
-        {"target_kind": "tasks", "title": "Позвонить",
-         "due_date": soon.format("%Y-%m-%d").to_string(),
-         "due_time": soon.format("%H:%M").to_string()},
-        {"target_kind": "shopping", "title": "Хлеб"}
+        support::llm::v4::with(support::llm::v4::with(support::llm::v4::task("Позвонить"), "date", support::llm::v4::date_ymd(&soon.format("%Y-%m-%d").to_string())), "time", json!(soon.format("%H:%M").to_string())),
+        support::llm::v4::shopping("Хлеб")
     ]});
     let mut stand = stand(&db.pool, vec![Ok(answer)]).await;
     stand
@@ -1987,8 +2064,8 @@ async fn shopping_text_adds_positions_without_confirmation() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко", "quantity": 2, "unit": "л"},
-            {"target_kind": "shopping", "title": "Хлеб"}
+            support::llm::v4::with(support::llm::v4::with(support::llm::v4::shopping("Молоко"), "quantity", json!(2)), "unit", json!("л")),
+            support::llm::v4::shopping("Хлеб")
         ]}))],
     )
     .await;
@@ -2061,8 +2138,8 @@ async fn a_task_from_the_shopping_screen_keeps_the_list_with_a_banner() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко"},
-            {"target_kind": "tasks", "title": "Позвонить маме"}
+            support::llm::v4::shopping("Молоко"),
+            support::llm::v4::task("Позвонить маме")
         ]}))],
     )
     .await;
@@ -2117,8 +2194,8 @@ async fn a_direct_draft_result_does_not_replace_the_settings_screen() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко"},
-            {"target_kind": "tasks", "title": "Позвонить маме"}
+            support::llm::v4::shopping("Молоко"),
+            support::llm::v4::task("Позвонить маме")
         ]}))],
     )
     .await;
@@ -2153,8 +2230,8 @@ async fn a_direct_draft_result_does_not_replace_the_open_editor() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко"},
-            {"target_kind": "tasks", "title": "Позвонить маме"}
+            support::llm::v4::shopping("Молоко"),
+            support::llm::v4::task("Позвонить маме")
         ]}))],
     )
     .await;
@@ -2183,8 +2260,8 @@ async fn a_direct_draft_result_opens_a_card_without_an_active_screen() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко"},
-            {"target_kind": "tasks", "title": "Позвонить маме"}
+            support::llm::v4::shopping("Молоко"),
+            support::llm::v4::task("Позвонить маме")
         ]}))],
     )
     .await;
@@ -2215,8 +2292,8 @@ async fn a_result_for_a_deleted_list_falls_back_to_the_main_menu() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко"},
-            {"target_kind": "tasks", "title": "Позвонить маме"}
+            support::llm::v4::shopping("Молоко"),
+            support::llm::v4::task("Позвонить маме")
         ]}))],
     )
     .await;
@@ -2260,8 +2337,8 @@ async fn an_invalid_purchase_from_the_shopping_screen_keeps_the_list_with_a_bann
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко"},
-            {"target_kind": "shopping", "title": long_title}
+            support::llm::v4::shopping("Молоко"),
+            support::llm::v4::shopping(&long_title)
         ]}))],
     )
     .await;
@@ -2321,7 +2398,7 @@ async fn a_direct_result_does_not_replace_a_screen_the_user_left() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Хлеб"}
+            support::llm::v4::shopping("Хлеб")
         ]}))],
     )
     .await;
@@ -2350,10 +2427,10 @@ async fn a_direct_result_updates_the_card_of_the_same_draft() {
     let mut stand = stand(
         &db.pool,
         vec![
-            Ok(json!({"items": [{"target_kind": "tasks", "title": "Позвонить маме"}]})),
+            Ok(json!({"items": [support::llm::v4::task("Позвонить маме")]})),
             Ok(json!({"items": [
-                {"target_kind": "shopping", "title": "Молоко"},
-                {"target_kind": "tasks", "title": "Полить цветы"}
+                support::llm::v4::shopping("Молоко"),
+                support::llm::v4::task("Полить цветы")
             ]})),
         ],
     )
@@ -2388,8 +2465,8 @@ async fn a_direct_result_replaces_its_own_processing_screen_with_the_card() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко"},
-            {"target_kind": "tasks", "title": "Позвонить маме"}
+            support::llm::v4::shopping("Молоко"),
+            support::llm::v4::task("Позвонить маме")
         ]}))],
     )
     .await;
@@ -2427,8 +2504,8 @@ async fn a_direct_result_does_not_replace_another_list() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко"},
-            {"target_kind": "tasks", "title": "Позвонить маме"}
+            support::llm::v4::shopping("Молоко"),
+            support::llm::v4::task("Позвонить маме")
         ]}))],
     )
     .await;
@@ -2458,8 +2535,8 @@ async fn a_failed_second_position_rolls_back_the_first() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко"},
-            {"target_kind": "shopping", "title": "Хлеб"}
+            support::llm::v4::shopping("Молоко"),
+            support::llm::v4::shopping("Хлеб")
         ]}))],
     )
     .await;
@@ -2509,7 +2586,7 @@ async fn a_failed_second_position_rolls_back_the_first() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_direct_parse_adds_the_positions_without_parsing() {
     let db = db().await;
-    let mut stand = stand(&db.pool, vec![Err(HaError::Rejected(400))]).await;
+    let mut stand = stand(&db.pool, vec![Err(LlmError::Rejected(400))]).await;
 
     stand.bot.press("Покупки").await;
     stand.bot.text("молоко и хлеб").await;
@@ -2550,13 +2627,8 @@ async fn a_direct_job_with_an_exhausted_quota_splits_the_text() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_direct_job_with_an_open_circuit_splits_the_text() {
     let db = db().await;
-    let breaker = Arc::new(CircuitBreaker::new(
-        1,
-        Duration::minutes(5),
-        Duration::minutes(2),
-    ));
-    let mut stand = stand_with_breaker(&db.pool, vec![], breaker.clone()).await;
-    breaker.record_failure(stand.bot.now);
+    let mut stand = stand(&db.pool, Vec::new()).await;
+    support::llm::open_primary(&stand.chain, stand.bot.now);
 
     stand.bot.press("Покупки").await;
     stand.bot.text("молоко, хлеб").await;
@@ -2587,7 +2659,7 @@ async fn too_many_items_on_a_direct_job_is_not_split_by_commas() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_direct_split_is_limited_to_twenty_positions() {
     let db = db().await;
-    let mut stand = stand(&db.pool, vec![Err(HaError::Rejected(400))]).await;
+    let mut stand = stand(&db.pool, vec![Err(LlmError::Rejected(400))]).await;
     let text: Vec<String> = (0..21).map(|number| format!("покупка {number}")).collect();
 
     stand.bot.press("Покупки").await;
@@ -2603,7 +2675,7 @@ async fn a_failed_direct_split_is_limited_to_twenty_positions() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_direct_split_reports_skipped_parts() {
     let db = db().await;
-    let mut stand = stand(&db.pool, vec![Err(HaError::Rejected(400))]).await;
+    let mut stand = stand(&db.pool, vec![Err(LlmError::Rejected(400))]).await;
     let long = "я".repeat(201);
 
     stand.bot.press("Покупки").await;
@@ -2623,8 +2695,8 @@ async fn a_duplicate_is_not_saved_and_the_banner_offers_a_choice() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко"},
-            {"target_kind": "shopping", "title": "Хлеб"}
+            support::llm::v4::shopping("Молоко"),
+            support::llm::v4::shopping("Хлеб")
         ]}))],
     )
     .await;
@@ -2667,8 +2739,8 @@ async fn repeated_new_positions_are_offered_as_a_duplicate() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Хлеб"},
-            {"target_kind": "shopping", "title": "Хлеб", "quantity": 2}
+            support::llm::v4::shopping("Хлеб"),
+            support::llm::v4::with(support::llm::v4::shopping("Хлеб"), "quantity", json!(2))
         ]}))],
     )
     .await;
@@ -2705,8 +2777,8 @@ async fn increasing_a_duplicate_updates_the_existing_position() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко"},
-            {"target_kind": "shopping", "title": "Хлеб"}
+            support::llm::v4::shopping("Молоко"),
+            support::llm::v4::shopping("Хлеб")
         ]}))],
     )
     .await;
@@ -2745,8 +2817,8 @@ async fn adding_a_duplicate_separately_creates_a_second_position() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко"},
-            {"target_kind": "shopping", "title": "Хлеб"}
+            support::llm::v4::shopping("Молоко"),
+            support::llm::v4::shopping("Хлеб")
         ]}))],
     )
     .await;
@@ -2786,8 +2858,8 @@ async fn a_version_conflict_while_increasing_does_not_crash() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко"},
-            {"target_kind": "shopping", "title": "Хлеб"}
+            support::llm::v4::shopping("Молоко"),
+            support::llm::v4::shopping("Хлеб")
         ]}))],
     )
     .await;
@@ -2821,8 +2893,8 @@ async fn a_version_conflict_keeps_the_waiting_draft_open_button() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко"},
-            {"target_kind": "tasks", "title": "Позвонить маме"}
+            support::llm::v4::shopping("Молоко"),
+            support::llm::v4::task("Позвонить маме")
         ]}))],
     )
     .await;
@@ -2853,9 +2925,9 @@ async fn several_duplicates_are_offered_one_by_one() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко"},
-            {"target_kind": "shopping", "title": "Хлеб"},
-            {"target_kind": "shopping", "title": "Яйца"}
+            support::llm::v4::shopping("Молоко"),
+            support::llm::v4::shopping("Хлеб"),
+            support::llm::v4::shopping("Яйца")
         ]}))],
     )
     .await;
@@ -2911,8 +2983,8 @@ async fn a_duplicate_choice_keeps_the_waiting_draft_available() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко"},
-            {"target_kind": "tasks", "title": "Позвонить маме"}
+            support::llm::v4::shopping("Молоко"),
+            support::llm::v4::task("Позвонить маме")
         ]}))],
     )
     .await;
@@ -2950,8 +3022,8 @@ async fn an_increase_keeps_the_waiting_draft_open_button() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко"},
-            {"target_kind": "tasks", "title": "Позвонить маме"}
+            support::llm::v4::shopping("Молоко"),
+            support::llm::v4::task("Позвонить маме")
         ]}))],
     )
     .await;
@@ -2977,8 +3049,8 @@ async fn a_separate_duplicate_keeps_the_waiting_draft_open_button() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко"},
-            {"target_kind": "tasks", "title": "Позвонить маме"}
+            support::llm::v4::shopping("Молоко"),
+            support::llm::v4::task("Позвонить маме")
         ]}))],
     )
     .await;
@@ -3004,9 +3076,9 @@ async fn the_open_button_has_its_own_banner_row() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко"},
-            {"target_kind": "shopping", "title": "Яйца"},
-            {"target_kind": "tasks", "title": "Позвонить маме"}
+            support::llm::v4::shopping("Молоко"),
+            support::llm::v4::shopping("Яйца"),
+            support::llm::v4::task("Позвонить маме")
         ]}))],
     )
     .await;
@@ -3037,8 +3109,8 @@ async fn repeated_duplicates_in_one_message_are_merged() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко"},
-            {"target_kind": "shopping", "title": "Молоко"}
+            support::llm::v4::shopping("Молоко"),
+            support::llm::v4::shopping("Молоко")
         ]}))],
     )
     .await;
@@ -3094,8 +3166,8 @@ async fn a_direct_add_can_be_undone_within_ten_minutes() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко", "quantity": 2, "unit": "л"},
-            {"target_kind": "shopping", "title": "Хлеб"}
+            support::llm::v4::with(support::llm::v4::with(support::llm::v4::shopping("Молоко"), "quantity", json!(2)), "unit", json!("л")),
+            support::llm::v4::shopping("Хлеб")
         ]}))],
     )
     .await;
@@ -3132,8 +3204,8 @@ async fn task_card_over_direct_add(pool: &PgPool) -> Stand {
     let mut stand = stand(
         pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко"},
-            {"target_kind": "tasks", "title": "Позвонить маме"}
+            support::llm::v4::shopping("Молоко"),
+            support::llm::v4::task("Позвонить маме")
         ]}))],
     )
     .await;
@@ -3192,8 +3264,8 @@ async fn undo_after_a_duplicate_choice_removes_the_created_position() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко"},
-            {"target_kind": "shopping", "title": "Хлеб"}
+            support::llm::v4::shopping("Молоко"),
+            support::llm::v4::shopping("Хлеб")
         ]}))],
     )
     .await;
@@ -3224,8 +3296,8 @@ async fn undo_after_ten_minutes_keeps_the_positions() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко", "quantity": 2, "unit": "л"},
-            {"target_kind": "shopping", "title": "Хлеб"}
+            support::llm::v4::with(support::llm::v4::with(support::llm::v4::shopping("Молоко"), "quantity", json!(2)), "unit", json!("л")),
+            support::llm::v4::shopping("Хлеб")
         ]}))],
     )
     .await;
@@ -3281,7 +3353,7 @@ async fn a_replayed_undo_token_is_not_applied_twice() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Хлеб"}
+            support::llm::v4::shopping("Хлеб")
         ]}))],
     )
     .await;
@@ -3318,7 +3390,7 @@ async fn a_stranger_cannot_undo_someone_elses_addition() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Хлеб"}
+            support::llm::v4::shopping("Хлеб")
         ]}))],
     )
     .await;
@@ -3355,8 +3427,8 @@ async fn undo_skips_a_position_deleted_by_hand() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Молоко", "quantity": 2, "unit": "л"},
-            {"target_kind": "shopping", "title": "Хлеб"}
+            support::llm::v4::with(support::llm::v4::with(support::llm::v4::shopping("Молоко"), "quantity", json!(2)), "unit", json!("л")),
+            support::llm::v4::shopping("Хлеб")
         ]}))],
     )
     .await;
@@ -3424,8 +3496,8 @@ async fn a_second_text_appends_to_the_waiting_draft_from_the_worker() {
     let mut stand = stand(
         &db.pool,
         vec![
-            Ok(json!({"items": [{"target_kind": "shopping", "title": "Хлеб"}]})),
-            Ok(json!({"items": [{"target_kind": "shopping", "title": "Молоко"}]})),
+            Ok(json!({"items": [support::llm::v4::shopping("Хлеб")]})),
+            Ok(json!({"items": [support::llm::v4::shopping("Молоко")]})),
         ],
     )
     .await;
@@ -3456,8 +3528,8 @@ async fn an_expired_pending_draft_is_not_appended_to() {
     let mut stand = stand(
         &db.pool,
         vec![
-            Ok(json!({"items": [{"target_kind": "shopping", "title": "Хлеб"}]})),
-            Ok(json!({"items": [{"target_kind": "shopping", "title": "Молоко"}]})),
+            Ok(json!({"items": [support::llm::v4::shopping("Хлеб")]})),
+            Ok(json!({"items": [support::llm::v4::shopping("Молоко")]})),
         ],
     )
     .await;
@@ -3509,14 +3581,22 @@ async fn appended_clarifications_stop_at_the_limit() {
     let mut stand = stand(
         &db.pool,
         vec![
-            Ok(json!({
-                "items": [{"target_kind": "shopping", "title": "Хлеб"}],
-                "clarifications": ["Первый?", "Второй?", "Третий?"]
-            })),
-            Ok(json!({
-                "items": [{"target_kind": "shopping", "title": "Молоко"}],
-                "clarifications": ["Четвёртый?", "Пятый?", "Шестой?"]
-            })),
+            Ok(support::llm::v4::response_with(
+                vec![support::llm::v4::shopping("Хлеб")],
+                json!([
+                    {"item": 0, "topic": "list"},
+                    {"item": 0, "topic": "date"},
+                    {"item": 0, "topic": "time"}
+                ]),
+            )),
+            Ok(support::llm::v4::response_with(
+                vec![support::llm::v4::shopping("Молоко")],
+                json!([
+                    {"item": 0, "topic": "assignee"},
+                    {"item": 0, "topic": "list"},
+                    {"item": 0, "topic": "date"}
+                ]),
+            )),
         ],
     )
     .await;
@@ -3538,7 +3618,7 @@ async fn appended_clarifications_stop_at_the_limit() {
         3,
         "new questions over the limit must be dropped: {clarifications:?}"
     );
-    assert_eq!(clarifications[0], json!("Первый?"));
+    assert_eq!(clarifications[0], json!("В какой список?"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3549,8 +3629,8 @@ async fn the_card_with_several_parts_matches_the_golden_snapshot() {
     let mut stand = stand(
         &db.pool,
         vec![
-            Ok(json!({"items": [{"target_kind": "shopping", "title": "Хлеб"}]})),
-            Ok(json!({"items": [{"target_kind": "shopping", "title": "Молоко"}]})),
+            Ok(json!({"items": [support::llm::v4::shopping("Хлеб")]})),
+            Ok(json!({"items": [support::llm::v4::shopping("Молоко")]})),
         ],
     )
     .await;
@@ -3590,8 +3670,8 @@ async fn appended_parts_are_quoted_separately_in_the_order_they_were_sent() {
     let mut stand = stand(
         &db.pool,
         vec![
-            Ok(json!({"items": [{"target_kind": "shopping", "title": "Хлеб"}]})),
-            Ok(json!({"items": [{"target_kind": "shopping", "title": "Молоко"}]})),
+            Ok(json!({"items": [support::llm::v4::shopping("Хлеб")]})),
+            Ok(json!({"items": [support::llm::v4::shopping("Молоко")]})),
         ],
     )
     .await;
@@ -3619,9 +3699,7 @@ async fn an_old_draft_without_parts_quotes_the_joined_text_once() {
     let db = db().await;
     let mut stand = stand(
         &db.pool,
-        vec![Ok(
-            json!({"items": [{"target_kind": "shopping", "title": "Хлеб"}]}),
-        )],
+        vec![Ok(json!({"items": [support::llm::v4::shopping("Хлеб")]}))],
     )
     .await;
 
@@ -3649,8 +3727,8 @@ async fn every_part_survives_removing_and_editing_and_is_escaped() {
     let mut stand = stand(
         &db.pool,
         vec![
-            Ok(json!({"items": [{"target_kind": "shopping", "title": "Хлеб"}]})),
-            Ok(json!({"items": [{"target_kind": "shopping", "title": "Молоко"}]})),
+            Ok(json!({"items": [support::llm::v4::shopping("Хлеб")]})),
+            Ok(json!({"items": [support::llm::v4::shopping("Молоко")]})),
         ],
     )
     .await;
@@ -3685,9 +3763,7 @@ async fn twenty_max_length_parts_still_fit_the_message_limit() {
     let db = db().await;
     let mut stand = stand(
         &db.pool,
-        vec![Ok(
-            json!({"items": [{"target_kind": "shopping", "title": "Хлеб"}]}),
-        )],
+        vec![Ok(json!({"items": [support::llm::v4::shopping("Хлеб")]}))],
     )
     .await;
 
@@ -3721,9 +3797,7 @@ async fn newline_heavy_parts_still_fit_the_message_limit() {
     let db = db().await;
     let mut stand = stand(
         &db.pool,
-        vec![Ok(
-            json!({"items": [{"target_kind": "shopping", "title": "Хлеб"}]}),
-        )],
+        vec![Ok(json!({"items": [support::llm::v4::shopping("Хлеб")]}))],
     )
     .await;
 
@@ -3753,14 +3827,9 @@ async fn newline_heavy_parts_still_fit_the_message_limit() {
 async fn a_draft_card_with_a_long_banner_still_fits_the_message_limit() {
     let db = db().await;
     let mut items: Vec<Value> = (0..19)
-        .map(|number| {
-            json!({
-                "target_kind": "shopping",
-                "title": format!("Покупка {number} {}", "я".repeat(70))
-            })
-        })
+        .map(|number| support::llm::v4::shopping(&format!("Покупка {number} {}", "я".repeat(70))))
         .collect();
-    items.push(json!({"target_kind": "tasks", "title": "Позвонить маме"}));
+    items.push(support::llm::v4::task("Позвонить маме"));
     let mut stand = stand(&db.pool, vec![Ok(json!({"items": items}))]).await;
 
     stand.bot.press("Покупки").await;
@@ -3784,14 +3853,9 @@ async fn a_draft_card_with_a_long_banner_still_fits_the_message_limit() {
 async fn many_items_and_parts_never_render_empty_quotes() {
     let db = db().await;
     let items: Vec<Value> = (0..20)
-        .map(|number| {
-            json!({
-                "target_kind": "shopping",
-                "title": format!("Покупка {number} {}", "я".repeat(180))
-            })
-        })
+        .map(|number| support::llm::v4::shopping(&format!("Покупка {number} {}", "я".repeat(180))))
         .collect();
-    let mut stand = stand(&db.pool, vec![Ok(json!({"items": items}))]).await;
+    let mut stand = stand(&db.pool, vec![Ok(support::llm::v4::response(items))]).await;
 
     stand.capture("двадцать длинных покупок").await;
     let parts: Vec<String> = (0..20).map(|_| "я".repeat(2_000)).collect();
@@ -3846,7 +3910,7 @@ async fn a_late_draft_does_not_replace_the_list_the_user_opened() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_parse_error_after_leaving_the_screen_stays_a_banner() {
     let db = db().await;
-    let mut stand = stand(&db.pool, vec![Err(HaError::Rejected(400))]).await;
+    let mut stand = stand(&db.pool, vec![Err(LlmError::Rejected(400))]).await;
     let text = "позвонить маме";
 
     stand.bot.text(text).await;
@@ -3882,7 +3946,7 @@ async fn a_parse_error_after_leaving_the_screen_stays_a_banner() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_manual_entry_token_is_one_shot() {
     let db = db().await;
-    let mut stand = stand(&db.pool, vec![Err(HaError::Rejected(400))]).await;
+    let mut stand = stand(&db.pool, vec![Err(LlmError::Rejected(400))]).await;
 
     stand.bot.text("позвонить маме").await;
     stand.bot.press("Назад").await;
@@ -3949,8 +4013,8 @@ async fn an_append_updates_the_card_the_user_is_looking_at() {
     let mut stand = stand(
         &db.pool,
         vec![
-            Ok(json!({"items": [{"target_kind": "shopping", "title": "Хлеб"}]})),
-            Ok(json!({"items": [{"target_kind": "shopping", "title": "Молоко"}]})),
+            Ok(json!({"items": [support::llm::v4::shopping("Хлеб")]})),
+            Ok(json!({"items": [support::llm::v4::shopping("Молоко")]})),
         ],
     )
     .await;
@@ -4000,8 +4064,8 @@ async fn a_processing_screen_of_another_job_is_not_this_job() {
     let mut stand = stand(
         &db.pool,
         vec![
-            Ok(json!({"items": [{"target_kind": "shopping", "title": "Хлеб"}]})),
-            Ok(json!({"items": [{"target_kind": "shopping", "title": "Молоко"}]})),
+            Ok(json!({"items": [support::llm::v4::shopping("Хлеб")]})),
+            Ok(json!({"items": [support::llm::v4::shopping("Молоко")]})),
         ],
     )
     .await;
@@ -4035,8 +4099,8 @@ async fn the_menu_shows_the_waiting_draft_and_opens_it() {
     let mut stand = stand(
         &db.pool,
         vec![Ok(json!({"items": [
-            {"target_kind": "shopping", "title": "Хлеб"},
-            {"target_kind": "shopping", "title": "Молоко"}
+            support::llm::v4::shopping("Хлеб"),
+            support::llm::v4::shopping("Молоко")
         ]}))],
     )
     .await;
@@ -4076,9 +4140,7 @@ async fn a_corrupted_draft_content_does_not_break_the_menu() {
     let db = db().await;
     let mut stand = stand(
         &db.pool,
-        vec![Ok(
-            json!({"items": [{"target_kind": "shopping", "title": "Хлеб"}]}),
-        )],
+        vec![Ok(json!({"items": [support::llm::v4::shopping("Хлеб")]}))],
     )
     .await;
 
@@ -4103,9 +4165,7 @@ async fn cancelling_the_draft_removes_the_menu_line() {
     let db = db().await;
     let mut stand = stand(
         &db.pool,
-        vec![Ok(
-            json!({"items": [{"target_kind": "shopping", "title": "Хлеб"}]}),
-        )],
+        vec![Ok(json!({"items": [support::llm::v4::shopping("Хлеб")]}))],
     )
     .await;
 
@@ -4124,9 +4184,7 @@ async fn an_expired_draft_removes_the_menu_line() {
     let db = db().await;
     let mut stand = stand(
         &db.pool,
-        vec![Ok(
-            json!({"items": [{"target_kind": "shopping", "title": "Хлеб"}]}),
-        )],
+        vec![Ok(json!({"items": [support::llm::v4::shopping("Хлеб")]}))],
     )
     .await;
 

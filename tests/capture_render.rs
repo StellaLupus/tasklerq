@@ -12,10 +12,11 @@ use std::time::Duration;
 use chrono::{TimeZone, Utc};
 use serde_json::{Map, Value, json};
 use tasklerq::capture::context::{CaptureContext, ListRef, MemberRef};
+use tasklerq::capture::llm;
 use tasklerq::capture::prompt;
 use tasklerq::domain::models::ListKind;
 use tasklerq::domain::recurrence::parse_timezone;
-use tasklerq::llm::{Chain, ChatRequest, OpenAiBackend, ResponseFailure, Slot, SystemClock};
+use tasklerq::llm::{Chain, OpenAiBackend, Slot};
 use tokio::process::Command;
 use uuid::Uuid;
 use wiremock::matchers::method;
@@ -389,12 +390,6 @@ async fn rendered_messages_and_schema_match_the_backend_request() {
         .mount(&server)
         .await;
 
-    let request = prompt::build_request(&capture_context(), phrase);
-    let chat = ChatRequest {
-        messages: &request.messages,
-        schema_name: "capture_v4",
-        schema: &request.schema,
-    };
     let backend = OpenAiBackend::new(
         &format!("{}/v1", server.uri()),
         "test/model",
@@ -408,15 +403,14 @@ async fn rendered_messages_and_schema_match_the_backend_request() {
         None,
     );
 
-    let outcome = chain
-        .run(
-            &chat,
-            Duration::from_secs(5),
-            Utc::now(),
-            &SystemClock::new(),
-            |content: &str| Ok::<String, ResponseFailure<()>>(content.to_owned()),
-        )
-        .await;
+    let outcome = llm::generate(
+        &chain,
+        &capture_context(),
+        phrase,
+        Utc::now(),
+        Duration::from_secs(5),
+    )
+    .await;
     assert!(outcome.result.is_ok(), "{:?}", outcome.result);
 
     let requests = server.received_requests().await.expect("requests");

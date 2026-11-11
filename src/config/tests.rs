@@ -749,7 +749,7 @@ fn legacy_home_assistant_variables_are_collected() {
     let mut pairs = enabled_primary();
     pairs.push(("HA_BASE_URL", "http://127.0.0.1:8123"));
     pairs.push(("HA_TOKEN", "home-assistant-secret-token"));
-    pairs.push(("HA_AI_TASK_ENTITY_ID", "ai_task.test"));
+    pairs.push(("HA_AI_TASK_ENTITY_ID", "legacy.entity"));
 
     let config = config_with(&pairs).expect("legacy variables must not stop startup");
     assert_eq!(

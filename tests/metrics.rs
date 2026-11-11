@@ -15,9 +15,7 @@ use chrono::{DateTime, Duration, Utc};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use sqlx::PgConnection;
-use tasklerq::capture::breaker::CircuitBreaker;
 use tasklerq::config::{CaptureConfig, SecretString};
-use tasklerq::home_assistant::{AiTask, GenerateData, HaError};
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
 use tasklerq::llm::{
@@ -61,38 +59,11 @@ fn fallback_capture_config() -> CaptureConfig {
     }
 }
 
-struct StubAi;
-
-#[async_trait]
-impl AiTask for StubAi {
-    async fn check_entity(&self) -> Result<(), HaError> {
-        Ok(())
-    }
-
-    async fn generate_data(
-        &self,
-        _request: &GenerateData<'_>,
-        _timeout: StdDuration,
-    ) -> Result<Value, HaError> {
-        Ok(json!({"items": [{"target_kind": "shopping", "title": "Молоко"}]}))
-    }
-}
-
-struct BadAi;
-
-#[async_trait]
-impl AiTask for BadAi {
-    async fn check_entity(&self) -> Result<(), HaError> {
-        Ok(())
-    }
-
-    async fn generate_data(
-        &self,
-        _request: &GenerateData<'_>,
-        _timeout: StdDuration,
-    ) -> Result<Value, HaError> {
-        Ok(json!({}))
-    }
+fn chain_always(answer: Result<Value, LlmError>) -> Arc<tasklerq::llm::Chain> {
+    Arc::new(support::llm::chain(
+        support::llm::BackendDouble::always(answer),
+        None,
+    ))
 }
 
 struct Noop;
@@ -120,24 +91,6 @@ impl UpdateHandler for Failing {
         _now: DateTime<Utc>,
     ) -> Result<Outcome, sqlx::Error> {
         Err(sqlx::Error::PoolTimedOut)
-    }
-}
-
-/// LLM недоступна: capture уходит в fallback из исходного текста.
-struct UnavailableAi;
-
-#[async_trait]
-impl AiTask for UnavailableAi {
-    async fn check_entity(&self) -> Result<(), HaError> {
-        Ok(())
-    }
-
-    async fn generate_data(
-        &self,
-        _request: &GenerateData<'_>,
-        _timeout: StdDuration,
-    ) -> Result<Value, HaError> {
-        Err(HaError::Unreachable)
     }
 }
 
@@ -260,8 +213,9 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
     let state = AppState::new(db.pool.clone(), Audit::new(db.pool.clone()))
         .with_capture(CaptureState::new(
             capture_config(),
-            Some(Arc::new(StubAi)),
-            Arc::new(CircuitBreaker::default()),
+            Some(chain_always(Ok(support::llm::v4::response(vec![
+                support::llm::v4::shopping("Молоко"),
+            ])))),
             200,
         ))
         .with_telegram(ingress)
@@ -303,12 +257,7 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
     // Сбой валидации ответа LLM считается отдельной метрикой.
     let bad_app = build_router(
         AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_capture(
-            CaptureState::new(
-                capture_config(),
-                Some(Arc::new(BadAi)),
-                Arc::new(CircuitBreaker::default()),
-                200,
-            ),
+            CaptureState::new(capture_config(), Some(chain_always(Ok(json!({})))), 200),
         ),
     );
     let (status, _, _) = send(
@@ -327,8 +276,7 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
         AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_capture(
             CaptureState::new(
                 fallback_capture_config(),
-                Some(Arc::new(UnavailableAi)),
-                Arc::new(CircuitBreaker::default()),
+                Some(chain_always(Err(LlmError::Transport))),
                 200,
             ),
         ),
@@ -465,7 +413,9 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
     telegram.press("меню").await;
     let capture_worker = CaptureWorker::new(
         db.pool.clone(),
-        Arc::new(StubAi),
+        chain_always(Ok(support::llm::v4::response(vec![
+            support::llm::v4::shopping("Молоко"),
+        ]))),
         handler,
         Arc::new(Notify::new()),
         Audit::new(db.pool.clone()),

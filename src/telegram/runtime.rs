@@ -7,10 +7,9 @@ use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 use url::Url;
 
-use crate::capture::breaker::CircuitBreaker;
 use crate::config::{Config, LlmConfig, TelegramMode};
-use crate::home_assistant::AiTask;
 use crate::jobs::scheduler::Scheduler;
+use crate::llm::Chain;
 use crate::security_audit::Audit;
 
 use super::api::{DEFAULT_BASE_URL, HttpTelegramApi, TelegramApi};
@@ -42,11 +41,10 @@ pub async fn start(
     config: &Config,
     pool: &PgPool,
     shutdown: watch::Receiver<bool>,
-    ai: Option<Arc<dyn AiTask>>,
-    breaker: Arc<CircuitBreaker>,
+    llm: Option<Arc<Chain>>,
     audit: Audit,
 ) -> Result<Option<Runtime>, StartError> {
-    start_with_update_limit(config, pool, shutdown, ai, breaker, audit, None).await
+    start_with_update_limit(config, pool, shutdown, llm, audit, None).await
 }
 
 /// Запустить Telegram-часть с явным лимитом обновлений на пользователя.
@@ -57,8 +55,7 @@ pub async fn start_with_update_limit(
     config: &Config,
     pool: &PgPool,
     shutdown: watch::Receiver<bool>,
-    ai: Option<Arc<dyn AiTask>>,
-    breaker: Arc<CircuitBreaker>,
+    llm: Option<Arc<Chain>>,
     audit: Audit,
     update_limit: Option<u32>,
 ) -> Result<Option<Runtime>, StartError> {
@@ -105,19 +102,18 @@ pub async fn start_with_update_limit(
     }
 
     let bot = Bot::new(telegram.bot_username.clone())
-        .with_llm_capture(ai.is_some())
+        .with_llm_capture(llm.is_some())
         .with_tenancy_config(config.tenancy)
         .with_audit(audit.clone());
-    if let Some(ai) = ai {
+    if let Some(llm) = llm {
         let capture = CaptureWorker::new(
             pool.clone(),
-            ai,
+            llm,
             bot.clone(),
             wake_outbox.clone(),
             audit.clone(),
         )
-        .with_quota(config.llm.daily_quota)
-        .with_breaker(breaker);
+        .with_quota(config.llm.daily_quota);
         tasks.push(tokio::spawn(capture.run(shutdown.clone())));
     }
     let updates = UpdateWorker::new(
@@ -140,64 +136,33 @@ pub async fn start_with_update_limit(
     Ok(Some(Runtime { ingress, tasks }))
 }
 
-/// Клиент разбора текста; `None`, если разбор выключен или ещё не подключён к
-/// слотам.
+/// Клиент разбора текста; `None`, если разбор выключен.
 ///
-/// Подключение цепочки слотов — пункт 7.1. До него разбор не вызывает LLM:
-/// свободный текст идёт в быстрое добавление, как при выключенном LLM. Модуль
-/// [`crate::home_assistant`] и его тесты остаются до 7.1.
-pub fn build_ai(llm: &LlmConfig) -> Option<Arc<dyn AiTask>> {
-    if llm.enabled {
-        tracing::warn!(
-            "LLM capture is enabled but is not connected to the slot chain yet; \
-             free text goes to quick add"
-        );
+/// Ошибка построения бэкенда не роняет сервис: слоты не настроены — разбор
+/// выключен, а свободный текст идёт в быстрое добавление. Текст предупреждения
+/// не содержит адрес и токен слота.
+pub fn build_llm(llm: &LlmConfig) -> Option<Arc<Chain>> {
+    match Chain::from_config(llm) {
+        Ok(Some(chain)) => Some(Arc::new(chain)),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(
+                error = error.code(),
+                "LLM capture is disabled: slot configuration is invalid"
+            );
+            None
+        }
     }
-    None
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use serde_json::Map;
 
     use super::*;
     use crate::config::{SecretString, SlotConfig};
-
-    #[derive(Clone, Default)]
-    struct LogBuffer(Arc<Mutex<Vec<u8>>>);
-
-    impl LogBuffer {
-        fn contents(&self) -> String {
-            let bytes = self.0.lock().expect("log buffer lock").clone();
-            String::from_utf8(bytes).expect("logs are UTF-8")
-        }
-    }
-
-    impl Write for LogBuffer {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .expect("log buffer lock")
-                .extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for LogBuffer {
-        type Writer = Self;
-
-        fn make_writer(&'writer self) -> Self::Writer {
-            self.clone()
-        }
-    }
 
     fn slot() -> SlotConfig {
         SlotConfig {
@@ -210,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_llm_capture_builds_no_client() {
+    fn disabled_llm_capture_builds_no_chain() {
         let llm = LlmConfig {
             enabled: false,
             primary: Some(slot()),
@@ -218,13 +183,11 @@ mod tests {
             connect_timeout: Duration::from_millis(1000),
             daily_quota: 200,
         };
-        assert!(build_ai(&llm).is_none());
+        assert!(build_llm(&llm).is_none());
     }
 
     #[test]
-    fn configured_slot_builds_no_client_until_the_chain_lands() {
-        // 7.1 подключит цепочку слотов; до тех пор даже настроенный слот не
-        // даёт клиента, и разбор идёт в быстрое добавление.
+    fn configured_slots_build_a_chain() {
         let llm = LlmConfig {
             enabled: true,
             primary: Some(slot()),
@@ -233,21 +196,8 @@ mod tests {
             daily_quota: 200,
         };
 
-        let buffer = LogBuffer::default();
-        let subscriber = tracing_subscriber::fmt()
-            .json()
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(buffer.clone())
-            .finish();
-
-        let ai = tracing::subscriber::with_default(subscriber, || build_ai(&llm));
-        assert!(ai.is_none());
-
-        let logs = buffer.contents();
-        assert!(logs.contains("\"level\":\"WARN\""), "{logs}");
-        assert!(
-            logs.contains("not connected to the slot chain"),
-            "an enabled but unwired LLM capture must be visible in the log: {logs}"
-        );
+        let chain = build_llm(&llm).expect("configured slots build a chain");
+        assert_eq!(chain.primary().name(), "primary");
+        assert_eq!(chain.fallback().map(|slot| slot.name()), Some("fallback"));
     }
 }

@@ -3,14 +3,11 @@
 //! Эту функцию вызывают и `serve()` в `main.rs`, и интеграционные тесты, чтобы
 //! тест проверял production-путь, а не отдельную ручную сборку.
 
-use std::sync::Arc;
-
 use axum::Router;
 use sqlx::PgPool;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::capture::breaker::CircuitBreaker;
 use crate::config::{Config, TelegramMode, TenancyMode};
 use crate::http::api::capture::CaptureState;
 use crate::http::router::{AppState, build_router};
@@ -54,8 +51,7 @@ pub async fn build_application_with_update_limit(
     warn_if_bootstrap_owner_missing(config);
     warn_if_multiple_households(config, &pool).await;
 
-    let ai = runtime::build_ai(&config.llm);
-    let breaker = Arc::new(CircuitBreaker::default());
+    let llm = runtime::build_llm(&config.llm);
     // Один журнал событий на процесс: вебхук, воркеры, бот и capture-воркер
     // делят состояние подавления и счётчики отказов.
     let audit = Audit::new(pool.clone());
@@ -63,8 +59,7 @@ pub async fn build_application_with_update_limit(
         config,
         &pool,
         shutdown.clone(),
-        ai.clone(),
-        breaker.clone(),
+        llm.clone(),
         audit.clone(),
         update_limit,
     )
@@ -82,8 +77,7 @@ pub async fn build_application_with_update_limit(
     if config.capture.enabled {
         state = state.with_capture(CaptureState::new(
             config.capture,
-            ai,
-            breaker,
+            llm,
             config.llm.daily_quota,
         ));
     }

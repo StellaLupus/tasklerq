@@ -8,17 +8,13 @@
 mod support;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration as StdDuration;
 
-use async_trait::async_trait;
 use chrono::Utc;
-use serde_json::Value;
 use sqlx::Row;
 use tasklerq::capture::prompt::PROMPT_VERSION;
 use tasklerq::domain::models::{CaptureMode, CaptureSource};
-use tasklerq::home_assistant::{AiTask, GenerateData, HaError};
-use tasklerq::llm::Attempt;
+use tasklerq::llm::{Attempt, Chain, LlmError};
 use tasklerq::security_audit::Audit;
 use tasklerq::storage::repositories::llm_runs::{self, FAILURE, NewRun, RunFields, SUCCESS};
 use tasklerq::telegram::bot::Bot;
@@ -29,25 +25,12 @@ use support::logs::LogBuffer;
 use support::telegram::{FakeTelegram, Harness};
 use support::{db, next_telegram_id};
 
-/// Home Assistant, который всегда отвечает некорректно.
-struct FailingAi {
-    calls: AtomicUsize,
-}
-
-#[async_trait]
-impl AiTask for FailingAi {
-    async fn check_entity(&self) -> Result<(), HaError> {
-        Ok(())
-    }
-
-    async fn generate_data(
-        &self,
-        _request: &GenerateData<'_>,
-        _timeout: StdDuration,
-    ) -> Result<Value, HaError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Err(HaError::BadResponse)
-    }
+/// Цепочка, которая всегда отвечает ошибкой транспорта.
+fn failing_chain() -> Arc<Chain> {
+    Arc::new(support::llm::chain(
+        support::llm::BackendDouble::new(vec![Err(LlmError::EmptyResponse)]),
+        None,
+    ))
 }
 
 #[test]
@@ -70,9 +53,7 @@ fn llm_logs_do_not_contain_the_source_text() {
             let handler = Bot::new("tasklerqbot")
                 .with_llm_capture(true)
                 .with_tenancy(tasklerq::config::TenancyMode::Multi);
-            let ai = Arc::new(FailingAi {
-                calls: AtomicUsize::new(0),
-            });
+            let ai = failing_chain();
             let mut bot =
                 Harness::with_handler(&db.pool, id, Arc::new(handler.clone()), FakeTelegram::new());
             bot.text("/start").await;
@@ -90,7 +71,6 @@ fn llm_logs_do_not_contain_the_source_text() {
             .only_chat(id);
             bot.text("секретная заметка про подарок").await;
             assert_eq!(worker.run_once(bot.now).await.expect("pass"), Pass::Dead);
-            assert_eq!(ai.calls.load(Ordering::SeqCst), 1);
         });
     });
 
