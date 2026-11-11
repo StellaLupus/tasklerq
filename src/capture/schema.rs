@@ -11,6 +11,7 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 use uuid::Uuid;
 
+use super::context::CaptureContext;
 use crate::domain::models::ListKind;
 
 /// Максимум элементов в одном ответе.
@@ -110,6 +111,11 @@ pub struct RawItem {
     pub due_date: Option<String>,
     /// Время `HH:MM`.
     pub due_time: Option<String>,
+    /// Элемент на весь день: время не задаётся, даже если модель или прежний
+    /// черновик его назвали. Признак появляется при ответе «Весь день» на
+    /// вопрос о времени.
+    #[serde(default)]
+    pub all_day: bool,
     /// Дата конца события `YYYY-MM-DD`, последний день включительно.
     #[serde(default)]
     pub end_date: Option<String>,
@@ -184,10 +190,11 @@ impl ClarificationTopic {
 
     /// Поле элемента уже заполнено, поэтому уточнение закрыто.
     ///
-    /// У `RawItem` нет отдельного признака «весь день»: вседневное событие
-    /// отличается отсутствием времени, а не отдельным полем, поэтому вопрос о
-    /// времени закрыт только названным временем.
-    pub fn is_filled(self, item: &RawItem) -> bool {
+    /// `context` нужен только вопросу о списке: имя считается названным, лишь
+    /// когда такой список есть в household. Если контекста нет (уточнения
+    /// сохраняются при создании черновика раньше проверки), имя не закрывает
+    /// вопрос: неизвестный список не должен молча превращаться в ответ.
+    pub fn is_filled(self, item: &RawItem, context: Option<&CaptureContext>) -> bool {
         let named = |value: &Option<String>| {
             value
                 .as_deref()
@@ -195,21 +202,34 @@ impl ClarificationTopic {
         };
         match self {
             Self::Date => item.due_date.is_some(),
-            Self::Time => item.due_time.is_some(),
+            Self::Time => item.due_time.is_some() || item.all_day,
             Self::Assignee => named(&item.assignee) || item.assignee_id.is_some(),
-            Self::List => named(&item.target_list),
+            Self::List => {
+                let Some(context) = context else {
+                    return false;
+                };
+                let Some(name) = item
+                    .target_list
+                    .as_deref()
+                    .filter(|name| !name.trim().is_empty())
+                else {
+                    return false;
+                };
+                context.find_list(item.target_kind, name).is_some()
+            }
         }
     }
 }
 
-/// Оставить уточнения только о существующих элементах с незаполненным полем и
-/// не больше [`MAX_CLARIFICATIONS`] штук.
+/// Оставить уточнения только о существующих элементах с незаполненным полем,
+/// без повторов пары «элемент, тема» и не больше [`MAX_CLARIFICATIONS`] штук.
 ///
 /// Одна и та же проверка нужна и ответу внешнего capture (до сохранения
 /// черновика), и самому черновику при создании, дописывании и правке.
 pub fn normalize_clarifications(
     items: &[RawItem],
     clarifications: Vec<Clarification>,
+    context: Option<&CaptureContext>,
 ) -> Vec<Clarification> {
     let mut kept = Vec::new();
     for clarification in clarifications {
@@ -219,7 +239,12 @@ pub fn normalize_clarifications(
         let Some(item) = items.get(clarification.item) else {
             continue;
         };
-        if clarification.topic.is_filled(item) {
+        // Модель иногда повторяет один и тот же вопрос: три одинаковых
+        // уточнения не должны занимать весь лимит.
+        if kept.contains(&clarification) {
+            continue;
+        }
+        if clarification.topic.is_filled(item, context) {
             continue;
         }
         kept.push(clarification);
@@ -317,6 +342,7 @@ fn parse_item(index: usize, value: &Value) -> Result<RawItem, ParseError> {
         notes: optional_text(object, at, "notes")?,
         due_date: optional_text(object, at, "due_date")?,
         due_time: optional_text(object, at, "due_time")?,
+        all_day: false,
         end_date: None,
         end_time: None,
         date_error: Vec::new(),
@@ -906,5 +932,69 @@ mod tests {
         let item: RawItem = serde_json::from_value(draft).expect("draft reads");
 
         assert!(item.date_error.is_empty());
+        assert!(!item.all_day, "an old draft is not all-day");
+    }
+
+    #[test]
+    fn duplicate_clarifications_do_not_fill_the_limit() {
+        let item = parse_one(json!({})).unwrap();
+        let duplicate = Clarification {
+            item: 0,
+            topic: ClarificationTopic::Date,
+        };
+
+        let normalized = normalize_clarifications(&[item], vec![duplicate; 3], None);
+
+        assert_eq!(
+            normalized,
+            [duplicate],
+            "three identical questions are one question"
+        );
+    }
+
+    #[test]
+    fn an_unknown_list_name_does_not_close_the_list_question() {
+        let context = crate::capture::test_support::context();
+        let question = Clarification {
+            item: 0,
+            topic: ClarificationTopic::List,
+        };
+
+        let unknown = parse_one(json!({"target_list": "Несуществующий"})).unwrap();
+        assert_eq!(
+            normalize_clarifications(
+                std::slice::from_ref(&unknown),
+                vec![question],
+                Some(&context)
+            ),
+            [question],
+            "a name that is not a household list leaves the question open"
+        );
+
+        let known = parse_one(json!({"target_list": "Дача"})).unwrap();
+        assert!(
+            normalize_clarifications(std::slice::from_ref(&known), vec![question], Some(&context))
+                .is_empty(),
+            "a real list of the right kind closes the question"
+        );
+
+        let other_kind = parse_one(json!({"target_list": "Покупки"})).unwrap();
+        assert_eq!(
+            normalize_clarifications(
+                std::slice::from_ref(&other_kind),
+                vec![question],
+                Some(&context)
+            ),
+            [question],
+            "a list of another kind does not answer the question"
+        );
+    }
+
+    #[test]
+    fn an_all_day_item_closes_the_time_question() {
+        let mut item = parse_one(json!({"due_date": "2026-11-11"})).unwrap();
+        item.all_day = true;
+
+        assert!(ClarificationTopic::Time.is_filled(&item, None));
     }
 }

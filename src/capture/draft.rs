@@ -11,7 +11,7 @@
 //! уже в транзакции) и берут блокировку строки черновика, так что параллельные
 //! подтверждения выстраиваются в очередь и второе видит результат первого.
 
-use chrono::{DateTime, Days, Utc};
+use chrono::{DateTime, Days, NaiveDate, NaiveTime, Utc};
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,8 +21,8 @@ use uuid::Uuid;
 
 use super::context::CaptureContext;
 use super::schema::{
-    Clarification, MAX_CLARIFICATIONS, MAX_ITEMS, ParsedResponse, RawItem, RawRecurrence,
-    normalize_clarifications,
+    Clarification, ClarificationTopic, MAX_CLARIFICATIONS, MAX_ITEMS, ParsedResponse, RawItem,
+    RawRecurrence, normalize_clarifications,
 };
 use super::validate::{DraftItem, ValidatedDraft, validate_items};
 use crate::domain::error::DomainError;
@@ -185,7 +185,7 @@ impl Stored {
             clarifications_answered: 0,
         };
         stored.items.iter_mut().for_each(scrub);
-        stored.clarifications = normalize_clarifications(&stored.items, clarifications);
+        stored.clarifications = normalize_clarifications(&stored.items, clarifications, None);
         stored
     }
 
@@ -491,7 +491,7 @@ async fn try_append(
             })
             .take(capacity),
     );
-    stored.clarifications = normalize_clarifications(&stored.items, stored.clarifications);
+    stored.clarifications = normalize_clarifications(&stored.items, stored.clarifications, None);
     let parsed = stored.to_value();
     let expires_at = now + chrono::Duration::minutes(drafts::DRAFT_TTL_MINUTES);
     drafts::append(
@@ -531,9 +531,17 @@ async fn build_view(
     now: DateTime<Utc>,
 ) -> Result<DraftView, DomainError> {
     let context = load_context_for(conn, draft.household_id, draft.user_id, now).await?;
+    build_view_with(draft, context)
+}
+
+fn build_view_with(draft: Draft, context: CaptureContext) -> Result<DraftView, DomainError> {
     let stored = Stored::read(&draft)?;
     let clarifications_answered = stored.clarifications_answered;
-    let clarifications = stored.clarifications.clone();
+    // Уточнение о списке закрыто, только если названный список есть в
+    // household: проверка идёт по актуальному контексту, а не по сохранённому
+    // имени.
+    let clarifications =
+        normalize_clarifications(&stored.items, stored.clarifications.clone(), Some(&context));
     let raw = stored.items.clone();
     let validated = validate_items(
         &context,
@@ -625,7 +633,8 @@ pub async fn replace_item(
 ///
 /// Ответ обновляет только черновик: LLM повторно не вызывается. Выбор
 /// принимается лишь для участника, который сейчас действительно входит в
-/// неоднозначный набор, и расходует одну из трёх попыток уточнения.
+/// неоднозначный набор или в household, если вопрос задала модель. Ответ
+/// расходует одну из трёх попыток уточнения.
 pub async fn answer_assignee(
     conn: &mut PgConnection,
     household_id: Uuid,
@@ -640,7 +649,13 @@ pub async fn answer_assignee(
         draft_id,
         index,
         now,
-        |item| item.has_assignee_question() && item.assignee_candidates.contains(&user_id),
+        |item, clarifications, context| {
+            if item.has_assignee_question() {
+                return item.assignee_candidates.contains(&user_id);
+            }
+            has_clarification(clarifications, index, ClarificationTopic::Assignee)
+                && context.members.iter().any(|member| member.id == user_id)
+        },
         |_, raw| raw.assignee_id = Some(user_id),
     )
     .await
@@ -666,7 +681,7 @@ pub async fn answer_due_date(
         draft_id,
         index,
         now,
-        DraftItem::has_date_question,
+        has_date_question(index),
         |context, raw| {
             let today = context.today();
             let date = match choice {
@@ -680,6 +695,147 @@ pub async fn answer_due_date(
     .await
 }
 
+/// Точный срок из экрана выбора даты: дата и, если названо, время.
+///
+/// Нужен событию, у которого ещё нет начала: форма правки элемента для события
+/// появится в 8.3, а выбрать дату можно уже сейчас. Названное ранее время
+/// сохраняется: экран выбирает дату, а «весь день» ставит отдельный ответ.
+pub async fn answer_due_text(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    draft_id: Uuid,
+    index: usize,
+    date: NaiveDate,
+    time: Option<NaiveTime>,
+    now: DateTime<Utc>,
+) -> Result<DraftView, DraftError> {
+    answer(
+        conn,
+        household_id,
+        draft_id,
+        index,
+        now,
+        has_date_question(index),
+        |_, raw| {
+            raw.due_date = Some(date.format("%Y-%m-%d").to_string());
+            if let Some(time) = time {
+                raw.due_time = Some(time.format("%H:%M").to_string());
+                raw.all_day = false;
+            }
+            clear_date_error(raw, "due_date");
+        },
+    )
+    .await
+}
+
+/// Ответ на вопрос о времени: точное время `HH:MM`.
+pub async fn answer_due_time(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    draft_id: Uuid,
+    index: usize,
+    time: NaiveTime,
+    now: DateTime<Utc>,
+) -> Result<DraftView, DraftError> {
+    answer(
+        conn,
+        household_id,
+        draft_id,
+        index,
+        now,
+        |item, clarifications, _| {
+            has_clarification(clarifications, index, ClarificationTopic::Time) && has_due_date(item)
+        },
+        |_, raw| {
+            raw.due_time = Some(time.format("%H:%M").to_string());
+            raw.all_day = false;
+        },
+    )
+    .await
+}
+
+/// «Весь день»: время не задаётся, вопрос о времени закрыт.
+pub async fn answer_all_day(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    draft_id: Uuid,
+    index: usize,
+    now: DateTime<Utc>,
+) -> Result<DraftView, DraftError> {
+    answer(
+        conn,
+        household_id,
+        draft_id,
+        index,
+        now,
+        |item, clarifications, _| {
+            has_clarification(clarifications, index, ClarificationTopic::Time) && has_due_date(item)
+        },
+        |_, raw| {
+            raw.all_day = true;
+            raw.due_time = None;
+        },
+    )
+    .await
+}
+
+/// Ответ на вопрос о списке: выбранный список нужного вида.
+pub async fn answer_list(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    draft_id: Uuid,
+    index: usize,
+    list_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<DraftView, DraftError> {
+    answer(
+        conn,
+        household_id,
+        draft_id,
+        index,
+        now,
+        |item, clarifications, context| {
+            has_clarification(clarifications, index, ClarificationTopic::List)
+                && context
+                    .lists
+                    .iter()
+                    .any(|list| list.id == list_id && list.kind == item.kind)
+        },
+        |context, raw| {
+            if let Some(list) = context.lists.iter().find(|list| list.id == list_id) {
+                raw.target_list = Some(list.name.clone());
+            }
+        },
+    )
+    .await
+}
+
+/// Вопрос о дате: ошибка валидатора или уточнение модели для этого элемента.
+fn has_date_question(
+    index: usize,
+) -> impl FnOnce(&DraftItem, &[Clarification], &CaptureContext) -> bool {
+    move |item, clarifications, _| {
+        item.has_date_question()
+            || has_clarification(clarifications, index, ClarificationTopic::Date)
+    }
+}
+
+fn has_clarification(
+    clarifications: &[Clarification],
+    index: usize,
+    topic: ClarificationTopic,
+) -> bool {
+    clarifications
+        .iter()
+        .any(|clarification| clarification.item == index && clarification.topic == topic)
+}
+
+/// У элемента назван срок: только тогда вопрос о времени имеет смысл. Время
+/// без даты валидатор отвергает, и ответить на такой вопрос было бы нечем.
+fn has_due_date(item: &DraftItem) -> bool {
+    item.effective_due_at.is_some() || item.effective_due_date.is_some()
+}
+
 /// Общая часть ответа на уточняющий вопрос: открыть черновик, проверить лимит
 /// и актуальность вопроса, применить изменение и перечитать карточку.
 async fn answer(
@@ -688,7 +844,7 @@ async fn answer(
     draft_id: Uuid,
     index: usize,
     now: DateTime<Utc>,
-    is_question: impl FnOnce(&DraftItem) -> bool,
+    is_question: impl FnOnce(&DraftItem, &[Clarification], &CaptureContext) -> bool,
     apply: impl FnOnce(&CaptureContext, &mut RawItem),
 ) -> Result<DraftView, DraftError> {
     let mut tx = conn.begin().await?;
@@ -702,7 +858,7 @@ async fn answer(
         .items
         .get(index)
         .ok_or(DraftError::NoSuchItem(index))?;
-    if !is_question(checked) {
+    if !is_question(checked, &stored.clarifications, &view.context) {
         return Err(DraftError::NoClarification);
     }
 
@@ -734,9 +890,13 @@ async fn persist(
     conn: &mut PgConnection,
     draft: Draft,
     stored: &mut Stored,
+    context: &CaptureContext,
 ) -> Result<Draft, DraftError> {
-    stored.clarifications =
-        normalize_clarifications(&stored.items, std::mem::take(&mut stored.clarifications));
+    stored.clarifications = normalize_clarifications(
+        &stored.items,
+        std::mem::take(&mut stored.clarifications),
+        Some(context),
+    );
     let parsed = stored.to_value();
     drafts::set_parsed(conn, draft.household_id, draft.id, &parsed).await?;
     Ok(Draft {
@@ -751,8 +911,9 @@ async fn save_and_view(
     mut stored: Stored,
     now: DateTime<Utc>,
 ) -> Result<DraftView, DraftError> {
-    let draft = persist(conn, draft, &mut stored).await?;
-    Ok(build_view(conn, draft, now).await?)
+    let context = load_context_for(conn, draft.household_id, draft.user_id, now).await?;
+    let draft = persist(conn, draft, &mut stored, &context).await?;
+    build_view_with(draft, context).map_err(DraftError::from)
 }
 
 /// Удалённый элемент больше не существует: его уточнения отбрасываются, а
@@ -1045,6 +1206,7 @@ fn apply(raw: &mut RawItem, edit: ItemEdit) {
     // Срок без даты не бывает: сняв дату, снимаем и время.
     if matches!(edit.due_date, Field::Null) {
         raw.due_time = None;
+        raw.all_day = false;
     }
     if !matches!(edit.due_date, Field::Missing) {
         clear_date_error(raw, "due_date");
@@ -1115,6 +1277,7 @@ mod tests {
             notes: None,
             due_date: None,
             due_time: None,
+            all_day: false,
             end_date: None,
             end_time: None,
             date_error: vec![RawDateError {

@@ -165,7 +165,7 @@ pub fn validate_items_in(
         clarifications,
         legacy_questions,
     } = parsed;
-    let clarifications = normalize_clarifications(&items, clarifications);
+    let clarifications = normalize_clarifications(&items, clarifications, Some(context));
     ValidatedDraft {
         items: items
             .into_iter()
@@ -605,16 +605,12 @@ fn resolve_list<'a>(context: &'a CaptureContext, raw: &RawItem) -> (Option<&'a L
     let named = raw
         .target_list
         .as_deref()
-        .map(fold)
+        .map(str::trim)
         .filter(|name| !name.is_empty());
-    if let Some(name) = &named {
-        let found = context
-            .lists
-            .iter()
-            .find(|list| list.kind == raw.target_kind && fold(&list.name) == *name);
-        if found.is_some() {
-            return (found, false);
-        }
+    if let Some(name) = named
+        && let Some(found) = context.find_list(raw.target_kind, name)
+    {
+        return (Some(found), false);
     }
     let default = context.default_list(raw.target_kind);
     (default, named.is_some())
@@ -959,7 +955,13 @@ fn resolve_due(
 ) -> (Option<DateTime<Utc>>, Option<NaiveDate>) {
     let today = context.today();
     let date = Parsed::of(raw.due_date.as_deref(), parse_date);
-    let time = Parsed::of(raw.due_time.as_deref(), parse_time);
+    // «Весь день» — это отсутствие времени: даже если время осталось в
+    // черновике прежнего формата, вседневный элемент его не использует.
+    let time = if raw.all_day {
+        Parsed::Absent
+    } else {
+        Parsed::of(raw.due_time.as_deref(), parse_time)
+    };
 
     let date = match (date, &time) {
         (Parsed::Valid(date), _) => date,

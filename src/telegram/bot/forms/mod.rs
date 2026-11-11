@@ -336,6 +336,18 @@ pub async fn start_time(ctx: &mut Ctx<'_>, field: TimeField) -> Result<(), Fail>
     open(ctx, Form::Time { field }).await
 }
 
+/// Начать ввод времени в ответ на уточнение в черновике.
+pub async fn start_draft_time(ctx: &mut Ctx<'_>, draft_id: Uuid, index: usize) -> Result<(), Fail> {
+    ctx.user()?;
+    open(ctx, Form::DraftTime { draft_id, index }).await
+}
+
+/// Начать выбор даты для уточнения в черновике без формы правки элемента.
+pub async fn start_draft_due(ctx: &mut Ctx<'_>, draft_id: Uuid, index: usize) -> Result<(), Fail> {
+    ctx.user()?;
+    open(ctx, Form::DraftDue { draft_id, index }).await
+}
+
 /// Начать первый контакт: онбординг или информационный экран.
 ///
 /// Классификатор решает по состоянию инсталляции, режиму размещения и

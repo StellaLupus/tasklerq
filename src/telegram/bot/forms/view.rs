@@ -100,6 +100,14 @@ pub async fn view(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
             .heading(time_title(field))
             .text("Отправьте время в формате HH:MM, например 08:30.")
             .row(vec![cancel_button()])),
+        Form::DraftTime { .. } => Ok(Ui::new()
+            .heading("Во сколько?")
+            .text("Отправьте время в формате HH:MM, например 08:30.")
+            .row(vec![cancel_button()])),
+        Form::DraftDue { .. } => Ok(Ui::new()
+            .heading("Когда начало?")
+            .text(ru::DUE_HINT)
+            .row(vec![cancel_button()])),
     }
 }
 

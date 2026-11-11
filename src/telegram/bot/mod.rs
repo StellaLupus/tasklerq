@@ -1163,6 +1163,15 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
             choice,
         } => capture::due(ctx, draft_id, index, choice).await,
         Action::DraftEditDue { draft_id, index } => capture::edit_due(ctx, draft_id, index).await,
+        Action::DraftList {
+            draft_id,
+            index,
+            list_id,
+        } => capture::choose_list(ctx, draft_id, index, list_id).await,
+        Action::DraftAllDay { draft_id, index } => capture::all_day(ctx, draft_id, index).await,
+        Action::DraftTime { draft_id, index } => {
+            forms::start_draft_time(ctx, draft_id, index).await
+        }
         Action::DraftRemove { draft_id, index } => capture::remove(ctx, draft_id, index).await,
         Action::DraftSave { draft_id } => capture::save(ctx, draft_id).await,
         Action::DraftCancel { draft_id } => capture::cancel(ctx, draft_id).await,

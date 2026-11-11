@@ -6,6 +6,7 @@
 //! черновик в том состоянии, в котором он находится (ждёт подтверждения,
 //! сохранён, отменён или истёк).
 
+use chrono::{NaiveDate, NaiveTime};
 use uuid::Uuid;
 
 use crate::capture::draft::{self, DraftError, DraftView, DueChoice};
@@ -682,6 +683,77 @@ pub async fn due(
     ctx.present(Screen::Draft { draft_id }).await
 }
 
+/// Точная дата из экрана выбора даты; время — если пользователь его назвал.
+pub async fn due_text(
+    ctx: &mut Ctx<'_>,
+    draft_id: Uuid,
+    index: usize,
+    date: NaiveDate,
+    time: Option<NaiveTime>,
+) -> Result<(), Fail> {
+    let household_id = ctx.household()?.id;
+    draft::answer_due_text(
+        &mut *ctx.conn,
+        household_id,
+        draft_id,
+        index,
+        date,
+        time,
+        ctx.now,
+    )
+    .await
+    .map_err(fail)?;
+    ctx.toast("Срок уточнён");
+    ctx.present(Screen::Draft { draft_id }).await
+}
+
+/// Ответ на вопрос о времени точным значением `HH:MM`.
+pub async fn due_time(
+    ctx: &mut Ctx<'_>,
+    draft_id: Uuid,
+    index: usize,
+    time: NaiveTime,
+) -> Result<(), Fail> {
+    let household_id = ctx.household()?.id;
+    draft::answer_due_time(&mut *ctx.conn, household_id, draft_id, index, time, ctx.now)
+        .await
+        .map_err(fail)?;
+    ctx.toast("Время уточнено");
+    ctx.present(Screen::Draft { draft_id }).await
+}
+
+/// «Весь день»: вопрос о времени закрыт без времени.
+pub async fn all_day(ctx: &mut Ctx<'_>, draft_id: Uuid, index: usize) -> Result<(), Fail> {
+    let household_id = ctx.household()?.id;
+    draft::answer_all_day(&mut *ctx.conn, household_id, draft_id, index, ctx.now)
+        .await
+        .map_err(fail)?;
+    ctx.toast("Время уточнено");
+    ctx.present(Screen::Draft { draft_id }).await
+}
+
+/// Ответ на вопрос о списке.
+pub async fn choose_list(
+    ctx: &mut Ctx<'_>,
+    draft_id: Uuid,
+    index: usize,
+    list_id: Uuid,
+) -> Result<(), Fail> {
+    let household_id = ctx.household()?.id;
+    draft::answer_list(
+        &mut *ctx.conn,
+        household_id,
+        draft_id,
+        index,
+        list_id,
+        ctx.now,
+    )
+    .await
+    .map_err(fail)?;
+    ctx.toast("Список выбран");
+    ctx.present(Screen::Draft { draft_id }).await
+}
+
 /// «Отмена».
 pub async fn cancel(ctx: &mut Ctx<'_>, draft_id: Uuid) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
@@ -726,7 +798,20 @@ pub async fn edit(ctx: &mut Ctx<'_>, draft_id: Uuid, index: usize) -> Result<(),
 }
 
 /// «Выбрать дату» в уточняющем вопросе: тот же редактор сразу на поле срока.
+///
+/// Событие ведёт экран выбора даты без формы правки элемента: полноценный
+/// редактор события появится в 8.3, а выбрать начало можно уже сейчас.
 pub async fn edit_due(ctx: &mut Ctx<'_>, draft_id: Uuid, index: usize) -> Result<(), Fail> {
+    let household_id = ctx.household()?.id;
+    let view = draft::view(&mut *ctx.conn, household_id, draft_id, ctx.now).await?;
+    let events = view
+        .validated
+        .items
+        .get(index)
+        .is_some_and(|item| item.kind == ListKind::Events);
+    if events {
+        return forms::start_draft_due(ctx, draft_id, index).await;
+    }
     open_editor(ctx, draft_id, index, Some(Step::Due)).await
 }
 
@@ -829,9 +914,18 @@ pub(super) async fn save_draft_item(
         .await?
         .raw
         .get(index)
-        .and_then(|raw| raw.recurrence.as_ref().and_then(|rule| rule.until.clone()));
+        .cloned();
 
-    let item = to_raw(values, list.kind, &list.name, previous);
+    let item = to_raw(
+        values,
+        list.kind,
+        &list.name,
+        previous
+            .as_ref()
+            .and_then(|raw| raw.recurrence.as_ref())
+            .and_then(|rule| rule.until.clone()),
+        previous.as_ref().is_some_and(|raw| raw.all_day),
+    );
     draft::replace_item(&mut *ctx.conn, household_id, draft_id, index, item, ctx.now)
         .await
         .map_err(fail)?;
@@ -934,7 +1028,13 @@ fn seed(raw: &RawItem, view: &DraftView) -> ItemDraft {
 }
 
 /// Элемент черновика по заполненной форме.
-fn to_raw(draft: &ItemDraft, kind: ListKind, list_name: &str, until: Option<String>) -> RawItem {
+fn to_raw(
+    draft: &ItemDraft,
+    kind: ListKind,
+    list_name: &str,
+    until: Option<String>,
+    previously_all_day: bool,
+) -> RawItem {
     let priority = match draft.priority {
         ItemPriority::Low => "low",
         ItemPriority::Normal => "normal",
@@ -975,6 +1075,10 @@ fn to_raw(draft: &ItemDraft, kind: ListKind, list_name: &str, until: Option<Stri
             .date
             .and(draft.time)
             .map(|time| time.format("%H:%M").to_string()),
+        // Правка формы не должна закрывать вопрос о времени: «весь день»
+        // остаётся только там, где пользователь уже так ответил, а время не
+        // назвал.
+        all_day: previously_all_day && draft.time.is_none(),
         end_date: None,
         end_time: None,
         date_error: Vec::new(),

@@ -122,6 +122,23 @@ impl CaptureContext {
             .find(|list| list.is_default)
             .or_else(|| of_kind.next())
     }
+
+    /// Список нужного типа по названию. Сравнение без регистра и различия
+    /// «е»/«ё» — одно для валидатора и вопроса о списке.
+    pub fn find_list(&self, kind: ListKind, name: &str) -> Option<&ListRef> {
+        let name = fold_name(name);
+        if name.is_empty() {
+            return None;
+        }
+        self.lists
+            .iter()
+            .find(|list| list.kind == kind && fold_name(&list.name) == name)
+    }
+}
+
+/// Сравнение имён без регистра и различия «е»/«ё».
+fn fold_name(value: &str) -> String {
+    value.trim().to_lowercase().replace('ё', "е")
 }
 
 #[cfg(test)]

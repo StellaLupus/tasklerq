@@ -11,6 +11,7 @@ fn raw(kind: ListKind, title: &str) -> RawItem {
         notes: None,
         due_date: None,
         due_time: None,
+        all_day: false,
         end_date: None,
         end_time: None,
         date_error: Vec::new(),
@@ -1231,4 +1232,22 @@ fn quantity_precision_has_its_own_message() {
 
 fn raw_shopping() -> RawItem {
     raw(ListKind::Shopping, "Молоко")
+}
+
+#[test]
+fn an_all_day_item_ignores_a_stale_time() {
+    let mut item = task();
+    item.due_date = Some("2026-11-01".to_owned());
+    item.due_time = Some("18:00".to_owned());
+    item.all_day = true;
+
+    let checked = check(item);
+
+    assert!(checked.is_valid(), "{:?}", checked.errors);
+    let item = checked.item.expect("all-day item is valid");
+    assert_eq!(
+        item.due_date,
+        Some(chrono::NaiveDate::from_ymd_opt(2026, 11, 1).unwrap())
+    );
+    assert_eq!(item.due_at, None, "all-day means no time");
 }

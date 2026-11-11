@@ -1023,6 +1023,7 @@ mod tests {
             notes: None,
             due_date: None,
             due_time: None,
+            all_day: false,
             end_date: None,
             end_time: None,
             date_error: Vec::new(),

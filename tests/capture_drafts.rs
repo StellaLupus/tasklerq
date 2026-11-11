@@ -23,6 +23,7 @@ fn raw(title: &str, kind: ListKind) -> RawItem {
         notes: None,
         due_date: None,
         due_time: None,
+        all_day: false,
         end_date: None,
         end_time: None,
         date_error: Vec::new(),
@@ -1952,4 +1953,97 @@ async fn an_invalid_appended_item_does_not_break_the_existing_draft() {
     assert_eq!(view.validated.items.len(), 2);
     assert!(view.validated.items[0].is_valid());
     assert_eq!(view.validated.items[1].errors[0].code, "date_past");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_clarifications_are_one_question() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+
+    let mut call = capture(&household, vec![raw("Позвонить", ListKind::Tasks)]);
+    call.parsed.clarifications = vec![
+        Clarification {
+            item: 0,
+            topic: ClarificationTopic::Date,
+        },
+        Clarification {
+            item: 0,
+            topic: ClarificationTopic::Date,
+        },
+        Clarification {
+            item: 0,
+            topic: ClarificationTopic::Date,
+        },
+    ];
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let id = draft::create(&mut conn, call, now).await.expect("draft").id;
+
+    let view = draft::view(&mut conn, household.household_id, id, now)
+        .await
+        .expect("view");
+
+    assert_eq!(
+        view.clarifications,
+        [Clarification {
+            item: 0,
+            topic: ClarificationTopic::Date,
+        }],
+        "three identical questions must not take the whole limit"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_list_name_does_not_close_the_list_question() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+
+    let mut item = raw("Позвонить", ListKind::Tasks);
+    item.target_list = Some("Несуществующий".into());
+    let mut call = capture(&household, vec![item]);
+    call.parsed.clarifications = vec![Clarification {
+        item: 0,
+        topic: ClarificationTopic::List,
+    }];
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let id = draft::create(&mut conn, call, now).await.expect("draft").id;
+
+    let view = draft::view(&mut conn, household.household_id, id, now)
+        .await
+        .expect("view");
+    assert_eq!(
+        view.clarifications,
+        [Clarification {
+            item: 0,
+            topic: ClarificationTopic::List,
+        }],
+        "an unknown list name must leave the question open"
+    );
+
+    let view = draft::answer_list(
+        &mut conn,
+        household.household_id,
+        id,
+        0,
+        household.tasks_list_id,
+        now,
+    )
+    .await
+    .expect("list answer");
+
+    assert!(
+        view.clarifications.is_empty(),
+        "the chosen list closes the question: {:?}",
+        view.clarifications
+    );
+    assert_eq!(
+        view.raw[0].target_list.as_deref(),
+        Some("Задачи"),
+        "the answer replaces the unknown name"
+    );
+    assert!(
+        !view.validated.items[0].list_auto_selected,
+        "the chosen list is not an automatic fallback"
+    );
 }

@@ -4298,3 +4298,474 @@ async fn an_expired_draft_removes_the_menu_line() {
         stand.bot.screen()
     );
 }
+
+/// Карточка с уточнением исполнителя от модели: подсказки валидатора нет.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_model_assignee_question_offers_members_and_assigns_without_llm() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(support::llm::v4::response_with(
+            vec![support::llm::v4::task("Купить торт")],
+            json!([{"item": 0, "topic": "assignee"}]),
+        ))],
+    )
+    .await;
+    let household = household_id(&db.pool, stand.bot.chat).await;
+    rename_member(&db.pool, stand.bot.chat, "Алексей", "alex_a").await;
+    let chosen = add_member(&db.pool, household, "Алексей", "alex_b").await;
+
+    stand.capture("купить торт для Алексея").await;
+
+    stand.bot.assert_screen_contains("Какой исполнитель");
+    stand.bot.assert_has_button("alex_a");
+    stand.bot.assert_has_button("alex_b");
+    assert!(
+        !stand.bot.screen().contains("Исполнитель:"),
+        "the item must not be assigned before the choice:\n{}",
+        stand.bot.screen()
+    );
+    let calls = stand.ai.calls();
+    assert_eq!(calls, 1);
+
+    stand.bot.press("alex_b").await;
+    assert_eq!(stand.ai.calls(), calls, "the answer must not call the LLM");
+    assert!(!stand.bot.screen().contains("Какой исполнитель"));
+    stand.bot.assert_screen_contains("Исполнитель: Алексей");
+
+    stand.bot.press("Сохранить всё").await;
+    let assignee: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT i.assignee_user_id FROM items i JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1 AND i.title = 'Купить торт'",
+    )
+    .bind(stand.bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("assignee");
+    assert_eq!(assignee, Some(chosen), "the choice must assign the item");
+}
+
+// ---------------------------------------------------------------
+// Событие без начала
+// ---------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_event_without_a_start_asks_for_a_date_and_tomorrow_closes_it() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(support::llm::v4::response_with(
+            vec![support::llm::v4::event("Маникюр")],
+            json!([{"item": 0, "topic": "date"}]),
+        ))],
+    )
+    .await;
+    let today = Utc::now()
+        .with_timezone(&chrono_tz::Europe::Moscow)
+        .date_naive();
+
+    stand.capture("маникюр").await;
+
+    stand.bot.assert_screen_contains("Уточните срок");
+    stand.bot.assert_has_button("Сегодня");
+    stand.bot.assert_has_button("Завтра");
+    stand.bot.assert_has_button("Выбрать дату");
+    assert_eq!(stand.ai.calls(), 1);
+
+    stand.bot.press("Завтра").await;
+
+    assert!(!stand.bot.screen().contains("Уточните срок"));
+    assert_eq!(stand.ai.calls(), 1, "the answer must not call the LLM");
+    stand.bot.press("Сохранить всё").await;
+
+    let (kind, due_date): (String, Option<chrono::NaiveDate>) = sqlx::query_as(
+        "SELECT l.kind::text, i.due_date
+         FROM items i JOIN lists l ON l.id = i.list_id
+         WHERE i.household_id = $1 AND i.title = 'Маникюр'",
+    )
+    .bind(household_id(&db.pool, stand.bot.chat).await)
+    .fetch_one(&db.pool)
+    .await
+    .expect("saved event");
+    assert_eq!(kind, "events");
+    assert_eq!(due_date, Some(today + Duration::days(1)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_event_without_a_start_can_take_a_date_from_the_date_screen() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(support::llm::v4::response_with(
+            vec![support::llm::v4::event("Маникюр")],
+            json!([{"item": 0, "topic": "date"}]),
+        ))],
+    )
+    .await;
+    let today = Utc::now()
+        .with_timezone(&chrono_tz::Europe::Moscow)
+        .date_naive();
+
+    stand.capture("маникюр").await;
+    stand.bot.press("Выбрать дату").await;
+
+    stand.bot.assert_screen_contains("Когда начало?");
+    stand.bot.text("завтра").await;
+
+    stand.bot.assert_screen_contains("Маникюр");
+    assert!(!stand.bot.screen().contains("Уточните срок"));
+    assert_eq!(stand.ai.calls(), 1, "the date screen must not call the LLM");
+
+    stand.bot.press("Сохранить всё").await;
+    let due_date: Option<chrono::NaiveDate> = sqlx::query_scalar(
+        "SELECT due_date FROM items
+         WHERE household_id = $1 AND title = 'Маникюр'",
+    )
+    .bind(household_id(&db.pool, stand.bot.chat).await)
+    .fetch_one(&db.pool)
+    .await
+    .expect("saved event");
+    assert_eq!(due_date, Some(today + Duration::days(1)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_past_year_date_offers_the_date_buttons_without_fixing_it() {
+    let db = db().await;
+    let past = (Utc::now()
+        .with_timezone(&chrono_tz::Europe::Moscow)
+        .date_naive()
+        - Duration::days(400))
+    .format("%Y-%m-%d")
+    .to_string();
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(json!({"items": [
+            support::llm::v4::with(
+                support::llm::v4::task("Оплатить счёт"),
+                "date",
+                support::llm::v4::date_ymd(&past),
+            )
+        ]}))],
+    )
+    .await;
+
+    stand.capture("оплатить счёт в прошлом году").await;
+
+    stand.bot.assert_screen_contains("Уточните срок");
+    stand.bot.assert_has_button("Сегодня");
+    stand.bot.assert_has_button("Завтра");
+    stand.bot.assert_has_button("Выбрать дату");
+
+    let stored: String = sqlx::query_scalar(
+        "SELECT parsed->'items'->0->>'due_date' FROM capture_drafts WHERE chat_id = $1",
+    )
+    .bind(stand.bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("stored due date");
+    assert_eq!(stored, past, "the server must not silently move the date");
+    assert_eq!(stand.ai.calls(), 1);
+}
+
+// ---------------------------------------------------------------
+// Список и время
+// ---------------------------------------------------------------
+
+async fn second_tasks_list(stand: &Stand, name: &str) -> uuid::Uuid {
+    add_tasks_list(&stand.bot.pool, stand.bot.chat, name).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_list_question_offers_lists_of_the_item_kind_and_changes_the_list() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(support::llm::v4::response_with(
+            vec![support::llm::v4::task("Покрасить забор")],
+            json!([{"item": 0, "topic": "list"}]),
+        ))],
+    )
+    .await;
+    let work = second_tasks_list(&stand, "Работа").await;
+
+    stand.capture("покрасить забор").await;
+
+    stand.bot.assert_screen_contains("В какой список");
+    stand.bot.assert_has_button("Работа");
+    stand.bot.assert_has_button("Задачи");
+    assert_eq!(stand.ai.calls(), 1);
+
+    stand.bot.press("Работа").await;
+
+    assert!(!stand.bot.screen().contains("В какой список"));
+    stand.bot.assert_screen_contains("Список: Работа");
+    assert_eq!(stand.ai.calls(), 1);
+
+    stand.bot.press("Сохранить всё").await;
+    let saved: uuid::Uuid = sqlx::query_scalar(
+        "SELECT i.list_id FROM items i
+         JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1 AND i.title = 'Покрасить забор'",
+    )
+    .bind(stand.bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("saved task");
+    assert_eq!(saved, work);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_day_closes_the_time_question() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(support::llm::v4::response_with(
+            vec![support::llm::v4::with(
+                support::llm::v4::task("Позвонить маме"),
+                "date",
+                support::llm::v4::date_ymd(&date_in_days(1)),
+            )],
+            json!([{"item": 0, "topic": "time"}]),
+        ))],
+    )
+    .await;
+
+    stand.capture("завтра позвонить маме").await;
+
+    stand.bot.assert_screen_contains("Во сколько");
+    stand.bot.assert_has_button("Весь день");
+    stand.bot.assert_has_button("Ввести время");
+
+    stand.bot.press("Весь день").await;
+
+    assert!(!stand.bot.screen().contains("Во сколько"));
+    assert_eq!(stand.ai.calls(), 1);
+    stand.bot.press("Сохранить всё").await;
+
+    let (due_date, due_at): (Option<chrono::NaiveDate>, Option<chrono::DateTime<Utc>>) =
+        sqlx::query_as(
+            "SELECT i.due_date, i.due_at FROM items i
+             JOIN users u ON u.household_id = i.household_id
+             WHERE u.telegram_user_id = $1 AND i.title = 'Позвонить маме'",
+        )
+        .bind(stand.bot.chat)
+        .fetch_one(&db.pool)
+        .await
+        .expect("saved task");
+    assert_eq!(
+        due_date.map(|date| date.format("%Y-%m-%d").to_string()),
+        Some(date_in_days(1))
+    );
+    assert_eq!(due_at, None, "all-day means no time");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_time_question_takes_text_and_rejects_a_bad_format() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(support::llm::v4::response_with(
+            vec![support::llm::v4::with(
+                support::llm::v4::task("Позвонить маме"),
+                "date",
+                support::llm::v4::date_ymd(&date_in_days(1)),
+            )],
+            json!([{"item": 0, "topic": "time"}]),
+        ))],
+    )
+    .await;
+
+    stand.capture("завтра позвонить маме").await;
+    stand.bot.press("Ввести время").await;
+
+    stand.bot.assert_screen_contains("HH:MM");
+    stand.bot.text("после обеда").await;
+    stand
+        .bot
+        .assert_screen_contains("Введите время в формате HH:MM");
+    assert_eq!(stand.ai.calls(), 1, "a bad time must not call the LLM");
+
+    stand.bot.text("18:00").await;
+
+    stand.bot.assert_screen_contains("Позвонить маме");
+    assert!(!stand.bot.screen().contains("Во сколько"));
+    stand.bot.press("Сохранить всё").await;
+
+    let due_at: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT i.due_at FROM items i
+         JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1 AND i.title = 'Позвонить маме'",
+    )
+    .bind(stand.bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("saved task");
+    let local = due_at
+        .expect("time is set")
+        .with_timezone(&chrono_tz::Europe::Moscow);
+    assert_eq!(local.format("%H:%M").to_string(), "18:00");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_validator_question_comes_before_a_model_clarification() {
+    let db = db().await;
+    let past = date_in_days(-2);
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(support::llm::v4::response_with(
+            vec![support::llm::v4::with(
+                support::llm::v4::task("Оплатить счёт"),
+                "date",
+                support::llm::v4::date_ymd(&past),
+            )],
+            json!([{"item": 0, "topic": "list"}]),
+        ))],
+    )
+    .await;
+    let work = second_tasks_list(&stand, "Работа").await;
+
+    stand.capture("оплатить счёт позавчера").await;
+
+    stand.bot.assert_screen_contains("Уточните срок");
+    assert!(
+        !stand.bot.screen().contains("В какой список"),
+        "the validator question goes first:\n{}",
+        stand.bot.screen()
+    );
+
+    stand.bot.press("Сегодня").await;
+
+    stand.bot.assert_screen_contains("В какой список");
+    stand.bot.press("Работа").await;
+    stand.bot.assert_screen_contains("Список: Работа");
+    stand.bot.press("Сохранить всё").await;
+
+    let saved: uuid::Uuid = sqlx::query_scalar(
+        "SELECT i.list_id FROM items i
+         JOIN users u ON u.household_id = i.household_id
+         WHERE u.telegram_user_id = $1 AND i.title = 'Оплатить счёт'",
+    )
+    .bind(stand.bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("saved task");
+    assert_eq!(saved, work);
+    assert_eq!(stand.ai.calls(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn choosing_a_date_keeps_the_time_the_model_named() {
+    let db = db().await;
+    // Неверное выражение даты оставляет названное время без даты: выбор даты
+    // должен сохранить время, а не превратить событие в вседневное.
+    let answer = json!({"items": [
+        support::llm::v4::with(
+            support::llm::v4::with(
+                support::llm::v4::event("Маникюр"),
+                "date",
+                support::llm::v4::date(31, 2, 0),
+            ),
+            "time",
+            json!("14:00"),
+        )
+    ]});
+    let mut stand = stand(&db.pool, vec![Ok(answer)]).await;
+    let today = Utc::now()
+        .with_timezone(&chrono_tz::Europe::Moscow)
+        .date_naive();
+
+    stand.capture("маникюр 31 февраля в 14:00").await;
+    stand.bot.assert_screen_contains("Уточните срок");
+    stand.bot.press("Выбрать дату").await;
+    stand.bot.text("завтра").await;
+
+    assert!(!stand.bot.screen().contains("Уточните срок"));
+    stand.bot.press("Сохранить всё").await;
+
+    let due_at: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT due_at FROM items
+         WHERE household_id = $1 AND title = 'Маникюр'",
+    )
+    .bind(household_id(&db.pool, stand.bot.chat).await)
+    .fetch_one(&db.pool)
+    .await
+    .expect("saved event");
+    let local = due_at
+        .expect("the date screen must keep the named time")
+        .with_timezone(&chrono_tz::Europe::Moscow);
+    assert_eq!(local.format("%H:%M").to_string(), "14:00");
+    assert_eq!(
+        local.date_naive(),
+        today + Duration::days(1),
+        "the chosen date is used"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_time_question_without_a_date_is_not_offered() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(support::llm::v4::response_with(
+            vec![support::llm::v4::task("Позвонить маме")],
+            json!([{"item": 0, "topic": "time"}]),
+        ))],
+    )
+    .await;
+
+    stand.capture("позвонить маме").await;
+
+    assert!(
+        !stand.bot.screen().contains("Во сколько"),
+        "time without a date cannot be answered:\n{}",
+        stand.bot.screen()
+    );
+    stand.bot.assert_has_button("Сохранить всё");
+    stand.bot.press("Сохранить всё").await;
+    assert_eq!(stand.household_items().await, 1);
+    assert_eq!(stand.ai.calls(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expired_draft_closes_the_time_form() {
+    let db = db().await;
+    let mut stand = stand(
+        &db.pool,
+        vec![Ok(support::llm::v4::response_with(
+            vec![support::llm::v4::with(
+                support::llm::v4::task("Позвонить маме"),
+                "date",
+                support::llm::v4::date_ymd(&date_in_days(1)),
+            )],
+            json!([{"item": 0, "topic": "time"}]),
+        ))],
+    )
+    .await;
+
+    stand.capture("завтра позвонить маме").await;
+    stand.bot.press("Ввести время").await;
+    stand.bot.assert_screen_contains("HH:MM");
+
+    sqlx::query(
+        "UPDATE capture_drafts SET expires_at = now() - interval '1 minute' WHERE chat_id = $1",
+    )
+    .bind(stand.bot.chat)
+    .execute(&db.pool)
+    .await
+    .expect("expire draft");
+
+    stand.bot.text("18:00").await;
+
+    stand.bot.assert_screen_contains("Черновик устарел");
+    assert!(
+        !stand.bot.screen().contains("HH:MM"),
+        "the form must be closed after a rejected answer:\n{}",
+        stand.bot.screen()
+    );
+
+    // Следующий текст снова уходит в разбор, а не в форму времени.
+    let calls = stand.ai.calls();
+    stand.bot.text("купить молоко").await;
+    assert_eq!(stand.jobs().await, 2);
+    assert_eq!(stand.ai.calls(), calls, "the new text waits for the worker");
+}
