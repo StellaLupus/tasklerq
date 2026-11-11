@@ -166,6 +166,8 @@ async fn warn_if_llm_slots_unverified(health: &LlmSlotHealth, pool: &PgPool) {
                 error = %error,
                 "could not read llm slot check status at startup"
             );
+            // Без значения метрики алерт `llm_slot_verified == 0` не сработал бы.
+            health.mark_unverified();
         }
     }
 }

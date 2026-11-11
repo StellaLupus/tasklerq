@@ -56,7 +56,7 @@
 
 ## 10. Итоговая проверка
 
-- [ ] 10.1 Добавить запись о решениях этого change в журнал решений `docs/roadmap.md` (прямой вызов LLM вместо Home Assistant, три формы и даты-выражения по итогам спайка, отказ от слота вида HA). Прогнать `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` и `openspec validate 0011-llm-slots-capture-v4 --strict` — всё проходит.
+- [x] 10.1 Добавить запись о решениях этого change в журнал решений `docs/roadmap.md` (прямой вызов LLM вместо Home Assistant, три формы и даты-выражения по итогам спайка, отказ от слота вида HA). Прогнать `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` и `openspec validate 0011-llm-slots-capture-v4 --strict` — всё проходит.
 - [ ] 10.2 Проверить на стенде с настоящими слотами (запросы платные): `tasklerq capture-eval --slot primary` и `--slot fallback` выполняются и записывают статус; `/health/ready` отражает его; фраза «маникюр завтра с 14 до 15:30» в боте создаёт событие, «по понедельникам и четвергам поливать цветы» — повторяющуюся задачу с ближайшим четвергом; при остановленном основном слоте разбор выполняет резервный, при остановленных обоих открывается редактор с исходным текстом. Результаты `capture-eval` записать в `docs/llm-capture.md` вместо прежних замеров.
 
 ## Workflow follow-up

@@ -8,14 +8,14 @@ use std::time::Duration as StdDuration;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use http_body_util::BodyExt;
 use serde_json::{Map, Value, json};
 use sqlx::PgPool;
 use tasklerq::app::build_application;
 use tasklerq::capture::prompt;
 use tasklerq::capture::slot_check;
-use tasklerq::capture::slot_status::LlmSlotHealth;
+use tasklerq::capture::slot_status::{CACHE_TTL, LlmSlotHealth, SlotStatus};
 use tasklerq::config::{CaptureConfig, Config, LlmConfig, SecretString, SlotConfig, TenancyMode};
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
@@ -344,6 +344,25 @@ async fn all_llm_slots_unavailable_is_a_warning_not_a_failure() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_open_primary_breaker_alone_does_not_warn_about_llm() {
+    let db = support::isolated_db().await;
+    let primary = slot_config("vendor/primary");
+    let fallback = slot_config("vendor/fallback");
+    let (chain, health) = llm_health(&primary, Some(&fallback));
+    store_check(&db.pool, "primary", &primary, 22, 22).await;
+    store_check(&db.pool, "fallback", &fallback, 22, 22).await;
+    support::llm::open_primary(&chain, Utc::now());
+
+    let (status, body) = ready_with_llm(&db.pool, health).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.get("warnings").is_none(),
+        "the fallback slot still serves capture:\n{body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unchecked_primary_slot_is_reported_in_readiness() {
     let db = support::isolated_db().await;
     let primary = slot_config("vendor/primary");
@@ -436,6 +455,77 @@ async fn the_readiness_status_is_cached_for_a_minute() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_readiness_cache_expires_after_its_ttl() {
+    let db = support::isolated_db().await;
+    let primary = slot_config("vendor/primary");
+    let (_chain, health) = llm_health(&primary, None);
+    store_check(&db.pool, "primary", &primary, 22, 22).await;
+
+    let now = Utc::now();
+    let statuses = health.statuses(&db.pool, now).await;
+    assert_eq!(statuses[0].status, SlotStatus::Passed);
+
+    // Новая проверка в базе не видна, пока не истёк срок кеша.
+    store_check(&db.pool, "primary", &primary, 17, 22).await;
+    let cached = health
+        .statuses(&db.pool, now + CACHE_TTL - ChronoDuration::seconds(1))
+        .await;
+    assert_eq!(cached[0].status, SlotStatus::Passed);
+
+    // Ровно через срок статус перечитывается из базы.
+    let fresh = health.statuses(&db.pool, now + CACHE_TTL).await;
+    assert_eq!(
+        fresh[0].status,
+        SlotStatus::Failed {
+            passed: 17,
+            total: 22
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_readiness_refresh_keeps_the_previous_status_and_extends_the_cache() {
+    let db = support::isolated_db().await;
+    let primary = slot_config("vendor/primary");
+    let (_chain, health) = llm_health(&primary, None);
+    store_check(&db.pool, "primary", &primary, 22, 22).await;
+    let now = Utc::now();
+    assert_eq!(
+        health.statuses(&db.pool, now).await[0].status,
+        SlotStatus::Passed
+    );
+
+    // Проверка в базе изменилась, но прочитать её нечем.
+    store_check(&db.pool, "primary", &primary, 17, 22).await;
+    let broken = sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(StdDuration::from_millis(500))
+        .connect_lazy("postgres://tasklerq:secret@127.0.0.1:1/tasklerq")
+        .expect("lazy pool");
+    let kept = health.statuses(&broken, now + CACHE_TTL).await;
+    assert_eq!(
+        kept[0].status,
+        SlotStatus::Passed,
+        "a failed read must keep the previous status"
+    );
+
+    // Отметка кеша сдвинута: сразу после ошибки база снова не опрашивается.
+    let still_cached = health
+        .statuses(&db.pool, now + CACHE_TTL + ChronoDuration::seconds(1))
+        .await;
+    assert_eq!(still_cached[0].status, SlotStatus::Passed);
+
+    // После нового срока статус перечитывается и видит новую проверку.
+    let fresh = health.statuses(&db.pool, now + CACHE_TTL + CACHE_TTL).await;
+    assert_eq!(
+        fresh[0].status,
+        SlotStatus::Failed {
+            passed: 17,
+            total: 22
+        }
+    );
+}
+
 #[tokio::test]
 async fn startup_warns_about_an_unchecked_primary_slot_without_secrets() {
     let db = support::isolated_db().await;
@@ -477,9 +567,17 @@ async fn startup_warns_about_an_unchecked_primary_slot_without_secrets() {
     );
 
     let text = logs.contents();
+    let warns_about_primary = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .any(|record| {
+            record["level"] == "WARN"
+                && record["fields"]["slot"] == "primary"
+                && record["fields"]["status"] == "unverified"
+        });
     assert!(
-        text.contains("primary"),
-        "the slot name is missing:\n{text}"
+        warns_about_primary,
+        "the startup log must warn with slot = primary:\n{text}"
     );
     assert!(
         text.contains("unverified"),

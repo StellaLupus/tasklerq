@@ -173,6 +173,16 @@ impl LlmSlotHealth {
         *self.lock_cache() = None;
     }
 
+    /// Выставить метрику «не проверен» для всех настроенных слотов.
+    ///
+    /// Нужен, когда базу прочитать нельзя: без значения серия
+    /// `llm_slot_verified{slot}` не появляется вовсе, и алерт `== 0` молчит.
+    pub fn mark_unverified(&self) {
+        for entry in &self.slots {
+            metrics::llm_slot_verified(entry.name, false);
+        }
+    }
+
     /// Статусы для readiness: из кеша, если он моложе [`CACHE_TTL`].
     ///
     /// Ошибка чтения базы не делает readiness неуспешным: возвращается прежний
@@ -190,14 +200,16 @@ impl LlmSlotHealth {
                     error = %error,
                     "could not read llm slot check status; keeping the previous one"
                 );
-                if let Some(cached) = self.lock_cache().as_ref() {
+                let mut cache = self.lock_cache();
+                if let Some(cached) = cache.as_mut() {
+                    // Прежний статус ещё годен, но без сдвига отметки readiness
+                    // опрашивал бы базу на каждом запросе, пока она не поднимется.
+                    cached.at = now;
                     return cached.statuses.clone();
                 }
-                let statuses = self.unverified();
-                for report in &statuses {
-                    metrics::llm_slot_verified(report.slot, false);
-                }
-                statuses
+                drop(cache);
+                self.mark_unverified();
+                self.unverified()
             }
         }
     }
