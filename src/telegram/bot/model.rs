@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::capture::draft::DueChoice;
 use crate::domain::error::DomainError;
+use crate::domain::events::end_day;
 use crate::domain::first_contact::FirstContact;
 use crate::domain::models::{
     Field, Item, ItemPatch, ItemPriority, ItemStatus, ListKind, MonthRule, NewItem, Recurrence,
@@ -1436,10 +1437,12 @@ impl ItemDraft {
                 let Some(end_time) = self.end_time else {
                     return Ok((None, self.end_date));
                 };
-                let mut date = self.end_date.unwrap_or(start_date);
-                if self.end_date.is_none() && end_time <= start_time {
-                    date += chrono::Duration::days(1);
-                }
+                // Правило времени конца без даты общее с разбором и доменом:
+                // время относится ко дню начала, а не позже начала — к
+                // следующему дню.
+                let date = self
+                    .end_date
+                    .unwrap_or_else(|| end_day(start_date, Some(start_time), end_time));
                 Ok((Some(resolve_local(timezone, date, end_time)?), None))
             }
             // У вседневного начала конец тоже вседневный: время без даты

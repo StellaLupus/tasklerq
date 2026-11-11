@@ -5,7 +5,7 @@ mod support;
 
 use std::sync::Arc;
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tasklerq::llm::{Chain, LlmError};
@@ -298,7 +298,88 @@ async fn an_event_from_the_parse_is_saved_by_save_all() {
                 support::llm::v4::with(
                     support::llm::v4::event("Маникюр"),
                     "date",
-                    support::llm::v4::date_ymd(&date_in_days(2)),
+                    support::llm::v4::date_offset(1, "days"),
+                ),
+                "time",
+                json!("14:00"),
+            ),
+            "end_time",
+            json!("15:30"),
+        ),
+        support::llm::v4::shopping("Молоко")
+    ]});
+    let mut stand = stand(&db.pool, vec![Ok(answer)]).await;
+    stand
+        .bot
+        .set_now("2026-11-10T09:00:00Z".parse().expect("time"));
+
+    stand
+        .capture("маникюр завтра с 14 до 15:30, купить молоко")
+        .await;
+
+    // Событие показывается интервалом, а не обычным сроком.
+    stand.bot.assert_screen_contains("Маникюр");
+    stand.bot.assert_screen_contains("Список: Календарь");
+    stand.bot.assert_screen_contains("14:00–15:30");
+    assert!(
+        !stand.bot.screen().contains("Срок: завтра, 14:00"),
+        "an event must not be shown as a plain due:\n{}",
+        stand.bot.screen()
+    );
+    stand.bot.assert_screen_contains("Молоко");
+    stand.bot.assert_has_button("Сохранить всё");
+    assert_eq!(stand.household_items().await, 0);
+    assert_eq!(stand.ai.calls(), 1, "the parse must call the LLM once");
+
+    stand.bot.press("Сохранить всё").await;
+
+    let household = household_id(&db.pool, stand.bot.chat).await;
+    let (list_kind, due_at, end_at): (String, Option<DateTime<Utc>>, Option<DateTime<Utc>>) =
+        sqlx::query_as(
+            "SELECT l.kind::text, i.due_at, i.end_at
+             FROM items i JOIN lists l ON l.id = i.list_id
+             WHERE i.household_id = $1 AND i.title = 'Маникюр'",
+        )
+        .bind(household)
+        .fetch_one(&db.pool)
+        .await
+        .expect("saved event");
+    assert_eq!(list_kind, "events");
+    let start = due_at
+        .expect("the event has a start")
+        .with_timezone(&chrono_tz::Europe::Moscow);
+    assert_eq!(start.date_naive().to_string(), "2026-11-11");
+    assert_eq!(start.format("%H:%M").to_string(), "14:00");
+    let end = end_at
+        .expect("saving must keep the event end")
+        .with_timezone(&chrono_tz::Europe::Moscow);
+    assert_eq!(end.date_naive().to_string(), "2026-11-11");
+    assert_eq!(end.format("%H:%M").to_string(), "15:30");
+
+    let milk: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM items i JOIN lists l ON l.id = i.list_id
+         WHERE i.household_id = $1 AND i.title = 'Молоко' AND l.kind = 'shopping'",
+    )
+    .bind(household)
+    .fetch_one(&db.pool)
+    .await
+    .expect("saved purchase");
+    assert_eq!(
+        milk, 1,
+        "the draft saves the event and the purchase together"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_event_editor_changes_the_draft_end_without_calling_the_llm() {
+    let db = db().await;
+    let answer = json!({"items": [
+        support::llm::v4::with(
+            support::llm::v4::with(
+                support::llm::v4::with(
+                    support::llm::v4::event("Маникюр"),
+                    "date",
+                    support::llm::v4::date_offset(1, "days"),
                 ),
                 "time",
                 json!("14:00"),
@@ -308,28 +389,53 @@ async fn an_event_from_the_parse_is_saved_by_save_all() {
         )
     ]});
     let mut stand = stand(&db.pool, vec![Ok(answer)]).await;
+    stand
+        .bot
+        .set_now("2026-11-10T09:00:00Z".parse().expect("time"));
 
-    stand.bot.text("маникюр через два дня с 14 до 15:30").await;
-    assert_eq!(stand.work().await, Pass::Drafted);
+    stand.capture("маникюр завтра с 14 до 15:30").await;
+    assert_eq!(stand.ai.calls(), 1);
 
+    // «Изменить» у события открывает редактор события, а не отказывает.
+    stand.bot.press("Изменить 1").await;
+    stand.bot.assert_screen_contains("Начало: Завтра, 14:00");
+    stand.bot.assert_screen_contains("Конец: Завтра, 15:30");
+    stand.bot.assert_has_button("🏁 Конец");
+    stand.bot.assert_has_button("🔁 Повторение");
+
+    stand.bot.press("🏁 Конец").await;
+    stand.bot.press("Дата и время").await;
+    stand.bot.text("16:00").await;
+
+    stand.bot.assert_screen_contains("Конец: Завтра, 16:00");
+    stand.bot.press("Сохранить").await;
+
+    // Сохранение правки возвращает к черновику без вызова LLM.
     stand.bot.assert_screen_contains("Маникюр");
-    stand.bot.assert_has_button("Сохранить всё");
-    assert_eq!(stand.household_items().await, 0);
+    stand.bot.assert_screen_contains("14:00–16:00");
+    assert_eq!(
+        stand.ai.calls(),
+        1,
+        "editing a draft item must not call the LLM"
+    );
 
     stand.bot.press("Сохранить всё").await;
 
     let household = household_id(&db.pool, stand.bot.chat).await;
-    let (list_kind, end_at): (String, Option<chrono::DateTime<Utc>>) = sqlx::query_as(
-        "SELECT l.kind::text, i.end_at
-         FROM items i JOIN lists l ON l.id = i.list_id
-         WHERE i.household_id = $1 AND i.title = 'Маникюр'",
+    let end_at: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT end_at FROM items
+         WHERE household_id = $1 AND title = 'Маникюр'",
     )
     .bind(household)
     .fetch_one(&db.pool)
     .await
     .expect("saved event");
-    assert_eq!(list_kind, "events");
-    assert!(end_at.is_some(), "saving must keep the event end");
+    let end = end_at
+        .expect("the event keeps the edited end")
+        .with_timezone(&chrono_tz::Europe::Moscow);
+    assert_eq!(end.date_naive().to_string(), "2026-11-11");
+    assert_eq!(end.format("%H:%M").to_string(), "16:00");
+    assert_eq!(stand.ai.calls(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3729,6 +3835,21 @@ async fn the_card_with_several_parts_matches_the_golden_snapshot() {
         vec![
             Ok(json!({"items": [support::llm::v4::shopping("Хлеб")]})),
             Ok(json!({"items": [support::llm::v4::shopping("Молоко")]})),
+            Ok(json!({"items": [
+                support::llm::v4::with(
+                    support::llm::v4::with(
+                        support::llm::v4::with(
+                            support::llm::v4::event("Маникюр"),
+                            "date",
+                            support::llm::v4::date_offset(1, "days"),
+                        ),
+                        "time",
+                        json!("14:00"),
+                    ),
+                    "end_time",
+                    json!("15:30"),
+                )
+            ]})),
         ],
     )
     .await;
@@ -3738,6 +3859,7 @@ async fn the_card_with_several_parts_matches_the_golden_snapshot() {
 
     stand.capture("купить хлеб").await;
     stand.capture("купить молоко").await;
+    stand.capture("маникюр завтра с 14 до 15:30").await;
 
     assert_eq!(
         normalize_callback_data(&stand.bot.screen()),

@@ -478,10 +478,19 @@ async fn try_append(
 
     let offset = stored.items.len();
     stored.items.append(&mut added.items);
-    // Вопросы при дописывании копятся: сверх потолка новые отбрасываются, а
-    // номера элементов сдвигаются на число уже имевшихся.
-    let capacity = MAX_CLARIFICATIONS.saturating_sub(stored.clarifications.len());
-    stored.clarifications.extend(
+    // Сначала закрываем устаревшие вопросы по актуальному контексту: иначе
+    // вопрос о списке, чьё имя уже существует, занимал бы лимит, и новые
+    // уточнения отбрасывались бы. Вопросы при дописывании копятся: сверх
+    // потолка новые отбрасываются, а номера элементов сдвигаются на число уже
+    // имевшихся.
+    let context = load_context_for(conn, draft.household_id, draft.user_id, now).await?;
+    let mut clarifications = normalize_clarifications(
+        &stored.items,
+        std::mem::take(&mut stored.clarifications),
+        Some(&context),
+    );
+    let capacity = MAX_CLARIFICATIONS.saturating_sub(clarifications.len());
+    clarifications.extend(
         added
             .clarifications
             .into_iter()
@@ -491,7 +500,7 @@ async fn try_append(
             })
             .take(capacity),
     );
-    stored.clarifications = normalize_clarifications(&stored.items, stored.clarifications, None);
+    stored.clarifications = normalize_clarifications(&stored.items, clarifications, Some(&context));
     let parsed = stored.to_value();
     let expires_at = now + chrono::Duration::minutes(drafts::DRAFT_TTL_MINUTES);
     drafts::append(
@@ -1212,6 +1221,11 @@ fn apply(raw: &mut RawItem, edit: ItemEdit) {
         clear_date_error(raw, "due_date");
     }
     set(&mut raw.due_date, edit.due_date);
+    // Время задано — элемент больше не «весь день»: иначе `resolve_due`
+    // проигнорирует время, и правка после ответа «Весь день» тихо потеряется.
+    if matches!(&edit.due_time, Field::Value(_)) {
+        raw.all_day = false;
+    }
     set(&mut raw.due_time, edit.due_time);
     set(&mut raw.quantity, edit.quantity);
     if let Some(tags) = edit.tags {
@@ -1233,8 +1247,8 @@ fn set<T>(target: &mut Option<T>, field: Field<T>) {
 
 /// Снять ошибку выражения, когда пользователь исправил это поле.
 ///
-/// Ошибку конца события пока снять нельзя: полей конца у [`ItemEdit`] нет,
-/// редактирование события в черновике — пункт 8.3.
+/// У [`ItemEdit`] нет полей конца события, поэтому ошибку конца через него не
+/// снять; редактор события заменяет элемент целиком.
 fn clear_date_error(raw: &mut RawItem, field: &str) {
     raw.date_error.retain(|error| error.field != field);
 }
@@ -1292,6 +1306,45 @@ mod tests {
             subtasks: Vec::new(),
             recurrence: None,
         }
+    }
+
+    #[test]
+    fn setting_the_time_clears_all_day() {
+        let mut item = raw_with_date_error("due_date");
+        item.all_day = true;
+        item.due_date = Some("2026-11-11".to_owned());
+        item.due_time = None;
+
+        apply(
+            &mut item,
+            ItemEdit {
+                due_time: Field::Value("14:00".to_owned()),
+                ..ItemEdit::default()
+            },
+        );
+
+        assert!(
+            !item.all_day,
+            "a named time must win over the earlier all-day answer"
+        );
+    }
+
+    #[test]
+    fn clearing_the_date_also_clears_all_day() {
+        let mut item = raw_with_date_error("due_date");
+        item.all_day = true;
+        item.due_date = Some("2026-11-11".to_owned());
+
+        apply(
+            &mut item,
+            ItemEdit {
+                due_date: Field::Null,
+                ..ItemEdit::default()
+            },
+        );
+
+        assert!(!item.all_day);
+        assert!(item.due_date.is_none());
     }
 
     #[test]

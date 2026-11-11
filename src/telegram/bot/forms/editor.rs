@@ -949,10 +949,19 @@ async fn save_new(
 /// Записать пункт в черновик, перепроверить его и вернуться к карточке.
 async fn save_draft(
     ctx: &mut Ctx<'_>,
-    editor: Editor,
+    mut editor: Editor,
     draft_id: Uuid,
     index: usize,
 ) -> Result<(), Fail> {
+    let household_id = ctx.household()?.id;
+    let list = lists::get_visible(&mut *ctx.conn, household_id, editor.list_id).await?;
+    // Поля события проверяются теми же правилами, что при создании: домен
+    // отверг бы их общим сообщением, а редактор должен назвать причину.
+    if let Some((message, field)) = event_draft_problem(&editor, list.kind, ctx.tz)? {
+        editor.error = Some(message);
+        editor.field = field;
+        return show(ctx, editor).await;
+    }
     crate::telegram::bot::capture::save_draft_item(
         ctx,
         draft_id,

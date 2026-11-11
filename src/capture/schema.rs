@@ -178,7 +178,7 @@ pub enum ClarificationTopic {
 
 impl ClarificationTopic {
     /// Короткий текст вопроса на русском: его показывают Telegram и внешний
-    /// capture. Полноценные экраны по темам — пункт 8.2.
+    /// capture.
     pub fn question(self) -> &'static str {
         match self {
             Self::Date => "Когда?",

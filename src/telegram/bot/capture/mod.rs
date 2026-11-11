@@ -253,8 +253,7 @@ fn kind_icon(kind: ListKind) -> &'static str {
         ListKind::Tasks => "📋",
         ListKind::Shopping => "🛒",
         ListKind::Checklist => "☑️",
-        // 0009-events 8.1: у списка событий появится свой значок в меню.
-        ListKind::Events => "☑️",
+        ListKind::Events => "🗓",
     }
 }
 
@@ -488,7 +487,20 @@ fn details(ctx: &Ctx<'_>, view: &DraftView, draft_item: &DraftItem, item: &NewIt
         };
         lines.push(format!("Список: {}{auto}", list.name));
     }
-    if let Some(due) = ru::due_label(
+    if draft_item.kind == ListKind::Events {
+        // У события вместо срока — интервал: начало и конец одной строкой,
+        // как в повестке и карточке события 0009.
+        if let Some(interval) = ru::event_interval(
+            draft_item.effective_due_at,
+            draft_item.effective_due_date,
+            item.end_at,
+            item.end_date,
+            ctx.tz,
+            ctx.now,
+        ) {
+            lines.push(format!("📅 {}", ru::capitalize(&interval)));
+        }
+    } else if let Some(due) = ru::due_label(
         draft_item.effective_due_at,
         draft_item.effective_due_date,
         ctx.tz,
@@ -799,8 +811,8 @@ pub async fn edit(ctx: &mut Ctx<'_>, draft_id: Uuid, index: usize) -> Result<(),
 
 /// «Выбрать дату» в уточняющем вопросе: тот же редактор сразу на поле срока.
 ///
-/// Событие ведёт экран выбора даты без формы правки элемента: полноценный
-/// редактор события появится в 8.3, а выбрать начало можно уже сейчас.
+/// Событие ведёт экран выбора даты без формы правки элемента: у события начало
+/// обязательное, а вернуться к полям можно из карточки черновика.
 pub async fn edit_due(ctx: &mut Ctx<'_>, draft_id: Uuid, index: usize) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
     let view = draft::view(&mut *ctx.conn, household_id, draft_id, ctx.now).await?;
@@ -902,14 +914,6 @@ pub(super) async fn save_draft_item(
 ) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
     let list = lists::get_visible(&mut *ctx.conn, household_id, list_id).await?;
-    // Редактор события появится в 8.3; до него форма элемента не предлагает
-    // списки событий. Если список всё же оказался списком событий, отказ
-    // объясняется, а не приходит как `list_missing`.
-    if list.kind == ListKind::Events {
-        return Err(Fail::User(
-            "Событие нельзя сохранить из разбора: выберите список задач или покупок.".into(),
-        ));
-    }
     let previous = draft::view(&mut *ctx.conn, household_id, draft_id, ctx.now)
         .await?
         .raw
@@ -1022,9 +1026,17 @@ fn seed(raw: &RawItem, view: &DraftView) -> ItemDraft {
         recurrence,
         quantity: raw.quantity,
         unit: raw.unit.clone(),
-        end_date: None,
-        end_time: None,
+        end_date: raw.end_date.as_deref().and_then(parse_date),
+        end_time: raw.end_time.as_deref().and_then(parse_time),
     }
+}
+
+fn format_date(date: NaiveDate) -> String {
+    date.format("%Y-%m-%d").to_string()
+}
+
+fn format_time(time: NaiveTime) -> String {
+    time.format("%H:%M").to_string()
 }
 
 /// Элемент черновика по заполненной форме.
@@ -1076,11 +1088,11 @@ fn to_raw(
             .and(draft.time)
             .map(|time| time.format("%H:%M").to_string()),
         // Правка формы не должна закрывать вопрос о времени: «весь день»
-        // остаётся только там, где пользователь уже так ответил, а время не
-        // назвал.
-        all_day: previously_all_day && draft.time.is_none(),
-        end_date: None,
-        end_time: None,
+        // остаётся только там, где пользователь уже так ответил, время не
+        // назвал и дата не снята.
+        all_day: previously_all_day && draft.date.is_some() && draft.time.is_none(),
+        end_date: draft.date.and(draft.end_date).map(format_date),
+        end_time: draft.end_time.map(format_time),
         date_error: Vec::new(),
         priority: Some(priority.to_owned()),
         assignee: None,
@@ -1094,5 +1106,63 @@ fn to_raw(
             .map(|subtask| subtask.title.clone())
             .collect(),
         recurrence,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{NaiveDate, NaiveTime};
+
+    use super::*;
+
+    fn date(day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 11, day).expect("date")
+    }
+
+    #[test]
+    fn removing_the_date_clears_all_day() {
+        let draft = ItemDraft {
+            date: None,
+            time: None,
+            ..ItemDraft::default()
+        };
+
+        let raw = to_raw(&draft, ListKind::Tasks, "Задачи", None, true);
+
+        assert!(!raw.all_day, "an item without a date cannot be all-day");
+    }
+
+    #[test]
+    fn all_day_stays_until_a_time_is_named() {
+        let mut draft = ItemDraft {
+            date: Some(date(11)),
+            ..ItemDraft::default()
+        };
+
+        let raw = to_raw(&draft, ListKind::Tasks, "Задачи", None, true);
+        assert!(raw.all_day, "the earlier all-day answer is kept");
+
+        draft.time = Some(NaiveTime::from_hms_opt(14, 0, 0).expect("time"));
+        let raw = to_raw(&draft, ListKind::Tasks, "Задачи", None, true);
+        assert!(!raw.all_day, "a named time closes the all-day answer");
+    }
+
+    #[test]
+    fn an_event_keeps_its_end_when_the_form_is_saved() {
+        let draft = ItemDraft {
+            date: Some(date(11)),
+            time: Some(NaiveTime::from_hms_opt(14, 0, 0).expect("time")),
+            end_time: Some(NaiveTime::from_hms_opt(16, 0, 0).expect("time")),
+            ..ItemDraft::default()
+        };
+
+        let raw = to_raw(&draft, ListKind::Events, "Календарь", None, false);
+
+        assert_eq!(raw.target_kind, ListKind::Events);
+        assert_eq!(
+            raw.end_date, None,
+            "a time-only end belongs to the start day at validation"
+        );
+        assert_eq!(raw.end_time.as_deref(), Some("16:00"));
     }
 }

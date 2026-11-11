@@ -1994,6 +1994,84 @@ async fn duplicate_clarifications_are_one_question() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn appended_clarifications_fit_after_stale_ones_are_dropped() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let chat = 4_100_011_i64;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    // Три вопроса о списке при уже названном существующем списке: при создании
+    // без контекста они считаются открытыми и занимают весь лимит.
+    let mut items = Vec::new();
+    for title in ["Первое", "Второе", "Третье"] {
+        let mut item = raw(title, ListKind::Tasks);
+        item.target_list = Some("Задачи".into());
+        items.push(item);
+    }
+    let mut first = telegram_capture(&household, chat, household.owner_id, "три дела", items);
+    first.parsed.clarifications = vec![
+        Clarification {
+            item: 0,
+            topic: ClarificationTopic::List,
+        },
+        Clarification {
+            item: 1,
+            topic: ClarificationTopic::List,
+        },
+        Clarification {
+            item: 2,
+            topic: ClarificationTopic::List,
+        },
+    ];
+    let draft = {
+        let mut tx = conn.begin().await.expect("transaction");
+        let draft = draft::append_or_create(&mut tx, first, now)
+            .await
+            .expect("first draft");
+        tx.commit().await.expect("commit");
+        draft
+    };
+
+    let mut appended = telegram_capture(
+        &household,
+        chat,
+        household.owner_id,
+        "четвёртое",
+        vec![raw("Четвёртое", ListKind::Tasks)],
+    );
+    appended.parsed.clarifications = vec![Clarification {
+        item: 0,
+        topic: ClarificationTopic::Date,
+    }];
+    {
+        let mut tx = conn.begin().await.expect("transaction");
+        let second = draft::append_or_create(&mut tx, appended, now + Duration::minutes(1))
+            .await
+            .expect("appended draft");
+        tx.commit().await.expect("commit");
+        assert_eq!(second.id, draft.id);
+    }
+
+    let view = draft::view(
+        &mut conn,
+        household.household_id,
+        draft.id,
+        now + Duration::minutes(1),
+    )
+    .await
+    .expect("view");
+    assert_eq!(
+        view.clarifications,
+        [Clarification {
+            item: 3,
+            topic: ClarificationTopic::Date,
+        }],
+        "stale list questions must free the limit for the appended one"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_list_name_does_not_close_the_list_question() {
     let db = support::db().await;
     let household = support::create_household(&db.pool).await;
