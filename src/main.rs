@@ -65,7 +65,12 @@ enum Command {
     /// household; lists — массив {"name", "kind":
     /// "tasks|shopping|checklist|events", "default": bool}; members — массив
     /// имён; author — имя или null. Идентификаторы не нужны: в запрос попадают
-    /// только имена.
+    /// только имена. lists и members можно не задавать — это пустые перечни;
+    /// author обязан быть среди members.
+    ///
+    /// Неизвестные поля и опечатки в именах полей — ошибка строки, а не другой
+    /// запрос. Пустые строки (из пробелов) пропускаются, нумерация строк при
+    /// этом сохраняется.
     ///
     /// Выход (stdout), одна запись на строку: {"id", "messages", "schema",
     /// "prompt_version", "contract_hash"} — сообщения и схема в том же виде, в
@@ -836,6 +841,11 @@ fn capture_render() -> Result<()> {
                 return Err(error).context("failed to read stdin");
             }
         };
+        // Пустая строка не запись: датасет может быть с пустыми строками между
+        // блоками, а номер следующей ошибки должен остаться прежним.
+        if line.trim().is_empty() {
+            continue;
+        }
         match tasklerq::capture::render::render_line(&line) {
             Ok(rendered) => {
                 writeln!(stdout, "{rendered}").context("failed to write stdout")?;

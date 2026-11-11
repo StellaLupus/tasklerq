@@ -438,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn full_example_from_docs_is_parsed() {
+    fn full_v3_example_is_parsed() {
         let data = json!({
             "items": [{
                 "target_kind": "shopping",

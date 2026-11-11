@@ -9,11 +9,17 @@
 //! Идентификаторы списков и участников в описании контекста не нужны: в промпт
 //! и схему попадают только имена. Модуль не знает о базе и сети.
 //!
+//! Входные структуры строгие (`deny_unknown_fields`): опечатка в имени поля —
+//! ошибка строки, а не другой запрос молча. `context.lists` и `context.members`
+//! можно не задавать — это пустые перечни; автор же обязан быть среди
+//! участников, иначе контекст не соответствовал бы боевому.
+//!
 //! Текст фразы в сообщения об ошибках не попадает: он может быть
 //! пользовательскими данными, а разбирать датасет удобнее по номеру строки.
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 use uuid::Uuid;
@@ -43,6 +49,50 @@ struct RenderedRecord {
     contract_hash: String,
 }
 
+/// Запись входа; неизвестное поле — ошибка, чтобы опечатка не меняла запрос.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InputRecord {
+    /// Строка или число; возвращается как есть.
+    id: Value,
+    /// Контекст household.
+    context: InputContext,
+    /// Фраза пользователя.
+    text: String,
+}
+
+/// Контекст записи.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InputContext {
+    /// Момент RFC 3339 с поясом.
+    now: String,
+    /// Пояс IANA household.
+    timezone: String,
+    /// Списки; без поля — пустой перечень.
+    #[serde(default)]
+    lists: Vec<InputList>,
+    /// Имена участников; без поля — пустой перечень.
+    #[serde(default)]
+    members: Vec<String>,
+    /// Имя автора или отсутствие автора.
+    #[serde(default)]
+    author: Option<String>,
+}
+
+/// Список в описании контекста.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InputList {
+    /// Название.
+    name: String,
+    /// Вид списка: `tasks`, `shopping`, `checklist` или `events`.
+    kind: ListKind,
+    /// Список по умолчанию для своего типа.
+    #[serde(default)]
+    default: bool,
+}
+
 /// Отрисовать одну строку JSONL: вернуть готовую строку выхода.
 ///
 /// Ошибка содержит `id`, если он есть во входе, но никогда не содержит текст
@@ -51,7 +101,7 @@ pub fn render_line(line: &str) -> Result<String, RenderError> {
     let value: Value = serde_json::from_str(line)
         .map_err(|_| RenderError::new(None, "строка не является JSON"))?;
     let id = value.get("id").and_then(record_id);
-    let record = render_record(&value).map_err(|message| RenderError {
+    let record = render_record(value).map_err(|message| RenderError {
         id: id.clone(),
         message,
     })?;
@@ -61,25 +111,13 @@ pub fn render_line(line: &str) -> Result<String, RenderError> {
     })
 }
 
-fn render_record(value: &Value) -> Result<RenderedRecord, String> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| "запись должна быть JSON-объектом".to_owned())?;
-    let id = match object.get("id") {
-        Some(value @ (Value::String(_) | Value::Number(_))) => value.clone(),
-        Some(_) => return Err("id должен быть строкой или числом".to_owned()),
-        None => return Err("нет поля id".to_owned()),
-    };
-    let context = object
-        .get("context")
-        .ok_or_else(|| "нет поля context".to_owned())?;
-    let context = context_from_json(context)?;
-    let text = object
-        .get("text")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "нет поля text или оно не строка".to_owned())?;
+fn render_record(value: Value) -> Result<RenderedRecord, String> {
+    let record: InputRecord =
+        serde_json::from_value(value).map_err(|error| format!("неверная запись: {error}"))?;
+    let id = record_id(&record.id).ok_or_else(|| "id должен быть строкой или числом".to_owned())?;
 
-    let request = prompt::build_request(&context, text);
+    let context = record.context.into_context()?;
+    let request = prompt::build_request(&context, &record.text);
     let payload = request_payload(&request.messages, &request.schema);
     Ok(RenderedRecord {
         id,
@@ -90,101 +128,49 @@ fn render_record(value: &Value) -> Result<RenderedRecord, String> {
     })
 }
 
-fn context_from_json(value: &Value) -> Result<CaptureContext, String> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| "context должен быть JSON-объектом".to_owned())?;
-    Ok(CaptureContext {
-        now: parse_now(object.get("now"))?,
-        timezone: parse_household_timezone(object.get("timezone"))?,
-        lists: parse_lists(object.get("lists"))?,
-        members: parse_members(object.get("members"))?,
-        author: parse_author(object.get("author"))?,
-    })
-}
+impl InputContext {
+    fn into_context(self) -> Result<CaptureContext, String> {
+        let now = DateTime::parse_from_rfc3339(&self.now)
+            .map(|moment| moment.with_timezone(&Utc))
+            .map_err(|_| "context.now должен быть моментом RFC 3339 с поясом".to_owned())?;
+        let timezone = parse_household_timezone(&self.timezone)?;
+        let lists = self
+            .lists
+            .into_iter()
+            .map(|list| ListRef {
+                id: Uuid::nil(),
+                name: list.name,
+                kind: list.kind,
+                is_default: list.default,
+            })
+            .collect();
+        let members = self
+            .members
+            .iter()
+            .map(|name| member(name))
+            .collect::<Vec<_>>();
+        let author = match self.author {
+            None => None,
+            Some(name) if self.members.iter().any(|member_name| member_name == &name) => {
+                Some(member(&name))
+            }
+            Some(_) => {
+                return Err("context.author должен быть среди context.members".to_owned());
+            }
+        };
 
-fn parse_now(value: Option<&Value>) -> Result<DateTime<Utc>, String> {
-    let value = value
-        .and_then(Value::as_str)
-        .ok_or_else(|| "нет поля context.now или оно не строка".to_owned())?;
-    DateTime::parse_from_rfc3339(value)
-        .map(|moment| moment.with_timezone(&Utc))
-        .map_err(|_| "context.now должен быть моментом RFC 3339 с поясом".to_owned())
-}
-
-fn parse_household_timezone(value: Option<&Value>) -> Result<Tz, String> {
-    let value = value
-        .and_then(Value::as_str)
-        .ok_or_else(|| "нет поля context.timezone или оно не строка".to_owned())?;
-    parse_timezone(value).map_err(|_| "context.timezone должен быть поясом IANA".to_owned())
-}
-
-fn parse_lists(value: Option<&Value>) -> Result<Vec<ListRef>, String> {
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
-    let items = value
-        .as_array()
-        .ok_or_else(|| "context.lists должен быть массивом".to_owned())?;
-    items.iter().map(parse_list).collect()
-}
-
-fn parse_list(value: &Value) -> Result<ListRef, String> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| "элемент context.lists должен быть объектом".to_owned())?;
-    let name = object
-        .get("name")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "у списка нет поля name или оно не строка".to_owned())?;
-    let kind = match object.get("kind").and_then(Value::as_str) {
-        Some("tasks") => ListKind::Tasks,
-        Some("shopping") => ListKind::Shopping,
-        Some("checklist") => ListKind::Checklist,
-        Some("events") => ListKind::Events,
-        Some(_) | None => {
-            return Err(
-                "неизвестный вид списка: ожидается tasks, shopping, checklist или events"
-                    .to_owned(),
-            );
-        }
-    };
-    let is_default = match object.get("default") {
-        None => false,
-        Some(Value::Bool(value)) => *value,
-        Some(_) => return Err("признак default у списка должен быть булевым".to_owned()),
-    };
-    Ok(ListRef {
-        id: Uuid::nil(),
-        name: name.to_owned(),
-        kind,
-        is_default,
-    })
-}
-
-fn parse_members(value: Option<&Value>) -> Result<Vec<MemberRef>, String> {
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
-    let items = value
-        .as_array()
-        .ok_or_else(|| "context.members должен быть массивом".to_owned())?;
-    items
-        .iter()
-        .map(|item| {
-            item.as_str()
-                .map(member)
-                .ok_or_else(|| "имя участника должно быть строкой".to_owned())
+        Ok(CaptureContext {
+            now,
+            timezone,
+            lists,
+            members,
+            author,
         })
-        .collect()
+    }
 }
 
-fn parse_author(value: Option<&Value>) -> Result<Option<MemberRef>, String> {
-    match value {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(name)) => Ok(Some(member(name))),
-        Some(_) => Err("context.author должен быть именем или null".to_owned()),
-    }
+fn parse_household_timezone(value: &str) -> Result<Tz, String> {
+    parse_timezone(value).map_err(|_| "context.timezone должен быть поясом IANA".to_owned())
 }
 
 fn member(name: &str) -> MemberRef {
@@ -209,5 +195,95 @@ impl RenderError {
             id,
             message: message.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn line(context: Value) -> String {
+        json!({"id": 1, "context": context, "text": "купить молоко"}).to_string()
+    }
+
+    fn context() -> Value {
+        json!({
+            "now": "2026-10-30T11:05:00+03:00",
+            "timezone": "Europe/Moscow",
+            "lists": [{"name": "Задачи", "kind": "tasks", "default": true}],
+            "members": ["Анна", "Пётр"],
+            "author": "Анна",
+        })
+    }
+
+    fn error(input: &str) -> String {
+        render_line(input).expect_err("record is invalid").message
+    }
+
+    #[test]
+    fn valid_record_is_rendered() {
+        let rendered = render_line(&line(context())).expect("record is valid");
+        let value: Value = serde_json::from_str(&rendered).expect("output is JSON");
+        assert_eq!(value["id"], 1);
+        assert_eq!(value["prompt_version"], prompt::PROMPT_VERSION);
+    }
+
+    #[test]
+    fn lists_and_members_are_optional() {
+        let input = line(json!({
+            "now": "2026-10-30T11:05:00+03:00",
+            "timezone": "Europe/Moscow",
+        }));
+        assert!(render_line(&input).is_ok());
+    }
+
+    #[test]
+    fn unknown_keys_are_errors_at_every_level() {
+        let mut record = json!({
+            "id": 1,
+            "context": context(),
+            "text": "купить молоко",
+            "txt": "другой текст",
+        });
+        assert!(error(&record.to_string()).contains("txt"));
+
+        record = json!({"id": 1, "context": context(), "text": "купить молоко"});
+        record["context"]["member"] = json!(["Анна"]);
+        let message = error(&record.to_string());
+        assert!(message.contains("member"), "{message}");
+
+        record = json!({"id": 1, "context": context(), "text": "купить молоко"});
+        record["context"]["lists"][0]["defualt"] = json!(true);
+        let message = error(&record.to_string());
+        assert!(message.contains("defualt"), "{message}");
+    }
+
+    #[test]
+    fn author_must_be_a_member() {
+        let mut record = json!({"id": 1, "context": context(), "text": "купить молоко"});
+        record["context"]["author"] = json!("Оля");
+        assert_eq!(
+            error(&record.to_string()),
+            "context.author должен быть среди context.members"
+        );
+
+        record["context"]["author"] = Value::Null;
+        assert!(render_line(&record.to_string()).is_ok());
+    }
+
+    #[test]
+    fn unrelated_field_types_are_errors() {
+        let mut record = json!({"id": 1, "context": context(), "text": "купить молоко"});
+        record["context"]["lists"] = json!({});
+        assert!(!error(&record.to_string()).is_empty());
+
+        record["context"]["members"] = json!("Анна");
+        assert!(!error(&record.to_string()).is_empty());
+
+        record["context"]["lists"] = json!([]);
+        record["text"] = json!(1);
+        assert!(!error(&record.to_string()).is_empty());
     }
 }

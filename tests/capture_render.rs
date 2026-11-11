@@ -151,7 +151,7 @@ async fn bad_lines_stop_the_command_with_a_line_number_and_no_phrase_text() {
     let cases = [
         (
             "не JSON",
-            json!({"id": "bad-json", "text": PHRASE}).to_string(),
+            format!("{{\"id\": \"bad-json\", \"context\": {{}}, \"text\": \"{PHRASE}"),
         ),
         (
             "нет поля context",
@@ -218,6 +218,126 @@ async fn bad_lines_stop_the_command_with_a_line_number_and_no_phrase_text() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_keys_stop_the_command_instead_of_changing_the_request() {
+    const PHRASE: &str = "секретная фраза про молоко и хлеб";
+
+    let good = record(json!("good"), "купить хлеб").to_string();
+    let cases = [
+        (
+            "defualt",
+            json!({
+                "id": "typo-default",
+                "context": {
+                    "now": "2026-10-30T11:05:00+03:00",
+                    "timezone": "Europe/Moscow",
+                    "lists": [{"name": "Задачи", "kind": "tasks", "defualt": true}],
+                },
+                "text": PHRASE,
+            }),
+        ),
+        (
+            "member",
+            json!({
+                "id": "typo-member",
+                "context": {
+                    "now": "2026-10-30T11:05:00+03:00",
+                    "timezone": "Europe/Moscow",
+                    "lists": [],
+                    "member": ["Анна"],
+                },
+                "text": PHRASE,
+            }),
+        ),
+        (
+            "txt",
+            json!({"id": "typo-text", "context": input_context(), "text": PHRASE, "txt": "x"}),
+        ),
+    ];
+
+    for (field, bad) in cases {
+        let input = format!("{good}\n{}\n", bad);
+        let output = render(&input).await;
+
+        assert!(!output.status.success(), "{field}: {output:?}");
+        let errors = stderr(&output);
+        assert!(errors.contains("строка 2"), "{field}: {errors}");
+        assert!(
+            errors.contains(field),
+            "{field}: the unknown key is named: {errors}"
+        );
+        assert!(
+            !errors.contains(PHRASE),
+            "{field}: the phrase must not reach stderr: {errors}"
+        );
+        assert_eq!(
+            stdout(&output).lines().count(),
+            1,
+            "{field}: the command stops after the first bad line"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn author_must_be_a_member_or_null() {
+    const PHRASE: &str = "секретная фраза про молоко и хлеб";
+
+    let outside = json!({
+        "id": "bad-author",
+        "context": {
+            "now": "2026-10-30T11:05:00+03:00",
+            "timezone": "Europe/Moscow",
+            "lists": [],
+            "members": ["Анна", "Пётр"],
+            "author": "Оля",
+        },
+        "text": PHRASE,
+    });
+    let output = render(&format!("{}\n", outside)).await;
+    assert!(!output.status.success(), "{output:?}");
+    let errors = stderr(&output);
+    assert!(errors.contains("строка 1"), "{errors}");
+    assert!(errors.contains("context.author"), "{errors}");
+    assert!(!errors.contains(PHRASE), "{errors}");
+
+    let absent = json!({
+        "id": "no-author",
+        "context": {
+            "now": "2026-10-30T11:05:00+03:00",
+            "timezone": "Europe/Moscow",
+            "author": null,
+        },
+        "text": "купить молоко",
+    });
+    let output = render(&format!("{}\n", absent)).await;
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_lines_are_skipped_and_line_numbers_are_kept() {
+    let first = record(json!("first"), "купить молоко").to_string();
+    let second = record(json!("second"), "позвонить маме").to_string();
+
+    let input = format!("{first}\n\n   \n{second}\n");
+    let output = render(&input).await;
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        stdout(&output).lines().count(),
+        2,
+        "empty lines produce no records"
+    );
+
+    let bad = json!({"id": "bad", "text": "купить хлеб"}).to_string();
+    let input = format!("{first}\n\n\t\n{bad}\n");
+    let output = render(&input).await;
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        stderr(&output).contains("строка 4"),
+        "the number counts skipped lines: {}",
+        stderr(&output)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn help_explains_the_input_format_and_the_stop_rule() {
     let output = bin()
         .args(["capture-render", "--help"])
@@ -235,6 +355,9 @@ async fn help_explains_the_input_format_and_the_stop_rule() {
         "prompt_version",
         "contract_hash",
         "останавливается",
+        "Неизвестные поля",
+        "Пустые строки",
+        "author",
     ] {
         assert!(help.contains(expected), "help lacks {expected}:\n{help}");
     }

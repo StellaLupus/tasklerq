@@ -1229,6 +1229,60 @@ mod tests {
         }
     }
 
+    /// Полный ответ v4 из `docs/llm-capture.md` проходит разбор формы для
+    /// контекста с теми списками и участниками, что в нём названы. Документ и
+    /// тест связаны маркерами: пример нельзя поменять, не проверив его.
+    #[test]
+    fn documented_example_parses() {
+        const DOC: &str = include_str!("../../docs/llm-capture.md");
+        const START: &str = "<!-- capture-v4-example:start -->";
+        const END: &str = "<!-- capture-v4-example:end -->";
+
+        let start = DOC
+            .find(START)
+            .expect("the example start marker is present")
+            + START.len();
+        let end = DOC[start..]
+            .find(END)
+            .expect("the example end marker is present")
+            + start;
+        let block = DOC[start..end].trim();
+        let example = block
+            .strip_prefix("```json")
+            .and_then(|block| block.strip_suffix("```"))
+            .map(str::trim)
+            .expect("the example is a json code block");
+
+        let mut context = context();
+        context.lists.push(crate::capture::test_support::list(
+            "Уборка",
+            ListKind::Checklist,
+            false,
+        ));
+        context.lists.push(crate::capture::test_support::list(
+            "Календарь",
+            ListKind::Events,
+            true,
+        ));
+
+        let parsed =
+            parse_capture_response(example, &context).expect("the documented example parses");
+
+        assert_eq!(parsed.items.len(), 5, "{example}");
+        assert_eq!(parsed.items[0].form(), Form::Shopping);
+        assert_eq!(parsed.items[1].form(), Form::Task);
+        assert_eq!(parsed.items[2].kind(), ListKind::Checklist);
+        assert_eq!(parsed.items[3].form(), Form::Event);
+        assert_eq!(parsed.items[4].form(), Form::Event);
+        assert_eq!(
+            parsed.clarifications,
+            [Clarification {
+                item: 4,
+                topic: ClarificationTopic::Date
+            }]
+        );
+    }
+
     #[test]
     fn responses_valid_against_the_generated_schema_parse() {
         let mut context = context();
