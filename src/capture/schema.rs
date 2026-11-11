@@ -84,6 +84,19 @@ pub struct RawRecurrence {
     pub until: Option<String>,
 }
 
+/// Ошибка выражения даты, которую не удалось превратить в календарную дату.
+///
+/// Хранится рядом с элементом черновика, а не рядом с ответом целиком: ошибка
+/// одного выражения не должна ронять остальные элементы. Валидатор показывает
+/// её пользователю как ошибку даты, и элемент не сохраняется до исправления.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RawDateError {
+    /// Поле элемента, к которому относится ошибка: `due_date`, `end_date`,
+    /// `recurrence` или `note_date`.
+    pub field: String,
+}
+
 /// Элемент черновика «как сказала LLM». Хранится в `capture_drafts.parsed`,
 /// поэтому новые поля должны иметь `#[serde(default)]`: черновик, записанный до
 /// обновления, не должен переставать читаться.
@@ -101,6 +114,15 @@ pub struct RawItem {
     pub due_date: Option<String>,
     /// Время `HH:MM`.
     pub due_time: Option<String>,
+    /// Дата конца события `YYYY-MM-DD`, последний день включительно.
+    #[serde(default)]
+    pub end_date: Option<String>,
+    /// Время конца события `HH:MM`.
+    #[serde(default)]
+    pub end_time: Option<String>,
+    /// Ошибка выражения даты, если его не удалось посчитать.
+    #[serde(default)]
+    pub date_error: Option<RawDateError>,
     /// Приоритет.
     pub priority: Option<String>,
     /// Исполнитель.
@@ -207,6 +229,9 @@ fn parse_item(index: usize, value: &Value) -> Result<RawItem, ParseError> {
         notes: optional_text(object, at, "notes")?,
         due_date: optional_text(object, at, "due_date")?,
         due_time: optional_text(object, at, "due_time")?,
+        end_date: None,
+        end_time: None,
+        date_error: None,
         priority: optional_text(object, at, "priority")?,
         assignee: optional_text(object, at, "assignee")?,
         assignee_id: None,
@@ -701,5 +726,35 @@ mod tests {
             ParseError::TooManyItems { count: 21 }.code(),
             "too_many_items"
         );
+    }
+
+    #[test]
+    fn a_draft_saved_before_the_event_fields_still_reads() {
+        // Черновик прежней версии не содержит `end_date`, `end_time` и
+        // `date_error`: они должны читаться значениями по умолчанию.
+        let old = json!({
+            "target_kind": "tasks",
+            "target_list": null,
+            "title": "Позвонить маме",
+            "notes": null,
+            "due_date": "2026-11-11",
+            "due_time": null,
+            "priority": null,
+            "assignee": null,
+            "assignee_id": null,
+            "tags": [],
+            "quantity": null,
+            "unit": null,
+            "subtasks": [],
+            "recurrence": null,
+        });
+
+        let item: RawItem = serde_json::from_value(old).expect("old draft reads");
+
+        assert_eq!(item.title, "Позвонить маме");
+        assert_eq!(item.due_date.as_deref(), Some("2026-11-11"));
+        assert_eq!(item.end_date, None);
+        assert_eq!(item.end_time, None);
+        assert_eq!(item.date_error, None);
     }
 }

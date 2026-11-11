@@ -627,6 +627,7 @@ pub async fn answer_due_date(
                 DueChoice::Tomorrow => today.checked_add_days(Days::new(1)).unwrap_or(today),
             };
             raw.due_date = Some(date.format("%Y-%m-%d").to_string());
+            clear_date_error(raw, "due_date");
         },
     )
     .await
@@ -964,14 +965,23 @@ fn apply(raw: &mut RawItem, edit: ItemEdit) {
         raw.title = title;
     }
     set(&mut raw.target_list, edit.target_list);
+    if !matches!(edit.notes, Field::Missing) {
+        clear_date_error(raw, "note_date");
+    }
     set(&mut raw.notes, edit.notes);
     set(&mut raw.priority, edit.priority);
     set(&mut raw.assignee, edit.assignee);
     set(&mut raw.unit, edit.unit);
+    if !matches!(edit.recurrence, Field::Missing) {
+        clear_date_error(raw, "recurrence");
+    }
     set(&mut raw.recurrence, edit.recurrence);
     // Срок без даты не бывает: сняв дату, снимаем и время.
     if matches!(edit.due_date, Field::Null) {
         raw.due_time = None;
+    }
+    if !matches!(edit.due_date, Field::Missing) {
+        clear_date_error(raw, "due_date");
     }
     set(&mut raw.due_date, edit.due_date);
     set(&mut raw.due_time, edit.due_time);
@@ -990,6 +1000,20 @@ fn set<T>(target: &mut Option<T>, field: Field<T>) {
         Field::Missing => {}
         Field::Null => *target = None,
         Field::Value(value) => *target = Some(value),
+    }
+}
+
+/// Снять ошибку выражения, когда пользователь исправил это поле.
+///
+/// Ошибку конца события пока снять нельзя: полей конца у [`ItemEdit`] нет,
+/// редактирование события в черновике — пункт 8.3.
+fn clear_date_error(raw: &mut RawItem, field: &str) {
+    if raw
+        .date_error
+        .as_ref()
+        .is_some_and(|error| error.field == field)
+    {
+        raw.date_error = None;
     }
 }
 
@@ -1015,5 +1039,84 @@ fn scrub(raw: &mut RawItem) {
         clean_opt(&mut recurrence.freq);
         clean_opt(&mut recurrence.month_rule);
         clean_opt(&mut recurrence.until);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture::schema::RawDateError;
+
+    fn raw_with_date_error(field: &str) -> RawItem {
+        RawItem {
+            target_kind: ListKind::Tasks,
+            target_list: None,
+            title: "Дело".to_owned(),
+            notes: None,
+            due_date: None,
+            due_time: None,
+            end_date: None,
+            end_time: None,
+            date_error: Some(RawDateError {
+                field: field.to_owned(),
+            }),
+            priority: None,
+            assignee: None,
+            assignee_id: None,
+            tags: Vec::new(),
+            quantity: None,
+            unit: None,
+            subtasks: Vec::new(),
+            recurrence: None,
+        }
+    }
+
+    #[test]
+    fn editing_a_field_clears_only_its_own_date_error() {
+        let mut item = raw_with_date_error("due_date");
+        apply(
+            &mut item,
+            ItemEdit {
+                due_date: Field::Value("2026-11-11".to_owned()),
+                ..ItemEdit::default()
+            },
+        );
+        assert_eq!(item.date_error, None);
+
+        let mut item = raw_with_date_error("recurrence");
+        apply(
+            &mut item,
+            ItemEdit {
+                due_date: Field::Value("2026-11-11".to_owned()),
+                ..ItemEdit::default()
+            },
+        );
+        assert!(
+            item.date_error.is_some(),
+            "editing another field must keep the error"
+        );
+
+        let mut item = raw_with_date_error("note_date");
+        apply(
+            &mut item,
+            ItemEdit {
+                notes: Field::Value("приём 20 ноября".to_owned()),
+                ..ItemEdit::default()
+            },
+        );
+        assert_eq!(item.date_error, None);
+    }
+
+    #[test]
+    fn editing_the_recurrence_clears_its_date_error() {
+        let mut item = raw_with_date_error("recurrence");
+        apply(
+            &mut item,
+            ItemEdit {
+                recurrence: Field::Value(RawRecurrence::default()),
+                ..ItemEdit::default()
+            },
+        );
+        assert_eq!(item.date_error, None);
     }
 }

@@ -3,7 +3,7 @@
 //! Начало события хранится в `due_at`/`due_date`, конец — в
 //! `end_at`/`end_date` (design, решения 2 и 3).
 
-use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
 
 use super::recurrence::MAX_CALENDAR_DAYS;
@@ -12,6 +12,24 @@ use super::recurrence::MAX_CALENDAR_DAYS;
 ///
 /// Тот же предел, что у интервала календаря.
 pub const MAX_EVENT_DAYS: i64 = MAX_CALENDAR_DAYS;
+
+/// День конца события по времени конца без даты конца.
+///
+/// Время относится ко дню начала, а если оно не позже времени начала — к
+/// следующему дню. У вседневного начала времени нет, поэтому конец остаётся в
+/// день начала. Это правило 0009-events; редактор события пока держит его
+/// инлайн и перейдёт на этот helper вместе с редактированием события (8.3).
+pub fn end_day(
+    start_date: NaiveDate,
+    start_time: Option<NaiveTime>,
+    end_time: NaiveTime,
+) -> NaiveDate {
+    if start_time.is_some_and(|start| end_time <= start) {
+        start_date.succ_opt().unwrap_or(start_date)
+    } else {
+        start_date
+    }
+}
 
 /// Момент, после которого событие считается прошедшим.
 ///
@@ -99,6 +117,34 @@ mod tests {
         assert_eq!(
             effective_end(Some(start), None, Some(end), None, Vladivostok),
             Some(end)
+        );
+    }
+
+    #[test]
+    fn end_day_without_a_date_belongs_to_the_start_day_or_the_next_one() {
+        let start_date = date(2026, 11, 11);
+        let start_time = NaiveTime::from_hms_opt(15, 0, 0).unwrap();
+
+        assert_eq!(
+            end_day(
+                start_date,
+                Some(start_time),
+                NaiveTime::from_hms_opt(16, 0, 0).unwrap()
+            ),
+            start_date
+        );
+        assert_eq!(
+            end_day(
+                start_date,
+                Some(start_time),
+                NaiveTime::from_hms_opt(15, 0, 0).unwrap()
+            ),
+            date(2026, 11, 12)
+        );
+        // У вседневного начала времени нет: конец остаётся в тот же день.
+        assert_eq!(
+            end_day(start_date, None, NaiveTime::from_hms_opt(9, 0, 0).unwrap()),
+            start_date
         );
     }
 
