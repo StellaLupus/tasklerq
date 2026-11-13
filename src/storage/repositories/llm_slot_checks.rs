@@ -17,6 +17,9 @@ pub struct StoredCheck {
     pub passed: i32,
     /// Сколько фраз всего.
     pub total: i32,
+    /// Стандарт сравнения названий сохранённой проверки (`strict` для строк
+    /// до появления режима: тогда проверки были только строгими).
+    pub titles: String,
 }
 
 /// Результат проверки слота.
@@ -41,20 +44,26 @@ pub struct NewCheck<'a> {
 /// Последняя проверка слота; `None`, если слот ещё не проверялся.
 ///
 /// `checked_at` не читается: статус зависит только от отпечатка и числа
-/// пройденных фраз, а срок давности проверки в требованиях не задан.
+/// пройденных фраз, а срок давности проверки в требованиях не задан. Стандарт
+/// читается из сохранённых частей отпечатка: отдельной колонки нет, а строка
+/// до появления режима была строгой.
 pub async fn latest(
     conn: &mut PgConnection,
     slot: &str,
 ) -> Result<Option<StoredCheck>, sqlx::Error> {
-    let row: Option<(String, i32, i32)> =
-        sqlx::query_as("SELECT fingerprint, passed, total FROM llm_slot_checks WHERE slot = $1")
-            .bind(slot)
-            .fetch_optional(conn)
-            .await?;
-    Ok(row.map(|(fingerprint, passed, total)| StoredCheck {
+    let row: Option<(String, i32, i32, String)> = sqlx::query_as(
+        "SELECT fingerprint, passed, total,
+                coalesce(fingerprint_parts->>'titles', 'strict')
+         FROM llm_slot_checks WHERE slot = $1",
+    )
+    .bind(slot)
+    .fetch_optional(conn)
+    .await?;
+    Ok(row.map(|(fingerprint, passed, total, titles)| StoredCheck {
         fingerprint,
         passed,
         total,
+        titles,
     }))
 }
 

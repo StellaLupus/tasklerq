@@ -7,9 +7,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use sqlx::Connection;
 use tasklerq::admin;
 use tasklerq::app::build_application;
-use tasklerq::capture::eval::SmokeSet;
+use tasklerq::capture::eval::{SmokeSet, TitleMatch, evaluate_with};
 use tasklerq::capture::slot_check;
 use tasklerq::config::{self, Config, DatabaseConfig, LlmConfig, SlotConfig, TenancyConfig};
 use tasklerq::domain::error::DomainError;
@@ -19,6 +20,7 @@ use tasklerq::llm::OpenAiBackend;
 use tasklerq::redaction;
 use tasklerq::storage;
 use tasklerq::storage::repositories::llm_slot_checks::{self, NewCheck};
+use tasklerq::storage::repositories::llm_slot_settings;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tracing_subscriber::EnvFilter;
@@ -74,6 +76,11 @@ enum Command {
     /// Проверка доступна и при `LLM_CAPTURE_ENABLED=false`, если запрошенный
     /// слот задан: так слот проверяют до включения разбора.
     ///
+    /// `--titles strict|normalized` задаёт и сохраняет стандарт слота: строгий
+    /// (форма — часть контракта) или с видом глагола и синонимами. Без флага
+    /// действует сохранённый стандарт. Второй режим печатается справочно по
+    /// тому же прогону; вердикт, код возврата и запись — по стандарту.
+    ///
     /// Коды возврата: 0 — все фразы пройдены; 1 — слот не прошёл проверку;
     /// 2 — ошибка конфигурации, слота или набора (версия контракта проверяется
     /// до вызовов LLM), а также недоступная база; результат в `llm_slot_checks`
@@ -114,6 +121,35 @@ struct CaptureEvalArgs {
     /// Файл smoke-набора; без значения — встроенный набор `capture-v4`.
     #[arg(long, value_name = "PATH")]
     set: Option<PathBuf>,
+    /// Сравнение названий: `strict` — только основы слов, `normalized` —
+    /// ещё вид глагола и синонимы («Вынести мусор» ≈ «Выносить мусор»).
+    ///
+    /// Флаг задаёт и сохраняет стандарт слота: режим входит в отпечаток
+    /// проверки, а смена стандарта делает прежнюю проверку устаревшей. Без
+    /// флага действует сохранённый стандарт (`strict`, если его ещё не
+    /// задавали). Второй режим печатается справочно по тому же прогону, без
+    /// повторных вызовов слота.
+    #[arg(long, value_enum)]
+    titles: Option<TitleArg>,
+}
+
+/// Режим сравнения названий для `capture-eval`.
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+enum TitleArg {
+    /// Только основы слов.
+    #[default]
+    Strict,
+    /// Основы, вид глагола и синонимы.
+    Normalized,
+}
+
+impl TitleArg {
+    fn mode(self) -> TitleMatch {
+        match self {
+            Self::Strict => TitleMatch::Strict,
+            Self::Normalized => TitleMatch::Normalized,
+        }
+    }
 }
 
 /// Слот, который проверяет `capture-eval`.
@@ -921,35 +957,91 @@ async fn run_capture_eval(args: CaptureEvalArgs) -> Result<tasklerq::capture::ev
     let prepared = prepare_check(&args)?;
 
     // База проверяется до вызовов LLM: недоступная база не должна стоить
-    // платных запросов. Соединение сразу отпускается: прогон длится до
-    // нескольких минут, и серверный idle timeout мог бы оборвать его к моменту
-    // записи. Для записи результата берём соединение заново.
+    // платных запросов. Здесь же читается действующий стандарт слота. Соединение
+    // сразу отпускается: прогон длится до нескольких минут, и серверный idle
+    // timeout мог бы оборвать его к моменту записи. Для записи результата берём
+    // соединение заново.
     let database = DatabaseConfig::from_env().context("invalid database configuration")?;
     let pool = storage::db::connect(&database)
         .await
         .context("database connection failed")?;
-    drop(pool.acquire().await.context("database connection failed")?);
+    let mode = {
+        let mut conn = pool.acquire().await.context("database connection failed")?;
+        match args.titles {
+            Some(titles) => titles.mode(),
+            None => {
+                let stored = llm_slot_settings::titles(&mut conn, prepared.slot_name)
+                    .await
+                    .context("failed to read the slot standard")?;
+                match TitleMatch::from_code(&stored) {
+                    Some(titles) => titles,
+                    None => {
+                        tracing::warn!(
+                            slot = prepared.slot_name,
+                            titles = %stored,
+                            "unknown llm slot title standard; treating it as strict"
+                        );
+                        TitleMatch::Strict
+                    }
+                }
+            }
+        }
+    };
 
-    let report = slot_check::run_set(&prepared.backend, &prepared.set, prepared.slot.timeout)
+    // Прогон один: вызовы слота платные и недетерминированные, поэтому оба
+    // режима судят одни и те же исходы.
+    let runs = slot_check::collect_runs(&prepared.backend, &prepared.set)
         .await
         .map_err(anyhow::Error::msg)
         .context("invalid smoke set")?;
+    let report = evaluate_with(&prepared.set, &runs, prepared.slot.timeout, mode)
+        .map_err(anyhow::Error::msg)
+        .context("invalid smoke set")?;
+    let other_mode = match mode {
+        TitleMatch::Strict => TitleMatch::Normalized,
+        TitleMatch::Normalized => TitleMatch::Strict,
+    };
+    let other = evaluate_with(&prepared.set, &runs, prepared.slot.timeout, other_mode).ok();
 
     let set_hash = slot_check::set_hash(&prepared.set_text);
     let contract_hash = tasklerq::capture::prompt::contract_hash();
-    let fingerprint = slot_check::fingerprint(&prepared.slot, &contract_hash, &set_hash);
+    let fingerprint = slot_check::fingerprint(&prepared.slot, &contract_hash, &set_hash, mode);
 
     // Отчёт печатается до записи: если база откажет, результат проверки всё
-    // равно виден, а код возврата останется «проверка не выполнена».
+    // равно виден, а код возврата останется «проверка не выполнена». Число по
+    // стандарту печатается всегда: без него отчёт не отвечает на главный вопрос.
     println!("Слот: {} ({})", prepared.slot_name, prepared.slot.model);
     println!("Отпечаток: {}", fingerprint.value);
+    match &other {
+        Some(other) => println!(
+            "Названия: {} — {} из {} (стандарт), {} — {} из {} (справочно)",
+            mode.as_str(),
+            report.passed_count(),
+            report.total(),
+            other_mode.as_str(),
+            other.passed_count(),
+            other.total(),
+        ),
+        None => println!(
+            "Названия: {} — {} из {} (стандарт)",
+            mode.as_str(),
+            report.passed_count(),
+            report.total(),
+        ),
+    }
     print!("{}", report.to_text());
 
+    // Стандарт и проверка записываются одной транзакцией: иначе смена стандарта
+    // без новой проверки оставила бы слот «устарел» без объяснения.
     let report_json = report.to_json();
     let parts_json = fingerprint.parts.to_json();
     let mut conn = pool.acquire().await.context("database connection failed")?;
+    let mut tx = conn
+        .begin()
+        .await
+        .context("failed to save the slot check")?;
     llm_slot_checks::upsert(
-        &mut conn,
+        &mut tx,
         NewCheck {
             slot: prepared.slot_name,
             fingerprint: &fingerprint.value,
@@ -963,6 +1055,12 @@ async fn run_capture_eval(args: CaptureEvalArgs) -> Result<tasklerq::capture::ev
     )
     .await
     .context("failed to save the slot check")?;
+    if args.titles.is_some() {
+        llm_slot_settings::set_titles(&mut tx, prepared.slot_name, mode.as_str())
+            .await
+            .context("failed to save the slot standard")?;
+    }
+    tx.commit().await.context("failed to save the slot check")?;
     drop(conn);
 
     Ok(report)

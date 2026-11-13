@@ -13,8 +13,8 @@
 //!
 //! Отпечаток слота ([`fingerprint`]) переиспользуется статусом проверки в 9.4:
 //! он сравнивает отпечаток действующей конфигурации с сохранённым. В отпечаток
-//! входят вид слота, модель, хост адреса, хеш контракта, хеш набора и таймаут;
-//! токен и квота не входят.
+//! входят вид слота, модель, хост адреса, хеш контракта, хеш набора, таймаут и
+//! стандарт сравнения названий; токен и квота не входят.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -24,7 +24,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use super::eval::{Report, SlotRun, SmokeSet, check_prompt_version, evaluate};
+use super::eval::{Report, SlotRun, SmokeSet, TitleMatch, check_prompt_version, evaluate};
 use super::prompt;
 use crate::config::SlotConfig;
 use crate::llm::{ChatBackend, ChatRequest};
@@ -57,6 +57,18 @@ pub async fn run_set(
     set: &SmokeSet,
     timeout: Duration,
 ) -> Result<Report, String> {
+    let runs = collect_runs(backend, set).await?;
+    evaluate(set, &runs, timeout)
+}
+
+/// Собрать исходы вызовов слота, не судя их.
+///
+/// Нужен, когда один прогон надо оценить в нескольких режимах сравнения
+/// названий: вызовы слота платные и недетерминированные, повторять их нельзя.
+pub async fn collect_runs(
+    backend: &dyn ChatBackend,
+    set: &SmokeSet,
+) -> Result<BTreeMap<String, SlotRun>, String> {
     let mut runs = BTreeMap::new();
     for phrase in &set.phrases {
         let context = phrase.context(&set.context)?;
@@ -75,7 +87,7 @@ pub async fn run_set(
         };
         runs.insert(phrase.id.clone(), run);
     }
-    evaluate(set, &runs, timeout)
+    Ok(runs)
 }
 
 /// Части отпечатка слота; сам отпечаток — SHA-256 этих частей.
@@ -93,6 +105,8 @@ pub struct FingerprintParts {
     pub set_hash: String,
     /// Таймаут запроса слота, миллисекунды.
     pub timeout_ms: u64,
+    /// Стандарт сравнения названий: часть проверки, как модель или таймаут.
+    pub titles: TitleMatch,
 }
 
 impl FingerprintParts {
@@ -111,11 +125,17 @@ pub struct SlotFingerprint {
     pub parts: FingerprintParts,
 }
 
-/// Отпечаток конфигурации слота, контракта и набора.
+/// Отпечаток конфигурации слота, контракта, набора и стандарта сравнения.
 ///
 /// Токен и квота намеренно не входят: смена токена не делает проверку
-/// устаревшей, а квота относится к household, а не к слоту.
-pub fn fingerprint(slot: &SlotConfig, contract_hash: &str, set_hash: &str) -> SlotFingerprint {
+/// устаревшей, а квота относится к household, а не к слоту. Стандарт входит:
+/// смена режима сравнения названий — другая проверка, как смена модели.
+pub fn fingerprint(
+    slot: &SlotConfig,
+    contract_hash: &str,
+    set_hash: &str,
+    titles: TitleMatch,
+) -> SlotFingerprint {
     let parts = FingerprintParts {
         kind: SLOT_KIND,
         model: slot.model.clone(),
@@ -123,6 +143,7 @@ pub fn fingerprint(slot: &SlotConfig, contract_hash: &str, set_hash: &str) -> Sl
         contract_hash: contract_hash.to_owned(),
         set_hash: set_hash.to_owned(),
         timeout_ms: u64::try_from(slot.timeout.as_millis()).unwrap_or(u64::MAX),
+        titles,
     };
     let serialized = serde_json::to_vec(&parts).expect("fingerprint parts serialize");
     let mut digest = Sha256::new();
@@ -178,6 +199,11 @@ mod tests {
         }
     }
 
+    /// Отпечаток в строгом стандарте: большинство тестов не про режим.
+    fn fp(slot: &SlotConfig, contract_hash: &str, set_hash: &str) -> SlotFingerprint {
+        fingerprint(slot, contract_hash, set_hash, TitleMatch::Strict)
+    }
+
     #[test]
     fn a_token_change_keeps_the_fingerprint() {
         let mut first = slot();
@@ -185,14 +211,14 @@ mod tests {
         second.token = Some(SecretString::new("another-token"));
 
         assert_eq!(
-            fingerprint(&first, CONTRACT, SET).value,
-            fingerprint(&second, CONTRACT, SET).value
+            fp(&first, CONTRACT, SET).value,
+            fp(&second, CONTRACT, SET).value
         );
 
         first.token = None;
         assert_eq!(
-            fingerprint(&first, CONTRACT, SET).value,
-            fingerprint(&slot(), CONTRACT, SET).value
+            fp(&first, CONTRACT, SET).value,
+            fp(&slot(), CONTRACT, SET).value
         );
     }
 
@@ -202,8 +228,8 @@ mod tests {
         other.model = "vendor/other".to_owned();
 
         assert_ne!(
-            fingerprint(&slot(), CONTRACT, SET).value,
-            fingerprint(&other, CONTRACT, SET).value
+            fp(&slot(), CONTRACT, SET).value,
+            fp(&other, CONTRACT, SET).value
         );
     }
 
@@ -215,55 +241,56 @@ mod tests {
             .expect("url");
 
         assert_eq!(
-            fingerprint(&slot(), CONTRACT, SET).value,
-            fingerprint(&other, CONTRACT, SET).value
+            fp(&slot(), CONTRACT, SET).value,
+            fp(&other, CONTRACT, SET).value
         );
     }
 
     #[test]
     fn host_port_timeout_contract_and_set_are_part_of_the_fingerprint() {
-        let base = fingerprint(&slot(), CONTRACT, SET);
+        let base = fp(&slot(), CONTRACT, SET);
 
         let mut other_host = slot();
         other_host.url = "https://api.other.test/v1".parse().expect("url");
-        assert_ne!(
-            base.value,
-            fingerprint(&other_host, CONTRACT, SET).value,
-            "host"
-        );
+        assert_ne!(base.value, fp(&other_host, CONTRACT, SET).value, "host");
 
         let mut other_port = slot();
         other_port.url = "https://api.example.test:8443/v1".parse().expect("url");
-        assert_ne!(
-            base.value,
-            fingerprint(&other_port, CONTRACT, SET).value,
-            "port"
-        );
+        assert_ne!(base.value, fp(&other_port, CONTRACT, SET).value, "port");
 
         let mut other_timeout = slot();
         other_timeout.timeout = Duration::from_secs(20);
         assert_ne!(
             base.value,
-            fingerprint(&other_timeout, CONTRACT, SET).value,
+            fp(&other_timeout, CONTRACT, SET).value,
             "timeout"
         );
 
         assert_ne!(
             base.value,
-            fingerprint(&slot(), "another-contract", SET).value,
+            fp(&slot(), "another-contract", SET).value,
             "contract hash"
         );
         assert_ne!(
             base.value,
-            fingerprint(&slot(), CONTRACT, "another-set").value,
+            fp(&slot(), CONTRACT, "another-set").value,
             "set hash"
+        );
+    }
+
+    #[test]
+    fn a_titles_change_changes_the_fingerprint() {
+        assert_ne!(
+            fingerprint(&slot(), CONTRACT, SET, TitleMatch::Strict).value,
+            fingerprint(&slot(), CONTRACT, SET, TitleMatch::Normalized).value,
+            "the title standard is part of the check, like the model"
         );
     }
 
     #[test]
     fn fingerprint_parts_have_the_documented_shape_and_no_token() {
         let slot = slot();
-        let value = fingerprint(&slot, CONTRACT, SET);
+        let value = fp(&slot, CONTRACT, SET);
         let parts = value.parts.to_json();
 
         assert_eq!(parts["kind"], "openai");
@@ -272,9 +299,10 @@ mod tests {
         assert_eq!(parts["contract_hash"], CONTRACT);
         assert_eq!(parts["set_hash"], SET);
         assert_eq!(parts["timeout_ms"], 10_000);
+        assert_eq!(parts["titles"], "strict");
         assert_eq!(
             parts.as_object().expect("object").len(),
-            6,
+            7,
             "only the documented parts, no token or quota: {parts}"
         );
         assert!(

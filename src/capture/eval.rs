@@ -14,6 +14,11 @@
 //! Названия сравниваются как множества основ слов (стеммер Snowball для
 //! русского), без учёта регистра и порядка слов: «Оплатить интернет» и
 //! «оплата интернета» — одно название.
+//!
+//! [`TitleMatch::Normalized`] дополнительно сводит видовые пары глаголов и
+//! синонимы: «Вынести мусор» и «Выносить мусор» — одно название. Строгий режим
+//! остаётся основным: нормализация нужна, чтобы отличить расхождение в смысле
+//! от расхождения в форме.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
@@ -375,6 +380,8 @@ pub struct Report {
     pub prompt_version: String,
     /// Дата заморозки набора.
     pub frozen_at: String,
+    /// Режим сравнения названий, которым получен вердикт.
+    pub titles: TitleMatch,
     /// Результаты в порядке набора.
     pub results: Vec<PhraseResult>,
 }
@@ -421,6 +428,7 @@ impl Report {
         json!({
             "prompt_version": self.prompt_version,
             "frozen_at": self.frozen_at,
+            "titles": self.titles.as_str(),
             "total": self.total(),
             "passed": self.passed_count(),
             "latency_p95_ms": duration_ms(self.p95()),
@@ -472,18 +480,75 @@ pub fn evaluate(
     runs: &BTreeMap<String, SlotRun>,
     timeout: Duration,
 ) -> Result<Report, String> {
+    evaluate_with(set, runs, timeout, TitleMatch::Strict)
+}
+
+/// Оценить набор в выбранном режиме сравнения названий.
+///
+/// Прогон (вызовы слота) не повторяется: один и тот же набор исходов можно
+/// оценить и строго, и нормализованно.
+pub fn evaluate_with(
+    set: &SmokeSet,
+    runs: &BTreeMap<String, SlotRun>,
+    timeout: Duration,
+    titles: TitleMatch,
+) -> Result<Report, String> {
     let mut results = Vec::with_capacity(set.phrases.len());
     for phrase in &set.phrases {
         let run = runs
             .get(&phrase.id)
             .ok_or_else(|| format!("фраза {}: нет исхода вызова слота", phrase.id))?;
-        results.push(judge(phrase, &set.context, run, timeout)?);
+        results.push(judge_with(phrase, &set.context, run, timeout, titles)?);
     }
     Ok(Report {
         prompt_version: set.prompt_version.clone(),
         frozen_at: set.frozen_at.clone(),
+        titles,
         results,
     })
+}
+
+/// Как сравнивать названия элементов.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TitleMatch {
+    /// Только основы слов: «Вынести мусор» и «Выносить мусор» — разные.
+    #[default]
+    Strict,
+    /// Основы плюс вид глагола и синонимы: «Вынести мусор» и
+    /// «Выносить мусор» — одно название.
+    Normalized,
+}
+
+impl TitleMatch {
+    /// Имя режима для отчёта и логов.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Normalized => "normalized",
+        }
+    }
+
+    /// Разобрать режим из сохранённого значения; неизвестное — `None`.
+    pub fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "strict" => Some(Self::Strict),
+            "normalized" => Some(Self::Normalized),
+            _ => None,
+        }
+    }
+}
+
+/// Оценить одну фразу строго (совместимость).
+///
+/// См. [`judge_with`].
+pub fn judge(
+    phrase: &SmokePhrase,
+    default_context: &InputContext,
+    run: &SlotRun,
+    timeout: Duration,
+) -> Result<PhraseResult, String> {
+    judge_with(phrase, default_context, run, timeout, TitleMatch::Strict)
 }
 
 /// Оценить одну фразу.
@@ -495,11 +560,12 @@ pub fn evaluate(
 /// Ошибка валидации, которую объясняет уточнение ответа (событие без начала и
 /// вопрос о дате), провалом не считается: контракт предписывает именно такой
 /// ответ, а поле дозаполняется ответом на вопрос.
-pub fn judge(
+pub fn judge_with(
     phrase: &SmokePhrase,
     default_context: &InputContext,
     run: &SlotRun,
     timeout: Duration,
+    titles: TitleMatch,
 ) -> Result<PhraseResult, String> {
     let context = phrase.context(default_context)?;
     let reference = reference(&context, &phrase.expect)
@@ -554,7 +620,7 @@ pub fn judge(
         return Ok(result);
     }
 
-    let differences = compare(&reference, &actual, &context);
+    let differences = compare_with(&reference, &actual, &context, titles);
     if !differences.is_empty() {
         result.failure = Some(Failure::Mismatch { differences });
     }
@@ -741,7 +807,12 @@ fn recurrence_text(rule: &RecurrenceInput) -> String {
 }
 
 /// Сравнить ответ с эталоном. Пустой перечень — фразы совпали.
-fn compare(expected: &Draft, actual: &Draft, context: &CaptureContext) -> Vec<Difference> {
+fn compare_with(
+    expected: &Draft,
+    actual: &Draft,
+    context: &CaptureContext,
+    titles: TitleMatch,
+) -> Vec<Difference> {
     let expected_items: Vec<ItemView> = expected
         .items
         .iter()
@@ -765,7 +836,7 @@ fn compare(expected: &Draft, actual: &Draft, context: &CaptureContext) -> Vec<Di
         });
     }
 
-    let pairs = pair_items(&expected_items, &actual_items);
+    let pairs = pair_items(&expected_items, &actual_items, titles);
     for (expected_index, actual_index) in &pairs {
         match (expected_index, actual_index) {
             (Some(expected_index), Some(actual_index)) => compare_pair(
@@ -773,6 +844,7 @@ fn compare(expected: &Draft, actual: &Draft, context: &CaptureContext) -> Vec<Di
                 *expected_index,
                 &actual_items[*actual_index],
                 &mut differences,
+                titles,
             ),
             (Some(expected_index), None) => differences.push(Difference {
                 item: Some(*expected_index),
@@ -848,6 +920,7 @@ fn compare_pair(
     expected_index: usize,
     actual: &ItemView,
     differences: &mut Vec<Difference>,
+    titles: TitleMatch,
 ) {
     let mut differ = |field: &'static str, expected: String, actual: String| {
         differences.push(Difference {
@@ -858,7 +931,7 @@ fn compare_pair(
         });
     };
 
-    if !names_match(&expected.title, &actual.title) {
+    if !names_match(&expected.title, &actual.title, titles) {
         differ("название", expected.title.clone(), actual.title.clone());
     }
     if expected.kind != actual.kind {
@@ -868,7 +941,9 @@ fn compare_pair(
             kind_name(actual.kind).to_owned(),
         );
     }
-    if !names_match(&expected.list, &actual.list) {
+    // Имя списка — идентификатор из контекста household: боевая валидация
+    // требует точного имени, поэтому нормализация к нему не применяется.
+    if !names_match(&expected.list, &actual.list, TitleMatch::Strict) {
         differ("список", expected.list.clone(), actual.list.clone());
     }
     differ_optional("дата", &expected.date, &actual.date, &mut differ);
@@ -970,33 +1045,152 @@ fn month_rule_name(rule: MonthRule) -> &'static str {
 }
 
 /// Названия совпали по основам слов, без учёта регистра и порядка слов.
-fn names_match(expected: &str, actual: &str) -> bool {
-    stems(expected) == stems(actual)
+fn names_match(expected: &str, actual: &str, titles: TitleMatch) -> bool {
+    stems(expected, titles) == stems(actual, titles)
 }
 
 /// Множество основ слов названия.
-fn stems(value: &str) -> BTreeSet<String> {
+fn stems(value: &str, titles: TitleMatch) -> BTreeSet<String> {
     static STEMMER: OnceLock<Stemmer> = OnceLock::new();
     let stemmer = STEMMER.get_or_init(|| Stemmer::create(Algorithm::Russian));
     value
         .split(|ch: char| !ch.is_alphanumeric())
         .filter(|word| !word.is_empty())
         .map(|word| {
-            stemmer
-                .stem(&word.to_lowercase().replace('ё', "е"))
-                .into_owned()
+            let folded = fold_word(word);
+            let stem = stemmer.stem(&folded).into_owned();
+            match titles {
+                TitleMatch::Strict => stem,
+                TitleMatch::Normalized => canonical_stem(&folded, &stem).unwrap_or(stem),
+            }
         })
         .filter(|stem| !stem.is_empty())
         .collect()
 }
 
+/// Слово в том виде, в каком его видит стеммер: нижний регистр, без `ё`.
+fn fold_word(word: &str) -> String {
+    word.to_lowercase().replace('ё', "е")
+}
+
+/// Свести основу слова к канону: синонимы и вид глагола.
+///
+/// Синонимы применяются к любой части речи. Вид глагола — только к
+/// инфинитивам: иначе существительное с той же основой склеилось бы с
+/// глаголом («наряд» и «нарядить», «пол» и «полить»), а это разные названия.
+/// Пары заданы инфинитивами, а сравниваются основы, поэтому склонения
+/// существительных из словаря синонимов попадают в канон автоматически.
+fn canonical_stem(word: &str, stem: &str) -> Option<String> {
+    if let Some(canonical) = lookup(&SYNONYM_STEMS, SYNONYMS, stem) {
+        return Some(canonical);
+    }
+    if is_infinitive(word) {
+        return lookup(&ASPECT_STEMS, ASPECT_PAIRS, stem);
+    }
+    None
+}
+
+/// Инфинитив по окончанию: `-ть`, `-ться`, `-ти`, `-чь`.
+fn is_infinitive(word: &str) -> bool {
+    word.ends_with("ться") || word.ends_with("ть") || word.ends_with("ти") || word.ends_with("чь")
+}
+
+fn lookup(
+    map: &OnceLock<BTreeMap<String, String>>,
+    pairs: &[(&str, &str)],
+    stem: &str,
+) -> Option<String> {
+    map.get_or_init(|| stem_map(pairs)).get(stem).cloned()
+}
+
+/// Карта «основа варианта → основа канона» с тем же фолдингом, что и у слов.
+fn stem_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+    let stemmer = Stemmer::create(Algorithm::Russian);
+    let mut map = BTreeMap::new();
+    for (variant, canonical) in pairs {
+        map.insert(
+            stemmer.stem(&fold_word(variant)).into_owned(),
+            stemmer.stem(&fold_word(canonical)).into_owned(),
+        );
+    }
+    map
+}
+
+/// Видовые пары глаголов: вариант → канон (несовершенный вид).
+static ASPECT_PAIRS: &[(&str, &str)] = &[
+    ("дать", "давать"),
+    ("вынести", "выносить"),
+    ("убраться", "убираться"),
+    ("убрать", "убирать"),
+    ("полить", "поливать"),
+    ("проверить", "проверять"),
+    ("отправить", "отправлять"),
+    ("закрыть", "закрывать"),
+    ("открыть", "открывать"),
+    ("собрать", "собирать"),
+    ("оплатить", "платить"),
+    ("заплатить", "платить"),
+    ("сдать", "сдавать"),
+    ("обновить", "обновлять"),
+    ("нарядить", "наряжать"),
+    ("пересмотреть", "пересматривать"),
+    ("передать", "передавать"),
+    ("постирать", "стирать"),
+    ("купить", "покупать"),
+    ("приготовить", "готовить"),
+    ("помыть", "мыть"),
+    ("вымыть", "мыть"),
+    ("принести", "приносить"),
+    ("забрать", "забирать"),
+    ("записать", "записывать"),
+    ("позвонить", "звонить"),
+    ("встретить", "встречать"),
+    ("налить", "наливать"),
+    ("починить", "чинить"),
+    ("сходить", "ходить"),
+    ("съездить", "ездить"),
+    ("заказать", "заказывать"),
+    ("достать", "доставать"),
+    ("покормить", "кормить"),
+    ("погулять", "гулять"),
+    ("подготовить", "подготавливать"),
+    ("показать", "показывать"),
+    ("рассказать", "рассказывать"),
+    ("спросить", "спрашивать"),
+    ("ответить", "отвечать"),
+    ("решить", "решать"),
+    ("закончить", "заканчивать"),
+    ("взять", "брать"),
+    ("положить", "класть"),
+    ("найти", "находить"),
+    ("прочитать", "читать"),
+    ("написать", "писать"),
+    ("надеть", "надевать"),
+    ("снять", "снимать"),
+    ("почистить", "чистить"),
+    ("погладить", "гладить"),
+    ("сварить", "варить"),
+    ("испечь", "печь"),
+    ("пожарить", "жарить"),
+];
+
+/// Синонимы, которые в эталонах уже встречались как расхождение.
+static SYNONYMS: &[(&str, &str)] = &[("картошка", "картофель"), ("свёкла", "свекла")];
+
+static ASPECT_STEMS: OnceLock<BTreeMap<String, String>> = OnceLock::new();
+static SYNONYM_STEMS: OnceLock<BTreeMap<String, String>> = OnceLock::new();
+
 /// Пары «эталон, ответ»: сначала по совпадению названий, затем оставшиеся по
 /// порядку, чтобы расхождения в названии и полях были видны.
-fn pair_items(expected: &[ItemView], actual: &[ItemView]) -> Vec<(Option<usize>, Option<usize>)> {
+fn pair_items(
+    expected: &[ItemView],
+    actual: &[ItemView],
+    titles: TitleMatch,
+) -> Vec<(Option<usize>, Option<usize>)> {
     let mut owner: Vec<Option<usize>> = vec![None; actual.len()];
     for index in 0..expected.len() {
         let mut seen = vec![false; actual.len()];
-        augment(index, expected, actual, &mut seen, &mut owner);
+        augment(index, expected, actual, &mut seen, &mut owner, titles);
     }
     let mut pairs = Vec::with_capacity(expected.len().max(actual.len()));
     let mut used = vec![false; actual.len()];
@@ -1029,9 +1223,10 @@ fn augment(
     actual: &[ItemView],
     seen: &mut [bool],
     owner: &mut [Option<usize>],
+    titles: TitleMatch,
 ) -> bool {
     for (slot, item) in actual.iter().enumerate() {
-        if seen[slot] || !names_match(&expected[index].title, &item.title) {
+        if seen[slot] || !names_match(&expected[index].title, &item.title, titles) {
             continue;
         }
         seen[slot] = true;
@@ -1041,7 +1236,7 @@ fn augment(
                 return true;
             }
             Some(current) => {
-                if augment(current, expected, actual, seen, owner) {
+                if augment(current, expected, actual, seen, owner, titles) {
                     owner[slot] = Some(index);
                     return true;
                 }
@@ -1796,6 +1991,7 @@ mod tests {
         let report = Report {
             prompt_version: PROMPT_VERSION.to_owned(),
             frozen_at: "2026-11-11".to_owned(),
+            titles: TitleMatch::Strict,
             results: vec![result(1_000), result(2_000), result(3_000), result(4_000)],
         };
         assert_eq!(report.p95(), Duration::from_secs(4));
@@ -1803,6 +1999,7 @@ mod tests {
         let report = Report {
             prompt_version: PROMPT_VERSION.to_owned(),
             frozen_at: "2026-11-11".to_owned(),
+            titles: TitleMatch::Strict,
             results: (1..=20).map(|seconds| result(seconds * 1_000)).collect(),
         };
         assert_eq!(report.p95(), Duration::from_secs(19));
@@ -1899,6 +2096,7 @@ mod tests {
         let report = Report {
             prompt_version: PROMPT_VERSION.to_owned(),
             frozen_at: "2026-11-11".to_owned(),
+            titles: TitleMatch::Strict,
             results: vec![
                 judge(
                     &phrase,
@@ -2059,5 +2257,294 @@ mod tests {
                 .with_timezone(&chrono::Utc)
         );
         assert_eq!(context.today().to_string(), "2026-11-10");
+    }
+
+    #[test]
+    fn strict_keeps_verb_aspect_apart() {
+        assert!(!names_match(
+            "Вынести мусор",
+            "Выносить мусор",
+            TitleMatch::Strict
+        ));
+        assert!(!names_match("Картошка", "Картофель", TitleMatch::Strict));
+    }
+
+    #[test]
+    fn the_title_standard_codes_match_serde() {
+        for titles in [TitleMatch::Strict, TitleMatch::Normalized] {
+            assert_eq!(TitleMatch::from_code(titles.as_str()), Some(titles));
+            assert_eq!(
+                serde_json::to_value(titles).expect("serialize"),
+                json!(titles.as_str()),
+                "the code and the stored form must agree"
+            );
+        }
+        assert_eq!(TitleMatch::from_code("loose"), None);
+    }
+
+    #[test]
+    fn normalized_merges_verb_aspect() {
+        for (expected, actual) in [
+            ("Вынести мусор", "Выносить мусор"),
+            ("Полить фикус", "Поливать фикус"),
+            ("Убраться в детской", "Убираться в детской"),
+            ("Проверить уроки", "Проверять уроки"),
+            ("Дать коту таблетку", "Давать коту таблетку"),
+            ("Заплатить за квартиру", "Платить за квартиру"),
+        ] {
+            assert!(
+                names_match(expected, actual, TitleMatch::Normalized),
+                "{expected} ~ {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalized_keeps_extra_words() {
+        // Нормализация сводит вид глагола, но не выбрасывает слова: «за» в
+        // названии — это разница в составе, а не в форме.
+        assert!(!names_match(
+            "Оплатить кружки",
+            "Платить за кружки",
+            TitleMatch::Normalized
+        ));
+    }
+
+    #[test]
+    fn normalized_merges_synonyms() {
+        assert!(names_match("Картошка", "Картофель", TitleMatch::Normalized));
+        assert!(names_match(
+            "купить картошку",
+            "Купить картофель",
+            TitleMatch::Normalized
+        ));
+    }
+
+    #[test]
+    fn the_list_name_is_compared_strictly_in_the_normalized_mode() {
+        let mut context = context_value();
+        context["lists"] = json!([
+            {"name": "Картошка", "kind": "tasks", "default": true},
+            {"name": "Картофель", "kind": "tasks", "default": false}
+        ]);
+        let phrase: SmokePhrase = serde_json::from_value(json!({
+            "id": "list-name",
+            "category": "simple",
+            "context": context,
+            "text": "фраза",
+            "expect": {
+                "items": [with(task("Купить молоко", date_none()), "list", json!("Картошка"))],
+                "clarifications": []
+            }
+        }))
+        .expect("phrase");
+        let answer = response(vec![with(
+            task("Купить молоко", date_none()),
+            "list",
+            json!("Картофель"),
+        )]);
+
+        let result = judge_mode(&phrase, &answer, TitleMatch::Normalized);
+
+        let Some(Failure::Mismatch { differences }) = &result.failure else {
+            panic!("not a mismatch: {:?}", result.failure);
+        };
+        assert!(
+            differences
+                .iter()
+                .any(|difference| difference.field == "список"),
+            "a list name is an identifier, not a free-text title: {differences:?}"
+        );
+    }
+
+    fn judge_mode(phrase: &SmokePhrase, answer: &str, titles: TitleMatch) -> PhraseResult {
+        let context: InputContext = serde_json::from_value(context_value()).expect("context");
+        judge_with(
+            phrase,
+            &context,
+            &SlotRun::text(answer, Duration::from_secs(1)),
+            Duration::from_secs(20),
+            titles,
+        )
+        .expect("phrase is judged")
+    }
+
+    /// Режим должен доходить до сравнения через `judge_with`, а не только
+    /// работать в `names_match` напрямую.
+    /// Один и тот же прогон оценивается в двух режимах, и вердикт отчёта
+    /// совпадает с выбранным режимом (это то, что печатает `capture-eval`).
+    #[test]
+    fn evaluate_with_reports_the_mode_and_its_verdict() {
+        let set = SmokeSet::parse(
+            &json!({
+                "prompt_version": PROMPT_VERSION,
+                "frozen_at": "2026-11-11",
+                "context": context_value(),
+                "phrases": [{
+                    "id": "mode",
+                    "category": Category::Simple,
+                    "text": "вынести мусор",
+                    "expect": {"items": [task("Вынести мусор", date_none())], "clarifications": []},
+                }],
+            })
+            .to_string(),
+        )
+        .expect("set");
+
+        let mut runs = BTreeMap::new();
+        runs.insert(
+            "mode".to_owned(),
+            SlotRun::text(
+                response(vec![task("Выносить мусор", date_none())]),
+                Duration::from_millis(1),
+            ),
+        );
+
+        let strict = evaluate_with(&set, &runs, Duration::from_secs(20), TitleMatch::Strict)
+            .expect("strict");
+        let normalized =
+            evaluate_with(&set, &runs, Duration::from_secs(20), TitleMatch::Normalized)
+                .expect("normalized");
+
+        assert!(!strict.passed(), "strict keeps the aspect apart");
+        assert!(normalized.passed(), "normalized accepts the aspect pair");
+        assert_eq!(strict.titles, TitleMatch::Strict);
+        assert_eq!(normalized.titles, TitleMatch::Normalized);
+        assert_eq!(normalized.to_json()["titles"], "normalized");
+        assert_eq!(strict.to_json()["titles"], "strict");
+    }
+
+    #[test]
+    fn normalized_mode_is_reachable_through_judge() {
+        let phrase = phrase(
+            "mode",
+            Category::Simple,
+            json!({"items": [task("Вынести мусор", date_none())], "clarifications": []}),
+        );
+        let answer = response(vec![task("Выносить мусор", date_none())]);
+
+        assert!(
+            judge_mode(&phrase, &answer, TitleMatch::Strict)
+                .failure
+                .is_some(),
+            "strict keeps the aspect apart"
+        );
+        assert!(
+            judge_mode(&phrase, &answer, TitleMatch::Normalized)
+                .failure
+                .is_none(),
+            "normalized accepts the aspect pair"
+        );
+    }
+
+    /// Сопоставление элементов тоже идёт по нормализованным названиям:
+    /// переставленные элементы не должны давать «не найден».
+    #[test]
+    fn normalized_pairing_matches_items_in_any_order() {
+        let phrase = phrase(
+            "pair",
+            Category::Simple,
+            json!({
+                "items": [
+                    task("Вынести мусор", date_none()),
+                    task("Полить фикус", date_none()),
+                ],
+                "clarifications": [],
+            }),
+        );
+        let answer = response(vec![
+            task("Поливать фикус", date_none()),
+            task("Выносить мусор", date_none()),
+        ]);
+
+        assert!(
+            judge_mode(&phrase, &answer, TitleMatch::Strict)
+                .failure
+                .is_some()
+        );
+        assert!(
+            judge_mode(&phrase, &answer, TitleMatch::Normalized)
+                .failure
+                .is_none(),
+            "aspect pairs pair up regardless of order"
+        );
+    }
+
+    /// Каждая пара словаря должна работать: иначе запись в словаре мертва.
+    #[test]
+    fn every_dictionary_pair_is_equivalent_in_normalized() {
+        for (variant, canonical) in ASPECT_PAIRS.iter().copied() {
+            assert!(
+                names_match(variant, canonical, TitleMatch::Normalized),
+                "{variant} ~ {canonical}"
+            );
+        }
+        for (variant, canonical) in SYNONYMS.iter().copied() {
+            assert!(
+                names_match(variant, canonical, TitleMatch::Normalized),
+                "{variant} ~ {canonical}"
+            );
+        }
+    }
+
+    /// Пары, на которых падали эталоны v0.9, обязаны быть в словаре.
+    /// Табличный тест выше перебирает сам словарь и удаление записи не
+    /// заметит; этот — заметит.
+    #[test]
+    fn aspect_dictionary_covers_the_observed_pairs() {
+        let required = [
+            ("дать", "давать"),
+            ("вынести", "выносить"),
+            ("убраться", "убираться"),
+            ("полить", "поливать"),
+            ("проверить", "проверять"),
+            ("отправить", "отправлять"),
+            ("закрыть", "закрывать"),
+            ("собрать", "собирать"),
+            ("оплатить", "платить"),
+            ("заплатить", "платить"),
+            ("сдать", "сдавать"),
+            ("обновить", "обновлять"),
+            ("нарядить", "наряжать"),
+            ("пересмотреть", "пересматривать"),
+            ("передать", "передавать"),
+        ];
+        for (variant, canonical) in required {
+            assert!(
+                ASPECT_PAIRS.contains(&(variant, canonical)),
+                "{variant}/{canonical} пропала из словаря"
+            );
+            assert!(
+                names_match(variant, canonical, TitleMatch::Normalized),
+                "{variant} ~ {canonical}"
+            );
+        }
+    }
+
+    /// Вид глагола сводится только у инфинитивов: существительное с той же
+    /// основой — другое название.
+    #[test]
+    fn normalized_does_not_merge_a_noun_with_its_verb() {
+        for (noun, verb) in [("наряд", "нарядить"), ("пол", "полить")] {
+            assert!(
+                !names_match(noun, verb, TitleMatch::Normalized),
+                "{noun} ≠ {verb}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalized_keeps_different_titles() {
+        for (expected, actual) in [
+            ("Подарок", "Подарок Игорю"),
+            ("Бензин", "Бензин для генератора"),
+            ("Визит сантехника", "Сантехник"),
+            ("Погулять в парке", "Сходить в кино"),
+        ] {
+            assert!(
+                !names_match(expected, actual, TitleMatch::Normalized),
+                "{expected} ≠ {actual}"
+            );
+        }
     }
 }

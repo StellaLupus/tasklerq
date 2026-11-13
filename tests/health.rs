@@ -13,6 +13,7 @@ use http_body_util::BodyExt;
 use serde_json::{Map, Value, json};
 use sqlx::PgPool;
 use tasklerq::app::build_application;
+use tasklerq::capture::eval::TitleMatch;
 use tasklerq::capture::prompt;
 use tasklerq::capture::slot_check;
 use tasklerq::capture::slot_status::{CACHE_TTL, LlmSlotHealth, SlotStatus};
@@ -22,6 +23,7 @@ use tasklerq::http::router::{AppState, build_router};
 use tasklerq::llm::Chain;
 use tasklerq::security_audit::Audit;
 use tasklerq::storage::repositories::llm_slot_checks::{self, NewCheck};
+use tasklerq::storage::repositories::llm_slot_settings;
 use tokio::sync::watch;
 use tower::ServiceExt;
 
@@ -88,11 +90,19 @@ fn llm_health(
     (chain, health)
 }
 
-async fn store_check(pool: &PgPool, slot: &str, config: &SlotConfig, passed: usize, total: usize) {
+async fn store_check(
+    pool: &PgPool,
+    slot: &str,
+    config: &SlotConfig,
+    passed: usize,
+    total: usize,
+    titles: TitleMatch,
+) {
     let fingerprint = slot_check::fingerprint(
         config,
         &prompt::contract_hash(),
         &slot_check::set_hash(slot_check::BUILTIN_SET),
+        titles,
     );
     let parts = fingerprint.parts.to_json();
     let report = json!({"total": total, "passed": passed});
@@ -331,8 +341,8 @@ async fn all_llm_slots_unavailable_is_a_warning_not_a_failure() {
     let primary = slot_config("vendor/primary");
     let fallback = slot_config("vendor/fallback");
     let (chain, health) = llm_health(&primary, Some(&fallback));
-    store_check(&db.pool, "primary", &primary, 22, 22).await;
-    store_check(&db.pool, "fallback", &fallback, 22, 22).await;
+    store_check(&db.pool, "primary", &primary, 22, 22, TitleMatch::Strict).await;
+    store_check(&db.pool, "fallback", &fallback, 22, 22, TitleMatch::Strict).await;
     let now = Utc::now();
     support::llm::open_primary(&chain, now);
     support::llm::open_fallback(&chain, now);
@@ -349,8 +359,8 @@ async fn an_open_primary_breaker_alone_does_not_warn_about_llm() {
     let primary = slot_config("vendor/primary");
     let fallback = slot_config("vendor/fallback");
     let (chain, health) = llm_health(&primary, Some(&fallback));
-    store_check(&db.pool, "primary", &primary, 22, 22).await;
-    store_check(&db.pool, "fallback", &fallback, 22, 22).await;
+    store_check(&db.pool, "primary", &primary, 22, 22, TitleMatch::Strict).await;
+    store_check(&db.pool, "fallback", &fallback, 22, 22, TitleMatch::Strict).await;
     support::llm::open_primary(&chain, Utc::now());
 
     let (status, body) = ready_with_llm(&db.pool, health).await;
@@ -380,6 +390,58 @@ async fn an_unchecked_primary_slot_is_reported_in_readiness() {
     assert!(!response.contains("vendor/primary"), "{response}");
     assert!(!response.contains("api.example.test"), "{response}");
     assert!(!response.contains("SECRET-slot-token"), "{response}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_normalized_check_names_its_standard_in_readiness() {
+    let db = support::isolated_db().await;
+    let primary = slot_config("vendor/primary");
+    let (_chain, health) = llm_health(&primary, None);
+    let mut conn = db.pool.acquire().await.expect("connection");
+    llm_slot_settings::set_titles(&mut conn, "primary", "normalized")
+        .await
+        .expect("standard");
+    drop(conn);
+    store_check(
+        &db.pool,
+        "primary",
+        &primary,
+        17,
+        22,
+        TitleMatch::Normalized,
+    )
+    .await;
+
+    let (status, body) = ready_with_llm(&db.pool, health).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["warnings"],
+        json!(["llm_slot_unverified:primary:normalized"]),
+        "the warning must name the saved standard:\n{body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_changed_standard_makes_the_saved_check_stale() {
+    let db = support::isolated_db().await;
+    let primary = slot_config("vendor/primary");
+    let (_chain, health) = llm_health(&primary, None);
+    store_check(&db.pool, "primary", &primary, 22, 22, TitleMatch::Strict).await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+    llm_slot_settings::set_titles(&mut conn, "primary", "normalized")
+        .await
+        .expect("standard");
+    drop(conn);
+
+    let (status, body) = ready_with_llm(&db.pool, health).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["warnings"],
+        json!(["llm_slot_unverified:primary:strict"]),
+        "a strict check must not pass as normalized:\n{body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -413,7 +475,7 @@ async fn a_passed_slot_has_no_readiness_warning() {
     let db = support::isolated_db().await;
     let primary = slot_config("vendor/primary");
     let (_chain, health) = llm_health(&primary, None);
-    store_check(&db.pool, "primary", &primary, 22, 22).await;
+    store_check(&db.pool, "primary", &primary, 22, 22, TitleMatch::Strict).await;
 
     let (status, body) = ready_with_llm(&db.pool, health).await;
 
@@ -429,14 +491,14 @@ async fn the_readiness_status_is_cached_for_a_minute() {
     let db = support::isolated_db().await;
     let primary = slot_config("vendor/primary");
     let (_chain, health) = llm_health(&primary, None);
-    store_check(&db.pool, "primary", &primary, 22, 22).await;
+    store_check(&db.pool, "primary", &primary, 22, 22, TitleMatch::Strict).await;
 
     let (status, body) = ready_with_llm(&db.pool, health.clone()).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.get("warnings").is_none(), "{body}");
 
     // Проверка изменилась, но readiness ещё смотрит в кеш.
-    store_check(&db.pool, "primary", &primary, 17, 22).await;
+    store_check(&db.pool, "primary", &primary, 17, 22, TitleMatch::Strict).await;
     let (status, body) = ready_with_llm(&db.pool, health.clone()).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(
@@ -450,8 +512,8 @@ async fn the_readiness_status_is_cached_for_a_minute() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body["warnings"],
-        json!(["llm_slot_unverified:primary"]),
-        "{body}"
+        json!(["llm_slot_unverified:primary:strict"]),
+        "a saved check names its standard:\n{body}"
     );
 }
 
@@ -460,14 +522,14 @@ async fn the_readiness_cache_expires_after_its_ttl() {
     let db = support::isolated_db().await;
     let primary = slot_config("vendor/primary");
     let (_chain, health) = llm_health(&primary, None);
-    store_check(&db.pool, "primary", &primary, 22, 22).await;
+    store_check(&db.pool, "primary", &primary, 22, 22, TitleMatch::Strict).await;
 
     let now = Utc::now();
     let statuses = health.statuses(&db.pool, now).await;
     assert_eq!(statuses[0].status, SlotStatus::Passed);
 
     // Новая проверка в базе не видна, пока не истёк срок кеша.
-    store_check(&db.pool, "primary", &primary, 17, 22).await;
+    store_check(&db.pool, "primary", &primary, 17, 22, TitleMatch::Strict).await;
     let cached = health
         .statuses(&db.pool, now + CACHE_TTL - ChronoDuration::seconds(1))
         .await;
@@ -489,7 +551,7 @@ async fn a_failed_readiness_refresh_keeps_the_previous_status_and_extends_the_ca
     let db = support::isolated_db().await;
     let primary = slot_config("vendor/primary");
     let (_chain, health) = llm_health(&primary, None);
-    store_check(&db.pool, "primary", &primary, 22, 22).await;
+    store_check(&db.pool, "primary", &primary, 22, 22, TitleMatch::Strict).await;
     let now = Utc::now();
     assert_eq!(
         health.statuses(&db.pool, now).await[0].status,
@@ -497,7 +559,7 @@ async fn a_failed_readiness_refresh_keeps_the_previous_status_and_extends_the_ca
     );
 
     // Проверка в базе изменилась, но прочитать её нечем.
-    store_check(&db.pool, "primary", &primary, 17, 22).await;
+    store_check(&db.pool, "primary", &primary, 17, 22, TitleMatch::Strict).await;
     let broken = sqlx::postgres::PgPoolOptions::new()
         .acquire_timeout(StdDuration::from_millis(500))
         .connect_lazy("postgres://tasklerq:secret@127.0.0.1:1/tasklerq")
@@ -578,6 +640,90 @@ async fn startup_warns_about_an_unchecked_primary_slot_without_secrets() {
     assert!(
         warns_about_primary,
         "the startup log must warn with slot = primary:\n{text}"
+    );
+    assert!(!text.contains("SECRET-slot-token"), "token leaked:\n{text}");
+    assert!(
+        !text.contains("api.example.test"),
+        "slot address leaked:\n{text}"
+    );
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    for worker in application.workers {
+        tokio::time::timeout(StdDuration::from_secs(5), worker)
+            .await
+            .expect("worker must stop on shutdown")
+            .expect("worker task must join");
+    }
+}
+
+#[tokio::test]
+async fn startup_names_the_saved_standard_of_a_passed_slot() {
+    let db = support::isolated_db().await;
+    let database_url = support::database_url().await;
+    let config = Config::from_map([
+        ("ENV", "development"),
+        ("PUBLIC_BASE_URL", "http://127.0.0.1:18080"),
+        ("DATABASE_URL", database_url.as_str()),
+        ("TELEGRAM_MODE", "disabled"),
+        ("TENANCY_MODE", "single"),
+        ("LLM_CAPTURE_ENABLED", "true"),
+        ("LLM_PRIMARY_URL", "https://api.example.test/v1"),
+        ("LLM_PRIMARY_MODEL", "vendor/primary"),
+        ("LLM_PRIMARY_TOKEN", "SECRET-slot-token"),
+    ])
+    .expect("test config should be valid");
+
+    let primary = slot_config("vendor/primary");
+    let mut conn = db.pool.acquire().await.expect("connection");
+    llm_slot_settings::set_titles(&mut conn, "primary", "normalized")
+        .await
+        .expect("standard");
+    drop(conn);
+    store_check(
+        &db.pool,
+        "primary",
+        &primary,
+        22,
+        22,
+        TitleMatch::Normalized,
+    )
+    .await;
+
+    // current_thread: подписчик `set_default` живёт на потоке теста, и все
+    // записи старта попадают в буфер.
+    let logs = support::logs::LogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(logs.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let application = build_application(&config, db.pool.clone(), shutdown_rx)
+        .await
+        .expect("a passed slot must not stop startup");
+
+    let (status, body) = get(&application.router, "/health/ready").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.get("warnings").is_none(),
+        "a passed slot must not warn:\n{body}"
+    );
+
+    let text = logs.contents();
+    let names_the_standard = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .any(|record| {
+            record["level"] == "INFO"
+                && record["fields"]["slot"] == "primary"
+                && record["fields"]["status"] == "passed"
+                && record["fields"]["titles"] == "normalized"
+        });
+    assert!(
+        names_the_standard,
+        "the startup log must name the saved standard:\n{text}"
     );
     assert!(!text.contains("SECRET-slot-token"), "token leaked:\n{text}");
     assert!(

@@ -14,6 +14,7 @@ pub mod items;
 pub mod lists;
 pub mod llm_runs;
 pub mod llm_slot_checks;
+pub mod llm_slot_settings;
 pub mod members;
 pub mod notifications;
 pub mod subtasks;
