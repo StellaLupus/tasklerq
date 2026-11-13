@@ -380,6 +380,8 @@ pub struct Report {
     pub prompt_version: String,
     /// Дата заморозки набора.
     pub frozen_at: String,
+    /// Режим сравнения названий, которым получен вердикт.
+    pub titles: TitleMatch,
     /// Результаты в порядке набора.
     pub results: Vec<PhraseResult>,
 }
@@ -426,6 +428,7 @@ impl Report {
         json!({
             "prompt_version": self.prompt_version,
             "frozen_at": self.frozen_at,
+            "titles": self.titles.as_str(),
             "total": self.total(),
             "passed": self.passed_count(),
             "latency_p95_ms": duration_ms(self.p95()),
@@ -477,22 +480,37 @@ pub fn evaluate(
     runs: &BTreeMap<String, SlotRun>,
     timeout: Duration,
 ) -> Result<Report, String> {
+    evaluate_with(set, runs, timeout, TitleMatch::Strict)
+}
+
+/// Оценить набор в выбранном режиме сравнения названий.
+///
+/// Прогон (вызовы слота) не повторяется: один и тот же набор исходов можно
+/// оценить и строго, и нормализованно.
+pub fn evaluate_with(
+    set: &SmokeSet,
+    runs: &BTreeMap<String, SlotRun>,
+    timeout: Duration,
+    titles: TitleMatch,
+) -> Result<Report, String> {
     let mut results = Vec::with_capacity(set.phrases.len());
     for phrase in &set.phrases {
         let run = runs
             .get(&phrase.id)
             .ok_or_else(|| format!("фраза {}: нет исхода вызова слота", phrase.id))?;
-        results.push(judge(phrase, &set.context, run, timeout)?);
+        results.push(judge_with(phrase, &set.context, run, timeout, titles)?);
     }
     Ok(Report {
         prompt_version: set.prompt_version.clone(),
         frozen_at: set.frozen_at.clone(),
+        titles,
         results,
     })
 }
 
 /// Как сравнивать названия элементов.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TitleMatch {
     /// Только основы слов: «Вынести мусор» и «Выносить мусор» — разные.
     #[default]
@@ -500,6 +518,16 @@ pub enum TitleMatch {
     /// Основы плюс вид глагола и синонимы: «Вынести мусор» и
     /// «Выносить мусор» — одно название.
     Normalized,
+}
+
+impl TitleMatch {
+    /// Имя режима для отчёта и логов.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Normalized => "normalized",
+        }
+    }
 }
 
 /// Оценить одну фразу строго (совместимость).
@@ -1957,6 +1985,7 @@ mod tests {
         let report = Report {
             prompt_version: PROMPT_VERSION.to_owned(),
             frozen_at: "2026-11-11".to_owned(),
+            titles: TitleMatch::Strict,
             results: vec![result(1_000), result(2_000), result(3_000), result(4_000)],
         };
         assert_eq!(report.p95(), Duration::from_secs(4));
@@ -1964,6 +1993,7 @@ mod tests {
         let report = Report {
             prompt_version: PROMPT_VERSION.to_owned(),
             frozen_at: "2026-11-11".to_owned(),
+            titles: TitleMatch::Strict,
             results: (1..=20).map(|seconds| result(seconds * 1_000)).collect(),
         };
         assert_eq!(report.p95(), Duration::from_secs(19));
@@ -2060,6 +2090,7 @@ mod tests {
         let report = Report {
             prompt_version: PROMPT_VERSION.to_owned(),
             frozen_at: "2026-11-11".to_owned(),
+            titles: TitleMatch::Strict,
             results: vec![
                 judge(
                     &phrase,
@@ -2279,6 +2310,48 @@ mod tests {
 
     /// Режим должен доходить до сравнения через `judge_with`, а не только
     /// работать в `names_match` напрямую.
+    /// Один и тот же прогон оценивается в двух режимах, и вердикт отчёта
+    /// совпадает с выбранным режимом (это то, что печатает `capture-eval`).
+    #[test]
+    fn evaluate_with_reports_the_mode_and_its_verdict() {
+        let set = SmokeSet::parse(
+            &json!({
+                "prompt_version": PROMPT_VERSION,
+                "frozen_at": "2026-11-11",
+                "context": context_value(),
+                "phrases": [{
+                    "id": "mode",
+                    "category": Category::Simple,
+                    "text": "вынести мусор",
+                    "expect": {"items": [task("Вынести мусор", date_none())], "clarifications": []},
+                }],
+            })
+            .to_string(),
+        )
+        .expect("set");
+
+        let mut runs = BTreeMap::new();
+        runs.insert(
+            "mode".to_owned(),
+            SlotRun::text(
+                response(vec![task("Выносить мусор", date_none())]),
+                Duration::from_millis(1),
+            ),
+        );
+
+        let strict =
+            evaluate_with(&set, &runs, Duration::from_secs(20), TitleMatch::Strict).expect("strict");
+        let normalized = evaluate_with(&set, &runs, Duration::from_secs(20), TitleMatch::Normalized)
+            .expect("normalized");
+
+        assert!(!strict.passed(), "strict keeps the aspect apart");
+        assert!(normalized.passed(), "normalized accepts the aspect pair");
+        assert_eq!(strict.titles, TitleMatch::Strict);
+        assert_eq!(normalized.titles, TitleMatch::Normalized);
+        assert_eq!(normalized.to_json()["titles"], "normalized");
+        assert_eq!(strict.to_json()["titles"], "strict");
+    }
+
     #[test]
     fn normalized_mode_is_reachable_through_judge() {
         let phrase = phrase(

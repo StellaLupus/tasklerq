@@ -57,6 +57,18 @@ pub async fn run_set(
     set: &SmokeSet,
     timeout: Duration,
 ) -> Result<Report, String> {
+    let runs = collect_runs(backend, set).await?;
+    evaluate(set, &runs, timeout)
+}
+
+/// Собрать исходы вызовов слота, не судя их.
+///
+/// Нужен, когда один прогон надо оценить в нескольких режимах сравнения
+/// названий: вызовы слота платные и недетерминированные, повторять их нельзя.
+pub async fn collect_runs(
+    backend: &dyn ChatBackend,
+    set: &SmokeSet,
+) -> Result<BTreeMap<String, SlotRun>, String> {
     let mut runs = BTreeMap::new();
     for phrase in &set.phrases {
         let context = phrase.context(&set.context)?;
@@ -75,7 +87,7 @@ pub async fn run_set(
         };
         runs.insert(phrase.id.clone(), run);
     }
-    evaluate(set, &runs, timeout)
+    Ok(runs)
 }
 
 /// Части отпечатка слота; сам отпечаток — SHA-256 этих частей.

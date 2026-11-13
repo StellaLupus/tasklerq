@@ -9,7 +9,7 @@ use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tasklerq::admin;
 use tasklerq::app::build_application;
-use tasklerq::capture::eval::SmokeSet;
+use tasklerq::capture::eval::{SmokeSet, evaluate_with};
 use tasklerq::capture::slot_check;
 use tasklerq::config::{self, Config, DatabaseConfig, LlmConfig, SlotConfig, TenancyConfig};
 use tasklerq::domain::error::DomainError;
@@ -74,6 +74,11 @@ enum Command {
     /// Проверка доступна и при `LLM_CAPTURE_ENABLED=false`, если запрошенный
     /// слот задан: так слот проверяют до включения разбора.
     ///
+    /// `--titles strict|normalized` выбирает сравнение названий: строгое
+    /// (форма — часть контракта) или с видом глагола и синонимами. Второй
+    /// режим печатается справочно по тому же прогону и не влияет на вердикт,
+    /// код возврата и запись в `llm_slot_checks`.
+    ///
     /// Коды возврата: 0 — все фразы пройдены; 1 — слот не прошёл проверку;
     /// 2 — ошибка конфигурации, слота или набора (версия контракта проверяется
     /// до вызовов LLM), а также недоступная база; результат в `llm_slot_checks`
@@ -114,6 +119,33 @@ struct CaptureEvalArgs {
     /// Файл smoke-набора; без значения — встроенный набор `capture-v4`.
     #[arg(long, value_name = "PATH")]
     set: Option<PathBuf>,
+    /// Сравнение названий: `strict` — только основы слов, `normalized` —
+    /// ещё вид глагола и синонимы («Вынести мусор» ≈ «Выносить мусор»).
+    ///
+    /// Режим задаёт вердикт, код возврата и запись в `llm_slot_checks`;
+    /// второй режим печатается справочно по тому же прогону, без повторных
+    /// вызовов слота. По умолчанию строгий: форма названия — часть контракта.
+    #[arg(long, value_enum, default_value = "strict")]
+    titles: TitleArg,
+}
+
+/// Режим сравнения названий для `capture-eval`.
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+enum TitleArg {
+    /// Только основы слов.
+    #[default]
+    Strict,
+    /// Основы, вид глагола и синонимы.
+    Normalized,
+}
+
+impl TitleArg {
+    fn mode(self) -> tasklerq::capture::eval::TitleMatch {
+        match self {
+            Self::Strict => tasklerq::capture::eval::TitleMatch::Strict,
+            Self::Normalized => tasklerq::capture::eval::TitleMatch::Normalized,
+        }
+    }
 }
 
 /// Слот, который проверяет `capture-eval`.
@@ -930,10 +962,25 @@ async fn run_capture_eval(args: CaptureEvalArgs) -> Result<tasklerq::capture::ev
         .context("database connection failed")?;
     drop(pool.acquire().await.context("database connection failed")?);
 
-    let report = slot_check::run_set(&prepared.backend, &prepared.set, prepared.slot.timeout)
+    // Прогон один: вызовы слота платные и недетерминированные, поэтому оба
+    // режима судят одни и те же исходы.
+    let runs = slot_check::collect_runs(&prepared.backend, &prepared.set)
         .await
         .map_err(anyhow::Error::msg)
         .context("invalid smoke set")?;
+    let mode = args.titles.mode();
+    let report = evaluate_with(&prepared.set, &runs, prepared.slot.timeout, mode)
+        .map_err(anyhow::Error::msg)
+        .context("invalid smoke set")?;
+    let other_mode = match mode {
+        tasklerq::capture::eval::TitleMatch::Strict => {
+            tasklerq::capture::eval::TitleMatch::Normalized
+        }
+        tasklerq::capture::eval::TitleMatch::Normalized => {
+            tasklerq::capture::eval::TitleMatch::Strict
+        }
+    };
+    let other = evaluate_with(&prepared.set, &runs, prepared.slot.timeout, other_mode).ok();
 
     let set_hash = slot_check::set_hash(&prepared.set_text);
     let contract_hash = tasklerq::capture::prompt::contract_hash();
@@ -943,6 +990,17 @@ async fn run_capture_eval(args: CaptureEvalArgs) -> Result<tasklerq::capture::ev
     // равно виден, а код возврата останется «проверка не выполнена».
     println!("Слот: {} ({})", prepared.slot_name, prepared.slot.model);
     println!("Отпечаток: {}", fingerprint.value);
+    if let Some(other) = &other {
+        println!(
+            "Названия: {} — {} из {} (вердикт), {} — {} из {} (справочно)",
+            mode.as_str(),
+            report.passed_count(),
+            report.total(),
+            other_mode.as_str(),
+            other.passed_count(),
+            other.total(),
+        );
+    }
     print!("{}", report.to_text());
 
     let report_json = report.to_json();
