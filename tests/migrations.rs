@@ -718,6 +718,98 @@ async fn llm_slots_migration_applies_on_a_clean_database() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn llm_slot_settings_migration_applies_on_a_clean_database() {
+    let db = support::empty_db().await;
+    migrations::run(&db.pool)
+        .await
+        .expect("migrations should apply on a clean database");
+
+    let columns: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT column_name, data_type, is_nullable
+         FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'llm_slot_settings'
+         ORDER BY ordinal_position",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("llm_slot_settings columns");
+
+    let shape: Vec<(&str, &str, &str)> = columns
+        .iter()
+        .map(|(name, data_type, nullable)| (name.as_str(), data_type.as_str(), nullable.as_str()))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("slot", "text", "NO"),
+            ("titles", "text", "NO"),
+            ("updated_at", "timestamp with time zone", "NO"),
+        ],
+        "one standard per slot, no nullable fields"
+    );
+
+    let primary_key: Vec<String> = sqlx::query_scalar(
+        "SELECT a.attname
+         FROM pg_index i
+         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey)
+         WHERE i.indrelid = 'public.llm_slot_settings'::regclass AND i.indisprimary",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("llm_slot_settings primary key");
+    assert_eq!(
+        primary_key,
+        vec!["slot".to_owned()],
+        "one row per slot: the slot is the primary key"
+    );
+
+    let titles_default: Option<String> = sqlx::query_scalar(
+        "SELECT column_default
+         FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'llm_slot_settings'
+           AND column_name = 'titles'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("titles default");
+    assert!(
+        titles_default
+            .as_deref()
+            .is_some_and(|default| default.contains("strict")),
+        "a missing standard must default to strict: {titles_default:?}"
+    );
+
+    sqlx::query("INSERT INTO llm_slot_settings (slot, titles) VALUES ('primary', 'normalized')")
+        .execute(&db.pool)
+        .await
+        .expect("a known standard must be accepted");
+
+    let rejected =
+        sqlx::query("INSERT INTO llm_slot_settings (slot, titles) VALUES ('fallback', 'loose')")
+            .execute(&db.pool)
+            .await;
+    assert!(
+        rejected.is_err(),
+        "only strict and normalized are valid standards"
+    );
+
+    let blank =
+        sqlx::query("INSERT INTO llm_slot_settings (slot, titles) VALUES ('   ', 'strict')")
+            .execute(&db.pool)
+            .await;
+    assert!(blank.is_err(), "a blank slot name must be rejected");
+
+    let duplicate =
+        sqlx::query("INSERT INTO llm_slot_settings (slot, titles) VALUES ('primary', 'strict')")
+            .execute(&db.pool)
+            .await;
+    assert!(
+        duplicate.is_err(),
+        "one row per slot: a duplicate is an error"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn llm_slots_migration_keeps_existing_runs_without_a_slot() {
     let db = support::empty_db().await;
     let dir = std::env::temp_dir().join(format!(

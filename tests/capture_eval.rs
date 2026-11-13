@@ -11,10 +11,16 @@ use std::process::{Output, Stdio};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sqlx::postgres::PgPoolOptions;
-use tasklerq::capture::prompt::PROMPT_VERSION;
+use tasklerq::capture::eval::TitleMatch;
+use tasklerq::capture::prompt::{self, PROMPT_VERSION};
+use tasklerq::capture::slot_check;
+use tasklerq::capture::slot_status::{self, SlotStatus};
+use tasklerq::config::{SecretString, SlotConfig};
 use tasklerq::storage::migrations;
+use tasklerq::storage::repositories::llm_slot_checks;
+use tasklerq::storage::repositories::llm_slot_settings;
 use tokio::process::Command;
 use uuid::Uuid;
 use wiremock::matchers::{body_string_contains, method, path};
@@ -149,6 +155,186 @@ async fn slot_rows(
     .fetch_all(pool)
     .await
     .expect("slot checks")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_slot_standard_round_trips_through_the_settings_table() {
+    let db = cli_database().await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    assert_eq!(
+        llm_slot_settings::titles(&mut conn, "primary")
+            .await
+            .expect("standard"),
+        "strict",
+        "no row means the strict standard"
+    );
+
+    llm_slot_settings::set_titles(&mut conn, "primary", "normalized")
+        .await
+        .expect("the standard should be stored");
+    assert_eq!(
+        llm_slot_settings::titles(&mut conn, "primary")
+            .await
+            .expect("standard"),
+        "normalized",
+        "the stored standard must be read back"
+    );
+    assert_eq!(
+        llm_slot_settings::titles(&mut conn, "fallback")
+            .await
+            .expect("standard"),
+        "strict",
+        "the standard is per slot"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_check_without_a_saved_standard_reads_as_strict() {
+    let db = cli_database().await;
+    sqlx::query(
+        "INSERT INTO llm_slot_checks (
+             slot, fingerprint, fingerprint_parts, passed, total, p95_ms, report,
+             checked_at
+         )
+         VALUES ('primary', 'legacy', '{\"model\":\"m\"}'::jsonb, 1, 1, 1000,
+                 '{}'::jsonb, now())",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("a check written before the standard existed");
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let check = llm_slot_checks::latest(&mut conn, "primary")
+        .await
+        .expect("the saved check should be read")
+        .expect("the check exists");
+
+    assert_eq!(
+        check.titles, "strict",
+        "a check without a saved standard was strict"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_title_standard_is_saved_and_decides_the_verdict() {
+    let db = cli_database().await;
+    let server = MockServer::start().await;
+    // Модель отвечает несовершенным видом на совершенный эталон: строгое
+    // сравнение видит разные основы, нормализованное — одну пару.
+    mount_answer(&server, "заплатить за квартиру", "Платить за квартиру").await;
+    let (set_path, dir) = write_set(
+        "titles",
+        &smoke_set(&[("standard", "заплатить за квартиру", "Заплатить за квартиру")]),
+    );
+
+    let run = |titles: Option<&str>| {
+        let mut command = capture_eval(&db.url, &server, 10_000);
+        command.args([
+            "capture-eval",
+            "--slot",
+            "primary",
+            "--set",
+            set_path.to_str().expect("path"),
+        ]);
+        if let Some(titles) = titles {
+            command.args(["--titles", titles]);
+        }
+        command.stdin(Stdio::null()).output()
+    };
+
+    // Нормализованный стандарт: фраза проходит, печатаются оба числа, стандарт
+    // сохраняется за слотом и входит в отпечаток.
+    let normalized = run(Some("normalized")).await.expect("the CLI should run");
+    assert_eq!(normalized.status.code(), Some(0), "{normalized:?}");
+    let text = stdout(&normalized);
+    assert!(
+        text.contains("Названия: normalized — 1 из 1 (стандарт), strict — 0 из 1 (справочно)"),
+        "both counts are printed from one run:\n{text}"
+    );
+    assert!(text.contains("Слот прошёл проверку"), "{text}");
+
+    // Второй режим судит тот же прогон: слот вызван один раз на фразу.
+    assert_eq!(
+        server.received_requests().await.expect("requests").len(),
+        1,
+        "both standards must be judged from one slot call"
+    );
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    assert_eq!(
+        llm_slot_settings::titles(&mut conn, "primary")
+            .await
+            .expect("standard"),
+        "normalized",
+        "the flag must save the standard"
+    );
+    let parts_titles: String = sqlx::query_scalar(
+        "SELECT fingerprint_parts->>'titles' FROM llm_slot_checks WHERE slot = 'primary'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("fingerprint parts");
+    assert_eq!(
+        parts_titles, "normalized",
+        "the standard is part of the check"
+    );
+
+    // Без флага действует сохранённый стандарт.
+    let default_run = run(None).await.expect("the CLI should run");
+    assert_eq!(default_run.status.code(), Some(0), "{default_run:?}");
+    let text = stdout(&default_run);
+    assert!(
+        text.contains("Названия: normalized — 1 из 1 (стандарт)"),
+        "the saved standard is used without the flag:\n{text}"
+    );
+
+    // Строгий стандарт: та же фраза не проходит, стандарт перезаписан.
+    let strict = run(Some("strict")).await.expect("the CLI should run");
+    assert_eq!(strict.status.code(), Some(1), "{strict:?}");
+    let text = stdout(&strict);
+    assert!(
+        text.contains("Названия: strict — 0 из 1 (стандарт), normalized — 1 из 1 (справочно)"),
+        "{text}"
+    );
+    assert_eq!(
+        llm_slot_settings::titles(&mut conn, "primary")
+            .await
+            .expect("standard"),
+        "strict",
+        "the strict flag must save the strict standard"
+    );
+
+    // Смена стандарта делает сохранённую проверку устаревшей.
+    let check = llm_slot_checks::latest(&mut conn, "primary")
+        .await
+        .expect("the saved check")
+        .expect("the check exists");
+    assert_eq!(check.titles, "strict");
+    llm_slot_settings::set_titles(&mut conn, "primary", "normalized")
+        .await
+        .expect("standard");
+    let set_text = std::fs::read_to_string(&set_path).expect("the smoke set");
+    let slot = SlotConfig {
+        url: format!("{}/v1", server.uri()).parse().expect("url"),
+        model: "test/model".to_owned(),
+        token: Some(SecretString::new("slot-token")),
+        timeout: Duration::from_secs(10),
+        extra: Map::new(),
+    };
+    assert_eq!(
+        slot_status::status(
+            &slot,
+            Some(&check),
+            &prompt::contract_hash(),
+            &slot_check::set_hash(&set_text),
+            TitleMatch::Normalized,
+        ),
+        SlotStatus::Stale,
+        "a strict check must not pass as a normalized one"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -325,6 +511,8 @@ async fn the_report_is_printed_even_when_the_result_cannot_be_saved() {
             "capture-eval",
             "--slot",
             "primary",
+            "--titles",
+            "strict",
             "--set",
             set_path.to_str().expect("path"),
         ])
@@ -343,6 +531,50 @@ async fn the_report_is_printed_even_when_the_result_cannot_be_saved() {
         stderr(&output).contains("failed to save the slot check"),
         "{}",
         stderr(&output)
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_standard_table_fails_before_calling_the_llm() {
+    // База есть, но миграций нет: стандарт не прочитать, платные вызовы не нужны.
+    let name = format!("cli_capture_eval_nostandard_{}", Uuid::now_v7().simple());
+    support::create_database(&name).await;
+    let url = support::database_url_for(&name).await;
+    let server = MockServer::start().await;
+    mount_answer(&server, "полить цветы", "Полить цветы").await;
+    let (set_path, dir) = write_set(
+        "nostandard",
+        &smoke_set(&[("first", "полить цветы", "Полить цветы")]),
+    );
+
+    let output = capture_eval(&url, &server, 10_000)
+        .args([
+            "capture-eval",
+            "--slot",
+            "primary",
+            "--set",
+            set_path.to_str().expect("path"),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .expect("the CLI should run");
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        stderr(&output).contains("failed to read the slot standard"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("requests")
+            .is_empty(),
+        "a missing standard must not cost a paid slot call"
     );
 
     std::fs::remove_dir_all(&dir).ok();

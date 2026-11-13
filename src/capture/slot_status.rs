@@ -15,12 +15,14 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
 
+use super::eval::TitleMatch;
 use super::prompt;
 use super::slot_check::{self, BUILTIN_SET};
 use crate::config::{LlmConfig, SlotConfig};
 use crate::llm::{Chain, FALLBACK_SLOT, PRIMARY_SLOT};
 use crate::metrics;
 use crate::storage::repositories::llm_slot_checks::{self, StoredCheck};
+use crate::storage::repositories::llm_slot_settings;
 
 /// Как долго readiness использует вычисленный статус слотов.
 pub const CACHE_TTL: Duration = Duration::minutes(1);
@@ -67,23 +69,28 @@ pub struct SlotStatusReport {
     pub slot: &'static str,
     /// Статус проверки.
     pub status: SlotStatus,
+    /// Стандарт сохранённой проверки; `None`, если проверки нет.
+    pub titles: Option<TitleMatch>,
 }
 
-/// Статус слота по сохранённой проверке.
+/// Статус слота по сохранённой проверке и действующему стандарту.
 ///
 /// Нет строки — «не проверен»; отпечаток отличается — «устарел»; отпечаток
 /// совпадает, и пройдены все фразы — «прошёл»; иначе — «не прошёл» с числом
-/// пройденных. Набор с нулём фраз не считается пройденным.
+/// пройденных. Набор с нулём фраз не считается пройденным. Стандарт берётся из
+/// настроек слота, а не из сохранённой проверки: иначе сравнение отпечатков
+/// всегда совпадало бы по режиму и смена стандарта осталась бы незамеченной.
 pub fn status(
     slot: &SlotConfig,
     check: Option<&StoredCheck>,
     contract_hash: &str,
     set_hash: &str,
+    titles: TitleMatch,
 ) -> SlotStatus {
     let Some(check) = check else {
         return SlotStatus::Unverified;
     };
-    let current = slot_check::fingerprint(slot, contract_hash, set_hash);
+    let current = slot_check::fingerprint(slot, contract_hash, set_hash, titles);
     if check.fingerprint != current.value {
         return SlotStatus::Stale;
     }
@@ -94,6 +101,25 @@ pub fn status(
         SlotStatus::Passed
     } else {
         SlotStatus::Failed { passed, total }
+    }
+}
+
+/// Стандарт из сохранённого значения; неизвестное не подменяется молча.
+///
+/// Ограничение таблицы и `TitleMatch` не дают другого значения, но строка из
+/// будущей версии или сторонней записи не должна выдавать себя за `strict` без
+/// следа в журнале.
+fn known_standard(slot: &'static str, stored: &str) -> TitleMatch {
+    match TitleMatch::from_code(stored) {
+        Some(titles) => titles,
+        None => {
+            tracing::warn!(
+                slot,
+                titles = stored,
+                "unknown llm slot title standard; treating it as strict"
+            );
+            TitleMatch::Strict
+        }
     }
 }
 
@@ -223,6 +249,8 @@ impl LlmSlotHealth {
         let mut conn = pool.acquire().await?;
         let mut statuses = Vec::with_capacity(self.slots.len());
         for entry in &self.slots {
+            let stored = llm_slot_settings::titles(&mut conn, entry.name).await?;
+            let titles = known_standard(entry.name, &stored);
             let check = llm_slot_checks::latest(&mut conn, entry.name).await?;
             statuses.push(SlotStatusReport {
                 slot: entry.name,
@@ -231,7 +259,11 @@ impl LlmSlotHealth {
                     check.as_ref(),
                     &self.contract_hash,
                     &self.set_hash,
+                    titles,
                 ),
+                titles: check
+                    .as_ref()
+                    .map(|check| known_standard(entry.name, &check.titles)),
             });
         }
         drop(conn);
@@ -258,6 +290,7 @@ impl LlmSlotHealth {
             .map(|entry| SlotStatusReport {
                 slot: entry.name,
                 status: SlotStatus::Unverified,
+                titles: None,
             })
             .collect()
     }
@@ -291,80 +324,139 @@ mod tests {
         }
     }
 
-    fn passed_check(slot: &SlotConfig, contract: &str) -> StoredCheck {
-        let fingerprint = slot_check::fingerprint(slot, contract, SET);
+    fn passed_check(slot: &SlotConfig, contract: &str, titles: TitleMatch) -> StoredCheck {
+        let fingerprint = slot_check::fingerprint(slot, contract, SET, titles);
         StoredCheck {
             fingerprint: fingerprint.value,
             passed: 22,
             total: 22,
+            titles: titles.as_str().to_owned(),
         }
     }
 
     #[test]
     fn no_saved_check_is_unverified() {
-        assert_eq!(status(&slot(), None, CONTRACT, SET), SlotStatus::Unverified);
+        assert_eq!(
+            status(&slot(), None, CONTRACT, SET, TitleMatch::Strict),
+            SlotStatus::Unverified
+        );
     }
 
     #[test]
     fn a_model_change_makes_the_status_stale() {
-        let stored = passed_check(&slot(), CONTRACT);
+        let stored = passed_check(&slot(), CONTRACT, TitleMatch::Strict);
         let mut changed = slot();
         changed.model = "vendor/other".to_owned();
 
         assert_eq!(
-            status(&changed, Some(&stored), CONTRACT, SET),
+            status(&changed, Some(&stored), CONTRACT, SET, TitleMatch::Strict),
             SlotStatus::Stale
         );
     }
 
     #[test]
     fn a_token_change_keeps_the_passed_status() {
-        let stored = passed_check(&slot(), CONTRACT);
+        let stored = passed_check(&slot(), CONTRACT, TitleMatch::Strict);
         let mut changed = slot();
         changed.token = Some(SecretString::new("another-token"));
 
         assert_eq!(
-            status(&changed, Some(&stored), CONTRACT, SET),
+            status(&changed, Some(&stored), CONTRACT, SET, TitleMatch::Strict),
             SlotStatus::Passed
         );
 
         changed.token = None;
         assert_eq!(
-            status(&changed, Some(&stored), CONTRACT, SET),
+            status(&changed, Some(&stored), CONTRACT, SET, TitleMatch::Strict),
             SlotStatus::Passed
         );
     }
 
     #[test]
     fn a_new_contract_makes_the_status_stale() {
-        let stored = passed_check(&slot(), CONTRACT);
+        let stored = passed_check(&slot(), CONTRACT, TitleMatch::Strict);
 
         assert_eq!(
-            status(&slot(), Some(&stored), "another-contract", SET),
+            status(
+                &slot(),
+                Some(&stored),
+                "another-contract",
+                SET,
+                TitleMatch::Strict
+            ),
             SlotStatus::Stale
         );
     }
 
     #[test]
     fn a_new_set_makes_the_status_stale() {
-        let stored = passed_check(&slot(), CONTRACT);
+        let stored = passed_check(&slot(), CONTRACT, TitleMatch::Strict);
 
         assert_eq!(
-            status(&slot(), Some(&stored), CONTRACT, "another-set"),
+            status(
+                &slot(),
+                Some(&stored),
+                CONTRACT,
+                "another-set",
+                TitleMatch::Strict
+            ),
             SlotStatus::Stale
         );
     }
 
     #[test]
+    fn the_saved_standard_must_match_the_slot_standard() {
+        let stored = passed_check(&slot(), CONTRACT, TitleMatch::Normalized);
+
+        assert_eq!(
+            status(
+                &slot(),
+                Some(&stored),
+                CONTRACT,
+                SET,
+                TitleMatch::Normalized
+            ),
+            SlotStatus::Passed
+        );
+        assert_eq!(
+            status(&slot(), Some(&stored), CONTRACT, SET, TitleMatch::Strict),
+            SlotStatus::Stale,
+            "a normalized check must not pass as strict"
+        );
+    }
+
+    #[test]
+    fn the_saved_standard_is_read_from_the_check() {
+        let stored = passed_check(&slot(), CONTRACT, TitleMatch::Normalized);
+
+        assert_eq!(
+            TitleMatch::from_code(&stored.titles),
+            Some(TitleMatch::Normalized)
+        );
+        assert_eq!(TitleMatch::from_code("legacy"), None);
+    }
+
+    #[test]
+    fn an_unknown_standard_falls_back_to_strict_with_a_warning() {
+        assert_eq!(known_standard("primary", "strict"), TitleMatch::Strict);
+        assert_eq!(
+            known_standard("primary", "normalized"),
+            TitleMatch::Normalized
+        );
+        assert_eq!(known_standard("primary", "loose"), TitleMatch::Strict);
+    }
+
+    #[test]
     fn a_failed_check_reports_the_passed_count() {
         let stored = StoredCheck {
-            fingerprint: slot_check::fingerprint(&slot(), CONTRACT, SET).value,
+            fingerprint: slot_check::fingerprint(&slot(), CONTRACT, SET, TitleMatch::Strict).value,
             passed: 17,
             total: 22,
+            titles: "strict".to_owned(),
         };
 
         assert_eq!(
-            status(&slot(), Some(&stored), CONTRACT, SET),
+            status(&slot(), Some(&stored), CONTRACT, SET, TitleMatch::Strict),
             SlotStatus::Failed {
                 passed: 17,
                 total: 22
@@ -382,13 +474,14 @@ mod tests {
     #[test]
     fn an_empty_set_never_passes() {
         let stored = StoredCheck {
-            fingerprint: slot_check::fingerprint(&slot(), CONTRACT, SET).value,
+            fingerprint: slot_check::fingerprint(&slot(), CONTRACT, SET, TitleMatch::Strict).value,
             passed: 0,
             total: 0,
+            titles: "strict".to_owned(),
         };
 
         assert_eq!(
-            status(&slot(), Some(&stored), CONTRACT, SET),
+            status(&slot(), Some(&stored), CONTRACT, SET, TitleMatch::Strict),
             SlotStatus::Failed {
                 passed: 0,
                 total: 0

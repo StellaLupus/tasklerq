@@ -528,6 +528,15 @@ impl TitleMatch {
             Self::Normalized => "normalized",
         }
     }
+
+    /// Разобрать режим из сохранённого значения; неизвестное — `None`.
+    pub fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "strict" => Some(Self::Strict),
+            "normalized" => Some(Self::Normalized),
+            _ => None,
+        }
+    }
 }
 
 /// Оценить одну фразу строго (совместимость).
@@ -932,7 +941,9 @@ fn compare_pair(
             kind_name(actual.kind).to_owned(),
         );
     }
-    if !names_match(&expected.list, &actual.list, titles) {
+    // Имя списка — идентификатор из контекста household: боевая валидация
+    // требует точного имени, поэтому нормализация к нему не применяется.
+    if !names_match(&expected.list, &actual.list, TitleMatch::Strict) {
         differ("список", expected.list.clone(), actual.list.clone());
     }
     differ_optional("дата", &expected.date, &actual.date, &mut differ);
@@ -1081,10 +1092,7 @@ fn canonical_stem(word: &str, stem: &str) -> Option<String> {
 
 /// Инфинитив по окончанию: `-ть`, `-ться`, `-ти`, `-чь`.
 fn is_infinitive(word: &str) -> bool {
-    word.ends_with("ться")
-        || word.ends_with("ть")
-        || word.ends_with("ти")
-        || word.ends_with("чь")
+    word.ends_with("ться") || word.ends_with("ть") || word.ends_with("ти") || word.ends_with("чь")
 }
 
 fn lookup(
@@ -1121,6 +1129,7 @@ static ASPECT_PAIRS: &[(&str, &str)] = &[
     ("открыть", "открывать"),
     ("собрать", "собирать"),
     ("оплатить", "платить"),
+    ("заплатить", "платить"),
     ("сдать", "сдавать"),
     ("обновить", "обновлять"),
     ("нарядить", "наряжать"),
@@ -1166,10 +1175,7 @@ static ASPECT_PAIRS: &[(&str, &str)] = &[
 ];
 
 /// Синонимы, которые в эталонах уже встречались как расхождение.
-static SYNONYMS: &[(&str, &str)] = &[
-    ("картошка", "картофель"),
-    ("свёкла", "свекла"),
-];
+static SYNONYMS: &[(&str, &str)] = &[("картошка", "картофель"), ("свёкла", "свекла")];
 
 static ASPECT_STEMS: OnceLock<BTreeMap<String, String>> = OnceLock::new();
 static SYNONYM_STEMS: OnceLock<BTreeMap<String, String>> = OnceLock::new();
@@ -2264,6 +2270,19 @@ mod tests {
     }
 
     #[test]
+    fn the_title_standard_codes_match_serde() {
+        for titles in [TitleMatch::Strict, TitleMatch::Normalized] {
+            assert_eq!(TitleMatch::from_code(titles.as_str()), Some(titles));
+            assert_eq!(
+                serde_json::to_value(titles).expect("serialize"),
+                json!(titles.as_str()),
+                "the code and the stored form must agree"
+            );
+        }
+        assert_eq!(TitleMatch::from_code("loose"), None);
+    }
+
+    #[test]
     fn normalized_merges_verb_aspect() {
         for (expected, actual) in [
             ("Вынести мусор", "Выносить мусор"),
@@ -2271,6 +2290,7 @@ mod tests {
             ("Убраться в детской", "Убираться в детской"),
             ("Проверить уроки", "Проверять уроки"),
             ("Дать коту таблетку", "Давать коту таблетку"),
+            ("Заплатить за квартиру", "Платить за квартиру"),
         ] {
             assert!(
                 names_match(expected, actual, TitleMatch::Normalized),
@@ -2293,7 +2313,48 @@ mod tests {
     #[test]
     fn normalized_merges_synonyms() {
         assert!(names_match("Картошка", "Картофель", TitleMatch::Normalized));
-        assert!(names_match("купить картошку", "Купить картофель", TitleMatch::Normalized));
+        assert!(names_match(
+            "купить картошку",
+            "Купить картофель",
+            TitleMatch::Normalized
+        ));
+    }
+
+    #[test]
+    fn the_list_name_is_compared_strictly_in_the_normalized_mode() {
+        let mut context = context_value();
+        context["lists"] = json!([
+            {"name": "Картошка", "kind": "tasks", "default": true},
+            {"name": "Картофель", "kind": "tasks", "default": false}
+        ]);
+        let phrase: SmokePhrase = serde_json::from_value(json!({
+            "id": "list-name",
+            "category": "simple",
+            "context": context,
+            "text": "фраза",
+            "expect": {
+                "items": [with(task("Купить молоко", date_none()), "list", json!("Картошка"))],
+                "clarifications": []
+            }
+        }))
+        .expect("phrase");
+        let answer = response(vec![with(
+            task("Купить молоко", date_none()),
+            "list",
+            json!("Картофель"),
+        )]);
+
+        let result = judge_mode(&phrase, &answer, TitleMatch::Normalized);
+
+        let Some(Failure::Mismatch { differences }) = &result.failure else {
+            panic!("not a mismatch: {:?}", result.failure);
+        };
+        assert!(
+            differences
+                .iter()
+                .any(|difference| difference.field == "список"),
+            "a list name is an identifier, not a free-text title: {differences:?}"
+        );
     }
 
     fn judge_mode(phrase: &SmokePhrase, answer: &str, titles: TitleMatch) -> PhraseResult {
@@ -2339,10 +2400,11 @@ mod tests {
             ),
         );
 
-        let strict =
-            evaluate_with(&set, &runs, Duration::from_secs(20), TitleMatch::Strict).expect("strict");
-        let normalized = evaluate_with(&set, &runs, Duration::from_secs(20), TitleMatch::Normalized)
-            .expect("normalized");
+        let strict = evaluate_with(&set, &runs, Duration::from_secs(20), TitleMatch::Strict)
+            .expect("strict");
+        let normalized =
+            evaluate_with(&set, &runs, Duration::from_secs(20), TitleMatch::Normalized)
+                .expect("normalized");
 
         assert!(!strict.passed(), "strict keeps the aspect apart");
         assert!(normalized.passed(), "normalized accepts the aspect pair");
@@ -2395,9 +2457,11 @@ mod tests {
             task("Выносить мусор", date_none()),
         ]);
 
-        assert!(judge_mode(&phrase, &answer, TitleMatch::Strict)
-            .failure
-            .is_some());
+        assert!(
+            judge_mode(&phrase, &answer, TitleMatch::Strict)
+                .failure
+                .is_some()
+        );
         assert!(
             judge_mode(&phrase, &answer, TitleMatch::Normalized)
                 .failure
@@ -2438,6 +2502,7 @@ mod tests {
             ("закрыть", "закрывать"),
             ("собрать", "собирать"),
             ("оплатить", "платить"),
+            ("заплатить", "платить"),
             ("сдать", "сдавать"),
             ("обновить", "обновлять"),
             ("нарядить", "наряжать"),

@@ -24,7 +24,8 @@ pub struct HealthResponse {
     pub time: DateTime<Utc>,
     /// Необязательные предупреждения о деградации; поле отсутствует, когда их
     /// нет. Имена предупреждений фиксированы: `multiple_households`,
-    /// `llm_unavailable`, `llm_slot_unverified:<slot>`.
+    /// `llm_unavailable`, `llm_slot_unverified:<slot>` и
+    /// `llm_slot_unverified:<slot>:<режим>` для сохранённой проверки.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warnings: Option<Vec<String>>,
 }
@@ -110,7 +111,14 @@ pub async fn ready(State(state): State<AppState>) -> Result<Json<HealthResponse>
         }
         for report in llm_slots.statuses(&state.pool, now).await {
             if !report.status.is_passed() {
-                warnings.push(format!("llm_slot_unverified:{}", report.slot));
+                match report.titles {
+                    Some(titles) => warnings.push(format!(
+                        "llm_slot_unverified:{}:{}",
+                        report.slot,
+                        titles.as_str()
+                    )),
+                    None => warnings.push(format!("llm_slot_unverified:{}", report.slot)),
+                }
             }
         }
     }

@@ -174,11 +174,13 @@ async fn warn_if_llm_slots_unverified(health: &LlmSlotHealth, pool: &PgPool) {
 
 fn log_llm_slot_statuses(statuses: &[SlotStatusReport]) {
     for report in statuses {
+        let titles = report.titles.map(|titles| titles.as_str()).unwrap_or("-");
         match report.status {
             SlotStatus::Passed => {
                 tracing::info!(
                     slot = report.slot,
                     status = report.status.code(),
+                    titles,
                     "llm slot passed the smoke-set check"
                 );
             }
@@ -188,6 +190,7 @@ fn log_llm_slot_statuses(statuses: &[SlotStatusReport]) {
                     status = report.status.code(),
                     passed,
                     total,
+                    titles,
                     "llm slot check has not passed; capture keeps working with this slot"
                 );
             }
@@ -195,6 +198,7 @@ fn log_llm_slot_statuses(statuses: &[SlotStatusReport]) {
                 tracing::warn!(
                     slot = report.slot,
                     status = other.code(),
+                    titles,
                     "llm slot check has not passed; capture keeps working with this slot"
                 );
             }

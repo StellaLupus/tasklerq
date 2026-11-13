@@ -15,6 +15,7 @@ use chrono::{DateTime, Duration, Utc};
 use http_body_util::BodyExt;
 use serde_json::{Map, Value, json};
 use sqlx::PgConnection;
+use tasklerq::capture::eval::TitleMatch;
 use tasklerq::capture::prompt;
 use tasklerq::capture::slot_check;
 use tasklerq::capture::slot_status::LlmSlotHealth;
@@ -684,6 +685,7 @@ async fn llm_slot_verified_is_one_only_for_a_passed_slot() {
         &primary,
         &prompt::contract_hash(),
         &slot_check::set_hash(slot_check::BUILTIN_SET),
+        TitleMatch::Strict,
     );
     let parts = fingerprint.parts.to_json();
     let report = json!({"total": 22, "passed": 22});
