@@ -209,6 +209,13 @@ fn convert_repeat(
         return (None, None);
     };
 
+    // «Каждую неделю» и «каждые две недели» без названного дня недели модель
+    // пишет как `weekly` с интервалом. Схема требует для `weekly` дни недели,
+    // но смысл однозначен: N недель — это 7N дней. Приводим к `daily`, иначе
+    // валидатор отвергает верный по смыслу ответ и спрашивает день недели,
+    // которого в тексте нет.
+    let (freq, interval) = normalize_freq(&repeat.freq, repeat.interval, &repeat.weekdays);
+
     let (until, until_error) = match dates::resolve(
         &repeat.until,
         // Дата окончания серии включается в неё, поэтому у выражений
@@ -230,12 +237,13 @@ fn convert_repeat(
     };
 
     if start.error.is_none() {
-        start.date = first_occurrence(repeat, until, start.date, context).or(start.date);
+        start.date =
+            first_occurrence(repeat, freq, interval, until, start.date, context).or(start.date);
     }
 
     let raw = RawRecurrence {
-        freq: Some(freq_name(repeat.freq).to_owned()),
-        interval: Some(repeat.interval),
+        freq: Some(freq_name(freq).to_owned()),
+        interval: Some(interval),
         month_rule: repeat
             .month_rule
             .map(month_rule_name)
@@ -246,6 +254,21 @@ fn convert_repeat(
     (Some(raw), until_error)
 }
 
+/// Частота и интервал в канонической форме схемы.
+///
+/// `weekly` без дней недели однозначно означает «раз в N недель», а схема
+/// такое выражает только как `daily` с интервалом в днях.
+fn normalize_freq(freq: &RecurrenceFreq, interval: i64, weekdays: &[i64]) -> (RecurrenceFreq, i64) {
+    if *freq == RecurrenceFreq::Weekly && weekdays.is_empty() {
+        (
+            RecurrenceFreq::Daily,
+            interval.saturating_mul(7).clamp(1, 365),
+        )
+    } else {
+        (*freq, interval)
+    }
+}
+
 /// Первое вхождение правила не раньше названной даты, а без неё — от сегодня.
 ///
 /// Названная дата используется, только если совместима с правилом; иначе
@@ -254,6 +277,8 @@ fn convert_repeat(
 /// покажет валидатор.
 fn first_occurrence(
     repeat: &Repeat,
+    freq: RecurrenceFreq,
+    interval: i64,
     until: Option<NaiveDate>,
     named: Option<NaiveDate>,
     context: &CaptureContext,
@@ -261,10 +286,10 @@ fn first_occurrence(
     // Дни недели и правило месяца имеют смысл только для своей частоты; у
     // остальных частот их заполняет модель по привычке, и это не ошибка —
     // так же их отбрасывает валидатор.
-    let weekly = repeat.freq == RecurrenceFreq::Weekly;
+    let weekly = freq == RecurrenceFreq::Weekly;
     let input = RecurrenceInput {
-        freq: repeat.freq,
-        interval: i16::try_from(repeat.interval).ok(),
+        freq,
+        interval: i16::try_from(interval).ok(),
         byweekday: if weekly {
             repeat
                 .weekdays
@@ -277,7 +302,7 @@ fn first_occurrence(
         until,
         timezone: None,
         anchor_date: named,
-        month_rule: if repeat.freq == RecurrenceFreq::Monthly {
+        month_rule: if freq == RecurrenceFreq::Monthly {
             repeat.month_rule
         } else {
             None
@@ -1000,5 +1025,25 @@ mod tests {
 
         let item = check(&context, value);
         assert_eq!(codes(&item), ["date_invalid", "note_date_invalid"]);
+    }
+
+    #[test]
+    fn weekly_without_weekdays_becomes_daily_interval() {
+        assert_eq!(
+            normalize_freq(&RecurrenceFreq::Weekly, 1, &[]),
+            (RecurrenceFreq::Daily, 7)
+        );
+        assert_eq!(
+            normalize_freq(&RecurrenceFreq::Weekly, 2, &[]),
+            (RecurrenceFreq::Daily, 14)
+        );
+        assert_eq!(
+            normalize_freq(&RecurrenceFreq::Weekly, 2, &[2]),
+            (RecurrenceFreq::Weekly, 2)
+        );
+        assert_eq!(
+            normalize_freq(&RecurrenceFreq::Daily, 3, &[]),
+            (RecurrenceFreq::Daily, 3)
+        );
     }
 }

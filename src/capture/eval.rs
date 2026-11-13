@@ -14,6 +14,11 @@
 //! Названия сравниваются как множества основ слов (стеммер Snowball для
 //! русского), без учёта регистра и порядка слов: «Оплатить интернет» и
 //! «оплата интернета» — одно название.
+//!
+//! [`TitleMatch::Normalized`] дополнительно сводит видовые пары глаголов и
+//! синонимы: «Вынести мусор» и «Выносить мусор» — одно название. Строгий режим
+//! остаётся основным: нормализация нужна, чтобы отличить расхождение в смысле
+//! от расхождения в форме.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
@@ -486,6 +491,29 @@ pub fn evaluate(
     })
 }
 
+/// Как сравнивать названия элементов.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TitleMatch {
+    /// Только основы слов: «Вынести мусор» и «Выносить мусор» — разные.
+    #[default]
+    Strict,
+    /// Основы плюс вид глагола и синонимы: «Вынести мусор» и
+    /// «Выносить мусор» — одно название.
+    Normalized,
+}
+
+/// Оценить одну фразу строго (совместимость).
+///
+/// См. [`judge_with`].
+pub fn judge(
+    phrase: &SmokePhrase,
+    default_context: &InputContext,
+    run: &SlotRun,
+    timeout: Duration,
+) -> Result<PhraseResult, String> {
+    judge_with(phrase, default_context, run, timeout, TitleMatch::Strict)
+}
+
 /// Оценить одну фразу.
 ///
 /// Сначала проверяется таймаут слота: верный, но медленный ответ — провал с
@@ -495,11 +523,12 @@ pub fn evaluate(
 /// Ошибка валидации, которую объясняет уточнение ответа (событие без начала и
 /// вопрос о дате), провалом не считается: контракт предписывает именно такой
 /// ответ, а поле дозаполняется ответом на вопрос.
-pub fn judge(
+pub fn judge_with(
     phrase: &SmokePhrase,
     default_context: &InputContext,
     run: &SlotRun,
     timeout: Duration,
+    titles: TitleMatch,
 ) -> Result<PhraseResult, String> {
     let context = phrase.context(default_context)?;
     let reference = reference(&context, &phrase.expect)
@@ -554,7 +583,7 @@ pub fn judge(
         return Ok(result);
     }
 
-    let differences = compare(&reference, &actual, &context);
+    let differences = compare_with(&reference, &actual, &context, titles);
     if !differences.is_empty() {
         result.failure = Some(Failure::Mismatch { differences });
     }
@@ -741,7 +770,12 @@ fn recurrence_text(rule: &RecurrenceInput) -> String {
 }
 
 /// Сравнить ответ с эталоном. Пустой перечень — фразы совпали.
-fn compare(expected: &Draft, actual: &Draft, context: &CaptureContext) -> Vec<Difference> {
+fn compare_with(
+    expected: &Draft,
+    actual: &Draft,
+    context: &CaptureContext,
+    titles: TitleMatch,
+) -> Vec<Difference> {
     let expected_items: Vec<ItemView> = expected
         .items
         .iter()
@@ -765,7 +799,7 @@ fn compare(expected: &Draft, actual: &Draft, context: &CaptureContext) -> Vec<Di
         });
     }
 
-    let pairs = pair_items(&expected_items, &actual_items);
+    let pairs = pair_items(&expected_items, &actual_items, titles);
     for (expected_index, actual_index) in &pairs {
         match (expected_index, actual_index) {
             (Some(expected_index), Some(actual_index)) => compare_pair(
@@ -773,6 +807,7 @@ fn compare(expected: &Draft, actual: &Draft, context: &CaptureContext) -> Vec<Di
                 *expected_index,
                 &actual_items[*actual_index],
                 &mut differences,
+                titles,
             ),
             (Some(expected_index), None) => differences.push(Difference {
                 item: Some(*expected_index),
@@ -848,6 +883,7 @@ fn compare_pair(
     expected_index: usize,
     actual: &ItemView,
     differences: &mut Vec<Difference>,
+    titles: TitleMatch,
 ) {
     let mut differ = |field: &'static str, expected: String, actual: String| {
         differences.push(Difference {
@@ -858,7 +894,7 @@ fn compare_pair(
         });
     };
 
-    if !names_match(&expected.title, &actual.title) {
+    if !names_match(&expected.title, &actual.title, titles) {
         differ("название", expected.title.clone(), actual.title.clone());
     }
     if expected.kind != actual.kind {
@@ -868,7 +904,7 @@ fn compare_pair(
             kind_name(actual.kind).to_owned(),
         );
     }
-    if !names_match(&expected.list, &actual.list) {
+    if !names_match(&expected.list, &actual.list, titles) {
         differ("список", expected.list.clone(), actual.list.clone());
     }
     differ_optional("дата", &expected.date, &actual.date, &mut differ);
@@ -970,33 +1006,125 @@ fn month_rule_name(rule: MonthRule) -> &'static str {
 }
 
 /// Названия совпали по основам слов, без учёта регистра и порядка слов.
-fn names_match(expected: &str, actual: &str) -> bool {
-    stems(expected) == stems(actual)
+fn names_match(expected: &str, actual: &str, titles: TitleMatch) -> bool {
+    stems(expected, titles) == stems(actual, titles)
 }
 
 /// Множество основ слов названия.
-fn stems(value: &str) -> BTreeSet<String> {
+fn stems(value: &str, titles: TitleMatch) -> BTreeSet<String> {
     static STEMMER: OnceLock<Stemmer> = OnceLock::new();
     let stemmer = STEMMER.get_or_init(|| Stemmer::create(Algorithm::Russian));
     value
         .split(|ch: char| !ch.is_alphanumeric())
         .filter(|word| !word.is_empty())
         .map(|word| {
-            stemmer
+            let stem = stemmer
                 .stem(&word.to_lowercase().replace('ё', "е"))
-                .into_owned()
+                .into_owned();
+            match titles {
+                TitleMatch::Strict => stem,
+                TitleMatch::Normalized => canonical_stem(&stem).unwrap_or(stem),
+            }
         })
         .filter(|stem| !stem.is_empty())
         .collect()
 }
 
+/// Свести основу слова к канону: вид глагола и синонимы.
+///
+/// Словари заданы инфинитивами (их удобно читать), а сравниваются основы:
+/// `stem("картошку") == stem("картошка")`, поэтому склонения попадают в канон
+/// автоматически. Список намеренно маленький и явный — он покрывает пары,
+/// которые реально встречались в отчётах; расширять по мере появления новых.
+fn canonical_stem(stem: &str) -> Option<String> {
+    static NORMALIZED: OnceLock<BTreeMap<String, String>> = OnceLock::new();
+    let map = NORMALIZED.get_or_init(|| {
+        let stemmer = Stemmer::create(Algorithm::Russian);
+        let mut map = BTreeMap::new();
+        for (variant, canonical) in ASPECT_PAIRS.iter().chain(SYNONYMS) {
+            let variant = stemmer.stem(variant).into_owned();
+            let canonical = stemmer.stem(canonical).into_owned();
+            map.insert(variant, canonical);
+        }
+        map
+    });
+    map.get(stem).cloned()
+}
+
+/// Видовые пары глаголов: вариант → канон (несовершенный вид).
+static ASPECT_PAIRS: &[(&str, &str)] = &[
+    ("дать", "давать"),
+    ("вынести", "выносить"),
+    ("убраться", "убираться"),
+    ("убрать", "убирать"),
+    ("полить", "поливать"),
+    ("проверить", "проверять"),
+    ("отправить", "отправлять"),
+    ("закрыть", "закрывать"),
+    ("открыть", "открывать"),
+    ("собрать", "собирать"),
+    ("оплатить", "платить"),
+    ("сдать", "сдавать"),
+    ("обновить", "обновлять"),
+    ("нарядить", "наряжать"),
+    ("пересмотреть", "пересматривать"),
+    ("передать", "передавать"),
+    ("постирать", "стирать"),
+    ("купить", "покупать"),
+    ("приготовить", "готовить"),
+    ("помыть", "мыть"),
+    ("вымыть", "мыть"),
+    ("принести", "приносить"),
+    ("забрать", "забирать"),
+    ("записать", "записывать"),
+    ("позвонить", "звонить"),
+    ("встретить", "встречать"),
+    ("налить", "наливать"),
+    ("починить", "чинить"),
+    ("сходить", "ходить"),
+    ("съездить", "ездить"),
+    ("заказать", "заказывать"),
+    ("достать", "доставать"),
+    ("покормить", "кормить"),
+    ("погулять", "гулять"),
+    ("подготовить", "подготавливать"),
+    ("показать", "показывать"),
+    ("рассказать", "рассказывать"),
+    ("спросить", "спрашивать"),
+    ("ответить", "отвечать"),
+    ("решить", "решать"),
+    ("закончить", "заканчивать"),
+    ("взять", "брать"),
+    ("положить", "класть"),
+    ("найти", "находить"),
+    ("прочитать", "читать"),
+    ("написать", "писать"),
+    ("надеть", "надевать"),
+    ("снять", "снимать"),
+    ("почистить", "чистить"),
+    ("погладить", "гладить"),
+    ("сварить", "варить"),
+    ("испечь", "печь"),
+    ("пожарить", "жарить"),
+];
+
+/// Синонимы, которые в эталонах уже встречались как расхождение.
+static SYNONYMS: &[(&str, &str)] = &[
+    ("картошка", "картофель"),
+    ("свёкла", "свекла"),
+];
+
 /// Пары «эталон, ответ»: сначала по совпадению названий, затем оставшиеся по
 /// порядку, чтобы расхождения в названии и полях были видны.
-fn pair_items(expected: &[ItemView], actual: &[ItemView]) -> Vec<(Option<usize>, Option<usize>)> {
+fn pair_items(
+    expected: &[ItemView],
+    actual: &[ItemView],
+    titles: TitleMatch,
+) -> Vec<(Option<usize>, Option<usize>)> {
     let mut owner: Vec<Option<usize>> = vec![None; actual.len()];
     for index in 0..expected.len() {
         let mut seen = vec![false; actual.len()];
-        augment(index, expected, actual, &mut seen, &mut owner);
+        augment(index, expected, actual, &mut seen, &mut owner, titles);
     }
     let mut pairs = Vec::with_capacity(expected.len().max(actual.len()));
     let mut used = vec![false; actual.len()];
@@ -1029,9 +1157,10 @@ fn augment(
     actual: &[ItemView],
     seen: &mut [bool],
     owner: &mut [Option<usize>],
+    titles: TitleMatch,
 ) -> bool {
     for (slot, item) in actual.iter().enumerate() {
-        if seen[slot] || !names_match(&expected[index].title, &item.title) {
+        if seen[slot] || !names_match(&expected[index].title, &item.title, titles) {
             continue;
         }
         seen[slot] = true;
@@ -1041,7 +1170,7 @@ fn augment(
                 return true;
             }
             Some(current) => {
-                if augment(current, expected, actual, seen, owner) {
+                if augment(current, expected, actual, seen, owner, titles) {
                     owner[slot] = Some(index);
                     return true;
                 }
@@ -2059,5 +2188,63 @@ mod tests {
                 .with_timezone(&chrono::Utc)
         );
         assert_eq!(context.today().to_string(), "2026-11-10");
+    }
+
+    #[test]
+    fn strict_keeps_verb_aspect_apart() {
+        assert!(!names_match(
+            "Вынести мусор",
+            "Выносить мусор",
+            TitleMatch::Strict
+        ));
+        assert!(!names_match("Картошка", "Картофель", TitleMatch::Strict));
+    }
+
+    #[test]
+    fn normalized_merges_verb_aspect() {
+        for (expected, actual) in [
+            ("Вынести мусор", "Выносить мусор"),
+            ("Полить фикус", "Поливать фикус"),
+            ("Убраться в детской", "Убираться в детской"),
+            ("Проверить уроки", "Проверять уроки"),
+            ("Дать коту таблетку", "Давать коту таблетку"),
+        ] {
+            assert!(
+                names_match(expected, actual, TitleMatch::Normalized),
+                "{expected} ~ {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalized_keeps_extra_words() {
+        // Нормализация сводит вид глагола, но не выбрасывает слова: «за» в
+        // названии — это разница в составе, а не в форме.
+        assert!(!names_match(
+            "Оплатить кружки",
+            "Платить за кружки",
+            TitleMatch::Normalized
+        ));
+    }
+
+    #[test]
+    fn normalized_merges_synonyms() {
+        assert!(names_match("Картошка", "Картофель", TitleMatch::Normalized));
+        assert!(names_match("купить картошку", "Купить картофель", TitleMatch::Normalized));
+    }
+
+    #[test]
+    fn normalized_keeps_different_titles() {
+        for (expected, actual) in [
+            ("Подарок", "Подарок Игорю"),
+            ("Бензин", "Бензин для генератора"),
+            ("Визит сантехника", "Сантехник"),
+            ("Погулять в парке", "Сходить в кино"),
+        ] {
+            assert!(
+                !names_match(expected, actual, TitleMatch::Normalized),
+                "{expected} ≠ {actual}"
+            );
+        }
     }
 }
