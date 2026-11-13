@@ -1018,37 +1018,66 @@ fn stems(value: &str, titles: TitleMatch) -> BTreeSet<String> {
         .split(|ch: char| !ch.is_alphanumeric())
         .filter(|word| !word.is_empty())
         .map(|word| {
-            let stem = stemmer
-                .stem(&word.to_lowercase().replace('ё', "е"))
-                .into_owned();
+            let folded = fold_word(word);
+            let stem = stemmer.stem(&folded).into_owned();
             match titles {
                 TitleMatch::Strict => stem,
-                TitleMatch::Normalized => canonical_stem(&stem).unwrap_or(stem),
+                TitleMatch::Normalized => canonical_stem(&folded, &stem).unwrap_or(stem),
             }
         })
         .filter(|stem| !stem.is_empty())
         .collect()
 }
 
-/// Свести основу слова к канону: вид глагола и синонимы.
+/// Слово в том виде, в каком его видит стеммер: нижний регистр, без `ё`.
+fn fold_word(word: &str) -> String {
+    word.to_lowercase().replace('ё', "е")
+}
+
+/// Свести основу слова к канону: синонимы и вид глагола.
 ///
-/// Словари заданы инфинитивами (их удобно читать), а сравниваются основы:
-/// `stem("картошку") == stem("картошка")`, поэтому склонения попадают в канон
-/// автоматически. Список намеренно маленький и явный — он покрывает пары,
-/// которые реально встречались в отчётах; расширять по мере появления новых.
-fn canonical_stem(stem: &str) -> Option<String> {
-    static NORMALIZED: OnceLock<BTreeMap<String, String>> = OnceLock::new();
-    let map = NORMALIZED.get_or_init(|| {
-        let stemmer = Stemmer::create(Algorithm::Russian);
-        let mut map = BTreeMap::new();
-        for (variant, canonical) in ASPECT_PAIRS.iter().chain(SYNONYMS) {
-            let variant = stemmer.stem(variant).into_owned();
-            let canonical = stemmer.stem(canonical).into_owned();
-            map.insert(variant, canonical);
-        }
-        map
-    });
-    map.get(stem).cloned()
+/// Синонимы применяются к любой части речи. Вид глагола — только к
+/// инфинитивам: иначе существительное с той же основой склеилось бы с
+/// глаголом («наряд» и «нарядить», «пол» и «полить»), а это разные названия.
+/// Пары заданы инфинитивами, а сравниваются основы, поэтому склонения
+/// существительных из словаря синонимов попадают в канон автоматически.
+fn canonical_stem(word: &str, stem: &str) -> Option<String> {
+    if let Some(canonical) = lookup(&SYNONYM_STEMS, SYNONYMS, stem) {
+        return Some(canonical);
+    }
+    if is_infinitive(word) {
+        return lookup(&ASPECT_STEMS, ASPECT_PAIRS, stem);
+    }
+    None
+}
+
+/// Инфинитив по окончанию: `-ть`, `-ться`, `-ти`, `-чь`.
+fn is_infinitive(word: &str) -> bool {
+    word.ends_with("ться")
+        || word.ends_with("ть")
+        || word.ends_with("ти")
+        || word.ends_with("чь")
+}
+
+fn lookup(
+    map: &OnceLock<BTreeMap<String, String>>,
+    pairs: &[(&str, &str)],
+    stem: &str,
+) -> Option<String> {
+    map.get_or_init(|| stem_map(pairs)).get(stem).cloned()
+}
+
+/// Карта «основа варианта → основа канона» с тем же фолдингом, что и у слов.
+fn stem_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+    let stemmer = Stemmer::create(Algorithm::Russian);
+    let mut map = BTreeMap::new();
+    for (variant, canonical) in pairs {
+        map.insert(
+            stemmer.stem(&fold_word(variant)).into_owned(),
+            stemmer.stem(&fold_word(canonical)).into_owned(),
+        );
+    }
+    map
 }
 
 /// Видовые пары глаголов: вариант → канон (несовершенный вид).
@@ -1113,6 +1142,9 @@ static SYNONYMS: &[(&str, &str)] = &[
     ("картошка", "картофель"),
     ("свёкла", "свекла"),
 ];
+
+static ASPECT_STEMS: OnceLock<BTreeMap<String, String>> = OnceLock::new();
+static SYNONYM_STEMS: OnceLock<BTreeMap<String, String>> = OnceLock::new();
 
 /// Пары «эталон, ответ»: сначала по совпадению названий, затем оставшиеся по
 /// порядку, чтобы расхождения в названии и полях были видны.
@@ -2231,6 +2263,136 @@ mod tests {
     fn normalized_merges_synonyms() {
         assert!(names_match("Картошка", "Картофель", TitleMatch::Normalized));
         assert!(names_match("купить картошку", "Купить картофель", TitleMatch::Normalized));
+    }
+
+    fn judge_mode(phrase: &SmokePhrase, answer: &str, titles: TitleMatch) -> PhraseResult {
+        let context: InputContext = serde_json::from_value(context_value()).expect("context");
+        judge_with(
+            phrase,
+            &context,
+            &SlotRun::text(answer, Duration::from_secs(1)),
+            Duration::from_secs(20),
+            titles,
+        )
+        .expect("phrase is judged")
+    }
+
+    /// Режим должен доходить до сравнения через `judge_with`, а не только
+    /// работать в `names_match` напрямую.
+    #[test]
+    fn normalized_mode_is_reachable_through_judge() {
+        let phrase = phrase(
+            "mode",
+            Category::Simple,
+            json!({"items": [task("Вынести мусор", date_none())], "clarifications": []}),
+        );
+        let answer = response(vec![task("Выносить мусор", date_none())]);
+
+        assert!(
+            judge_mode(&phrase, &answer, TitleMatch::Strict)
+                .failure
+                .is_some(),
+            "strict keeps the aspect apart"
+        );
+        assert!(
+            judge_mode(&phrase, &answer, TitleMatch::Normalized)
+                .failure
+                .is_none(),
+            "normalized accepts the aspect pair"
+        );
+    }
+
+    /// Сопоставление элементов тоже идёт по нормализованным названиям:
+    /// переставленные элементы не должны давать «не найден».
+    #[test]
+    fn normalized_pairing_matches_items_in_any_order() {
+        let phrase = phrase(
+            "pair",
+            Category::Simple,
+            json!({
+                "items": [
+                    task("Вынести мусор", date_none()),
+                    task("Полить фикус", date_none()),
+                ],
+                "clarifications": [],
+            }),
+        );
+        let answer = response(vec![
+            task("Поливать фикус", date_none()),
+            task("Выносить мусор", date_none()),
+        ]);
+
+        assert!(judge_mode(&phrase, &answer, TitleMatch::Strict)
+            .failure
+            .is_some());
+        assert!(
+            judge_mode(&phrase, &answer, TitleMatch::Normalized)
+                .failure
+                .is_none(),
+            "aspect pairs pair up regardless of order"
+        );
+    }
+
+    /// Каждая пара словаря должна работать: иначе запись в словаре мертва.
+    #[test]
+    fn every_dictionary_pair_is_equivalent_in_normalized() {
+        for (variant, canonical) in ASPECT_PAIRS.iter().copied() {
+            assert!(
+                names_match(variant, canonical, TitleMatch::Normalized),
+                "{variant} ~ {canonical}"
+            );
+        }
+        for (variant, canonical) in SYNONYMS.iter().copied() {
+            assert!(
+                names_match(variant, canonical, TitleMatch::Normalized),
+                "{variant} ~ {canonical}"
+            );
+        }
+    }
+
+    /// Пары, на которых падали эталоны v0.9, обязаны быть в словаре.
+    /// Табличный тест выше перебирает сам словарь и удаление записи не
+    /// заметит; этот — заметит.
+    #[test]
+    fn aspect_dictionary_covers_the_observed_pairs() {
+        let required = [
+            ("дать", "давать"),
+            ("вынести", "выносить"),
+            ("убраться", "убираться"),
+            ("полить", "поливать"),
+            ("проверить", "проверять"),
+            ("отправить", "отправлять"),
+            ("закрыть", "закрывать"),
+            ("собрать", "собирать"),
+            ("оплатить", "платить"),
+            ("сдать", "сдавать"),
+            ("обновить", "обновлять"),
+            ("нарядить", "наряжать"),
+            ("пересмотреть", "пересматривать"),
+            ("передать", "передавать"),
+        ];
+        for (variant, canonical) in required {
+            assert!(
+                ASPECT_PAIRS.contains(&(variant, canonical)),
+                "{variant}/{canonical} пропала из словаря"
+            );
+            assert!(
+                names_match(variant, canonical, TitleMatch::Normalized),
+                "{variant} ~ {canonical}"
+            );
+        }
+    }
+
+    /// Вид глагола сводится только у инфинитивов: существительное с той же
+    /// основой — другое название.
+    #[test]
+    fn normalized_does_not_merge_a_noun_with_its_verb() {
+        for (noun, verb) in [("наряд", "нарядить"), ("пол", "полить")] {
+            assert!(
+                !names_match(noun, verb, TitleMatch::Normalized),
+                "{noun} ≠ {verb}"
+            );
+        }
     }
 
     #[test]

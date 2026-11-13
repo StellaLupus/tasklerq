@@ -27,7 +27,7 @@ use crate::domain::validation::{
 };
 
 /// Максимум интервала повторения.
-const MAX_INTERVAL: i64 = 365;
+pub(crate) const MAX_INTERVAL: i64 = 365;
 /// Горизонт сроков и окончания серии, месяцы.
 const HORIZON_MONTHS: u32 = 60;
 

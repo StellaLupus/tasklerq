@@ -15,7 +15,7 @@ use chrono::{Datelike, NaiveDate, NaiveTime};
 use super::context::CaptureContext;
 use super::dates::{self, DateRole};
 use super::schema::{RawDateError, RawItem, RawRecurrence};
-use super::validate::parse_time;
+use super::validate::{MAX_INTERVAL, parse_time};
 use super::wire::{DateExpr, EventItem, Item, Repeat, ShoppingItem, TaskItem};
 use crate::domain::events::end_day;
 use crate::domain::models::{ListKind, MonthRule, RecurrenceFreq, RecurrenceInput};
@@ -257,15 +257,17 @@ fn convert_repeat(
 /// Частота и интервал в канонической форме схемы.
 ///
 /// `weekly` без дней недели однозначно означает «раз в N недель», а схема
-/// такое выражает только как `daily` с интервалом в днях.
+/// такое выражает только как `daily` с интервалом в днях. Пересчитываем
+/// только когда результат остаётся допустимым интервалом: `interval=0` или
+/// 60 недель — это неверный ответ, и его должен отвергнуть валидатор, а не
+/// молча превратить в другое расписание.
 fn normalize_freq(freq: &RecurrenceFreq, interval: i64, weekdays: &[i64]) -> (RecurrenceFreq, i64) {
-    if *freq == RecurrenceFreq::Weekly && weekdays.is_empty() {
-        (
-            RecurrenceFreq::Daily,
-            interval.saturating_mul(7).clamp(1, 365),
-        )
-    } else {
-        (*freq, interval)
+    if *freq != RecurrenceFreq::Weekly || !weekdays.is_empty() {
+        return (*freq, interval);
+    }
+    match interval.checked_mul(7) {
+        Some(days) if (1..=MAX_INTERVAL).contains(&days) => (RecurrenceFreq::Daily, days),
+        _ => (*freq, interval),
     }
 }
 
@@ -1038,6 +1040,10 @@ mod tests {
             (RecurrenceFreq::Daily, 14)
         );
         assert_eq!(
+            normalize_freq(&RecurrenceFreq::Weekly, 52, &[]),
+            (RecurrenceFreq::Daily, 364)
+        );
+        assert_eq!(
             normalize_freq(&RecurrenceFreq::Weekly, 2, &[2]),
             (RecurrenceFreq::Weekly, 2)
         );
@@ -1045,5 +1051,82 @@ mod tests {
             normalize_freq(&RecurrenceFreq::Daily, 3, &[]),
             (RecurrenceFreq::Daily, 3)
         );
+    }
+
+    /// Неверный интервал должен дойти до валидатора как ошибка, а не
+    /// превратиться в другое расписание: «0 недель» — не «каждый день».
+    #[test]
+    fn an_out_of_range_weekly_interval_is_not_normalized() {
+        for interval in [0, -1, 53, i64::MAX] {
+            assert_eq!(
+                normalize_freq(&RecurrenceFreq::Weekly, interval, &[]),
+                (RecurrenceFreq::Weekly, interval),
+                "interval={interval}"
+            );
+        }
+    }
+
+    #[test]
+    fn weekly_without_weekdays_is_a_valid_daily_rule() {
+        let context = spec_context();
+        let repeat = json!({
+            "freq": "weekly",
+            "interval": 2,
+            "weekdays": [],
+            "month_rule": "",
+            "until": date_none(),
+        });
+        let value = with(with(task(), "date", offset(1)), "repeat", repeat);
+        let item = check(&context, value);
+
+        assert!(item.is_valid(), "{:?}", item.errors);
+        let rule = item
+            .item
+            .expect("valid task")
+            .recurrence
+            .expect("repeat survived");
+        assert_eq!(rule.freq, RecurrenceFreq::Daily);
+        assert_eq!(rule.interval, Some(14));
+    }
+
+    #[test]
+    fn weekly_with_a_weekday_stays_weekly() {
+        let context = spec_context();
+        let repeat = json!({
+            "freq": "weekly",
+            "interval": 2,
+            "weekdays": [2],
+            "month_rule": "",
+            "until": date_none(),
+        });
+        let value = with(with(task(), "date", offset(1)), "repeat", repeat);
+        let item = check(&context, value);
+
+        assert!(item.is_valid(), "{:?}", item.errors);
+        let rule = item
+            .item
+            .expect("valid task")
+            .recurrence
+            .expect("repeat survived");
+        assert_eq!(rule.freq, RecurrenceFreq::Weekly);
+        assert_eq!(rule.byweekday, vec![2]);
+    }
+
+    /// Нулевой интервал у `weekly` без дней недели не должен проходить
+    /// валидацию: раньше нормализация делала из него «каждый день».
+    #[test]
+    fn a_zero_weekly_interval_is_still_an_error() {
+        let context = spec_context();
+        let repeat = json!({
+            "freq": "weekly",
+            "interval": 0,
+            "weekdays": [],
+            "month_rule": "",
+            "until": date_none(),
+        });
+        let value = with(with(task(), "date", offset(1)), "repeat", repeat);
+        let item = check(&context, value);
+
+        assert!(!item.is_valid());
     }
 }
