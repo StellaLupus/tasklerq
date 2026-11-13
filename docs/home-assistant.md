@@ -25,7 +25,7 @@ discovery. Шаблонные сенсоры и `rest`-интеграция да
 | Тип установки | HA Container (Docker), `network_mode: host` |
 | Python | Версия, поддерживаемая вашей версией HA |
 | HACS | Установлен |
-| Tasklerq | 0.1.0+ |
+| Tasklerq | 0.2.0+ |
 | Интеграция `tasklerq-ha` | 0.2.0+ — списки событий без `todo`-сущности |
 | Сеть | HA → Tasklerq: `http://127.0.0.1:18080`; Tasklerq → слоты LLM по адресам из `LLM_*_URL` |
 
