@@ -5,6 +5,7 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Map, Value, json};
+use uuid::Uuid;
 
 use super::*;
 use crate::config::{LlmConfig, SecretKey};
@@ -306,5 +307,20 @@ fn the_key_list_marks_exactly_the_token_keys_as_secret_and_names_are_unique() {
             .len(),
         SETTING_KEYS.len(),
         "keys are unique"
+    );
+}
+
+#[test]
+fn secret_contexts_are_built_from_the_setting_scope() {
+    let household = Uuid::from_u64_pair(1, 2);
+    let key = "llm.primary.token";
+
+    assert_eq!(
+        secret_context(SettingScope::Installation, None, key),
+        SecretContext::installation(key)
+    );
+    assert_eq!(
+        secret_context(SettingScope::Household, Some(household), key),
+        SecretContext::household(household, key)
     );
 }

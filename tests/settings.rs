@@ -12,10 +12,12 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Map, Value, json};
 use sqlx::PgPool;
 use tasklerq::config::{Config, LlmConfig, SecretKey, SecretString, SlotConfig};
-use tasklerq::settings::crypto::SecretCipher;
+use tasklerq::settings::crypto::{SecretCipher, SecretContext};
 use tasklerq::settings::{
-    self, SETTING_KEYS, SecretState, SettingSource, SlotProblem, effective_llm, read_effective_llm,
+    self, SETTING_KEYS, SecretProblem, SecretState, SettingSource, SlotProblem, effective_llm,
+    read_effective_llm,
 };
+use tasklerq::storage::repositories::settings as repository;
 
 fn env_llm(pairs: &[(&str, &str)]) -> LlmConfig {
     let mut vars: Vec<(String, String)> = [
@@ -659,6 +661,91 @@ async fn writes_use_the_same_bounds_as_the_readers() {
     assert_eq!(
         effective.primary().config().map(|slot| slot.timeout),
         Some(Duration::from_secs(600))
+    );
+}
+
+#[tokio::test]
+async fn blank_secrets_are_rejected_without_a_row() {
+    let db = support::isolated_db().await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    for value in ["", " ", "\n\t "] {
+        let error = settings::write_secret(
+            &mut conn,
+            "llm.primary.token",
+            &SecretString::new(value),
+            &cipher(1),
+        )
+        .await
+        .expect_err("a blank secret must be rejected");
+        assert!(
+            matches!(error, settings::SettingError::InvalidValue { .. }),
+            "{value:?}: {error:?}"
+        );
+    }
+    drop(conn);
+
+    assert_eq!(row_count(&db.pool, "llm.primary.token").await, 0);
+}
+
+#[tokio::test]
+async fn stored_secrets_are_checked_with_their_own_row_context() {
+    let db = support::isolated_db().await;
+    set_secret(&db.pool, "llm.primary.token", "db-token", &cipher(1)).await;
+
+    let healthy = settings::read_secret_health(&db.pool, &cipher(1))
+        .await
+        .expect("secret rows are read");
+    assert_eq!(healthy.secrets(), 1);
+    assert_eq!(healthy.problem(), None);
+
+    let missing = settings::read_secret_health(&db.pool, &cipher_without_key())
+        .await
+        .expect("secret rows are read");
+    assert_eq!(missing.secrets(), 1);
+    assert_eq!(missing.problem(), Some(SecretProblem::KeyMissing));
+
+    let wrong = settings::read_secret_health(&db.pool, &cipher(2))
+        .await
+        .expect("secret rows are read");
+    assert_eq!(wrong.problem(), Some(SecretProblem::Undecryptable));
+
+    let rotated = SecretCipher::new(Some(key(2)), Some(key(1)));
+    let readable = settings::read_secret_health(&db.pool, &rotated)
+        .await
+        .expect("secret rows are read");
+    assert_eq!(readable.problem(), None);
+}
+
+#[tokio::test]
+async fn unknown_secret_keys_are_checked_too() {
+    let db = support::isolated_db().await;
+    let key = "llm.from_a_newer_version";
+    let blob = cipher(1)
+        .encrypt(
+            &SecretContext::installation(key),
+            &SecretString::new("SECRET-future-token"),
+        )
+        .expect("encryption");
+    let mut conn = db.pool.acquire().await.expect("connection");
+    repository::set_secret(&mut conn, "installation", None, key, &blob)
+        .await
+        .expect("an unknown secret row is written directly");
+    drop(conn);
+
+    let healthy = settings::read_secret_health(&db.pool, &cipher(1))
+        .await
+        .expect("secret rows are read");
+    assert_eq!(healthy.secrets(), 1);
+    assert_eq!(healthy.problem(), None);
+
+    let wrong = settings::read_secret_health(&db.pool, &cipher(2))
+        .await
+        .expect("secret rows are read");
+    assert_eq!(
+        wrong.problem(),
+        Some(SecretProblem::Undecryptable),
+        "unknown keys are checked for rotation as well"
     );
 }
 

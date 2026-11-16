@@ -51,6 +51,46 @@ pub async fn all(
         .collect())
 }
 
+/// Зашифрованная строка `settings` вместе с уровнем.
+///
+/// Уровень нужен проверке расшифровки: AAD зависит от `scope`, `household_id`
+/// и `key`, поэтому одна и та же строка читается только своим контекстом.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredSecret {
+    /// Значение `settings.scope`: `installation` или `household`.
+    pub scope: String,
+    /// Household строки; `None` у настройки инсталляции.
+    pub household_id: Option<Uuid>,
+    /// Имя настройки (`settings.key`).
+    pub key: String,
+    /// Шифротекст из `settings.secret`.
+    pub secret: Vec<u8>,
+}
+
+/// Прочитать все зашифрованные строки всех уровней.
+///
+/// Неизвестные ключи тоже возвращаются: при ротации их придётся перешифровать.
+pub async fn secrets(conn: &mut PgConnection) -> Result<Vec<StoredSecret>, sqlx::Error> {
+    let rows: Vec<(String, Option<Uuid>, String, Vec<u8>)> = sqlx::query_as(
+        "SELECT scope, household_id, key, secret
+         FROM settings
+         WHERE secret IS NOT NULL
+         ORDER BY scope, household_id, key",
+    )
+    .fetch_all(conn)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(scope, household_id, key, secret)| StoredSecret {
+            scope,
+            household_id,
+            key,
+            secret,
+        })
+        .collect())
+}
+
 /// Записать обычное значение, заменив прежнее (в том числе секрет).
 pub async fn set_value(
     conn: &mut PgConnection,

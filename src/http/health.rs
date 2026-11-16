@@ -25,7 +25,8 @@ pub struct HealthResponse {
     /// Необязательные предупреждения о деградации; поле отсутствует, когда их
     /// нет. Имена предупреждений фиксированы: `multiple_households`,
     /// `llm_unavailable`, `llm_slot_unverified:<slot>` и
-    /// `llm_slot_unverified:<slot>:<режим>` для сохранённой проверки.
+    /// `llm_slot_unverified:<slot>:<режим>` для сохранённой проверки,
+    /// `secret_key_missing` и `secret_undecryptable` для сохранённых секретов.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warnings: Option<Vec<String>>,
 }
@@ -66,6 +67,19 @@ pub async fn ready(State(state): State<AppState>) -> Result<Json<HealthResponse>
 
     let now = Utc::now();
     let mut warnings: Vec<String> = Vec::new();
+
+    // Секреты читаются при каждом запросе: настройка может появиться из консоли
+    // без перезапуска. Ошибка базы здесь — та же недоступность, что и выше.
+    let secrets = crate::settings::read_secret_health(&state.pool, &state.secret_cipher)
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "readiness secret check failed");
+            ApiError::service_unavailable("Database is unavailable")
+        })?;
+    if let Some(problem) = secrets.problem() {
+        warnings.push(problem.code().to_owned());
+    }
+
     // Очередь и счёт household делят одно соединение. Счёт идёт после проверки
     // очереди: при 503 из-за лага он уже не нужен.
     if state.queue_lag_limit.is_some() || state.tenancy_mode == TenancyMode::Single {

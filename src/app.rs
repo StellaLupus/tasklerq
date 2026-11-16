@@ -14,6 +14,8 @@ use crate::http::api::capture::CaptureState;
 use crate::http::router::{AppState, build_router};
 use crate::jobs::retention::RetentionWorker;
 use crate::security_audit::Audit;
+use crate::settings;
+use crate::settings::crypto::SecretCipher;
 use crate::storage::repositories::households;
 use crate::telegram::runtime::{self, StartError};
 
@@ -52,6 +54,9 @@ pub async fn build_application_with_update_limit(
     warn_if_bootstrap_owner_missing(config);
     warn_if_multiple_households(config, &pool).await;
 
+    let secret_cipher = SecretCipher::from_config(config);
+    warn_if_stored_secrets_unreadable(&pool, &secret_cipher).await;
+
     let llm = runtime::build_llm(&config.llm);
     let llm_slots = llm
         .as_ref()
@@ -74,7 +79,9 @@ pub async fn build_application_with_update_limit(
     )
     .await?;
 
-    let mut state = AppState::new(pool.clone(), audit).with_tenancy_mode(config.tenancy.mode);
+    let mut state = AppState::new(pool.clone(), audit)
+        .with_tenancy_mode(config.tenancy.mode)
+        .with_secret_cipher(secret_cipher);
     if let Some(health) = llm_slots {
         state = state.with_llm_slots(health);
     }
@@ -147,6 +154,33 @@ async fn warn_if_multiple_households(config: &Config, pool: &PgPool) {
             tracing::warn!(
                 error = %error,
                 "could not count active households at startup"
+            );
+        }
+    }
+}
+
+/// Предупредить, что сохранённые секреты нельзя расшифровать.
+///
+/// Проверяются все зашифрованные строки, включая неизвестные этой версии
+/// ключи: при ротации их тоже придётся перешифровать. В строке нет имён
+/// настроек и значений — только признак и число строк. Сбой чтения базы не
+/// мешает запуску: его покажут readiness и рабочие задачи.
+async fn warn_if_stored_secrets_unreadable(pool: &PgPool, cipher: &SecretCipher) {
+    match settings::read_secret_health(pool, cipher).await {
+        Ok(health) => {
+            if let Some(problem) = health.problem() {
+                tracing::warn!(
+                    code = problem.code(),
+                    secrets = health.secrets(),
+                    "stored secrets cannot be decrypted: secret settings are unavailable until \
+                     the encryption key is fixed"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "could not check stored secrets at startup"
             );
         }
     }

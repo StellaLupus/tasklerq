@@ -189,7 +189,7 @@ pub enum SecretError {
 }
 
 /// Шифровальщик секретов: текущий ключ и необязательный прежний.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SecretCipher {
     current: Option<SecretKey>,
     old: Option<SecretKey>,

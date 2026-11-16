@@ -26,7 +26,7 @@ use crate::config::{
     parse_extra_json, parse_slot_timeout_ms, parse_slot_url,
 };
 use crate::settings::crypto::{SecretCipher, SecretContext, SecretError, SettingScope};
-use crate::storage::repositories::settings::{self as repository, StoredSetting};
+use crate::storage::repositories::settings::{self as repository, StoredSecret, StoredSetting};
 
 /// Источник действующего значения.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -221,6 +221,46 @@ impl SecretState {
             Self::KeyMissing => "key_missing",
             Self::Undecryptable => "undecryptable",
         }
+    }
+}
+
+/// Причина, по которой сохранённые секреты нельзя прочитать.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecretProblem {
+    /// Ни текущего, ни прежнего ключа нет.
+    KeyMissing,
+    /// Хотя бы одна строка не расшифровывается заданными ключами.
+    Undecryptable,
+}
+
+impl SecretProblem {
+    /// Код предупреждения readiness и стартового лога.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::KeyMissing => "secret_key_missing",
+            Self::Undecryptable => "secret_undecryptable",
+        }
+    }
+}
+
+/// Состояние зашифрованных настроек в базе.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SecretHealth {
+    /// Число строк с `secret IS NOT NULL`.
+    secrets: usize,
+    /// Причина, по которой их нельзя прочитать; `None` — всё читается.
+    problem: Option<SecretProblem>,
+}
+
+impl SecretHealth {
+    /// Число зашифрованных строк.
+    pub const fn secrets(self) -> usize {
+        self.secrets
+    }
+
+    /// Причина, по которой секреты нельзя прочитать.
+    pub const fn problem(self) -> Option<SecretProblem> {
+        self.problem
     }
 }
 
@@ -515,6 +555,71 @@ pub async fn read_effective_llm(
     Ok(effective_llm(env, &stored, cipher))
 }
 
+/// Проверить, что все зашифрованные настройки читаются заданными ключами.
+///
+/// Проверяются все строки с `secret IS NOT NULL`, включая неизвестные этой
+/// версии ключи: при ротации их тоже придётся перешифровать. Каждая строка
+/// расшифровывается со своим контекстом строки (уровень, household, имя
+/// настройки), поэтому подменённый шифротекст не пройдёт проверку только по id
+/// ключа. Открытый текст сразу отбрасывается.
+pub async fn read_secret_health(
+    pool: &PgPool,
+    cipher: &SecretCipher,
+) -> Result<SecretHealth, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    let secrets = repository::secrets(&mut conn).await?;
+    Ok(secret_health(&secrets, cipher))
+}
+
+fn secret_health(secrets: &[StoredSecret], cipher: &SecretCipher) -> SecretHealth {
+    let problem = secrets.iter().find_map(|secret| {
+        let context = secret_context(scope_of(&secret.scope), secret.household_id, &secret.key);
+        match cipher.decrypt(&context, &secret.secret) {
+            Ok(_) => None,
+            Err(SecretError::KeyMissing) => Some(SecretProblem::KeyMissing),
+            Err(SecretError::Undecryptable) => Some(SecretProblem::Undecryptable),
+        }
+    });
+
+    SecretHealth {
+        secrets: secrets.len(),
+        problem,
+    }
+}
+
+/// Уровень строки из `settings.scope`.
+///
+/// CHECK таблицы допускает только `installation` и `household`; всё, что не
+/// installation, считается household.
+fn scope_of(scope: &str) -> SettingScope {
+    if scope == SettingScope::Household.as_str() {
+        SettingScope::Household
+    } else {
+        SettingScope::Installation
+    }
+}
+
+/// Контекст шифротекста по уровню строки.
+///
+/// Единственное место построения AAD: запись, чтение слота и проверка
+/// readiness используют одну функцию, поэтому уровень из перечня ключей и
+/// уровень строки не расходятся. У household-ключа без идентификатора
+/// контекста строки не существует, и такой вызов остаётся инсталляционным —
+/// согласованность уровня обеспечивает CHECK таблицы при чтении и будущий
+/// писатель household-настроек при записи.
+fn secret_context(
+    scope: SettingScope,
+    household_id: Option<uuid::Uuid>,
+    key: &str,
+) -> SecretContext {
+    match (scope, household_id) {
+        (SettingScope::Household, Some(household_id)) => {
+            SecretContext::household(household_id, key)
+        }
+        _ => SecretContext::installation(key),
+    }
+}
+
 /// Записать обычное значение известной настройки.
 pub async fn write_value(
     conn: &mut PgConnection,
@@ -555,7 +660,13 @@ pub async fn write_secret(
             key: descriptor.name,
         });
     }
-    let context = SecretContext::installation(descriptor.name);
+    if value.expose().trim().is_empty() {
+        return Err(SettingError::InvalidValue {
+            key: descriptor.name,
+            reason: "expected a non-empty string".to_owned(),
+        });
+    }
+    let context = secret_context(descriptor.scope, None, descriptor.name);
     let blob = cipher
         .encrypt(&context, value)
         .map_err(|error| match error {
@@ -803,7 +914,7 @@ fn resolve_slot(
         Some(row) => match row.secret.as_deref() {
             None => (None, SecretState::NotSet),
             Some(blob) => {
-                let context = SecretContext::installation(keys.token);
+                let context = secret_context(SettingScope::Installation, None, keys.token);
                 match cipher.decrypt(&context, blob) {
                     Ok(secret) => (Some(secret), SecretState::Set),
                     Err(SecretError::KeyMissing) => {

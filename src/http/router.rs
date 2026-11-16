@@ -13,6 +13,7 @@ use super::middleware::request_id;
 use crate::capture::slot_status::LlmSlotHealth;
 use crate::config::TenancyMode;
 use crate::security_audit::Audit;
+use crate::settings::crypto::SecretCipher;
 use crate::telegram::webhook::{self, Ingress};
 
 /// Состояние приложения, доступное обработчикам.
@@ -34,6 +35,9 @@ pub struct AppState {
     pub capture: Option<CaptureState>,
     /// Статус проверки слотов LLM; `None`, если разбор выключен.
     pub llm_slots: Option<std::sync::Arc<LlmSlotHealth>>,
+    /// Ключи шифрования для проверки сохранённых секретов в `/health/ready`.
+    /// По умолчанию ключей нет: тестовая сборка не читает чужие секреты.
+    pub secret_cipher: SecretCipher,
 }
 
 impl AppState {
@@ -51,6 +55,7 @@ impl AppState {
             tenancy_mode: TenancyMode::Single,
             capture: None,
             llm_slots: None,
+            secret_cipher: SecretCipher::new(None, None),
         }
     }
 
@@ -69,6 +74,12 @@ impl AppState {
     /// Задать режим размещения для проверки деградации в `/health/ready`.
     pub fn with_tenancy_mode(mut self, mode: TenancyMode) -> Self {
         self.tenancy_mode = mode;
+        self
+    }
+
+    /// Задать ключи для проверки сохранённых секретов в `/health/ready`.
+    pub fn with_secret_cipher(mut self, cipher: SecretCipher) -> Self {
+        self.secret_cipher = cipher;
         self
     }
 
