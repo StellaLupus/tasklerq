@@ -200,6 +200,35 @@ impl fmt::Display for SecretKey {
 const SECRET_KEY_FORMAT: &str =
     "expected base64-encoded 32 bytes, for example the output of `openssl rand -base64 32`";
 
+/// Ключи шифрования секретных настроек: текущий и прежний.
+///
+/// Разбор тот же, что у полной конфигурации сервиса, но командам, которым не
+/// нужны Telegram, LLM и публичный URL, достаточно этого набора.
+#[derive(Clone, Debug)]
+pub struct SecretKeyConfig {
+    /// `TASKLERQ_SECRET_KEY`: им шифруются все записи.
+    pub current: Option<SecretKey>,
+    /// `TASKLERQ_SECRET_KEY_OLD`: им ещё можно расшифровывать после ротации.
+    pub old: Option<SecretKey>,
+}
+
+impl SecretKeyConfig {
+    /// Загрузить только ключи шифрования из окружения.
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Self::from_source(&EnvSource::from_process())
+    }
+
+    fn from_source(source: &EnvSource) -> Result<Self, ConfigError> {
+        Ok(Self {
+            current: read_secret_key(source.get("TASKLERQ_SECRET_KEY"), "TASKLERQ_SECRET_KEY")?,
+            old: read_secret_key(
+                source.get("TASKLERQ_SECRET_KEY_OLD"),
+                "TASKLERQ_SECRET_KEY_OLD",
+            )?,
+        })
+    }
+}
+
 /// Адрес для журнала и `Debug`: без учётных данных, query и fragment.
 ///
 /// Неразбираемый адрес заменяется заглушкой: в нём может оказаться секрет,

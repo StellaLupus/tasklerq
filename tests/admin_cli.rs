@@ -8,12 +8,18 @@ mod support;
 use std::process::{Output, Stdio};
 
 use axum::http::{Method, StatusCode};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::Utc;
 use serde_json::Value;
+use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tasklerq::auth::tokens::{SCOPES, hash_token};
+use tasklerq::config::{SecretKey, SecretString};
+use tasklerq::settings::crypto::{KeyId, SecretCipher, SecretContext, SecretError, key_id};
 use tasklerq::storage::migrations;
 use tasklerq::storage::repositories::invites;
+use tasklerq::storage::repositories::settings as settings_repository;
 use tokio::process::Command;
 use uuid::Uuid;
 use wiremock::matchers::{method, path};
@@ -1527,4 +1533,293 @@ async fn multi_export_requires_household_even_when_unique() {
     assert_eq!(export["household"]["id"], household_id);
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Ключ шифрования, все 32 байта которого равны `byte`, в base64.
+fn encoded_key(byte: u8) -> String {
+    BASE64.encode([byte; 32])
+}
+
+fn secret_key(byte: u8) -> SecretKey {
+    SecretKey::parse(&encoded_key(byte)).expect("32 bytes are a key")
+}
+
+fn key_cipher(byte: u8) -> SecretCipher {
+    SecretCipher::new(Some(secret_key(byte)), None)
+}
+
+async fn store_secret(
+    pool: &PgPool,
+    household: Option<Uuid>,
+    key: &str,
+    plaintext: &str,
+    cipher: &SecretCipher,
+) {
+    let context = match household {
+        Some(household_id) => SecretContext::household(household_id, key),
+        None => SecretContext::installation(key),
+    };
+    let blob = cipher
+        .encrypt(&context, &SecretString::new(plaintext))
+        .expect("encryption with the test key succeeds");
+    let scope = if household.is_some() {
+        "household"
+    } else {
+        "installation"
+    };
+    let mut conn = pool.acquire().await.expect("connection");
+    settings_repository::set_secret(&mut conn, scope, household, key, &blob)
+        .await
+        .expect("the secret row is written");
+}
+
+async fn stored_row(
+    pool: &PgPool,
+    household: Option<Uuid>,
+    key: &str,
+) -> (Vec<u8>, chrono::DateTime<Utc>) {
+    sqlx::query_as(
+        "SELECT secret, updated_at
+         FROM settings
+         WHERE scope = $1 AND household_id IS NOT DISTINCT FROM $2 AND key = $3",
+    )
+    .bind(if household.is_some() {
+        "household"
+    } else {
+        "installation"
+    })
+    .bind(household)
+    .bind(key)
+    .fetch_one(pool)
+    .await
+    .expect("the secret row exists")
+}
+
+async fn run_rotate(url: &str, current: Option<u8>, old: Option<u8>) -> Output {
+    let mut command = bin();
+    command
+        .env("DATABASE_URL", url)
+        .env("RUST_LOG", "error")
+        .env_remove("TASKLERQ_SECRET_KEY")
+        .env_remove("TASKLERQ_SECRET_KEY_OLD")
+        .args(["admin", "secret-key", "rotate"])
+        .stdin(Stdio::null());
+    if let Some(byte) = current {
+        command.env("TASKLERQ_SECRET_KEY", encoded_key(byte));
+    }
+    if let Some(byte) = old {
+        command.env("TASKLERQ_SECRET_KEY_OLD", encoded_key(byte));
+    }
+    command.output().await.expect("the CLI should run")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secret_key_rotate_reencrypts_secrets_with_the_new_key() {
+    let db = cli_database().await;
+    store_secret(
+        &db.pool,
+        None,
+        "llm.primary.token",
+        "SECRET-primary-token",
+        &key_cipher(1),
+    )
+    .await;
+    store_secret(
+        &db.pool,
+        None,
+        "llm.fallback.token",
+        "SECRET-fallback-token",
+        &key_cipher(1),
+    )
+    .await;
+
+    let output = run_rotate(&db.url, Some(2), Some(1)).await;
+
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("2 перешифровано"), "{text}");
+    assert!(
+        !text.contains("SECRET-"),
+        "values must not be printed:\n{text}"
+    );
+
+    for (key, plaintext) in [
+        ("llm.primary.token", "SECRET-primary-token"),
+        ("llm.fallback.token", "SECRET-fallback-token"),
+    ] {
+        let (blob, _) = stored_row(&db.pool, None, key).await;
+        assert_eq!(
+            key_id(&blob),
+            Some(KeyId::of(&secret_key(2))),
+            "{key} must be under the new key"
+        );
+        let context = SecretContext::installation(key);
+        assert_eq!(
+            key_cipher(2)
+                .decrypt(&context, &blob)
+                .expect("the new key reads the secret")
+                .expose(),
+            plaintext
+        );
+        assert_eq!(
+            key_cipher(1).decrypt(&context, &blob),
+            Err(SecretError::Undecryptable),
+            "{key} must not be readable by the old key alone"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secret_key_rotate_does_not_touch_rows_under_the_current_key() {
+    let db = cli_database().await;
+    store_secret(
+        &db.pool,
+        None,
+        "llm.primary.token",
+        "SECRET-primary-token",
+        &key_cipher(1),
+    )
+    .await;
+
+    let first = run_rotate(&db.url, Some(2), Some(1)).await;
+    assert!(first.status.success(), "{first:?}");
+    let before = stored_row(&db.pool, None, "llm.primary.token").await;
+
+    let second = run_rotate(&db.url, Some(2), Some(1)).await;
+
+    assert!(second.status.success(), "{second:?}");
+    let text = stdout(&second);
+    assert!(text.contains("0 перешифровано"), "{text}");
+    assert!(text.contains("1 уже"), "{text}");
+    let after = stored_row(&db.pool, None, "llm.primary.token").await;
+    assert_eq!(after.0, before.0, "the ciphertext must stay unchanged");
+    assert_eq!(after.1, before.1, "a second run must not change updated_at");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secret_key_rotate_rolls_back_and_names_the_setting_it_cannot_decrypt() {
+    let db = cli_database().await;
+    let household = support::create_household(&db.pool).await;
+    let household_id = household.household_id;
+    store_secret(
+        &db.pool,
+        Some(household_id),
+        "llm.primary.token",
+        "SECRET-household-token",
+        &key_cipher(1),
+    )
+    .await;
+    store_secret(
+        &db.pool,
+        Some(household_id),
+        "llm.zzz.broken",
+        "SECRET-broken-token",
+        &key_cipher(3),
+    )
+    .await;
+    store_secret(
+        &db.pool,
+        None,
+        "llm.fallback.token",
+        "SECRET-installation-token",
+        &key_cipher(1),
+    )
+    .await;
+
+    let rows = [
+        (
+            Some(household_id),
+            "llm.primary.token",
+            stored_row(&db.pool, Some(household_id), "llm.primary.token").await,
+        ),
+        (
+            Some(household_id),
+            "llm.zzz.broken",
+            stored_row(&db.pool, Some(household_id), "llm.zzz.broken").await,
+        ),
+        (
+            None,
+            "llm.fallback.token",
+            stored_row(&db.pool, None, "llm.fallback.token").await,
+        ),
+    ];
+
+    let output = run_rotate(&db.url, Some(2), Some(1)).await;
+
+    assert!(!output.status.success(), "{output:?}");
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        combined.contains("llm.zzz.broken"),
+        "the CLI must name the undecryptable setting:\n{combined}"
+    );
+    assert!(
+        combined.contains(&household_id.to_string()),
+        "the CLI must name the household of the setting:\n{combined}"
+    );
+    assert!(
+        !combined.contains("SECRET-"),
+        "secret values must not be printed:\n{combined}"
+    );
+
+    for (household, key, before) in rows {
+        let after = stored_row(&db.pool, household, key).await;
+        assert_eq!(
+            after.0, before.0,
+            "{key} must stay byte-identical after rollback"
+        );
+        assert_eq!(
+            after.1, before.1,
+            "{key} must keep updated_at after rollback"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secret_key_rotate_without_the_current_key_explains_what_to_set() {
+    let db = cli_database().await;
+
+    let output = run_rotate(&db.url, None, Some(1)).await;
+
+    assert!(!output.status.success(), "{output:?}");
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        combined.contains("TASKLERQ_SECRET_KEY"),
+        "the error must name the missing parameter:\n{combined}"
+    );
+    assert!(
+        combined.contains("openssl rand -base64 32"),
+        "the error must hint at the key format:\n{combined}"
+    );
+    assert!(
+        !combined.contains(&encoded_key(1)),
+        "key values must not be printed:\n{combined}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secret_key_rotate_rejects_an_invalid_key_without_printing_it() {
+    let db = cli_database().await;
+    let invalid = "not-base64-SECRET-key";
+
+    let output = bin()
+        .env("DATABASE_URL", &db.url)
+        .env("RUST_LOG", "error")
+        .env("TASKLERQ_SECRET_KEY", invalid)
+        .env_remove("TASKLERQ_SECRET_KEY_OLD")
+        .args(["admin", "secret-key", "rotate"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .expect("the CLI should run");
+
+    assert!(!output.status.success(), "{output:?}");
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        combined.contains("TASKLERQ_SECRET_KEY"),
+        "the error must name the invalid parameter:\n{combined}"
+    );
+    assert!(
+        !combined.contains(invalid),
+        "the invalid key value must not be printed:\n{combined}"
+    );
 }

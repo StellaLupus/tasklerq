@@ -91,6 +91,56 @@ pub async fn secrets(conn: &mut PgConnection) -> Result<Vec<StoredSecret>, sqlx:
         .collect())
 }
 
+/// Прочитать все зашифрованные строки всех уровней с блокировкой до конца
+/// транзакции.
+///
+/// Нужно ротации: пока ключ меняется, сервис не должен записать новую строку
+/// со старым ключом мимо перешифровки.
+pub async fn secrets_for_update(conn: &mut PgConnection) -> Result<Vec<StoredSecret>, sqlx::Error> {
+    let rows: Vec<(String, Option<Uuid>, String, Vec<u8>)> = sqlx::query_as(
+        "SELECT scope, household_id, key, secret
+         FROM settings
+         WHERE secret IS NOT NULL
+         ORDER BY scope, household_id, key
+         FOR UPDATE",
+    )
+    .fetch_all(conn)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(scope, household_id, key, secret)| StoredSecret {
+            scope,
+            household_id,
+            key,
+            secret,
+        })
+        .collect())
+}
+
+/// Записать новый шифротекст существующей секретной строки.
+pub async fn update_secret(
+    conn: &mut PgConnection,
+    scope: &str,
+    household_id: Option<Uuid>,
+    key: &str,
+    secret: &[u8],
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE settings
+         SET secret = $4, updated_at = now()
+         WHERE scope = $1 AND household_id IS NOT DISTINCT FROM $2 AND key = $3
+           AND secret IS NOT NULL",
+    )
+    .bind(scope)
+    .bind(household_id)
+    .bind(key)
+    .bind(secret)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
 /// Записать обычное значение, заменив прежнее (в том числе секрет).
 pub async fn set_value(
     conn: &mut PgConnection,

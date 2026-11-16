@@ -25,7 +25,7 @@ use crate::config::{
     SecretString, SlotConfig, loggable_url, parse_connect_timeout_ms, parse_daily_quota,
     parse_extra_json, parse_slot_timeout_ms, parse_slot_url,
 };
-use crate::settings::crypto::{SecretCipher, SecretContext, SecretError, SettingScope};
+use crate::settings::crypto::{SecretCipher, SecretContext, SecretError, SettingScope, key_id};
 use crate::storage::repositories::settings::{self as repository, StoredSecret, StoredSetting};
 
 /// Источник действующего значения.
@@ -584,6 +584,110 @@ fn secret_health(secrets: &[StoredSecret], cipher: &SecretCipher) -> SecretHealt
     SecretHealth {
         secrets: secrets.len(),
         problem,
+    }
+}
+
+/// Итог ротации ключа шифрования: сколько строк перешифровано.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RotationReport {
+    rotated: usize,
+    already_current: usize,
+}
+
+impl RotationReport {
+    /// Число строк, перешифрованных текущим ключом.
+    pub const fn rotated(self) -> usize {
+        self.rotated
+    }
+
+    /// Число строк, уже зашифрованных текущим ключом.
+    pub const fn already_current(self) -> usize {
+        self.already_current
+    }
+}
+
+/// Ошибка ротации ключа. Не содержит ни значений, ни шифротекста.
+#[derive(Debug, Error)]
+pub enum RotationError {
+    /// Текущий ключ не задан: перешифровывать нечем.
+    #[error(
+        "TASKLERQ_SECRET_KEY is not set: set the current encryption key, for example \
+         the output of `openssl rand -base64 32`; nothing changed"
+    )]
+    KeyMissing,
+    /// Строку не удалось расшифровать ни одним ключом; транзакция откатится.
+    #[error(
+        "secret setting {setting} cannot be decrypted by the current or old key; nothing changed"
+    )]
+    Undecryptable {
+        /// Имя настройки и household без значения секрета.
+        setting: String,
+    },
+    /// Ошибка базы.
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+}
+
+/// Перешифровать все секреты текущим ключом в одной транзакции.
+///
+/// Строки читаются с `FOR UPDATE`, поэтому сервис не запишет секрет прежним
+/// ключом мимо перешифровки. Строки, уже зашифрованные текущим ключом, не
+/// меняются (в том числе `updated_at`), но всё равно расшифровываются: так
+/// подменённый тег обнаруживается и без смены id ключа. Контекст строки
+/// строится из её собственных `scope`, `household_id` и `key`, поэтому
+/// неизвестные этой версии ключи перешифровываются тоже. Первая же
+/// нерасшифровываемая строка откатывает всю транзакцию.
+pub async fn rotate_secret_key(
+    pool: &PgPool,
+    cipher: &SecretCipher,
+) -> Result<RotationReport, RotationError> {
+    let current_key_id = cipher.current_key_id().ok_or(RotationError::KeyMissing)?;
+    let mut tx = pool.begin().await?;
+    let secrets = repository::secrets_for_update(&mut tx).await?;
+    let mut report = RotationReport::default();
+
+    for secret in &secrets {
+        let context = secret_context(scope_of(&secret.scope), secret.household_id, &secret.key);
+        let plaintext = cipher
+            .decrypt(&context, &secret.secret)
+            .map_err(|error| rotation_error(secret, error))?;
+
+        if key_id(&secret.secret) == Some(current_key_id) {
+            report.already_current += 1;
+            continue;
+        }
+
+        let blob = cipher
+            .encrypt(&context, &plaintext)
+            .map_err(|error| rotation_error(secret, error))?;
+        repository::update_secret(
+            &mut tx,
+            &secret.scope,
+            secret.household_id,
+            &secret.key,
+            &blob,
+        )
+        .await?;
+        report.rotated += 1;
+    }
+
+    tx.commit().await?;
+    Ok(report)
+}
+
+fn rotation_error(secret: &StoredSecret, error: SecretError) -> RotationError {
+    match error {
+        SecretError::KeyMissing => RotationError::KeyMissing,
+        SecretError::Undecryptable => RotationError::Undecryptable {
+            setting: rotation_setting_label(secret),
+        },
+    }
+}
+
+fn rotation_setting_label(secret: &StoredSecret) -> String {
+    match secret.household_id {
+        Some(household_id) => format!("`{}` (household {household_id})", secret.key),
+        None => format!("`{}`", secret.key),
     }
 }
 

@@ -12,12 +12,15 @@ use tasklerq::admin;
 use tasklerq::app::build_application;
 use tasklerq::capture::eval::{SmokeSet, TitleMatch, evaluate_with};
 use tasklerq::capture::slot_check;
-use tasklerq::config::{self, Config, DatabaseConfig, LlmConfig, SlotConfig, TenancyConfig};
+use tasklerq::config::{
+    self, Config, DatabaseConfig, LlmConfig, SecretKeyConfig, SlotConfig, TenancyConfig,
+};
 use tasklerq::domain::error::DomainError;
 use tasklerq::domain::models::UserRole;
 use tasklerq::http::server;
 use tasklerq::llm::OpenAiBackend;
 use tasklerq::redaction;
+use tasklerq::settings::{self, crypto::SecretCipher};
 use tasklerq::storage;
 use tasklerq::storage::repositories::llm_slot_checks::{self, NewCheck};
 use tasklerq::storage::repositories::llm_slot_settings;
@@ -206,6 +209,11 @@ enum AdminCommand {
         #[command(subcommand)]
         command: UserCommand,
     },
+    /// Ключ шифрования секретных настроек.
+    SecretKey {
+        #[command(subcommand)]
+        command: SecretKeyCommand,
+    },
     /// Выгрузить данные household в JSON.
     Export(ExportArgs),
 }
@@ -220,6 +228,7 @@ enum DatabaseCommand {
     Queue(QueueCommand),
     Household(HouseholdCommand),
     User(UserCommand),
+    SecretKey(SecretKeyCommand),
     Export(ExportArgs),
 }
 
@@ -354,6 +363,16 @@ enum UserCommand {
 enum RoleArg {
     Owner,
     Member,
+}
+
+#[derive(Debug, Subcommand)]
+enum SecretKeyCommand {
+    /// Перешифровать секреты прежним ключом на текущий в одной транзакции.
+    ///
+    /// Текущий ключ — `TASKLERQ_SECRET_KEY`, прежний — `TASKLERQ_SECRET_KEY_OLD`.
+    /// Строки, уже зашифрованные текущим ключом, не меняются. Если хоть одна
+    /// строка не расшифровывается ни одним ключом, ничего не меняется.
+    Rotate,
 }
 
 impl From<RoleArg> for UserRole {
@@ -529,6 +548,9 @@ async fn run_admin(command: AdminCommand) -> Result<()> {
             run_admin_database(DatabaseCommand::Household(command)).await
         }
         AdminCommand::User { command } => run_admin_database(DatabaseCommand::User(command)).await,
+        AdminCommand::SecretKey { command } => {
+            run_admin_database(DatabaseCommand::SecretKey(command)).await
+        }
         AdminCommand::Export(args) => run_admin_database(DatabaseCommand::Export(args)).await,
     }
 }
@@ -723,6 +745,19 @@ async fn run_admin_database(command: DatabaseCommand) -> Result<()> {
                 println!("household: {}", household.id);
                 println!("user: {}", user.id);
                 println!("telegram_id: {}", user.telegram_user_id);
+            }
+        },
+        DatabaseCommand::SecretKey(command) => match command {
+            SecretKeyCommand::Rotate => {
+                let keys =
+                    SecretKeyConfig::from_env().context("invalid secret key configuration")?;
+                let cipher = SecretCipher::new(keys.current, keys.old);
+                let report = settings::rotate_secret_key(&pool, &cipher).await?;
+                println!(
+                    "{} перешифровано, {} уже под текущим ключом",
+                    report.rotated(),
+                    report.already_current()
+                );
             }
         },
         DatabaseCommand::Export(args) => {
