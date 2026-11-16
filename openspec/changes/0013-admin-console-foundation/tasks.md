@@ -119,7 +119,7 @@
 
 ## 5. Listener, учётка и вход
 
-- [ ] 5.1 Второй listener в `src/main.rs::serve` с общим shutdown;
+- [x] 5.1 Второй listener в `src/main.rs::serve` с общим shutdown;
   `src/admin_console/router.rs` с главной за аутентификацией;
   `ADMIN_BIND_ADDR=disabled` не поднимает listener. Вынести определение
   клиента и схемы в `src/http/client.rs` с параметром «доверенные сети»:

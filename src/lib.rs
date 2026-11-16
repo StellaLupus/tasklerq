@@ -1,6 +1,7 @@
 //! Tasklerq — семейные задачи и покупки.
 
 pub mod admin;
+pub mod admin_console;
 pub mod app;
 pub mod auth;
 pub mod capture;

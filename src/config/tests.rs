@@ -514,6 +514,24 @@ fn ip_net_contains_covers_ipv4_ipv6_and_prefix_boundaries() {
     assert!(!v6_all.contains("10.0.0.1".parse().unwrap()));
 }
 
+#[test]
+fn ip_net_contains_canonicalizes_ipv4_mapped_addresses() {
+    let ipv4 = IpNet::parse("10.0.0.0/8").expect("IPv4 network");
+
+    assert!(ipv4.contains("::ffff:10.0.0.1".parse().unwrap()));
+    assert!(!ipv4.contains("::ffff:11.0.0.1".parse().unwrap()));
+}
+
+#[test]
+fn ip_net_contains_handles_prefixes_not_multiple_of_eight() {
+    let network = IpNet::parse("192.168.1.0/25").expect("IPv4 network");
+
+    assert!(network.contains("192.168.1.0".parse().unwrap()));
+    assert!(network.contains("192.168.1.127".parse().unwrap()));
+    assert!(!network.contains("192.168.1.128".parse().unwrap()));
+    assert!(!network.contains("192.168.0.255".parse().unwrap()));
+}
+
 /// Base64 стандартного алфавита для 32 байт `0x00..=0x1f`.
 const SECRET_KEY_BASE64: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
 /// Base64 стандартного алфавита для 16 байт: слишком короткий ключ.

@@ -62,8 +62,11 @@ impl IpNet {
     }
 
     /// Входит ли адрес в сеть. Сети разного семейства не пересекаются.
+    ///
+    /// Проверяемый адрес приводится через [`IpAddr::to_canonical`]: пир
+    /// `::ffff:10.0.0.1` на dual-stack-сокете входит в `10.0.0.0/8`.
     pub fn contains(self, other: IpAddr) -> bool {
-        match (self.addr, other) {
+        match (self.addr, other.to_canonical()) {
             (IpAddr::V4(network), IpAddr::V4(address)) => {
                 let different = u32::from(network) ^ u32::from(address);
                 different.leading_zeros() >= u32::from(self.prefix)

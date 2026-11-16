@@ -8,6 +8,7 @@ use sqlx::PgPool;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use crate::admin_console::router::{AdminState, build_router as build_admin_router};
 use crate::capture::slot_status::{LlmSlotHealth, SlotStatus, SlotStatusReport};
 use crate::config::{Config, TelegramMode, TenancyMode};
 use crate::http::api::capture::CaptureState;
@@ -25,6 +26,8 @@ use crate::telegram::runtime::{self, StartError};
 pub struct Application {
     /// Готовый HTTP-роутер.
     pub router: Router,
+    /// Роутер консоли; `None`, если `ADMIN_BIND_ADDR=disabled`.
+    pub admin_router: Option<Router>,
     /// Фоновые задачи: Telegram (в режиме `disabled` их нет), retention и
     /// доменный тикер.
     pub workers: Vec<JoinHandle<()>>,
@@ -103,6 +106,15 @@ pub async fn build_application_with_update_limit(
         state = state.with_capture(CaptureState::new(config.capture, llm));
     }
 
+    // Консоль получает собственный роутер и listener. `disabled` не создаёт
+    // ни того, ни другого.
+    let admin_router = config.admin_bind_addr.map(|_| {
+        build_admin_router(AdminState::new(
+            pool.clone(),
+            config.admin_trusted_proxies.clone(),
+        ))
+    });
+
     // Retention и доменный тикер не зависят от Telegram: чистят базу и
     // переводят повторяющиеся события и без токена бота.
     workers.push(tokio::spawn(
@@ -112,6 +124,7 @@ pub async fn build_application_with_update_limit(
 
     Ok(Application {
         router: build_router(state),
+        admin_router,
         workers,
         llm_settings,
     })

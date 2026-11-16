@@ -19,7 +19,6 @@ use tasklerq::llm::OpenAiBackend;
 use tasklerq::redaction;
 use tasklerq::settings::{self, crypto::SecretCipher};
 use tasklerq::storage;
-use tokio::net::TcpListener;
 use tokio::signal;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -449,12 +448,21 @@ async fn serve() -> Result<()> {
         .await
         .context("database migration failed")?;
 
-    let listener = TcpListener::bind(config.bind_addr)
+    let listeners = server::bind_listeners(&config)
         .await
-        .with_context(|| format!("failed to bind {}", config.bind_addr))?;
-    let address = listener
+        .context("failed to bind http listeners")?;
+    let address = listeners
+        .public
         .local_addr()
         .context("failed to read the bound address")?;
+    let admin_address = match listeners.admin.as_ref() {
+        Some(listener) => Some(
+            listener
+                .local_addr()
+                .context("failed to read the bound admin console address")?,
+        ),
+        None => None,
+    };
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let application = build_application(&config, pool, shutdown_rx)
@@ -462,6 +470,7 @@ async fn serve() -> Result<()> {
         .context("telegram startup failed")?;
     let workers = application.workers;
     let app = application.router;
+    let admin = listeners.admin.zip(application.admin_router);
     tracing::info!(
         mode = config.telegram.mode.as_str(),
         workers = workers.len(),
@@ -469,8 +478,12 @@ async fn serve() -> Result<()> {
     );
 
     tracing::info!(%address, "http server listening");
+    match admin_address {
+        Some(address) => tracing::info!(%address, "admin console listening"),
+        None => tracing::info!("admin console is disabled"),
+    }
 
-    server::serve(listener, app, async move {
+    server::serve_listeners(listeners.public, app, admin, async move {
         shutdown_signal().await;
         let _ = shutdown_tx.send(true);
     })

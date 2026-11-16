@@ -17,6 +17,7 @@ use tokio::sync::Notify;
 
 use crate::config::SecretString;
 use crate::domain::models::{Actor, ActorType};
+use crate::http::client::{Client, TrustedProxies};
 use crate::http::error::ApiError;
 use crate::http::router::AppState;
 use crate::metrics;
@@ -36,8 +37,6 @@ pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 pub const WEBHOOKS_PER_SECOND: u32 = 120;
 /// Окно лимита webhook, секунды.
 const WEBHOOK_WINDOW_SECONDS: i64 = 1;
-/// Заголовок, который дописывает доверенный reverse proxy.
-const FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
 
 /// Настройки приёма webhook.
 #[derive(Clone)]
@@ -91,7 +90,7 @@ pub async fn receive(
 
     // Проверка лимита — до разбора тела и секрета: всплеск запросов с одного
     // IP не должен доходить до парсинга и базы.
-    let ip = client_ip(peer, forwarded_for(&headers).as_deref());
+    let ip = Client::resolve(peer, &headers, TrustedProxies::PrivateNetworks).ip;
     let now = Utc::now();
     // IPv6-клиент почти всегда распоряжается целой /64: лимит должен считать
     // префикс, иначе смена младших 64 бит обходит 120/с. Тот же префикс идёт в
@@ -189,102 +188,4 @@ pub async fn receive(
     }
 
     Ok(StatusCode::OK)
-}
-
-/// Последнее значение `X-Forwarded-For` из всех заголовков запроса.
-fn forwarded_for(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get_all(FORWARDED_FOR_HEADER)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(str::trim)
-        .rfind(|value| !value.is_empty())
-        .map(str::to_owned)
-}
-
-/// IP клиента по адресу пира и `X-Forwarded-For`.
-///
-/// Заголовок принимается только от доверенного прокси: loopback или приватной
-/// сети. В Docker reverse proxy на хосте подключается к контейнеру через
-/// bridge-шлюз (`172.x.0.1`), поэтому одного loopback недостаточно. Для
-/// остальных пиров заголовок игнорируется: клиент мог подделать его сам.
-fn client_ip(peer: SocketAddr, forwarded: Option<&str>) -> IpAddr {
-    // IPv4-mapped адрес (`::ffff:127.0.0.1`) — это тот же IPv4-клиент на
-    // dual-stack-сокете; без приведения loopback-пир не считался бы доверенным
-    // прокси и `X-Forwarded-For` игнорировался бы.
-    let peer_ip = peer.ip().to_canonical();
-    if is_trusted_proxy(peer_ip)
-        && let Some(forwarded) = forwarded
-        && let Ok(ip) = forwarded.trim().parse::<IpAddr>()
-    {
-        return ip;
-    }
-    peer_ip
-}
-
-/// Адрес доверенного reverse proxy: loopback, RFC1918 или IPv6 ULA.
-fn is_trusted_proxy(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
-        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-    use axum::http::{HeaderMap, HeaderValue};
-
-    use super::{client_ip, forwarded_for};
-
-    fn peer(octets: [u8; 4]) -> SocketAddr {
-        SocketAddr::from((octets, 4_040))
-    }
-
-    #[test]
-    fn the_last_forwarded_address_is_used() {
-        let mut headers = HeaderMap::new();
-        headers.append(
-            "x-forwarded-for",
-            HeaderValue::from_static("203.0.113.1, 198.51.100.7"),
-        );
-        assert_eq!(forwarded_for(&headers).as_deref(), Some("198.51.100.7"));
-    }
-
-    #[test]
-    fn a_trusted_peer_uses_the_forwarded_address() {
-        let ip: IpAddr = "198.51.100.7".parse().expect("ip");
-        assert_eq!(client_ip(peer([127, 0, 0, 1]), Some("198.51.100.7")), ip);
-        // Docker bridge: reverse proxy на хосте виден как шлюз 172.x.0.1.
-        assert_eq!(client_ip(peer([172, 18, 0, 1]), Some("198.51.100.7")), ip);
-        assert_eq!(
-            client_ip(peer([127, 0, 0, 1]), None),
-            IpAddr::V4(Ipv4Addr::LOCALHOST)
-        );
-        assert_eq!(
-            client_ip(peer([127, 0, 0, 1]), Some("not-an-ip")),
-            IpAddr::V4(Ipv4Addr::LOCALHOST)
-        );
-    }
-
-    #[test]
-    fn a_public_peer_ignores_the_forwarded_header() {
-        assert_eq!(
-            client_ip(peer([203, 0, 113, 9]), Some("198.51.100.7")),
-            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))
-        );
-    }
-
-    #[test]
-    fn an_ipv4_mapped_loopback_peer_is_a_trusted_proxy() {
-        let mapped: SocketAddr = "[::ffff:127.0.0.1]:4040".parse().expect("mapped peer");
-        assert_eq!(
-            client_ip(mapped, Some("198.51.100.7")),
-            "198.51.100.7".parse::<IpAddr>().expect("ip")
-        );
-        // Без заголовка пир приводится к каноническому IPv4.
-        assert_eq!(client_ip(mapped, None), IpAddr::V4(Ipv4Addr::LOCALHOST));
-    }
 }
