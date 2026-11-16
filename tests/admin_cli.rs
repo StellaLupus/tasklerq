@@ -2007,3 +2007,165 @@ async fn setup_code_with_an_account_suggests_reset_password() {
         .expect("code count");
     assert_eq!(codes, 0, "no code is issued for an existing account");
 }
+
+/// Запуск CLI с явным `ADMIN_BIND_ADDR`; без значения переменная убрана.
+async fn run_with_admin_addr(url: &str, admin_bind_addr: Option<&str>, args: &[&str]) -> Output {
+    let mut command = bin();
+    command
+        .env("DATABASE_URL", url)
+        .env("RUST_LOG", "error")
+        .env_remove("ADMIN_BIND_ADDR")
+        .args(args)
+        .stdin(Stdio::null());
+    if let Some(value) = admin_bind_addr {
+        command.env("ADMIN_BIND_ADDR", value);
+    }
+    command.output().await.expect("the CLI should run")
+}
+
+async fn insert_admin_account(pool: &PgPool) {
+    sqlx::query(
+        "INSERT INTO admin_accounts (id, username, password_hash)
+         VALUES ($1, 'admin', '$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA')",
+    )
+    .bind(Uuid::now_v7())
+    .execute(pool)
+    .await
+    .expect("administrator account");
+}
+
+/// `admin reset-password` печатает путь, срок и порт, пишет аудит без кода и
+/// гасит прежнюю ссылку.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reset_password_prints_a_recovery_path_and_revokes_the_previous_link() {
+    let db = cli_database().await;
+    insert_admin_account(&db.pool).await;
+
+    let first = run_with_admin_addr(
+        &db.url,
+        Some("127.0.0.1:19181"),
+        &["admin", "reset-password"],
+    )
+    .await;
+    assert!(first.status.success(), "{first:?}");
+    let text = stdout(&first);
+    let path = text.lines().next().expect("the link line").trim();
+    let code = path
+        .strip_prefix("/admin/recover/")
+        .unwrap_or_else(|| panic!("the first line must be the recovery path:\n{text}"))
+        .to_owned();
+    assert!(code.len() >= 22, "at least 128 bits: {text}");
+    assert!(
+        text.contains("15"),
+        "the output must name the 15 minute lifetime:\n{text}"
+    );
+    let hint = stderr(&first);
+    assert!(
+        hint.contains(":19181"),
+        "the hint must use the port from ADMIN_BIND_ADDR:\n{hint}"
+    );
+    assert!(
+        hint.contains("/admin/recover/"),
+        "the hint must point to the recovery page:\n{hint}"
+    );
+    assert!(
+        !hint.contains("<порт>"),
+        "the literal placeholder must be replaced:\n{hint}"
+    );
+
+    let payloads: Vec<(String, Option<Uuid>, Value)> = sqlx::query_as(
+        "SELECT actor_type::text, household_id, payload FROM audit_events
+         WHERE event_type::text = 'admin_recovery_issued'
+         ORDER BY created_at, id",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("admin_recovery_issued events");
+    assert_eq!(payloads.len(), 1, "one issued link leaves one event");
+    assert_eq!(payloads[0].0, "system");
+    assert_eq!(payloads[0].1, None);
+    assert!(
+        !payloads[0].2.to_string().contains(&code),
+        "the code must not be written to the audit: {:?}",
+        payloads[0].2
+    );
+
+    let second = run_with_admin_addr(
+        &db.url,
+        Some("127.0.0.1:19181"),
+        &["admin", "reset-password"],
+    )
+    .await;
+    assert!(second.status.success(), "{second:?}");
+    let second_text = stdout(&second);
+    let second_path = second_text.lines().next().expect("the link line").trim();
+    let second_code = second_path
+        .strip_prefix("/admin/recover/")
+        .expect("the recovery path")
+        .to_owned();
+    assert_ne!(code, second_code, "every issue makes a new link");
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let previous = codes::use_code(&mut conn, Purpose::Recovery, &code, Utc::now()).await;
+    assert!(
+        previous.is_err(),
+        "the previous recovery link must be revoked by the new issue"
+    );
+    codes::use_code(&mut conn, Purpose::Recovery, &second_code, Utc::now())
+        .await
+        .expect("the printed link must work as a recovery code");
+}
+
+/// Без учётной записи ссылку выпускать некуда: подсказка ведёт к setup-коду.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reset_password_without_an_account_suggests_setup_code() {
+    let db = cli_database().await;
+
+    let output = run(&db.url, &["admin", "reset-password"]).await;
+    assert!(!output.status.success(), "{output:?}");
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        combined.contains("setup-code"),
+        "the error must suggest the setup command:\n{combined}"
+    );
+
+    let codes: i64 = sqlx::query_scalar("SELECT count(*) FROM admin_one_time_codes")
+        .fetch_one(&db.pool)
+        .await
+        .expect("code count");
+    assert_eq!(codes, 0, "no code is issued without an account");
+}
+
+/// `setup-code` называет порт из `ADMIN_BIND_ADDR` вместо заглушки.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_code_prints_the_admin_port_from_the_environment() {
+    let db = cli_database().await;
+
+    let output =
+        run_with_admin_addr(&db.url, Some("127.0.0.1:19182"), &["admin", "setup-code"]).await;
+    assert!(output.status.success(), "{output:?}");
+    let hint = stderr(&output);
+    assert!(
+        hint.contains(":19182"),
+        "the hint must name the console port:\n{hint}"
+    );
+    assert!(
+        !hint.contains("<порт>"),
+        "the literal placeholder must be replaced:\n{hint}"
+    );
+}
+
+/// `ADMIN_BIND_ADDR=disabled` — код выпускается, но CLI предупреждает, что
+/// консоль выключена.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_code_warns_when_the_console_is_disabled() {
+    let db = cli_database().await;
+
+    let output = run_with_admin_addr(&db.url, Some("disabled"), &["admin", "setup-code"]).await;
+    assert!(output.status.success(), "{output:?}");
+    let hint = stderr(&output);
+    assert!(
+        hint.contains("disabled") && hint.contains("выключена"),
+        "the CLI must warn that the console is disabled:\n{hint}"
+    );
+}

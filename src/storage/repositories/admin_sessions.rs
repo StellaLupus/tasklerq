@@ -93,3 +93,29 @@ pub async fn delete(conn: &mut PgConnection, session_id: Uuid) -> Result<(), Dom
 
     Ok(())
 }
+
+/// Удалить все сессии, кроме `keep`.
+///
+/// `None` удаляет все: восстановление пароля завершает доступ со всех
+/// устройств. Смена пароля передаёт текущую сессию, чтобы администратор не
+/// вылетел из консоли на том же устройстве.
+pub async fn delete_all_except(
+    conn: &mut PgConnection,
+    keep: Option<Uuid>,
+) -> Result<u64, DomainError> {
+    let result = match keep {
+        Some(session_id) => {
+            sqlx::query("DELETE FROM admin_sessions WHERE id <> $1")
+                .bind(session_id)
+                .execute(conn)
+                .await?
+        }
+        None => {
+            sqlx::query("DELETE FROM admin_sessions")
+                .execute(conn)
+                .await?
+        }
+    };
+
+    Ok(result.rows_affected())
+}

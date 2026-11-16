@@ -7,12 +7,14 @@
 //! проверяется фиктивный хеш с теми же параметрами.
 
 use chrono::{DateTime, Utc};
+use sqlx::PgPool;
 
+use crate::admin_console::attempt::{self, Attempt};
 use crate::admin_console::password::{self, Password, PasswordError};
 use crate::admin_console::router::AdminState;
 use crate::domain::error::DomainError;
 use crate::http::client::Client;
-use crate::rate_limit::{RateDecision, Reservation, ip_key};
+use crate::rate_limit::{RateDecision, ip_key};
 use crate::security_audit;
 use crate::storage::repositories::admin_accounts::{self, AdminAccount};
 
@@ -30,6 +32,8 @@ pub enum LoginError {
     Database(DomainError),
     /// Сломался argon2 или повреждён хеш в базе.
     Password(PasswordError),
+    /// Задача проверки упала.
+    Task(String),
 }
 
 /// Итог попытки входа.
@@ -50,6 +54,10 @@ pub enum LoginOutcome {
 /// Успех слот освобождает и лимит не расходует. Неверные данные дают
 /// [`LoginOutcome::Rejected`], а не ошибку: клиент не должен различать
 /// неверное имя и неверный пароль.
+///
+/// Проверка и аудит выполняются в отдельной задаче, владеющей слотом: отмена
+/// обработчика не освобождает слот, не теряет неудачу и не теряет событие
+/// входа.
 pub async fn authenticate(
     state: &AdminState,
     client: &Client,
@@ -58,30 +66,47 @@ pub async fn authenticate(
     now: DateTime<Utc>,
 ) -> Result<LoginOutcome, LoginError> {
     let key = ip_key(client.ip);
-    let guard = match state.login_limiter().reserve(&key, now) {
-        Reservation::Allowed(guard) => guard,
-        Reservation::Denied(decision) => {
+    let pool = state.pool.clone();
+    let username = username.to_owned();
+    let audit = state.audit.clone();
+    let ip = client.ip;
+    let outcome = attempt::run_with_after(
+        state.login_limiter(),
+        key,
+        now,
+        move || async move {
+            match verify_credentials(&pool, &username, password).await? {
+                Some(account) => Ok((Some(account), false)),
+                None => Ok((None, true)),
+            }
+        },
+        move |value: Option<AdminAccount>, failed| async move {
+            if failed {
+                audit.admin_login_failed(ip, "bad_credentials", now).await;
+            } else {
+                audit.admin_login_succeeded(ip, now).await;
+            }
+            value
+        },
+        |error| LoginError::Task(error.to_string()),
+    )
+    .await;
+
+    match outcome {
+        Attempt::Denied(decision) => {
             state
                 .audit_rate_limited(security_audit::ADMIN_LOGIN_LIMIT, client.ip, decision, now)
                 .await;
-            return Ok(LoginOutcome::RateLimited(decision));
+            Ok(LoginOutcome::RateLimited(decision))
         }
-    };
-
-    match verify_credentials(state, username, password).await? {
-        Some(account) => {
-            guard.succeeded();
-            state.audit.admin_login_succeeded(client.ip, now).await;
-            Ok(LoginOutcome::Accepted(account))
-        }
-        None => {
-            guard.failed();
-            state
-                .audit
-                .admin_login_failed(client.ip, "bad_credentials", now)
-                .await;
-            Ok(LoginOutcome::Rejected)
-        }
+        Attempt::Error(error) => Err(error),
+        Attempt::Checked {
+            value: Some(account),
+            ..
+        } => Ok(LoginOutcome::Accepted(account)),
+        // Неверное имя и неверный пароль дают один и тот же итог; аудит уже
+        // записан задачей проверки.
+        Attempt::Checked { value: None, .. } => Ok(LoginOutcome::Rejected),
     }
 }
 
@@ -89,8 +114,8 @@ pub async fn authenticate(
 ///
 /// `Ok(Some(account))` — данные верны; `Ok(None)` — имя или пароль не подходят
 /// (клиент не должен различать эти случаи).
-pub async fn verify_credentials(
-    state: &AdminState,
+async fn verify_credentials(
+    pool: &PgPool,
     username: &str,
     password: Password,
 ) -> Result<Option<AdminAccount>, LoginError> {
@@ -99,8 +124,7 @@ pub async fn verify_credentials(
     // пароля: иначе параллельные входы занимали бы весь пул, общий с публичным
     // API и capture.
     let account = {
-        let mut conn = state
-            .pool
+        let mut conn = pool
             .acquire()
             .await
             .map_err(|error| LoginError::Database(DomainError::Database(error)))?;

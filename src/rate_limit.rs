@@ -3,13 +3,19 @@
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::net::{IpAddr, Ipv6Addr};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, Utc};
 use uuid::Uuid;
 
 /// Окно лимита по умолчанию, секунды.
 pub const DEFAULT_WINDOW_SECONDS: i64 = 60;
+/// `Retry-After`, когда отказ вызван только идущими проверками.
+///
+/// Окно в этом случае ещё не исчерпано: как только параллельная проверка
+/// завершится, слот освободится. Называть всё окно (до 15 минут) клиенту,
+/// который просто попал в параллельный запрос, незачем.
+pub const IN_FLIGHT_RETRY_SECONDS: u64 = 1;
 
 /// Решение лимита частоты.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,10 +59,10 @@ struct State<K> {
 ///
 /// [`Reservation::Denied`] содержит решение с `Retry-After`: проверку ввода
 /// выполнять нельзя.
-pub enum Reservation<'a, K: Eq + Hash + Clone> {
+pub enum Reservation<K: Eq + Hash + Clone> {
     /// Слот занят до [`RateGuard::succeeded`] или [`RateGuard::failed`]; если
     /// разрешение просто уничтожить, слот освобождается без отметки неудачи.
-    Allowed(RateGuard<'a, K>),
+    Allowed(RateGuard<K>),
     /// Лимит уже исчерпан записанными неудачами или идущими проверками.
     Denied(RateDecision),
 }
@@ -67,14 +73,17 @@ pub enum Reservation<'a, K: Eq + Hash + Clone> {
 /// проходят лимит все сразу. Успех освобождает слот без отметки, неудача
 /// превращает его в запись окна. Внутренняя ошибка (база, argon2) разрешение
 /// просто роняет: это не попытка ввода и лимит она не расходует.
-pub struct RateGuard<'a, K: Eq + Hash + Clone> {
-    limiter: &'a RateLimiter<K>,
+///
+/// Лимитер хранится в [`Arc`], а не заимствуется: разрешение можно передать в
+/// `tokio::spawn`, чтобы проверка и её отметка пережили отмену HTTP-обработчика.
+pub struct RateGuard<K: Eq + Hash + Clone> {
+    limiter: Arc<RateLimiter<K>>,
     key: K,
     now: DateTime<Utc>,
     armed: bool,
 }
 
-impl<K: Eq + Hash + Clone> RateGuard<'_, K> {
+impl<K: Eq + Hash + Clone> RateGuard<K> {
     /// Ввод удался: слот освобождается, неудача не записывается.
     pub fn succeeded(mut self) {
         self.armed = false;
@@ -88,7 +97,7 @@ impl<K: Eq + Hash + Clone> RateGuard<'_, K> {
     }
 }
 
-impl<K: Eq + Hash + Clone> Drop for RateGuard<'_, K> {
+impl<K: Eq + Hash + Clone> Drop for RateGuard<K> {
     fn drop(&mut self) {
         if self.armed {
             self.limiter.release(&self.key);
@@ -170,58 +179,19 @@ impl<K: Eq + Hash + Clone> RateLimiter<K> {
         allowed()
     }
 
-    /// Проверить ключ `key`, не учитывая операцию.
-    ///
-    /// Режим «проверить до, учесть после неудачи»: [`peek`](Self::peek)
-    /// вызывается перед проверкой пароля, а [`record`](Self::record) — только
-    /// после неудачи. Удачный ввод лимит не расходует.
-    pub fn peek(&self, key: &K, now: DateTime<Utc>) -> RateDecision {
-        let cutoff = now - self.window;
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        self.cleanup(&mut state, now, cutoff);
-
-        // Пустой ключ не заводится: проверка без учёта не должна оставлять
-        // записи в карте.
-        state
-            .hits
-            .get_mut(key)
-            .and_then(|queue| {
-                prune(queue, cutoff);
-                self.denied(queue, now)
-            })
-            .unwrap_or_else(allowed)
-    }
-
-    /// Учесть одну неудачу ключа `key` в момент `now`.
-    ///
-    /// Вызывается после [`peek`](Self::peek), поэтому отметок в окне не
-    /// больше лимита. Окно скользящее: старые отметки удаляются и здесь.
-    pub fn record(&self, key: &K, now: DateTime<Utc>) {
-        let cutoff = now - self.window;
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        self.cleanup(&mut state, now, cutoff);
-
-        let queue = state.hits.entry(key.clone()).or_default();
-        prune(queue, cutoff);
-        queue.push_back(now);
-    }
-
     /// Занять слот проверки ввода, учитывая уже идущие проверки.
     ///
-    /// Без этого параллельные запросы все проходят [`peek`](Self::peek), пока
-    /// ни одна неудача не записана, и лимит обходится всплеском. Занятый слот
+    /// Без этого параллельные запросы все прошли бы лимит, пока ни одна
+    /// неудача не записана, и лимит обходился бы всплеском. Занятый слот
     /// освобождает [`RateGuard::succeeded`] (успех) или занимает
     /// [`RateGuard::failed`] (неудача); простое уничтожение разрешения
-    /// освобождает слот без отметки.
-    pub fn reserve(&self, key: &K, now: DateTime<Utc>) -> Reservation<'_, K> {
+    /// освобождает слот без отметки. Проверка без учёта (прежние `peek` и
+    /// `record`) — тот же путь с завершением `succeeded`/`failed`.
+    ///
+    /// Лимитер принимается через [`Arc`], чтобы разрешение можно было передать
+    /// в `tokio::spawn` и слот держался до конца проверки, даже если
+    /// HTTP-обработчик отменён.
+    pub fn reserve(self: &Arc<Self>, key: &K, now: DateTime<Utc>) -> Reservation<K> {
         let cutoff = now - self.window;
         let mut state = self
             .state
@@ -242,14 +212,14 @@ impl<K: Eq + Hash + Clone> RateLimiter<K> {
             let queue = state.hits.get(key).unwrap_or(&empty);
             return Reservation::Denied(self.denied(queue, now).unwrap_or(RateDecision {
                 allowed: false,
-                retry_after: Some(retry_after_seconds(self.window)),
-                retry_at: None,
+                retry_after: Some(IN_FLIGHT_RETRY_SECONDS),
+                retry_at: Some(now + Duration::seconds(IN_FLIGHT_RETRY_SECONDS as i64)),
             }));
         }
 
         *state.in_flight.entry(key.clone()).or_default() += 1;
         Reservation::Allowed(RateGuard {
-            limiter: self,
+            limiter: Arc::clone(self),
             key: key.clone(),
             now,
             armed: true,
@@ -380,7 +350,7 @@ mod tests {
 
     #[test]
     fn the_rate_limit_is_per_key_and_slides() {
-        let limiter = RateLimiter::new(10);
+        let limiter = Arc::new(RateLimiter::new(10));
         let key = Uuid::now_v7();
         let other = Uuid::now_v7();
         let start = at(1_000);
@@ -405,7 +375,7 @@ mod tests {
 
     #[test]
     fn a_key_outside_the_window_is_removed_from_the_rate_limiter() {
-        let limiter = RateLimiter::new(10);
+        let limiter = Arc::new(RateLimiter::new(10));
         let stale = Uuid::now_v7();
         let fresh = Uuid::now_v7();
 
@@ -421,7 +391,7 @@ mod tests {
 
     #[test]
     fn stale_keys_are_cleaned_up_once_per_window_not_on_every_call() {
-        let limiter = RateLimiter::new(10);
+        let limiter = Arc::new(RateLimiter::new(10));
         for _ in 0..50 {
             assert!(limiter.check(Uuid::now_v7(), at(1_000)).allowed);
         }
@@ -446,7 +416,7 @@ mod tests {
 
     #[test]
     fn the_current_key_is_pruned_even_between_global_cleanups() {
-        let limiter = RateLimiter::with_window(2, 10);
+        let limiter = Arc::new(RateLimiter::with_window(2, 10));
         let first = Uuid::now_v7();
         let other = Uuid::now_v7();
 
@@ -486,7 +456,7 @@ mod tests {
 
     #[test]
     fn a_key_still_inside_the_window_keeps_its_hits() {
-        let limiter = RateLimiter::new(10);
+        let limiter = Arc::new(RateLimiter::new(10));
         let first = Uuid::now_v7();
         let second = Uuid::now_v7();
 
@@ -499,7 +469,7 @@ mod tests {
 
     #[test]
     fn a_removed_key_counts_its_limit_from_zero() {
-        let limiter = RateLimiter::new(2);
+        let limiter = Arc::new(RateLimiter::new(2));
         let stale = Uuid::now_v7();
         let fresh = Uuid::now_v7();
         let start = at(1_000);
@@ -518,7 +488,7 @@ mod tests {
 
     #[test]
     fn the_slot_release_moment_is_exact_and_two_denials_share_it() {
-        let limiter = RateLimiter::with_window(2, 60);
+        let limiter = Arc::new(RateLimiter::with_window(2, 60));
         let key = 7_i64;
         let start = at(1_000) + Duration::milliseconds(250);
         assert!(limiter.check(key, start).allowed);
@@ -545,7 +515,7 @@ mod tests {
 
     #[test]
     fn a_denied_check_does_not_consume_a_slot() {
-        let limiter = RateLimiter::with_window(1, 60);
+        let limiter = Arc::new(RateLimiter::with_window(1, 60));
         let key = 7_i64;
         let start = at(2_000) + Duration::milliseconds(100);
         assert!(limiter.check(key, start).allowed);
@@ -559,82 +529,98 @@ mod tests {
         assert!(limiter.check(key, start + Duration::seconds(60)).allowed);
     }
 
+    /// Учесть неудачу через боевой путь: слот → `failed`.
+    fn fail(limiter: &Arc<RateLimiter<i64>>, key: &i64, now: DateTime<Utc>) {
+        let Reservation::Allowed(guard) = limiter.reserve(key, now) else {
+            panic!("a failure inside the limit must reserve a slot");
+        };
+        guard.failed();
+    }
+
     #[test]
-    fn peek_does_not_consume_the_limit() {
-        let limiter = RateLimiter::with_window(2, 60);
+    fn a_check_without_a_recorded_outcome_does_not_consume_the_limit() {
+        let limiter = Arc::new(RateLimiter::with_window(2, 60));
         let key = 7_i64;
         let start = at(3_000);
 
         for _ in 0..10 {
-            assert!(
-                limiter.peek(&key, start).allowed,
-                "peek must not spend a slot"
-            );
+            let Reservation::Allowed(guard) = limiter.reserve(&key, start) else {
+                panic!("a successful check must not spend a failure slot");
+            };
+            guard.succeeded();
         }
 
-        limiter.record(&key, start);
-        assert!(limiter.peek(&key, start + Duration::seconds(1)).allowed);
-        limiter.record(&key, start + Duration::seconds(1));
-        let denied = limiter.peek(&key, start + Duration::seconds(2));
-        assert!(!denied.allowed);
+        fail(&limiter, &key, start);
+        fail(&limiter, &key, start + Duration::seconds(1));
+        let Reservation::Denied(denied) = limiter.reserve(&key, start + Duration::seconds(2))
+        else {
+            panic!("the third failure must be refused");
+        };
         assert_eq!(denied.retry_after, Some(58));
         assert_eq!(denied.retry_at, Some(start + Duration::seconds(60)));
     }
 
     #[test]
-    fn five_failures_deny_the_sixth_peek_and_the_window_slides() {
-        let limiter = RateLimiter::with_window(5, 900);
+    fn five_failures_deny_the_sixth_attempt_and_the_window_slides() {
+        let limiter = Arc::new(RateLimiter::with_window(5, 900));
         let key = 7_i64;
         let start = at(4_000);
 
         for offset in 0..5 {
-            assert!(
-                limiter
-                    .peek(&key, start + Duration::seconds(offset))
-                    .allowed,
-                "failure {offset} is inside the limit"
-            );
-            limiter.record(&key, start + Duration::seconds(offset));
+            fail(&limiter, &key, start + Duration::seconds(offset));
         }
-        let denied = limiter.peek(&key, start + Duration::seconds(5));
-        assert!(!denied.allowed, "the sixth attempt must be refused");
+        let Reservation::Denied(denied) = limiter.reserve(&key, start + Duration::seconds(5))
+        else {
+            panic!("the sixth attempt must be refused");
+        };
         assert!(denied.retry_after.unwrap_or(0) >= 895);
 
         // Окно скользит от самой старой неудачи, а не от начала отсчёта.
-        assert!(!limiter.peek(&key, start + Duration::seconds(899)).allowed);
-        assert!(limiter.peek(&key, start + Duration::seconds(900)).allowed);
+        assert!(matches!(
+            limiter.reserve(&key, start + Duration::seconds(899)),
+            Reservation::Denied(_)
+        ));
+        assert!(matches!(
+            limiter.reserve(&key, start + Duration::seconds(900)),
+            Reservation::Allowed(_)
+        ));
     }
 
     #[test]
-    fn the_old_check_still_consumes_a_slot() {
-        let limiter = RateLimiter::with_window(1, 60);
+    fn the_check_hits_are_seen_by_reserve() {
+        let limiter = Arc::new(RateLimiter::with_window(1, 60));
         let key = 7_i64;
         let start = at(5_000);
 
         assert!(limiter.check(key, start).allowed);
-        assert!(!limiter.check(key, start + Duration::seconds(1)).allowed);
         assert!(
-            !limiter.peek(&key, start + Duration::seconds(1)).allowed,
-            "check and peek share the same counters"
+            matches!(
+                limiter.reserve(&key, start + Duration::seconds(1)),
+                Reservation::Denied(_)
+            ),
+            "check and reserve share the same counters"
         );
     }
 
     #[test]
     fn an_in_flight_check_occupies_a_slot_until_it_finishes() {
-        let limiter = RateLimiter::with_window(1, 60);
+        let limiter = Arc::new(RateLimiter::with_window(1, 60));
         let key = 7_i64;
         let start = at(6_000);
 
         let Reservation::Allowed(guard) = limiter.reserve(&key, start) else {
             panic!("the first check must be allowed");
         };
-        assert!(
-            matches!(
-                limiter.reserve(&key, start),
-                Reservation::Denied(decision) if !decision.allowed
-            ),
-            "a parallel check must not pass while the slot is busy"
+        let Reservation::Denied(denied) = limiter.reserve(&key, start) else {
+            panic!("a parallel check must not pass while the slot is busy");
+        };
+        assert!(!denied.allowed);
+        assert_eq!(
+            denied.retry_after,
+            Some(1),
+            "a denial caused only by a running check must not name the whole window"
         );
+        assert_eq!(denied.retry_at, Some(start + Duration::seconds(1)));
 
         guard.succeeded();
         assert!(
@@ -648,7 +634,7 @@ mod tests {
 
     #[test]
     fn a_failed_reservation_becomes_a_hit_and_a_dropped_one_does_not() {
-        let limiter = RateLimiter::with_window(1, 60);
+        let limiter = Arc::new(RateLimiter::with_window(1, 60));
         let key = 7_i64;
         let start = at(7_000);
 
@@ -671,7 +657,10 @@ mod tests {
         };
         guard.failed();
         assert!(
-            !limiter.peek(&key, start + Duration::seconds(2)).allowed,
+            matches!(
+                limiter.reserve(&key, start + Duration::seconds(2)),
+                Reservation::Denied(_)
+            ),
             "a failed check consumes the slot"
         );
         assert!(matches!(
@@ -682,7 +671,7 @@ mod tests {
 
     #[test]
     fn the_window_is_configurable() {
-        let limiter = RateLimiter::with_window(2, 1);
+        let limiter = Arc::new(RateLimiter::with_window(2, 1));
         let key = 7_i64;
 
         assert!(limiter.check(key, at(1_000)).allowed);

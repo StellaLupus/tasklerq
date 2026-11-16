@@ -75,6 +75,10 @@ impl fmt::Debug for IssuedCode {
 ///
 /// Оба оператора должны стать видимыми вместе, поэтому вызывать внутри
 /// транзакции: [`crate::admin_console::codes::issue`] открывает её сама.
+///
+/// Сначала берётся `pg_advisory_xact_lock` от назначения (и household):
+/// параллельный выпуск той же пары ждёт коммита и видит уже погашенные коды,
+/// поэтому двух действующих кодов не остаётся.
 pub async fn issue(
     conn: &mut PgConnection,
     purpose: &str,
@@ -82,6 +86,8 @@ pub async fn issue(
     expires_at: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> Result<IssuedCode, DomainError> {
+    lock_purpose(conn, purpose, household_id).await?;
+
     sqlx::query(
         "UPDATE admin_one_time_codes SET used_at = $3
          WHERE purpose = $1 AND household_id IS NOT DISTINCT FROM $2
@@ -110,6 +116,55 @@ pub async fn issue(
     .await?;
 
     Ok(IssuedCode { code, record })
+}
+
+/// Взять транзакционную блокировку выпуска кодов назначения.
+///
+/// Ключ — строка `admin_one_time_codes:<purpose>[:<household>]`, хешированная
+/// функцией PostgreSQL: отдельной миграции для ключей не нужно. Блокировка
+/// снимается коммитом или откатом транзакции вызывающего. Повторный вызов в той
+/// же транзакции (например, `issue_setup_code` → `issue`) допустим: advisory
+/// lock реентерабелен.
+pub async fn lock_purpose(
+    conn: &mut PgConnection,
+    purpose: &str,
+    household_id: Option<Uuid>,
+) -> Result<(), DomainError> {
+    let key = household_id.map_or_else(
+        || format!("admin_one_time_codes:{purpose}"),
+        |household_id| format!("admin_one_time_codes:{purpose}:{household_id}"),
+    );
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(key)
+        .execute(&mut *conn)
+        .await?;
+
+    Ok(())
+}
+
+/// Найти действующий код по открытому значению, не гася его.
+///
+/// Так проверяет ссылку восстановления `GET`: предпросмотр не должен её
+/// сжигать. Условия те же, что у [`use_code`]: назначение, `used_at IS NULL` и
+/// неистёкший срок; неизвестный, погашенный, истёкший и чужой код неотличимы.
+pub async fn find_active(
+    conn: &mut PgConnection,
+    purpose: &str,
+    code: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<OneTimeCode>, DomainError> {
+    let record = sqlx::query_as::<_, OneTimeCode>(&format!(
+        "SELECT {COLUMNS} FROM admin_one_time_codes
+         WHERE code_hash = $1 AND purpose = $2 AND used_at IS NULL
+           AND (expires_at IS NULL OR expires_at > $3)"
+    ))
+    .bind(hash_token(code.trim()))
+    .bind(purpose)
+    .bind(now)
+    .fetch_optional(&mut *conn)
+    .await?;
+
+    Ok(record)
 }
 
 /// Погасить код атомарно и вернуть его строку.

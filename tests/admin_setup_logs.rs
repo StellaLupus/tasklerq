@@ -305,13 +305,18 @@ async fn post_form(app: &Router, path: &str, fields: &[(&str, &str)]) -> StatusC
     let body = url::form_urlencoded::Serializer::new(String::new())
         .extend_pairs(fields)
         .finish();
+    post_form_with_origin(app, path, "http://nas:18081", &body).await
+}
+
+/// `POST` формы с явным `Origin`: нужен для проверки отказа до обработчика.
+async fn post_form_with_origin(app: &Router, path: &str, origin: &str, body: &str) -> StatusCode {
     let mut request = Request::builder()
         .method(Method::POST)
         .uri(path)
         .header(header::HOST, "nas:18081")
-        .header(header::ORIGIN, "http://nas:18081")
+        .header(header::ORIGIN, origin)
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body(Body::from(body))
+        .body(Body::from(body.to_owned()))
         .expect("request should build");
     request
         .extensions_mut()
@@ -325,4 +330,42 @@ async fn post_form(app: &Router, path: &str, fields: &[(&str, &str)]) -> StatusC
     let status = response.status();
     let _ = response.into_body().collect().await;
     status
+}
+
+/// Отказ сверки origin не выносит код восстановления в журнал.
+#[test]
+fn a_rejected_recovery_post_does_not_log_the_code() {
+    let (logs, (status, code)) = capture(|| {
+        runtime().block_on(async {
+            let (pool, _url) = setup_db().await;
+            insert_account(&pool).await;
+            let issued = codes::issue(&pool, Purpose::Recovery, None, chrono::Utc::now())
+                .await
+                .expect("a recovery code");
+            let app = build_admin_router(AdminState::new(
+                pool.clone(),
+                Vec::new(),
+                Audit::new(pool.clone()),
+            ));
+            let path = format!("/admin/recover/{}", issued.code);
+            let status = post_form_with_origin(
+                &app,
+                &path,
+                "http://evil.example",
+                "password=unused-password-12",
+            )
+            .await;
+            (status, issued.code)
+        })
+    });
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        !logs.contains(&code),
+        "the recovery code must not be logged:\n{logs}"
+    );
+    assert!(
+        logs.contains("/admin/recover/{code}"),
+        "the route template is logged instead of the raw path:\n{logs}"
+    );
 }

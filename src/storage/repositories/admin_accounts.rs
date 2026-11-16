@@ -84,3 +84,53 @@ pub async fn create(
 
     Ok(account)
 }
+
+/// Заменить хеш пароля и время смены.
+///
+/// Вызывать внутри транзакции вместе с удалением сессий: смена пароля и отзыв
+/// сессий должны стать видимыми вместе. `NotFound` — учётной записи нет.
+pub async fn update_password(
+    conn: &mut PgConnection,
+    password_hash: &str,
+    now: DateTime<Utc>,
+) -> Result<AdminAccount, DomainError> {
+    let account = sqlx::query_as::<_, AdminAccount>(&format!(
+        "UPDATE admin_accounts
+            SET password_hash = $1, password_changed_at = $2
+          RETURNING {COLUMNS}"
+    ))
+    .bind(password_hash)
+    .bind(now)
+    .fetch_optional(conn)
+    .await?
+    .ok_or(DomainError::NotFound)?;
+
+    Ok(account)
+}
+
+/// Заменить хеш пароля и время смены, если действующий хеш не изменился.
+///
+/// Смена пароля проверяет текущий пароль по прочитанному хешу; между проверкой
+/// и записью параллельное восстановление могло сменить пароль. Условие
+/// `password_hash = $3` не даёт затёреть более новый пароль. `None` — хеш уже
+/// другой (или учётной записи нет); транзакция вызывающего откатывается.
+pub async fn update_password_if_unchanged(
+    conn: &mut PgConnection,
+    expected_hash: &str,
+    password_hash: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<AdminAccount>, DomainError> {
+    let account = sqlx::query_as::<_, AdminAccount>(&format!(
+        "UPDATE admin_accounts
+            SET password_hash = $1, password_changed_at = $2
+          WHERE password_hash = $3
+          RETURNING {COLUMNS}"
+    ))
+    .bind(password_hash)
+    .bind(now)
+    .bind(expected_hash)
+    .fetch_optional(conn)
+    .await?;
+
+    Ok(account)
+}

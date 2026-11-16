@@ -15,15 +15,20 @@ use http_body_util::BodyExt;
 use serde_json::Value;
 use sqlx::PgPool;
 use tasklerq::admin_console::codes::{self, Purpose};
+use tasklerq::admin_console::login;
+use tasklerq::admin_console::password::Password;
 use tasklerq::admin_console::router::{AdminState, build_router as build_admin_router};
-use tasklerq::admin_console::setup::{self, SetupError};
+use tasklerq::admin_console::setup::{self, SetupOutcome};
 use tasklerq::app::build_application;
 use tasklerq::auth::tokens::hash_token;
 use tasklerq::config::{Config, IpNet};
 use tasklerq::domain::error::DomainError;
+use tasklerq::http::client::{Client, Scheme};
 use tasklerq::http::router::{AppState, build_router};
 use tasklerq::http::server::{bind_listeners, serve_listeners};
+use tasklerq::rate_limit::{Reservation, ip_key};
 use tasklerq::security_audit::Audit;
+use tasklerq::storage::repositories::admin_accounts;
 use tower::ServiceExt;
 use url::form_urlencoded;
 use uuid::Uuid;
@@ -354,6 +359,7 @@ async fn public_router_does_not_serve_console_paths() {
         (Method::GET, "/admin/login"),
         (Method::GET, "/admin/setup"),
         (Method::GET, "/admin/recover/x"),
+        (Method::GET, "/admin/password"),
         (Method::POST, "/admin/login"),
     ] {
         let (console_status, console_headers, console_body) =
@@ -886,14 +892,19 @@ async fn an_existing_account_keeps_the_setup_code_unused() {
     let state = AdminState::new(db.pool.clone(), Vec::new(), Audit::new(db.pool.clone()));
     let result = setup::create_account(
         &state,
+        &Client {
+            ip: "127.0.0.1".parse().expect("ip"),
+            scheme: Scheme::Http,
+            host: Some("nas:18081".into()),
+        },
         &issued.code,
         "second",
-        "unused-password-hash",
+        Password::new("unused-password-12"),
         Utc::now(),
     )
     .await;
     assert!(
-        matches!(result, Err(SetupError::AlreadyConfigured)),
+        matches!(result, Ok(SetupOutcome::AlreadyConfigured)),
         "a second account must be refused: {result:?}"
     );
 
@@ -1286,25 +1297,46 @@ async fn setup_validation_errors_do_not_spend_the_code_limit() {
 /// Все четыре бакета живут в состоянии и не делят счётчики.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn all_four_failure_buckets_are_independent() {
+    use tasklerq::rate_limit::Reservation;
+
+    fn fail(
+        limiter: &std::sync::Arc<tasklerq::rate_limit::RateLimiter<std::net::IpAddr>>,
+        ip: &std::net::IpAddr,
+        now: DateTime<Utc>,
+    ) {
+        let Reservation::Allowed(guard) = limiter.reserve(ip, now) else {
+            panic!("a failure inside the limit must reserve a slot");
+        };
+        guard.failed();
+    }
+
+    fn allowed(
+        limiter: &std::sync::Arc<tasklerq::rate_limit::RateLimiter<std::net::IpAddr>>,
+        ip: &std::net::IpAddr,
+        now: DateTime<Utc>,
+    ) -> bool {
+        matches!(limiter.reserve(ip, now), Reservation::Allowed(_))
+    }
+
     let db = support::db().await;
     let state = AdminState::new(db.pool.clone(), Vec::new(), Audit::new(db.pool.clone()));
     let ip: std::net::IpAddr = "203.0.113.5".parse().expect("an IP address");
     let now = Utc::now();
 
     for _ in 0..5 {
-        state.setup_limiter().record(&ip, now);
+        fail(&state.setup_limiter(), &ip, now);
     }
-    assert!(!state.setup_limiter().peek(&ip, now).allowed);
-    assert!(state.login_limiter().peek(&ip, now).allowed);
-    assert!(state.current_password_limiter().peek(&ip, now).allowed);
-    assert!(state.recovery_limiter().peek(&ip, now).allowed);
+    assert!(!allowed(&state.setup_limiter(), &ip, now));
+    assert!(allowed(&state.login_limiter(), &ip, now));
+    assert!(allowed(&state.current_password_limiter(), &ip, now));
+    assert!(allowed(&state.recovery_limiter(), &ip, now));
 
     for _ in 0..5 {
-        state.login_limiter().record(&ip, now);
+        fail(&state.login_limiter(), &ip, now);
     }
-    assert!(!state.login_limiter().peek(&ip, now).allowed);
+    assert!(!allowed(&state.login_limiter(), &ip, now));
     assert!(
-        state.recovery_limiter().peek(&ip, now).allowed,
+        allowed(&state.recovery_limiter(), &ip, now),
         "the recovery bucket stays untouched"
     );
 }
@@ -2042,4 +2074,617 @@ async fn a_database_failure_is_an_error_not_an_anonymous_session() {
     let (status, _, _) =
         send_with_cookie(&app, Method::GET, "/admin", "tlq_admin=some-token").await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+/// Вход с паролем и cookie-пара для следующих запросов.
+async fn login_cookie(app: &Router, username: &str, password: &str) -> String {
+    let (status, headers, _) = send_form(
+        app,
+        "/admin/login",
+        &[("username", username), ("password", password)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "a valid login must succeed");
+    cookie_pair(&set_cookie(&headers).expect("a successful login sets a cookie"))
+}
+
+/// Текущий хеш и время смены пароля.
+async fn account_password(pool: &PgPool) -> (String, DateTime<Utc>) {
+    sqlx::query_as("SELECT password_hash, password_changed_at FROM admin_accounts")
+        .fetch_one(pool)
+        .await
+        .expect("the account row")
+}
+
+/// `GET` ссылки восстановления не расходует код, `POST` меняет пароль,
+/// завершает все сессии и аудируется без секретов.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_link_previews_without_spending_and_resets_the_password_on_post() {
+    const NEW_PASSWORD: &str = "recovered-password-1";
+
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console(&db.pool, Vec::new());
+    let issued = codes::issue(&db.pool, Purpose::Recovery, None, Utc::now())
+        .await
+        .expect("a recovery code");
+    let path = format!("/admin/recover/{}", issued.code);
+
+    let now = precise_now();
+    insert_session(&db.pool, "recovery-old-session", now, now).await;
+    insert_session(&db.pool, "recovery-other-session", now, now).await;
+
+    for attempt in 0..2 {
+        let (status, headers, body) = send(&app, Method::GET, &path).await;
+        assert_eq!(status, StatusCode::OK, "preview {attempt}");
+        assert!(
+            String::from_utf8_lossy(&body).contains("Новый пароль"),
+            "the preview shows the form: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_security_headers(&headers, "a recovery preview");
+    }
+    let used_at: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT used_at FROM admin_one_time_codes WHERE id = $1")
+            .bind(issued.record.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("the code row");
+    assert!(used_at.is_none(), "GET must not consume the link");
+    assert_eq!(session_count(&db.pool).await, 2, "GET deletes no sessions");
+
+    let (status, headers, _) = send_form(&app, &path, &[("password", NEW_PASSWORD)]).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/login"));
+    assert_eq!(
+        session_count(&db.pool).await,
+        0,
+        "recovery ends every session"
+    );
+
+    let new_cookie = login_cookie(&app, "admin", NEW_PASSWORD).await;
+    let (status, _, _) = send_with_cookie(&app, Method::GET, "/admin", &new_cookie).await;
+    assert_eq!(status, StatusCode::OK, "the new password logs in");
+
+    let (status, headers, _) = send_form(
+        &app,
+        "/admin/login",
+        &[("username", "admin"), ("password", TEST_PASSWORD)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the old password no longer works");
+    assert!(set_cookie(&headers).is_none());
+
+    // Повторный POST по сохранённой ссылке — тот же ответ, что у истёкшей.
+    let (status, _, body) = send_form(&app, &path, &[("password", "another-password-2")]).await;
+    assert_eq!(status, StatusCode::GONE);
+    assert!(
+        String::from_utf8_lossy(&body).contains("недействительна"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let changed = audit_payloads(&db.pool, "admin_password_changed").await;
+    assert_eq!(changed.len(), 1, "one password change is audited");
+    assert_eq!(changed[0]["reason"], "recovery");
+    assert_eq!(changed[0]["ip"], "127.0.0.1");
+    let payload = changed[0].to_string();
+    for secret in [NEW_PASSWORD, TEST_PASSWORD, issued.code.as_str()] {
+        assert!(
+            !payload.contains(secret),
+            "the audit must not contain {secret:?}: {payload}"
+        );
+    }
+    for (actor, household) in audit_actor(&db.pool, "admin_password_changed").await {
+        assert_eq!(actor, "system");
+        assert_eq!(household, None);
+    }
+}
+
+/// Истёкшая ссылка не меняет пароль и даёт единый ответ.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expired_recovery_link_is_invalid_and_keeps_the_password() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console(&db.pool, Vec::new());
+    let before = account_password(&db.pool).await;
+    let now = Utc::now();
+    let code = "expired-recovery-link";
+
+    // CHECK `expires_at > created_at` требует created_at в прошлом.
+    sqlx::query(
+        "INSERT INTO admin_one_time_codes (id, purpose, code_hash, created_at, expires_at)
+         VALUES ($1, 'recovery', $2, $3, $4)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(hash_token(code))
+    .bind(now - ChronoDuration::minutes(20))
+    .bind(now - ChronoDuration::minutes(5))
+    .execute(&db.pool)
+    .await
+    .expect("an expired code is storable");
+
+    let path = format!("/admin/recover/{code}");
+    let (status, _, body) = send(&app, Method::GET, &path).await;
+    assert_eq!(status, StatusCode::GONE);
+    assert!(
+        String::from_utf8_lossy(&body).contains("недействительна"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, _, _) = send_form(&app, &path, &[("password", "unused-password-12")]).await;
+    assert_eq!(status, StatusCode::GONE);
+    assert_eq!(
+        account_password(&db.pool).await,
+        before,
+        "an expired link must not change the password"
+    );
+    assert!(
+        audit_payloads(&db.pool, "admin_password_changed")
+            .await
+            .is_empty()
+    );
+}
+
+/// Слишком короткий пароль — ошибка формы, ссылка остаётся действующей.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_short_recovery_password_does_not_spend_the_link() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console(&db.pool, Vec::new());
+    let issued = codes::issue(&db.pool, Purpose::Recovery, None, Utc::now())
+        .await
+        .expect("a recovery code");
+    let path = format!("/admin/recover/{}", issued.code);
+
+    let (status, _, body) = send_form(&app, &path, &[("password", "short")]).await;
+    assert_eq!(status, StatusCode::OK, "a bad length is a form error");
+    assert!(
+        String::from_utf8_lossy(&body).contains("не менее 12"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, _, _) = send(&app, Method::GET, &path).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the link is still valid after a form error"
+    );
+
+    let (status, headers, _) = send_form(&app, &path, &[("password", "valid-password-12")]).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/login"));
+}
+
+/// Шестая неудачная ссылка восстановления — `429` до проверки кода.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_failures_are_rate_limited() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console(&db.pool, Vec::new());
+    let valid = codes::issue(&db.pool, Purpose::Recovery, None, Utc::now())
+        .await
+        .expect("a recovery code");
+
+    for attempt in 0..5 {
+        let (status, _, _) = send(&app, Method::GET, "/admin/recover/no-such-code").await;
+        assert_eq!(status, StatusCode::GONE, "failure {attempt} is a dead link");
+    }
+
+    let (status, headers, _) =
+        send(&app, Method::GET, &format!("/admin/recover/{}", valid.code)).await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the sixth attempt is refused before the code check"
+    );
+    assert!(headers.contains_key(header::RETRY_AFTER));
+    assert_security_headers(&headers, "a rate-limited recovery");
+    let used_at: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT used_at FROM admin_one_time_codes WHERE id = $1")
+            .bind(valid.record.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("the code row");
+    assert!(
+        used_at.is_none(),
+        "a rate-limited request must not consume the valid link"
+    );
+
+    let limits = audit_payloads(&db.pool, "rate_limited").await;
+    assert!(
+        limits
+            .iter()
+            .any(|payload| payload["limit"] == "admin_recovery_per_15_minutes"),
+        "{limits:?}"
+    );
+}
+
+/// POST восстановления с чужим `Origin` отклоняется слоем роутера.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recovery_post_with_a_foreign_origin_is_refused_before_the_handler() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console(&db.pool, Vec::new());
+    let issued = codes::issue(&db.pool, Purpose::Recovery, None, Utc::now())
+        .await
+        .expect("a recovery code");
+    let path = format!("/admin/recover/{}", issued.code);
+
+    let headers = headers_with(&[("host", "nas:18081"), ("origin", "http://evil.example")]);
+    let (status, response_headers, _) = send_form_from(
+        &app,
+        &path,
+        test_peer(),
+        headers,
+        &[("password", "unused-password-12")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_security_headers(&response_headers, "a recovery POST with a foreign origin");
+
+    let (status, _, _) = send(&app, Method::GET, &path).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the refused POST keeps the link valid"
+    );
+    let (status, _, _) = send_form(&app, &path, &[("password", "valid-password-12")]).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+}
+
+/// Смена пароля из одной сессии завершает другую и сохраняет текущую.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changing_the_password_ends_other_sessions_but_keeps_the_current_one() {
+    const NEW_PASSWORD: &str = "changed-password-123";
+
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console(&db.pool, Vec::new());
+    let first = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    let second = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    assert_eq!(session_count(&db.pool).await, 2);
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin/password", &first).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(&body).contains("Текущий пароль"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, headers, _) = send_form_from(
+        &app,
+        "/admin/password",
+        test_peer(),
+        {
+            let mut headers = with_same_origin(HeaderMap::new());
+            headers.insert(
+                header::COOKIE,
+                HeaderValue::from_str(&first).expect("cookie"),
+            );
+            headers
+        },
+        &[
+            ("current_password", TEST_PASSWORD),
+            ("new_password", NEW_PASSWORD),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        location(&headers),
+        Some("/admin/password?changed=1"),
+        "the response confirms the change"
+    );
+
+    let (status, _, body) =
+        send_with_cookie(&app, Method::GET, "/admin/password?changed=1", &first).await;
+    assert_eq!(status, StatusCode::OK, "the current session survives");
+    assert!(
+        String::from_utf8_lossy(&body).contains("Пароль изменён"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, headers, _) = send_with_cookie(&app, Method::GET, "/admin", &second).await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "the other device loses access"
+    );
+    assert_eq!(location(&headers), Some("/admin/login"));
+    assert_eq!(
+        session_count(&db.pool).await,
+        1,
+        "only the current session stays"
+    );
+
+    let changed = audit_payloads(&db.pool, "admin_password_changed").await;
+    assert_eq!(changed.len(), 1);
+    assert_eq!(changed[0]["reason"], "change");
+    let payload = changed[0].to_string();
+    for secret in [TEST_PASSWORD, NEW_PASSWORD] {
+        assert!(
+            !payload.contains(secret),
+            "the audit must not contain {secret:?}: {payload}"
+        );
+    }
+}
+
+/// Неверный текущий пароль не меняет пароль; шестая попытка — `429`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wrong_current_password_keeps_the_password_and_is_rate_limited() {
+    const NEW_PASSWORD: &str = "unreachable-password-1";
+
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console(&db.pool, Vec::new());
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    let before = account_password(&db.pool).await;
+
+    let mut request_headers = with_same_origin(HeaderMap::new());
+    request_headers.insert(
+        header::COOKIE,
+        HeaderValue::from_str(&cookie).expect("cookie"),
+    );
+
+    for attempt in 0..5 {
+        let (status, _, body) = send_form_from(
+            &app,
+            "/admin/password",
+            test_peer(),
+            request_headers.clone(),
+            &[
+                ("current_password", "wrong-current-password"),
+                ("new_password", NEW_PASSWORD),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "failure {attempt} is a form error");
+        assert!(
+            String::from_utf8_lossy(&body).contains("Неверный текущий пароль"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            account_password(&db.pool).await,
+            before,
+            "a wrong current password must not change the password"
+        );
+    }
+
+    let (status, headers, _) = send_form_from(
+        &app,
+        "/admin/password",
+        test_peer(),
+        request_headers,
+        &[
+            ("current_password", TEST_PASSWORD),
+            ("new_password", NEW_PASSWORD),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the sixth attempt is refused before argon2"
+    );
+    assert_security_headers(&headers, "a rate-limited password change");
+    assert_eq!(
+        account_password(&db.pool).await,
+        before,
+        "a rate-limited attempt must not change the password"
+    );
+
+    let limits = audit_payloads(&db.pool, "rate_limited").await;
+    assert!(
+        limits
+            .iter()
+            .any(|payload| payload["limit"] == "admin_current_password_per_15_minutes"),
+        "{limits:?}"
+    );
+}
+
+/// Отмена обработчика входа не освобождает слот и не теряет неудачу.
+///
+/// Таблица `admin_accounts` заблокирована, поэтому проверка пароля заведомо не
+/// завершится до отмены: слот должен остаться занятым до конца фоновой
+/// проверки, а пять отменённых попыток — закрыть вход. Вызывается сам сервис
+/// входа: страница до резервирования слота успела бы упереться в ту же
+/// блокировку на чтении учётки.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_login_still_counts_as_a_failure() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let state = AdminState::new(db.pool.clone(), Vec::new(), Audit::new(db.pool.clone()));
+    let app = build_admin_router(state.clone());
+
+    let mut lock = db.pool.begin().await.expect("lock transaction");
+    sqlx::query("LOCK TABLE admin_accounts IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .expect("the account table is locked");
+
+    let client = Client {
+        ip: "127.0.0.1".parse().expect("ip"),
+        scheme: Scheme::Http,
+        host: Some("nas:18081".into()),
+    };
+
+    for attempt in 0..5 {
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(500),
+            login::authenticate(
+                &state,
+                &client,
+                "admin",
+                Password::new("wrong-password-123"),
+                Utc::now(),
+            ),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "attempt {attempt} must be cancelled before the blocked check finishes"
+        );
+    }
+
+    lock.commit().await.expect("release the account table");
+
+    // Ждём, пока все пять фоновых проверок запишут неудачи: отказ только из-за
+    // идущих проверок отдаёт `Retry-After = 1`, а отказ по пяти отметкам —
+    // остаток окна. Поэтому большое значение и есть признак готовности.
+    let key = ip_key(client.ip);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match state.login_limiter().reserve(&key, Utc::now()) {
+            Reservation::Allowed(guard) => guard.succeeded(),
+            Reservation::Denied(decision) if decision.retry_after.unwrap_or(0) > 1 => break,
+            _ => {}
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the cancelled checks did not record five failures in time"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let (status, headers, _) = send_form(
+        &app,
+        "/admin/login",
+        &[("username", "admin"), ("password", TEST_PASSWORD)],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "five cancelled failures must close the login"
+    );
+    assert!(set_cookie(&headers).is_none());
+}
+
+/// Два параллельных выпуска одной пары сериализуются: действует один код.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_code_issues_leave_exactly_one_active_code() {
+    let db = support::isolated_db().await;
+    let now = Utc::now();
+
+    let (first, second) = tokio::join!(
+        codes::issue(&db.pool, Purpose::Recovery, None, now),
+        codes::issue(&db.pool, Purpose::Recovery, None, now),
+    );
+    first.expect("the first issue succeeds");
+    second.expect("the second issue waits and succeeds");
+
+    let active: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM admin_one_time_codes
+         WHERE purpose = 'recovery' AND used_at IS NULL",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("active code count");
+    assert_eq!(active, 1, "only one recovery code may stay active");
+}
+
+/// Выпуск setup-кода ждёт транзакцию создания учётки и после неё не выпускает
+/// код.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn setup_code_issue_waits_for_the_account_transaction() {
+    let db = support::isolated_db().await;
+    let now = Utc::now();
+
+    let mut tx = db.pool.begin().await.expect("account transaction");
+    codes::lock_purpose(&mut tx, Purpose::Setup, None)
+        .await
+        .expect("the setup lock");
+    sqlx::query(
+        "INSERT INTO admin_accounts (id, username, password_hash)
+         VALUES ($1, 'admin', '$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA')",
+    )
+    .bind(Uuid::now_v7())
+    .execute(&mut *tx)
+    .await
+    .expect("the account is created in the transaction");
+
+    let pool = db.pool.clone();
+    let task = tokio::spawn(async move { codes::issue_setup_code(&pool, now).await });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !task.is_finished(),
+        "the setup code issue must wait for the account transaction"
+    );
+
+    tx.commit().await.expect("commit the account transaction");
+    let issued = task
+        .await
+        .expect("the issue task")
+        .expect("the issue result");
+    assert!(
+        issued.is_none(),
+        "the committed account must prevent a setup code"
+    );
+
+    let codes: i64 = sqlx::query_scalar("SELECT count(*) FROM admin_one_time_codes")
+        .fetch_one(&db.pool)
+        .await
+        .expect("code count");
+    assert_eq!(codes, 0, "no setup code is issued after the account exists");
+}
+
+/// Запись пароля по устаревшему хешу не затирает более новый пароль.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_current_password_does_not_overwrite_a_newer_one() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let now = Utc::now();
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let original: String = sqlx::query_scalar("SELECT password_hash FROM admin_accounts")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the original hash");
+
+    // Параллельное восстановление уже сменило пароль.
+    admin_accounts::update_password(&mut conn, "newer-password-hash", now)
+        .await
+        .expect("the newer password is written");
+
+    let stale = admin_accounts::update_password_if_unchanged(
+        &mut conn,
+        &original,
+        "stale-password-hash",
+        now,
+    )
+    .await
+    .expect("the stale update runs");
+    assert!(
+        stale.is_none(),
+        "a hash changed after the check must reject the stale write"
+    );
+
+    let stored: String = sqlx::query_scalar("SELECT password_hash FROM admin_accounts")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the stored hash");
+    assert_eq!(stored, "newer-password-hash", "the newer password survives");
+
+    // С актуальным ожидаемым хешем запись проходит.
+    let updated = admin_accounts::update_password_if_unchanged(
+        &mut conn,
+        &stored,
+        "final-password-hash",
+        now,
+    )
+    .await
+    .expect("the current update runs");
+    assert!(updated.is_some());
+    let stored: String = sqlx::query_scalar("SELECT password_hash FROM admin_accounts")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the stored hash");
+    assert_eq!(stored, "final-password-hash");
 }

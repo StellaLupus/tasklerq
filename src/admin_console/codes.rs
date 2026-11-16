@@ -52,6 +52,10 @@ impl Purpose {
 /// Прежние неиспользованные коды той же пары `(purpose, household_id)`
 /// гасятся в той же транзакции, поэтому после выпуска действует только новый
 /// код. Открытое значение возвращается один раз.
+///
+/// Транзакция берёт `pg_advisory_xact_lock` от назначения (и household):
+/// два параллельных выпуска одной пары сериализуются, и «погасить прежние,
+/// вставить новый» не оставляет двух действующих кодов.
 pub async fn issue(
     pool: &PgPool,
     purpose: Purpose,
@@ -66,6 +70,19 @@ pub async fn issue(
     tx.commit().await?;
 
     Ok(issued)
+}
+
+/// Взять блокировку выпуска кодов назначения в транзакции вызывающего.
+///
+/// Блокировка транзакционная: снимается коммитом или откатом. Создание учётки
+/// по setup-коду берёт ту же блокировку, поэтому выпуск setup-кода не может
+/// пройти между проверкой «учётки нет» и коммитом создания.
+pub async fn lock_purpose(
+    conn: &mut PgConnection,
+    purpose: Purpose,
+    household_id: Option<Uuid>,
+) -> Result<(), DomainError> {
+    repository::lock_purpose(conn, purpose.as_str(), household_id).await
 }
 
 /// Погасить код атомарным `UPDATE … RETURNING`.
@@ -91,20 +108,50 @@ pub async fn use_code(
 /// Выпустить setup-код, если учётной записи администратора ещё нет.
 ///
 /// `Ok(None)` — учётка уже создана, код не выпускается. Проверка и выпуск идут
-/// в одной транзакции.
+/// в одной транзакции под блокировкой назначения `setup`: создание учётки по
+/// setup-коду берёт ту же блокировку, поэтому код не выпустится параллельно с
+/// ним.
 pub async fn issue_setup_code(
     pool: &PgPool,
     now: DateTime<Utc>,
 ) -> Result<Option<IssuedCode>, DomainError> {
     let mut tx = pool.begin().await?;
+    repository::lock_purpose(&mut tx, Purpose::Setup.as_str(), None).await?;
     let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM admin_accounts)")
         .fetch_one(&mut *tx)
         .await?;
     if exists {
+        tx.rollback().await?;
         return Ok(None);
     }
 
     let issued = repository::issue(&mut tx, Purpose::Setup.as_str(), None, None, now).await?;
+    tx.commit().await?;
+
+    Ok(Some(issued))
+}
+
+/// Выпустить `recovery`-код, если учётная запись администратора существует.
+///
+/// `Ok(None)` — учётки нет: выпускать ссылку некуда, CLI подскажет
+/// `tasklerq admin setup-code`. Проверка и выпуск идут в одной транзакции.
+pub async fn issue_recovery_code(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+) -> Result<Option<IssuedCode>, DomainError> {
+    let mut tx = pool.begin().await?;
+    repository::lock_purpose(&mut tx, Purpose::Recovery.as_str(), None).await?;
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM admin_accounts)")
+        .fetch_one(&mut *tx)
+        .await?;
+    if !exists {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+
+    let expires_at = now.checked_add_signed(Duration::minutes(RECOVERY_TTL_MINUTES));
+    let issued =
+        repository::issue(&mut tx, Purpose::Recovery.as_str(), None, expires_at, now).await?;
     tx.commit().await?;
 
     Ok(Some(issued))

@@ -8,7 +8,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::{ConnectInfo, MatchedPath, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, header};
 use axum::middleware::Next;
 use axum::response::Response;
@@ -80,23 +80,23 @@ impl AdminState {
     }
 
     /// Бакет неудачных входов.
-    pub fn login_limiter(&self) -> &RateLimiter<IpAddr> {
-        &self.login_limiter
+    pub fn login_limiter(&self) -> Arc<RateLimiter<IpAddr>> {
+        Arc::clone(&self.login_limiter)
     }
 
     /// Бакет неудачных setup-кодов.
-    pub fn setup_limiter(&self) -> &RateLimiter<IpAddr> {
-        &self.setup_limiter
+    pub fn setup_limiter(&self) -> Arc<RateLimiter<IpAddr>> {
+        Arc::clone(&self.setup_limiter)
     }
 
-    /// Бакет неверного текущего пароля (подключается в 5.7).
-    pub fn current_password_limiter(&self) -> &RateLimiter<IpAddr> {
-        &self.current_password_limiter
+    /// Бакет неверного текущего пароля.
+    pub fn current_password_limiter(&self) -> Arc<RateLimiter<IpAddr>> {
+        Arc::clone(&self.current_password_limiter)
     }
 
-    /// Бакет восстановления доступа (подключается в 5.7).
-    pub fn recovery_limiter(&self) -> &RateLimiter<IpAddr> {
-        &self.recovery_limiter
+    /// Бакет восстановления доступа.
+    pub fn recovery_limiter(&self) -> Arc<RateLimiter<IpAddr>> {
+        Arc::clone(&self.recovery_limiter)
     }
 
     /// Записать в журнал превышение лимита консоли.
@@ -148,6 +148,14 @@ pub fn build_router(state: AdminState) -> Router {
             "/admin/login",
             get(pages::login_page).post(pages::login_submit),
         )
+        .route(
+            "/admin/recover/{code}",
+            get(pages::recover_page).post(pages::recover_submit),
+        )
+        .route(
+            "/admin/password",
+            get(pages::password_page).post(pages::password_submit),
+        )
         .route("/admin/logout", post(pages::logout))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -181,9 +189,15 @@ async fn require_trusted_origin(
     });
 
     if !allowed {
+        // Шаблон маршрута, а не сырой путь: в `/admin/recover/{code}` лежит
+        // действующий одноразовый код, и он не должен попадать в журнал.
+        let route = request
+            .extensions()
+            .get::<MatchedPath>()
+            .map(|path| path.as_str().to_owned());
         tracing::info!(
             method = %request.method(),
-            path = %request.uri().path(),
+            route = route.as_deref().unwrap_or("<unmatched>"),
             "admin console request rejected: origin does not match"
         );
         return origin::forbidden();

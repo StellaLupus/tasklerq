@@ -10,8 +10,9 @@
 //! Флуд не должен раздувать журнал: на пару (тип события, ключ) пишется не
 //! больше одного события за [`SUPPRESSION_WINDOW_SECONDS`]; сколько повторов
 //! подавлено, видно в поле `suppressed`. Метрики при этом считают все случаи.
-//! Успешные события консоли (`admin_login`, `admin_account_created`) не
-//! подавляются: они редки и каждый вход должен оставлять след.
+//! Успешные события консоли (`admin_login`, `admin_account_created`,
+//! `admin_password_changed`, `admin_recovery_issued`) не подавляются: они редки,
+//! и каждое действие должно оставлять след.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
@@ -632,6 +633,36 @@ impl Audit {
             now,
         )
         .await;
+    }
+
+    /// Пароль администратора изменён.
+    ///
+    /// `reason` — `recovery` (по ссылке восстановления) или `change` (ввод
+    /// текущего пароля). Ни пароль, ни код в payload не попадают. Смена пароля
+    /// редка и значима, поэтому событие не подавляется: каждая смена должна
+    /// оставлять след.
+    pub async fn admin_password_changed(
+        &self,
+        ip: IpAddr,
+        reason: &'static str,
+        now: DateTime<Utc>,
+    ) {
+        self.record_admin_success(
+            AuditEventType::AdminPasswordChanged,
+            json!({ "ip": ip.to_string(), "reason": reason }),
+            now,
+        )
+        .await;
+    }
+
+    /// Выпущена ссылка восстановления доступа.
+    ///
+    /// Вызывается из CLI, где клиента нет: payload не содержит ни кода, ни
+    /// адреса. Событие редкое и не подавляется — каждая выданная ссылка должна
+    /// оставлять след.
+    pub async fn admin_recovery_issued(&self, now: DateTime<Utc>) {
+        self.record_admin_success(AuditEventType::AdminRecoveryIssued, json!({}), now)
+            .await;
     }
 
     /// Записать редкое успешное событие консоли без подавления повторов.

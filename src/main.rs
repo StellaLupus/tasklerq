@@ -206,6 +206,8 @@ enum AdminCommand {
     },
     /// Выпустить setup-код первого входа в веб-консоль.
     SetupCode,
+    /// Выпустить ссылку восстановления пароля администратора.
+    ResetPassword,
     /// Выгрузить данные household в JSON.
     Export(ExportArgs),
 }
@@ -519,6 +521,7 @@ async fn serve() -> Result<()> {
 async fn setup_code() -> Result<()> {
     init_cli_tracing();
 
+    let port = admin_console_port()?;
     let database = DatabaseConfig::from_env().context("invalid database configuration")?;
     let pool = storage::db::connect(&database)
         .await
@@ -530,16 +533,96 @@ async fn setup_code() -> Result<()> {
     {
         Some(issued) => {
             println!("{}", issued.code);
-            eprintln!(
-                "Откройте http://<адрес хоста>:<порт>/admin/setup и введите код. \
-                 Повторно код не показывается."
-            );
+            match port {
+                Some(port) => eprintln!(
+                    "Откройте http://<адрес хоста>:{port}/admin/setup и введите код. \
+                     Повторно код не показывается."
+                ),
+                None => eprintln!(
+                    "Консоль выключена (ADMIN_BIND_ADDR=disabled): включите её и выпустите \
+                     код заново. Повторно код не показывается."
+                ),
+            }
             Ok(())
         }
         None => bail!(
             "учётная запись администратора уже существует; \
              сменить пароль: tasklerq admin reset-password"
         ),
+    }
+}
+
+/// Выпустить ссылку восстановления и напечатать её путь.
+///
+/// В базе остаётся только хеш кода; открытое значение печатается один раз.
+/// Полный адрес сервер не знает, поэтому путь выводится отдельно, а порт
+/// консоли подсказывается из `ADMIN_BIND_ADDR`.
+async fn reset_password() -> Result<()> {
+    init_cli_tracing();
+
+    let port = admin_console_port()?;
+    let database = DatabaseConfig::from_env().context("invalid database configuration")?;
+    let pool = storage::db::connect(&database)
+        .await
+        .context("database connection failed")?;
+
+    let now = Utc::now();
+    let Some(issued) = admin_console::codes::issue_recovery_code(&pool, now)
+        .await
+        .map_err(explain)?
+    else {
+        bail!(
+            "учётная запись администратора не создана; \
+             выпустите setup-код: tasklerq admin setup-code"
+        );
+    };
+
+    // Код в журнал и аудит не попадает: событие фиксирует только выпуск.
+    tasklerq::security_audit::Audit::new(pool.clone())
+        .admin_recovery_issued(now)
+        .await;
+
+    println!("/admin/recover/{}", issued.code);
+    println!(
+        "Срок действия: {} минут.",
+        admin_console::codes::RECOVERY_TTL_MINUTES
+    );
+    match port {
+        Some(port) => eprintln!(
+            "Откройте http://<адрес хоста>:{port}/admin/recover/{} в течение {} минут. \
+             Повторно ссылка не показывается.",
+            issued.code,
+            admin_console::codes::RECOVERY_TTL_MINUTES
+        ),
+        None => eprintln!(
+            "Консоль выключена (ADMIN_BIND_ADDR=disabled): ссылка не откроется, пока \
+             консоль не включена. Повторно ссылка не показывается."
+        ),
+    }
+
+    Ok(())
+}
+
+/// Порт консоли из `ADMIN_BIND_ADDR` для подсказки в CLI.
+///
+/// `None` — консоль выключена. Значение по умолчанию совпадает с
+/// [`Config`]: без переменной консоль слушает `0.0.0.0:8081`.
+fn admin_console_port() -> Result<Option<u16>> {
+    let raw = std::env::var("ADMIN_BIND_ADDR").ok();
+    match raw.as_deref().map(str::trim) {
+        None | Some("") => Ok(Some(
+            "0.0.0.0:8081"
+                .parse::<std::net::SocketAddr>()
+                .expect("the default admin address is valid")
+                .port(),
+        )),
+        Some("disabled") => Ok(None),
+        Some(raw) => raw
+            .parse::<std::net::SocketAddr>()
+            .map(|address| Some(address.port()))
+            .map_err(|_| {
+                anyhow!("ADMIN_BIND_ADDR: ожидается адрес вида 0.0.0.0:8081 или `disabled`")
+            }),
     }
 }
 
@@ -595,6 +678,7 @@ async fn run_admin(command: AdminCommand) -> Result<()> {
             run_admin_database(DatabaseCommand::SecretKey(command)).await
         }
         AdminCommand::SetupCode => setup_code().await,
+        AdminCommand::ResetPassword => reset_password().await,
         AdminCommand::Export(args) => run_admin_database(DatabaseCommand::Export(args)).await,
     }
 }
