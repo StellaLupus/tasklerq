@@ -12,6 +12,7 @@ use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, header};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use http_body_util::BodyExt;
+use serde_json::Value;
 use sqlx::PgPool;
 use tasklerq::admin_console::codes::{self, Purpose};
 use tasklerq::admin_console::router::{AdminState, build_router as build_admin_router};
@@ -185,7 +186,11 @@ async fn send_with_cookie(
 }
 
 fn console(pool: &PgPool, trusted_proxies: Vec<IpNet>) -> Router {
-    build_admin_router(AdminState::new(pool.clone(), trusted_proxies))
+    build_admin_router(AdminState::new(
+        pool.clone(),
+        trusted_proxies,
+        Audit::new(pool.clone()),
+    ))
 }
 
 fn location(headers: &HeaderMap) -> Option<&str> {
@@ -260,6 +265,32 @@ async fn session_count(pool: &PgPool) -> i64 {
         .fetch_one(pool)
         .await
         .expect("session count")
+}
+
+/// Payload событий аудита одного типа в порядке записи.
+async fn audit_payloads(pool: &PgPool, event_type: &str) -> Vec<Value> {
+    sqlx::query_scalar(
+        "SELECT payload FROM audit_events
+         WHERE event_type::text = $1
+         ORDER BY created_at, id",
+    )
+    .bind(event_type)
+    .fetch_all(pool)
+    .await
+    .expect("audit payloads")
+}
+
+/// Актор и household событий аудита одного типа.
+async fn audit_actor(pool: &PgPool, event_type: &str) -> Vec<(String, Option<Uuid>)> {
+    sqlx::query_as(
+        "SELECT actor_type::text, household_id FROM audit_events
+         WHERE event_type::text = $1
+         ORDER BY created_at, id",
+    )
+    .bind(event_type)
+    .fetch_all(pool)
+    .await
+    .expect("audit actors")
 }
 
 /// Время с точностью до микросекунды: `timestamptz` хранит именно её.
@@ -347,7 +378,11 @@ async fn public_router_does_not_serve_console_paths() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn console_router_redirects_to_login_without_a_session() {
     let db = support::db().await;
-    let app = build_admin_router(AdminState::new(db.pool.clone(), Vec::new()));
+    let app = build_admin_router(AdminState::new(
+        db.pool.clone(),
+        Vec::new(),
+        Audit::new(db.pool.clone()),
+    ));
 
     let (status, headers, _) = send(&app, Method::GET, "/admin").await;
 
@@ -462,7 +497,11 @@ async fn enabled_console_serves_on_its_own_listener_only() {
     let admin_address = admin.local_addr().expect("admin listener address");
 
     let public = build_router(AppState::new(db.pool.clone(), Audit::new(db.pool.clone())));
-    let console = build_admin_router(AdminState::new(db.pool.clone(), Vec::new()));
+    let console = build_admin_router(AdminState::new(
+        db.pool.clone(),
+        Vec::new(),
+        Audit::new(db.pool.clone()),
+    ));
     let server = spawn_server(listeners.public, public, Some((admin, console)));
 
     let client = no_redirect_client();
@@ -844,7 +883,7 @@ async fn an_existing_account_keeps_the_setup_code_unused() {
         .await
         .expect("a setup code should be issued");
 
-    let state = AdminState::new(db.pool.clone(), Vec::new());
+    let state = AdminState::new(db.pool.clone(), Vec::new(), Audit::new(db.pool.clone()));
     let result = setup::create_account(
         &state,
         &issued.code,
@@ -923,6 +962,480 @@ async fn the_password_length_is_checked_before_hashing() {
         "the same code still works and 12 characters pass"
     );
     assert_eq!(account_count(&db.pool).await, 1);
+}
+
+/// Пять неудач закрывают вход: шестая попытка — `429` без проверки пароля.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn five_failed_logins_turn_the_sixth_attempt_into_too_many_requests() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console(&db.pool, Vec::new());
+
+    for attempt in 0..5 {
+        let (status, headers, _) = send_form(
+            &app,
+            "/admin/login",
+            &[("username", "admin"), ("password", "wrong-password-123")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "failure {attempt} is a form error");
+        assert!(
+            set_cookie(&headers).is_none(),
+            "failure {attempt} must not set a cookie"
+        );
+    }
+
+    // Пароль верный, но лимит уже исчерпан: проверка до argon2 не доходит,
+    // поэтому сессии нет.
+    let (status, headers, _) = send_form(
+        &app,
+        "/admin/login",
+        &[("username", "admin"), ("password", TEST_PASSWORD)],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the sixth attempt must be refused before checking the password"
+    );
+    assert!(set_cookie(&headers).is_none());
+    let retry_after: u64 = headers
+        .get(header::RETRY_AFTER)
+        .expect("a rate-limited response names the retry moment")
+        .to_str()
+        .expect("an ASCII Retry-After")
+        .parse()
+        .expect("Retry-After is a number of seconds");
+    assert!(
+        (1..=900).contains(&retry_after),
+        "Retry-After stays inside the window: {retry_after}"
+    );
+    assert_security_headers(&headers, "a rate-limited login");
+    assert_eq!(
+        session_count(&db.pool).await,
+        0,
+        "a rate-limited attempt must not issue a session"
+    );
+
+    let limits = audit_payloads(&db.pool, "rate_limited").await;
+    let limit = limits
+        .iter()
+        .find(|payload| payload["limit"] == "admin_login_per_15_minutes")
+        .expect("the login limit is audited");
+    assert_eq!(limit["ip"], "127.0.0.1");
+    assert!(limit["retry_after"].as_u64().unwrap_or(0) >= 1);
+
+    let failed = audit_payloads(&db.pool, "admin_login_failed").await;
+    assert!(!failed.is_empty(), "failed logins are audited");
+    assert!(
+        failed
+            .iter()
+            .all(|payload| payload["reason"] == "bad_credentials"),
+        "{failed:?}"
+    );
+}
+
+/// Параллельные неудачи не обходят лимит: проверок не больше пяти.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_failures_do_not_bypass_the_login_limit() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console(&db.pool, Vec::new());
+
+    let mut tasks = Vec::new();
+    for _ in 0..10 {
+        let app = app.clone();
+        tasks.push(tokio::spawn(async move {
+            let (status, _, _) = send_form(
+                &app,
+                "/admin/login",
+                &[("username", "admin"), ("password", "wrong-password-123")],
+            )
+            .await;
+            status
+        }));
+    }
+
+    let mut checked = 0;
+    let mut limited = 0;
+    for task in tasks {
+        match task.await.expect("login task") {
+            StatusCode::OK => checked += 1,
+            StatusCode::TOO_MANY_REQUESTS => limited += 1,
+            other => panic!("unexpected login status: {other}"),
+        }
+    }
+    assert_eq!(checked, 5, "only five password checks may run");
+    assert_eq!(limited, 5, "the rest is refused before argon2");
+    assert_eq!(session_count(&db.pool).await, 0);
+}
+
+/// Успешные входы не расходуют лимит неудач.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn successful_logins_do_not_spend_the_failure_limit() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console(&db.pool, Vec::new());
+    let fields = [("username", "admin"), ("password", TEST_PASSWORD)];
+
+    for attempt in 0..4 {
+        let (status, headers, _) = send_form(&app, "/admin/login", &fields).await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "success {attempt}");
+        assert!(
+            set_cookie(&headers).is_some(),
+            "success {attempt} sets a cookie"
+        );
+    }
+
+    let (status, headers, _) = send_form(&app, "/admin/login", &fields).await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "the fifth successful login still passes"
+    );
+    assert!(set_cookie(&headers).is_some());
+    assert_eq!(session_count(&db.pool).await, 5);
+
+    let logins = audit_payloads(&db.pool, "admin_login").await;
+    assert_eq!(
+        logins.len(),
+        5,
+        "every successful login leaves an audit event: {logins:?}"
+    );
+}
+
+/// `X-Forwarded-For` учитывается только от доверенного прокси.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn x_forwarded_for_does_not_bypass_the_login_limit() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let fields = [("username", "admin"), ("password", "wrong-password-123")];
+
+    // Пустой ADMIN_TRUSTED_PROXIES: адрес клиента — адрес соединения, смена
+    // X-Forwarded-For не создаёт новый бакет.
+    let untrusted = console(&db.pool, Vec::new());
+    for attempt in 0..5 {
+        let mut forwarded = HeaderMap::new();
+        forwarded.insert(
+            "x-forwarded-for",
+            HeaderValue::from_str(&format!("203.0.113.{}", attempt + 1))
+                .expect("a forwarded address"),
+        );
+        let (status, _, _) =
+            send_form_from(&untrusted, "/admin/login", test_peer(), forwarded, &fields).await;
+        assert_eq!(status, StatusCode::OK, "failure {attempt}");
+    }
+    let mut forwarded = HeaderMap::new();
+    forwarded.insert("x-forwarded-for", HeaderValue::from_static("198.51.100.99"));
+    let (status, _, _) =
+        send_form_from(&untrusted, "/admin/login", test_peer(), forwarded, &fields).await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "an ignored X-Forwarded-For must not reset the bucket"
+    );
+
+    // Доверенный прокси: разные X-Forwarded-For — разные клиенты.
+    let trusted = console(
+        &db.pool,
+        vec![IpNet::parse("127.0.0.1").expect("a loopback network")],
+    );
+    for attempt in 0..5 {
+        let mut forwarded = HeaderMap::new();
+        forwarded.insert(
+            "x-forwarded-for",
+            HeaderValue::from_str(&format!("198.51.100.{}", attempt + 1))
+                .expect("a forwarded address"),
+        );
+        let (status, _, _) =
+            send_form_from(&trusted, "/admin/login", test_peer(), forwarded, &fields).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "client {attempt} has its own bucket"
+        );
+    }
+    let mut forwarded = HeaderMap::new();
+    forwarded.insert("x-forwarded-for", HeaderValue::from_static("198.51.100.99"));
+    let (status, _, _) =
+        send_form_from(&trusted, "/admin/login", test_peer(), forwarded, &fields).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a new forwarded client is not refused because of its neighbours"
+    );
+}
+
+/// Setup-код и вход считают неудачи в разных бакетах.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_code_failures_do_not_block_a_later_login() {
+    let db = support::isolated_db().await;
+    let app = console(&db.pool, Vec::new());
+    let issued = codes::issue(&db.pool, Purpose::Setup, None, Utc::now())
+        .await
+        .expect("a setup code should be issued");
+    let password = "valid-password-12";
+
+    for attempt in 0..5 {
+        let (status, _, body) = send_form(
+            &app,
+            "/admin/setup",
+            &[
+                ("code", "no-such-code"),
+                ("username", "admin"),
+                ("password", password),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "failure {attempt}");
+        assert!(
+            String::from_utf8_lossy(&body).contains("Код недействителен"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    // Шестая попытка отклоняется до argon2 и до проверки кода: даже верный
+    // код не создаёт учётку.
+    let (status, headers, _) = send_form(
+        &app,
+        "/admin/setup",
+        &[
+            ("code", &issued.code),
+            ("username", "admin"),
+            ("password", password),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_security_headers(&headers, "a rate-limited setup");
+    assert_eq!(
+        account_count(&db.pool).await,
+        0,
+        "the sixth request must not create an account"
+    );
+
+    let limits = audit_payloads(&db.pool, "rate_limited").await;
+    assert!(
+        limits
+            .iter()
+            .any(|payload| payload["limit"] == "admin_setup_code_per_15_minutes"),
+        "{limits:?}"
+    );
+
+    // Вход не делит бакет с setup-кодом: учётка, созданная вне консоли, даёт
+    // обычный вход с того же адреса.
+    insert_account(&db.pool, "admin").await;
+    let (status, headers, _) = send_form(
+        &app,
+        "/admin/login",
+        &[("username", "admin"), ("password", TEST_PASSWORD)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(set_cookie(&headers).is_some());
+}
+
+/// Ошибка валидации на setup — не попытка кода и лимит не расходует.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_validation_errors_do_not_spend_the_code_limit() {
+    let db = support::isolated_db().await;
+    let app = console(&db.pool, Vec::new());
+    let issued = codes::issue(&db.pool, Purpose::Setup, None, Utc::now())
+        .await
+        .expect("a setup code should be issued");
+
+    for attempt in 0..5 {
+        let (status, _, body) = send_form(
+            &app,
+            "/admin/setup",
+            &[
+                ("code", &issued.code),
+                ("username", "admin"),
+                ("password", "short"),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "invalid input {attempt}");
+        assert!(
+            String::from_utf8_lossy(&body).contains("не менее 12"),
+            "the length error is shown: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    let (status, headers, _) = send_form(
+        &app,
+        "/admin/setup",
+        &[
+            ("code", &issued.code),
+            ("username", "admin"),
+            ("password", "valid-password-12"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "five invalid lengths must not spend the code limit"
+    );
+    assert!(set_cookie(&headers).is_some());
+    assert_eq!(account_count(&db.pool).await, 1);
+}
+
+/// Все четыре бакета живут в состоянии и не делят счётчики.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_four_failure_buckets_are_independent() {
+    let db = support::db().await;
+    let state = AdminState::new(db.pool.clone(), Vec::new(), Audit::new(db.pool.clone()));
+    let ip: std::net::IpAddr = "203.0.113.5".parse().expect("an IP address");
+    let now = Utc::now();
+
+    for _ in 0..5 {
+        state.setup_limiter().record(&ip, now);
+    }
+    assert!(!state.setup_limiter().peek(&ip, now).allowed);
+    assert!(state.login_limiter().peek(&ip, now).allowed);
+    assert!(state.current_password_limiter().peek(&ip, now).allowed);
+    assert!(state.recovery_limiter().peek(&ip, now).allowed);
+
+    for _ in 0..5 {
+        state.login_limiter().record(&ip, now);
+    }
+    assert!(!state.login_limiter().peek(&ip, now).allowed);
+    assert!(
+        state.recovery_limiter().peek(&ip, now).allowed,
+        "the recovery bucket stays untouched"
+    );
+}
+
+/// События консоли пишутся с системным актором и без секретов.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn console_audit_events_are_written_without_secrets() {
+    const SETUP_PASSWORD: &str = "setup-password-123";
+    const HIDDEN_NAME: &str = "hidden-user-name";
+    const HIDDEN_PASSWORD: &str = "hidden-password-987";
+
+    let db = support::isolated_db().await;
+    let app = console(&db.pool, Vec::new());
+    let issued = codes::issue(&db.pool, Purpose::Setup, None, Utc::now())
+        .await
+        .expect("a setup code should be issued");
+
+    let (status, _, _) = send_form(
+        &app,
+        "/admin/setup",
+        &[
+            ("code", "no-such-code"),
+            ("username", HIDDEN_NAME),
+            ("password", SETUP_PASSWORD),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _, _) = send_form(
+        &app,
+        "/admin/setup",
+        &[
+            ("code", &issued.code),
+            ("username", "admin"),
+            ("password", SETUP_PASSWORD),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let (status, _, _) = send_form(
+        &app,
+        "/admin/login",
+        &[("username", HIDDEN_NAME), ("password", HIDDEN_PASSWORD)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _, _) = send_form(
+        &app,
+        "/admin/login",
+        &[("username", "admin"), ("password", SETUP_PASSWORD)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    for event_type in [
+        "admin_setup_code_failed",
+        "admin_account_created",
+        "admin_login_failed",
+        "admin_login",
+    ] {
+        let payloads = audit_payloads(&db.pool, event_type).await;
+        assert!(!payloads.is_empty(), "event {event_type} is recorded");
+        for (actor, household) in audit_actor(&db.pool, event_type).await {
+            assert_eq!(actor, "system", "event {event_type} has the system actor");
+            assert_eq!(
+                household, None,
+                "console events have no household: {event_type}"
+            );
+        }
+        for payload in payloads {
+            let text = payload.to_string();
+            for secret in [
+                SETUP_PASSWORD,
+                HIDDEN_PASSWORD,
+                issued.code.as_str(),
+                HIDDEN_NAME,
+            ] {
+                assert!(
+                    !text.contains(secret),
+                    "{event_type} payload leaked {secret:?}: {text}"
+                );
+            }
+        }
+    }
+
+    let created = audit_payloads(&db.pool, "admin_account_created").await;
+    assert_eq!(
+        created[0]["username"], "admin",
+        "the created account name is allowed"
+    );
+    let failed = audit_payloads(&db.pool, "admin_login_failed").await;
+    assert_eq!(failed[0]["reason"], "bad_credentials");
+    assert_eq!(failed[0]["ip"], "127.0.0.1");
+}
+
+/// POST без `Host` или с мусором в нём не даёт определить origin запроса.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_post_without_a_valid_host_header_is_refused() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console(&db.pool, Vec::new());
+
+    // Нет Host; пустой порт; обратный слэш; недопустимый символ — всё это не
+    // authority, а не значение, которое можно нормализовать в origin.
+    for host in [None, Some("nas:"), Some("nas\\"), Some("na_s:18081")] {
+        let mut headers = headers_with(&[("origin", "http://nas:18081")]);
+        if let Some(host) = host {
+            headers.insert(
+                header::HOST,
+                HeaderValue::from_str(host).expect("a header value"),
+            );
+        }
+        let (status, response_headers, _) = send_form_raw(
+            &app,
+            "/admin/login",
+            test_peer(),
+            headers,
+            &[("username", "admin"), ("password", TEST_PASSWORD)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "Host {host:?}");
+        assert_security_headers(&response_headers, "a request with a bad Host");
+    }
+    assert_eq!(
+        session_count(&db.pool).await,
+        0,
+        "a request without a valid Host must not log in"
+    );
 }
 
 /// Верные данные дают сессию; неверный пароль и неверное имя неотличимы.
@@ -1439,7 +1952,8 @@ async fn secure_cookie_follows_the_trusted_proxy() {
     let fields = [("username", "admin"), ("password", TEST_PASSWORD)];
     let mut forwarded = HeaderMap::new();
     forwarded.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-    // Origin доверенного прокси: https и X-Forwarded-Host/Vhost.
+    // Origin доверенного прокси: схема https из X-Forwarded-Proto, хост из
+    // заголовка Host (X-Forwarded-Host в тесте не задан).
     forwarded.insert(
         header::ORIGIN,
         HeaderValue::from_static("https://nas:18081"),

@@ -4,7 +4,8 @@
 //! содержит её маршрутов. Все ответы консоли, включая редиректы и ошибки,
 //! получают запрет кеширования и встраивания во фреймы одним слоем на роутере.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{ConnectInfo, Request, State};
@@ -12,28 +13,57 @@ use axum::http::{HeaderMap, HeaderValue, Method, header};
 use axum::middleware::Next;
 use axum::response::Response;
 use axum::routing::{get, post};
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 use crate::config::IpNet;
+use crate::domain::models::{Actor, ActorType};
 use crate::http::client::{Client, TrustedProxies};
+use crate::rate_limit::{RateDecision, RateLimiter};
+use crate::security_audit::{Audit, LimitKey, RateLimitEvent};
 
 use super::{origin, pages};
 
-/// Состояние консоли: база и доверенные прокси.
+/// Сколько неудач допускается в окне лимита консоли.
+pub const FAILURE_LIMIT: u32 = 5;
+/// Окно лимита консоли, секунды.
+pub const FAILURE_WINDOW_SECONDS: i64 = 900;
+
+/// Состояние консоли: база, доверенные прокси, журнал и лимиты.
 #[derive(Clone)]
 pub struct AdminState {
     /// Пул соединений PostgreSQL.
     pub pool: PgPool,
     /// Сети, от которых принимаются `X-Forwarded-*`.
     trusted_proxies: Vec<IpNet>,
+    /// Тот же журнал событий, что у публичного роутера: порог отказов
+    /// аутентификации общий.
+    pub audit: Audit,
+    /// Бакеты неудач по IP клиента. Ключ нормализуется
+    /// [`ip_key`](crate::rate_limit::ip_key): IPv6 сводится к /64, как у лимита
+    /// webhook, чтобы смена младших 64 бит не обходила лимит. Журнал при этом
+    /// хранит полный адрес клиента. `Arc`, чтобы клоны состояния делили
+    /// счётчики: новые лимитеры при копировании не создаются.
+    login_limiter: Arc<RateLimiter<IpAddr>>,
+    setup_limiter: Arc<RateLimiter<IpAddr>>,
+    current_password_limiter: Arc<RateLimiter<IpAddr>>,
+    recovery_limiter: Arc<RateLimiter<IpAddr>>,
 }
 
 impl AdminState {
     /// Создать состояние консоли.
-    pub fn new(pool: PgPool, trusted_proxies: Vec<IpNet>) -> Self {
+    ///
+    /// Журнал передаётся снаружи: неудачные входы в консоль должны попадать в
+    /// общий порог отказов аутентификации публичного роутера.
+    pub fn new(pool: PgPool, trusted_proxies: Vec<IpNet>, audit: Audit) -> Self {
         Self {
             pool,
             trusted_proxies,
+            audit,
+            login_limiter: failure_limiter(),
+            setup_limiter: failure_limiter(),
+            current_password_limiter: failure_limiter(),
+            recovery_limiter: failure_limiter(),
         }
     }
 
@@ -48,6 +78,58 @@ impl AdminState {
             TrustedProxies::Explicit(&self.trusted_proxies),
         )
     }
+
+    /// Бакет неудачных входов.
+    pub fn login_limiter(&self) -> &RateLimiter<IpAddr> {
+        &self.login_limiter
+    }
+
+    /// Бакет неудачных setup-кодов.
+    pub fn setup_limiter(&self) -> &RateLimiter<IpAddr> {
+        &self.setup_limiter
+    }
+
+    /// Бакет неверного текущего пароля (подключается в 5.7).
+    pub fn current_password_limiter(&self) -> &RateLimiter<IpAddr> {
+        &self.current_password_limiter
+    }
+
+    /// Бакет восстановления доступа (подключается в 5.7).
+    pub fn recovery_limiter(&self) -> &RateLimiter<IpAddr> {
+        &self.recovery_limiter
+    }
+
+    /// Записать в журнал превышение лимита консоли.
+    ///
+    /// Ключ — IP клиента без секретов. Повторы подавляет сам [`Audit`].
+    pub async fn audit_rate_limited(
+        &self,
+        limit: &'static str,
+        ip: IpAddr,
+        decision: RateDecision,
+        now: DateTime<Utc>,
+    ) {
+        self.audit
+            .rate_limited(
+                RateLimitEvent {
+                    limit,
+                    key: LimitKey::Ip(ip),
+                    retry_after: decision.retry_after.unwrap_or(0),
+                    household_id: None,
+                    actor: Actor::system(ActorType::System),
+                },
+                now,
+            )
+            .await;
+    }
+}
+
+/// Бакет неудач консоли: 5 за 15 минут на клиента.
+fn failure_limiter() -> Arc<RateLimiter<IpAddr>> {
+    Arc::new(RateLimiter::with_window(
+        FAILURE_LIMIT,
+        FAILURE_WINDOW_SECONDS,
+    ))
 }
 
 /// Собрать роутер консоли.

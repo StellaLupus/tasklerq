@@ -82,17 +82,73 @@ pub fn forbidden() -> Response {
 
 /// Разобрать `Host`/`X-Forwarded-Host` как authority и собрать origin.
 ///
-/// Значение обязано быть только хостом и необязательным портом: userinfo,
-/// путь, query и fragment — уже не authority, и origin считается неизвестным.
+/// Разбор строгий, без нормализации `Url::parse`: пустой порт (`nas:`),
+/// обратный слэш, знаки табуляции и перевода строки, любые символы вне
+/// `[A-Za-z0-9.\-:\[\]]` — уже не authority, и origin считается неизвестным.
+/// `Url` молча превратил бы `nas:` в `nas:80`, а `nas\path` — в путь.
 fn authority_origin(scheme: Scheme, authority: &str) -> Option<Origin> {
-    let url = Url::parse(&format!("{}://{}", scheme.as_str(), authority)).ok()?;
-    if !url.username().is_empty() || url.password().is_some() {
+    if authority.is_empty()
+        || !authority
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | ':' | '[' | ']'))
+    {
         return None;
     }
-    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+
+    let (host, port) = split_authority(scheme, authority)?;
+    Some(Origin { scheme, host, port })
+}
+
+/// Разделить authority на канонический хост и порт.
+///
+/// IPv6 допускается только в скобках: без них двоеточия неотличимы от
+/// разделителя порта. Пустой порт и нецифровое значение — не authority.
+fn split_authority(scheme: Scheme, authority: &str) -> Option<(String, u16)> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (address, after) = rest.split_once(']')?;
+        if address.is_empty()
+            || !address
+                .chars()
+                .all(|ch| ch.is_ascii_hexdigit() || matches!(ch, ':' | '.'))
+        {
+            return None;
+        }
+        let address: std::net::Ipv6Addr = address.parse().ok()?;
+        let port = match after {
+            "" => default_port(scheme),
+            _ => parse_port(after.strip_prefix(':')?)?,
+        };
+        return Some((format!("[{address}]"), port));
+    }
+
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, parse_port(port)?),
+        None => (authority, default_port(scheme)),
+    };
+    if host.is_empty()
+        || !host
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-'))
+    {
         return None;
     }
-    from_url(&url)
+    Some((host.to_ascii_lowercase(), port))
+}
+
+/// Порт по умолчанию для схемы.
+const fn default_port(scheme: Scheme) -> u16 {
+    match scheme {
+        Scheme::Http => 80,
+        Scheme::Https => 443,
+    }
+}
+
+/// Порт обязан быть непустым числом в диапазоне `u16`; ноль не допускается.
+fn parse_port(value: &str) -> Option<u16> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse::<u16>().ok().filter(|port| *port != 0)
 }
 
 /// Разобрать значение `Origin`.
@@ -244,6 +300,41 @@ mod tests {
             &client(Scheme::Http, "nas:18081"),
             &headers(&[("referer", "")])
         ));
+    }
+
+    #[test]
+    fn a_valid_foreign_origin_does_not_fall_back_to_a_matching_referer() {
+        let headers = headers(&[
+            ("origin", "http://evil.example"),
+            ("referer", "http://nas:18081/admin/login"),
+        ]);
+        assert!(
+            !allows(&client(Scheme::Http, "nas:18081"), &headers),
+            "a present Origin decides even when the Referer matches"
+        );
+    }
+
+    #[test]
+    fn strict_authority_rejects_empty_ports_and_control_characters() {
+        for host in [
+            "nas:",
+            "nas\\",
+            "nas\t18081",
+            "nas\n18081",
+            "nas\r18081",
+            "nas:18 081",
+            "na_s:18081",
+            "nas:18081/",
+        ] {
+            assert!(
+                request_origin(&client(Scheme::Http, host)).is_none(),
+                "host {host:?} must not be normalized into an origin"
+            );
+        }
+        assert!(
+            request_origin(&client(Scheme::Http, "[fd00::1]:18081")).is_some(),
+            "a bracketed IPv6 host with a port stays valid"
+        );
     }
 
     #[test]

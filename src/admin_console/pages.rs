@@ -16,12 +16,14 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use chrono::Utc;
 use serde::Deserialize;
 
-use super::login::{self, LoginError};
+use super::login::{self, LoginError, LoginOutcome};
 use super::password::{self, Password};
 use super::router::AdminState;
 use super::session::{self, AdminSession, LOGIN_PATH};
 use super::setup::{self, SetupError};
 use crate::domain::error::DomainError;
+use crate::rate_limit::{RateDecision, Reservation, ip_key};
+use crate::security_audit;
 use crate::storage::repositories::admin_accounts;
 
 /// Путь страницы первого входа.
@@ -93,24 +95,61 @@ pub(crate) async fn setup_submit(
         return Html(setup_html(Some(&error.to_string()))).into_response();
     }
 
+    // Лимит проверяется до argon2 и до кода: неверная длина или пустое имя
+    // выше попыткой кода не считаются, а расход хеширования ограничен. Слот
+    // резервируется, поэтому параллельный всплеск не проходит лимит целиком.
+    let client = state.client(peer, &headers);
+    let now = Utc::now();
+    let key = ip_key(client.ip);
+    let guard = match state.setup_limiter().reserve(&key, now) {
+        Reservation::Allowed(guard) => guard,
+        Reservation::Denied(decision) => {
+            state
+                .audit_rate_limited(
+                    security_audit::ADMIN_SETUP_CODE_LIMIT,
+                    client.ip,
+                    decision,
+                    now,
+                )
+                .await;
+            return too_many_requests(decision);
+        }
+    };
+
     // Длина проверена до хеширования: неверный ввод код не расходует.
     // Хеш считается до транзакции, чтобы не держать блокировку строки кода на
     // время argon2; неверный код поэтому стоит одного хеша, а частоту
-    // setup-попыток ограничит 5.6.
+    // setup-попыток ограничивает бакет выше.
     let password_hash = match password::hash(form.password).await {
         Ok(hash) => hash,
         Err(error) => return internal(error),
     };
 
-    let now = Utc::now();
     match setup::create_account(&state, &form.code, username, &password_hash, now).await {
-        Ok(_) => match session::start(&state, &state.client(peer, &headers), Utc::now()).await {
-            Ok((_, cookie)) => redirect_with_cookie(HOME_PATH, cookie),
-            Err(error) => internal(error),
-        },
+        Ok(account) => {
+            guard.succeeded();
+            state
+                .audit
+                .admin_account_created(client.ip, &account.username, Utc::now())
+                .await;
+            match session::start(&state, &client, Utc::now()).await {
+                Ok((_, cookie)) => redirect_with_cookie(HOME_PATH, cookie),
+                Err(error) => internal(error),
+            }
+        }
         // Учётка появилась параллельно: код откатился и остался действующим.
-        Err(SetupError::AlreadyConfigured) => redirect(LOGIN_PATH),
-        Err(SetupError::InvalidCode) => Html(setup_html(Some(SETUP_FORM_ERROR))).into_response(),
+        Err(SetupError::AlreadyConfigured) => {
+            guard.succeeded();
+            redirect(LOGIN_PATH)
+        }
+        Err(SetupError::InvalidCode) => {
+            guard.failed();
+            state
+                .audit
+                .admin_setup_code_failed(client.ip, "invalid_code", Utc::now())
+                .await;
+            Html(setup_html(Some(SETUP_FORM_ERROR))).into_response()
+        }
         Err(SetupError::Database(error)) => internal(error),
     }
 }
@@ -143,15 +182,16 @@ pub(crate) async fn login_submit(
         Err(error) => return internal(error),
     }
 
-    match login::verify_credentials(&state, &form.username, form.password).await {
-        Ok(Some(_)) => {
-            match session::start(&state, &state.client(peer, &headers), Utc::now()).await {
-                Ok((_, cookie)) => redirect_with_cookie(HOME_PATH, cookie),
-                Err(error) => internal(error),
-            }
-        }
+    let client = state.client(peer, &headers);
+    match login::authenticate(&state, &client, &form.username, form.password, Utc::now()).await {
+        Ok(LoginOutcome::Accepted(_)) => match session::start(&state, &client, Utc::now()).await {
+            Ok((_, cookie)) => redirect_with_cookie(HOME_PATH, cookie),
+            Err(error) => internal(error),
+        },
         // Неверное имя и неверный пароль дают один и тот же ответ.
-        Ok(None) => Html(login_html(Some(LOGIN_FORM_ERROR))).into_response(),
+        Ok(LoginOutcome::Rejected) => Html(login_html(Some(LOGIN_FORM_ERROR))).into_response(),
+        // Пароль не проверялся: лимит исчерпан записанными неудачами.
+        Ok(LoginOutcome::RateLimited(decision)) => too_many_requests(decision),
         Err(LoginError::Database(error)) => internal(error),
         Err(LoginError::Password(error)) => internal(error),
     }
@@ -189,6 +229,19 @@ async fn account_exists(state: &AdminState) -> Result<bool, DomainError> {
 /// `303` без cookie.
 fn redirect(path: &str) -> Response {
     Redirect::to(path).into_response()
+}
+
+/// `429` без проверки ввода: `Retry-After` из решения лимита.
+///
+/// Заголовки безопасности добавляет слой роутера, как и к остальным ответам.
+fn too_many_requests(decision: RateDecision) -> Response {
+    let mut response = (StatusCode::TOO_MANY_REQUESTS, "Too Many Requests").into_response();
+    if let Some(retry_after) = decision.retry_after
+        && let Ok(value) = header::HeaderValue::from_str(&retry_after.to_string())
+    {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
 }
 
 /// `303` с одной `Set-Cookie`.

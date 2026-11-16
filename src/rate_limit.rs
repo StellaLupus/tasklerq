@@ -40,9 +40,60 @@ pub struct RateLimiter<K = Uuid> {
 #[derive(Debug)]
 struct State<K> {
     hits: HashMap<K, VecDeque<DateTime<Utc>>>,
+    /// Сколько проверок ключа уже выполняется. Они тоже занимают слоты:
+    /// иначе параллельные запросы проходили бы лимит все сразу, пока ни одна
+    /// неудача ещё не записана.
+    in_flight: HashMap<K, u32>,
     /// Когда последний раз чистили всю карту. Полный проход по карте не
     /// должен повторяться на каждый запрос с новым ключом.
     last_cleanup: Option<DateTime<Utc>>,
+}
+
+/// Итог резервирования слота проверки.
+///
+/// [`Reservation::Denied`] содержит решение с `Retry-After`: проверку ввода
+/// выполнять нельзя.
+pub enum Reservation<'a, K: Eq + Hash + Clone> {
+    /// Слот занят до [`RateGuard::succeeded`] или [`RateGuard::failed`]; если
+    /// разрешение просто уничтожить, слот освобождается без отметки неудачи.
+    Allowed(RateGuard<'a, K>),
+    /// Лимит уже исчерпан записанными неудачами или идущими проверками.
+    Denied(RateDecision),
+}
+
+/// Занятый слот проверки ввода.
+///
+/// Пока разрешение живо, параллельные проверки того же ключа его видят и не
+/// проходят лимит все сразу. Успех освобождает слот без отметки, неудача
+/// превращает его в запись окна. Внутренняя ошибка (база, argon2) разрешение
+/// просто роняет: это не попытка ввода и лимит она не расходует.
+pub struct RateGuard<'a, K: Eq + Hash + Clone> {
+    limiter: &'a RateLimiter<K>,
+    key: K,
+    now: DateTime<Utc>,
+    armed: bool,
+}
+
+impl<K: Eq + Hash + Clone> RateGuard<'_, K> {
+    /// Ввод удался: слот освобождается, неудача не записывается.
+    pub fn succeeded(mut self) {
+        self.armed = false;
+        self.limiter.release(&self.key);
+    }
+
+    /// Ввод не удался: слот превращается в отметку неудачи.
+    pub fn failed(mut self) {
+        self.armed = false;
+        self.limiter.record_failure(&self.key, self.now);
+    }
+}
+
+impl<K: Eq + Hash + Clone> Drop for RateGuard<'_, K> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.limiter.release(&self.key);
+        }
+    }
 }
 
 impl<K> RateLimiter<K> {
@@ -58,6 +109,7 @@ impl<K> RateLimiter<K> {
             window: Duration::seconds(window_seconds.max(1)),
             state: Mutex::new(State {
                 hits: HashMap::new(),
+                in_flight: HashMap::new(),
                 last_cleanup: None,
             }),
         }
@@ -107,38 +159,180 @@ impl<K: Eq + Hash + Clone> RateLimiter<K> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
+        self.cleanup(&mut state, now, cutoff);
+
+        let queue = state.hits.entry(key).or_default();
+        prune(queue, cutoff);
+        if let Some(denied) = self.denied(queue, now) {
+            return denied;
+        }
+        queue.push_back(now);
+        allowed()
+    }
+
+    /// Проверить ключ `key`, не учитывая операцию.
+    ///
+    /// Режим «проверить до, учесть после неудачи»: [`peek`](Self::peek)
+    /// вызывается перед проверкой пароля, а [`record`](Self::record) — только
+    /// после неудачи. Удачный ввод лимит не расходует.
+    pub fn peek(&self, key: &K, now: DateTime<Utc>) -> RateDecision {
+        let cutoff = now - self.window;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        self.cleanup(&mut state, now, cutoff);
+
+        // Пустой ключ не заводится: проверка без учёта не должна оставлять
+        // записи в карте.
+        state
+            .hits
+            .get_mut(key)
+            .and_then(|queue| {
+                prune(queue, cutoff);
+                self.denied(queue, now)
+            })
+            .unwrap_or_else(allowed)
+    }
+
+    /// Учесть одну неудачу ключа `key` в момент `now`.
+    ///
+    /// Вызывается после [`peek`](Self::peek), поэтому отметок в окне не
+    /// больше лимита. Окно скользящее: старые отметки удаляются и здесь.
+    pub fn record(&self, key: &K, now: DateTime<Utc>) {
+        let cutoff = now - self.window;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        self.cleanup(&mut state, now, cutoff);
+
+        let queue = state.hits.entry(key.clone()).or_default();
+        prune(queue, cutoff);
+        queue.push_back(now);
+    }
+
+    /// Занять слот проверки ввода, учитывая уже идущие проверки.
+    ///
+    /// Без этого параллельные запросы все проходят [`peek`](Self::peek), пока
+    /// ни одна неудача не записана, и лимит обходится всплеском. Занятый слот
+    /// освобождает [`RateGuard::succeeded`] (успех) или занимает
+    /// [`RateGuard::failed`] (неудача); простое уничтожение разрешения
+    /// освобождает слот без отметки.
+    pub fn reserve(&self, key: &K, now: DateTime<Utc>) -> Reservation<'_, K> {
+        let cutoff = now - self.window;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        self.cleanup(&mut state, now, cutoff);
+
+        let occupied = {
+            let hits = state.hits.get_mut(key).map_or(0, |queue| {
+                prune(queue, cutoff);
+                queue.len()
+            });
+            hits + usize::try_from(state.in_flight.get(key).copied().unwrap_or(0)).unwrap_or(0)
+        };
+        if occupied >= self.limit as usize {
+            let empty = VecDeque::new();
+            let queue = state.hits.get(key).unwrap_or(&empty);
+            return Reservation::Denied(self.denied(queue, now).unwrap_or(RateDecision {
+                allowed: false,
+                retry_after: Some(retry_after_seconds(self.window)),
+                retry_at: None,
+            }));
+        }
+
+        *state.in_flight.entry(key.clone()).or_default() += 1;
+        Reservation::Allowed(RateGuard {
+            limiter: self,
+            key: key.clone(),
+            now,
+            armed: true,
+        })
+    }
+
+    /// Освободить занятый слот без отметки неудачи.
+    fn release(&self, key: &K) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        release_slot(&mut state.in_flight, key);
+    }
+
+    /// Освободить занятый слот и записать неудачу.
+    fn record_failure(&self, key: &K, now: DateTime<Utc>) {
+        let cutoff = now - self.window;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        release_slot(&mut state.in_flight, key);
+        self.cleanup(&mut state, now, cutoff);
+
+        let queue = state.hits.entry(key.clone()).or_default();
+        prune(queue, cutoff);
+        queue.push_back(now);
+    }
+
+    /// Удалить устаревшие ключи, но не чаще раза в окно.
+    fn cleanup(&self, state: &mut State<K>, now: DateTime<Utc>, cutoff: DateTime<Utc>) {
         if state
             .last_cleanup
             .is_none_or(|last| now - last >= self.window)
         {
             state.hits.retain(|_, queue| {
-                while queue.front().is_some_and(|at| *at <= cutoff) {
-                    queue.pop_front();
-                }
+                prune(queue, cutoff);
                 !queue.is_empty()
             });
             state.last_cleanup = Some(now);
         }
+    }
 
-        let queue = state.hits.entry(key).or_default();
-        while queue.front().is_some_and(|at| *at <= cutoff) {
-            queue.pop_front();
+    /// Отказ, если в окне уже лимит отметок.
+    fn denied(&self, queue: &VecDeque<DateTime<Utc>>, now: DateTime<Utc>) -> Option<RateDecision> {
+        if queue.len() < self.limit as usize {
+            return None;
         }
-        if queue.len() >= self.limit as usize {
-            let retry_at = queue.front().map(|at| *at + self.window);
-            let wait = retry_at.map_or(self.window, |at| at - now);
-            return RateDecision {
-                allowed: false,
-                retry_after: Some(retry_after_seconds(wait)),
-                retry_at,
-            };
+        let retry_at = queue.front().map(|at| *at + self.window);
+        let wait = retry_at.map_or(self.window, |at| at - now);
+        Some(RateDecision {
+            allowed: false,
+            retry_after: Some(retry_after_seconds(wait)),
+            retry_at,
+        })
+    }
+}
+
+/// Удалить отметки старше окна.
+fn prune(queue: &mut VecDeque<DateTime<Utc>>, cutoff: DateTime<Utc>) {
+    while queue.front().is_some_and(|at| *at <= cutoff) {
+        queue.pop_front();
+    }
+}
+
+/// Уменьшить счётчик идущих проверок ключа, удалив нулевую запись.
+fn release_slot<K: Eq + Hash + Clone>(in_flight: &mut HashMap<K, u32>, key: &K) {
+    if let std::collections::hash_map::Entry::Occupied(mut entry) = in_flight.entry(key.clone()) {
+        let count = entry.get_mut();
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            entry.remove();
         }
-        queue.push_back(now);
-        RateDecision {
-            allowed: true,
-            retry_after: None,
-            retry_at: None,
-        }
+    }
+}
+
+const fn allowed() -> RateDecision {
+    RateDecision {
+        allowed: true,
+        retry_after: None,
+        retry_at: None,
     }
 }
 
@@ -363,6 +557,127 @@ mod tests {
         // Если бы отказ записывался отметкой, в этот момент он ещё был бы в
         // окне и снова запретил бы операцию.
         assert!(limiter.check(key, start + Duration::seconds(60)).allowed);
+    }
+
+    #[test]
+    fn peek_does_not_consume_the_limit() {
+        let limiter = RateLimiter::with_window(2, 60);
+        let key = 7_i64;
+        let start = at(3_000);
+
+        for _ in 0..10 {
+            assert!(
+                limiter.peek(&key, start).allowed,
+                "peek must not spend a slot"
+            );
+        }
+
+        limiter.record(&key, start);
+        assert!(limiter.peek(&key, start + Duration::seconds(1)).allowed);
+        limiter.record(&key, start + Duration::seconds(1));
+        let denied = limiter.peek(&key, start + Duration::seconds(2));
+        assert!(!denied.allowed);
+        assert_eq!(denied.retry_after, Some(58));
+        assert_eq!(denied.retry_at, Some(start + Duration::seconds(60)));
+    }
+
+    #[test]
+    fn five_failures_deny_the_sixth_peek_and_the_window_slides() {
+        let limiter = RateLimiter::with_window(5, 900);
+        let key = 7_i64;
+        let start = at(4_000);
+
+        for offset in 0..5 {
+            assert!(
+                limiter
+                    .peek(&key, start + Duration::seconds(offset))
+                    .allowed,
+                "failure {offset} is inside the limit"
+            );
+            limiter.record(&key, start + Duration::seconds(offset));
+        }
+        let denied = limiter.peek(&key, start + Duration::seconds(5));
+        assert!(!denied.allowed, "the sixth attempt must be refused");
+        assert!(denied.retry_after.unwrap_or(0) >= 895);
+
+        // Окно скользит от самой старой неудачи, а не от начала отсчёта.
+        assert!(!limiter.peek(&key, start + Duration::seconds(899)).allowed);
+        assert!(limiter.peek(&key, start + Duration::seconds(900)).allowed);
+    }
+
+    #[test]
+    fn the_old_check_still_consumes_a_slot() {
+        let limiter = RateLimiter::with_window(1, 60);
+        let key = 7_i64;
+        let start = at(5_000);
+
+        assert!(limiter.check(key, start).allowed);
+        assert!(!limiter.check(key, start + Duration::seconds(1)).allowed);
+        assert!(
+            !limiter.peek(&key, start + Duration::seconds(1)).allowed,
+            "check and peek share the same counters"
+        );
+    }
+
+    #[test]
+    fn an_in_flight_check_occupies_a_slot_until_it_finishes() {
+        let limiter = RateLimiter::with_window(1, 60);
+        let key = 7_i64;
+        let start = at(6_000);
+
+        let Reservation::Allowed(guard) = limiter.reserve(&key, start) else {
+            panic!("the first check must be allowed");
+        };
+        assert!(
+            matches!(
+                limiter.reserve(&key, start),
+                Reservation::Denied(decision) if !decision.allowed
+            ),
+            "a parallel check must not pass while the slot is busy"
+        );
+
+        guard.succeeded();
+        assert!(
+            matches!(
+                limiter.reserve(&key, start + Duration::seconds(1)),
+                Reservation::Allowed(_)
+            ),
+            "a successful check returns the slot"
+        );
+    }
+
+    #[test]
+    fn a_failed_reservation_becomes_a_hit_and_a_dropped_one_does_not() {
+        let limiter = RateLimiter::with_window(1, 60);
+        let key = 7_i64;
+        let start = at(7_000);
+
+        {
+            let Reservation::Allowed(_guard) = limiter.reserve(&key, start) else {
+                panic!("the first check must be allowed");
+            };
+        }
+        assert!(
+            matches!(
+                limiter.reserve(&key, start + Duration::seconds(1)),
+                Reservation::Allowed(_)
+            ),
+            "dropping a permit means an internal error, not a failed input"
+        );
+
+        let Reservation::Allowed(guard) = limiter.reserve(&key, start + Duration::seconds(2))
+        else {
+            panic!("the slot is free after the dropped permit");
+        };
+        guard.failed();
+        assert!(
+            !limiter.peek(&key, start + Duration::seconds(2)).allowed,
+            "a failed check consumes the slot"
+        );
+        assert!(matches!(
+            limiter.reserve(&key, start + Duration::seconds(3)),
+            Reservation::Denied(_)
+        ));
     }
 
     #[test]

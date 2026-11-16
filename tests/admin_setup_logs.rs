@@ -21,6 +21,7 @@ use support::logs::LogBuffer;
 use tasklerq::admin_console::codes::{self, Purpose};
 use tasklerq::admin_console::router::{AdminState, build_router as build_admin_router};
 use tasklerq::config::Config;
+use tasklerq::security_audit::Audit;
 use tasklerq::storage::migrations;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -262,7 +263,11 @@ fn the_password_never_appears_in_the_logs() {
     let (logs, (setup_status, login_status)) = capture(|| {
         runtime().block_on(async {
             let (pool, _url) = setup_db().await;
-            let app = build_admin_router(AdminState::new(pool.clone(), Vec::new()));
+            let app = build_admin_router(AdminState::new(
+                pool.clone(),
+                Vec::new(),
+                Audit::new(pool.clone()),
+            ));
             let issued = codes::issue(&pool, Purpose::Setup, None, chrono::Utc::now())
                 .await
                 .expect("a setup code");

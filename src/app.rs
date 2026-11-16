@@ -90,7 +90,7 @@ pub async fn build_application_with_update_limit(
     )
     .await?;
 
-    let mut state = AppState::new(pool.clone(), audit)
+    let mut state = AppState::new(pool.clone(), audit.clone())
         .with_tenancy_mode(config.tenancy.mode)
         .with_secret_cipher(secret_cipher)
         .with_llm_slots(llm_slots);
@@ -112,6 +112,7 @@ pub async fn build_application_with_update_limit(
         build_admin_router(AdminState::new(
             pool.clone(),
             config.admin_trusted_proxies.clone(),
+            audit,
         ))
     });
 

@@ -1,13 +1,19 @@
 //! Проверка имени и пароля администратора.
 //!
-//! Одна функция на весь вход: сюда 5.6 добавит ограничение частоты и события
-//! аудита. Сейчас она всегда прогоняет argon2, даже если имя не совпало, чтобы
+//! Одна функция на весь вход [`authenticate`]: ограничение частоты и события
+//! аудита живут здесь, поэтому обработчик страницы только различает итог.
+//! Проверка пароля всегда прогоняет argon2, даже если имя не совпало, чтобы
 //! время ответа не выдавало существующее имя. При отсутствии учётки
 //! проверяется фиктивный хеш с теми же параметрами.
+
+use chrono::{DateTime, Utc};
 
 use crate::admin_console::password::{self, Password, PasswordError};
 use crate::admin_console::router::AdminState;
 use crate::domain::error::DomainError;
+use crate::http::client::Client;
+use crate::rate_limit::{RateDecision, Reservation, ip_key};
+use crate::security_audit;
 use crate::storage::repositories::admin_accounts::{self, AdminAccount};
 
 /// Фиктивный хеш для проверки пароля, когда учётной записи нет.
@@ -26,7 +32,60 @@ pub enum LoginError {
     Password(PasswordError),
 }
 
-/// Проверить имя и пароль.
+/// Итог попытки входа.
+#[derive(Debug)]
+pub enum LoginOutcome {
+    /// Данные верны; сессию выдаёт обработчик.
+    Accepted(AdminAccount),
+    /// Имя или пароль не подошли; неудача уже учтена в лимите и журнале.
+    Rejected,
+    /// Лимит неудач исчерпан: пароль не проверялся.
+    RateLimited(RateDecision),
+}
+
+/// Проверить имя и пароль с ограничением частоты и аудитом.
+///
+/// Слот резервируется до argon2: после пятой неудачи шестая попытка не
+/// расходует хеширование, а параллельные попытки видят уже занятые слоты.
+/// Успех слот освобождает и лимит не расходует. Неверные данные дают
+/// [`LoginOutcome::Rejected`], а не ошибку: клиент не должен различать
+/// неверное имя и неверный пароль.
+pub async fn authenticate(
+    state: &AdminState,
+    client: &Client,
+    username: &str,
+    password: Password,
+    now: DateTime<Utc>,
+) -> Result<LoginOutcome, LoginError> {
+    let key = ip_key(client.ip);
+    let guard = match state.login_limiter().reserve(&key, now) {
+        Reservation::Allowed(guard) => guard,
+        Reservation::Denied(decision) => {
+            state
+                .audit_rate_limited(security_audit::ADMIN_LOGIN_LIMIT, client.ip, decision, now)
+                .await;
+            return Ok(LoginOutcome::RateLimited(decision));
+        }
+    };
+
+    match verify_credentials(state, username, password).await? {
+        Some(account) => {
+            guard.succeeded();
+            state.audit.admin_login_succeeded(client.ip, now).await;
+            Ok(LoginOutcome::Accepted(account))
+        }
+        None => {
+            guard.failed();
+            state
+                .audit
+                .admin_login_failed(client.ip, "bad_credentials", now)
+                .await;
+            Ok(LoginOutcome::Rejected)
+        }
+    }
+}
+
+/// Проверить имя и пароль без лимита и аудита.
 ///
 /// `Ok(Some(account))` — данные верны; `Ok(None)` — имя или пароль не подходят
 /// (клиент не должен различать эти случаи).

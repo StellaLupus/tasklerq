@@ -10,6 +10,8 @@
 //! Флуд не должен раздувать журнал: на пару (тип события, ключ) пишется не
 //! больше одного события за [`SUPPRESSION_WINDOW_SECONDS`]; сколько повторов
 //! подавлено, видно в поле `suppressed`. Метрики при этом считают все случаи.
+//! Успешные события консоли (`admin_login`, `admin_account_created`) не
+//! подавляются: они редки и каждый вход должен оставлять след.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
@@ -35,9 +37,12 @@ pub const MAX_SUPPRESSION_ENTRIES: usize = 4_096;
 pub const MAX_RECORDS_PER_WINDOW: usize = 50;
 /// Сколько ждём запись аудита, прежде чем ответить клиенту без неё.
 pub const RECORD_TIMEOUT_MS: u64 = 500;
-/// Окно подсчёта отказов webhook, секунды.
+/// Окно подсчёта отказов аутентификации, секунды.
+///
+/// Одно окно на webhook и неудачные входы в консоль: порог уведомления об
+/// отказах аутентификации общий.
 pub const WEBHOOK_FAILURE_WINDOW_SECONDS: i64 = 300;
-/// Порог отказов webhook в окне: превышение создаёт событие и метрику.
+/// Порог отказов аутентификации в окне: превышение создаёт событие и метрику.
 pub const WEBHOOK_FAILURE_THRESHOLD: u64 = 50;
 
 /// Имя лимита capture в событиях.
@@ -48,6 +53,22 @@ pub const WEBHOOK_LIMIT: &str = "webhook_per_second";
 pub const TELEGRAM_LIMIT: &str = "telegram_updates_per_minute";
 /// Имя лимита создания приглашений на household.
 pub const INVITES_LIMIT: &str = "invites_per_hour";
+/// Имя лимита неудачных входов в консоль.
+pub const ADMIN_LOGIN_LIMIT: &str = "admin_login_per_15_minutes";
+/// Имя лимита неудачных setup-кодов консоли.
+pub const ADMIN_SETUP_CODE_LIMIT: &str = "admin_setup_code_per_15_minutes";
+/// Имя лимита неверного текущего пароля в консоли.
+pub const ADMIN_CURRENT_PASSWORD_LIMIT: &str = "admin_current_password_per_15_minutes";
+/// Имя лимита восстановления доступа в консоли.
+pub const ADMIN_RECOVERY_LIMIT: &str = "admin_recovery_per_15_minutes";
+
+/// Относится ли лимит к консоли оператора.
+fn is_admin_limit(limit: &str) -> bool {
+    limit == ADMIN_LOGIN_LIMIT
+        || limit == ADMIN_SETUP_CODE_LIMIT
+        || limit == ADMIN_CURRENT_PASSWORD_LIMIT
+        || limit == ADMIN_RECOVERY_LIMIT
+}
 
 /// Тип события для подавления повторов.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -55,6 +76,7 @@ enum SuppressKind {
     AuthFailed,
     RateLimited,
     LlmValidationFailed,
+    AdminConsole,
 }
 
 /// Источник события для потолка записей.
@@ -63,11 +85,14 @@ enum SuppressKind {
 /// потолок позволял флуду webhook вытеснять события API. Так же флуд webhook
 /// по лимиту частоты не должен выбирать потолок для `rate_limited` capture,
 /// Telegram и приглашений, поэтому webhook-события считаются отдельно.
+/// События консоли оператора считаются своим потолком: поток неудачных входов
+/// не должен вытеснять события остальных источников.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum RecordScope {
     All,
     Webhook,
     Api,
+    Console,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -232,7 +257,10 @@ impl Suppression {
     }
 }
 
-/// Скользящее окно отказов аутентификации webhook.
+/// Скользящее окно отказов аутентификации.
+///
+/// Общее для webhook и консоли оператора: порог уведомления
+/// [`WEBHOOK_FAILURE_THRESHOLD`] не должен обходиться раздельными счётчиками.
 #[derive(Debug, Default)]
 struct WebhookFailures {
     hits: VecDeque<DateTime<Utc>>,
@@ -463,6 +491,15 @@ impl Audit {
             .await;
         }
 
+        self.record_auth_failure("webhook", now).await;
+    }
+
+    /// Учесть отказ аутентификации в общем окне порога.
+    ///
+    /// Окно и счётчик общие для webhook и консоли: порог уведомления не должен
+    /// обходиться раздельными счётчиками. Источник последнего отказа попадает
+    /// в payload события порога.
+    async fn record_auth_failure(&self, source: &'static str, now: DateTime<Utc>) {
         let exceeded = self
             .inner
             .webhook_failures
@@ -479,6 +516,7 @@ impl Audit {
                     "window_seconds": WEBHOOK_FAILURE_WINDOW_SECONDS,
                     "threshold": WEBHOOK_FAILURE_THRESHOLD,
                     "count": count,
+                    "source": source,
                 }),
                 now,
             )
@@ -535,15 +573,127 @@ impl Audit {
         .await;
     }
 
+    /// Вход администратора в консоль удался.
+    ///
+    /// Имя учётной записи не пишется: для успешного события достаточно адреса,
+    /// а лишние пользовательские строки в журнале не нужны. Успешные входы не
+    /// подавляются: их немного, и каждый вход должен оставлять след.
+    pub async fn admin_login_succeeded(&self, ip: IpAddr, now: DateTime<Utc>) {
+        self.record_admin_success(
+            AuditEventType::AdminLogin,
+            json!({ "ip": ip.to_string() }),
+            now,
+        )
+        .await;
+    }
+
+    /// Неудачный вход в консоль.
+    ///
+    /// Введённое имя не пишется: в него часто попадает пароль. Неудача также
+    /// учитывается в общем пороге отказов аутентификации.
+    pub async fn admin_login_failed(&self, ip: IpAddr, reason: &'static str, now: DateTime<Utc>) {
+        self.record_admin_event(
+            "admin_login_failed",
+            AuditEventType::AdminLoginFailed,
+            ip,
+            json!({ "ip": ip.to_string(), "reason": reason }),
+            now,
+        )
+        .await;
+        self.record_auth_failure("admin_console", now).await;
+    }
+
+    /// Неверный, повторный или погашенный setup-код консоли.
+    ///
+    /// Ни код, ни введённое имя в payload не попадают.
+    pub async fn admin_setup_code_failed(
+        &self,
+        ip: IpAddr,
+        reason: &'static str,
+        now: DateTime<Utc>,
+    ) {
+        self.record_admin_event(
+            "admin_setup_code_failed",
+            AuditEventType::AdminSetupCodeFailed,
+            ip,
+            json!({ "ip": ip.to_string(), "reason": reason }),
+            now,
+        )
+        .await;
+    }
+
+    /// Учётная запись администратора создана. Имя созданной учётки допустимо.
+    ///
+    /// Событие не подавляется: учётная запись создаётся один раз.
+    pub async fn admin_account_created(&self, ip: IpAddr, username: &str, now: DateTime<Utc>) {
+        self.record_admin_success(
+            AuditEventType::AdminAccountCreated,
+            json!({ "ip": ip.to_string(), "username": username }),
+            now,
+        )
+        .await;
+    }
+
+    /// Записать редкое успешное событие консоли без подавления повторов.
+    async fn record_admin_success(
+        &self,
+        event_type: AuditEventType,
+        mut payload: Value,
+        now: DateTime<Utc>,
+    ) {
+        payload["suppressed"] = json!(0);
+        self.record(
+            None,
+            &Actor::system(ActorType::System),
+            event_type,
+            payload,
+            now,
+        )
+        .await;
+    }
+
+    /// Записать событие консоли с системным актором и подавлением повторов.
+    ///
+    /// Household у событий консоли нет: учётная запись администратора общая для
+    /// установки. Ошибка записи не мешает основному пути — так же, как у
+    /// остальных событий журнала.
+    async fn record_admin_event(
+        &self,
+        event_name: &'static str,
+        event_type: AuditEventType,
+        ip: IpAddr,
+        mut payload: Value,
+        now: DateTime<Utc>,
+    ) {
+        let key = format!("{event_name}:ip:{ip}");
+        let Some(suppressed) =
+            self.check(SuppressKind::AdminConsole, RecordScope::Console, &key, now)
+        else {
+            return;
+        };
+        payload["suppressed"] = json!(suppressed);
+
+        self.record(
+            None,
+            &Actor::system(ActorType::System),
+            event_type,
+            payload,
+            now,
+        )
+        .await;
+    }
+
     /// Сработавший лимит частоты.
     ///
     /// `true` — событие записано; `false` — повтор подавлен или запись не
     /// удалась. Метрики вызывающая сторона считает сама.
     pub async fn rate_limited(&self, event: RateLimitEvent, now: DateTime<Utc>) -> bool {
-        // Превышения лимита webhook считаются отдельно: их флуд не должен
-        // выбирать потолок записей для capture, Telegram и приглашений.
+        // Превышения лимита webhook и консоли считаются отдельно: их флуд не
+        // должен выбирать потолок записей для capture, Telegram и приглашений.
         let scope = if event.limit == WEBHOOK_LIMIT {
             RecordScope::Webhook
+        } else if is_admin_limit(event.limit) {
+            RecordScope::Console
         } else {
             RecordScope::All
         };
