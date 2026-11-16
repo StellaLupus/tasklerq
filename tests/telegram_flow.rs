@@ -2987,7 +2987,7 @@ async fn each_kind_of_incoming_text_is_deleted() {
     // Текст на разбор.
     let id = next_telegram_id();
     let handler = Bot::new("tasklerqbot")
-        .with_llm_capture(true)
+        .with_llm(support::llm::capture_handle())
         .with_tenancy(tasklerq::config::TenancyMode::Multi);
     let mut parser = Harness::with_handler(&db.pool, id, Arc::new(handler), FakeTelegram::new());
     parser.text("/start").await;
@@ -3155,7 +3155,7 @@ async fn text_on_the_agenda_screen_starts_the_general_capture() {
     let db = db().await;
     let id = next_telegram_id();
     let handler = Bot::new("tasklerqbot")
-        .with_llm_capture(true)
+        .with_llm(support::llm::capture_handle())
         .with_tenancy(tasklerq::config::TenancyMode::Multi);
     let mut bot = Harness::with_handler(&db.pool, id, Arc::new(handler), FakeTelegram::new());
     bot.text("/start").await;

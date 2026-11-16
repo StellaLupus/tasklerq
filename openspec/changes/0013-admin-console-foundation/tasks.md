@@ -72,7 +72,7 @@
 
 ## 3. Снимок LLM и hot-swap
 
-- [ ] 3.1 `LlmHandle` (`ArcSwap<LlmSnapshot>` с версией, `EffectiveLlm`,
+- [x] 3.1 `LlmHandle` (`ArcSwap<LlmSnapshot>` с версией, `EffectiveLlm`,
   цепочкой и квотой) в `src/llm/`; `build_application` создаёт его. Заменить
   `Option<Arc<Chain>>` и квоту по значению в `CaptureState`, `CaptureWorker`,
   `LlmSlotHealth`; `AppState` получает `LlmSlotHealth` всегда; флаг

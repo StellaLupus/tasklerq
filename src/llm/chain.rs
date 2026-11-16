@@ -17,6 +17,7 @@ use super::{ChatBackend, ChatRequest, LlmError, OpenAiBackend};
 use crate::capture::breaker::CircuitBreaker;
 use crate::config::{LlmConfig, SlotConfig};
 use crate::metrics;
+use crate::settings::EffectiveLlm;
 
 /// Имя основного слота в `llm_runs.slot`.
 pub const PRIMARY_SLOT: &str = "primary";
@@ -209,17 +210,42 @@ impl Chain {
     /// Собрать цепочку из конфигурации. `None`, если разбор выключен или
     /// основной слот не задан.
     pub fn from_config(config: &LlmConfig) -> Result<Option<Self>, LlmError> {
-        if !config.capture_enabled() {
+        Self::build(
+            config.capture_enabled(),
+            config.primary.as_ref(),
+            config.fallback.as_ref(),
+            config.connect_timeout,
+        )
+    }
+
+    /// Собрать цепочку из действующей конфигурации консоли.
+    ///
+    /// Источник полей уже разрешён правилом «окружение → база → умолчание»,
+    /// поэтому флаг не пересчитывается и `LlmConfig` не нужен.
+    pub fn from_effective(effective: &EffectiveLlm) -> Result<Option<Self>, LlmError> {
+        Self::build(
+            effective.enabled(),
+            effective.primary().config(),
+            effective.fallback().config(),
+            effective.connect_timeout(),
+        )
+    }
+
+    fn build(
+        enabled: bool,
+        primary: Option<&SlotConfig>,
+        fallback: Option<&SlotConfig>,
+        connect_timeout: Duration,
+    ) -> Result<Option<Self>, LlmError> {
+        if !enabled {
             return Ok(None);
         }
-        let Some(primary_config) = &config.primary else {
+        let Some(primary_config) = primary else {
             return Ok(None);
         };
-        let primary = Slot::from_config(PRIMARY_SLOT, primary_config, config.connect_timeout)?;
-        let fallback = config
-            .fallback
-            .as_ref()
-            .map(|slot| Slot::from_config(FALLBACK_SLOT, slot, config.connect_timeout))
+        let primary = Slot::from_config(PRIMARY_SLOT, primary_config, connect_timeout)?;
+        let fallback = fallback
+            .map(|slot| Slot::from_config(FALLBACK_SLOT, slot, connect_timeout))
             .transpose()?;
         Ok(Some(Self::new(primary, fallback)))
     }

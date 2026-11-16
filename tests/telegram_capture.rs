@@ -8,10 +8,11 @@ use std::sync::Arc;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use tasklerq::llm::{Chain, LlmError};
+use tasklerq::config::DEFAULT_DAILY_QUOTA;
+use tasklerq::llm::{Chain, LlmError, LlmHandle, LlmSnapshot};
 use tasklerq::security_audit::Audit;
 use tasklerq::telegram::bot::Bot;
-use tasklerq::telegram::capture_worker::{CaptureWorker, DEFAULT_DAILY_QUOTA, MAX_ATTEMPTS, Pass};
+use tasklerq::telegram::capture_worker::{CaptureWorker, MAX_ATTEMPTS, Pass};
 use tokio::sync::Notify;
 
 use support::telegram::{FakeTelegram, Harness, button_rows};
@@ -59,6 +60,7 @@ struct Stand {
     worker: CaptureWorker,
     ai: Arc<StubAi>,
     chain: Arc<Chain>,
+    llm: LlmHandle,
 }
 
 /// Сколько разборов в минуту допускает бот.
@@ -96,8 +98,13 @@ async fn stand_with_chain(
     llm_capture: bool,
 ) -> Stand {
     let id = next_telegram_id();
+    let llm = LlmHandle::new(LlmSnapshot::from_chain(Some(chain.clone()), quota));
     let handler = Bot::new("tasklerqbot")
-        .with_llm_capture(llm_capture)
+        .with_llm(if llm_capture {
+            llm.clone()
+        } else {
+            LlmHandle::empty()
+        })
         .with_tenancy(tasklerq::config::TenancyMode::Multi);
     let mut bot = Harness::with_handler(pool, id, Arc::new(handler.clone()), FakeTelegram::new());
     bot.text("/start").await;
@@ -107,18 +114,18 @@ async fn stand_with_chain(
 
     let worker = CaptureWorker::new(
         pool.clone(),
-        chain.clone(),
+        llm.clone(),
         handler,
         Arc::new(Notify::new()),
         Audit::new(pool.clone()),
     )
-    .only_chat(id)
-    .with_quota(quota);
+    .only_chat(id);
     Stand {
         bot,
         worker,
         ai,
         chain,
+        llm,
     }
 }
 
@@ -1593,6 +1600,36 @@ async fn disabled_llm_opens_the_manual_form_without_queueing() {
     stand.bot.assert_screen_contains("купить хлеб");
     assert_eq!(stand.jobs().await, 0);
     assert_eq!(stand.ai.calls(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_queued_before_the_chain_disappeared_finishes_as_llm_disabled() {
+    let db = db().await;
+    let mut stand = stand(&db.pool, vec![]).await;
+
+    // Задание поставлено при снимке с цепочкой.
+    stand.bot.text("купить молоко").await;
+    assert_eq!(stand.jobs().await, 1);
+
+    // Цепочку убрали до обработки: воркер обязан взять снимок заново.
+    stand
+        .llm
+        .store(LlmSnapshot::from_chain(None, DEFAULT_DAILY_QUOTA));
+
+    assert_eq!(stand.work().await, Pass::Dead);
+    assert_eq!(stand.ai.calls(), 0, "the disabled llm must not be called");
+    stand.bot.assert_screen_contains("Название: купить молоко");
+
+    let (status, error, attempts): (String, Option<String>, i32) = sqlx::query_as(
+        "SELECT status::text, last_error, attempts FROM capture_jobs WHERE chat_id = $1",
+    )
+    .bind(stand.bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("capture job");
+    assert_eq!(status, "dead");
+    assert_eq!(error.as_deref(), Some("llm_disabled"));
+    assert_eq!(attempts, 1, "llm_disabled must not be retried");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

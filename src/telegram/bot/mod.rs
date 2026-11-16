@@ -29,6 +29,7 @@ use crate::domain::error::DomainError;
 use crate::domain::identity::{MembershipChange, MembershipNotice, NoticeKind};
 use crate::domain::models::{Actor, Household, User};
 use crate::domain::recurrence::parse_timezone;
+use crate::llm::LlmHandle;
 use crate::security_audit::Audit;
 use crate::storage::repositories::{households, users};
 
@@ -80,8 +81,8 @@ pub struct Recipient<'a> {
 pub struct Bot {
     /// Имя бота для ссылок-приглашений.
     pub username: String,
-    /// Свободный текст уходит на разбор в LLM, а не в быстрое добавление.
-    pub llm_capture: bool,
+    /// Свободный текст уходит на разбор, только если в снимке есть цепочка.
+    pub llm: Option<LlmHandle>,
     /// Политика размещения инсталляции; влияет на первый контакт.
     pub tenancy: TenancyConfig,
     /// Журнал событий безопасности, которые откатываются вместе с шагом.
@@ -440,7 +441,7 @@ impl Bot {
     pub fn new(username: impl Into<String>) -> Self {
         Self {
             username: username.into(),
-            llm_capture: false,
+            llm: None,
             tenancy: TenancyConfig {
                 mode: TenancyMode::Single,
                 bootstrap_owner: None,
@@ -530,17 +531,25 @@ impl Bot {
             toast: None,
             banner,
             placement: Placement::Visible,
-            llm_capture: self.llm_capture,
+            llm_capture: self.llm_capture(),
             tenancy: self.tenancy,
             audit: self.audit.as_ref(),
         }
     }
 
-    /// Включить или выключить разбор свободного текста через LLM.
+    /// Задать снимок LLM: по нему обработка обновления решает, ставить ли
+    /// задание разбора и показывать ли подсказки для LLM.
     #[must_use]
-    pub fn with_llm_capture(mut self, enabled: bool) -> Self {
-        self.llm_capture = enabled;
+    pub fn with_llm(mut self, llm: LlmHandle) -> Self {
+        self.llm = Some(llm);
         self
+    }
+
+    /// Разбор свободного текста включён в текущем снимке.
+    fn llm_capture(&self) -> bool {
+        self.llm
+            .as_ref()
+            .is_some_and(|llm| llm.load().chain().is_some())
     }
 
     /// Задать режим размещения инсталляции, сохранив `bootstrap_owner`.
@@ -623,7 +632,7 @@ impl Bot {
             toast: None,
             banner: None,
             placement: Placement::Visible,
-            llm_capture: self.llm_capture,
+            llm_capture: self.llm_capture(),
             tenancy: self.tenancy,
             audit: self.audit.as_ref(),
         };

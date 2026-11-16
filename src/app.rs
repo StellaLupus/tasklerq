@@ -13,6 +13,7 @@ use crate::config::{Config, TelegramMode, TenancyMode};
 use crate::http::api::capture::CaptureState;
 use crate::http::router::{AppState, build_router};
 use crate::jobs::retention::RetentionWorker;
+use crate::llm::{LlmHandle, LlmSnapshot};
 use crate::security_audit::Audit;
 use crate::settings;
 use crate::settings::crypto::SecretCipher;
@@ -57,14 +58,9 @@ pub async fn build_application_with_update_limit(
     let secret_cipher = SecretCipher::from_config(config);
     warn_if_stored_secrets_unreadable(&pool, &secret_cipher).await;
 
-    let llm = runtime::build_llm(&config.llm);
-    let llm_slots = llm
-        .as_ref()
-        .and_then(|chain| LlmSlotHealth::new(chain.clone(), &config.llm))
-        .map(std::sync::Arc::new);
-    if let Some(health) = &llm_slots {
-        warn_if_llm_slots_unverified(health, &pool).await;
-    }
+    let llm = build_llm_handle(&pool, config, &secret_cipher).await;
+    let llm_slots = std::sync::Arc::new(LlmSlotHealth::new(llm.clone()));
+    warn_if_llm_slots_unverified(&llm_slots, &pool).await;
 
     // Один журнал событий на процесс: вебхук, воркеры, бот и capture-воркер
     // делят состояние подавления и счётчики отказов.
@@ -81,10 +77,8 @@ pub async fn build_application_with_update_limit(
 
     let mut state = AppState::new(pool.clone(), audit)
         .with_tenancy_mode(config.tenancy.mode)
-        .with_secret_cipher(secret_cipher);
-    if let Some(health) = llm_slots {
-        state = state.with_llm_slots(health);
-    }
+        .with_secret_cipher(secret_cipher)
+        .with_llm_slots(llm_slots);
     let mut workers = Vec::new();
     if let Some(runtime) = telegram {
         if let Some(ingress) = runtime.ingress {
@@ -94,11 +88,7 @@ pub async fn build_application_with_update_limit(
         workers = runtime.tasks;
     }
     if config.capture.enabled {
-        state = state.with_capture(CaptureState::new(
-            config.capture,
-            llm,
-            config.llm.daily_quota,
-        ));
+        state = state.with_capture(CaptureState::new(config.capture, llm));
     }
 
     // Retention не зависит от Telegram: чистит базу и без токена бота.
@@ -110,6 +100,26 @@ pub async fn build_application_with_update_limit(
         router: build_router(state),
         workers,
     })
+}
+
+/// Собрать снимок LLM из окружения, базы и умолчаний.
+///
+/// Слоты, заданные только в консоли, начинают работать после перезапуска без
+/// `LLM_*` в окружении. Сбой чтения базы не роняет сервис: действует
+/// конфигурация из окружения и умолчаний, а в журнал уходит предупреждение без
+/// значений настроек.
+async fn build_llm_handle(pool: &PgPool, config: &Config, cipher: &SecretCipher) -> LlmHandle {
+    let effective = match settings::read_effective_llm(pool, &config.llm, cipher).await {
+        Ok(effective) => effective,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "could not read llm settings at startup; using environment and defaults"
+            );
+            settings::effective_llm(&config.llm, &[], cipher)
+        }
+    };
+    LlmHandle::new(LlmSnapshot::from_effective(effective))
 }
 
 /// Предупредить, что без явного первого владельца им станет первый написавший

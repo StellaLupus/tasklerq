@@ -11,6 +11,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Map, Value, json};
 use sqlx::PgPool;
+use tasklerq::app::build_application;
 use tasklerq::config::{Config, LlmConfig, SecretKey, SecretString, SlotConfig};
 use tasklerq::settings::crypto::{SecretCipher, SecretContext};
 use tasklerq::settings::{
@@ -18,6 +19,9 @@ use tasklerq::settings::{
     read_effective_llm,
 };
 use tasklerq::storage::repositories::settings as repository;
+use tokio::sync::watch;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn env_llm(pairs: &[(&str, &str)]) -> LlmConfig {
     let mut vars: Vec<(String, String)> = [
@@ -764,10 +768,99 @@ fn the_effective_config_builds_the_same_primary_slot_for_the_chain() {
     };
 
     let effective = effective_llm(&env, &[], &cipher(1));
-    let config = effective.to_llm_config();
+    let chain = tasklerq::llm::Chain::from_effective(&effective)
+        .expect("an enabled slot builds a chain")
+        .expect("the primary slot is set");
 
-    assert_eq!(config.enabled, Some(true));
-    assert_eq!(config.primary.expect("primary").model, slot.model);
-    assert_eq!(config.connect_timeout, Duration::from_millis(1_000));
-    assert_eq!(config.daily_quota, 200);
+    assert!(effective.enabled());
+    assert_eq!(
+        chain.primary().timeout(),
+        Duration::from_secs(10),
+        "the chain uses the slot timeout"
+    );
+    assert_eq!(
+        effective.primary().config().expect("primary").model,
+        slot.model
+    );
+    assert_eq!(effective.connect_timeout(), Duration::from_millis(1_000));
+    assert_eq!(effective.daily_quota(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slot_stored_only_in_settings_serves_http_capture_after_restart() {
+    let db = support::isolated_db().await;
+    let server = MockServer::start().await;
+    let answer = support::llm::v4::response(vec![support::llm::v4::shopping("Молоко")]);
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "db/model",
+            "choices": [{"message": {"content": serde_json::to_string(&answer).expect("json")}}],
+        })))
+        .mount(&server)
+        .await;
+
+    // Окружение без LLM_*: слот задан только в settings, как после переноса из
+    // `.env` в консоль (Migration Plan п.4).
+    set_plain(
+        &db.pool,
+        "llm.primary.url",
+        json!(format!("{}/v1", server.uri())),
+    )
+    .await;
+    set_plain(&db.pool, "llm.primary.model", json!("db/model")).await;
+    set_secret(&db.pool, "llm.primary.token", "db-token", &cipher(1)).await;
+    set_plain(&db.pool, "llm.enabled", json!(true)).await;
+
+    let secret_key = BASE64.encode([1u8; 32]);
+    let config = Config::from_map([
+        ("ENV", "development".to_owned()),
+        ("PUBLIC_BASE_URL", "http://127.0.0.1:8080".to_owned()),
+        (
+            "DATABASE_URL",
+            "postgres://tasklerq:secret@127.0.0.1:5432/tasklerq".to_owned(),
+        ),
+        ("TELEGRAM_MODE", "disabled".to_owned()),
+        ("TASKLERQ_SECRET_KEY", secret_key),
+    ])
+    .expect("test config should be valid");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let application = build_application(&config, db.pool.clone(), shutdown_rx)
+        .await
+        .expect("application");
+
+    let household = support::create_household(&db.pool).await;
+    let token = support::issue_token(&db.pool, household.household_id, &["capture:write"]).await;
+    let (status, body) = support::request(
+        &application.router,
+        axum::http::Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(json!({"text": "купить молоко", "source": "api", "mode": "auto"})),
+    )
+    .await;
+
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "applied", "{body}");
+    assert_eq!(
+        body["fallback"], false,
+        "the answer must come from the llm, not from the raw-text fallback: {body}"
+    );
+    assert_eq!(
+        body["items"][0]["title"], "Молоко",
+        "the title must be the model answer, not the source text: {body}"
+    );
+    assert_eq!(
+        server.received_requests().await.expect("requests").len(),
+        1,
+        "the slot stored only in settings must receive the capture request"
+    );
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    for worker in application.workers {
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .expect("worker must stop on shutdown")
+            .expect("worker task must join");
+    }
 }

@@ -24,11 +24,13 @@ use url::Url;
 use crate::config::{SecretString, SlotConfig, loggable_url};
 
 mod chain;
+mod snapshot;
 
 pub use chain::{
     Attempt, Chain, ChainError, ChainOutcome, Clock, FALLBACK_SLOT, PRIMARY_SLOT, ResponseFailure,
     Slot, SystemClock,
 };
+pub use snapshot::{LlmHandle, LlmSnapshot};
 
 /// Верхняя граница ответа модели: черновик из двадцати элементов и уточнений
 /// укладывается с запасом.

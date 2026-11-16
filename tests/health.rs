@@ -24,7 +24,7 @@ use tasklerq::config::{
 };
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
-use tasklerq::llm::Chain;
+use tasklerq::llm::{Chain, LlmHandle, LlmSnapshot};
 use tasklerq::security_audit::Audit;
 use tasklerq::settings;
 use tasklerq::settings::crypto::SecretCipher;
@@ -95,7 +95,12 @@ fn llm_health(
         daily_quota_from_env: false,
         ignored_env: Vec::new(),
     };
-    let health = Arc::new(LlmSlotHealth::new(chain.clone(), &llm).expect("llm health"));
+    let effective = settings::effective_llm(&llm, &[], &SecretCipher::new(None, None));
+    let handle = LlmHandle::new(LlmSnapshot::from_effective_and_chain(
+        effective,
+        Some(chain.clone()),
+    ));
+    let health = Arc::new(LlmSlotHealth::new(handle));
     (chain, health)
 }
 
@@ -490,7 +495,10 @@ async fn an_unchecked_slot_does_not_block_capture() {
     let state = AppState::new(db.pool.clone(), Audit::new(db.pool.clone()))
         .with_tenancy_mode(TenancyMode::Single)
         .with_llm_slots(health)
-        .with_capture(CaptureState::new(capture_config(), Some(chain), 200));
+        .with_capture(CaptureState::new(
+            capture_config(),
+            LlmHandle::new(LlmSnapshot::from_chain(Some(chain), 200)),
+        ));
     let app = build_router(state);
 
     let (status, body) = support::request(

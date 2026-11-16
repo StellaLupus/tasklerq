@@ -119,20 +119,18 @@ pub async fn ready(State(state): State<AppState>) -> Result<Json<HealthResponse>
     // Статус слотов LLM — предупреждение, а не отказ: без LLM сервис работает с
     // деградацией, и падение readiness вывело бы из работы то, что от него не
     // зависит.
-    if let Some(llm_slots) = &state.llm_slots {
-        if llm_slots.all_breakers_open(now) {
-            warnings.push("llm_unavailable".to_owned());
-        }
-        for report in llm_slots.statuses(&state.pool, now).await {
-            if !report.status.is_passed() {
-                match report.titles {
-                    Some(titles) => warnings.push(format!(
-                        "llm_slot_unverified:{}:{}",
-                        report.slot,
-                        titles.as_str()
-                    )),
-                    None => warnings.push(format!("llm_slot_unverified:{}", report.slot)),
-                }
+    if state.llm_slots.all_breakers_open(now) {
+        warnings.push("llm_unavailable".to_owned());
+    }
+    for report in state.llm_slots.statuses(&state.pool, now).await {
+        if !report.status.is_passed() {
+            match report.titles {
+                Some(titles) => warnings.push(format!(
+                    "llm_slot_unverified:{}:{}",
+                    report.slot,
+                    titles.as_str()
+                )),
+                None => warnings.push(format!("llm_slot_unverified:{}", report.slot)),
             }
         }
     }

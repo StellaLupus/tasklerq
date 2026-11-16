@@ -419,7 +419,6 @@ pub struct EffectiveLlm {
     daily_quota: u32,
     daily_quota_source: SettingSource,
     settings: Vec<ResolvedSetting>,
-    ignored_env: Vec<&'static str>,
 }
 
 impl EffectiveLlm {
@@ -467,23 +466,6 @@ impl EffectiveLlm {
     pub fn settings(&self) -> &[ResolvedSetting] {
         &self.settings
     }
-
-    /// Конфигурация для [`crate::llm::Chain::from_config`].
-    ///
-    /// Флаг становится явным: цепочка собирается по уже разрешённому правилу
-    /// «окружение → база → умолчание» и не пересчитывает его.
-    pub fn to_llm_config(&self) -> LlmConfig {
-        LlmConfig {
-            enabled: Some(self.enabled),
-            primary: self.primary.config().cloned(),
-            fallback: self.fallback.config().cloned(),
-            connect_timeout: self.connect_timeout,
-            connect_timeout_from_env: self.connect_timeout_source == SettingSource::Env,
-            daily_quota: self.daily_quota,
-            daily_quota_from_env: self.daily_quota_source == SettingSource::Env,
-            ignored_env: self.ignored_env.clone(),
-        }
-    }
 }
 
 /// Собрать действующую конфигурацию LLM из окружения и уже прочитанных строк.
@@ -511,7 +493,6 @@ pub fn effective_llm(
         daily_quota: resolved.daily_quota,
         daily_quota_source: resolved.daily_quota_source,
         settings,
-        ignored_env: env.ignored_env.clone(),
     }
 }
 
@@ -630,8 +611,9 @@ pub enum RotationError {
 
 /// Перешифровать все секреты текущим ключом в одной транзакции.
 ///
-/// Строки читаются с `FOR UPDATE`, поэтому сервис не запишет секрет прежним
-/// ключом мимо перешифровки. Строки, уже зашифрованные текущим ключом, не
+/// Строки читаются с `FOR UPDATE`: блокировка исключает конкурентную запись той
+/// же строки во время перешифровки (сервис всегда шифрует текущим ключом).
+/// Строки, уже зашифрованные текущим ключом, не
 /// меняются (в том числе `updated_at`), но всё равно расшифровываются: так
 /// подменённый тег обнаруживается и без смены id ключа. Контекст строки
 /// строится из её собственных `scope`, `household_id` и `key`, поэтому

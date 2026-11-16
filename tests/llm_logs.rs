@@ -14,7 +14,7 @@ use chrono::Utc;
 use sqlx::Row;
 use tasklerq::capture::prompt::PROMPT_VERSION;
 use tasklerq::domain::models::{CaptureMode, CaptureSource};
-use tasklerq::llm::{Attempt, Chain, LlmError};
+use tasklerq::llm::{Attempt, Chain, LlmError, LlmHandle, LlmSnapshot};
 use tasklerq::security_audit::Audit;
 use tasklerq::storage::repositories::llm_runs::{self, FAILURE, NewRun, RunFields, SUCCESS};
 use tasklerq::telegram::bot::Bot;
@@ -50,10 +50,11 @@ fn llm_logs_do_not_contain_the_source_text() {
         runtime.block_on(async {
             let db = db().await;
             let id = next_telegram_id();
-            let handler = Bot::new("tasklerqbot")
-                .with_llm_capture(true)
-                .with_tenancy(tasklerq::config::TenancyMode::Multi);
             let ai = failing_chain();
+            let llm = LlmHandle::new(LlmSnapshot::from_chain(Some(ai.clone()), 200));
+            let handler = Bot::new("tasklerqbot")
+                .with_llm(llm.clone())
+                .with_tenancy(tasklerq::config::TenancyMode::Multi);
             let mut bot =
                 Harness::with_handler(&db.pool, id, Arc::new(handler.clone()), FakeTelegram::new());
             bot.text("/start").await;
@@ -63,7 +64,7 @@ fn llm_logs_do_not_contain_the_source_text() {
 
             let worker = CaptureWorker::new(
                 db.pool.clone(),
-                ai.clone(),
+                llm,
                 handler,
                 Arc::new(Notify::new()),
                 Audit::new(db.pool.clone()),

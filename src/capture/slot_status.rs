@@ -10,7 +10,7 @@
 //! статус кешируется на [`CACHE_TTL`]. Ошибка чтения базы при старте — только
 //! предупреждение, а в readiness используется прежний кеш.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
@@ -18,8 +18,8 @@ use sqlx::PgPool;
 use super::eval::TitleMatch;
 use super::prompt;
 use super::slot_check::{self, BUILTIN_SET};
-use crate::config::{LlmConfig, SlotConfig};
-use crate::llm::{Chain, FALLBACK_SLOT, PRIMARY_SLOT};
+use crate::config::SlotConfig;
+use crate::llm::{FALLBACK_SLOT, LlmHandle, LlmSnapshot, PRIMARY_SLOT};
 use crate::metrics;
 use crate::storage::repositories::llm_slot_checks::{self, StoredCheck};
 use crate::storage::repositories::llm_slot_settings;
@@ -125,8 +125,7 @@ fn known_standard(slot: &'static str, stored: &str) -> TitleMatch {
 
 /// Состояние проверки слотов для старта и readiness.
 pub struct LlmSlotHealth {
-    chain: Arc<Chain>,
-    slots: Vec<SlotEntry>,
+    llm: LlmHandle,
     contract_hash: String,
     set_hash: String,
     cache: Mutex<Option<CachedStatuses>>,
@@ -143,34 +142,18 @@ struct CachedStatuses {
 }
 
 impl LlmSlotHealth {
-    /// Собрать состояние из действующей цепочки и конфигурации.
+    /// Собрать состояние поверх снимка LLM.
     ///
-    /// `None`, если разбор выключен или основной слот не задан: тогда и
-    /// предупреждать не о чем. Цепочка передаётся снаружи, чтобы readiness
-    /// видел те же предохранители, что и рабочий разбор.
-    pub fn new(chain: Arc<Chain>, llm: &LlmConfig) -> Option<Self> {
-        if !llm.capture_enabled() {
-            return None;
-        }
-        let primary = llm.primary.clone()?;
-        let mut slots = vec![SlotEntry {
-            name: PRIMARY_SLOT,
-            config: primary,
-        }];
-        if let Some(fallback) = &llm.fallback {
-            slots.push(SlotEntry {
-                name: FALLBACK_SLOT,
-                config: fallback.clone(),
-            });
-        }
-
-        Some(Self {
-            chain,
-            slots,
+    /// Слоты и их отпечатки берутся из текущего снимка, поэтому появившийся в
+    /// консоли слот виден readiness. Снимок без цепочки или без основного слота
+    /// не даёт ни статусов, ни предупреждений: предупреждать не о чем.
+    pub fn new(llm: LlmHandle) -> Self {
+        Self {
+            llm,
             contract_hash: prompt::contract_hash(),
             set_hash: slot_check::set_hash(BUILTIN_SET),
             cache: Mutex::new(None),
-        })
+        }
     }
 
     /// Предохранители всех настроенных слотов разомкнуты.
@@ -178,8 +161,12 @@ impl LlmSlotHealth {
     /// `retry_after` не меняет состояние предохранителя, в отличие от `allow`:
     /// проверка readiness не должна сбрасывать паузу перед новой попыткой.
     pub fn all_breakers_open(&self, now: DateTime<Utc>) -> bool {
+        let snapshot = self.llm.load();
+        let Some(chain) = snapshot.chain() else {
+            return false;
+        };
         let mut configured = false;
-        for slot in [Some(self.chain.primary()), self.chain.fallback()]
+        for slot in [Some(chain.primary()), chain.fallback()]
             .into_iter()
             .flatten()
         {
@@ -204,7 +191,7 @@ impl LlmSlotHealth {
     /// Нужен, когда базу прочитать нельзя: без значения серия
     /// `llm_slot_verified{slot}` не появляется вовсе, и алерт `== 0` молчит.
     pub fn mark_unverified(&self) {
-        for entry in &self.slots {
+        for entry in self.slots() {
             metrics::llm_slot_verified(entry.name, false);
         }
     }
@@ -246,9 +233,14 @@ impl LlmSlotHealth {
         pool: &PgPool,
         now: DateTime<Utc>,
     ) -> Result<Vec<SlotStatusReport>, sqlx::Error> {
+        let snapshot = self.llm.load();
+        let slots = slots_from(&snapshot);
+        if slots.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut conn = pool.acquire().await?;
-        let mut statuses = Vec::with_capacity(self.slots.len());
-        for entry in &self.slots {
+        let mut statuses = Vec::with_capacity(slots.len());
+        for entry in &slots {
             let stored = llm_slot_settings::titles(&mut conn, entry.name).await?;
             let titles = known_standard(entry.name, &stored);
             let check = llm_slot_checks::latest(&mut conn, entry.name).await?;
@@ -278,6 +270,10 @@ impl LlmSlotHealth {
         Ok(statuses)
     }
 
+    fn slots(&self) -> Vec<SlotEntry> {
+        slots_from(&self.llm.load())
+    }
+
     fn cached(&self, now: DateTime<Utc>) -> Option<Vec<SlotStatusReport>> {
         let cache = self.lock_cache();
         let cached = cache.as_ref()?;
@@ -285,7 +281,7 @@ impl LlmSlotHealth {
     }
 
     fn unverified(&self) -> Vec<SlotStatusReport> {
-        self.slots
+        self.slots()
             .iter()
             .map(|entry| SlotStatusReport {
                 slot: entry.name,
@@ -300,6 +296,32 @@ impl LlmSlotHealth {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+/// Настроенные слоты текущего снимка.
+///
+/// Без цепочки слотов нет: даже настроенный, но неиспользуемый слот не должен
+/// попадать в readiness. При ошибке сборки цепочки тоже нечего проверять.
+fn slots_from(snapshot: &LlmSnapshot) -> Vec<SlotEntry> {
+    let Some(chain) = snapshot.chain() else {
+        return Vec::new();
+    };
+    let Some(primary) = snapshot.effective().primary().config() else {
+        return Vec::new();
+    };
+    let mut slots = vec![SlotEntry {
+        name: PRIMARY_SLOT,
+        config: primary.clone(),
+    }];
+    if chain.fallback().is_some()
+        && let Some(fallback) = snapshot.effective().fallback().config()
+    {
+        slots.push(SlotEntry {
+            name: FALLBACK_SLOT,
+            config: fallback.clone(),
+        });
+    }
+    slots
 }
 
 #[cfg(test)]

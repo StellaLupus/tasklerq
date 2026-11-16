@@ -16,6 +16,7 @@ use tasklerq::config::CaptureConfig;
 use tasklerq::domain::models::{ListKind, RecurrenceFreq};
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
+use tasklerq::llm::{LlmHandle, LlmSnapshot};
 use tasklerq::security_audit::Audit;
 use uuid::Uuid;
 
@@ -32,8 +33,10 @@ fn capture_app(pool: &PgPool, ai: Arc<support::llm::BackendDouble>) -> Router {
     build_router(
         AppState::new(pool.clone(), Audit::new(pool.clone())).with_capture(CaptureState::new(
             config,
-            Some(Arc::new(support::llm::chain(ai, None))),
-            200,
+            LlmHandle::new(LlmSnapshot::from_chain(
+                Some(Arc::new(support::llm::chain(ai, None))),
+                200,
+            )),
         )),
     )
 }

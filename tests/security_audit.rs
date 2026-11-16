@@ -21,7 +21,7 @@ use tasklerq::capture::prompt::PROMPT_VERSION;
 use tasklerq::config::{CaptureConfig, SecretString, TenancyMode};
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
-use tasklerq::llm::Chain;
+use tasklerq::llm::{Chain, LlmHandle, LlmSnapshot};
 use tasklerq::security_audit::Audit;
 use tasklerq::storage::repositories::capture_jobs::{self, NewJob};
 use tasklerq::storage::repositories::members;
@@ -284,7 +284,7 @@ async fn rate_limits_are_audited_for_webhook_and_capture() {
     config.rate_limit_per_min = 1;
     let app = build_router(
         AppState::new(db.pool.clone(), Audit::new(db.pool.clone()))
-            .with_capture(CaptureState::new(config, None, 200)),
+            .with_capture(capture_state(config, None, 200)),
     );
     let body = json!({"text": "Купить лекарство", "source": "api", "mode": "draft"});
     let (first, _) = support::request(
@@ -524,6 +524,10 @@ fn chain(answer: Value) -> Arc<Chain> {
     ))
 }
 
+fn capture_state(config: CaptureConfig, ai: Option<Arc<Chain>>, quota: u32) -> CaptureState {
+    CaptureState::new(config, LlmHandle::new(LlmSnapshot::from_chain(ai, quota)))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn llm_validation_failures_are_audited_for_api_and_telegram() {
     const LLM_RESPONSE: &str = "LLM-RESPONSE-SECRET-NAME";
@@ -535,10 +539,11 @@ async fn llm_validation_failures_are_audited_for_api_and_telegram() {
     // HTTP API: ответ модели не прошёл разбор схемы.
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
     let ai = chain(json!({"items": LLM_RESPONSE}));
-    let app = build_router(
-        AppState::new(db.pool.clone(), Audit::new(db.pool.clone()))
-            .with_capture(CaptureState::new(capture_config(), Some(ai), 200)),
-    );
+    let app =
+        build_router(
+            AppState::new(db.pool.clone(), Audit::new(db.pool.clone()))
+                .with_capture(capture_state(capture_config(), Some(ai), 200)),
+        );
     let (status, _) = support::request(
         &app,
         Method::POST,
@@ -579,7 +584,10 @@ async fn llm_validation_failures_are_audited_for_api_and_telegram() {
 
     let worker = CaptureWorker::new(
         db.pool.clone(),
-        chain(json!({"items": LLM_RESPONSE})),
+        LlmHandle::new(LlmSnapshot::from_chain(
+            Some(chain(json!({"items": LLM_RESPONSE}))),
+            200,
+        )),
         Bot::new("tasklerqbot"),
         Arc::new(Notify::new()),
         Audit::new(db.pool.clone()),
@@ -709,10 +717,11 @@ async fn no_secret_or_user_content_reaches_audit_payloads() {
 
     // Capture с ответом модели, который не прошёл валидацию.
     let ai = chain(json!({"items": LLM_RESPONSE}));
-    let app = build_router(
-        AppState::new(db.pool.clone(), Audit::new(db.pool.clone()))
-            .with_capture(CaptureState::new(capture_config(), Some(ai), 200)),
-    );
+    let app =
+        build_router(
+            AppState::new(db.pool.clone(), Audit::new(db.pool.clone()))
+                .with_capture(capture_state(capture_config(), Some(ai), 200)),
+        );
     let _ = support::request(
         &app,
         Method::POST,

@@ -17,7 +17,8 @@ use tasklerq::config::CaptureConfig;
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
 use tasklerq::llm::{
-    Chain, ChatBackend, ChatCompletion, ChatRequest, LlmError, PRIMARY_SLOT, Slot,
+    Chain, ChatBackend, ChatCompletion, ChatRequest, LlmError, LlmHandle, LlmSnapshot,
+    PRIMARY_SLOT, Slot,
 };
 use tasklerq::security_audit::Audit;
 use tokio::sync::Notify;
@@ -151,8 +152,10 @@ fn app_with(
 
 fn app_chain(pool: &PgPool, llm: Option<Arc<Chain>>, config: CaptureConfig, quota: u32) -> Router {
     build_router(
-        AppState::new(pool.clone(), Audit::new(pool.clone()))
-            .with_capture(CaptureState::new(config, llm, quota)),
+        AppState::new(pool.clone(), Audit::new(pool.clone())).with_capture(CaptureState::new(
+            config,
+            LlmHandle::new(LlmSnapshot::from_chain(llm, quota)),
+        )),
     )
 }
 
