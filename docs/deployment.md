@@ -1022,8 +1022,8 @@ OpenAI-совместимому API основного и резервного �
    считается сравнением текущего отпечатка с сохранённым:
 
    - «не проверен» — записи в `llm_slot_checks` нет;
-   - «устарел» — отпечаток другой (изменились модель, адрес, контракт, набор,
-     таймаут или стандарт);
+   - «устарел» — отпечаток другой (изменились модель, хост адреса с портом,
+     контракт, набор, таймаут или стандарт);
    - «прошёл» — отпечаток совпал, пройдены все фразы;
    - «не прошёл» — отпечаток совпал, пройдены не все фразы; отчёт показывает,
      сколько и какие.
@@ -1100,7 +1100,9 @@ curl -fsS http://127.0.0.1:18080/health/ready
 Адрес, модель и токен в предупреждения не попадают. Статус слотов
 перечитывается из `llm_slot_checks` не чаще раза в минуту, чтобы скрейп не
 опрашивал базу на
-каждый запрос.
+каждый запрос. Кеш привязан к версии снимка LLM: после сохранения настроек
+статусы пересчитываются на следующем запросе readiness, не дожидаясь минуты,
+поэтому смена модели сразу даёт «устарел» и `llm_slot_unverified`.
 
 Метрики — `GET /metrics` в формате Prometheus exposition 0.0.4. Эндпоинт не
 публичный: нужен Bearer-токен со scope `metrics:read` (токен в query не
@@ -1132,7 +1134,10 @@ curl -fsS \
 - `llm_requests_total{slot,status}` — вызовы слотов LLM;
 - `llm_latency_seconds{slot}` (гистограмма) — длительность вызова слота;
 - `llm_slot_verified{slot}` — `1`, если слот прошёл проверку
-  `capture-eval --slot`, иначе `0`;
+  `capture-eval --slot`, иначе `0`; после смены снимка LLM статус и серия
+  пересчитываются на следующем пересчёте статусов (запрос readiness), и тогда же
+  исчезает серия слота, которого нет в текущем снимке, — а не в момент
+  сохранения настроек;
 - `llm_validation_failures_total`;
 - `http_requests_total{route,status}` — `route` — шаблон маршрута, а не сырой
   путь;
@@ -1289,7 +1294,7 @@ PostgreSQL, Home Assistant). Инфраструктурные пункты 15.2 
 | Rate limits | Не больше 5 приглашений в час на household, с временем повтора | `tests/identity_households.rs::at_most_five_invites_per_hour_including_revoked_ones`; `tests/telegram_screens.rs::sixth_invite_within_an_hour_is_refused_with_retry_time` | пройдено |
 | Rate limits | Не больше 120 webhook-запросов в секунду на IP; лишние → `429` с `Retry-After`, остальные обрабатываются | `tests/telegram_webhook.rs::the_121st_request_from_one_ip_is_rejected_and_not_queued` | пройдено |
 | Rate limits | `429` API всегда содержит `Retry-After` | `src/http/error.rs` (`with_retry_after`); `tests/capture_api.rs::the_eleventh_capture_in_a_minute_is_rate_limited_per_token` | пройдено |
-| Rate limits | Суточная квота LLM по умолчанию 200 и настраивается | `src/config/mod.rs::LLM_DAILY_QUOTA` (200), `src/telegram/capture_worker.rs::DEFAULT_DAILY_QUOTA`; `src/config/tests.rs::defaults_match_documented_values`; `tests/telegram_capture.rs::daily_quota_stops_parsing_and_opens_the_manual_form` | пройдено |
+| Rate limits | Суточная квота LLM по умолчанию 200 и настраивается | `src/config/mod.rs::DEFAULT_DAILY_QUOTA` (200); `src/config/tests.rs::defaults_match_documented_values`; `tests/telegram_capture.rs::daily_quota_stops_parsing_and_opens_the_manual_form` | пройдено |
 | Rate limits | Действия по callback ограничены лимитом пользователя: сверх лимита нажатие сразу получает пустой ответ и выполняется после освобождения слота; сверх очереди отложенных отбрасывается, нажатие получает пустой ответ | `tests/telegram_queue.rs::the_twenty_first_callback_is_answered_immediately_and_runs_after_the_slot_frees`, `a_callback_over_the_deferred_queue_limit_is_dropped_with_an_empty_answer`, `a_repeatedly_deferred_callback_is_answered_once` | пройдено |
 | Rate limits | Превышения лимитов пишутся в аудит | `tests/security_audit.rs::rate_limits_are_audited_for_webhook_and_capture`, `the_telegram_update_limit_is_audited`, `the_invite_limit_is_audited` | пройдено |
 
@@ -1688,8 +1693,8 @@ proxy, проверка слотов LLM, backup), остаются в 15.2 и �
    фактическим временем в отчёте, `2` — ошибка конфигурации, слота, набора или
    базы. `--slot fallback` выполняйте, только если резервный слот задан.
    Результат пишется в `llm_slot_checks`. Статус «устарел» означает, что
-   изменились модель, адрес, контракт, набор, таймаут или стандарт сравнения
-   названий: повторите проверку.
+   изменились модель, хост адреса, контракт, набор, таймаут или стандарт
+   сравнения названий: повторите проверку.
    Статус «не прошёл» показывает, сколько фраз пройдено и почему упали
    остальные. В `llm_slot_verified{slot}` тогда `0`, а в `/health/ready` —
    `llm_slot_unverified:<slot>` (с режимом, если проверка сохранена); на
