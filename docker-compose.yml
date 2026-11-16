@@ -34,6 +34,7 @@ services:
         condition: service_healthy
     ports:
       - "127.0.0.1:18080:8080"
+      - "127.0.0.1:18081:8081"
     read_only: true
     tmpfs:
       - /tmp

@@ -21,7 +21,7 @@
   с именем параметра без значения; `Debug` скрывает ключи. В
   `tests/secret_redaction.rs` — ключи не попадают в стартовый лог (spec
   deployment-operations «Конфигурация через окружение», design, решение 7).
-- [ ] 1.3 Обновить `.env.example` (убрать `LLM_CAPTURE_ENABLED` и параметры
+- [x] 1.3 Обновить `.env.example` (убрать `LLM_CAPTURE_ENABLED` и параметры
   слотов из активных строк — оставить закомментированными как альтернативу
   консоли; добавить `TASKLERQ_SECRET_KEY`, `ADMIN_BIND_ADDR`,
   `ADMIN_TRUSTED_PROXIES`), dev-`docker-compose.yml` (строка

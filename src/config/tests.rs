@@ -1328,3 +1328,37 @@ fn telegram_api_base_url_allows_http_only_in_development() {
     let loaded = config(vars).expect("https is always allowed");
     assert_eq!(loaded.telegram.api_base_url.expect("url").scheme(), "https");
 }
+
+/// Активные строки `.env.example`: без комментариев и пустых строк.
+fn env_example_active_vars() -> Vec<(String, String)> {
+    include_str!("../../.env.example")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let (key, value) = line
+                .split_once('=')
+                .expect("an active .env.example line contains `=`");
+            (key.trim().to_owned(), value.trim().to_owned())
+        })
+        .collect()
+}
+
+#[test]
+fn env_example_leaves_every_llm_field_to_the_console() {
+    // Чистый `.env.example` не задаёт ни одного поля LLM: страница LLM в
+    // консоли остаётся редактируемой, а ключи шифрования не заданы.
+    let config =
+        Config::from_map(env_example_active_vars()).expect(".env.example should be a valid config");
+
+    assert_eq!(config.llm.enabled, None);
+    assert!(config.llm.primary.is_none());
+    assert!(config.llm.fallback.is_none());
+    assert!(
+        config.llm.ignored_env.is_empty(),
+        "no slot variable may be active: {:?}",
+        config.llm.ignored_env
+    );
+    assert!(config.secret_key.is_none());
+    assert!(config.secret_key_old.is_none());
+}
