@@ -15,8 +15,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 
-use super::Chain;
-use crate::config::{DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_DAILY_QUOTA, LlmConfig};
+use super::{Chain, FALLBACK_SLOT, PRIMARY_SLOT};
+use crate::capture::breaker::CircuitBreaker;
+use crate::capture::eval::TitleMatch;
+use crate::capture::prompt;
+use crate::capture::slot_check::{self, BUILTIN_SET};
+use crate::config::{DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_DAILY_QUOTA, LlmConfig, SlotConfig};
+use crate::llm::LlmError;
 use crate::settings::crypto::SecretCipher;
 use crate::settings::{self, EffectiveLlm};
 
@@ -52,6 +57,31 @@ impl LlmSnapshot {
             chain,
             quota,
         }
+    }
+
+    /// Собрать снимок, перенося предохранители слотов с неизменным отпечатком.
+    ///
+    /// Слот строится из новой конфигурации (новый токен применяется сразу), но
+    /// если его отпечаток совпадает с прежним, сохраняется состояние
+    /// предохранителя: смена одной квоты не сбрасывает разомкнутый слот. Новый
+    /// или изменённый слот начинает с замкнутым предохранителем. Ошибка сборки
+    /// цепочки возвращается вызывающему: при сборке из сохранённых настроек
+    /// транзакция тогда откатывается, а снимок не меняется.
+    pub fn rebuild(effective: EffectiveLlm, previous: &Self) -> Result<Self, LlmError> {
+        let chain = Chain::from_effective_with(&effective, |name, config| {
+            match previous_slot(previous, name) {
+                Some((previous_config, breaker))
+                    if slot_fingerprint(previous_config) == slot_fingerprint(config) =>
+                {
+                    breaker
+                }
+                _ => Arc::new(CircuitBreaker::default()),
+            }
+        })?;
+        Ok(Self::from_effective_and_chain(
+            effective,
+            chain.map(Arc::new),
+        ))
     }
 
     /// Снимок с готовой цепочкой и квотой без настроек консоли.
@@ -98,6 +128,38 @@ fn build_chain(effective: &EffectiveLlm) -> Option<Arc<Chain>> {
             None
         }
     }
+}
+
+/// Слот прежней цепочки: конфигурация из действующего снимка и предохранитель.
+fn previous_slot<'a>(
+    snapshot: &'a LlmSnapshot,
+    name: &'static str,
+) -> Option<(&'a SlotConfig, Arc<CircuitBreaker>)> {
+    let chain = snapshot.chain()?;
+    match name {
+        PRIMARY_SLOT => {
+            let config = snapshot.effective().primary().config()?;
+            Some((config, chain.primary().breaker_handle()))
+        }
+        FALLBACK_SLOT => {
+            let config = snapshot.effective().fallback().config()?;
+            chain.fallback().map(|slot| (config, slot.breaker_handle()))
+        }
+        _ => None,
+    }
+}
+
+/// Отпечаток слота для переноса предохранителя между цепочками.
+///
+/// Части те же, что у проверки слота: модель, хост, таймаут, контракт и набор;
+/// токен и квота не входят. Стандарт сравнения названий не хранится в
+/// конфигурации слота, поэтому здесь он постоянен и одинаков для старой и новой
+/// цепочки — на равенство отпечатков он не влияет.
+fn slot_fingerprint(config: &SlotConfig) -> String {
+    static HASHES: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+    let (contract, set) =
+        HASHES.get_or_init(|| (prompt::contract_hash(), slot_check::set_hash(BUILTIN_SET)));
+    slot_check::fingerprint(config, contract, set, TitleMatch::Strict).value
 }
 
 /// Пустая действующая конфигурация с заданной квотой.
@@ -201,6 +263,22 @@ mod tests {
         settings::effective_llm(&env, &[], &SecretCipher::new(None, None))
     }
 
+    fn effective_with(quota: u32, model: &str) -> EffectiveLlm {
+        let mut primary = slot();
+        primary.model = model.to_owned();
+        let env = LlmConfig {
+            enabled: Some(true),
+            primary: Some(primary),
+            fallback: None,
+            connect_timeout: Duration::from_millis(1_000),
+            connect_timeout_from_env: true,
+            daily_quota: quota,
+            daily_quota_from_env: true,
+            ignored_env: Vec::new(),
+        };
+        settings::effective_llm(&env, &[], &SecretCipher::new(None, None))
+    }
+
     #[test]
     fn disabled_capture_builds_no_chain() {
         let snapshot = LlmSnapshot::from_effective(effective(false, Some(slot())));
@@ -269,6 +347,60 @@ mod tests {
         let handle = LlmHandle::new(LlmSnapshot::from_chain(Some(chain.clone()), 50));
         assert!(Arc::ptr_eq(handle.load().chain().expect("chain"), &chain));
         assert_eq!(handle.load().quota(), 50);
+    }
+
+    #[test]
+    fn a_quota_change_keeps_the_open_breaker_of_an_unchanged_slot() {
+        let first = LlmSnapshot::from_effective(effective_with(200, "local/model"));
+        let now = chrono::Utc::now();
+        let chain = first.chain().expect("configured slot builds a chain");
+        for _ in 0..crate::capture::breaker::DEFAULT_THRESHOLD {
+            chain.primary().breaker().record_failure(now);
+        }
+
+        let rebuilt =
+            LlmSnapshot::rebuild(effective_with(300, "local/model"), &first).expect("rebuild");
+
+        assert_eq!(rebuilt.quota(), 300);
+        let chain = rebuilt.chain().expect("chain");
+        assert!(
+            chain.primary().breaker().retry_after(now).is_some(),
+            "a quota change must not close the breaker of the same slot"
+        );
+    }
+
+    #[test]
+    fn a_model_change_starts_with_a_closed_breaker() {
+        let first = LlmSnapshot::from_effective(effective_with(200, "local/model"));
+        let now = chrono::Utc::now();
+        let chain = first.chain().expect("configured slot builds a chain");
+        for _ in 0..crate::capture::breaker::DEFAULT_THRESHOLD {
+            chain.primary().breaker().record_failure(now);
+        }
+
+        let rebuilt =
+            LlmSnapshot::rebuild(effective_with(200, "local/other"), &first).expect("rebuild");
+
+        let chain = rebuilt.chain().expect("chain");
+        assert!(
+            chain.primary().breaker().retry_after(now).is_none(),
+            "a changed slot must start with a closed breaker"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_slot_shares_the_breaker_with_the_previous_chain() {
+        let first = LlmSnapshot::from_effective(effective_with(200, "local/model"));
+        let before = first.chain().expect("chain").primary().breaker_handle();
+
+        let rebuilt =
+            LlmSnapshot::rebuild(effective_with(300, "local/model"), &first).expect("rebuild");
+
+        let after = rebuilt.chain().expect("chain").primary().breaker_handle();
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "a failed parse started on the old chain must count on the new one"
+        );
     }
 
     struct UnusedBackend;

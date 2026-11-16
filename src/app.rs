@@ -13,7 +13,7 @@ use crate::config::{Config, TelegramMode, TenancyMode};
 use crate::http::api::capture::CaptureState;
 use crate::http::router::{AppState, build_router};
 use crate::jobs::retention::RetentionWorker;
-use crate::llm::{LlmHandle, LlmSnapshot};
+use crate::llm::{LlmHandle, LlmSettings, LlmSnapshot};
 use crate::security_audit::Audit;
 use crate::settings;
 use crate::settings::crypto::SecretCipher;
@@ -26,6 +26,9 @@ pub struct Application {
     pub router: Router,
     /// Фоновые задачи: Telegram (в режиме `disabled` их нет) и retention.
     pub workers: Vec<JoinHandle<()>>,
+    /// Применение сохранённых настроек LLM к снимку без перезапуска: вход
+    /// будущей консоли администратора и тестов.
+    pub llm_settings: LlmSettings,
 }
 
 /// Собрать состояние и роутер так же, как это делает `serve()`.
@@ -59,6 +62,12 @@ pub async fn build_application_with_update_limit(
     warn_if_stored_secrets_unreadable(&pool, &secret_cipher).await;
 
     let llm = build_llm_handle(&pool, config, &secret_cipher).await;
+    let llm_settings = LlmSettings::new(
+        pool.clone(),
+        config.llm.clone(),
+        secret_cipher.clone(),
+        llm.clone(),
+    );
     let llm_slots = std::sync::Arc::new(LlmSlotHealth::new(llm.clone()));
     warn_if_llm_slots_unverified(&llm_slots, &pool).await;
 
@@ -99,6 +108,7 @@ pub async fn build_application_with_update_limit(
     Ok(Application {
         router: build_router(state),
         workers,
+        llm_settings,
     })
 }
 
