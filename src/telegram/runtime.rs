@@ -177,11 +177,12 @@ mod tests {
     #[test]
     fn disabled_llm_capture_builds_no_chain() {
         let llm = LlmConfig {
-            enabled: false,
+            enabled: Some(false),
             primary: Some(slot()),
             fallback: None,
             connect_timeout: Duration::from_millis(1000),
             daily_quota: 200,
+            ignored_env: Vec::new(),
         };
         assert!(build_llm(&llm).is_none());
     }
@@ -189,11 +190,12 @@ mod tests {
     #[test]
     fn configured_slots_build_a_chain() {
         let llm = LlmConfig {
-            enabled: true,
+            enabled: Some(true),
             primary: Some(slot()),
             fallback: Some(slot()),
             connect_timeout: Duration::from_millis(1000),
             daily_quota: 200,
+            ignored_env: Vec::new(),
         };
 
         let chain = build_llm(&llm).expect("configured slots build a chain");

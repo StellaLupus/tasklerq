@@ -149,7 +149,7 @@ impl LlmSlotHealth {
     /// предупреждать не о чем. Цепочка передаётся снаружи, чтобы readiness
     /// видел те же предохранители, что и рабочий разбор.
     pub fn new(chain: Arc<Chain>, llm: &LlmConfig) -> Option<Self> {
-        if !llm.enabled {
+        if llm.enabled != Some(true) {
             return None;
         }
         let primary = llm.primary.clone()?;

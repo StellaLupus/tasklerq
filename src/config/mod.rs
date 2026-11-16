@@ -4,6 +4,7 @@
 //! сообщения об ошибках: [`SecretString`] печатает `<redacted>`.
 
 mod env_source;
+mod network;
 #[cfg(test)]
 mod tests;
 
@@ -11,12 +12,16 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use thiserror::Error;
 use url::Url;
 
 use crate::VERSION;
+
+pub use network::IpNet;
 
 /// Минимум `RETENTION_AUDIT_DAYS`: журнал владельца обещает 90 дней.
 const MIN_AUDIT_DAYS: u32 = 90;
@@ -153,6 +158,47 @@ impl fmt::Display for SecretString {
         formatter.write_str("<redacted>")
     }
 }
+
+/// Ключ шифрования настроек: ровно 32 байта после base64-декодирования.
+///
+/// `Debug` и `Display` не показывают ни base64, ни байты: в стартовом логе
+/// [`Config`] от ключа остаётся только признак «задан».
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretKey([u8; 32]);
+
+impl SecretKey {
+    /// Разобрать значение из `TASKLERQ_SECRET_KEY`: стандартный base64.
+    ///
+    /// Причина ошибки не повторяет значение: это ключ шифрования.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let bytes = BASE64
+            .decode(raw)
+            .map_err(|_| SECRET_KEY_FORMAT.to_owned())?;
+        let bytes: [u8; 32] = bytes.try_into().map_err(|_| SECRET_KEY_FORMAT.to_owned())?;
+        Ok(Self(bytes))
+    }
+
+    /// Байты ключа для шифрования и расшифровки, не для журналирования.
+    pub const fn expose(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+impl fmt::Display for SecretKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+/// Ожидаемый формат ключа шифрования без значения.
+const SECRET_KEY_FORMAT: &str =
+    "expected base64-encoded 32 bytes, for example the output of `openssl rand -base64 32`";
 
 /// Адрес для журнала и `Debug`: без учётных данных, query и fragment.
 ///
@@ -332,9 +378,11 @@ impl fmt::Debug for SlotConfig {
 /// Параметры LLM-capture: слоты, таймаут соединения и квота.
 #[derive(Clone, Debug)]
 pub struct LlmConfig {
-    /// Включён ли разбор текста.
-    pub enabled: bool,
-    /// Основной слот; обязателен при включённом разборе.
+    /// Явно заданный `LLM_CAPTURE_ENABLED`: `Some(..)` только если переменная
+    /// есть в окружении. `None` — флаг не задан и берётся из настроек консоли
+    /// (до 2.3 — выключен).
+    pub enabled: Option<bool>,
+    /// Основной слот; обязателен при явном `LLM_CAPTURE_ENABLED=true`.
     pub primary: Option<SlotConfig>,
     /// Резервный слот; настраивается целиком или отсутствует.
     pub fallback: Option<SlotConfig>,
@@ -342,6 +390,9 @@ pub struct LlmConfig {
     pub connect_timeout: Duration,
     /// Суточная квота разборов на household.
     pub daily_quota: u32,
+    /// Переменные слотов, заданные без `*_URL` и `*_MODEL`: они игнорируются,
+    /// значения не разбирались. Печатаются предупреждением в стартовом логе.
+    pub ignored_env: Vec<&'static str>,
 }
 
 impl LlmConfig {
@@ -386,12 +437,21 @@ pub struct RetentionConfig {
 /// Полная конфигурация сервиса.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Окружение.
+    /// Окружение; по умолчанию `production`.
     pub env: Environment,
     /// Адрес HTTP-сервера.
     pub bind_addr: SocketAddr,
-    /// Публичный базовый URL.
-    pub public_base_url: Url,
+    /// Публичный базовый URL; сейчас в рантайме не используется.
+    pub public_base_url: Option<Url>,
+    /// Адрес listener консоли; `None` — консоль выключена
+    /// (`ADMIN_BIND_ADDR=disabled`).
+    pub admin_bind_addr: Option<SocketAddr>,
+    /// Сети, от которых консоль принимает `X-Forwarded-*`; пусто — ни от кого.
+    pub admin_trusted_proxies: Vec<IpNet>,
+    /// Ключ шифрования настроек; `None` — секреты в базе недоступны.
+    pub secret_key: Option<SecretKey>,
+    /// Прежний ключ шифрования для чтения после ротации.
+    pub secret_key_old: Option<SecretKey>,
     /// PostgreSQL.
     pub database: DatabaseConfig,
     /// Telegram.
@@ -435,9 +495,9 @@ impl Config {
     }
 
     fn from_source(source: &EnvSource) -> Result<Self, ConfigError> {
-        let environment = Environment::parse(source.required("ENV")?)?;
-        let public_base_url =
-            source.required_url("PUBLIC_BASE_URL", environment.is_production())?;
+        // Безопасное умолчание: HTTPS-адреса и запрет polling.
+        let environment = Environment::parse(source.get("ENV").unwrap_or("production"))?;
+        let public_base_url = source.url("PUBLIC_BASE_URL", environment.is_production())?;
         let database = DatabaseConfig::from_source(source)?;
 
         let bind_addr = source
@@ -447,6 +507,38 @@ impl Config {
             .map_err(|_| {
                 ConfigError::invalid("BIND_ADDR", "expected an address like 0.0.0.0:8080")
             })?;
+
+        let admin_bind_addr = match source.get("ADMIN_BIND_ADDR") {
+            None => Some(
+                "0.0.0.0:8081"
+                    .parse()
+                    .expect("default admin bind address is valid"),
+            ),
+            Some("disabled") => None,
+            Some(raw) => Some(raw.parse::<SocketAddr>().map_err(|_| {
+                ConfigError::invalid(
+                    "ADMIN_BIND_ADDR",
+                    "expected an address like 0.0.0.0:8081 or `disabled`",
+                )
+            })?),
+        };
+
+        let admin_trusted_proxies = match source.get("ADMIN_TRUSTED_PROXIES") {
+            None => Vec::new(),
+            Some(raw) => raw
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(IpNet::parse)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|reason| ConfigError::invalid("ADMIN_TRUSTED_PROXIES", reason))?,
+        };
+
+        let secret_key = read_secret_key(source.get("TASKLERQ_SECRET_KEY"), "TASKLERQ_SECRET_KEY")?;
+        let secret_key_old = read_secret_key(
+            source.get("TASKLERQ_SECRET_KEY_OLD"),
+            "TASKLERQ_SECRET_KEY_OLD",
+        )?;
 
         let telegram_mode = TelegramMode::parse(source.get("TELEGRAM_MODE").unwrap_or("webhook"))?;
         let telegram = Self::telegram_config(source, telegram_mode, environment)?;
@@ -486,6 +578,10 @@ impl Config {
             env: environment,
             bind_addr,
             public_base_url,
+            admin_bind_addr,
+            admin_trusted_proxies,
+            secret_key,
+            secret_key_old,
             database,
             telegram,
             tenancy,
@@ -599,11 +695,11 @@ impl Config {
     }
 
     fn llm_config(source: &EnvSource) -> Result<LlmConfig, ConfigError> {
-        let enabled = source.bool("LLM_CAPTURE_ENABLED", true)?;
+        let enabled = source.optional_bool("LLM_CAPTURE_ENABLED")?;
         let primary = read_slot(source, &PRIMARY_SLOT)?;
         let fallback = read_slot(source, &FALLBACK_SLOT)?;
 
-        if enabled && primary.is_none() {
+        if enabled == Some(true) && primary.is_none() {
             // Наполовину заданный слот уже дал бы ошибку с именем недостающей
             // переменной, значит здесь не задано ничего.
             return Err(ConfigError::Missing {
@@ -611,13 +707,23 @@ impl Config {
             });
         }
 
-        let connect_timeout = Duration::from_millis(u64::from(source.u32(
-            "LLM_CONNECT_TIMEOUT_MS",
-            1_000,
-            10,
-            60_000,
-        )?));
-        let daily_quota = source.u32("LLM_DAILY_QUOTA", 200, 1, 100_000)?;
+        // Прочие переменные слота без адреса и модели не читаются: невалидный
+        // `*_TIMEOUT_MS` не должен ронять запуск.
+        let mut ignored_env = Vec::new();
+        for (env, slot) in [(&PRIMARY_SLOT, &primary), (&FALLBACK_SLOT, &fallback)] {
+            if slot.is_none() {
+                ignored_env.extend(ignored_slot_env(source, env));
+            }
+        }
+
+        let connect_timeout = match source.get("LLM_CONNECT_TIMEOUT_MS") {
+            None => Duration::from_millis(u64::from(DEFAULT_CONNECT_TIMEOUT_MS)),
+            Some(raw) => named("LLM_CONNECT_TIMEOUT_MS", parse_connect_timeout_ms(raw))?,
+        };
+        let daily_quota = match source.get("LLM_DAILY_QUOTA") {
+            None => DEFAULT_DAILY_QUOTA,
+            Some(raw) => named("LLM_DAILY_QUOTA", parse_daily_quota(raw))?,
+        };
 
         Ok(LlmConfig {
             enabled,
@@ -625,6 +731,7 @@ impl Config {
             fallback,
             connect_timeout,
             daily_quota,
+            ignored_env,
         })
     }
 
@@ -639,6 +746,12 @@ impl Config {
             tracing::warn!(
                 variable = *name,
                 "environment variable is no longer used and can be removed"
+            );
+        }
+        for name in &self.llm.ignored_env {
+            tracing::warn!(
+                variable = *name,
+                "LLM slot environment variable is ignored: the slot URL and model are not set"
             );
         }
         tracing::info!(
@@ -677,17 +790,38 @@ const FALLBACK_SLOT: SlotEnv = SlotEnv {
 /// Таймаут запроса слота по умолчанию, миллисекунды.
 const DEFAULT_SLOT_TIMEOUT_MS: u32 = 10_000;
 
+/// Границы таймаута запроса слота, миллисекунды.
+const SLOT_TIMEOUT_MS_MIN: u32 = 100;
+const SLOT_TIMEOUT_MS_MAX: u32 = 600_000;
+
+/// Границы таймаута установки соединения, миллисекунды.
+const CONNECT_TIMEOUT_MS_MIN: u32 = 10;
+const CONNECT_TIMEOUT_MS_MAX: u32 = 60_000;
+const DEFAULT_CONNECT_TIMEOUT_MS: u32 = 1_000;
+
+/// Умолчание суточной квоты разборов.
+const DEFAULT_DAILY_QUOTA: u32 = 200;
+const DAILY_QUOTA_MIN: u32 = 1;
+const DAILY_QUOTA_MAX: u32 = 100_000;
+
 /// Переменные Home Assistant, которые больше не читаются.
 const LEGACY_ENV: [&str; 3] = ["HA_BASE_URL", "HA_TOKEN", "HA_AI_TASK_ENTITY_ID"];
 
 /// Прочитать слот: адрес и модель задаются только вместе.
 ///
+/// Слот считается заданным окружением, только если задан его адрес или модель.
 /// Резервный слот настраивается целиком или отсутствует, поэтому половина
 /// пары — ошибка запуска с именем недостающей переменной. Основной слот при
-/// выключенном разборе не обязателен, но заданный так же проверяется.
+/// выключенном или незаданном разборе не обязателен, но заданный так же
+/// проверяется.
 fn read_slot(source: &EnvSource, env: &SlotEnv) -> Result<Option<SlotConfig>, ConfigError> {
-    let url = source.url(env.url, false)?;
-    let model = source.get(env.model).map(ToOwned::to_owned);
+    // Адрес разбирается до проверки пары: невалидный URL с недостающей моделью
+    // и раньше давал ошибку адреса.
+    let url = match source.get(env.url) {
+        Some(raw) => Some(named(env.url, parse_slot_url(raw))?),
+        None => None,
+    };
+    let model = source.get(env.model);
 
     match (url, model) {
         (None, None) => Ok(None),
@@ -695,35 +829,86 @@ fn read_slot(source: &EnvSource, env: &SlotEnv) -> Result<Option<SlotConfig>, Co
         (Some(_), None) => Err(ConfigError::Missing { name: env.model }),
         (Some(url), Some(model)) => Ok(Some(SlotConfig {
             url,
-            model,
+            model: model.to_owned(),
             token: source.secret(env.token),
-            timeout: Duration::from_millis(u64::from(source.u32(
-                env.timeout_ms,
-                DEFAULT_SLOT_TIMEOUT_MS,
-                100,
-                600_000,
-            )?)),
-            extra: extra_params(source, env.extra_json)?,
+            timeout: match source.get(env.timeout_ms) {
+                Some(raw) => named(env.timeout_ms, parse_slot_timeout_ms(raw))?,
+                None => Duration::from_millis(u64::from(DEFAULT_SLOT_TIMEOUT_MS)),
+            },
+            extra: match source.get(env.extra_json) {
+                Some(raw) => named(env.extra_json, parse_extra_json(raw))?,
+                None => Map::new(),
+            },
         })),
     }
 }
 
+/// Переменные слота, заданные без адреса и модели: их значения не читаются.
+fn ignored_slot_env(source: &EnvSource, env: &SlotEnv) -> Vec<&'static str> {
+    [env.token, env.timeout_ms, env.extra_json]
+        .into_iter()
+        .filter(|name| source.get(name).is_some())
+        .collect()
+}
+
+/// Обернуть причину разбора в ошибку с именем параметра.
+fn named<T>(name: &'static str, parsed: Result<T, String>) -> Result<T, ConfigError> {
+    parsed.map_err(|reason| ConfigError::invalid(name, reason))
+}
+
+fn read_secret_key(
+    raw: Option<&str>,
+    name: &'static str,
+) -> Result<Option<SecretKey>, ConfigError> {
+    raw.map(|raw| named(name, SecretKey::parse(raw)))
+        .transpose()
+}
+
+/// Разобрать адрес слота LLM: правила прежние, причина без значения.
+///
+/// Используется и `from_env`, и валидацией полей консоли (6.3).
+pub fn parse_slot_url(raw: &str) -> Result<Url, String> {
+    env_source::parse_url_reason(raw, false).map_err(str::to_owned)
+}
+
+/// Разобрать `LLM_*_TIMEOUT_MS` / значение поля консоли: границы прежние.
+pub fn parse_slot_timeout_ms(raw: &str) -> Result<Duration, String> {
+    bounded_u32(raw, SLOT_TIMEOUT_MS_MIN, SLOT_TIMEOUT_MS_MAX)
+        .map(|value| Duration::from_millis(u64::from(value)))
+}
+
+/// Разобрать `LLM_CONNECT_TIMEOUT_MS` / значение поля консоли.
+pub fn parse_connect_timeout_ms(raw: &str) -> Result<Duration, String> {
+    bounded_u32(raw, CONNECT_TIMEOUT_MS_MIN, CONNECT_TIMEOUT_MS_MAX)
+        .map(|value| Duration::from_millis(u64::from(value)))
+}
+
+/// Разобрать `LLM_DAILY_QUOTA` / значение поля консоли.
+pub fn parse_daily_quota(raw: &str) -> Result<u32, String> {
+    bounded_u32(raw, DAILY_QUOTA_MIN, DAILY_QUOTA_MAX)
+}
+
 /// Разобрать `LLM_*_EXTRA_JSON`: принимается только JSON-объект.
 ///
-/// Текст ошибки называет переменную, но не повторяет её значение: в параметрах
-/// слота могут быть ключи провайдера.
-fn extra_params(source: &EnvSource, name: &'static str) -> Result<Map<String, Value>, ConfigError> {
-    let Some(raw) = source.get(name) else {
-        return Ok(Map::new());
-    };
-
+/// Текст ошибки не повторяет значение: в параметрах слота могут быть ключи
+/// провайдера.
+pub fn parse_extra_json(raw: &str) -> Result<Map<String, Value>, String> {
     match serde_json::from_str::<Value>(raw) {
         Ok(Value::Object(extra)) => Ok(extra),
-        _ => Err(ConfigError::invalid(
-            name,
-            "expected a JSON object, for example {\"reasoning\":{\"effort\":\"minimal\"}}",
-        )),
+        _ => Err(
+            "expected a JSON object, for example {\"reasoning\":{\"effort\":\"minimal\"}}"
+                .to_owned(),
+        ),
     }
+}
+
+fn bounded_u32(raw: &str, min: u32, max: u32) -> Result<u32, String> {
+    let reason = || format!("expected an integer in range {min}..={max}");
+    let value = raw.parse::<u32>().map_err(|_| reason())?;
+    if !(min..=max).contains(&value) {
+        return Err(reason());
+    }
+    Ok(value)
 }
 
 /// Список заданных переменных, которые сервис больше не читает.

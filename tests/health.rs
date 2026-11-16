@@ -80,11 +80,12 @@ fn llm_health(
     };
     let chain = Arc::new(support::llm::chain(answer(), fallback.map(|_| answer())));
     let llm = LlmConfig {
-        enabled: true,
+        enabled: Some(true),
         primary: Some(primary.clone()),
         fallback: fallback.cloned(),
         connect_timeout: StdDuration::from_millis(1_000),
         daily_quota: 200,
+        ignored_env: Vec::new(),
     };
     let health = Arc::new(LlmSlotHealth::new(chain.clone(), &llm).expect("llm health"));
     (chain, health)

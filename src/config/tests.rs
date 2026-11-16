@@ -85,7 +85,7 @@ fn minimal_development_config_is_valid() {
     assert_eq!(config.telegram.mode, TelegramMode::Disabled);
     assert_eq!(config.database.max_connections, 10);
     assert!(config.capture.enabled);
-    assert!(!config.llm.enabled);
+    assert_eq!(config.llm.enabled, Some(false));
     assert_eq!(config.retention.events_days, 365);
     assert_eq!(config.log_filter, DEFAULT_LOG_FILTER);
 }
@@ -110,7 +110,8 @@ fn defaults_match_documented_values() {
 
     assert_eq!(config.bind_addr, "0.0.0.0:8080".parse().unwrap());
     assert_eq!(config.telegram.mode, TelegramMode::Webhook);
-    assert!(config.llm.enabled);
+    // Флаг больше не имеет умолчания `true`: без переменной он не задан.
+    assert_eq!(config.llm.enabled, None);
     assert!(config.capture.enabled);
     assert_eq!(config.capture.voice_timeout_ms, 8_000);
     assert!(config.capture.voice_fallback_raw);
@@ -250,12 +251,39 @@ fn missing_database_url_fails() {
 }
 
 #[test]
-fn missing_public_base_url_fails() {
+fn public_base_url_is_optional() {
     let mut vars = base_env();
     vars.remove("PUBLIC_BASE_URL");
 
-    let error = config(vars).expect_err("PUBLIC_BASE_URL is required");
-    assert_missing(error, "PUBLIC_BASE_URL");
+    let config = config(vars).expect("PUBLIC_BASE_URL is optional");
+    assert_eq!(config.public_base_url, None);
+}
+
+#[test]
+fn minimal_production_config_without_optional_variables() {
+    // Минимальный запуск: ни `ENV`, ни `PUBLIC_BASE_URL`, ни консоли, ни
+    // ключей шифрования, ни слотов LLM.
+    let config = Config::from_map([
+        (
+            "DATABASE_URL",
+            "postgres://tasklerq:db-password@127.0.0.1:5432/tasklerq?sslmode=disable",
+        ),
+        ("TELEGRAM_MODE", "disabled"),
+    ])
+    .expect("minimal production config should be valid");
+
+    assert_eq!(config.env, Environment::Production);
+    assert_eq!(config.public_base_url, None);
+    assert_eq!(config.llm.enabled, None);
+    assert!(config.llm.primary.is_none());
+    assert!(config.llm.fallback.is_none());
+    assert_eq!(
+        config.admin_bind_addr,
+        Some("0.0.0.0:8081".parse().unwrap())
+    );
+    assert!(config.admin_trusted_proxies.is_empty());
+    assert!(config.secret_key.is_none());
+    assert!(config.secret_key_old.is_none());
 }
 
 #[test]
@@ -378,6 +406,176 @@ fn bind_addr_is_validated() {
     vars.insert("BIND_ADDR".to_owned(), "127.0.0.1:9090".to_owned());
     let config = config(vars).expect("valid bind address should be accepted");
     assert_eq!(config.bind_addr, "127.0.0.1:9090".parse().unwrap());
+}
+
+#[test]
+fn admin_bind_addr_defaults_to_8081_and_accepts_disabled() {
+    let config = config(base_env()).expect("config should be valid");
+    assert_eq!(
+        config.admin_bind_addr,
+        Some("0.0.0.0:8081".parse().unwrap())
+    );
+
+    let config = config_with(&[("ADMIN_BIND_ADDR", "127.0.0.1:9091")])
+        .expect("an explicit address is accepted");
+    assert_eq!(
+        config.admin_bind_addr,
+        Some("127.0.0.1:9091".parse().unwrap())
+    );
+
+    let config =
+        config_with(&[("ADMIN_BIND_ADDR", "disabled")]).expect("disabled turns the listener off");
+    assert_eq!(config.admin_bind_addr, None);
+}
+
+#[test]
+fn admin_bind_addr_errors_name_the_parameter_without_the_value() {
+    for raw in ["localhost:abc", "not-an-address", "127.0.0.1"] {
+        let error = config_with(&[("ADMIN_BIND_ADDR", raw)])
+            .expect_err("invalid admin bind address should be rejected");
+        let message = error.to_string();
+        assert_invalid(error, "ADMIN_BIND_ADDR");
+        assert!(
+            !message.contains(raw),
+            "error must not echo {raw}: {message}"
+        );
+        assert!(
+            message.contains("disabled"),
+            "error describes the disabled literal: {message}"
+        );
+    }
+}
+
+#[test]
+fn trusted_proxies_parse_cidr_lists() {
+    let config = config_with(&[("ADMIN_TRUSTED_PROXIES", "")])
+        .expect("a blank value means no trusted proxies");
+    assert!(config.admin_trusted_proxies.is_empty());
+
+    let config = config_with(&[(
+        "ADMIN_TRUSTED_PROXIES",
+        " 10.0.0.0/8 , 172.16.0.0/12,2001:db8::/32 , 192.0.2.1 ",
+    )])
+    .expect("spaces around the list elements are allowed");
+    assert_eq!(config.admin_trusted_proxies.len(), 4);
+    assert_eq!(config.admin_trusted_proxies[0].to_string(), "10.0.0.0/8");
+    assert_eq!(config.admin_trusted_proxies[3].to_string(), "192.0.2.1/32");
+}
+
+#[test]
+fn trusted_proxies_reject_invalid_cidr_without_echoing_the_value() {
+    for raw in [
+        "10.0.0.0/33",
+        "2001:db8::/129",
+        "garbage",
+        "10.0.0.0/not-a-number",
+    ] {
+        let error = config_with(&[("ADMIN_TRUSTED_PROXIES", raw)])
+            .expect_err("invalid CIDR should be rejected");
+        let message = error.to_string();
+        assert_invalid(error, "ADMIN_TRUSTED_PROXIES");
+        assert!(
+            !message.contains(raw),
+            "error must not echo {raw}: {message}"
+        );
+    }
+}
+
+#[test]
+fn ip_net_contains_covers_ipv4_ipv6_and_prefix_boundaries() {
+    let ipv4 = IpNet::parse("10.0.0.0/8").expect("IPv4 network");
+    assert!(ipv4.contains("10.0.0.1".parse().unwrap()));
+    assert!(ipv4.contains("10.255.255.255".parse().unwrap()));
+    assert!(!ipv4.contains("11.0.0.0".parse().unwrap()));
+    assert!(!ipv4.contains("2001:db8::1".parse().unwrap()));
+
+    let host = IpNet::parse("192.0.2.7").expect("an address without a prefix is one host");
+    assert_eq!(host.prefix_len(), 32);
+    assert!(host.contains("192.0.2.7".parse().unwrap()));
+    assert!(!host.contains("192.0.2.8".parse().unwrap()));
+
+    let zero = IpNet::parse("0.0.0.0/0").expect("the default route matches any IPv4 address");
+    assert!(zero.contains("203.0.113.5".parse().unwrap()));
+    assert!(!zero.contains("2001:db8::1".parse().unwrap()));
+
+    let ipv6 = IpNet::parse("2001:db8::/32").expect("IPv6 network");
+    assert!(ipv6.contains("2001:db8::1".parse().unwrap()));
+    assert!(ipv6.contains("2001:db8:ffff::1".parse().unwrap()));
+    assert!(!ipv6.contains("2001:db9::1".parse().unwrap()));
+    assert!(!ipv6.contains("10.0.0.1".parse().unwrap()));
+
+    let v6_host = IpNet::parse("2001:db8::1").expect("an IPv6 address is a /128 network");
+    assert_eq!(v6_host.prefix_len(), 128);
+    assert!(v6_host.contains("2001:db8::1".parse().unwrap()));
+    assert!(!v6_host.contains("2001:db8::2".parse().unwrap()));
+
+    let v6_all = IpNet::parse("::/0").expect("the default route matches any IPv6 address");
+    assert!(v6_all.contains("2001:db8::1".parse().unwrap()));
+    assert!(!v6_all.contains("10.0.0.1".parse().unwrap()));
+}
+
+/// Base64 стандартного алфавита для 32 байт `0x00..=0x1f`.
+const SECRET_KEY_BASE64: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+/// Base64 стандартного алфавита для 16 байт: слишком короткий ключ.
+const SHORT_SECRET_KEY_BASE64: &str = "AAECAwQFBgcICQoLDA0ODw==";
+
+#[test]
+fn secret_keys_are_decoded_into_thirty_two_bytes() {
+    let config = config_with(&[
+        ("TASKLERQ_SECRET_KEY", SECRET_KEY_BASE64),
+        ("TASKLERQ_SECRET_KEY_OLD", SECRET_KEY_BASE64),
+    ])
+    .expect("valid keys are accepted");
+
+    let expected: [u8; 32] = std::array::from_fn(|index| index as u8);
+    assert_eq!(
+        config.secret_key.as_ref().map(SecretKey::expose),
+        Some(&expected)
+    );
+    assert_eq!(
+        config.secret_key_old.as_ref().map(SecretKey::expose),
+        Some(&expected)
+    );
+}
+
+#[test]
+fn secret_key_is_hidden_in_config_debug() {
+    let config = config_with(&[
+        ("TASKLERQ_SECRET_KEY", SECRET_KEY_BASE64),
+        ("TASKLERQ_SECRET_KEY_OLD", SECRET_KEY_BASE64),
+    ])
+    .expect("valid keys are accepted");
+
+    let debug = format!("{config:?}");
+    assert!(!debug.contains(SECRET_KEY_BASE64));
+    assert!(!debug.contains("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"));
+    assert!(
+        !debug.contains("000102030405060708090a0b0c0d0e0f"),
+        "raw bytes must not be printed: {debug}"
+    );
+    assert!(debug.contains("<redacted>"));
+    assert!(debug.contains("Some"), "the presence of keys is visible");
+}
+
+#[test]
+fn secret_key_errors_name_the_parameter_and_expected_format() {
+    for (name, raw) in [
+        ("TASKLERQ_SECRET_KEY", SHORT_SECRET_KEY_BASE64),
+        ("TASKLERQ_SECRET_KEY", "not base64!"),
+        ("TASKLERQ_SECRET_KEY_OLD", SHORT_SECRET_KEY_BASE64),
+    ] {
+        let error = config_with(&[(name, raw)]).expect_err("invalid key should be rejected");
+        let message = error.to_string();
+        assert_invalid(error, name);
+        assert!(
+            !message.contains(raw),
+            "error must not echo the key: {message}"
+        );
+        assert!(
+            message.contains("32 bytes"),
+            "error describes the expected format: {message}"
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -589,6 +787,163 @@ fn llm_requires_primary_slot_when_enabled() {
 }
 
 #[test]
+fn llm_enabled_flag_is_optional_and_only_true_requires_a_slot() {
+    // `None` — переменная не задана; слоты берутся из консоли (2.3).
+    let mut vars = base_env();
+    vars.remove("LLM_CAPTURE_ENABLED");
+    let absent = config(vars).expect("an absent flag does not require a slot");
+    assert_eq!(absent.llm.enabled, None);
+    assert!(absent.llm.primary.is_none());
+
+    // Явный `false` без слота — успех.
+    let disabled = config(base_env()).expect("an explicit false does not require a slot");
+    assert_eq!(disabled.llm.enabled, Some(false));
+    assert!(disabled.llm.primary.is_none());
+
+    // Явный `true` без слота — прежняя ошибка с именем переменной.
+    let error = llm_with(&[("LLM_CAPTURE_ENABLED", "true")])
+        .expect_err("an explicit true requires the primary slot");
+    assert_missing(error, "LLM_PRIMARY_URL");
+}
+
+#[test]
+fn slot_variables_without_url_or_model_are_ignored() {
+    let config = config_with(&[("LLM_PRIMARY_TIMEOUT_MS", "10000")])
+        .expect("a lone slot variable must not stop startup");
+    assert!(config.llm.primary.is_none());
+    assert_eq!(config.llm.ignored_env, vec!["LLM_PRIMARY_TIMEOUT_MS"]);
+
+    // Невалидное значение одиночной переменной даже не разбирается.
+    let config = config_with(&[("LLM_PRIMARY_TIMEOUT_MS", "abc")])
+        .expect("a lone invalid slot variable must not be parsed");
+    assert_eq!(config.llm.ignored_env, vec!["LLM_PRIMARY_TIMEOUT_MS"]);
+
+    let config = config_with(&[
+        ("LLM_PRIMARY_TOKEN", "primary-token"),
+        ("LLM_PRIMARY_TIMEOUT_MS", "10000"),
+        ("LLM_PRIMARY_EXTRA_JSON", "not json"),
+        ("LLM_FALLBACK_TOKEN", "fallback-token"),
+        ("LLM_FALLBACK_TIMEOUT_MS", "abc"),
+        ("LLM_FALLBACK_EXTRA_JSON", "[1]"),
+    ])
+    .expect("lone variables of both slots are ignored");
+    assert_eq!(
+        config.llm.ignored_env,
+        vec![
+            "LLM_PRIMARY_TOKEN",
+            "LLM_PRIMARY_TIMEOUT_MS",
+            "LLM_PRIMARY_EXTRA_JSON",
+            "LLM_FALLBACK_TOKEN",
+            "LLM_FALLBACK_TIMEOUT_MS",
+            "LLM_FALLBACK_EXTRA_JSON",
+        ]
+    );
+}
+
+#[test]
+fn ignored_slot_variable_is_logged_without_its_value() {
+    let config =
+        config_with(&[("LLM_PRIMARY_TIMEOUT_MS", "10000")]).expect("config should be valid");
+    let buffer = LogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(buffer.clone())
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || config.log_startup());
+
+    let logs = buffer.contents();
+    assert!(
+        logs.contains("LLM_PRIMARY_TIMEOUT_MS"),
+        "the warning names the ignored variable: {logs}"
+    );
+    assert!(
+        logs.contains("\"level\":\"WARN\""),
+        "the warning is logged at WARN level: {logs}"
+    );
+    assert!(
+        logs.contains("ignored"),
+        "the warning says the variable is ignored: {logs}"
+    );
+    assert!(
+        !logs.contains("10000"),
+        "the warning must not contain the value: {logs}"
+    );
+}
+
+#[test]
+fn slot_parsers_use_the_same_limits_and_never_echo_the_value() {
+    for raw in ["100", "600000"] {
+        assert_eq!(
+            parse_slot_timeout_ms(raw).expect("boundary timeout"),
+            Duration::from_millis(raw.parse::<u64>().unwrap())
+        );
+    }
+    for raw in ["99", "600001", "abc"] {
+        let error = parse_slot_timeout_ms(raw).expect_err("out-of-range timeout");
+        assert!(
+            error.contains("100..=600000"),
+            "reason describes the range: {error}"
+        );
+        assert!(!error.contains(raw), "reason must not echo {raw}: {error}");
+    }
+
+    for raw in ["10", "60000"] {
+        assert_eq!(
+            parse_connect_timeout_ms(raw).expect("boundary connect timeout"),
+            Duration::from_millis(raw.parse::<u64>().unwrap())
+        );
+    }
+    assert!(parse_connect_timeout_ms("9").is_err());
+    assert!(parse_connect_timeout_ms("60001").is_err());
+
+    for raw in ["1", "100000"] {
+        assert_eq!(
+            parse_daily_quota(raw).expect("boundary quota"),
+            raw.parse::<u32>().unwrap()
+        );
+    }
+    for raw in ["0", "100001", "many"] {
+        let error = parse_daily_quota(raw).expect_err("out-of-range quota");
+        assert!(
+            error.contains("1..=100000"),
+            "reason describes the range: {error}"
+        );
+        if raw == "many" {
+            assert!(!error.contains(raw), "reason must not echo {raw}: {error}");
+        }
+    }
+
+    let extra = parse_extra_json(r#"{"reasoning":{"effort":"minimal"}}"#).expect("JSON object");
+    assert_eq!(
+        extra.get("reasoning"),
+        Some(&serde_json::json!({"effort": "minimal"}))
+    );
+    for raw in ["[1,2]", "\"text\"", "{not json"] {
+        let error = parse_extra_json(raw).expect_err("not a JSON object");
+        assert!(
+            error.contains("JSON object"),
+            "reason describes the format: {error}"
+        );
+        assert!(!error.contains(raw), "reason must not echo {raw}: {error}");
+    }
+
+    for raw in ["https://llm.example.com/v1", "http://127.0.0.1:8080/v1"] {
+        assert_eq!(parse_slot_url(raw).expect("valid slot url").as_str(), raw);
+    }
+    for raw in [
+        "ftp://llm.example.com/v1",
+        "https://user:password@llm.example.com/v1",
+        "https://llm.example.com/v1?token=1",
+        "https://llm.example.com/v1#fragment",
+        "not a url",
+    ] {
+        let error = parse_slot_url(raw).expect_err("invalid slot url");
+        assert!(!error.contains(raw), "reason must not echo {raw}: {error}");
+    }
+}
+
+#[test]
 fn fallback_slot_must_be_configured_completely() {
     let mut pairs = enabled_primary();
     pairs.push(("LLM_FALLBACK_URL", "https://backup.example.com/v1"));
@@ -719,7 +1074,7 @@ fn extra_json_must_be_a_json_object() {
 #[test]
 fn disabled_llm_does_not_require_slots_but_validates_given_ones() {
     let llm = llm_with(&[]).expect("no slots are fine when LLM is off");
-    assert!(!llm.enabled);
+    assert_eq!(llm.enabled, Some(false));
     assert!(llm.primary.is_none());
     assert!(llm.fallback.is_none());
 
@@ -729,7 +1084,7 @@ fn disabled_llm_does_not_require_slots_but_validates_given_ones() {
         ("LLM_PRIMARY_TOKEN", "primary-token"),
     ];
     let llm = llm_with(&pairs).expect("configured slot is loaded while LLM is off");
-    assert!(!llm.enabled);
+    assert_eq!(llm.enabled, Some(false));
     assert!(llm.primary.is_some());
 
     assert_invalid(

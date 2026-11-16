@@ -5,7 +5,7 @@
 - [x] 1.1 Добавить зависимости `askama`, `argon2`, `chacha20poly1305`,
   `arc-swap`; проверить, что `cargo build` и проверка зависимостей из CI
   проходят без новых исключений.
-- [ ] 1.2 В `src/config/mod.rs`: `ENV` с умолчанием `production`;
+- [x] 1.2 В `src/config/mod.rs`: `ENV` с умолчанием `production`;
   `ADMIN_BIND_ADDR` (`SocketAddr` или `disabled`, по умолчанию
   `0.0.0.0:8081`); `ADMIN_TRUSTED_PROXIES` (список CIDR, по умолчанию пуст);
   `TASKLERQ_SECRET_KEY` и `TASKLERQ_SECRET_KEY_OLD` (`SecretString`, base64 →

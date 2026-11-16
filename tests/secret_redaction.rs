@@ -30,17 +30,21 @@ const PROVIDED_WEBHOOK_SECRET: &str = "SECRET-provided-webhook-redaction";
 const HA_TOKEN: &str = "SECRET-ha-token-redaction";
 const PRIMARY_TOKEN: &str = "SECRET-primary-slot-redaction";
 const FALLBACK_TOKEN: &str = "SECRET-fallback-slot-redaction";
+const SECRET_KEY: &str = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+const SECRET_KEY_OLD: &str = "Hx4dHBsaGRgXFhUUExIREA8ODQwLCgkIBwYFBAMCAQA=";
 const DB_PASSWORD: &str = "S3cretPassw0rd";
 const API_TOKEN: &str = "tlq_SECRET-bearer-redaction";
 
 /// Все значения, которые не должны появляться в выводе.
-const SECRETS: [&str; 8] = [
+const SECRETS: [&str; 10] = [
     BOT_TOKEN,
     WEBHOOK_SECRET,
     PROVIDED_WEBHOOK_SECRET,
     HA_TOKEN,
     PRIMARY_TOKEN,
     FALLBACK_TOKEN,
+    SECRET_KEY,
+    SECRET_KEY_OLD,
     DB_PASSWORD,
     API_TOKEN,
 ];
@@ -99,6 +103,11 @@ fn config_env() -> BTreeMap<String, String> {
         (
             "HA_AI_TASK_ENTITY_ID".to_owned(),
             "legacy.entity".to_owned(),
+        ),
+        ("TASKLERQ_SECRET_KEY".to_owned(), SECRET_KEY.to_owned()),
+        (
+            "TASKLERQ_SECRET_KEY_OLD".to_owned(),
+            SECRET_KEY_OLD.to_owned(),
         ),
     ])
 }
