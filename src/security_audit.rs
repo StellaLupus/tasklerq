@@ -665,6 +665,19 @@ impl Audit {
             .await;
     }
 
+    /// Настройка консоли изменена (в том числе отметка пропуска шага мастера).
+    ///
+    /// Пишется только имя ключа и новое простое значение — секретов здесь нет.
+    /// Событие редкое и не подавляется.
+    pub async fn admin_setting_changed(&self, key: &'static str, value: &str, now: DateTime<Utc>) {
+        self.record_admin_success(
+            AuditEventType::AdminSettingChanged,
+            json!({ "key": key, "value": value }),
+            now,
+        )
+        .await;
+    }
+
     /// Записать редкое успешное событие консоли без подавления повторов.
     async fn record_admin_success(
         &self,

@@ -9,6 +9,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::admin_console::router::{AdminState, build_router as build_admin_router};
+use crate::admin_console::wizard::WizardSettings;
 use crate::capture::slot_status::{LlmSlotHealth, SlotStatus, SlotStatusReport};
 use crate::config::{Config, TelegramMode, TenancyMode};
 use crate::http::api::capture::CaptureState;
@@ -92,7 +93,7 @@ pub async fn build_application_with_update_limit(
 
     let mut state = AppState::new(pool.clone(), audit.clone())
         .with_tenancy_mode(config.tenancy.mode)
-        .with_secret_cipher(secret_cipher)
+        .with_secret_cipher(secret_cipher.clone())
         .with_llm_slots(llm_slots);
     let mut workers = Vec::new();
     if let Some(runtime) = telegram {
@@ -109,11 +110,16 @@ pub async fn build_application_with_update_limit(
     // Консоль получает собственный роутер и listener. `disabled` не создаёт
     // ни того, ни другого.
     let admin_router = config.admin_bind_addr.map(|_| {
-        build_admin_router(AdminState::new(
-            pool.clone(),
-            config.admin_trusted_proxies.clone(),
-            audit,
-        ))
+        let wizard = WizardSettings::new(
+            config.tenancy.mode,
+            config.telegram.mode.is_enabled(),
+            config.llm.clone(),
+            secret_cipher.clone(),
+        );
+        build_admin_router(
+            AdminState::new(pool.clone(), config.admin_trusted_proxies.clone(), audit)
+                .with_wizard(wizard),
+        )
     });
 
     // Retention и доменный тикер не зависят от Telegram: чистят базу и

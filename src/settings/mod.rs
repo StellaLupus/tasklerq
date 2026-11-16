@@ -100,8 +100,9 @@ impl SettingKey {
 
 /// Перечень ключей настроек, которые знает эта версия.
 ///
-/// Остальные `wizard.*` добавит 6.1. Ключи уровня household появятся вместе с
-/// Telegram-настройками; пока все перечисленные — уровня инсталляции.
+/// Ключи уровня household появятся вместе с Telegram-настройками; пока все
+/// перечисленные — уровня инсталляции. `wizard.*_skipped` читаются только из
+/// базы: окружение их не задаёт.
 pub const SETTING_KEYS: &[SettingKey] = &[
     SettingKey {
         name: "llm.enabled",
@@ -183,6 +184,18 @@ pub const SETTING_KEYS: &[SettingKey] = &[
     },
     SettingKey {
         name: "wizard.llm_skipped",
+        scope: SettingScope::Installation,
+        kind: SettingKind::Plain,
+        value_kind: ValueKind::Bool,
+    },
+    SettingKey {
+        name: "wizard.household_skipped",
+        scope: SettingScope::Installation,
+        kind: SettingKind::Plain,
+        value_kind: ValueKind::Bool,
+    },
+    SettingKey {
+        name: "wizard.token_skipped",
         scope: SettingScope::Installation,
         kind: SettingKind::Plain,
         value_kind: ValueKind::Bool,
@@ -1122,7 +1135,9 @@ fn settings_from(stored: &[StoredSetting], resolved: &ResolvedLlm) -> Vec<Resolv
                     value: Some(Value::from(resolved.daily_quota)),
                     secret: None,
                 },
-                "wizard.llm_skipped" => plain_from_db_or_default(key, stored),
+                "wizard.llm_skipped" | "wizard.household_skipped" | "wizard.token_skipped" => {
+                    plain_from_db_or_default(key, stored)
+                }
                 _ => default_setting(key),
             }
         })

@@ -24,6 +24,7 @@ use crate::http::client::{Client, TrustedProxies};
 use crate::rate_limit::{RateDecision, RateLimiter};
 use crate::security_audit::{Audit, LimitKey, RateLimitEvent};
 
+use super::wizard::{WIZARD_PATH, WIZARD_SKIP_PATH, WizardSettings};
 use super::{assets, origin, pages};
 
 /// Сколько неудач допускается в окне лимита консоли.
@@ -50,6 +51,8 @@ pub struct AdminState {
     setup_limiter: Arc<RateLimiter<IpAddr>>,
     current_password_limiter: Arc<RateLimiter<IpAddr>>,
     recovery_limiter: Arc<RateLimiter<IpAddr>>,
+    /// Режим размещения, признак Telegram и параметры LLM для мастера.
+    wizard: WizardSettings,
 }
 
 impl AdminState {
@@ -66,7 +69,22 @@ impl AdminState {
             setup_limiter: failure_limiter(),
             current_password_limiter: failure_limiter(),
             recovery_limiter: failure_limiter(),
+            wizard: WizardSettings::default(),
         }
+    }
+
+    /// Задать параметры мастера: режим, Telegram, LLM и ключ шифрования.
+    ///
+    /// Без вызова действует `single` без Telegram и LLM: страницы мастера
+    /// открываются, но шаги household и LLM остаются незавершёнными.
+    pub fn with_wizard(mut self, wizard: WizardSettings) -> Self {
+        self.wizard = wizard;
+        self
+    }
+
+    /// Параметры чтения снимка мастера.
+    pub fn wizard(&self) -> &WizardSettings {
+        &self.wizard
     }
 
     /// Клиент по адресу соединения и заголовкам запроса.
@@ -142,6 +160,8 @@ fn failure_limiter() -> Arc<RateLimiter<IpAddr>> {
 pub fn build_router(state: AdminState) -> Router {
     Router::new()
         .route("/admin", get(pages::index))
+        .route(WIZARD_PATH, get(pages::wizard_page))
+        .route(WIZARD_SKIP_PATH, post(pages::wizard_skip))
         .route(
             "/admin/setup",
             get(pages::setup_page).post(pages::setup_submit),

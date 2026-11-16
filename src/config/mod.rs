@@ -94,6 +94,11 @@ impl TelegramMode {
         }
     }
 
+    /// Бот включён: приём обновлений настроен.
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
     fn parse(raw: &str) -> Result<Self, ConfigError> {
         match raw {
             "webhook" => Ok(Self::Webhook),
@@ -455,6 +460,20 @@ pub struct LlmConfig {
 }
 
 impl LlmConfig {
+    /// Пустая конфигурация: ни слотов, ни явных флагов.
+    pub fn empty() -> Self {
+        Self {
+            enabled: None,
+            primary: None,
+            fallback: None,
+            connect_timeout: Duration::from_millis(u64::from(DEFAULT_CONNECT_TIMEOUT_MS)),
+            connect_timeout_from_env: false,
+            daily_quota: DEFAULT_DAILY_QUOTA,
+            daily_quota_from_env: false,
+            ignored_env: Vec::new(),
+        }
+    }
+
     /// Загрузить только параметры LLM-capture из окружения.
     ///
     /// Нужно подкоманде `capture-eval`: остальная конфигурация сервиса ей не

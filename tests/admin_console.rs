@@ -23,16 +23,19 @@ use tasklerq::admin_console::password::{self, Password};
 use tasklerq::admin_console::router::{AdminState, build_router as build_admin_router};
 use tasklerq::admin_console::session::AdminSession;
 use tasklerq::admin_console::setup::{self, SetupOutcome};
+use tasklerq::admin_console::wizard::WizardSettings;
 use tasklerq::app::build_application;
 use tasklerq::auth::tokens::hash_token;
-use tasklerq::config::{Config, IpNet};
+use tasklerq::config::{Config, IpNet, LlmConfig, TenancyMode};
 use tasklerq::domain::error::DomainError;
 use tasklerq::http::client::{Client, Scheme};
 use tasklerq::http::router::{AppState, build_router};
 use tasklerq::http::server::{bind_listeners, serve_listeners};
 use tasklerq::rate_limit::{Reservation, ip_key};
 use tasklerq::security_audit::Audit;
+use tasklerq::settings::crypto::SecretCipher;
 use tasklerq::storage::repositories::admin_accounts;
+use tasklerq::storage::repositories::households;
 use tower::ServiceExt;
 use url::form_urlencoded;
 use uuid::Uuid;
@@ -200,6 +203,43 @@ fn console(pool: &PgPool, trusted_proxies: Vec<IpNet>) -> Router {
         trusted_proxies,
         Audit::new(pool.clone()),
     ))
+}
+
+/// Консоль с явным режимом и признаком Telegram.
+fn console_with(pool: &PgPool, tenancy: TenancyMode, telegram: bool, llm: LlmConfig) -> Router {
+    build_admin_router(
+        AdminState::new(pool.clone(), Vec::new(), Audit::new(pool.clone())).with_wizard(
+            WizardSettings::new(tenancy, telegram, llm, SecretCipher::new(None, None)),
+        ),
+    )
+}
+
+/// Значение настройки инсталляции из `settings`.
+async fn setting_value(pool: &PgPool, key: &str) -> Option<Value> {
+    sqlx::query_scalar(
+        "SELECT value FROM settings
+         WHERE scope = 'installation' AND household_id IS NULL AND key = $1",
+    )
+    .bind(key)
+    .fetch_optional(pool)
+    .await
+    .expect("setting value")
+}
+
+/// Household, созданный до входа администратора.
+async fn insert_household(pool: &PgPool) {
+    let mut tx = pool.begin().await.expect("household transaction");
+    households::create_empty(
+        &mut tx,
+        TenancyMode::Single,
+        "Дом",
+        "Europe/Moscow",
+        &tasklerq::admin::admin_actor(),
+        Utc::now(),
+    )
+    .await
+    .expect("household is created");
+    tx.commit().await.expect("commit the household");
 }
 
 fn location(headers: &HeaderMap) -> Option<&str> {
@@ -768,7 +808,7 @@ async fn setup_creates_the_account_and_the_code_is_single_use() {
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert_eq!(location(&headers), Some("/admin"));
+    assert_eq!(location(&headers), Some("/admin/wizard"));
     let cookie = set_cookie(&headers).expect("the setup response sets a session cookie");
     assert!(cookie.starts_with("tlq_admin="), "{cookie}");
     assert!(cookie.contains("HttpOnly"), "{cookie}");
@@ -882,7 +922,7 @@ async fn an_unknown_code_creates_nothing_and_keeps_the_valid_code() {
         StatusCode::SEE_OTHER,
         "the valid code still works after the failed attempt"
     );
-    assert_eq!(location(&headers), Some("/admin"));
+    assert_eq!(location(&headers), Some("/admin/wizard"));
     assert_eq!(account_count(&db.pool).await, 1);
 }
 
@@ -1493,7 +1533,7 @@ async fn login_accepts_the_right_credentials_and_hides_the_reason_on_failure() {
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert_eq!(location(&headers), Some("/admin"));
+    assert_eq!(location(&headers), Some("/admin/wizard"));
     let cookie = set_cookie(&headers).expect("a successful login sets a cookie");
     assert!(cookie.starts_with("tlq_admin="), "{cookie}");
     assert!(cookie.contains("HttpOnly"), "{cookie}");
@@ -1722,7 +1762,7 @@ async fn setup_with_a_foreign_origin_keeps_the_code_for_the_right_request() {
         StatusCode::SEE_OTHER,
         "the code still works from its own origin"
     );
-    assert_eq!(location(&response_headers), Some("/admin"));
+    assert_eq!(location(&response_headers), Some("/admin/wizard"));
     assert_eq!(account_count(&db.pool).await, 1);
 }
 
@@ -3096,7 +3136,7 @@ async fn the_whole_flow_works_with_plain_form_posts() {
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert_eq!(location(&headers), Some("/admin"));
+    assert_eq!(location(&headers), Some("/admin/wizard"));
     let cookie = cookie_pair(&set_cookie(&headers).expect("setup starts a session"));
 
     let (status, headers, _) = send_form_from(
@@ -3118,7 +3158,7 @@ async fn the_whole_flow_works_with_plain_form_posts() {
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert_eq!(location(&headers), Some("/admin"));
+    assert_eq!(location(&headers), Some("/admin/wizard"));
     let cookie = cookie_pair(&set_cookie(&headers).expect("login starts a session"));
 
     let (status, headers, _) = send_form_from(
@@ -3200,4 +3240,441 @@ async fn a_recovery_code_with_path_separators_stays_one_segment() {
         !text.contains("action=\"/admin/recover/a?b#c\""),
         "the raw separators must not reach the markup: {text}"
     );
+}
+
+/// Household, созданный до входа, снимает шаг household: мастер начинается с LLM.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_household_created_before_login_starts_the_wizard_at_llm() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    insert_household(&db.pool).await;
+    let app = console(&db.pool, Vec::new());
+
+    let (status, headers, _) = send_form(
+        &app,
+        "/admin/login",
+        &[("username", "admin"), ("password", TEST_PASSWORD)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        location(&headers),
+        Some("/admin/wizard"),
+        "an unfinished wizard comes before the main page"
+    );
+
+    let cookie = cookie_pair(&set_cookie(&headers).expect("a successful login sets a cookie"));
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin/wizard", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("Разбор записей"), "{text}");
+    assert!(
+        !text.contains("Токен Home Assistant"),
+        "the token step must wait for LLM: {text}"
+    );
+}
+
+/// После пропуска LLM повторный вход открывает следующий незавершённый шаг.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_wizard_resumes_at_the_next_unfinished_step_after_a_new_login() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    insert_household(&db.pool).await;
+    let app = console(&db.pool, Vec::new());
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin/wizard", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(String::from_utf8_lossy(&body).contains("Разбор записей"));
+
+    let (status, headers, _) = send_form_from(
+        &app,
+        "/admin/wizard/skip",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("step", "llm")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/wizard"));
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin/wizard", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(&body).contains("Токен Home Assistant"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        setting_value(&db.pool, "wizard.llm_skipped").await,
+        Some(Value::Bool(true))
+    );
+    let events = audit_payloads(&db.pool, "admin_setting_changed").await;
+    assert_eq!(
+        events.len(),
+        1,
+        "the skip leaves one audit event: {events:?}"
+    );
+    assert_eq!(events[0]["key"], "wizard.llm_skipped");
+    for (actor, household) in audit_actor(&db.pool, "admin_setting_changed").await {
+        assert_eq!(actor, "system");
+        assert_eq!(household, None);
+    }
+
+    let (status, _, _) = send_form_from(
+        &app,
+        "/admin/logout",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let (status, headers, _) = send_form(
+        &app,
+        "/admin/login",
+        &[("username", "admin"), ("password", TEST_PASSWORD)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/wizard"));
+    let cookie = cookie_pair(&set_cookie(&headers).expect("a successful login sets a cookie"));
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin/wizard", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("Токен Home Assistant"), "{text}");
+    assert!(
+        !text.contains("Разбор записей"),
+        "a finished step is not repeated: {text}"
+    );
+}
+
+/// Без Telegram шаг household не пропускается; с Telegram — пропускается.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_household_step_can_only_be_skipped_with_telegram() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let without = console(&db.pool, Vec::new());
+    let cookie = login_cookie(&without, "admin", TEST_PASSWORD).await;
+
+    let (status, _, body) = send_with_cookie(&without, Method::GET, "/admin/wizard", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("Дом"), "{text}");
+    assert!(
+        !text.contains("Пропустить"),
+        "the household step has no skip button without Telegram: {text}"
+    );
+
+    let (status, _, body) = send_form_from(
+        &without,
+        "/admin/wizard/skip",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("step", "household")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "skipping the household without Telegram is refused"
+    );
+    assert!(
+        String::from_utf8_lossy(&body).contains("Дом"),
+        "the current step is shown again: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        setting_value(&db.pool, "wizard.household_skipped").await,
+        None,
+        "a refused skip writes no key"
+    );
+
+    let (status, _, body) = send_with_cookie(&without, Method::GET, "/admin/wizard", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(String::from_utf8_lossy(&body).contains("Дом"));
+
+    // Тот же сеанс, но Telegram включён: пропуск работает.
+    let with = console_with(&db.pool, TenancyMode::Single, true, LlmConfig::empty());
+    let (status, _, body) = send_with_cookie(&with, Method::GET, "/admin/wizard", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(&body).contains("Пропустить"),
+        "Telegram enables the household skip: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, headers, _) = send_form_from(
+        &with,
+        "/admin/wizard/skip",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("step", "household")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/wizard"));
+    assert_eq!(
+        setting_value(&db.pool, "wizard.household_skipped").await,
+        Some(Value::Bool(true))
+    );
+
+    let (status, _, body) = send_with_cookie(&with, Method::GET, "/admin/wizard", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(&body).contains("Разбор записей"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+/// В `multi` мастер не показывает шаги household и токена.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_mode_hides_the_household_and_token_steps() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
+
+    let (status, headers, _) = send_form(
+        &app,
+        "/admin/login",
+        &[("username", "admin"), ("password", TEST_PASSWORD)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/wizard"));
+    let cookie = cookie_pair(&set_cookie(&headers).expect("a successful login sets a cookie"));
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin/wizard", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("Разбор записей"), "{text}");
+    assert!(
+        !text.contains("Дом") && !text.contains("Токен Home Assistant"),
+        "multi hides the household and token steps: {text}"
+    );
+
+    let (status, headers, _) = send_form_from(
+        &app,
+        "/admin/wizard/skip",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("step", "llm")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        location(&headers),
+        Some("/admin"),
+        "the last step leads to the main page"
+    );
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("Консоль администратора"), "{text}");
+    assert!(
+        !text.contains("Продолжить настройку"),
+        "the wizard is finished: {text}"
+    );
+}
+
+/// Чужой `Origin` на пропуске — `403`; без сессии — `303` на вход.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wizard_skip_checks_the_origin_and_the_session() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console(&db.pool, Vec::new());
+
+    let (status, headers, _) =
+        send_form(&app, "/admin/wizard/skip", &[("step", "household")]).await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "an anonymous POST goes to the login page"
+    );
+    assert_eq!(location(&headers), Some("/admin/login"));
+
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    let headers = headers_with(&[
+        ("host", "nas:18081"),
+        ("origin", "http://evil.example"),
+        ("cookie", &cookie),
+    ]);
+    let (status, response_headers, _) = send_form_from(
+        &app,
+        "/admin/wizard/skip",
+        test_peer(),
+        headers,
+        &[("step", "household")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_security_headers(&response_headers, "a wizard skip with a foreign origin");
+    assert_eq!(
+        setting_value(&db.pool, "wizard.household_skipped").await,
+        None,
+        "a refused origin writes no key"
+    );
+
+    // Не текущий шаг тоже ничего не пишет.
+    let (status, _, _) = send_form_from(
+        &app,
+        "/admin/wizard/skip",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("step", "llm")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(setting_value(&db.pool, "wizard.llm_skipped").await, None);
+}
+
+/// Страницы мастера проходят общие проверки: локальные ресурсы, POST-форма,
+/// запрет кеша и фреймов; главная остаётся доступной со ссылкой на мастер.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wizard_pages_are_self_contained_and_keep_the_home_reachable() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Single, true, LlmConfig::empty());
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let (status, headers, body) =
+        send_with_cookie(&app, Method::GET, "/admin/wizard", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_security_headers(&headers, "GET /admin/wizard");
+    assert_no_external_urls(&body, "GET /admin/wizard");
+    assert_local_assets(&body, "GET /admin/wizard");
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("<form method=\"post\" action=\"/admin/wizard/skip\">"),
+        "the skip is a plain POST form: {text}"
+    );
+    assert!(
+        text.contains("Действие на этом шаге появится позже."),
+        "the page says the action is coming later: {text}"
+    );
+
+    let (status, headers, body) = send_with_cookie(&app, Method::GET, "/admin", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "the main page stays reachable");
+    assert_security_headers(&headers, "GET /admin during the wizard");
+    assert_no_external_urls(&body, "GET /admin during the wizard");
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("Продолжить настройку"), "{text}");
+    assert!(text.contains("href=\"/admin/wizard\""), "{text}");
+    assert!(text.contains("href=\"/admin/password\""), "{text}");
+    assert!(text.contains("action=\"/admin/logout\""), "{text}");
+}
+
+/// Пропуск токена завершает мастер; повторный пропуск уводит на главную.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_token_step_can_be_skipped_and_finishes_the_wizard() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    insert_household(&db.pool).await;
+    let app = console(&db.pool, Vec::new());
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let (status, _, _) = send_form_from(
+        &app,
+        "/admin/wizard/skip",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("step", "llm")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin/wizard", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(&body).contains("Токен Home Assistant"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, headers, _) = send_form_from(
+        &app,
+        "/admin/wizard/skip",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("step", "token")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin"));
+    assert_eq!(
+        setting_value(&db.pool, "wizard.token_skipped").await,
+        Some(Value::Bool(true))
+    );
+
+    let (status, headers, _) = send_with_cookie(&app, Method::GET, "/admin/wizard", &cookie).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin"));
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !String::from_utf8_lossy(&body).contains("Продолжить настройку"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, headers, _) = send_form_from(
+        &app,
+        "/admin/wizard/skip",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("step", "token")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "a repeated skip after the wizard is finished goes home"
+    );
+    assert_eq!(location(&headers), Some("/admin"));
+}
+
+/// Активный токен household снимает шаг токена.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_active_token_removes_the_token_step() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    insert_household(&db.pool).await;
+    tasklerq::admin::create_token(
+        &db.pool,
+        TenancyMode::Single,
+        None,
+        "home-assistant",
+        &["ha:read".to_owned()],
+        None,
+        Utc::now(),
+    )
+    .await
+    .expect("a household token is issued");
+
+    let app = console(&db.pool, Vec::new());
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let (status, headers, _) = send_form_from(
+        &app,
+        "/admin/wizard/skip",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("step", "llm")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        location(&headers),
+        Some("/admin"),
+        "the token step is already complete"
+    );
+
+    let (status, headers, _) = send_with_cookie(&app, Method::GET, "/admin/wizard", &cookie).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin"));
 }

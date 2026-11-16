@@ -12,3 +12,4 @@ pub mod recovery;
 pub mod router;
 pub mod session;
 pub mod setup;
+pub mod wizard;
