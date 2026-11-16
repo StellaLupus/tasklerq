@@ -4,6 +4,7 @@ mod support;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,7 +16,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use http_body_util::BodyExt;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use support::telegram::{FakeTelegram, Harness};
@@ -30,6 +31,8 @@ use tasklerq::admin_console::setup::{self, SetupOutcome};
 use tasklerq::admin_console::wizard::WizardSettings;
 use tasklerq::app::build_application;
 use tasklerq::auth::tokens::hash_token;
+use tasklerq::capture::eval::SmokeSet;
+use tasklerq::capture::slot_check;
 use tasklerq::config::{
     CaptureConfig, Config, IpNet, LlmConfig, SecretKey, TenancyConfig, TenancyMode,
 };
@@ -49,6 +52,8 @@ use tasklerq::telegram::bot::Bot;
 use tower::ServiceExt;
 use url::form_urlencoded;
 use uuid::Uuid;
+use wiremock::matchers::{body_string_contains, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const REQUEST_ID: &str = "test-request-id";
 
@@ -192,6 +197,22 @@ fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
     headers
 }
 
+/// Тег `<input>` с заданным `name`.
+fn input_with_name<'a>(html: &'a str, name: &str) -> &'a str {
+    let needle = format!("name=\"{name}\"");
+    let position = html
+        .find(&needle)
+        .unwrap_or_else(|| panic!("no input named {name}: {html}"));
+    let start = html[..position]
+        .rfind("<input")
+        .unwrap_or_else(|| panic!("no input tag around {name}: {html}"));
+    let end = html[position..]
+        .find('>')
+        .map(|offset| position + offset)
+        .unwrap_or_else(|| panic!("unclosed input named {name}: {html}"));
+    &html[start..=end]
+}
+
 /// Запрос с cookie сессии.
 async fn send_with_cookie(
     app: &Router,
@@ -273,6 +294,117 @@ fn console_with_llm(pool: &PgPool, llm: LlmConfig, cipher: SecretCipher) -> (Rou
             .with_llm(settings.clone()),
     );
     (app, settings)
+}
+
+/// Встроенный набор проверки слота.
+fn builtin_smoke_set() -> SmokeSet {
+    SmokeSet::parse(slot_check::BUILTIN_SET).expect("the built-in smoke set parses")
+}
+
+/// Ответ `chat/completions` с готовым ответом модели.
+fn completion(answer: &Value) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "model": "test/model",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": answer.to_string()},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+    }))
+}
+
+/// Ответить на каждую фразу встроенного набора; `slow` — задержка одной фразы.
+async fn mount_smoke_answers(server: &MockServer, delay: Duration, slow: Option<(&str, Duration)>) {
+    for phrase in builtin_smoke_set().phrases {
+        let marker = format!("USER_TEXT\\n{}\\nUSER_TEXT", phrase.text);
+        let mut response = completion(&phrase.expect);
+        if let Some((slow_id, slow_delay)) = slow
+            && slow_id == phrase.id
+        {
+            response = response.set_delay(slow_delay);
+        } else if !delay.is_zero() {
+            response = response.set_delay(delay);
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains(marker))
+            .respond_with(response)
+            .mount(server)
+            .await;
+    }
+}
+
+/// Консоль с основным слотом на подменном сервере.
+fn console_with_server(
+    pool: &PgPool,
+    server: &MockServer,
+    timeout_ms: u64,
+) -> (Router, LlmSettings) {
+    let url = format!("{}/v1", server.uri());
+    let timeout = timeout_ms.to_string();
+    let llm = llm_env(&[
+        ("LLM_CAPTURE_ENABLED", "true"),
+        ("LLM_PRIMARY_URL", &url),
+        ("LLM_PRIMARY_MODEL", "test/model"),
+        ("LLM_PRIMARY_TIMEOUT_MS", &timeout),
+    ]);
+    console_with_llm(pool, llm, SecretCipher::new(None, None))
+}
+
+/// POST кнопки проверки слота.
+async fn start_check(
+    app: &Router,
+    cookie: &str,
+    slot: &str,
+    titles: &str,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    send_form_from(
+        app,
+        &format!("/admin/llm/check/{slot}"),
+        test_peer(),
+        headers_with(&[("cookie", cookie)]),
+        &[("titles", titles)],
+    )
+    .await
+}
+
+/// Ждать отчёт проверки на странице хода.
+async fn wait_for_check_report(app: &Router, cookie: &str) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let (status, headers, body) =
+            send_with_cookie(app, Method::GET, "/admin/llm/check", cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_security_headers(&headers, "GET /admin/llm/check");
+        let text = String::from_utf8_lossy(&body).into_owned();
+        if text.contains("Задержка p95") {
+            return text;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the check never finished: {text}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// URL изолированной базы теста для запуска команды.
+async fn command_database_url(pool: &PgPool) -> String {
+    let name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(pool)
+        .await
+        .expect("the database name");
+    support::database_url_for(&name).await
+}
+
+/// Отпечаток сохранённой проверки слота.
+async fn saved_fingerprint(pool: &PgPool, slot: &str) -> String {
+    sqlx::query_scalar("SELECT fingerprint FROM llm_slot_checks WHERE slot = $1")
+        .bind(slot)
+        .fetch_one(pool)
+        .await
+        .expect("the saved check")
 }
 
 /// Число строк `settings` с указанными ключами.
@@ -4293,6 +4425,7 @@ async fn an_environment_slot_is_read_only_and_post_cannot_change_it() {
     let llm = llm_env(&[
         ("LLM_PRIMARY_URL", "https://env.example.test/v1"),
         ("LLM_PRIMARY_MODEL", "env/model"),
+        ("LLM_PRIMARY_TOKEN", "env-secret-token"),
     ]);
     let (app, settings) = console_with_llm(&db.pool, llm, SecretCipher::new(None, None));
     let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
@@ -4303,10 +4436,26 @@ async fn an_environment_slot_is_read_only_and_post_cannot_change_it() {
     assert!(text.contains("https://env.example.test/v1"), "{text}");
     assert!(text.contains("env/model"), "{text}");
     assert!(text.contains("источник: окружение"), "{text}");
+    for name in [
+        "primary_url",
+        "primary_model",
+        "primary_timeout_ms",
+        "primary_extra_json",
+    ] {
+        assert!(
+            input_with_name(&text, name).contains("readonly"),
+            "the environment field {name} is read only: {text}"
+        );
+    }
     assert!(
-        text.matches("readonly").count() >= 2,
-        "the environment slot fields are read only: {text}"
+        !text.contains("name=\"primary_token\""),
+        "a token from the environment has no replacement field: {text}"
     );
+    assert!(
+        !text.contains("name=\"primary_token_delete\""),
+        "a token from the environment has no delete field: {text}"
+    );
+    assert!(text.contains("Токен: <strong>задан</strong>"), "{text}");
 
     let before = settings.handle().load();
     let (status, headers, _) = send_form_from(
@@ -4355,24 +4504,19 @@ async fn a_saved_token_is_never_rendered_and_can_be_replaced_or_deleted() {
     let (app, settings) = console_with_llm(&db.pool, LlmConfig::empty(), cipher_with_key(7));
     let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
 
-    let field_header = [
-        ("cookie", cookie.as_str()),
+    let headers = headers_with(&[("cookie", cookie.as_str())]);
+    let base_fields = [
+        ("enabled_present", "1"),
         ("enabled", "1"),
         ("primary_url", "https://llm.example.test/v1"),
         ("primary_model", "vendor/model"),
     ];
-    let mut fields = field_header.to_vec();
+    let mut fields = base_fields.to_vec();
     fields.push(("primary_token", TOKEN));
-    let (status, headers, _) = send_form_from(
-        &app,
-        "/admin/llm",
-        test_peer(),
-        headers_with(&fields),
-        &fields,
-    )
-    .await;
+    let (status, response_headers, _) =
+        send_form_from(&app, "/admin/llm", test_peer(), headers.clone(), &fields).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert_eq!(location(&headers), Some("/admin/llm?saved=1"));
+    assert_eq!(location(&response_headers), Some("/admin/llm?saved=1"));
 
     let (status, _, body) =
         send_with_cookie(&app, Method::GET, "/admin/llm?saved=1", &cookie).await;
@@ -4413,18 +4557,12 @@ async fn a_saved_token_is_never_rendered_and_can_be_replaced_or_deleted() {
         "the snapshot uses the saved token"
     );
 
-    let mut fields = field_header.to_vec();
+    let mut fields = base_fields.to_vec();
     fields.push(("primary_token", NEW_TOKEN));
-    let (status, headers, _) = send_form_from(
-        &app,
-        "/admin/llm",
-        test_peer(),
-        headers_with(&fields),
-        &fields,
-    )
-    .await;
+    let (status, response_headers, _) =
+        send_form_from(&app, "/admin/llm", test_peer(), headers.clone(), &fields).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert_eq!(location(&headers), Some("/admin/llm?saved=1"));
+    assert_eq!(location(&response_headers), Some("/admin/llm?saved=1"));
     assert_eq!(
         settings
             .handle()
@@ -4442,18 +4580,12 @@ async fn a_saved_token_is_never_rendered_and_can_be_replaced_or_deleted() {
     let text = String::from_utf8_lossy(&body);
     assert!(!text.contains(NEW_TOKEN), "{text}");
 
-    let mut fields = field_header.to_vec();
+    let mut fields = base_fields.to_vec();
     fields.push(("primary_token_delete", "1"));
-    let (status, headers, _) = send_form_from(
-        &app,
-        "/admin/llm",
-        test_peer(),
-        headers_with(&fields),
-        &fields,
-    )
-    .await;
+    let (status, response_headers, _) =
+        send_form_from(&app, "/admin/llm", test_peer(), headers.clone(), &fields).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert_eq!(location(&headers), Some("/admin/llm?saved=1"));
+    assert_eq!(location(&response_headers), Some("/admin/llm?saved=1"));
     assert_eq!(
         settings.handle().load().effective().primary().token_state(),
         tasklerq::settings::SecretState::NotSet,
@@ -4491,6 +4623,7 @@ async fn a_missing_secret_key_rejects_the_token_but_saves_the_other_fields() {
         test_peer(),
         headers_with(&[("cookie", &cookie)]),
         &[
+            ("enabled_present", "1"),
             ("enabled", "1"),
             ("primary_url", "https://llm.example.test/v1"),
             ("primary_model", "vendor/model"),
@@ -4556,6 +4689,7 @@ async fn a_model_and_quota_change_take_effect_without_a_restart() {
         test_peer(),
         headers_with(&[("cookie", &cookie)]),
         &[
+            ("enabled_present", "1"),
             ("enabled", "1"),
             ("primary_url", "https://llm.example.test/v1"),
             ("primary_model", "first/model"),
@@ -4582,6 +4716,7 @@ async fn a_model_and_quota_change_take_effect_without_a_restart() {
         test_peer(),
         headers_with(&[("cookie", &cookie)]),
         &[
+            ("enabled_present", "1"),
             ("enabled", "1"),
             ("primary_model", "second/model"),
             ("daily_quota", "300"),
@@ -4670,6 +4805,7 @@ async fn a_saved_llm_form_is_audited_without_secret_values() {
         test_peer(),
         headers_with(&[("cookie", &cookie)]),
         &[
+            ("enabled_present", "1"),
             ("enabled", "1"),
             ("primary_url", "https://llm.example.test/v1"),
             ("primary_model", "vendor/model"),
@@ -4768,6 +4904,545 @@ async fn the_llm_page_checks_the_origin_and_the_session() {
     );
 }
 
+/// Проверка из консоли: кнопка, ход, отчёт, отпечаток CLI и отказы.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_check_from_the_console_shows_progress_and_saves_the_cli_fingerprint() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let server = MockServer::start().await;
+    mount_smoke_answers(
+        &server,
+        Duration::from_millis(60),
+        Some(("simple-1", Duration::from_millis(1_200))),
+    )
+    .await;
+    let (app, _) = console_with_server(&db.pool, &server, 1_000);
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    // Кнопка есть только у настроенного слота и показывает число фраз набора.
+    let (status, headers, body) = send_with_cookie(&app, Method::GET, "/admin/llm", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_security_headers(&headers, "GET /admin/llm with a configured slot");
+    assert_local_assets(&body, "GET /admin/llm with a configured slot");
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("action=\"/admin/llm/check/primary\""),
+        "the configured slot has a check button: {text}"
+    );
+    assert!(
+        text.contains("Проверить — 22 фразы"),
+        "the button shows the built-in set size: {text}"
+    );
+    assert!(
+        !text.contains("action=\"/admin/llm/check/fallback\""),
+        "an unconfigured slot has no check button: {text}"
+    );
+
+    // Чужой Origin отвергается слоем роутера, анонимный POST ведёт на вход.
+    let (status, _, _) = send_form_from(
+        &app,
+        "/admin/llm/check/primary",
+        test_peer(),
+        headers_with(&[
+            ("host", "nas:18081"),
+            ("origin", "http://evil.example"),
+            ("cookie", &cookie),
+        ]),
+        &[("titles", "strict")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, headers, _) =
+        send_form(&app, "/admin/llm/check/primary", &[("titles", "strict")]).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/login"));
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("requests")
+            .is_empty(),
+        "a refused check must not reach the LLM"
+    );
+
+    // POST запускает прогон и ведёт на страницу хода.
+    let (status, headers, _) = start_check(&app, &cookie, "primary", "strict").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/llm/check"));
+
+    // Страница хода работает без JavaScript: у фрагмента есть htmx-опрос и
+    // ссылка «Обновить», у полной страницы — meta refresh в noscript.
+    let (status, headers, body) =
+        send_with_cookie(&app, Method::GET, "/admin/llm/check", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_security_headers(&headers, "GET /admin/llm/check");
+    assert_no_external_urls(&body, "GET /admin/llm/check");
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("Проверка слота primary идёт"), "{text}");
+    assert!(text.contains("из 22 фраз"), "{text}");
+    assert!(text.contains("href=\"/admin/llm/check\""), "{text}");
+    assert!(text.contains("<noscript>"), "{text}");
+    assert!(text.contains("hx-trigger=\"every 2s\""), "{text}");
+
+    // Ход растёт: первая фраза медленная, следующие отвечают по очереди.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (_, _, body) = send_with_cookie(&app, Method::GET, "/admin/llm/check", &cookie).await;
+        let text = String::from_utf8_lossy(&body).into_owned();
+        if text.contains("идёт")
+            && let Some(start) = text.find("пройдено ")
+        {
+            let done: usize = text[start + "пройдено ".len()..]
+                .split(' ')
+                .next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            if done > 0 {
+                break;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the check page never showed live progress: {text}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let (status, headers, body) =
+        send_with_cookie(&app, Method::GET, "/admin/llm/check-fragment", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_security_headers(&headers, "GET /admin/llm/check-fragment");
+    assert_no_external_urls(&body, "GET /admin/llm/check-fragment");
+    let fragment = String::from_utf8_lossy(&body);
+    assert!(
+        fragment.contains("hx-get=\"/admin/llm/check-fragment\""),
+        "{fragment}"
+    );
+
+    // Отчёт: провал с фактическим временем и оценкой задержки; опрос прекращён.
+    let text = wait_for_check_report(&app, &cookie).await;
+    assert!(text.contains("пройдено 21 из 22"), "{text}");
+    assert!(text.contains("simple-1"), "{text}");
+    assert!(text.contains("timeout: ответ за 1.2 с"), "{text}");
+    assert!(text.contains("Задержка p95:"), "{text}");
+    assert!(
+        !text.contains("hx-trigger=\"every 2s\""),
+        "a finished check must stop polling: {text}"
+    );
+    let console_fingerprint = saved_fingerprint(&db.pool, "primary").await;
+
+    // Ненастроенный резервный слот: POST отклонён без обращения к LLM.
+    let requests_before = server.received_requests().await.expect("requests").len();
+    let (status, _, _) = start_check(&app, &cookie, "fallback", "strict").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        server.received_requests().await.expect("requests").len(),
+        requests_before,
+        "an unconfigured slot must not call the LLM"
+    );
+
+    // Тот же слот и стандарт в `capture-eval` дают тот же отпечаток.
+    let database_url = command_database_url(&db.pool).await;
+    let url = format!("{}/v1", server.uri());
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_tasklerq"))
+        .env("DATABASE_URL", &database_url)
+        .env("LLM_CAPTURE_ENABLED", "false")
+        .env("LLM_PRIMARY_URL", &url)
+        .env("LLM_PRIMARY_MODEL", "test/model")
+        .env("LLM_PRIMARY_TIMEOUT_MS", "1000")
+        .env("RUST_LOG", "error")
+        .args(["capture-eval", "--slot", "primary"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .expect("the CLI should run");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let cli_text = String::from_utf8_lossy(&output.stdout);
+    assert!(cli_text.contains("timeout"), "{cli_text}");
+    assert_eq!(
+        saved_fingerprint(&db.pool, "primary").await,
+        console_fingerprint,
+        "the console and capture-eval save the same check fingerprint"
+    );
+}
+
+/// Повторное нажатие во время прогона не запускает второй.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_check_post_while_running_does_not_start_another_run() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let server = MockServer::start().await;
+    mount_smoke_answers(&server, Duration::from_millis(150), None).await;
+
+    // Оба слота настроены на один сервер: второй POST по другому слоту тоже
+    // должен вести на ход первого прогона.
+    let primary_url = format!("{}/v1", server.uri());
+    let llm = llm_env(&[
+        ("LLM_CAPTURE_ENABLED", "true"),
+        ("LLM_PRIMARY_URL", &primary_url),
+        ("LLM_PRIMARY_MODEL", "test/model"),
+        ("LLM_PRIMARY_TIMEOUT_MS", "10000"),
+        ("LLM_FALLBACK_URL", &primary_url),
+        ("LLM_FALLBACK_MODEL", "test/model"),
+        ("LLM_FALLBACK_TIMEOUT_MS", "10000"),
+    ]);
+    let (app, _) = console_with_llm(&db.pool, llm, SecretCipher::new(None, None));
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let (status, headers, _) = start_check(&app, &cookie, "primary", "strict").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/llm/check"));
+
+    let (status, headers, _) = start_check(&app, &cookie, "fallback", "strict").await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "a second press does not start another run"
+    );
+    assert_eq!(location(&headers), Some("/admin/llm/check"));
+
+    let text = wait_for_check_report(&app, &cookie).await;
+    assert!(text.contains("Проверка слота primary завершена"), "{text}");
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(
+        requests.len(),
+        22,
+        "only one run reached the LLM, not both slots"
+    );
+}
+
+/// Блокировку держит другой процесс: страница говорит «проверка уже идёт».
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_check_held_by_another_process_reports_busy_without_calling_the_llm() {
+    use sqlx::Connection;
+
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let server = MockServer::start().await;
+    mount_smoke_answers(&server, Duration::ZERO, None).await;
+    let (app, _) = console_with_server(&db.pool, &server, 10_000);
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    // Отдельное соединение, как у `capture-eval` в другом процессе.
+    let database_url = command_database_url(&db.pool).await;
+    let mut lock = sqlx::PgConnection::connect(&database_url)
+        .await
+        .expect("an independent connection");
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(slot_check::CHECK_LOCK_KEY)
+        .fetch_one(&mut lock)
+        .await
+        .expect("the test takes the check lock");
+    assert!(acquired);
+
+    let (status, headers, _) = start_check(&app, &cookie, "primary", "strict").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/llm/check"));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let text = loop {
+        let (status, _, body) =
+            send_with_cookie(&app, Method::GET, "/admin/llm/check", &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8_lossy(&body).into_owned();
+        if text.contains("проверка уже идёт") {
+            break text;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the busy check was never reported: {text}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(text.contains("Слот не проверен"), "{text}");
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("requests")
+            .is_empty(),
+        "a check locked by another process must not reach the LLM"
+    );
+
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(slot_check::CHECK_LOCK_KEY)
+        .execute(&mut lock)
+        .await
+        .expect("unlock");
+}
+
+/// Токен слота сохраняется без пробелов по краям.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slot_token_is_saved_without_surrounding_spaces() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let (app, settings) = console_with_llm(&db.pool, LlmConfig::empty(), cipher_with_key(5));
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let (status, headers, _) = send_form_from(
+        &app,
+        "/admin/llm",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("enabled_present", "1"),
+            ("enabled", "1"),
+            ("primary_url", "https://llm.example.test/v1"),
+            ("primary_model", "vendor/model"),
+            ("primary_token", "  tlq-trimmed-token \t"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/llm?saved=1"));
+    assert_eq!(
+        settings
+            .handle()
+            .load()
+            .effective()
+            .primary()
+            .config()
+            .and_then(|config| config.token.as_ref())
+            .map(|token| token.expose().to_owned()),
+        Some("tlq-trimmed-token".to_owned()),
+        "a trailing space would break the Authorization header"
+    );
+}
+
+/// POST без служебного поля флажка не выключает разбор.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_post_without_the_enabled_marker_keeps_capture_enabled() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let (app, settings) =
+        console_with_llm(&db.pool, LlmConfig::empty(), SecretCipher::new(None, None));
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let (status, _, _) = send_form_from(
+        &app,
+        "/admin/llm",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("enabled_present", "1"),
+            ("enabled", "1"),
+            ("primary_url", "https://llm.example.test/v1"),
+            ("primary_model", "vendor/model"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(
+        settings.handle().load().effective().enabled(),
+        "the first save enables capture"
+    );
+
+    // Неполный POST: только квота. Разбор обязан остаться включённым.
+    let (status, _, _) = send_form_from(
+        &app,
+        "/admin/llm",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("daily_quota", "321")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(
+        settings.handle().load().effective().enabled(),
+        "a partial POST must not switch capture off"
+    );
+    assert_eq!(
+        setting_value(&db.pool, "llm.enabled").await,
+        Some(json!(true))
+    );
+
+    // Браузерная форма со снятым флажком присылает служебное поле: выключает.
+    let (status, _, _) = send_form_from(
+        &app,
+        "/admin/llm",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("enabled_present", "1"), ("daily_quota", "321")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(
+        !settings.handle().load().effective().enabled(),
+        "an unchecked box in the browser form switches capture off"
+    );
+}
+
+/// Отмена запроса сохранения не теряет событие аудита.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_llm_save_still_writes_the_audit_event() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let (app, _) = console_with_llm(&db.pool, LlmConfig::empty(), SecretCipher::new(None, None));
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    // Блокируем запись в settings: обработчик успевает дойти до применения, а
+    // затем его ожидание отменяется. Отсоединённая задача должна дописать аудит.
+    let mut blocker = db.pool.begin().await.expect("blocker transaction");
+    sqlx::query("LOCK TABLE settings IN EXCLUSIVE MODE")
+        .execute(&mut *blocker)
+        .await
+        .expect("the settings table is locked for writing");
+
+    let task_app = app.clone();
+    let task_cookie = cookie.clone();
+    let request = tokio::spawn(async move {
+        send_form_from(
+            &task_app,
+            "/admin/llm",
+            test_peer(),
+            headers_with(&[("cookie", &task_cookie)]),
+            &[
+                ("enabled_present", "1"),
+                ("enabled", "1"),
+                ("primary_url", "https://llm.example.test/v1"),
+                ("primary_model", "vendor/model"),
+                ("daily_quota", "333"),
+            ],
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    request.abort();
+    let cancelled = request.await;
+    assert!(
+        cancelled.is_err() || cancelled.expect("the request finished").0 == StatusCode::SEE_OTHER,
+        "the test cancels the request while the save is blocked"
+    );
+    blocker.rollback().await.expect("release the settings lock");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let payloads = audit_payloads(&db.pool, "admin_setting_changed").await;
+        if payloads
+            .iter()
+            .any(|payload| payload["key"] == "llm.daily_quota")
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a cancelled save lost its audit event: {payloads:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Секрет, который нельзя расшифровать, просит ввести токен заново.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_secret_that_cannot_be_decrypted_asks_for_a_new_token() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+
+    let encrypter = cipher_with_key(3);
+    let mut conn = db.pool.acquire().await.expect("connection");
+    settings::write_value(
+        &mut conn,
+        "llm.primary.url",
+        json!("https://llm.example.test/v1"),
+    )
+    .await
+    .expect("the slot url is written");
+    settings::write_value(&mut conn, "llm.primary.model", json!("vendor/model"))
+        .await
+        .expect("the slot model is written");
+    settings::write_secret(
+        &mut conn,
+        "llm.primary.token",
+        &tasklerq::config::SecretString::new("tlq-encrypted-token"),
+        &encrypter,
+    )
+    .await
+    .expect("the slot token is written");
+    drop(conn);
+
+    // Чужой ключ: шифротекст не читается.
+    let (app, _) = console_with_llm(&db.pool, LlmConfig::empty(), cipher_with_key(4));
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin/llm", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("не расшифровывается — введите токен заново"),
+        "{text}"
+    );
+    assert!(!text.contains("tlq-encrypted-token"), "{text}");
+
+    // Ключа нет вовсе.
+    let (app, _) = console_with_llm(&db.pool, LlmConfig::empty(), SecretCipher::new(None, None));
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin/llm", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("ключ шифрования не задан — введите токен заново"),
+        "{text}"
+    );
+}
+
+/// Отказ токена без ключа аудируется только несекретными полями.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_token_rejected_without_a_key_audits_only_plain_fields() {
+    const TOKEN: &str = "tlq-rejected-secret-token";
+
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let (app, _) = console_with_llm(&db.pool, LlmConfig::empty(), SecretCipher::new(None, None));
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let (status, headers, _) = send_form_from(
+        &app,
+        "/admin/llm",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("enabled_present", "1"),
+            ("enabled", "1"),
+            ("primary_url", "https://llm.example.test/v1"),
+            ("primary_model", "vendor/model"),
+            ("primary_token", TOKEN),
+            ("daily_quota", "322"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        location(&headers),
+        Some("/admin/llm?saved=1&secret=key_missing")
+    );
+
+    let payloads = audit_payloads(&db.pool, "admin_setting_changed").await;
+    let keys: Vec<&str> = payloads
+        .iter()
+        .filter_map(|payload| payload["key"].as_str())
+        .collect();
+    for expected in [
+        "llm.enabled",
+        "llm.primary.url",
+        "llm.primary.model",
+        "llm.daily_quota",
+    ] {
+        assert!(
+            keys.contains(&expected),
+            "the saved plain field {expected} is audited: {payloads:?}"
+        );
+    }
+    assert!(
+        !keys.contains(&"llm.primary.token"),
+        "a rejected token has no audit event: {payloads:?}"
+    );
+    let joined = payloads.iter().map(Value::to_string).collect::<String>();
+    assert!(
+        !joined.contains(TOKEN),
+        "the audit leaked the token: {joined}"
+    );
+}
+
 /// Шаг LLM мастера ведёт на страницу, а сохранённый слот завершает шаг.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_wizard_llm_step_leads_to_the_llm_page_and_completes_on_save() {
@@ -4792,6 +5467,7 @@ async fn the_wizard_llm_step_leads_to_the_llm_page_and_completes_on_save() {
         test_peer(),
         headers_with(&[("cookie", &cookie)]),
         &[
+            ("enabled_present", "1"),
             ("enabled", "1"),
             ("primary_url", "https://llm.example.test/v1"),
             ("primary_model", "vendor/model"),

@@ -22,13 +22,15 @@
 //! стандарт сравнения названий; токен и квота не входят.
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use sqlx::{Connection, PgPool};
+use sqlx::pool::PoolConnection;
+use sqlx::{Connection, PgPool, Postgres};
 use thiserror::Error;
 use url::Url;
 
@@ -58,6 +60,16 @@ pub fn load_set(text: &str) -> Result<SmokeSet, String> {
     Ok(set)
 }
 
+/// Сколько фраз во встроенном наборе.
+///
+/// Кнопка проверки в консоли показывает число из набора, а не литерал: набор
+/// может измениться без правки страницы. Разбор кэшируется: страница не должна
+/// платить за него на каждый показ.
+pub fn builtin_phrase_count() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| load_set(BUILTIN_SET).map_or(0, |set| set.phrases.len()))
+}
+
 /// Прогнать все фразы набора через бэкенд слота.
 ///
 /// Фразы идут по очереди. Запрос собирает та же функция, что и боевой разбор
@@ -81,8 +93,23 @@ pub async fn collect_runs(
     backend: &dyn ChatBackend,
     set: &SmokeSet,
 ) -> Result<BTreeMap<String, SlotRun>, String> {
+    collect_runs_with(backend, set, |_, _| {}).await
+}
+
+/// Собрать исходы вызовов слота и сообщать о ходе прогона.
+///
+/// Наблюдатель получает число пройденных фраз и общее число после каждой
+/// фразы. Нулевой вызов перед первой фразой сообщает общее число сразу:
+/// страница проверки показывает «0 из N», пока ответа ещё нет.
+pub async fn collect_runs_with(
+    backend: &dyn ChatBackend,
+    set: &SmokeSet,
+    progress: impl Fn(usize, usize),
+) -> Result<BTreeMap<String, SlotRun>, String> {
+    let total = set.phrases.len();
+    progress(0, total);
     let mut runs = BTreeMap::new();
-    for phrase in &set.phrases {
+    for (index, phrase) in set.phrases.iter().enumerate() {
         let context = phrase.context(&set.context)?;
         let request = prompt::build_request(&context, &phrase.text);
         let chat = ChatRequest {
@@ -98,6 +125,7 @@ pub async fn collect_runs(
             Err(error) => SlotRun::error(error.code(), duration),
         };
         runs.insert(phrase.id.clone(), run);
+        progress(index + 1, total);
     }
     Ok(runs)
 }
@@ -190,41 +218,90 @@ pub async fn run_check(
     prepared: PreparedCheck,
     titles: Option<TitleMatch>,
 ) -> Result<CheckResult, CheckError> {
-    let mut lock = pool.acquire().await.map_err(CheckError::Database)?;
-    // Соединение блокировки только держит блокировку: стандарт и запись идут по
-    // своим соединениям из пула, поэтому обрыв простаивающего сеанса не ломает
-    // результат. Такой обрыв снимет блокировку досрочно — это цена сеансовой
-    // блокировки при долгом простое; серверный idle timeout в конфигурации
-    // сервиса не задан.
-    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
-        .bind(CHECK_LOCK_KEY)
-        .fetch_one(&mut *lock)
-        .await
-        .map_err(CheckError::Database)?;
-    if !acquired {
-        return Err(CheckError::Busy);
+    run_check_with_progress(pool, prepared, titles, |_, _| {}).await
+}
+
+/// То же, что [`run_check`], но с сообщением о ходе прогона.
+///
+/// Консоль передаёт наблюдателя, который обновляет ход в памяти процесса;
+/// команда `capture-eval` — пустого. Наблюдатель не может отменить прогон.
+pub async fn run_check_with_progress(
+    pool: &PgPool,
+    prepared: PreparedCheck,
+    titles: Option<TitleMatch>,
+    progress: impl Fn(usize, usize) + Sync,
+) -> Result<CheckResult, CheckError> {
+    let lock = CheckLock::acquire(pool).await?;
+    let outcome = run_locked(pool, &prepared, titles, &progress).await;
+    lock.release().await;
+    outcome
+}
+
+/// Соединение с сеансовой advisory-блокировкой проверки.
+///
+/// Соединение не возвращается в пул с блокировкой: при выходе без явного
+/// `pg_advisory_unlock` (отмена future, паника) или при ошибке снятия оно
+/// закрывается. Иначе блокировка залипла бы до закрытия соединения, и все
+/// следующие проверки, включая `capture-eval` в другом процессе, получали бы
+/// «проверка уже идёт».
+struct CheckLock {
+    conn: Option<PoolConnection<Postgres>>,
+}
+
+impl CheckLock {
+    /// Взять блокировку или вернуть [`CheckError::Busy`], не тревожа LLM.
+    async fn acquire(pool: &PgPool) -> Result<Self, CheckError> {
+        let mut conn = pool.acquire().await.map_err(CheckError::Database)?;
+        // Соединение блокировки только держит блокировку: стандарт и запись
+        // идут по своим соединениям из пула, поэтому обрыв простаивающего
+        // сеанса не ломает результат. Такой обрыв снимет блокировку досрочно —
+        // это цена сеансовой блокировки при долгом простое; серверный idle
+        // timeout в конфигурации сервиса не задан.
+        let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+            .bind(CHECK_LOCK_KEY)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(CheckError::Database)?;
+        if !acquired {
+            return Err(CheckError::Busy);
+        }
+        Ok(Self { conn: Some(conn) })
     }
 
-    let outcome = run_locked(pool, &prepared, titles).await;
-
-    // Соединение блокировки закрывается, если снять её не удалось: сеансовая
-    // блокировка не должна залипнуть в пуле.
-    match sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(CHECK_LOCK_KEY)
-        .execute(&mut *lock)
-        .await
-    {
-        Ok(_) => drop(lock),
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "could not release the llm slot check lock; closing its connection"
-            );
-            lock.close().await.ok();
+    /// Снять блокировку и вернуть соединение в пул.
+    ///
+    /// При ошибке снятия соединение закрывается: `Drop` не даст вернуть его в
+    /// пул с блокировкой.
+    async fn release(mut self) {
+        let Some(conn) = self.conn.as_mut() else {
+            return;
+        };
+        let released = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(CHECK_LOCK_KEY)
+            .execute(&mut **conn)
+            .await;
+        match released {
+            Ok(_) => {
+                // Блокировка снята: соединение можно вернуть в пул.
+                drop(self.conn.take());
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "could not release the llm slot check lock; closing its connection"
+                );
+            }
         }
     }
+}
 
-    outcome
+impl Drop for CheckLock {
+    fn drop(&mut self) {
+        if let Some(mut conn) = self.conn.take() {
+            tracing::warn!("llm slot check lock connection was dropped without unlock; closing it");
+            conn.close_on_drop();
+        }
+    }
 }
 
 /// Прогон и запись под уже взятой блокировкой.
@@ -232,6 +309,7 @@ async fn run_locked(
     pool: &PgPool,
     prepared: &PreparedCheck,
     requested: Option<TitleMatch>,
+    progress: &(impl Fn(usize, usize) + Sync),
 ) -> Result<CheckResult, CheckError> {
     let mode = match requested {
         Some(titles) => titles,
@@ -257,7 +335,7 @@ async fn run_locked(
 
     // Прогон один: вызовы слота платные и недетерминированные, поэтому оба
     // режима судят одни и те же исходы.
-    let runs = collect_runs(prepared.backend.as_ref(), &prepared.set)
+    let runs = collect_runs_with(prepared.backend.as_ref(), &prepared.set, progress)
         .await
         .map_err(CheckError::Set)?;
     let report = evaluate_with(&prepared.set, &runs, prepared.slot.timeout, mode)

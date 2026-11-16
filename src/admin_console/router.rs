@@ -26,6 +26,7 @@ use crate::rate_limit::{RateDecision, RateLimiter};
 use crate::security_audit::{Audit, LimitKey, RateLimitEvent};
 use crate::settings::crypto::SecretCipher;
 
+use super::checks::CheckState;
 use super::wizard::{WIZARD_PATH, WIZARD_SKIP_PATH, WizardSettings};
 use super::{assets, origin, pages};
 
@@ -58,6 +59,8 @@ pub struct AdminState {
     /// Тот же экземпляр применения настроек LLM, что у рантайма: страница
     /// меняет настройки без перезапуска.
     llm_settings: LlmSettings,
+    /// Ход проверки слота; одна проверка на процесс.
+    checks: CheckState,
 }
 
 impl AdminState {
@@ -82,6 +85,7 @@ impl AdminState {
             recovery_limiter: failure_limiter(),
             wizard: WizardSettings::default(),
             llm_settings,
+            checks: CheckState::new(),
         }
     }
 
@@ -94,6 +98,11 @@ impl AdminState {
     /// Применение настроек LLM без перезапуска.
     pub fn llm_settings(&self) -> &LlmSettings {
         &self.llm_settings
+    }
+
+    /// Состояние проверки слота.
+    pub fn checks(&self) -> &CheckState {
+        &self.checks
     }
 
     /// Задать параметры мастера: режим, Telegram, LLM и ключ шифрования.
@@ -191,6 +200,12 @@ pub fn build_router(state: AdminState) -> Router {
             pages::LLM_PATH,
             get(pages::llm_page).post(pages::llm_submit),
         )
+        .route(pages::LLM_CHECK_PATH, get(pages::llm_check_page))
+        .route(
+            pages::LLM_CHECK_FRAGMENT_PATH,
+            get(pages::llm_check_fragment),
+        )
+        .route("/admin/llm/check/{slot}", post(pages::llm_check_start))
         .route(
             "/admin/setup",
             get(pages::setup_page).post(pages::setup_submit),

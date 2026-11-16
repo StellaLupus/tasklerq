@@ -15,6 +15,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value, json};
 use sqlx::postgres::PgPoolOptions;
+use sqlx::{Connection, PgConnection};
 use tasklerq::capture::eval::TitleMatch;
 use tasklerq::capture::prompt::{self, PROMPT_VERSION};
 use tasklerq::capture::slot_check;
@@ -887,10 +888,15 @@ async fn the_lock_is_released_when_the_result_cannot_be_saved() {
         "a database without migrations cannot store the check"
     );
 
-    let mut conn = db.pool.acquire().await.expect("connection");
+    // Проверка на независимом соединении: если блокировка залипла в пуле, то
+    // `pg_try_advisory_lock` из того же пула мог бы попасть в тот же сеанс и
+    // ошибочно сообщить об успехе.
+    let mut conn = PgConnection::connect(&db.url)
+        .await
+        .expect("an independent connection");
     let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
         .bind(slot_check::CHECK_LOCK_KEY)
-        .fetch_one(&mut *conn)
+        .fetch_one(&mut conn)
         .await
         .expect("try the check lock");
     assert!(
@@ -899,9 +905,119 @@ async fn the_lock_is_released_when_the_result_cannot_be_saved() {
     );
     sqlx::query("SELECT pg_advisory_unlock($1)")
         .bind(slot_check::CHECK_LOCK_KEY)
-        .execute(&mut *conn)
+        .execute(&mut conn)
         .await
         .expect("unlock");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Отмена future проверки освобождает блокировку для следующего прогона.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_check_releases_the_lock_for_the_next_run() {
+    let db = cli_database().await;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("USER_TEXT\\nполить цветы\\nUSER_TEXT"))
+        .respond_with(
+            completion(&support::llm::v4::response(vec![support::llm::v4::task(
+                "Полить цветы",
+            )]))
+            .set_delay(Duration::from_millis(800)),
+        )
+        .mount(&server)
+        .await;
+    let (set_path, dir) = write_set(
+        "cancelled-lock",
+        &smoke_set(&[("first", "полить цветы", "Полить цветы")]),
+    );
+    let set_text = std::fs::read_to_string(&set_path).expect("the smoke set");
+    let slot = SlotConfig {
+        url: format!("{}/v1", server.uri()).parse().expect("url"),
+        model: "test/model".to_owned(),
+        token: None,
+        timeout: Duration::from_secs(10),
+        extra: Map::new(),
+    };
+    let prepared = |slot: &SlotConfig, set_text: &str| {
+        let backend = OpenAiBackend::from_slot(slot, Duration::from_secs(5)).expect("backend");
+        slot_check::PreparedCheck {
+            slot_name: "primary",
+            slot: slot.clone(),
+            backend: Box::new(backend),
+            set: slot_check::load_set(set_text).expect("the set matches the contract"),
+            set_text: set_text.to_owned(),
+        }
+    };
+
+    let pool = db.pool.clone();
+    let first_slot = slot.clone();
+    let first_set = set_text.clone();
+    let first = tokio::spawn(async move {
+        let prepared = prepared(&first_slot, &first_set);
+        slot_check::run_check(&pool, prepared, Some(TitleMatch::Strict)).await
+    });
+
+    // Прогон дошёл до LLM: блокировка уже взята, запрос в полёте.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if !server
+            .received_requests()
+            .await
+            .expect("requests")
+            .is_empty()
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first check never reached the LLM"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    first.abort();
+    assert!(first.await.is_err(), "the test cancels the run");
+
+    // Блокировку проверяем на независимом соединении: если она залипла в
+    // пуле, тот же пул мог бы вернуть её же сеанс.
+    let mut conn = PgConnection::connect(&db.url)
+        .await
+        .expect("an independent connection");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+            .bind(slot_check::CHECK_LOCK_KEY)
+            .fetch_one(&mut conn)
+            .await
+            .expect("try the check lock");
+        if acquired {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a cancelled check left the lock held"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(slot_check::CHECK_LOCK_KEY)
+        .execute(&mut conn)
+        .await
+        .expect("unlock");
+
+    // Следующая проверка получает блокировку и проходит.
+    let result = slot_check::run_check(
+        &db.pool,
+        prepared(&slot, &set_text),
+        Some(TitleMatch::Strict),
+    )
+    .await
+    .expect("the next check takes the released lock");
+    assert!(
+        result.report.passed(),
+        "the next check runs after the cancelled one"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -14,8 +14,8 @@
 //! `src/`. Значения пользователя подставляет askama и экранирует их сам; `|safe`
 //! стоит только на уже отрисованном фрагменте askama, не на данных страницы.
 //!
-//! Формы — обычные POST без JavaScript; htmx подключён макетом для будущего
-//! хода проверки слота, но ни одна форма этого пункта от него не зависит.
+//! Формы — обычные POST без JavaScript; htmx подключён макетом для опроса хода
+//! проверки слота, и страница хода работает без него по ссылке «Обновить».
 //!
 //! Сверка `Origin` живёт отдельным слоем роутера
 //! ([`super::router::require_trusted_origin`]): сюда запрос с чужим origin не
@@ -36,6 +36,7 @@ use serde_json::Value;
 
 use super::assets;
 use super::change::{self, ChangeError, ChangeOutcome};
+use super::checks::{CheckOutcome, CheckSlot, CheckSnapshot};
 use super::login::{self, LoginError, LoginOutcome};
 use super::password::{self, Password};
 use super::recovery::{self, RecoveryCheck, RecoveryError, RecoveryOutcome};
@@ -44,13 +45,16 @@ use super::session::{self, AdminSession, LOGIN_PATH};
 use super::setup::{self, SetupError, SetupOutcome};
 use super::wizard::{self, WizardStep};
 use crate::admin;
+use crate::capture::eval::TitleMatch;
+use crate::capture::slot_check::{self, CheckError, PreparedCheck};
 use crate::domain::error::DomainError;
 use crate::domain::settings::{DEFAULT_TIMEZONE, validate_timezone};
 use crate::domain::validation::normalize_text;
-use crate::llm::{LlmApplyError, LlmChange};
+use crate::llm::{LlmApplyError, LlmChange, OpenAiBackend};
 use crate::rate_limit::RateDecision;
 use crate::settings::{ResolvedSetting, SecretState, SettingError, SettingSource};
 use crate::storage::repositories::admin_accounts;
+use crate::storage::repositories::llm_slot_settings;
 
 /// Путь страницы первого входа.
 const SETUP_PATH: &str = "/admin/setup";
@@ -60,6 +64,10 @@ const HOME_PATH: &str = "/admin";
 const PASSWORD_PATH: &str = "/admin/password";
 /// Путь страницы настроек LLM.
 pub(crate) const LLM_PATH: &str = "/admin/llm";
+/// Путь страницы хода проверки слота.
+pub(crate) const LLM_CHECK_PATH: &str = "/admin/llm/check";
+/// Путь фрагмента хода для htmx; полная страница работает без JavaScript.
+pub(crate) const LLM_CHECK_FRAGMENT_PATH: &str = "/admin/llm/check-fragment";
 /// Успешное сохранение настроек LLM.
 const LLM_SAVED_PATH: &str = "/admin/llm?saved=1";
 /// Настройки сохранены, но токен отклонён: нет ключа шифрования.
@@ -153,6 +161,10 @@ pub(crate) struct TokenForm {
 /// или слот остаётся неполным и сохранение отклоняется).
 #[derive(Deserialize)]
 pub(crate) struct LlmForm {
+    /// Служебное поле: браузерная форма присылает его всегда, поэтому
+    /// отсутствие флажка `enabled` означает «снят», а не «поле не прислали».
+    #[serde(default)]
+    enabled_present: Option<String>,
     /// Флажок включения разбора.
     #[serde(default)]
     enabled: Option<String>,
@@ -229,6 +241,14 @@ pub(crate) struct LlmQuery {
     saved: Option<String>,
     #[serde(default)]
     secret: Option<String>,
+}
+
+/// Поля формы проверки слота.
+#[derive(Deserialize)]
+pub(crate) struct CheckForm {
+    /// Выбранный стандарт названий; нет поля — действующий стандарт слота.
+    #[serde(default)]
+    titles: Option<String>,
 }
 
 /// `GET /admin`: главная страница за сессией.
@@ -457,15 +477,21 @@ pub(crate) async fn llm_page(
     _session: AdminSession,
     Query(query): Query<LlmQuery>,
 ) -> Response {
-    match state.llm_settings().read_settings().await {
-        Ok(settings) => render(ConsolePage::new(Page::Llm(Box::new(llm_view(
-            &settings,
-            None,
-            query.saved.is_some(),
-            query.secret.as_deref() == Some("key_missing"),
-        ))))),
-        Err(error) => internal(error),
-    }
+    let settings = match state.llm_settings().read_settings().await {
+        Ok(settings) => settings,
+        Err(error) => return internal(error),
+    };
+    let checks = match llm_checks(&state).await {
+        Ok(checks) => checks,
+        Err(error) => return internal(error),
+    };
+    render(ConsolePage::new(Page::Llm(Box::new(llm_view(
+        &settings,
+        None,
+        query.saved.is_some(),
+        query.secret.as_deref() == Some("key_missing"),
+        checks,
+    )))))
 }
 
 /// `POST /admin/llm`: применить изменённые поля одной группой.
@@ -490,13 +516,55 @@ pub(crate) async fn llm_submit(
 
     let now = Utc::now();
     let all: Vec<LlmChange> = pending.iter().map(|change| change.change.clone()).collect();
+
+    // Применение и аудит — одна отсоединённая задача: обрыв HTTP-запроса не
+    // оставляет изменённые настройки без события журнала. Ожидание результата
+    // отменяемо, сама запись и аудит — нет.
+    let task = tokio::spawn(save_llm(state.clone(), pending, all, now));
+    match task.await {
+        Ok(LlmSaveOutcome::Saved) => redirect(LLM_SAVED_PATH),
+        Ok(LlmSaveOutcome::SecretRejected { others_saved: true }) => {
+            redirect(LLM_SECRET_REJECTED_PATH)
+        }
+        Ok(LlmSaveOutcome::SecretRejected {
+            others_saved: false,
+        }) => redirect(LLM_SECRET_ONLY_REJECTED_PATH),
+        Ok(LlmSaveOutcome::Failed(error)) => llm_error_page(&state, &form, &error).await,
+        Err(error) => internal(error),
+    }
+}
+
+/// Итог отсоединённого сохранения настроек LLM.
+enum LlmSaveOutcome {
+    /// Всё сохранено и записано в аудит.
+    Saved,
+    /// Токен отклонён: нет ключа шифрования.
+    SecretRejected {
+        /// Остальные поля сохранены отдельной группой.
+        others_saved: bool,
+    },
+    /// Применение не удалось; ничего не изменено.
+    Failed(LlmApplyError),
+}
+
+/// Применить группу изменений и записать её в аудит.
+///
+/// Группа с секретом при отсутствии ключа шифрования сохраняется без секрета:
+/// остальные поля формы не должны теряться. Аудит пишется в той же задаче, что
+/// и применение, поэтому отмена запроса не оставляет сохранение без события.
+async fn save_llm(
+    state: AdminState,
+    pending: Vec<PendingChange>,
+    all: Vec<LlmChange>,
+    now: DateTime<Utc>,
+) -> LlmSaveOutcome {
     let has_secret = pending.iter().any(PendingChange::is_secret);
 
     if has_secret {
         match state.llm_settings().apply(&all).await {
             Ok(_) => {
                 audit_changes(&state, &pending, now).await;
-                return redirect(LLM_SAVED_PATH);
+                return LlmSaveOutcome::Saved;
             }
             Err(LlmApplyError::Setting(SettingError::SecretKeyMissing { .. })) => {
                 let plain: Vec<LlmChange> = pending
@@ -505,27 +573,119 @@ pub(crate) async fn llm_submit(
                     .map(|change| change.change.clone())
                     .collect();
                 if plain.is_empty() {
-                    return redirect(LLM_SECRET_ONLY_REJECTED_PATH);
+                    return LlmSaveOutcome::SecretRejected {
+                        others_saved: false,
+                    };
                 }
-                match state.llm_settings().apply(&plain).await {
+                return match state.llm_settings().apply(&plain).await {
                     Ok(_) => {
                         audit_plain_changes(&state, &pending, now).await;
-                        return redirect(LLM_SECRET_REJECTED_PATH);
+                        LlmSaveOutcome::SecretRejected { others_saved: true }
                     }
-                    Err(error) => return llm_error_page(&state, &form, &error).await,
-                }
+                    Err(error) => LlmSaveOutcome::Failed(error),
+                };
             }
-            Err(error) => return llm_error_page(&state, &form, &error).await,
+            Err(error) => return LlmSaveOutcome::Failed(error),
         }
     }
 
     match state.llm_settings().apply(&all).await {
         Ok(_) => {
             audit_changes(&state, &pending, now).await;
-            redirect(LLM_SAVED_PATH)
+            LlmSaveOutcome::Saved
         }
-        Err(error) => llm_error_page(&state, &form, &error).await,
+        Err(error) => LlmSaveOutcome::Failed(error),
     }
+}
+
+/// `GET /admin/llm/check`: страница хода проверки слота.
+///
+/// Открывается после POST и без JavaScript: ссылка «Обновить» перезагружает
+/// страницу, пока прогон идёт.
+pub(crate) async fn llm_check_page(
+    State(state): State<AdminState>,
+    _session: AdminSession,
+) -> Response {
+    render(ConsolePage::new(Page::Check(state.checks().current())))
+}
+
+/// `GET /admin/llm/check-fragment`: ход проверки для htmx.
+///
+/// Фрагмент опрашивает себя раз в 2 секунды, пока прогон идёт; после отчёта
+/// атрибуты опроса пропадают, и страница перестаёт ходить в сеть.
+pub(crate) async fn llm_check_fragment(
+    State(state): State<AdminState>,
+    _session: AdminSession,
+) -> Response {
+    let view = check_view(state.checks().current().as_ref());
+    match (CheckBody { view: &view }).render() {
+        Ok(body) => (StatusCode::OK, Html(body)).into_response(),
+        Err(error) => internal(error),
+    }
+}
+
+/// `POST /admin/llm/check/{slot}`: запустить проверку слота в фоне.
+///
+/// Проверка берёт слот из действующего снимка — того же, что строит
+/// `capture-eval` из окружения, базы и ключа. Прогон идёт отдельной задачей:
+/// обрыв HTTP-запроса его не прерывает. Пока проверка идёт, повторный POST
+/// ведёт на её страницу и не запускает второй прогон.
+pub(crate) async fn llm_check_start(
+    State(state): State<AdminState>,
+    _session: AdminSession,
+    Path(slot): Path<String>,
+    Form(form): Form<CheckForm>,
+) -> Response {
+    let Some(slot) = CheckSlot::from_slug(&slot) else {
+        return (StatusCode::BAD_REQUEST, "Unknown slot").into_response();
+    };
+
+    let snapshot = state.llm_settings().handle().load();
+    let effective = snapshot.effective();
+    let Some(config) = slot.config(effective).cloned() else {
+        let message = format!("Слот {} не настроен: проверять нечего.", slot.slug());
+        return llm_page_with_message(&state, &message, StatusCode::BAD_REQUEST).await;
+    };
+
+    let set_text = slot_check::BUILTIN_SET.to_owned();
+    let set = match slot_check::load_set(&set_text) {
+        Ok(set) => set,
+        Err(error) => return internal(error),
+    };
+    let backend = match OpenAiBackend::from_slot(&config, effective.connect_timeout()) {
+        Ok(backend) => backend,
+        Err(error) => return internal(error),
+    };
+    let prepared = PreparedCheck {
+        slot_name: slot.name(),
+        slot: config,
+        backend: Box::new(backend),
+        set,
+        set_text,
+    };
+    let titles = form.titles.as_deref().and_then(TitleMatch::from_code);
+
+    if !state
+        .checks()
+        .try_start(slot.name(), slot_check::builtin_phrase_count())
+    {
+        return redirect(LLM_CHECK_PATH);
+    }
+
+    let checks = state.checks().clone();
+    let task_state = state.clone();
+    tokio::spawn(async move {
+        let progress = |done, total| checks.advance(done, total);
+        match slot_check::run_check_with_progress(&task_state.pool, prepared, titles, progress)
+            .await
+        {
+            Ok(result) => checks.finish_result(result),
+            Err(CheckError::Busy) => checks.fail("Слот не проверен: проверка уже идёт."),
+            Err(error) => checks.fail(format!("Проверка не выполнена: {error}")),
+        }
+    });
+
+    redirect(LLM_CHECK_PATH)
 }
 
 /// `GET /admin/wizard`: текущий шаг мастера за сессией.
@@ -807,14 +967,18 @@ fn collect_changes(form: &LlmForm, settings: &[ResolvedSetting]) -> Vec<PendingC
     let mut changes = Vec::new();
 
     if !is_readonly(settings, "llm.enabled") {
-        let current = bool_of(settings, "llm.enabled").unwrap_or(false);
-        let submitted = form.enabled.is_some();
-        if submitted != current {
-            changes.push(PendingChange {
-                change: LlmChange::set("llm.enabled", Value::Bool(submitted)),
-                key: "llm.enabled",
-                audit_value: "changed",
-            });
+        // Отсутствие `enabled_present` — неполный POST, а не снятый флажок:
+        // браузерная форма присылает служебное поле всегда.
+        if form.enabled_present.is_some() {
+            let current = bool_of(settings, "llm.enabled").unwrap_or(false);
+            let submitted = form.enabled.is_some();
+            if submitted != current {
+                changes.push(PendingChange {
+                    change: LlmChange::set("llm.enabled", Value::Bool(submitted)),
+                    key: "llm.enabled",
+                    audit_value: "changed",
+                });
+            }
         }
     }
 
@@ -883,7 +1047,7 @@ fn collect_slot_changes(
             key: keys.token,
             audit_value: "deleted",
         });
-    } else if let Some(token) = form.token.filter(|token| !token.trim().is_empty()) {
+    } else if let Some(token) = form.token.map(str::trim).filter(|token| !token.is_empty()) {
         changes.push(PendingChange {
             change: LlmChange::secret(keys.token, token),
             key: keys.token,
@@ -945,18 +1109,43 @@ async fn llm_error_page(state: &AdminState, form: &LlmForm, error: &LlmApplyErro
     let Some(message) = llm_error_message(error) else {
         return internal(error);
     };
-    match state.llm_settings().read_settings().await {
-        Ok(settings) => render(
-            ConsolePage::new(Page::Llm(Box::new(llm_view(
-                &settings,
-                Some(form),
-                false,
-                false,
-            ))))
-            .error(&message),
-        ),
-        Err(error) => internal(error),
-    }
+    let settings = match state.llm_settings().read_settings().await {
+        Ok(settings) => settings,
+        Err(error) => return internal(error),
+    };
+    let checks = match llm_checks(state).await {
+        Ok(checks) => checks,
+        Err(error) => return internal(error),
+    };
+    render(
+        ConsolePage::new(Page::Llm(Box::new(llm_view(
+            &settings,
+            Some(form),
+            false,
+            false,
+            checks,
+        ))))
+        .error(&message),
+    )
+}
+
+/// Страница настроек с сообщением об отказе проверки.
+async fn llm_page_with_message(state: &AdminState, message: &str, status: StatusCode) -> Response {
+    let settings = match state.llm_settings().read_settings().await {
+        Ok(settings) => settings,
+        Err(error) => return internal(error),
+    };
+    let checks = match llm_checks(state).await {
+        Ok(checks) => checks,
+        Err(error) => return internal(error),
+    };
+    render_with_status(
+        ConsolePage::new(Page::Llm(Box::new(llm_view(
+            &settings, None, false, false, checks,
+        ))))
+        .error(message),
+        status,
+    )
 }
 
 /// Понятное сообщение формы с именем поля; `None` — внутренняя ошибка.
@@ -1149,6 +1338,42 @@ struct LlmView {
     connect_timeout: LlmTextField,
     /// Суточная квота.
     daily_quota: LlmTextField,
+    /// Кнопки проверки настроенных слотов.
+    checks: LlmChecks,
+}
+
+/// Кнопки проверки по слотам.
+struct LlmChecks {
+    /// Основной слот; `None` — слот не настроен.
+    primary: Option<LlmCheck>,
+    /// Резервный слот; `None` — слот не настроен.
+    fallback: Option<LlmCheck>,
+}
+
+impl LlmChecks {
+    /// Есть ли что проверять.
+    fn any(&self) -> bool {
+        self.primary.is_some() || self.fallback.is_some()
+    }
+
+    /// Кнопки в порядке слотов.
+    fn iter(&self) -> impl Iterator<Item = &LlmCheck> {
+        [self.primary.as_ref(), self.fallback.as_ref()]
+            .into_iter()
+            .flatten()
+    }
+}
+
+/// Кнопка проверки одного слота.
+struct LlmCheck {
+    /// Слот.
+    slot: CheckSlot,
+    /// Название слота для подписи.
+    legend: &'static str,
+    /// Число фраз встроенного набора.
+    phrases: usize,
+    /// Действующий стандарт слота — он выбран в форме по умолчанию.
+    titles: TitleMatch,
 }
 
 /// Логическое поле формы.
@@ -1206,6 +1431,7 @@ fn llm_view(
     form: Option<&LlmForm>,
     saved: bool,
     secret_rejected: bool,
+    checks: LlmChecks,
 ) -> LlmView {
     LlmView {
         saved,
@@ -1213,7 +1439,11 @@ fn llm_view(
         enabled: toggle_view(
             settings,
             "llm.enabled",
-            form.map(|form| form.enabled.is_some()),
+            form.and_then(|form| {
+                form.enabled_present
+                    .as_ref()
+                    .map(|_| form.enabled.is_some())
+            }),
         ),
         primary: slot_view(settings, PRIMARY_KEYS, form, true),
         fallback: slot_view(settings, FALLBACK_KEYS, form, false),
@@ -1227,7 +1457,46 @@ fn llm_view(
             "llm.daily_quota",
             form.and_then(|form| form.daily_quota.as_deref()),
         ),
+        checks,
     }
+}
+
+/// Кнопки проверки для настроенных слотов.
+///
+/// Слот берётся из действующего снимка: проверка пойдёт с той же
+/// конфигурацией, что у разбора. Стандарт названий читается из `settings`:
+/// как и у `capture-eval` без флага, он служит значением по умолчанию.
+async fn llm_checks(state: &AdminState) -> Result<LlmChecks, sqlx::Error> {
+    let snapshot = state.llm_settings().handle().load();
+    let effective = snapshot.effective();
+    let phrases = slot_check::builtin_phrase_count();
+    let mut conn = state.pool.acquire().await?;
+
+    let primary = llm_check(&mut conn, effective, CheckSlot::Primary, phrases).await?;
+    let fallback = llm_check(&mut conn, effective, CheckSlot::Fallback, phrases).await?;
+    Ok(LlmChecks { primary, fallback })
+}
+
+async fn llm_check(
+    conn: &mut sqlx::PgConnection,
+    effective: &crate::settings::EffectiveLlm,
+    slot: CheckSlot,
+    phrases: usize,
+) -> Result<Option<LlmCheck>, sqlx::Error> {
+    if slot.config(effective).is_none() {
+        return Ok(None);
+    }
+    let stored = llm_slot_settings::titles(conn, slot.name()).await?;
+    let titles = TitleMatch::from_code(&stored).unwrap_or(TitleMatch::Strict);
+    Ok(Some(LlmCheck {
+        slot,
+        legend: match slot {
+            CheckSlot::Primary => "Основной слот",
+            CheckSlot::Fallback => "Резервный слот",
+        },
+        phrases,
+        titles,
+    }))
 }
 
 fn slot_view(
@@ -1352,6 +1621,87 @@ fn bool_of(settings: &[ResolvedSetting], key: &str) -> Option<bool> {
     }
 }
 
+/// Вид хода проверки для шаблона.
+struct CheckView {
+    /// Проверка уже запускалась.
+    started: bool,
+    /// Проверка идёт.
+    running: bool,
+    /// Имя слота.
+    slot: &'static str,
+    /// Сколько фраз пройдено.
+    done: usize,
+    /// Сколько фраз в наборе.
+    total: usize,
+    /// Сколько фраз пройдено в готовом отчёте.
+    passed: usize,
+    /// Отчёт с причинами и оценкой задержки; пусто — отчёта нет.
+    report: String,
+    /// Результат сохранён.
+    saved: bool,
+    /// Причина, по которой проверка не выполнена.
+    error: String,
+}
+
+/// Привести снимок проверки к плоскому виду для шаблона.
+fn check_view(snapshot: Option<&CheckSnapshot>) -> CheckView {
+    let Some(snapshot) = snapshot else {
+        return CheckView {
+            started: false,
+            running: false,
+            slot: "",
+            done: 0,
+            total: 0,
+            passed: 0,
+            report: String::new(),
+            saved: false,
+            error: String::new(),
+        };
+    };
+    let mut view = CheckView {
+        started: true,
+        running: snapshot.running(),
+        slot: snapshot.slot,
+        done: snapshot.done,
+        total: snapshot.total,
+        passed: 0,
+        report: String::new(),
+        saved: false,
+        error: String::new(),
+    };
+    match &snapshot.outcome {
+        None => {}
+        Some(CheckOutcome::Report {
+            report,
+            passed,
+            total,
+            saved,
+        }) => {
+            view.passed = *passed;
+            view.total = *total;
+            view.report = report.clone();
+            view.saved = *saved;
+        }
+        Some(CheckOutcome::Failed { message }) => view.error = message.clone(),
+    }
+    view
+}
+
+/// Слово «фраза» в нужной форме: 22 фразы, 21 фраза, 25 фраз.
+fn phrase_word(count: usize) -> &'static str {
+    let last_two = count % 100;
+    let last = count % 10;
+    if (11..=14).contains(&last_two) {
+        "фраз"
+    } else {
+        match last {
+            1 => "фраза",
+            2..=4 => "фразы",
+            _ => "фраз",
+        }
+    }
+}
+
 /// Данные страницы; тип страницы задаёт и заголовок, и навигацию.
 enum Page {
     /// Главная за сессией.
@@ -1391,6 +1741,8 @@ enum Page {
     },
     /// Настройки разбора.
     Llm(Box<LlmView>),
+    /// Ход проверки слота.
+    Check(Option<CheckSnapshot>),
 }
 
 /// Поля шага мастера, которые возвращаются в форму после отказа.
@@ -1424,6 +1776,7 @@ impl Page {
             Self::Wizard { step, .. } => step.title(),
             Self::TokenIssued { .. } => "Токен Home Assistant",
             Self::Llm(_) => "Разбор записей",
+            Self::Check(_) => "Проверка слота",
         }
     }
 
@@ -1439,6 +1792,7 @@ impl Page {
                 | Self::Wizard { .. }
                 | Self::TokenIssued { .. }
                 | Self::Llm(_)
+                | Self::Check(_)
         )
     }
 
@@ -1503,6 +1857,23 @@ impl Page {
                     slot: &view.fallback,
                 }
                 .render()?;
+                let mut checks = String::new();
+                for check in view.checks.iter() {
+                    checks.push_str(
+                        &CheckButtonBody {
+                            legend: check.legend,
+                            slot: check.slot.slug(),
+                            phrases: check.phrases,
+                            phrase_word: phrase_word(check.phrases),
+                            strict: check.titles == TitleMatch::Strict,
+                            normalized: check.titles == TitleMatch::Normalized,
+                        }
+                        .render()?,
+                    );
+                }
+                if !view.checks.any() {
+                    checks.push_str("<p>Настройте слот, чтобы проверить его.</p>");
+                }
                 LlmBody {
                     saved: view.saved,
                     secret_rejected: view.secret_rejected,
@@ -1511,6 +1882,16 @@ impl Page {
                     daily_quota: &view.daily_quota,
                     primary,
                     fallback,
+                    checks,
+                }
+                .render()
+            }
+            Self::Check(snapshot) => {
+                let view = check_view(snapshot.as_ref());
+                let check = CheckBody { view: &view }.render()?;
+                CheckPageBody {
+                    running: view.running,
+                    check,
                 }
                 .render()
             }
@@ -1864,6 +2245,7 @@ struct SlotBody<'a> {
 <p role="alert" class="console-alert">Токен не сохранён: не задан ключ шифрования TASKLERQ_SECRET_KEY.{% if saved %} Остальные поля сохранены.{% endif %}</p>
 {% endif %}
 <form method="post" action="/admin/llm">
+<input type="hidden" name="enabled_present" value="1">
 <fieldset>
 <legend>Разбор</legend>
 <p><label><input id="llm-enabled" name="enabled" type="checkbox" value="1"{% if enabled.checked %} checked{% endif %}{% if enabled.readonly %} disabled{% endif %}> Включить разбор</label>
@@ -1882,6 +2264,10 @@ struct SlotBody<'a> {
 </fieldset>
 <p><button type="submit">Сохранить</button></p>
 </form>
+<fieldset>
+<legend>Проверка слотов</legend>
+{{ checks|safe }}
+</fieldset>
 "#,
     ext = "html"
 )]
@@ -1900,15 +2286,101 @@ struct LlmBody<'a> {
     primary: String,
     /// Уже отрисованный резервный слот.
     fallback: String,
+    /// Уже отрисованные кнопки проверки.
+    checks: String,
+}
+
+/// Форма проверки одного слота.
+#[derive(Template)]
+#[template(
+    source = r#"<div class="console-check">
+<p><strong>{{ legend }}</strong></p>
+<form method="post" action="/admin/llm/check/{{ slot }}">
+<p><label for="llm-check-{{ slot }}-titles">Стандарт названий</label>
+<select id="llm-check-{{ slot }}-titles" name="titles">
+<option value="strict"{% if strict %} selected{% endif %}>strict</option>
+<option value="normalized"{% if normalized %} selected{% endif %}>normalized</option>
+</select>
+<button type="submit">Проверить — {{ phrases }} {{ phrase_word }}</button></p>
+</form>
+</div>
+"#,
+    ext = "html"
+)]
+struct CheckButtonBody {
+    /// Название слота.
+    legend: &'static str,
+    /// Слот в адресе формы.
+    slot: &'static str,
+    /// Число фраз набора.
+    phrases: usize,
+    /// Слово «фраза» в нужной форме.
+    phrase_word: &'static str,
+    /// Выбран строгий стандарт.
+    strict: bool,
+    /// Выбран нормализованный стандарт.
+    normalized: bool,
+}
+
+/// Содержимое страницы хода проверки.
+#[derive(Template)]
+#[template(
+    source = r#"<h1>Проверка слота</h1>
+{% if running %}<noscript><meta http-equiv="refresh" content="2"></noscript>{% endif %}
+{{ check|safe }}
+"#,
+    ext = "html"
+)]
+struct CheckPageBody {
+    /// Проверка идёт: без JavaScript страницу обновит meta refresh.
+    running: bool,
+    /// Уже отрисованный ход.
+    check: String,
+}
+
+/// Ход проверки; фрагмент страницы хода для htmx.
+#[derive(Template)]
+#[template(
+    source = r#"{% if !view.started %}
+<div id="llm-check">
+<p>Проверка ещё не запускалась.</p>
+<p><a href="/admin/llm">Вернуться к настройкам</a></p>
+</div>
+{% else %}{% if view.running %}
+<div id="llm-check" hx-get="/admin/llm/check-fragment" hx-trigger="every 2s" hx-swap="outerHTML">
+<p role="status">Проверка слота {{ view.slot }} идёт: пройдено {{ view.done }} из {{ view.total }} фраз.</p>
+<p><a href="/admin/llm/check">Обновить</a></p>
+</div>
+{% else %}{% if view.report.is_empty() %}
+<div id="llm-check">
+<p role="alert">{{ view.error }}</p>
+<p><a href="/admin/llm">Вернуться к настройкам</a></p>
+</div>
+{% else %}
+<div id="llm-check">
+<p role="status" class="console-notice">Проверка слота {{ view.slot }} завершена: пройдено {{ view.passed }} из {{ view.total }}.</p>
+{% if !view.saved %}<p role="alert">Результат проверки не сохранён.</p>{% endif %}
+<pre>{{ view.report }}</pre>
+<p><a href="/admin/llm">Вернуться к настройкам</a> · <a href="/admin/llm/check">Обновить</a></p>
+</div>
+{% endif %}{% endif %}{% endif %}
+"#,
+    ext = "html"
+)]
+struct CheckBody<'a> {
+    /// Ход проверки.
+    view: &'a CheckView,
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ConsolePage, HouseholdForm, LlmSlotView, LlmTextField, LlmToggle, LlmTokenView, LlmView,
-        Page, WizardForm, household_form_error, target_or_home,
+        ConsolePage, HouseholdForm, LlmCheck, LlmChecks, LlmSlotView, LlmTextField, LlmToggle,
+        LlmTokenView, LlmView, Page, WizardForm, household_form_error, phrase_word, target_or_home,
     };
+    use crate::admin_console::checks::{CheckOutcome, CheckSlot, CheckSnapshot};
     use crate::admin_console::wizard::WizardStep;
+    use crate::capture::eval::TitleMatch;
     use crate::domain::error::DomainError;
 
     fn llm_view_for_tests(token_label: &'static str) -> LlmView {
@@ -1940,6 +2412,10 @@ mod tests {
             fallback: slot(),
             connect_timeout: text("1000"),
             daily_quota: text("200"),
+            checks: LlmChecks {
+                primary: None,
+                fallback: None,
+            },
         }
     }
 
@@ -2081,6 +2557,84 @@ mod tests {
             "the replacement token field never carries a value: {html}"
         );
         assert!(!html.contains("value=\"tlq_"), "{html}");
+    }
+
+    #[test]
+    fn the_check_button_shows_the_set_size_and_the_saved_standard() {
+        let mut view = llm_view_for_tests("задан");
+        view.checks = LlmChecks {
+            primary: Some(LlmCheck {
+                slot: CheckSlot::Primary,
+                legend: "Основной слот",
+                phrases: 22,
+                titles: TitleMatch::Normalized,
+            }),
+            fallback: None,
+        };
+        let html = ConsolePage::new(Page::Llm(Box::new(view)))
+            .render()
+            .expect("the page renders");
+
+        assert!(
+            html.contains("action=\"/admin/llm/check/primary\""),
+            "{html}"
+        );
+        assert!(html.contains("Проверить — 22 фразы"), "{html}");
+        assert!(
+            html.contains("<option value=\"normalized\" selected>normalized</option>"),
+            "the saved standard is the default: {html}"
+        );
+        assert!(
+            !html.contains("action=\"/admin/llm/check/fallback\""),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn the_check_page_polls_until_the_report_and_works_without_javascript() {
+        let running = CheckSnapshot {
+            slot: "primary",
+            done: 3,
+            total: 22,
+            outcome: None,
+        };
+        let html = ConsolePage::new(Page::Check(Some(running)))
+            .render()
+            .expect("the page renders");
+        assert!(html.contains("пройдено 3 из 22 фраз"), "{html}");
+        assert!(html.contains("hx-trigger=\"every 2s\""), "{html}");
+        assert!(html.contains("href=\"/admin/llm/check\""), "{html}");
+        assert!(html.contains("<noscript>"), "{html}");
+
+        let finished = CheckSnapshot {
+            slot: "primary",
+            done: 22,
+            total: 22,
+            outcome: Some(CheckOutcome::Report {
+                report: "Набор capture-v4: пройдено 21 из 22".to_owned(),
+                passed: 21,
+                total: 22,
+                saved: true,
+            }),
+        };
+        let html = ConsolePage::new(Page::Check(Some(finished)))
+            .render()
+            .expect("the page renders");
+        assert!(!html.contains("hx-trigger=\"every 2s\""), "{html}");
+        assert!(html.contains("пройдено 21 из 22"), "{html}");
+        assert!(html.contains("Набор capture-v4"), "{html}");
+    }
+
+    #[test]
+    fn the_phrase_word_follows_the_number() {
+        assert_eq!(phrase_word(1), "фраза");
+        assert_eq!(phrase_word(2), "фразы");
+        assert_eq!(phrase_word(4), "фразы");
+        assert_eq!(phrase_word(5), "фраз");
+        assert_eq!(phrase_word(11), "фраз");
+        assert_eq!(phrase_word(21), "фраза");
+        assert_eq!(phrase_word(22), "фразы");
+        assert_eq!(phrase_word(25), "фраз");
     }
 
     #[test]
