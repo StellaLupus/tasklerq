@@ -51,7 +51,10 @@ fn llm_logs_do_not_contain_the_source_text() {
             let db = db().await;
             let id = next_telegram_id();
             let ai = failing_chain();
-            let llm = LlmHandle::new(LlmSnapshot::from_chain(Some(ai.clone()), 200));
+            let llm = LlmHandle::new(LlmSnapshot::for_tests_without_settings(
+                Some(ai.clone()),
+                200,
+            ));
             let handler = Bot::new("tasklerqbot")
                 .with_llm(llm.clone())
                 .with_tenancy(tasklerq::config::TenancyMode::Multi);

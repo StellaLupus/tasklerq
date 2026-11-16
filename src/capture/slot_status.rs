@@ -7,8 +7,10 @@
 //! `/health/ready`.
 //!
 //! Readiness не опрашивает `llm_slot_checks` на каждый запрос: вычисленный
-//! статус кешируется на [`CACHE_TTL`]. Ошибка чтения базы при старте — только
-//! предупреждение, а в readiness используется прежний кеш.
+//! статус кешируется на [`CACHE_TTL`]. Кеш привязан к версии снимка LLM: после
+//! смены настроек он недействителен независимо от срока, иначе readiness до
+//! минуты показывал бы статус прежней модели. Ошибка чтения базы при старте —
+//! только предупреждение, а в readiness используется прежний кеш той же версии.
 
 use std::sync::Mutex;
 
@@ -137,6 +139,7 @@ struct SlotEntry {
 }
 
 struct CachedStatuses {
+    version: u64,
     at: DateTime<Utc>,
     statuses: Vec<SlotStatusReport>,
 }
@@ -191,16 +194,21 @@ impl LlmSlotHealth {
     /// Нужен, когда базу прочитать нельзя: без значения серия
     /// `llm_slot_verified{slot}` не появляется вовсе, и алерт `== 0` молчит.
     pub fn mark_unverified(&self) {
-        for entry in self.slots() {
+        let slots = self.slots();
+        for entry in &slots {
             metrics::llm_slot_verified(entry.name, false);
         }
+        self.drop_absent_slot_metrics(&slots);
     }
 
-    /// Статусы для readiness: из кеша, если он моложе [`CACHE_TTL`].
+    /// Статусы для readiness: из кеша, если он моложе [`CACHE_TTL`] и посчитан
+    /// для текущей версии снимка.
     ///
     /// Ошибка чтения базы не делает readiness неуспешным: возвращается прежний
-    /// кеш, а без него все слоты считаются непроверенными. Ошибка пишется в
-    /// журнал без адресов и токенов.
+    /// кеш той же версии снимка, а без него все слоты считаются
+    /// непроверенными. Кеш другой версии действующим не считается: его статусы
+    /// относятся к прежним слотам. Ошибка пишется в журнал без адресов и
+    /// токенов.
     pub async fn statuses(&self, pool: &PgPool, now: DateTime<Utc>) -> Vec<SlotStatusReport> {
         if let Some(cached) = self.cached(now) {
             return cached;
@@ -213,8 +221,9 @@ impl LlmSlotHealth {
                     error = %error,
                     "could not read llm slot check status; keeping the previous one"
                 );
+                let version = self.llm.load().version();
                 let mut cache = self.lock_cache();
-                if let Some(cached) = cache.as_mut() {
+                if let Some(cached) = cache.as_mut().filter(|cached| cached.version == version) {
                     // Прежний статус ещё годен, но без сдвига отметки readiness
                     // опрашивал бы базу на каждом запросе, пока она не поднимется.
                     cached.at = now;
@@ -234,8 +243,13 @@ impl LlmSlotHealth {
         now: DateTime<Utc>,
     ) -> Result<Vec<SlotStatusReport>, sqlx::Error> {
         let snapshot = self.llm.load();
+        let version = snapshot.version();
         let slots = slots_from(&snapshot);
         if slots.is_empty() {
+            // Слотов нет: серия прежнего слота не должна остаться в `/metrics`
+            // с прежним значением — иначе алерт `== 0` горит по несуществующему
+            // слоту.
+            self.drop_absent_slot_metrics(&slots);
             return Ok(Vec::new());
         }
         let mut conn = pool.acquire().await?;
@@ -263,11 +277,22 @@ impl LlmSlotHealth {
         for report in &statuses {
             metrics::llm_slot_verified(report.slot, report.status.is_passed());
         }
+        self.drop_absent_slot_metrics(&slots);
         *self.lock_cache() = Some(CachedStatuses {
+            version,
             at: now,
             statuses: statuses.clone(),
         });
         Ok(statuses)
+    }
+
+    /// Убрать из метрики серии слотов, которых нет в текущем снимке.
+    fn drop_absent_slot_metrics(&self, present: &[SlotEntry]) {
+        for name in [PRIMARY_SLOT, FALLBACK_SLOT] {
+            if !present.iter().any(|entry| entry.name == name) {
+                metrics::llm_slot_verified_remove(name);
+            }
+        }
     }
 
     fn slots(&self) -> Vec<SlotEntry> {
@@ -275,9 +300,10 @@ impl LlmSlotHealth {
     }
 
     fn cached(&self, now: DateTime<Utc>) -> Option<Vec<SlotStatusReport>> {
+        let version = self.llm.load().version();
         let cache = self.lock_cache();
         let cached = cache.as_ref()?;
-        (now - cached.at < CACHE_TTL).then(|| cached.statuses.clone())
+        (cached.version == version && now - cached.at < CACHE_TTL).then(|| cached.statuses.clone())
     }
 
     fn unverified(&self) -> Vec<SlotStatusReport> {

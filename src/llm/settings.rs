@@ -77,6 +77,13 @@ impl LlmChange {
     pub fn delete(key: impl Into<String>) -> Self {
         Self::Delete { key: key.into() }
     }
+
+    /// Имя изменяемой настройки.
+    fn key(&self) -> &str {
+        match self {
+            Self::Set { key, .. } | Self::SetSecret { key, .. } | Self::Delete { key } => key,
+        }
+    }
 }
 
 /// Ошибка применения группы настроек.
@@ -159,7 +166,7 @@ impl LlmSettings {
         // будут закоммичены.
         let stored = repository::all(&mut tx, SettingScope::Installation.as_str(), None).await?;
         let effective = settings::effective_llm(&self.env, &stored, &self.cipher);
-        check_slots(&effective, &stored)?;
+        check_slots(&effective, &stored, changes)?;
 
         let previous = self.handle.load();
         let snapshot = LlmSnapshot::rebuild(effective, &previous)?;
@@ -200,26 +207,41 @@ async fn write_change(
 
 /// Отклонить слот из базы, который остался бы ненастроенным.
 ///
-/// Неполный слот (адрес без модели или наоборот) и неразобранное поле — ошибка
-/// формы: иначе сохранение прошло бы, а действующие слоты молча не изменились.
-/// Остальные причины (слот не задан, не читается секрет) сохранение не
-/// отклоняют.
+/// Проверяются только слоты, ключи которых есть в наборе изменений: неполный
+/// слот из старой строки или прямого SQL не должен блокировать сохранение
+/// квоты. Неполный слот (адрес без модели или наоборот) и неразобранное поле в
+/// затронутом слоте — ошибка формы: иначе сохранение прошло бы, а действующие
+/// слоты молча не изменились. Остальные причины (слот не задан, не читается
+/// секрет) сохранение не отклоняют.
 fn check_slots(
     effective: &settings::EffectiveLlm,
     stored: &[StoredSetting],
+    changes: &[LlmChange],
 ) -> Result<(), LlmApplyError> {
-    check_slot(
-        effective.primary(),
-        "llm.primary.url",
-        "llm.primary.model",
-        stored,
-    )?;
-    check_slot(
-        effective.fallback(),
-        "llm.fallback.url",
-        "llm.fallback.model",
-        stored,
-    )
+    if touches_slot(changes, "llm.primary.") {
+        check_slot(
+            effective.primary(),
+            "llm.primary.url",
+            "llm.primary.model",
+            stored,
+        )?;
+    }
+    if touches_slot(changes, "llm.fallback.") {
+        check_slot(
+            effective.fallback(),
+            "llm.fallback.url",
+            "llm.fallback.model",
+            stored,
+        )?;
+    }
+    Ok(())
+}
+
+/// Набор изменений затрагивает поля слота с заданным префиксом.
+fn touches_slot(changes: &[LlmChange], prefix: &str) -> bool {
+    changes
+        .iter()
+        .any(|change| change.key().starts_with(prefix))
 }
 
 fn check_slot(

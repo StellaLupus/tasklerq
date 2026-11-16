@@ -525,7 +525,10 @@ fn chain(answer: Value) -> Arc<Chain> {
 }
 
 fn capture_state(config: CaptureConfig, ai: Option<Arc<Chain>>, quota: u32) -> CaptureState {
-    CaptureState::new(config, LlmHandle::new(LlmSnapshot::from_chain(ai, quota)))
+    CaptureState::new(
+        config,
+        LlmHandle::new(LlmSnapshot::for_tests_without_settings(ai, quota)),
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -584,7 +587,7 @@ async fn llm_validation_failures_are_audited_for_api_and_telegram() {
 
     let worker = CaptureWorker::new(
         db.pool.clone(),
-        LlmHandle::new(LlmSnapshot::from_chain(
+        LlmHandle::new(LlmSnapshot::for_tests_without_settings(
             Some(chain(json!({"items": LLM_RESPONSE}))),
             200,
         )),

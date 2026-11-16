@@ -24,7 +24,7 @@ use tasklerq::config::{
 };
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
-use tasklerq::llm::{Chain, LlmHandle, LlmSnapshot};
+use tasklerq::llm::{Chain, LlmChange, LlmHandle, LlmSettings, LlmSnapshot};
 use tasklerq::security_audit::Audit;
 use tasklerq::settings;
 use tasklerq::settings::crypto::SecretCipher;
@@ -79,6 +79,15 @@ fn llm_health(
     primary: &SlotConfig,
     fallback: Option<&SlotConfig>,
 ) -> (Arc<Chain>, Arc<LlmSlotHealth>) {
+    let (chain, _handle, health) = llm_health_with_handle(primary, fallback);
+    (chain, health)
+}
+
+/// То же, но с доступом к снимку для применения настроек в тесте.
+fn llm_health_with_handle(
+    primary: &SlotConfig,
+    fallback: Option<&SlotConfig>,
+) -> (Arc<Chain>, LlmHandle, Arc<LlmSlotHealth>) {
     let answer = || {
         support::llm::BackendDouble::always(Ok(support::llm::v4::response(vec![
             support::llm::v4::shopping("Молоко"),
@@ -100,8 +109,23 @@ fn llm_health(
         effective,
         Some(chain.clone()),
     ));
-    let health = Arc::new(LlmSlotHealth::new(handle));
-    (chain, health)
+    let health = Arc::new(LlmSlotHealth::new(handle.clone()));
+    (chain, handle, health)
+}
+
+/// Применение настроек без слотов в окружении: слот целиком приходит из базы.
+fn llm_settings(pool: &PgPool, handle: LlmHandle) -> LlmSettings {
+    let env = LlmConfig {
+        enabled: None,
+        primary: None,
+        fallback: None,
+        connect_timeout: StdDuration::from_millis(1_000),
+        connect_timeout_from_env: false,
+        daily_quota: 200,
+        daily_quota_from_env: false,
+        ignored_env: Vec::new(),
+    };
+    LlmSettings::new(pool.clone(), env, SecretCipher::new(None, None), handle)
 }
 
 async fn store_check(
@@ -486,6 +510,73 @@ async fn a_changed_standard_makes_the_saved_check_stale() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_model_change_makes_the_slot_stale_without_waiting_for_the_cache() {
+    let db = support::isolated_db().await;
+    let primary = slot_config("vendor/primary");
+    let (_chain, handle, health) = llm_health_with_handle(&primary, None);
+    store_check(&db.pool, "primary", &primary, 22, 22, TitleMatch::Strict).await;
+
+    let (status, body) = ready_with_llm(&db.pool, health.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.get("warnings").is_none(),
+        "a passed slot must not warn before the change:\n{body}"
+    );
+
+    // Меняем только модель: адрес и включение разбора пишем в той же группе,
+    // потому что у настроек в этом тесте нет слотов из окружения.
+    llm_settings(&db.pool, handle)
+        .apply(&[
+            LlmChange::set("llm.primary.url", json!(primary.url.as_str())),
+            LlmChange::set("llm.primary.model", json!("vendor/other")),
+            LlmChange::set("llm.enabled", json!(true)),
+        ])
+        .await
+        .expect("a model change is applied");
+
+    // Ни перезапуска, ни `invalidate`, ни ожидания `CACHE_TTL`: кеш прежней
+    // версии снимка недействителен сразу.
+    let (status, body) = ready_with_llm(&db.pool, health).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["warnings"],
+        json!(["llm_slot_unverified:primary:strict"]),
+        "the changed model must be stale immediately:\n{body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slot_added_after_start_is_seen_by_readiness_without_a_restart() {
+    let db = support::isolated_db().await;
+    let handle = LlmHandle::empty();
+    let health = Arc::new(LlmSlotHealth::new(handle.clone()));
+
+    let (status, body) = ready_with_llm(&db.pool, health.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.get("warnings").is_none(),
+        "a service without slots has nothing to warn about:\n{body}"
+    );
+
+    llm_settings(&db.pool, handle)
+        .apply(&[
+            LlmChange::set("llm.primary.url", json!("https://api.example.test/v1")),
+            LlmChange::set("llm.primary.model", json!("vendor/primary")),
+            LlmChange::set("llm.enabled", json!(true)),
+        ])
+        .await
+        .expect("a slot is applied without a check");
+
+    let (status, body) = ready_with_llm(&db.pool, health).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["warnings"],
+        json!(["llm_slot_unverified:primary"]),
+        "a slot added in the console must appear in readiness at once:\n{body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unchecked_slot_does_not_block_capture() {
     let db = support::isolated_db().await;
     let household = support::create_household(&db.pool).await;
@@ -497,7 +588,7 @@ async fn an_unchecked_slot_does_not_block_capture() {
         .with_llm_slots(health)
         .with_capture(CaptureState::new(
             capture_config(),
-            LlmHandle::new(LlmSnapshot::from_chain(Some(chain), 200)),
+            LlmHandle::new(LlmSnapshot::for_tests_without_settings(Some(chain), 200)),
         ));
     let app = build_router(state);
 
@@ -629,6 +720,41 @@ async fn a_failed_readiness_refresh_keeps_the_previous_status_and_extends_the_ca
             passed: 17,
             total: 22
         }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_refresh_after_a_snapshot_change_does_not_return_the_old_cache() {
+    let db = support::isolated_db().await;
+    let primary = slot_config("vendor/primary");
+    let (_chain, handle, health) = llm_health_with_handle(&primary, None);
+    store_check(&db.pool, "primary", &primary, 22, 22, TitleMatch::Strict).await;
+    let now = Utc::now();
+    assert_eq!(
+        health.statuses(&db.pool, now).await[0].status,
+        SlotStatus::Passed
+    );
+
+    llm_settings(&db.pool, handle)
+        .apply(&[
+            LlmChange::set("llm.primary.url", json!(primary.url.as_str())),
+            LlmChange::set("llm.primary.model", json!("vendor/other")),
+            LlmChange::set("llm.enabled", json!(true)),
+        ])
+        .await
+        .expect("a model change is applied");
+
+    let broken = sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(StdDuration::from_millis(500))
+        .connect_lazy("postgres://tasklerq:secret@127.0.0.1:1/tasklerq")
+        .expect("lazy pool");
+    let statuses = health.statuses(&broken, now + CACHE_TTL).await;
+
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(
+        statuses[0].status,
+        SlotStatus::Unverified,
+        "a cached status of another snapshot version must not be kept"
     );
 }
 

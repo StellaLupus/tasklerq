@@ -84,13 +84,15 @@ impl LlmSnapshot {
         ))
     }
 
-    /// Снимок с готовой цепочкой и квотой без настроек консоли.
+    /// Снимок с готовой цепочкой и квотой, но без действующих настроек.
     ///
-    /// Только для тестов потребителей снимка: проверяется цепочка и квота, а не
-    /// разбор `settings`. Действующая конфигурация в нём пустая, разбор
-    /// выключен, поэтому readiness по такому снимку не видит ни одного слота.
+    /// Только для тестов потребителей снимка, которым важна цепочка, а не
+    /// `settings`: действующая конфигурация пустая, разбор выключен, поэтому
+    /// readiness по такому снимку не видит ни одного слота. Если тесту нужны
+    /// слоты или отпечатки (readiness, статус проверки), он собирает снимок
+    /// через [`Self::from_effective_and_chain`] с настоящим `EffectiveLlm`.
     #[doc(hidden)]
-    pub fn from_chain(chain: Option<Arc<Chain>>, quota: u32) -> Self {
+    pub fn for_tests_without_settings(chain: Option<Arc<Chain>>, quota: u32) -> Self {
         Self::from_effective_and_chain(empty_effective(quota), chain)
     }
 
@@ -196,7 +198,10 @@ impl LlmHandle {
 
     /// Handle без настроенных слотов: HTTP API и тесты без LLM.
     pub fn empty() -> Self {
-        Self::new(LlmSnapshot::from_chain(None, DEFAULT_DAILY_QUOTA))
+        Self::new(LlmSnapshot::for_tests_without_settings(
+            None,
+            DEFAULT_DAILY_QUOTA,
+        ))
     }
 
     /// Текущий снимок целиком.
@@ -279,6 +284,25 @@ mod tests {
         settings::effective_llm(&env, &[], &SecretCipher::new(None, None))
     }
 
+    fn effective_with_fallback(quota: u32, model: &str, fallback_model: &str) -> EffectiveLlm {
+        let mut primary = slot();
+        primary.model = model.to_owned();
+        let mut fallback = slot();
+        fallback.url = "http://127.0.0.1:8081/v1".parse().expect("url");
+        fallback.model = fallback_model.to_owned();
+        let env = LlmConfig {
+            enabled: Some(true),
+            primary: Some(primary),
+            fallback: Some(fallback),
+            connect_timeout: Duration::from_millis(1_000),
+            connect_timeout_from_env: true,
+            daily_quota: quota,
+            daily_quota_from_env: true,
+            ignored_env: Vec::new(),
+        };
+        settings::effective_llm(&env, &[], &SecretCipher::new(None, None))
+    }
+
     #[test]
     fn disabled_capture_builds_no_chain() {
         let snapshot = LlmSnapshot::from_effective(effective(false, Some(slot())));
@@ -319,14 +343,14 @@ mod tests {
 
     #[test]
     fn every_store_increments_the_version() {
-        let handle = LlmHandle::new(LlmSnapshot::from_chain(None, 200));
+        let handle = LlmHandle::new(LlmSnapshot::for_tests_without_settings(None, 200));
         assert_eq!(handle.load().version(), 1);
 
-        handle.store(LlmSnapshot::from_chain(None, 300));
+        handle.store(LlmSnapshot::for_tests_without_settings(None, 300));
         assert_eq!(handle.load().version(), 2);
         assert_eq!(handle.load().quota(), 300);
 
-        handle.store(LlmSnapshot::from_chain(None, 400));
+        handle.store(LlmSnapshot::for_tests_without_settings(None, 400));
         assert_eq!(handle.load().version(), 3);
     }
 
@@ -344,7 +368,10 @@ mod tests {
             crate::llm::Slot::new("primary", Arc::new(UnusedBackend), Duration::from_secs(1)),
             None,
         ));
-        let handle = LlmHandle::new(LlmSnapshot::from_chain(Some(chain.clone()), 50));
+        let handle = LlmHandle::new(LlmSnapshot::for_tests_without_settings(
+            Some(chain.clone()),
+            50,
+        ));
         assert!(Arc::ptr_eq(handle.load().chain().expect("chain"), &chain));
         assert_eq!(handle.load().quota(), 50);
     }
@@ -400,6 +427,55 @@ mod tests {
         assert!(
             Arc::ptr_eq(&before, &after),
             "a failed parse started on the old chain must count on the new one"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_fallback_slot_shares_the_breaker_with_the_previous_chain() {
+        let first = LlmSnapshot::from_effective(effective_with_fallback(
+            200,
+            "local/model",
+            "local/fallback",
+        ));
+        let now = chrono::Utc::now();
+        let chain = first.chain().expect("chain");
+        let fallback = chain.fallback().expect("fallback slot");
+        for _ in 0..crate::capture::breaker::DEFAULT_THRESHOLD {
+            fallback.breaker().record_failure(now);
+        }
+
+        let rebuilt = LlmSnapshot::rebuild(
+            effective_with_fallback(300, "local/model", "local/fallback"),
+            &first,
+        )
+        .expect("rebuild");
+
+        let chain = rebuilt.chain().expect("chain");
+        assert!(
+            chain
+                .fallback()
+                .expect("fallback slot")
+                .breaker()
+                .retry_after(now)
+                .is_some(),
+            "a quota change must keep the open breaker of the unchanged fallback"
+        );
+
+        let changed = LlmSnapshot::rebuild(
+            effective_with_fallback(300, "local/model", "local/other"),
+            &rebuilt,
+        )
+        .expect("rebuild");
+        assert!(
+            changed
+                .chain()
+                .expect("chain")
+                .fallback()
+                .expect("fallback slot")
+                .breaker()
+                .retry_after(now)
+                .is_none(),
+            "a changed fallback must start with a closed breaker"
         );
     }
 

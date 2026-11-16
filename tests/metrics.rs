@@ -74,7 +74,10 @@ fn chain_always(answer: Result<Value, LlmError>) -> Arc<tasklerq::llm::Chain> {
 }
 
 fn capture_state(config: CaptureConfig, llm: Option<Arc<Chain>>, quota: u32) -> CaptureState {
-    CaptureState::new(config, LlmHandle::new(LlmSnapshot::from_chain(llm, quota)))
+    CaptureState::new(
+        config,
+        LlmHandle::new(LlmSnapshot::for_tests_without_settings(llm, quota)),
+    )
 }
 
 struct Noop;
@@ -411,7 +414,10 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
     let capture_chain = chain_always(Ok(support::llm::v4::response(vec![
         support::llm::v4::shopping("Молоко"),
     ])));
-    let capture_llm = LlmHandle::new(LlmSnapshot::from_chain(Some(capture_chain), 200));
+    let capture_llm = LlmHandle::new(LlmSnapshot::for_tests_without_settings(
+        Some(capture_chain),
+        200,
+    ));
     let handler = Bot::new("tasklerqbot")
         .with_llm(capture_llm.clone())
         .with_tenancy(tasklerq::config::TenancyMode::Multi);

@@ -49,7 +49,7 @@ fn app_chain(pool: &PgPool, llm: Option<Arc<Chain>>, config: CaptureConfig, quot
     build_router(
         AppState::new(pool.clone(), Audit::new(pool.clone())).with_capture(CaptureState::new(
             config,
-            LlmHandle::new(LlmSnapshot::from_chain(llm, quota)),
+            LlmHandle::new(LlmSnapshot::for_tests_without_settings(llm, quota)),
         )),
     )
 }

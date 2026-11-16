@@ -14,11 +14,12 @@ use axum::http::{Method, StatusCode};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::Utc;
-use serde_json::json;
+use serde_json::{Map, json};
 use tasklerq::app::{Application, build_application};
-use tasklerq::config::{Config, TenancyMode};
-use tasklerq::llm::{LlmChange, LlmSettings, LlmSnapshot};
+use tasklerq::config::{Config, LlmConfig, SlotConfig, TenancyMode};
+use tasklerq::llm::{LlmApplyError, LlmChange, LlmHandle, LlmSettings, LlmSnapshot};
 use tasklerq::security_audit::Audit;
+use tasklerq::settings::crypto::SecretCipher;
 use tasklerq::telegram::bot::Bot;
 use tasklerq::telegram::capture_worker::{CaptureWorker, Pass};
 use tokio::sync::{Notify, watch};
@@ -530,6 +531,164 @@ async fn a_quota_change_keeps_an_open_breaker_but_a_model_change_closes_it() {
     assert_eq!(body["items"][0]["title"], "Молоко", "{body}");
     let requests = server.received_requests().await.expect("requests");
     assert_eq!(models(&requests), vec!["new/model".to_owned()]);
+
+    stop(application, shutdown).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quota_change_ignores_an_incomplete_fallback_written_outside_apply() {
+    let db = support::isolated_db().await;
+    let (application, shutdown) = start(&db).await;
+    // Строка старой версии или прямой SQL: адрес без модели.
+    sqlx::query("INSERT INTO settings (scope, key, value) VALUES ('installation', $1, $2)")
+        .bind("llm.fallback.url")
+        .bind(json!("http://127.0.0.1:9/v1"))
+        .execute(&db.pool)
+        .await
+        .expect("incomplete fallback is stored directly");
+
+    let snapshot = application
+        .llm_settings
+        .apply(&[LlmChange::set("llm.daily_quota", json!(300))])
+        .await
+        .expect("a quota save must not be blocked by an untouched broken slot");
+    assert_eq!(snapshot.quota(), 300);
+
+    let error = application
+        .llm_settings
+        .apply(&[LlmChange::set(
+            "llm.fallback.url",
+            json!("http://127.0.0.1:10/v1"),
+        )])
+        .await
+        .expect_err("a save that touches the incomplete fallback is rejected");
+    assert!(
+        error.to_string().contains("llm.fallback.model"),
+        "the error must name the missing field: {error}"
+    );
+
+    stop(application, shutdown).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invalid_stored_value_in_a_touched_slot_is_rejected() {
+    let db = support::isolated_db().await;
+    let (application, shutdown) = start(&db).await;
+    // Прямая запись значения, которое не проходит разбор при чтении.
+    sqlx::query("INSERT INTO settings (scope, key, value) VALUES ('installation', $1, $2)")
+        .bind("llm.primary.url")
+        .bind(json!("not a url"))
+        .execute(&db.pool)
+        .await
+        .expect("invalid url is stored directly");
+    let before = application.llm_settings.handle().load();
+
+    let error = application
+        .llm_settings
+        .apply(&[LlmChange::set("llm.primary.model", json!("vendor/model"))])
+        .await
+        .expect_err("a touched slot with an invalid stored field is rejected");
+    assert!(
+        error.to_string().contains("llm.primary.url"),
+        "the error must name the invalid field: {error}"
+    );
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM settings WHERE key = $1")
+        .bind("llm.primary.model")
+        .fetch_one(&db.pool)
+        .await
+        .expect("count");
+    assert_eq!(rows, 0, "the transaction must roll back the valid write");
+    assert_eq!(
+        application.llm_settings.handle().load().version(),
+        before.version(),
+        "a rejected save must not replace the snapshot"
+    );
+
+    stop(application, shutdown).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_chain_build_error_rolls_back_the_group() {
+    let db = support::isolated_db().await;
+    let env = LlmConfig {
+        enabled: Some(true),
+        primary: Some(SlotConfig {
+            // Адрес проходит разбор настройки, но не годится для HTTP-клиента.
+            url: "mailto:slot@example.test".parse().expect("url"),
+            model: "vendor/model".to_owned(),
+            token: None,
+            timeout: Duration::from_secs(10),
+            extra: Map::new(),
+        }),
+        fallback: None,
+        connect_timeout: Duration::from_millis(1_000),
+        connect_timeout_from_env: false,
+        daily_quota: 200,
+        daily_quota_from_env: false,
+        ignored_env: Vec::new(),
+    };
+    let handle = LlmHandle::empty();
+    let settings = LlmSettings::new(
+        db.pool.clone(),
+        env,
+        SecretCipher::new(None, None),
+        handle.clone(),
+    );
+
+    let error = settings
+        .apply(&[LlmChange::set("llm.daily_quota", json!(300))])
+        .await
+        .expect_err("a chain that cannot be built rejects the save");
+    assert!(
+        matches!(error, LlmApplyError::Chain { .. }),
+        "the error must be the chain error: {error}"
+    );
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM settings WHERE key = $1")
+        .bind("llm.daily_quota")
+        .fetch_one(&db.pool)
+        .await
+        .expect("count");
+    assert_eq!(rows, 0, "the transaction must roll back the saved quota");
+    assert_eq!(
+        handle.load().version(),
+        1,
+        "a rejected save must not replace the snapshot"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_group_with_an_invalid_last_change_writes_nothing() {
+    let db = support::isolated_db().await;
+    let server = MockServer::start().await;
+    mount_answer(&server, "Молоко", Duration::ZERO).await;
+    let (application, shutdown) = start(&db).await;
+    apply_slot(&application.llm_settings, &server, "settings/model").await;
+    let before = application.llm_settings.handle().load();
+
+    let error = application
+        .llm_settings
+        .apply(&[
+            LlmChange::set("llm.daily_quota", json!(300)),
+            LlmChange::set("llm.fallback.url", json!("http://127.0.0.1:9/v1")),
+        ])
+        .await
+        .expect_err("the last change makes the fallback incomplete");
+    assert!(
+        error.to_string().contains("llm.fallback.model"),
+        "the error must name the missing field: {error}"
+    );
+
+    let after = application.llm_settings.handle().load();
+    assert_eq!(after.version(), before.version());
+    assert_eq!(after.quota(), before.quota());
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM settings WHERE key = ANY($1)")
+        .bind(vec!["llm.daily_quota", "llm.fallback.url"])
+        .fetch_one(&db.pool)
+        .await
+        .expect("count");
+    assert_eq!(rows, 0, "no row of the group may survive the rollback");
 
     stop(application, shutdown).await;
 }

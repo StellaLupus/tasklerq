@@ -98,7 +98,10 @@ async fn stand_with_chain(
     llm_capture: bool,
 ) -> Stand {
     let id = next_telegram_id();
-    let llm = LlmHandle::new(LlmSnapshot::from_chain(Some(chain.clone()), quota));
+    let llm = LlmHandle::new(LlmSnapshot::for_tests_without_settings(
+        Some(chain.clone()),
+        quota,
+    ));
     let handler = Bot::new("tasklerqbot")
         .with_llm(if llm_capture {
             llm.clone()
@@ -1612,9 +1615,10 @@ async fn a_job_queued_before_the_chain_disappeared_finishes_as_llm_disabled() {
     assert_eq!(stand.jobs().await, 1);
 
     // Цепочку убрали до обработки: воркер обязан взять снимок заново.
-    stand
-        .llm
-        .store(LlmSnapshot::from_chain(None, DEFAULT_DAILY_QUOTA));
+    stand.llm.store(LlmSnapshot::for_tests_without_settings(
+        None,
+        DEFAULT_DAILY_QUOTA,
+    ));
 
     assert_eq!(stand.work().await, Pass::Dead);
     assert_eq!(stand.ai.calls(), 0, "the disabled llm must not be called");

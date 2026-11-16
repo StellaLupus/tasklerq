@@ -91,7 +91,7 @@
   разрешает разбор в тот же день; смена квоты не замыкает разомкнутый
   предохранитель (spec llm-backends «Слоты LLM», spec admin-console «Настройка
   LLM в консоли»).
-- [ ] 3.3 `LlmSlotHealth` сбрасывает кеш при смене версии снимка. Проверить в
+- [x] 3.3 `LlmSlotHealth` сбрасывает кеш при смене версии снимка. Проверить в
   `tests/health.rs`: после смены модели через `settings` — «устарел» и
   `llm_slot_unverified` без перезапуска и без ожидания `CACHE_TTL`; слот,
   появившийся после старта, виден readiness (spec deployment-operations

@@ -33,7 +33,7 @@ fn capture_app(pool: &PgPool, ai: Arc<support::llm::BackendDouble>) -> Router {
     build_router(
         AppState::new(pool.clone(), Audit::new(pool.clone())).with_capture(CaptureState::new(
             config,
-            LlmHandle::new(LlmSnapshot::from_chain(
+            LlmHandle::new(LlmSnapshot::for_tests_without_settings(
                 Some(Arc::new(support::llm::chain(ai, None))),
                 200,
             )),

@@ -30,7 +30,10 @@ fn chain(answer: Result<Value, LlmError>) -> Arc<Chain> {
 }
 
 fn capture_state(config: CaptureConfig, ai: Option<Arc<Chain>>, quota: u32) -> CaptureState {
-    CaptureState::new(config, LlmHandle::new(LlmSnapshot::from_chain(ai, quota)))
+    CaptureState::new(
+        config,
+        LlmHandle::new(LlmSnapshot::for_tests_without_settings(ai, quota)),
+    )
 }
 
 #[test]

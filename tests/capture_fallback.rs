@@ -49,7 +49,7 @@ fn app_chain(pool: &PgPool, llm: Option<Arc<Chain>>, config: CaptureConfig, quot
     build_router(
         AppState::new(pool.clone(), Audit::new(pool.clone())).with_capture(CaptureState::new(
             config,
-            LlmHandle::new(LlmSnapshot::from_chain(llm, quota)),
+            LlmHandle::new(LlmSnapshot::for_tests_without_settings(llm, quota)),
         )),
     )
 }
@@ -1094,7 +1094,10 @@ mod telegram_split {
         let id = support::next_telegram_id();
         let ai = StubAi::new(answers);
         let chain = Arc::new(support::llm::chain(ai.clone(), None));
-        let llm = LlmHandle::new(LlmSnapshot::from_chain(Some(chain), DEFAULT_DAILY_QUOTA));
+        let llm = LlmHandle::new(LlmSnapshot::for_tests_without_settings(
+            Some(chain),
+            DEFAULT_DAILY_QUOTA,
+        ));
         let handler = Bot::new("tasklerqbot")
             .with_llm(if llm_capture {
                 llm.clone()

@@ -170,7 +170,7 @@ pub fn chain_from(
 
 /// Снимок LLM с готовой цепочкой: бот и воркер видят разбор включённым.
 pub fn handle(chain: Arc<Chain>, quota: u32) -> LlmHandle {
-    LlmHandle::new(LlmSnapshot::from_chain(Some(chain), quota))
+    LlmHandle::new(LlmSnapshot::for_tests_without_settings(Some(chain), quota))
 }
 
 /// Снимок «разбор включён» с безразличным двойником.
