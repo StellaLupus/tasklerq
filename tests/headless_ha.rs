@@ -9,11 +9,12 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{Method, Request, StatusCode};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, SubsecRound, Utc};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tasklerq::app::build_application;
 use tasklerq::config::{Config, TelegramMode};
+use tasklerq::domain::models::RecurrenceFreq;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -79,15 +80,60 @@ async fn headless_disabled_telegram_serves_the_home_assistant_scenario() {
     assert!(config.telegram.bot_token.is_none());
     assert!(config.telegram.webhook_secret.is_none());
 
+    // Повторяющееся событие, закончившееся до старта. Его должен перевести
+    // доменный тикер, который запускается и без Telegram. Время усечено до
+    // микросекунд, как в PostgreSQL.
+    let start = Utc::now().trunc_subsecs(6) - Duration::days(2);
+    let mut recurring = support::new_item(household.events_list_id, "Ежедневная зарядка");
+    recurring.due_at = Some(start);
+    recurring.end_at = Some(start + Duration::hours(1));
+    recurring.recurrence = Some(support::recurrence(RecurrenceFreq::Daily, Vec::new()));
+    let recurring = support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &household.owner(),
+        recurring,
+    )
+    .await;
+
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let application = build_application(&config, db.pool.clone(), shutdown_rx)
         .await
         .expect("application should build in disabled mode");
     assert_eq!(
         application.workers.len(),
-        1,
-        "disabled Telegram starts only the retention worker"
+        2,
+        "disabled Telegram starts retention and the domain ticker"
     );
+
+    // Первый тик доменного тикера срабатывает сразу после старта: ручной тик
+    // не нужен.
+    let expected_due = start + Duration::days(2);
+    let mut seen = None;
+    let advanced = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let (due_at, version): (Option<DateTime<Utc>>, i32) =
+                sqlx::query_as("SELECT due_at, version FROM items WHERE id = $1")
+                    .bind(recurring.id)
+                    .fetch_one(&db.pool)
+                    .await
+                    .expect("recurring event");
+            if due_at == Some(expected_due) && version == recurring.version + 1 {
+                return;
+            }
+            seen = Some((due_at, version));
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    assert!(
+        advanced.is_ok(),
+        "the always-on domain ticker must advance the recurring event: \
+         seen {seen:?}, expected due {expected_due:?} and version {}",
+        recurring.version + 1
+    );
+
     let app = application
         .router
         .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 4040))));

@@ -11,12 +11,17 @@ use uuid::Uuid;
 use super::TestHousehold;
 use super::telegram::{Harness, buttons};
 use tasklerq::domain::models::{Actor, Item, RecurrenceInput, UserRole};
+use tasklerq::jobs::domain::DomainTicker;
 use tasklerq::jobs::scheduler::{Scheduler, TickStats};
 use tasklerq::storage::repositories::notifications;
 use tokio::sync::Notify;
 
 pub fn scheduler(pool: &PgPool) -> Scheduler {
     Scheduler::new(pool.clone(), Arc::new(Notify::new()))
+}
+
+pub fn domain_ticker(pool: &PgPool) -> DomainTicker {
+    DomainTicker::new(pool.clone())
 }
 
 pub fn local_utc(timezone: Tz, date: NaiveDate, hour: u32, minute: u32) -> DateTime<Utc> {
@@ -287,6 +292,13 @@ pub async fn tick_with_a_failing_digest(
 }
 
 pub async fn tick_and_deliver(bot: &mut Harness, pool: &PgPool, at: DateTime<Utc>) -> TickStats {
+    // В проде переход событий и планировщик — два независимых цикла. Тест
+    // сохраняет прежний порядок одного тика: сначала доменный шаг, затем
+    // уведомления.
+    domain_ticker(pool)
+        .tick(at)
+        .await
+        .expect("domain ticker tick");
     let stats = scheduler(pool).tick(at).await.expect("tick");
     if at > bot.now {
         bot.advance(at - bot.now);

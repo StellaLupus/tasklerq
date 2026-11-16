@@ -110,7 +110,7 @@
   только в `settings`, проверяется командой; второй одновременный запуск из
   другого соединения получает «проверка уже идёт» без обращения к LLM (spec
   llm-backends «Проверка слота», design, решение 10).
-- [ ] 4.2 Вынести `advance_recurring_events` из `Scheduler` в `DomainTicker`,
+- [x] 4.2 Вынести `advance_recurring_events` из `Scheduler` в `DomainTicker`,
   запускаемый всегда в `build_application`. Проверить в
   `tests/event_advance.rs` и `tests/headless_ha.rs`: при
   `TELEGRAM_MODE=disabled` повторяющееся событие переходит на следующее

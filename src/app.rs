@@ -12,6 +12,7 @@ use crate::capture::slot_status::{LlmSlotHealth, SlotStatus, SlotStatusReport};
 use crate::config::{Config, TelegramMode, TenancyMode};
 use crate::http::api::capture::CaptureState;
 use crate::http::router::{AppState, build_router};
+use crate::jobs::domain::DomainTicker;
 use crate::jobs::retention::RetentionWorker;
 use crate::llm::{LlmHandle, LlmSettings, LlmSnapshot};
 use crate::security_audit::Audit;
@@ -24,7 +25,8 @@ use crate::telegram::runtime::{self, StartError};
 pub struct Application {
     /// Готовый HTTP-роутер.
     pub router: Router,
-    /// Фоновые задачи: Telegram (в режиме `disabled` их нет) и retention.
+    /// Фоновые задачи: Telegram (в режиме `disabled` их нет), retention и
+    /// доменный тикер.
     pub workers: Vec<JoinHandle<()>>,
     /// Применение сохранённых настроек LLM к снимку без перезапуска: вход
     /// будущей консоли администратора и тестов.
@@ -35,7 +37,8 @@ pub struct Application {
 ///
 /// В режиме `TELEGRAM_MODE=disabled` без токена [`runtime::start`] ничего не
 /// запускает: ingress и воркеры Telegram отсутствуют, а HTTP API и capture
-/// работают. Retention запускается всегда и попадает в [`Application::workers`].
+/// работают. Retention и доменный тикер запускаются всегда и попадают в
+/// [`Application::workers`].
 pub async fn build_application(
     config: &Config,
     pool: PgPool,
@@ -100,10 +103,12 @@ pub async fn build_application_with_update_limit(
         state = state.with_capture(CaptureState::new(config.capture, llm));
     }
 
-    // Retention не зависит от Telegram: чистит базу и без токена бота.
+    // Retention и доменный тикер не зависят от Telegram: чистят базу и
+    // переводят повторяющиеся события и без токена бота.
     workers.push(tokio::spawn(
-        RetentionWorker::new(pool, config.retention).run(shutdown),
+        RetentionWorker::new(pool.clone(), config.retention).run(shutdown.clone()),
     ));
+    workers.push(tokio::spawn(DomainTicker::new(pool).run(shutdown)));
 
     Ok(Application {
         router: build_router(state),

@@ -1,5 +1,5 @@
-//! Автопереход повторяющегося события на следующее вхождение в тике
-//! планировщика.
+//! Автопереход повторяющегося события на следующее вхождение в доменном
+//! тикере, который работает и без Telegram.
 
 mod support;
 
@@ -10,13 +10,14 @@ use sqlx::PgPool;
 use support::{TestDb, TestHousehold};
 use tasklerq::domain::models::{Item, ListKind, RecurrenceFreq, RecurrenceInput};
 use tasklerq::domain::recurrence::Due;
+use tasklerq::jobs::domain::DomainTicker;
 use tasklerq::jobs::scheduler::Scheduler;
 use tasklerq::storage::repositories::{items, lists};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-fn scheduler(pool: &PgPool) -> Scheduler {
-    Scheduler::new(pool.clone(), Arc::new(Notify::new()))
+fn ticker(pool: &PgPool) -> DomainTicker {
+    DomainTicker::new(pool.clone())
 }
 
 fn utc(year: i32, month: u32, day: u32, hour: u32) -> DateTime<Utc> {
@@ -88,7 +89,7 @@ async fn a_weekly_event_moves_to_the_next_week_without_journal_records() {
     .await;
     let events_before = item_events_for(&db.pool, event.id).await;
 
-    scheduler(&db.pool)
+    ticker(&db.pool)
         .tick(end)
         .await
         .expect("tick advances the event");
@@ -131,7 +132,7 @@ async fn three_weeks_of_downtime_cause_a_single_transition() {
 
     // Вторник 24 ноября, 20:00 по Москве: три недели вхождений уже прошли.
     let now = utc(2026, 11, 24, 17);
-    scheduler(&db.pool)
+    ticker(&db.pool)
         .tick(now)
         .await
         .expect("tick skips the missed occurrences");
@@ -162,7 +163,7 @@ async fn a_series_with_until_stays_on_its_last_occurrence() {
 
     // Вторник 17 ноября, 20:00 по Москве: последнее вхождение закончилось.
     let now = utc(2026, 11, 17, 17);
-    scheduler(&db.pool)
+    ticker(&db.pool)
         .tick(now)
         .await
         .expect("tick moves the series to its last occurrence");
@@ -178,7 +179,7 @@ async fn a_series_with_until_stays_on_its_last_occurrence() {
     assert_eq!(current.end_at, Some(last_end), "the end is shifted too");
     assert_eq!(current.version, event.version + 1);
 
-    scheduler(&db.pool)
+    ticker(&db.pool)
         .tick(now)
         .await
         .expect("a second tick leaves the finished series alone");
@@ -202,7 +203,7 @@ async fn a_finished_series_already_on_its_last_occurrence_does_not_change() {
     let event = create_event(&db, &household, "Тренировка", start, end, rule).await;
 
     // Среда 18 ноября: последнее вхождение уже прошло.
-    scheduler(&db.pool)
+    ticker(&db.pool)
         .tick(utc(2026, 11, 18, 12))
         .await
         .expect("tick leaves the finished series on its last occurrence");
@@ -260,7 +261,7 @@ async fn a_moved_occurrence_returns_to_the_rule_and_clears_the_slot() {
     );
 
     // Среда 11 ноября, 21:00 по Москве: перенесённое вхождение закончилось.
-    scheduler(&db.pool)
+    ticker(&db.pool)
         .tick(utc(2026, 11, 11, 18))
         .await
         .expect("tick returns the event to the rule");
@@ -297,7 +298,7 @@ async fn an_ongoing_event_is_not_advanced() {
     )
     .await;
 
-    scheduler(&db.pool)
+    ticker(&db.pool)
         .tick(start)
         .await
         .expect("tick during the occurrence");
@@ -335,7 +336,7 @@ async fn an_archived_events_list_is_not_advanced() {
         .await
         .expect("archive");
 
-    scheduler(&db.pool)
+    ticker(&db.pool)
         .tick(end)
         .await
         .expect("tick skips archived lists");
@@ -365,7 +366,7 @@ async fn an_all_day_event_advance_keeps_the_inclusive_multi_day_length() {
     .await;
 
     // 4 марта 03:00 по Москве: вседневное вхождение 1–3 марта закончилось.
-    scheduler(&db.pool)
+    ticker(&db.pool)
         .tick(utc(2027, 3, 4, 0))
         .await
         .expect("tick advances the all-day event");
@@ -402,7 +403,7 @@ async fn a_daily_all_day_event_moves_to_the_occurrence_that_just_started() {
 
     // 2 марта 00:00:30 по Москве: вхождение 1 марта закончилось, а вхождение
     // 2 марта уже началось.
-    scheduler(&db.pool)
+    ticker(&db.pool)
         .tick(utc(2026, 3, 1, 21) + Duration::seconds(30))
         .await
         .expect("tick advances to the ongoing occurrence");
@@ -434,7 +435,7 @@ async fn a_weekly_event_after_downtime_lands_on_the_occurrence_in_progress() {
     .await;
 
     // Вторник 10 ноября, 18:30 по Москве: недельное вхождение идёт с 18:00.
-    scheduler(&db.pool)
+    ticker(&db.pool)
         .tick(utc(2026, 11, 10, 15) + Duration::minutes(30))
         .await
         .expect("tick lands on the ongoing occurrence");
@@ -463,7 +464,7 @@ async fn a_recurring_event_without_an_end_keeps_the_implicit_duration() {
     .await;
 
     // Без явного конца вхождение длится час: тик ровно в конце.
-    scheduler(&db.pool)
+    ticker(&db.pool)
         .tick(start + Duration::hours(1))
         .await
         .expect("tick advances the event without an end");
@@ -493,7 +494,7 @@ async fn a_weekly_event_advances_with_local_time_across_the_dst_change() {
 
     // Среда 4 ноября 00:00 UTC: вхождение вторника 3 ноября уже закончилось,
     // после перехода на зимнее время оно шло с 18:00 до 19:00 EST.
-    scheduler(&db.pool)
+    ticker(&db.pool)
         .tick(utc(2026, 11, 4, 0))
         .await
         .expect("tick advances across the offset change");
@@ -510,4 +511,35 @@ async fn a_weekly_event_advances_with_local_time_across_the_dst_change() {
         chrono::NaiveTime::from_hms_opt(19, 0, 0).unwrap()
     );
     assert_eq!(current.version, event.version + 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_scheduler_tick_no_longer_advances_events() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let start = utc(2026, 11, 10, 15);
+    let end = utc(2026, 11, 10, 16);
+    let event = create_event(
+        &db,
+        &household,
+        "Тренировка",
+        start,
+        end,
+        support::recurrence(RecurrenceFreq::Weekly, vec![2]),
+    )
+    .await;
+
+    Scheduler::new(db.pool.clone(), Arc::new(Notify::new()))
+        .tick(end)
+        .await
+        .expect("scheduler tick");
+
+    let current = reload(&db.pool, &household, event.id).await;
+    assert_eq!(
+        current.due_at,
+        Some(start),
+        "the advance step must live in DomainTicker, not in Scheduler"
+    );
+    assert_eq!(current.end_at, Some(end));
+    assert_eq!(current.version, event.version);
 }
