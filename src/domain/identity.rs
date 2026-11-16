@@ -42,6 +42,20 @@ pub enum AuditEventType {
     AuthFailureThresholdExceeded,
     /// Household удалён.
     HouseholdDeleted,
+    /// Вход администратора в консоль.
+    AdminLogin,
+    /// Неудачная попытка входа в консоль.
+    AdminLoginFailed,
+    /// Неверный setup-код консоли.
+    AdminSetupCodeFailed,
+    /// Учётная запись администратора создана.
+    AdminAccountCreated,
+    /// Пароль администратора изменён.
+    AdminPasswordChanged,
+    /// Выпущена ссылка восстановления доступа.
+    AdminRecoveryIssued,
+    /// Настройка изменена в консоли.
+    AdminSettingChanged,
 }
 
 impl AuditEventType {
@@ -63,6 +77,13 @@ impl AuditEventType {
             Self::LlmValidationFailed => "llm_validation_failed",
             Self::AuthFailureThresholdExceeded => "auth_failure_threshold_exceeded",
             Self::HouseholdDeleted => "household_deleted",
+            Self::AdminLogin => "admin_login",
+            Self::AdminLoginFailed => "admin_login_failed",
+            Self::AdminSetupCodeFailed => "admin_setup_code_failed",
+            Self::AdminAccountCreated => "admin_account_created",
+            Self::AdminPasswordChanged => "admin_password_changed",
+            Self::AdminRecoveryIssued => "admin_recovery_issued",
+            Self::AdminSettingChanged => "admin_setting_changed",
         }
     }
 
@@ -212,7 +233,7 @@ pub fn confirmation_matches(name: &str, confirmation: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::confirmation_matches;
+    use super::{AuditEventType, confirmation_matches};
 
     #[test]
     fn household_name_confirmation_trims_surrounding_spaces_only() {
@@ -220,5 +241,28 @@ mod tests {
         assert!(!confirmation_matches("Семья", "Семья 2"));
         assert!(!confirmation_matches("Семья", "семья"));
         assert!(!confirmation_matches("Семья", ""));
+    }
+
+    #[test]
+    fn admin_audit_event_names_match_the_database_enum() {
+        let expected = [
+            (AuditEventType::AdminLogin, "admin_login"),
+            (AuditEventType::AdminLoginFailed, "admin_login_failed"),
+            (
+                AuditEventType::AdminSetupCodeFailed,
+                "admin_setup_code_failed",
+            ),
+            (AuditEventType::AdminAccountCreated, "admin_account_created"),
+            (
+                AuditEventType::AdminPasswordChanged,
+                "admin_password_changed",
+            ),
+            (AuditEventType::AdminRecoveryIssued, "admin_recovery_issued"),
+            (AuditEventType::AdminSettingChanged, "admin_setting_changed"),
+        ];
+
+        for (event_type, name) in expected {
+            assert_eq!(event_type.as_str(), name);
+        }
     }
 }

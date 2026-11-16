@@ -586,7 +586,14 @@ pub fn journal_line(event: &AuditEvent, tz: chrono_tz::Tz) -> String {
         | AuditEventType::AuthFailed
         | AuditEventType::RateLimited
         | AuditEventType::LlmValidationFailed
-        | AuditEventType::AuthFailureThresholdExceeded => "Служебное событие".to_owned(),
+        | AuditEventType::AuthFailureThresholdExceeded
+        | AuditEventType::AdminLogin
+        | AuditEventType::AdminLoginFailed
+        | AuditEventType::AdminSetupCodeFailed
+        | AuditEventType::AdminAccountCreated
+        | AuditEventType::AdminPasswordChanged
+        | AuditEventType::AdminRecoveryIssued
+        | AuditEventType::AdminSettingChanged => "Служебное событие".to_owned(),
     };
     match source_label(event.actor_type) {
         Some(source) => format!("{stamp} · {what} · источник: {source}"),

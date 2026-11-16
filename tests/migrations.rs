@@ -809,7 +809,7 @@ async fn llm_slot_settings_migration_applies_on_a_clean_database() {
     );
 }
 
-fn settings_error_code(result: &Result<(), sqlx::Error>) -> Option<String> {
+fn error_code<T>(result: &Result<T, sqlx::Error>) -> Option<String> {
     match result {
         Err(sqlx::Error::Database(database)) => database.code().map(|code| code.into_owned()),
         _ => None,
@@ -924,7 +924,7 @@ async fn settings_migration_enforces_scope_key_and_secret_rules() {
     )
     .await;
     assert_eq!(
-        settings_error_code(&duplicate_installation).as_deref(),
+        error_code(&duplicate_installation).as_deref(),
         Some("23505"),
         "installation keys must be unique even though household_id is NULL"
     );
@@ -950,7 +950,7 @@ async fn settings_migration_enforces_scope_key_and_secret_rules() {
     )
     .await;
     assert_eq!(
-        settings_error_code(&duplicate_household).as_deref(),
+        error_code(&duplicate_household).as_deref(),
         Some("23505"),
         "a key must be unique within one household"
     );
@@ -987,7 +987,7 @@ async fn settings_migration_enforces_scope_key_and_secret_rules() {
     )
     .await;
     assert_eq!(
-        settings_error_code(&both).as_deref(),
+        error_code(&both).as_deref(),
         Some("23514"),
         "value and secret are mutually exclusive"
     );
@@ -1002,7 +1002,7 @@ async fn settings_migration_enforces_scope_key_and_secret_rules() {
     )
     .await;
     assert_eq!(
-        settings_error_code(&neither).as_deref(),
+        error_code(&neither).as_deref(),
         Some("23514"),
         "a setting must carry either a value or a secret"
     );
@@ -1017,7 +1017,7 @@ async fn settings_migration_enforces_scope_key_and_secret_rules() {
     )
     .await;
     assert_eq!(
-        settings_error_code(&installation_with_household).as_deref(),
+        error_code(&installation_with_household).as_deref(),
         Some("23514"),
         "an installation setting must not reference a household"
     );
@@ -1032,7 +1032,7 @@ async fn settings_migration_enforces_scope_key_and_secret_rules() {
     )
     .await;
     assert_eq!(
-        settings_error_code(&household_without_household).as_deref(),
+        error_code(&household_without_household).as_deref(),
         Some("23514"),
         "a household setting must reference a household"
     );
@@ -1047,7 +1047,7 @@ async fn settings_migration_enforces_scope_key_and_secret_rules() {
     )
     .await;
     assert_eq!(
-        settings_error_code(&unknown_scope).as_deref(),
+        error_code(&unknown_scope).as_deref(),
         Some("23514"),
         "only the installation and household levels exist"
     );
@@ -1062,7 +1062,7 @@ async fn settings_migration_enforces_scope_key_and_secret_rules() {
     )
     .await;
     assert_eq!(
-        settings_error_code(&blank_key).as_deref(),
+        error_code(&blank_key).as_deref(),
         Some("23514"),
         "a blank key must be rejected"
     );
@@ -1380,4 +1380,376 @@ async fn cli_migrate_warns_about_migrations_missing_from_the_image() {
         "readiness must ignore migrations that are missing from the image"
     );
     pool.close().await;
+}
+
+/// Колонки таблицы: имя, тип и допустимость NULL.
+async fn table_shape(pool: &sqlx::PgPool, table: &str) -> Vec<(String, String, String)> {
+    sqlx::query_as(
+        "SELECT column_name, data_type, is_nullable
+         FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = $1
+         ORDER BY ordinal_position",
+    )
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .expect("table columns")
+}
+
+async fn insert_admin_account(pool: &sqlx::PgPool, username: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO admin_accounts (id, username, password_hash)
+         VALUES ($1, $2, '$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(username)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+async fn insert_one_time_code(
+    pool: &sqlx::PgPool,
+    purpose: &str,
+    household_id: Option<Uuid>,
+    code_hash: &str,
+    expires_in: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    let expires_at = expires_in
+        .map(|interval| format!("now() + interval '{interval}'"))
+        .unwrap_or_else(|| "NULL".to_owned());
+    sqlx::query(&format!(
+        "INSERT INTO admin_one_time_codes (id, purpose, household_id, code_hash, expires_at)
+         VALUES ($1, $2, $3, $4, {expires_at})"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(purpose)
+    .bind(household_id)
+    .bind(code_hash)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// 64 hex-символа, как SHA-256 в нижнем регистре.
+fn code_hash(fill: char) -> String {
+    fill.to_string().repeat(64)
+}
+
+/// Таблицы консоли: форма колонок и новые значения `audit_event_type`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_console_migration_creates_tables_and_audit_values() {
+    let db = support::empty_db().await;
+    migrations::run(&db.pool)
+        .await
+        .expect("migrations should apply on a clean database");
+
+    let accounts = table_shape(&db.pool, "admin_accounts").await;
+    let accounts: Vec<(&str, &str, &str)> = accounts
+        .iter()
+        .map(|(name, data_type, nullable)| (name.as_str(), data_type.as_str(), nullable.as_str()))
+        .collect();
+    assert_eq!(
+        accounts,
+        vec![
+            ("id", "uuid", "NO"),
+            ("username", "text", "NO"),
+            ("password_hash", "text", "NO"),
+            ("created_at", "timestamp with time zone", "NO"),
+            ("password_changed_at", "timestamp with time zone", "NO"),
+        ],
+        "admin_accounts must keep the design fields and always have a password"
+    );
+
+    let sessions = table_shape(&db.pool, "admin_sessions").await;
+    let sessions: Vec<(&str, &str, &str)> = sessions
+        .iter()
+        .map(|(name, data_type, nullable)| (name.as_str(), data_type.as_str(), nullable.as_str()))
+        .collect();
+    assert_eq!(
+        sessions,
+        vec![
+            ("id", "uuid", "NO"),
+            ("token_hash", "text", "NO"),
+            ("created_at", "timestamp with time zone", "NO"),
+            ("last_seen_at", "timestamp with time zone", "NO"),
+        ],
+        "7 and 30 day limits are computed from created_at and last_seen_at"
+    );
+
+    let codes = table_shape(&db.pool, "admin_one_time_codes").await;
+    let codes: Vec<(&str, &str, &str)> = codes
+        .iter()
+        .map(|(name, data_type, nullable)| (name.as_str(), data_type.as_str(), nullable.as_str()))
+        .collect();
+    assert_eq!(
+        codes,
+        vec![
+            ("id", "uuid", "NO"),
+            ("purpose", "text", "NO"),
+            ("household_id", "uuid", "YES"),
+            ("code_hash", "text", "NO"),
+            ("expires_at", "timestamp with time zone", "YES"),
+            ("used_at", "timestamp with time zone", "YES"),
+            ("created_at", "timestamp with time zone", "NO"),
+        ],
+        "a one-time code may carry no household and no expiry yet"
+    );
+
+    let values: Vec<String> =
+        sqlx::query_scalar("SELECT unnest(enum_range(NULL::audit_event_type))::text")
+            .fetch_all(&db.pool)
+            .await
+            .expect("audit_event_type values");
+    for expected in [
+        "admin_login",
+        "admin_login_failed",
+        "admin_setup_code_failed",
+        "admin_account_created",
+        "admin_password_changed",
+        "admin_recovery_issued",
+        "admin_setting_changed",
+    ] {
+        assert!(
+            values.iter().any(|value| value == expected),
+            "audit_event_type must contain {expected}: {values:?}"
+        );
+    }
+}
+
+/// Учётка: ровно одна строка, непустое имя.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_accounts_migration_allows_a_single_account() {
+    let db = support::empty_db().await;
+    migrations::run(&db.pool)
+        .await
+        .expect("migrations should apply on a clean database");
+
+    insert_admin_account(&db.pool, "admin")
+        .await
+        .expect("the first account is valid");
+
+    let second = insert_admin_account(&db.pool, "another").await;
+    assert_eq!(
+        error_code(&second).as_deref(),
+        Some("23505"),
+        "the database must allow only one administrator account"
+    );
+
+    let blank = insert_admin_account(&db.pool, "   ").await;
+    assert_eq!(
+        error_code(&blank).as_deref(),
+        Some("23514"),
+        "a blank username must be rejected"
+    );
+
+    let accounts: i64 = sqlx::query_scalar("SELECT count(*) FROM admin_accounts")
+        .fetch_one(&db.pool)
+        .await
+        .expect("accounts");
+    assert_eq!(accounts, 1, "the rejected rows must not be stored");
+}
+
+/// Одноразовые коды: назначения, срок, household и уникальность хеша.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_one_time_codes_migration_enforces_purpose_expiry_and_household() {
+    let db = support::empty_db().await;
+    migrations::run(&db.pool)
+        .await
+        .expect("migrations should apply on a clean database");
+
+    insert_one_time_code(&db.pool, "setup", None, &code_hash('a'), None)
+        .await
+        .expect("a setup code has no household and no expiry");
+
+    insert_one_time_code(
+        &db.pool,
+        "recovery",
+        None,
+        &code_hash('b'),
+        Some("15 minutes"),
+    )
+    .await
+    .expect("a recovery code lives 15 minutes");
+
+    let unknown = insert_one_time_code(&db.pool, "magic", None, &code_hash('c'), None).await;
+    assert_eq!(
+        error_code(&unknown).as_deref(),
+        Some("23514"),
+        "0013 knows only setup and recovery"
+    );
+
+    let household_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO households (id, name, timezone) VALUES ($1, 'Дом', 'Europe/Moscow')")
+        .bind(household_id)
+        .execute(&db.pool)
+        .await
+        .expect("household");
+
+    let setup_with_household =
+        insert_one_time_code(&db.pool, "setup", Some(household_id), &code_hash('d'), None).await;
+    assert_eq!(
+        error_code(&setup_with_household).as_deref(),
+        Some("23514"),
+        "in 0013 every purpose is installation-wide"
+    );
+
+    let recovery_without_expiry =
+        insert_one_time_code(&db.pool, "recovery", None, &code_hash('e'), None).await;
+    assert_eq!(
+        error_code(&recovery_without_expiry).as_deref(),
+        Some("23514"),
+        "only a setup code may live without an expiry"
+    );
+
+    let duplicate = insert_one_time_code(
+        &db.pool,
+        "recovery",
+        None,
+        &code_hash('b'),
+        Some("15 minutes"),
+    )
+    .await;
+    assert_eq!(
+        error_code(&duplicate).as_deref(),
+        Some("23505"),
+        "a code hash must be unique"
+    );
+
+    let raw_code = insert_one_time_code(&db.pool, "setup", None, "A3f-_code", None).await;
+    assert_eq!(
+        error_code(&raw_code).as_deref(),
+        Some("23514"),
+        "only a 64 hex character SHA-256 may be stored instead of the code"
+    );
+
+    // В 0013 строку с household вставить нельзя, поэтому проверяем определение
+    // внешнего ключа по каталогу: 0014 будет выпускать коды household, и они
+    // должны уходить вместе с ним.
+    let foreign_key: Option<String> = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid)
+         FROM pg_constraint
+         WHERE conrelid = 'admin_one_time_codes'::regclass AND contype = 'f'",
+    )
+    .fetch_optional(&db.pool)
+    .await
+    .expect("foreign key definition");
+    let foreign_key = foreign_key.expect("admin_one_time_codes must reference households");
+    assert!(
+        foreign_key.contains("REFERENCES households(id)")
+            && foreign_key.contains("ON DELETE CASCADE"),
+        "household codes must be deleted with the household: {foreign_key}"
+    );
+}
+
+/// Сессии: уникальный хеш токена и порядок времён.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_sessions_migration_requires_a_unique_token_hash() {
+    let db = support::empty_db().await;
+    migrations::run(&db.pool)
+        .await
+        .expect("migrations should apply on a clean database");
+
+    let hash = code_hash('f');
+    sqlx::query("INSERT INTO admin_sessions (id, token_hash) VALUES ($1, $2)")
+        .bind(Uuid::now_v7())
+        .bind(&hash)
+        .execute(&db.pool)
+        .await
+        .expect("a session with a SHA-256 token hash is valid");
+
+    let duplicate = sqlx::query("INSERT INTO admin_sessions (id, token_hash) VALUES ($1, $2)")
+        .bind(Uuid::now_v7())
+        .bind(&hash)
+        .execute(&db.pool)
+        .await;
+    assert_eq!(
+        error_code(&duplicate).as_deref(),
+        Some("23505"),
+        "a token hash must be unique"
+    );
+
+    let raw_token = sqlx::query("INSERT INTO admin_sessions (id, token_hash) VALUES ($1, $2)")
+        .bind(Uuid::now_v7())
+        .bind("c2Vzc2lvbi10b2tlbi1pcy1ub3QtaGFzaGVk")
+        .execute(&db.pool)
+        .await;
+    assert_eq!(
+        error_code(&raw_token).as_deref(),
+        Some("23514"),
+        "the raw token must not fit the hash column"
+    );
+
+    let earlier_seen = sqlx::query(
+        "INSERT INTO admin_sessions (id, token_hash, created_at, last_seen_at)
+         VALUES ($1, $2, now(), now() - interval '1 minute')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(code_hash('e'))
+    .execute(&db.pool)
+    .await;
+    assert_eq!(
+        error_code(&earlier_seen).as_deref(),
+        Some("23514"),
+        "a session cannot be last seen before it was created"
+    );
+}
+
+/// Новые события аудита пишутся и читаются через `AuditEventType`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_console_migration_round_trips_new_audit_events() {
+    use tasklerq::domain::identity::AuditEventType;
+
+    let db = support::empty_db().await;
+    migrations::run(&db.pool)
+        .await
+        .expect("migrations should apply on a clean database");
+
+    let expected = [
+        AuditEventType::AdminLogin,
+        AuditEventType::AdminLoginFailed,
+        AuditEventType::AdminSetupCodeFailed,
+        AuditEventType::AdminAccountCreated,
+        AuditEventType::AdminPasswordChanged,
+        AuditEventType::AdminRecoveryIssued,
+        AuditEventType::AdminSettingChanged,
+    ];
+    for event_type in expected {
+        sqlx::query(
+            "INSERT INTO audit_events (id, household_id, actor_user_id, actor_type,
+                                       event_type, payload)
+             VALUES ($1, NULL, NULL, 'system', $2, '{}'::jsonb)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(event_type)
+        .execute(&db.pool)
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "{} must be writable after the migration: {error}",
+                event_type.as_str()
+            )
+        });
+    }
+
+    let stored: Vec<AuditEventType> = sqlx::query_scalar(
+        "SELECT event_type FROM audit_events
+         WHERE event_type::text LIKE 'admin\\_%'
+         ORDER BY event_type::text",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("admin audit events");
+
+    let mut stored: Vec<&str> = stored
+        .iter()
+        .map(|event_type| event_type.as_str())
+        .collect();
+    let mut expected: Vec<&str> = expected
+        .iter()
+        .map(|event_type| event_type.as_str())
+        .collect();
+    stored.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(stored, expected);
 }

@@ -130,7 +130,7 @@
   `ADMIN_TRUSTED_PROXIES` подменённый `X-Forwarded-For` не меняет клиента;
   существующие тесты webhook проходят (spec admin-console «Отдельный listener
   консоли», design, решения 1, 5).
-- [ ] 5.2 Миграция `0021_admin_console.sql`: `admin_accounts` (не более одной
+- [x] 5.2 Миграция `0021_admin_console.sql`: `admin_accounts` (не более одной
   строки), `admin_sessions`, `admin_one_time_codes` (с `household_id` NULL и
   CHECK назначений), новые значения `audit_event_type` из design, решение 6.
   Проверить в `tests/migrations.rs`: вторая учётка отклоняется, значения enum
