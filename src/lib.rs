@@ -13,6 +13,7 @@ pub mod metrics;
 pub mod rate_limit;
 pub mod redaction;
 pub mod security_audit;
+pub mod settings;
 pub mod storage;
 pub mod telegram;
 

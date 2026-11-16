@@ -546,15 +546,25 @@ fn secret_key_is_hidden_in_config_debug() {
     ])
     .expect("valid keys are accepted");
 
+    // Поле ключа целиком: у Option<SecretKey> от ключа остаётся только признак
+    // «задан» и редактированный вид, а не десятичный список байт `[0, 1, ...]`.
+    assert_eq!(format!("{:?}", config.secret_key), "Some(<redacted>)");
+    assert_eq!(format!("{:?}", config.secret_key_old), "Some(<redacted>)");
+
     let debug = format!("{config:?}");
-    assert!(!debug.contains(SECRET_KEY_BASE64));
-    assert!(!debug.contains("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"));
     assert!(
-        !debug.contains("000102030405060708090a0b0c0d0e0f"),
-        "raw bytes must not be printed: {debug}"
+        debug.contains("secret_key: Some(<redacted>)"),
+        "the current key field must be redacted: {debug}"
     );
-    assert!(debug.contains("<redacted>"));
-    assert!(debug.contains("Some"), "the presence of keys is visible");
+    assert!(
+        debug.contains("secret_key_old: Some(<redacted>)"),
+        "the old key field must be redacted: {debug}"
+    );
+    assert!(!debug.contains(SECRET_KEY_BASE64));
+    assert!(
+        !debug.contains("[0, 1, 2"),
+        "key bytes must not be printed as a decimal list: {debug}"
+    );
 }
 
 #[test]
