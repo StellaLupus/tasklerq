@@ -7,13 +7,22 @@
 
 mod support;
 
+use std::net::SocketAddr;
+
+use axum::Router;
+use axum::body::Body;
+use axum::extract::ConnectInfo;
+use axum::http::{Method, Request, StatusCode, header};
+use http_body_util::BodyExt;
 use serde_json::Value;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use support::logs::LogBuffer;
 use tasklerq::admin_console::codes::{self, Purpose};
+use tasklerq::admin_console::router::{AdminState, build_router as build_admin_router};
 use tasklerq::config::Config;
 use tasklerq::storage::migrations;
+use tower::ServiceExt;
 use uuid::Uuid;
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -243,4 +252,70 @@ fn restart_revokes_the_previous_setup_code() {
             "both issues are kept as history"
         );
     });
+}
+
+/// Пароль не попадает в журнал ни при настройке, ни при входе.
+#[test]
+fn the_password_never_appears_in_the_logs() {
+    const PASSWORD: &str = "log-secret-password-123";
+
+    let (logs, (setup_status, login_status)) = capture(|| {
+        runtime().block_on(async {
+            let (pool, _url) = setup_db().await;
+            let app = build_admin_router(AdminState::new(pool.clone(), Vec::new()));
+            let issued = codes::issue(&pool, Purpose::Setup, None, chrono::Utc::now())
+                .await
+                .expect("a setup code");
+
+            let setup_status = post_form(
+                &app,
+                "/admin/setup",
+                &[
+                    ("code", &issued.code),
+                    ("username", "admin"),
+                    ("password", PASSWORD),
+                ],
+            )
+            .await;
+            let login_status = post_form(
+                &app,
+                "/admin/login",
+                &[("username", "admin"), ("password", PASSWORD)],
+            )
+            .await;
+            (setup_status, login_status)
+        })
+    });
+
+    assert_eq!(setup_status, StatusCode::SEE_OTHER);
+    assert_eq!(login_status, StatusCode::SEE_OTHER);
+    assert!(
+        !logs.contains(PASSWORD),
+        "the password must not be logged:\n{logs}"
+    );
+}
+
+/// `POST` формы с пиром, как у боевого listener через `ConnectInfo`.
+async fn post_form(app: &Router, path: &str, fields: &[(&str, &str)]) -> StatusCode {
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(fields)
+        .finish();
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(body))
+        .expect("request should build");
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 4_040))));
+
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("router should respond");
+    let status = response.status();
+    let _ = response.into_body().collect().await;
+    status
 }

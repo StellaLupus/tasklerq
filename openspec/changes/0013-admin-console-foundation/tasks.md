@@ -144,7 +144,7 @@
   ошибка с подсказкой `reset-password` (spec admin-console «Setup-код первого
   входа», spec deployment-operations «Секреты и безопасные значения по
   умолчанию»).
-- [ ] 5.4 Страницы `/admin/setup` и `/admin/login`, argon2id в
+- [x] 5.4 Страницы `/admin/setup` и `/admin/login`, argon2id в
   `spawn_blocking`, пароль 12–1024, сессии (`HttpOnly`, `SameSite=Strict`,
   `Secure` за доверенным прокси), продление не чаще раза в минуту, выход, сроки
   7 и 30 дней, заголовки `no-store` и запрет фреймов. Проверить в

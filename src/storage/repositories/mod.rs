@@ -3,7 +3,9 @@
 //! Функции принимают `&mut PgConnection`, чтобы вызывающая сторона могла
 //! объединять несколько операций в одну транзакцию.
 
+pub mod admin_accounts;
 pub mod admin_one_time_codes;
+pub mod admin_sessions;
 pub mod audit;
 pub mod capture_jobs;
 pub mod capture_requests;

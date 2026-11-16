@@ -1,20 +1,21 @@
 //! Роутер консоли администратора.
 //!
 //! Консоль живёт на отдельном listener: публичный [`crate::http::router`] не
-//! содержит её маршрутов.
+//! содержит её маршрутов. Все ответы консоли, включая редиректы и ошибки,
+//! получают запрет кеширования и встраивания во фреймы одним слоем на роутере.
 
 use std::net::SocketAddr;
 
 use axum::Router;
-use axum::http::HeaderMap;
-use axum::response::Html;
-use axum::routing::get;
+use axum::http::{HeaderMap, HeaderValue, header};
+use axum::response::Response;
+use axum::routing::{get, post};
 use sqlx::PgPool;
 
 use crate::config::IpNet;
 use crate::http::client::{Client, TrustedProxies};
 
-use super::session::AdminSession;
+use super::pages;
 
 /// Состояние консоли: база и доверенные прокси.
 #[derive(Clone)]
@@ -37,7 +38,7 @@ impl AdminState {
     /// Клиент по адресу соединения и заголовкам запроса.
     ///
     /// Доверие задаётся только явным списком `ADMIN_TRUSTED_PROXIES`; пустой
-    /// список не доверяет никому.
+    /// список не доверяет никому. Схема клиента решает флаг `Secure` у cookie.
     pub fn client(&self, peer: SocketAddr, headers: &HeaderMap) -> Client {
         Client::resolve(
             peer,
@@ -49,13 +50,33 @@ impl AdminState {
 
 /// Собрать роутер консоли.
 pub fn build_router(state: AdminState) -> Router {
-    Router::new().route("/admin", get(index)).with_state(state)
+    Router::new()
+        .route("/admin", get(pages::index))
+        .route(
+            "/admin/setup",
+            get(pages::setup_page).post(pages::setup_submit),
+        )
+        .route(
+            "/admin/login",
+            get(pages::login_page).post(pages::login_submit),
+        )
+        .route("/admin/logout", post(pages::logout))
+        .layer(axum::middleware::map_response(security_headers))
+        .with_state(state)
 }
 
-/// Главная страница консоли. До 5.8 отдаётся простой HTML без шаблонов.
-async fn index(_session: AdminSession) -> Html<&'static str> {
-    Html(
-        "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">\
-         <title>Tasklerq</title></head><body><h1>Tasklerq</h1></body></html>",
-    )
+/// Заголовки всех ответов консоли.
+///
+/// `no-store` не даёт прокси и браузеру сохранить страницу с формой или
+/// cookie; запрет фреймов закрывает clickjacking. Один слой на роутере
+/// покрывает и HTML, и `303`, и ошибки обработчиков.
+async fn security_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    response
 }
