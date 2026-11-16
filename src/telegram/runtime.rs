@@ -181,7 +181,9 @@ mod tests {
             primary: Some(slot()),
             fallback: None,
             connect_timeout: Duration::from_millis(1000),
+            connect_timeout_from_env: false,
             daily_quota: 200,
+            daily_quota_from_env: false,
             ignored_env: Vec::new(),
         };
         assert!(build_llm(&llm).is_none());
@@ -194,12 +196,31 @@ mod tests {
             primary: Some(slot()),
             fallback: Some(slot()),
             connect_timeout: Duration::from_millis(1000),
+            connect_timeout_from_env: false,
             daily_quota: 200,
+            daily_quota_from_env: false,
             ignored_env: Vec::new(),
         };
 
         let chain = build_llm(&llm).expect("configured slots build a chain");
         assert_eq!(chain.primary().name(), "primary");
         assert_eq!(chain.fallback().map(|slot| slot.name()), Some("fallback"));
+    }
+
+    #[test]
+    fn an_absent_flag_builds_a_chain_when_the_primary_slot_is_set() {
+        // Прежнее умолчание окружения: слот задан, флага нет — разбор включён.
+        let llm = LlmConfig {
+            enabled: None,
+            primary: Some(slot()),
+            fallback: None,
+            connect_timeout: Duration::from_millis(1000),
+            connect_timeout_from_env: false,
+            daily_quota: 200,
+            daily_quota_from_env: false,
+            ignored_env: Vec::new(),
+        };
+
+        assert!(build_llm(&llm).is_some());
     }
 }

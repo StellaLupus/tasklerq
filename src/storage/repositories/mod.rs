@@ -17,6 +17,7 @@ pub mod llm_slot_checks;
 pub mod llm_slot_settings;
 pub mod members;
 pub mod notifications;
+pub mod settings;
 pub mod subtasks;
 pub mod tags;
 pub mod tokens;

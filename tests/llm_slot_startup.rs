@@ -98,7 +98,9 @@ async fn an_unreadable_database_without_a_cache_marks_slots_unverified() {
         primary: Some(primary),
         fallback: None,
         connect_timeout: StdDuration::from_millis(1_000),
+        connect_timeout_from_env: false,
         daily_quota: 200,
+        daily_quota_from_env: false,
         ignored_env: Vec::new(),
     };
     let health = LlmSlotHealth::new(Arc::new(chain), &llm).expect("llm health");

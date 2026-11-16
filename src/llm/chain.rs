@@ -209,7 +209,7 @@ impl Chain {
     /// Собрать цепочку из конфигурации. `None`, если разбор выключен или
     /// основной слот не задан.
     pub fn from_config(config: &LlmConfig) -> Result<Option<Self>, LlmError> {
-        if config.enabled != Some(true) {
+        if !config.capture_enabled() {
             return Ok(None);
         }
         let Some(primary_config) = &config.primary else {

@@ -379,8 +379,8 @@ impl fmt::Debug for SlotConfig {
 #[derive(Clone, Debug)]
 pub struct LlmConfig {
     /// Явно заданный `LLM_CAPTURE_ENABLED`: `Some(..)` только если переменная
-    /// есть в окружении. `None` — флаг не задан и берётся из настроек консоли
-    /// (до 2.3 — выключен).
+    /// есть в окружении. `None` — флаг не задан: он берётся из настроек
+    /// консоли, а без них действует умолчание [`LlmConfig::capture_enabled`].
     pub enabled: Option<bool>,
     /// Основной слот; обязателен при явном `LLM_CAPTURE_ENABLED=true`.
     pub primary: Option<SlotConfig>,
@@ -388,8 +388,14 @@ pub struct LlmConfig {
     pub fallback: Option<SlotConfig>,
     /// Таймаут установки соединения, общий для слотов.
     pub connect_timeout: Duration,
+    /// Задан ли [`Self::connect_timeout`] явно в окружении. `false` — значение
+    /// по умолчанию; хранимая настройка консоли тогда имеет приоритет над ним.
+    pub connect_timeout_from_env: bool,
     /// Суточная квота разборов на household.
     pub daily_quota: u32,
+    /// Задана ли [`Self::daily_quota`] явно в окружении: как у
+    /// [`Self::connect_timeout_from_env`], отличает значение от умолчания.
+    pub daily_quota_from_env: bool,
     /// Переменные слотов, заданные без `*_URL` и `*_MODEL`: они игнорируются,
     /// значения не разбирались. Печатаются предупреждением в стартовом логе.
     pub ignored_env: Vec<&'static str>,
@@ -403,6 +409,17 @@ impl LlmConfig {
     /// слота работает до включения разбора, если запрошенный слот задан.
     pub fn from_env() -> Result<Self, ConfigError> {
         Config::llm_config(&EnvSource::from_process())
+    }
+
+    /// Включён ли разбор по правилу окружения без учёта базы.
+    ///
+    /// Явный `LLM_CAPTURE_ENABLED` побеждает. Без переменной действует
+    /// умолчание: разбор включён, если основной слот задан окружением, иначе
+    /// выключен. Так установки со слотами в `.env` без флага сохраняют прежнее
+    /// поведение. После подключения настроек консоли (3.1) база встаёт между
+    /// окружением и этим умолчанием; здесь она не участвует.
+    pub fn capture_enabled(&self) -> bool {
+        self.enabled.unwrap_or(self.primary.is_some())
     }
 }
 
@@ -716,11 +733,13 @@ impl Config {
             }
         }
 
-        let connect_timeout = match source.get("LLM_CONNECT_TIMEOUT_MS") {
+        let connect_timeout_raw = source.get("LLM_CONNECT_TIMEOUT_MS");
+        let connect_timeout = match connect_timeout_raw {
             None => Duration::from_millis(u64::from(DEFAULT_CONNECT_TIMEOUT_MS)),
             Some(raw) => named("LLM_CONNECT_TIMEOUT_MS", parse_connect_timeout_ms(raw))?,
         };
-        let daily_quota = match source.get("LLM_DAILY_QUOTA") {
+        let daily_quota_raw = source.get("LLM_DAILY_QUOTA");
+        let daily_quota = match daily_quota_raw {
             None => DEFAULT_DAILY_QUOTA,
             Some(raw) => named("LLM_DAILY_QUOTA", parse_daily_quota(raw))?,
         };
@@ -730,7 +749,9 @@ impl Config {
             primary,
             fallback,
             connect_timeout,
+            connect_timeout_from_env: connect_timeout_raw.is_some(),
             daily_quota,
+            daily_quota_from_env: daily_quota_raw.is_some(),
             ignored_env,
         })
     }
@@ -788,7 +809,7 @@ const FALLBACK_SLOT: SlotEnv = SlotEnv {
 };
 
 /// Таймаут запроса слота по умолчанию, миллисекунды.
-const DEFAULT_SLOT_TIMEOUT_MS: u32 = 10_000;
+pub const DEFAULT_SLOT_TIMEOUT_MS: u32 = 10_000;
 
 /// Границы таймаута запроса слота, миллисекунды.
 const SLOT_TIMEOUT_MS_MIN: u32 = 100;
@@ -797,10 +818,11 @@ const SLOT_TIMEOUT_MS_MAX: u32 = 600_000;
 /// Границы таймаута установки соединения, миллисекунды.
 const CONNECT_TIMEOUT_MS_MIN: u32 = 10;
 const CONNECT_TIMEOUT_MS_MAX: u32 = 60_000;
-const DEFAULT_CONNECT_TIMEOUT_MS: u32 = 1_000;
+/// Умолчание таймаута установки соединения, миллисекунды.
+pub const DEFAULT_CONNECT_TIMEOUT_MS: u32 = 1_000;
 
 /// Умолчание суточной квоты разборов.
-const DEFAULT_DAILY_QUOTA: u32 = 200;
+pub const DEFAULT_DAILY_QUOTA: u32 = 200;
 const DAILY_QUOTA_MIN: u32 = 1;
 const DAILY_QUOTA_MAX: u32 = 100_000;
 

@@ -258,14 +258,16 @@ impl SecretCipher {
         if self.current.is_none() && self.old.is_none() {
             return Err(SecretError::KeyMissing);
         }
-        let key_id = key_id(blob).ok_or(SecretError::Undecryptable)?;
+        let blob_key_id = key_id(blob).ok_or(SecretError::Undecryptable)?;
         if blob[0] != FORMAT_VERSION {
             return Err(SecretError::Undecryptable);
         }
         if blob.len() < HEADER_LEN + TAG_LEN {
             return Err(SecretError::Undecryptable);
         }
-        let key = self.key_with_id(key_id).ok_or(SecretError::Undecryptable)?;
+        let key = self
+            .key_with_id(blob_key_id)
+            .ok_or(SecretError::Undecryptable)?;
 
         let mut nonce = [0_u8; NONCE_LEN];
         nonce.copy_from_slice(&blob[1 + KEY_ID_LEN..HEADER_LEN]);
@@ -494,6 +496,55 @@ mod tests {
                 Some(Uuid::nil().as_bytes().as_slice()),
                 b"ab"
             )
+        );
+    }
+
+    #[test]
+    fn aad_binds_the_scope_even_with_the_same_household_and_key() {
+        let household = Uuid::from_u64_pair(1, 2);
+        assert_ne!(
+            associated_data(
+                FORMAT_VERSION,
+                SettingScope::Installation.as_str().as_bytes(),
+                Some(household.as_bytes().as_slice()),
+                b"llm.primary.token"
+            ),
+            associated_data(
+                FORMAT_VERSION,
+                SettingScope::Household.as_str().as_bytes(),
+                Some(household.as_bytes().as_slice()),
+                b"llm.primary.token"
+            ),
+            "scope must be part of the AAD"
+        );
+    }
+
+    #[test]
+    fn context_aad_has_the_expected_byte_layout() {
+        // Собрано независимо от `associated_data`: версия, затем каждое поле
+        // с префиксом длины u32 big-endian (scope, household_id, key).
+        let mut installation = vec![FORMAT_VERSION, 0, 0, 0, 12];
+        installation.extend_from_slice(b"installation");
+        installation.extend_from_slice(&[0, 0, 0, 0]);
+        installation.extend_from_slice(&[0, 0, 0, 17]);
+        installation.extend_from_slice(b"llm.primary.token");
+
+        assert_eq!(
+            SecretContext::installation("llm.primary.token").aad(),
+            installation
+        );
+
+        let household_id = Uuid::from_u64_pair(0x0102_0304_0506_0708, 0x090a_0b0c_0d0e_0f10);
+        let mut household = vec![FORMAT_VERSION, 0, 0, 0, 9];
+        household.extend_from_slice(b"household");
+        household.extend_from_slice(&[0, 0, 0, 16]);
+        household.extend_from_slice(household_id.as_bytes());
+        household.extend_from_slice(&[0, 0, 0, 17]);
+        household.extend_from_slice(b"llm.primary.token");
+
+        assert_eq!(
+            SecretContext::household(household_id, "llm.primary.token").aad(),
+            household
         );
     }
 

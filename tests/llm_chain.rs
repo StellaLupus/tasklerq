@@ -180,7 +180,9 @@ fn chain_is_built_from_slot_configs() {
             Duration::from_secs(4),
         )),
         connect_timeout: Duration::from_millis(500),
+        connect_timeout_from_env: false,
         daily_quota: 200,
+        daily_quota_from_env: false,
         ignored_env: Vec::new(),
     };
 

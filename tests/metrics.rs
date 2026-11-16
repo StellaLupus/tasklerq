@@ -665,7 +665,9 @@ async fn llm_slot_verified_is_one_only_for_a_passed_slot() {
         primary: Some(primary.clone()),
         fallback: None,
         connect_timeout: StdDuration::from_millis(1_000),
+        connect_timeout_from_env: false,
         daily_quota: 200,
+        daily_quota_from_env: false,
         ignored_env: Vec::new(),
     };
     let health = LlmSlotHealth::new(Arc::new(chain), &llm).expect("llm health");

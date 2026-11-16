@@ -84,7 +84,9 @@ fn llm_health(
         primary: Some(primary.clone()),
         fallback: fallback.cloned(),
         connect_timeout: StdDuration::from_millis(1_000),
+        connect_timeout_from_env: false,
         daily_quota: 200,
+        daily_quota_from_env: false,
         ignored_env: Vec::new(),
     };
     let health = Arc::new(LlmSlotHealth::new(chain.clone(), &llm).expect("llm health"));
