@@ -103,7 +103,7 @@
 
 ## 4. Проверка слота и доменный тикер
 
-- [ ] 4.1 Перенести прогон из `run_capture_eval` в
+- [x] 4.1 Перенести прогон из `run_capture_eval` в
   `capture::slot_check::run_check` с `pg_try_advisory_lock`; `prepare_check`
   собирает слот через `settings::effective_llm`. Проверить:
   `tests/capture_eval.rs` проходит без изменения ожиданий; слот, заданный

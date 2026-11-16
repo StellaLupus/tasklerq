@@ -10,6 +10,8 @@ mod support;
 use std::process::{Output, Stdio};
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -17,7 +19,10 @@ use tasklerq::capture::eval::TitleMatch;
 use tasklerq::capture::prompt::{self, PROMPT_VERSION};
 use tasklerq::capture::slot_check;
 use tasklerq::capture::slot_status::{self, SlotStatus};
-use tasklerq::config::{SecretString, SlotConfig};
+use tasklerq::config::{SecretKey, SecretString, SlotConfig};
+use tasklerq::llm::OpenAiBackend;
+use tasklerq::settings;
+use tasklerq::settings::crypto::SecretCipher;
 use tasklerq::storage::migrations;
 use tasklerq::storage::repositories::llm_slot_checks;
 use tasklerq::storage::repositories::llm_slot_settings;
@@ -31,7 +36,8 @@ struct CliDatabase {
     pool: sqlx::PgPool,
 }
 
-async fn cli_database() -> CliDatabase {
+/// База без миграций: соединение проходит, таблиц нет.
+async fn empty_database() -> CliDatabase {
     let name = format!("cli_capture_eval_{}", Uuid::now_v7().simple());
     support::create_database(&name).await;
     let url = support::database_url_for(&name).await;
@@ -40,10 +46,15 @@ async fn cli_database() -> CliDatabase {
         .connect(&url)
         .await
         .expect("the CLI database should accept connections");
-    migrations::run(&pool)
+    CliDatabase { url, pool }
+}
+
+async fn cli_database() -> CliDatabase {
+    let db = empty_database().await;
+    migrations::run(&db.pool)
         .await
         .expect("migrations should apply");
-    CliDatabase { url, pool }
+    db
 }
 
 fn bin() -> Command {
@@ -73,6 +84,30 @@ fn capture_eval(url: &str, server: &MockServer, timeout_ms: u64) -> Command {
         .env_remove("LLM_FALLBACK_TOKEN")
         .env_remove("LLM_FALLBACK_TIMEOUT_MS")
         .env_remove("LLM_FALLBACK_EXTRA_JSON");
+    command
+}
+
+/// Команда без параметров слота в окружении: слот задан только в `settings`.
+fn capture_eval_without_slot_env(url: &str) -> Command {
+    let mut command = bin();
+    command
+        .env("DATABASE_URL", url)
+        .env("LLM_CAPTURE_ENABLED", "false")
+        .env("RUST_LOG", "error");
+    for name in [
+        "LLM_PRIMARY_URL",
+        "LLM_PRIMARY_MODEL",
+        "LLM_PRIMARY_TOKEN",
+        "LLM_PRIMARY_TIMEOUT_MS",
+        "LLM_PRIMARY_EXTRA_JSON",
+        "LLM_FALLBACK_URL",
+        "LLM_FALLBACK_MODEL",
+        "LLM_FALLBACK_TOKEN",
+        "LLM_FALLBACK_TIMEOUT_MS",
+        "LLM_FALLBACK_EXTRA_JSON",
+    ] {
+        command.env_remove(name);
+    }
     command
 }
 
@@ -660,6 +695,213 @@ async fn a_set_for_another_contract_fails_before_calling_the_llm() {
             .is_empty(),
         "another contract must not reach the LLM"
     );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slot_configured_only_in_settings_is_checked_by_the_command() {
+    let db = cli_database().await;
+    let server = MockServer::start().await;
+    mount_answer(&server, "полить цветы", "Полить цветы").await;
+    let (set_path, dir) = write_set(
+        "settings-slot",
+        &smoke_set(&[("first", "полить цветы", "Полить цветы")]),
+    );
+
+    // Слот перенесён из `.env` в консоль: в окружении команды `LLM_*` нет, а
+    // адрес, модель и токен лежат в `settings`. Токен шифруется ключом, который
+    // команда получает из `TASKLERQ_SECRET_KEY`.
+    let key = [7u8; 32];
+    let secret_key = BASE64.encode(key);
+    let cipher = SecretCipher::new(
+        Some(SecretKey::parse(&secret_key).expect("32 bytes are a key")),
+        None,
+    );
+    let mut conn = db.pool.acquire().await.expect("connection");
+    settings::write_value(
+        &mut conn,
+        "llm.primary.url",
+        json!(format!("{}/v1", server.uri())),
+    )
+    .await
+    .expect("the slot url is written");
+    settings::write_value(&mut conn, "llm.primary.model", json!("db/model"))
+        .await
+        .expect("the slot model is written");
+    settings::write_secret(
+        &mut conn,
+        "llm.primary.token",
+        &SecretString::new("db-token"),
+        &cipher,
+    )
+    .await
+    .expect("the slot token is written");
+    drop(conn);
+
+    let output = capture_eval_without_slot_env(&db.url)
+        .env("TASKLERQ_SECRET_KEY", &secret_key)
+        .args([
+            "capture-eval",
+            "--slot",
+            "primary",
+            "--set",
+            set_path.to_str().expect("path"),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .expect("the CLI should run");
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(requests.len(), 1, "the phrase is checked once");
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer db-token"),
+        "the token is decrypted from settings"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("request body");
+    assert_eq!(body["model"], "db/model", "the model comes from settings");
+
+    let model: String = sqlx::query_scalar(
+        "SELECT fingerprint_parts->>'model' FROM llm_slot_checks WHERE slot = 'primary'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("the check is saved with the slot fingerprint");
+    assert_eq!(model, "db/model");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_run_while_a_check_is_running_fails_without_calling_the_llm() {
+    let db = cli_database().await;
+    let server = MockServer::start().await;
+    mount_answer(&server, "полить цветы", "Полить цветы").await;
+    let (set_path, dir) = write_set(
+        "busy",
+        &smoke_set(&[("first", "полить цветы", "Полить цветы")]),
+    );
+
+    // Блокировку держит другой прогон, как идущая проверка из консоли.
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(slot_check::CHECK_LOCK_KEY)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the test takes the check lock");
+    assert!(acquired);
+
+    let run = || {
+        capture_eval(&db.url, &server, 10_000)
+            .args([
+                "capture-eval",
+                "--slot",
+                "primary",
+                "--set",
+                set_path.to_str().expect("path"),
+            ])
+            .stdin(Stdio::null())
+            .output()
+    };
+
+    let busy = run().await.expect("the CLI should run");
+    assert_eq!(busy.status.code(), Some(2), "{busy:?}");
+    assert!(
+        stderr(&busy).contains("проверка уже идёт"),
+        "{}",
+        stderr(&busy)
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("requests")
+            .is_empty(),
+        "a concurrent check must not reach the LLM"
+    );
+    assert!(
+        slot_rows(&db.pool).await.is_empty(),
+        "a concurrent check must not write a result"
+    );
+
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(slot_check::CHECK_LOCK_KEY)
+        .execute(&mut *conn)
+        .await
+        .expect("the test releases the check lock");
+    drop(conn);
+
+    // Блокировка не залипает: после снятия та же команда проходит.
+    let retry = run().await.expect("the CLI should run");
+    assert_eq!(retry.status.code(), Some(0), "{retry:?}");
+    assert!(
+        stdout(&retry).contains("Слот прошёл проверку"),
+        "{}",
+        stdout(&retry)
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_lock_is_released_when_the_result_cannot_be_saved() {
+    // База без миграций: прогон проходит, запись результата — нет.
+    let db = empty_database().await;
+    let server = MockServer::start().await;
+    mount_answer(&server, "полить цветы", "Полить цветы").await;
+    let (set_path, dir) = write_set(
+        "lock-release",
+        &smoke_set(&[("first", "полить цветы", "Полить цветы")]),
+    );
+
+    let set_text = std::fs::read_to_string(&set_path).expect("the smoke set");
+    let set = slot_check::load_set(&set_text).expect("the set matches the contract");
+    let slot = SlotConfig {
+        url: format!("{}/v1", server.uri()).parse().expect("url"),
+        model: "test/model".to_owned(),
+        token: None,
+        timeout: Duration::from_secs(10),
+        extra: Map::new(),
+    };
+    let backend = OpenAiBackend::from_slot(&slot, Duration::from_secs(5)).expect("backend");
+    let prepared = slot_check::PreparedCheck {
+        slot_name: "primary",
+        slot,
+        backend: Box::new(backend),
+        set,
+        set_text,
+    };
+
+    let result = slot_check::run_check(&db.pool, prepared, Some(TitleMatch::Strict))
+        .await
+        .expect("the report is ready even when the save fails");
+    assert!(
+        result.saved.is_err(),
+        "a database without migrations cannot store the check"
+    );
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(slot_check::CHECK_LOCK_KEY)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("try the check lock");
+    assert!(
+        acquired,
+        "the check lock must be released after a failed save"
+    );
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(slot_check::CHECK_LOCK_KEY)
+        .execute(&mut *conn)
+        .await
+        .expect("unlock");
 
     std::fs::remove_dir_all(&dir).ok();
 }
