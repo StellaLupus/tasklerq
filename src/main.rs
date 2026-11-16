@@ -15,6 +15,7 @@ use tasklerq::capture::slot_check;
 use tasklerq::config::{self, Config, DatabaseConfig, LlmConfig, SecretKeyConfig, TenancyConfig};
 use tasklerq::domain::error::DomainError;
 use tasklerq::domain::models::UserRole;
+use tasklerq::domain::settings::DEFAULT_TIMEZONE;
 use tasklerq::http::server;
 use tasklerq::llm::OpenAiBackend;
 use tasklerq::redaction;
@@ -305,7 +306,7 @@ enum HouseholdCommand {
         #[arg(long)]
         name: String,
         /// Часовой пояс IANA.
-        #[arg(long, default_value = "Europe/Moscow")]
+        #[arg(long, default_value = DEFAULT_TIMEZONE)]
         timezone: String,
         /// Telegram ID владельца (положительное целое).
         #[arg(long, value_name = "ID", value_parser = clap::value_parser!(i64).range(1..))]

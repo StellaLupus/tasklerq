@@ -121,6 +121,10 @@ pub enum LlmApplyError {
     /// Ошибка чтения настроек в транзакции.
     #[error(transparent)]
     Database(#[from] sqlx::Error),
+    /// Фоновая задача применения не завершилась; подробности не содержат
+    /// значений настроек.
+    #[error("llm settings task failed")]
+    Task(#[from] tokio::task::JoinError),
 }
 
 /// Применение сохранённых настроек LLM к снимку.
@@ -150,11 +154,34 @@ impl LlmSettings {
         &self.handle
     }
 
+    /// Действующие значения всех известных ключей для страницы настроек.
+    ///
+    /// Чтение не берёт мьютекс записи: конкурентное сохранение публикует новый
+    /// снимок и строки одной транзакцией, поэтому страница увидит либо прежнее,
+    /// либо новое состояние.
+    pub async fn read_settings(&self) -> Result<Vec<settings::ResolvedSetting>, sqlx::Error> {
+        let mut conn = self.pool.acquire().await?;
+        let stored = repository::all(&mut conn, SettingScope::Installation.as_str(), None).await?;
+        Ok(settings::resolve_settings(&self.env, &stored, &self.cipher))
+    }
+
     /// Применить группу изменений целиком.
     ///
     /// Ошибка любого шага откатывает транзакцию, поэтому частично сохранённой
     /// группы не бывает. Снимок заменяется только после commit.
+    ///
+    /// Применение выполняется отдельной задачей: между commit и `store` нет
+    /// точки, где отмена future обработчика оставила бы базу записанной, а
+    /// снимок прежним. Отмена ожидания результата (обрыв запроса) не
+    /// прерывает применение.
     pub async fn apply(&self, changes: &[LlmChange]) -> Result<Arc<LlmSnapshot>, LlmApplyError> {
+        let this = self.clone();
+        let changes = changes.to_vec();
+        tokio::spawn(async move { this.apply_inner(&changes).await }).await?
+    }
+
+    /// Критическая часть [`Self::apply`], переживающая отмену вызывающего.
+    async fn apply_inner(&self, changes: &[LlmChange]) -> Result<Arc<LlmSnapshot>, LlmApplyError> {
         let _guard = self.write_lock.lock().await;
         let mut tx = self.pool.begin().await?;
 

@@ -118,7 +118,8 @@ pub async fn build_application_with_update_limit(
         );
         build_admin_router(
             AdminState::new(pool.clone(), config.admin_trusted_proxies.clone(), audit)
-                .with_wizard(wizard),
+                .with_wizard(wizard)
+                .with_llm(llm_settings.clone()),
         )
     });
 

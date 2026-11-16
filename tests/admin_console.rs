@@ -11,6 +11,8 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, header};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use http_body_util::BodyExt;
 use serde_json::Value;
@@ -28,15 +30,18 @@ use tasklerq::admin_console::setup::{self, SetupOutcome};
 use tasklerq::admin_console::wizard::WizardSettings;
 use tasklerq::app::build_application;
 use tasklerq::auth::tokens::hash_token;
-use tasklerq::config::{CaptureConfig, Config, IpNet, LlmConfig, TenancyConfig, TenancyMode};
+use tasklerq::config::{
+    CaptureConfig, Config, IpNet, LlmConfig, SecretKey, TenancyConfig, TenancyMode,
+};
 use tasklerq::domain::error::DomainError;
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::client::{Client, Scheme};
 use tasklerq::http::router::{AppState, build_router};
 use tasklerq::http::server::{bind_listeners, serve_listeners};
-use tasklerq::llm::{LlmHandle, LlmSnapshot};
+use tasklerq::llm::{LlmChange, LlmHandle, LlmSettings, LlmSnapshot};
 use tasklerq::rate_limit::{Reservation, ip_key};
 use tasklerq::security_audit::Audit;
+use tasklerq::settings;
 use tasklerq::settings::crypto::SecretCipher;
 use tasklerq::storage::repositories::admin_accounts;
 use tasklerq::storage::repositories::households;
@@ -217,6 +222,66 @@ fn console_with(pool: &PgPool, tenancy: TenancyMode, telegram: bool, llm: LlmCon
             WizardSettings::new(tenancy, telegram, llm, SecretCipher::new(None, None)),
         ),
     )
+}
+
+/// Ключ шифрования из повторяющегося байта.
+fn secret_key(byte: u8) -> SecretKey {
+    SecretKey::parse(&BASE64.encode([byte; 32])).expect("32 bytes are a key")
+}
+
+fn cipher_with_key(byte: u8) -> SecretCipher {
+    SecretCipher::new(Some(secret_key(byte)), None)
+}
+
+/// Параметры LLM из окружения для тестов консоли.
+fn llm_env(pairs: &[(&str, &str)]) -> LlmConfig {
+    let mut vars: Vec<(String, String)> = [
+        ("ENV", "development"),
+        ("PUBLIC_BASE_URL", "http://127.0.0.1:18080"),
+        (
+            "DATABASE_URL",
+            "postgres://tasklerq:secret@127.0.0.1:5432/tasklerq",
+        ),
+        ("TELEGRAM_MODE", "disabled"),
+        ("LLM_CAPTURE_ENABLED", "false"),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.to_owned(), value.to_owned()))
+    .collect();
+    vars.extend(
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
+    );
+    Config::from_map(vars)
+        .expect("the test environment is valid")
+        .llm
+}
+
+/// Консоль с тем же экземпляром настроек LLM, что у рантайма.
+fn console_with_llm(pool: &PgPool, llm: LlmConfig, cipher: SecretCipher) -> (Router, LlmSettings) {
+    // Как в `build_application`: снимок стартует из окружения, базы и умолчаний.
+    let handle = LlmHandle::new(LlmSnapshot::from_effective(settings::effective_llm(
+        &llm,
+        &[],
+        &cipher,
+    )));
+    let settings = LlmSettings::new(pool.clone(), llm.clone(), cipher.clone(), handle);
+    let app = build_admin_router(
+        AdminState::new(pool.clone(), Vec::new(), Audit::new(pool.clone()))
+            .with_wizard(WizardSettings::new(TenancyMode::Single, false, llm, cipher))
+            .with_llm(settings.clone()),
+    );
+    (app, settings)
+}
+
+/// Число строк `settings` с указанными ключами.
+async fn setting_rows(pool: &PgPool, keys: &[&str]) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM settings WHERE key = ANY($1)")
+        .bind(keys)
+        .fetch_one(pool)
+        .await
+        .expect("setting rows")
 }
 
 /// Значение настройки инсталляции из `settings`.
@@ -3647,7 +3712,6 @@ async fn the_token_step_can_be_skipped_and_finishes_the_wizard() {
     assert_eq!(location(&headers), Some("/admin"));
 }
 
-/// Активный токен household снимает шаг токена.
 /// Число неудалённых household.
 async fn household_count(pool: &PgPool) -> i64 {
     sqlx::query_scalar("SELECT count(*) FROM households WHERE deleted_at IS NULL")
@@ -4137,6 +4201,7 @@ async fn a_failed_wizard_target_after_setup_still_sets_the_cookie() {
     assert_eq!(session_count(&db.pool).await, 1);
 }
 
+/// Активный токен household снимает шаг токена.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_active_token_removes_the_token_step() {
     let db = support::isolated_db().await;
@@ -4175,4 +4240,676 @@ async fn an_active_token_removes_the_token_step() {
     let (status, headers, _) = send_with_cookie(&app, Method::GET, "/admin/wizard", &cookie).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(location(&headers), Some("/admin"));
+}
+
+/// Слот наполовину: адрес резервного без модели отклоняется, недостающее поле
+/// названо, снимок и строки `settings` не меняются.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_incomplete_slot_is_rejected_without_changing_the_snapshot() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let (app, settings) =
+        console_with_llm(&db.pool, LlmConfig::empty(), SecretCipher::new(None, None));
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    let before = settings.handle().load();
+
+    let (status, _, body) = send_form_from(
+        &app,
+        "/admin/llm",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("fallback_url", "http://127.0.0.1:9/v1")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "an incomplete slot is a form error");
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("role=\"alert\""), "{text}");
+    assert!(
+        text.contains("llm.fallback.model"),
+        "the error must name the missing field: {text}"
+    );
+    assert!(
+        text.contains("value=\"http://127.0.0.1:9/v1\""),
+        "the entered address is kept: {text}"
+    );
+
+    assert_eq!(
+        settings.handle().load().version(),
+        before.version(),
+        "a rejected save must not replace the snapshot"
+    );
+    assert_eq!(
+        setting_rows(&db.pool, &["llm.fallback.url", "llm.fallback.model"]).await,
+        0,
+        "no row of the rejected slot is written"
+    );
+}
+
+/// Поля слота из окружения показываются только для чтения, а POST их не пишет.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_environment_slot_is_read_only_and_post_cannot_change_it() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let llm = llm_env(&[
+        ("LLM_PRIMARY_URL", "https://env.example.test/v1"),
+        ("LLM_PRIMARY_MODEL", "env/model"),
+    ]);
+    let (app, settings) = console_with_llm(&db.pool, llm, SecretCipher::new(None, None));
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin/llm", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("https://env.example.test/v1"), "{text}");
+    assert!(text.contains("env/model"), "{text}");
+    assert!(text.contains("источник: окружение"), "{text}");
+    assert!(
+        text.matches("readonly").count() >= 2,
+        "the environment slot fields are read only: {text}"
+    );
+
+    let before = settings.handle().load();
+    let (status, headers, _) = send_form_from(
+        &app,
+        "/admin/llm",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("primary_url", "https://env.example.test/v1"),
+            ("primary_model", "db/model"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        location(&headers),
+        Some("/admin/llm"),
+        "nothing changed, so no save marker is shown"
+    );
+
+    assert_eq!(
+        setting_value(&db.pool, "llm.primary.model").await,
+        None,
+        "a model from the form must not be written over an environment slot"
+    );
+    let after = settings.handle().load();
+    assert_eq!(after.version(), before.version());
+    assert_eq!(
+        after
+            .effective()
+            .primary()
+            .config()
+            .map(|config| config.model.as_str()),
+        Some("env/model")
+    );
+}
+
+/// Токен: в HTML только состояние, замена и удаление работают, значения нет.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_saved_token_is_never_rendered_and_can_be_replaced_or_deleted() {
+    const TOKEN: &str = "tlq-console-secret-token";
+    const NEW_TOKEN: &str = "tlq-replacement-secret-token";
+
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let (app, settings) = console_with_llm(&db.pool, LlmConfig::empty(), cipher_with_key(7));
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let field_header = [
+        ("cookie", cookie.as_str()),
+        ("enabled", "1"),
+        ("primary_url", "https://llm.example.test/v1"),
+        ("primary_model", "vendor/model"),
+    ];
+    let mut fields = field_header.to_vec();
+    fields.push(("primary_token", TOKEN));
+    let (status, headers, _) = send_form_from(
+        &app,
+        "/admin/llm",
+        test_peer(),
+        headers_with(&fields),
+        &fields,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/llm?saved=1"));
+
+    let (status, _, body) =
+        send_with_cookie(&app, Method::GET, "/admin/llm?saved=1", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        !text.contains(TOKEN),
+        "the token leaks into the page: {text}"
+    );
+    assert!(text.contains("Токен: <strong>задан</strong>"), "{text}");
+    assert!(
+        text.contains("Настройки LLM сохранены."),
+        "the save marker is shown: {text}"
+    );
+
+    let blob: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT secret FROM settings WHERE key = 'llm.primary.token'")
+            .fetch_one(&db.pool)
+            .await
+            .expect("the secret row");
+    let blob = blob.expect("the token is stored encrypted");
+    assert!(
+        !blob
+            .windows(TOKEN.len())
+            .any(|window| window == TOKEN.as_bytes()),
+        "the open token must not be stored"
+    );
+    assert_eq!(
+        settings
+            .handle()
+            .load()
+            .effective()
+            .primary()
+            .config()
+            .and_then(|config| config.token.as_ref())
+            .map(|token| token.expose().to_owned()),
+        Some(TOKEN.to_owned()),
+        "the snapshot uses the saved token"
+    );
+
+    let mut fields = field_header.to_vec();
+    fields.push(("primary_token", NEW_TOKEN));
+    let (status, headers, _) = send_form_from(
+        &app,
+        "/admin/llm",
+        test_peer(),
+        headers_with(&fields),
+        &fields,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/llm?saved=1"));
+    assert_eq!(
+        settings
+            .handle()
+            .load()
+            .effective()
+            .primary()
+            .config()
+            .and_then(|config| config.token.as_ref())
+            .map(|token| token.expose().to_owned()),
+        Some(NEW_TOKEN.to_owned()),
+        "the replacement token is applied without a restart"
+    );
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin/llm", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(!text.contains(NEW_TOKEN), "{text}");
+
+    let mut fields = field_header.to_vec();
+    fields.push(("primary_token_delete", "1"));
+    let (status, headers, _) = send_form_from(
+        &app,
+        "/admin/llm",
+        test_peer(),
+        headers_with(&fields),
+        &fields,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/llm?saved=1"));
+    assert_eq!(
+        settings.handle().load().effective().primary().token_state(),
+        tasklerq::settings::SecretState::NotSet,
+        "the deleted token is gone from the snapshot"
+    );
+    assert_eq!(
+        setting_rows(&db.pool, &["llm.primary.token"]).await,
+        0,
+        "the deleted secret row is gone"
+    );
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin/llm", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(&body).contains("Токен: <strong>не задан</strong>"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+/// Без ключа шифрования токен отклоняется, остальные поля сохраняются.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_secret_key_rejects_the_token_but_saves_the_other_fields() {
+    const TOKEN: &str = "tlq-token-without-a-key";
+
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let (app, settings) =
+        console_with_llm(&db.pool, LlmConfig::empty(), SecretCipher::new(None, None));
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let (status, headers, _) = send_form_from(
+        &app,
+        "/admin/llm",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("enabled", "1"),
+            ("primary_url", "https://llm.example.test/v1"),
+            ("primary_model", "vendor/model"),
+            ("primary_token", TOKEN),
+            ("daily_quota", "321"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        location(&headers),
+        Some("/admin/llm?saved=1&secret=key_missing"),
+        "the other fields are saved and the token is rejected"
+    );
+
+    assert_eq!(
+        setting_value(&db.pool, "llm.daily_quota").await,
+        Some(serde_json::json!("321")),
+        "the quota is saved without a key"
+    );
+    assert_eq!(
+        setting_rows(&db.pool, &["llm.primary.token"]).await,
+        0,
+        "the token is not written without a key"
+    );
+    let snapshot = settings.handle().load();
+    assert_eq!(snapshot.quota(), 321, "the quota is applied");
+    assert_eq!(
+        snapshot.effective().primary().token_state(),
+        tasklerq::settings::SecretState::NotSet
+    );
+
+    let (status, _, body) = send_with_cookie(
+        &app,
+        Method::GET,
+        "/admin/llm?saved=1&secret=key_missing",
+        &cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("TASKLERQ_SECRET_KEY"), "{text}");
+    assert!(text.contains("Токен не сохранён"), "{text}");
+    assert!(text.contains("Настройки LLM сохранены."), "{text}");
+    assert!(
+        !text.contains(TOKEN),
+        "the rejected token is not echoed: {text}"
+    );
+}
+
+/// Смена модели и квоты действует на следующий снимок без перезапуска.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_model_and_quota_change_take_effect_without_a_restart() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let (app, settings) =
+        console_with_llm(&db.pool, LlmConfig::empty(), SecretCipher::new(None, None));
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let (status, headers, _) = send_form_from(
+        &app,
+        "/admin/llm",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("enabled", "1"),
+            ("primary_url", "https://llm.example.test/v1"),
+            ("primary_model", "first/model"),
+            ("daily_quota", "200"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/llm?saved=1"));
+    let first = settings.handle().load();
+    assert_eq!(
+        first
+            .effective()
+            .primary()
+            .config()
+            .map(|config| config.model.clone()),
+        Some("first/model".to_owned())
+    );
+    assert_eq!(first.quota(), 200);
+
+    let (status, headers, _) = send_form_from(
+        &app,
+        "/admin/llm",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("enabled", "1"),
+            ("primary_model", "second/model"),
+            ("daily_quota", "300"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/llm?saved=1"));
+
+    let second = settings.handle().load();
+    assert!(
+        second.version() > first.version(),
+        "the snapshot version grows"
+    );
+    assert!(second.chain().is_some(), "the chain is rebuilt");
+    assert_eq!(
+        second
+            .effective()
+            .primary()
+            .config()
+            .map(|config| config.model.clone()),
+        Some("second/model".to_owned()),
+        "the next snapshot uses the new model"
+    );
+    assert_eq!(second.quota(), 300, "the new quota is in the snapshot");
+    assert_eq!(
+        setting_value(&db.pool, "llm.primary.model").await,
+        Some(serde_json::json!("second/model"))
+    );
+}
+
+/// Отменённое ожидание сохранения не оставляет базу и снимок расходящимися.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_save_still_finishes_with_a_matching_snapshot() {
+    let db = support::isolated_db().await;
+    let handle = LlmHandle::empty();
+    let settings = LlmSettings::new(
+        db.pool.clone(),
+        LlmConfig::empty(),
+        SecretCipher::new(None, None),
+        handle.clone(),
+    );
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(1),
+        settings.apply(&[LlmChange::set("llm.daily_quota", serde_json::json!(300))]),
+    )
+    .await;
+    assert!(result.is_err(), "the caller's wait is cancelled");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if setting_value(&db.pool, "llm.daily_quota").await == Some(serde_json::json!(300))
+            && handle.load().quota() == 300
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the detached save never reached the database and the snapshot"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(
+        setting_value(&db.pool, "llm.daily_quota").await,
+        Some(serde_json::json!(300)),
+        "the snapshot matches the committed row"
+    );
+    assert_eq!(handle.load().quota(), 300);
+}
+
+/// Успешное сохранение пишет `admin_setting_changed` без значений секретов.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_saved_llm_form_is_audited_without_secret_values() {
+    const TOKEN: &str = "tlq-audited-secret-token";
+
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let (app, _) = console_with_llm(&db.pool, LlmConfig::empty(), cipher_with_key(9));
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let (status, _, _) = send_form_from(
+        &app,
+        "/admin/llm",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("enabled", "1"),
+            ("primary_url", "https://llm.example.test/v1"),
+            ("primary_model", "vendor/model"),
+            ("primary_token", TOKEN),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let payloads = audit_payloads(&db.pool, "admin_setting_changed").await;
+    let keys: Vec<&str> = payloads
+        .iter()
+        .filter_map(|payload| payload["key"].as_str())
+        .collect();
+    for expected in [
+        "llm.enabled",
+        "llm.primary.url",
+        "llm.primary.model",
+        "llm.primary.token",
+    ] {
+        assert!(
+            keys.contains(&expected),
+            "missing audit for {expected}: {payloads:?}"
+        );
+    }
+    let joined = payloads.iter().map(Value::to_string).collect::<String>();
+    assert!(
+        !joined.contains(TOKEN),
+        "the audit payload leaked the token: {joined}"
+    );
+    let token_event = payloads
+        .iter()
+        .find(|payload| payload["key"] == "llm.primary.token")
+        .expect("the token change is audited");
+    assert_eq!(token_event["value"], "set");
+    for (actor, household) in audit_actor(&db.pool, "admin_setting_changed").await {
+        assert_eq!(actor, "system");
+        assert_eq!(household, None);
+    }
+}
+
+/// Чужой `Origin` на странице LLM — `403`, без сессии — `303` на вход.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_llm_page_checks_the_origin_and_the_session() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let (app, _) = console_with_llm(&db.pool, LlmConfig::empty(), SecretCipher::new(None, None));
+
+    let (status, headers, _) = send(&app, Method::GET, "/admin/llm").await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "an anonymous GET goes to the login page"
+    );
+    assert_eq!(location(&headers), Some("/admin/login"));
+
+    let (status, headers, _) = send_form(&app, "/admin/llm", &[("daily_quota", "300")]).await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "an anonymous POST goes to the login page"
+    );
+    assert_eq!(location(&headers), Some("/admin/login"));
+    assert_eq!(
+        setting_value(&db.pool, "llm.daily_quota").await,
+        None,
+        "an anonymous POST writes nothing"
+    );
+
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    let (status, response_headers, _) = send_form_from(
+        &app,
+        "/admin/llm",
+        test_peer(),
+        headers_with(&[
+            ("host", "nas:18081"),
+            ("origin", "http://evil.example"),
+            ("cookie", &cookie),
+        ]),
+        &[("daily_quota", "300")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_security_headers(&response_headers, "a foreign origin on the llm form");
+    assert_eq!(setting_value(&db.pool, "llm.daily_quota").await, None);
+
+    let (status, headers, body) = send_with_cookie(&app, Method::GET, "/admin/llm", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_security_headers(&headers, "GET /admin/llm");
+    assert_no_external_urls(&body, "GET /admin/llm");
+    assert_local_assets(&body, "GET /admin/llm");
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("<form method=\"post\" action=\"/admin/llm\">"),
+        "the form is a plain POST to the console path: {text}"
+    );
+}
+
+/// Шаг LLM мастера ведёт на страницу, а сохранённый слот завершает шаг.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_wizard_llm_step_leads_to_the_llm_page_and_completes_on_save() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    insert_household(&db.pool).await;
+    let (app, settings) =
+        console_with_llm(&db.pool, LlmConfig::empty(), SecretCipher::new(None, None));
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin/wizard", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("href=\"/admin/llm\"") && text.contains("Настроить разбор"),
+        "the llm step links to its page: {text}"
+    );
+
+    let (status, headers, _) = send_form_from(
+        &app,
+        "/admin/llm",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("enabled", "1"),
+            ("primary_url", "https://llm.example.test/v1"),
+            ("primary_model", "vendor/model"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/llm?saved=1"));
+    assert!(
+        settings
+            .handle()
+            .load()
+            .effective()
+            .primary()
+            .is_configured(),
+        "the saved slot is effective"
+    );
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin/wizard", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("action=\"/admin/wizard/token\""),
+        "the wizard moved past the llm step: {text}"
+    );
+    assert!(!text.contains("Настроить разбор"), "{text}");
+}
+
+/// Шаг токена: чужие и анонимные запросы, длина имени и отсутствие повторного
+/// выпуска. Токен не получает cookie.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_token_step_refuses_repeats_and_foreign_requests() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    insert_household(&db.pool).await;
+    let app = console_with(&db.pool, TenancyMode::Single, false, LlmConfig::empty());
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let (status, _, _) = send_form_from(
+        &app,
+        "/admin/wizard/skip",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("step", "llm")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let (status, headers, _) = send_form(&app, "/admin/wizard/token", &[("name", "")]).await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "an anonymous POST goes to the login page"
+    );
+    assert_eq!(location(&headers), Some("/admin/login"));
+    assert_eq!(token_count(&db.pool).await, 0);
+
+    let (status, response_headers, _) = send_form_from(
+        &app,
+        "/admin/wizard/token",
+        test_peer(),
+        headers_with(&[
+            ("host", "nas:18081"),
+            ("origin", "http://evil.example"),
+            ("cookie", &cookie),
+        ]),
+        &[("name", "")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_security_headers(&response_headers, "a token POST with a foreign origin");
+    assert_eq!(token_count(&db.pool).await, 0);
+
+    let too_long = "x".repeat(65);
+    let (status, headers, body) = send_form_from(
+        &app,
+        "/admin/wizard/token",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("name", &too_long)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "a too long name is a form error");
+    assert_security_headers(&headers, "the token form error");
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("role=\"alert\""), "{text}");
+    assert_eq!(token_count(&db.pool).await, 0);
+
+    let (status, headers, body) = send_form_from(
+        &app,
+        "/admin/wizard/token",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("name", "Home Assistant")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        set_cookie(&headers).is_none(),
+        "the token page must not receive a session cookie"
+    );
+    let token = issued_token(&body);
+    assert!(token.starts_with("tlq_"), "{token}");
+    assert_eq!(token_count(&db.pool).await, 1);
+
+    let (status, headers, _) = send_form_from(
+        &app,
+        "/admin/wizard/token",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("name", "Second")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin"));
+    assert_eq!(
+        token_count(&db.pool).await,
+        1,
+        "a repeated POST must not issue a second token"
+    );
 }

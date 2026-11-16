@@ -1,4 +1,5 @@
-//! Страницы консоли: setup, вход, восстановление, смена пароля, мастер и главная.
+//! Страницы консоли: setup, вход, восстановление, смена пароля, мастер,
+//! настройки LLM и главная.
 //!
 //! Макет (`Layout`) общий: шапка, навигация вошедшего администратора, сообщение
 //! и место для содержимого. Содержимое рисует небольшой askama-шаблон своей
@@ -29,8 +30,9 @@ use askama::Template;
 use axum::extract::{ConnectInfo, Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use serde_json::Value;
 
 use super::assets;
 use super::change::{self, ChangeError, ChangeOutcome};
@@ -43,9 +45,11 @@ use super::setup::{self, SetupError, SetupOutcome};
 use super::wizard::{self, WizardStep};
 use crate::admin;
 use crate::domain::error::DomainError;
-use crate::domain::settings::validate_timezone;
+use crate::domain::settings::{DEFAULT_TIMEZONE, validate_timezone};
 use crate::domain::validation::normalize_text;
+use crate::llm::{LlmApplyError, LlmChange};
 use crate::rate_limit::RateDecision;
+use crate::settings::{ResolvedSetting, SecretState, SettingError, SettingSource};
 use crate::storage::repositories::admin_accounts;
 
 /// Путь страницы первого входа.
@@ -54,9 +58,14 @@ const SETUP_PATH: &str = "/admin/setup";
 const HOME_PATH: &str = "/admin";
 /// Путь страницы смены пароля; `?changed=1` показывает подтверждение.
 const PASSWORD_PATH: &str = "/admin/password";
-
-/// Часовой пояс по умолчанию: то же значение, что у `admin household create`.
-const DEFAULT_TIMEZONE: &str = "Europe/Moscow";
+/// Путь страницы настроек LLM.
+pub(crate) const LLM_PATH: &str = "/admin/llm";
+/// Успешное сохранение настроек LLM.
+const LLM_SAVED_PATH: &str = "/admin/llm?saved=1";
+/// Настройки сохранены, но токен отклонён: нет ключа шифрования.
+const LLM_SECRET_REJECTED_PATH: &str = "/admin/llm?saved=1&secret=key_missing";
+/// Токен отклонён, других изменений не было.
+const LLM_SECRET_ONLY_REJECTED_PATH: &str = "/admin/llm?secret=key_missing";
 /// Имя токена Home Assistant по умолчанию.
 const DEFAULT_TOKEN_NAME: &str = "Home Assistant";
 /// Scopes токена, который выпускает мастер.
@@ -135,6 +144,91 @@ pub(crate) struct TokenForm {
     /// Название токена; пустое значение заменяется именем по умолчанию.
     #[serde(default)]
     name: Option<String>,
+}
+
+/// Поля формы настроек LLM.
+///
+/// Отсутствие поля означает «не менять»: так неполный POST не стирает
+/// настройки. Пустая строка у обычного поля стирает ключ (действует умолчание
+/// или слот остаётся неполным и сохранение отклоняется).
+#[derive(Deserialize)]
+pub(crate) struct LlmForm {
+    /// Флажок включения разбора.
+    #[serde(default)]
+    enabled: Option<String>,
+    #[serde(default)]
+    primary_url: Option<String>,
+    #[serde(default)]
+    primary_model: Option<String>,
+    #[serde(default)]
+    primary_token: Option<String>,
+    #[serde(default)]
+    primary_token_delete: Option<String>,
+    #[serde(default)]
+    primary_timeout_ms: Option<String>,
+    #[serde(default)]
+    primary_extra_json: Option<String>,
+    #[serde(default)]
+    fallback_url: Option<String>,
+    #[serde(default)]
+    fallback_model: Option<String>,
+    #[serde(default)]
+    fallback_token: Option<String>,
+    #[serde(default)]
+    fallback_token_delete: Option<String>,
+    #[serde(default)]
+    fallback_timeout_ms: Option<String>,
+    #[serde(default)]
+    fallback_extra_json: Option<String>,
+    #[serde(default)]
+    connect_timeout_ms: Option<String>,
+    #[serde(default)]
+    daily_quota: Option<String>,
+}
+
+impl LlmForm {
+    /// Поля одного слота; `primary` выбирает основной слот.
+    fn slot(&self, primary: bool) -> LlmSlotFields<'_> {
+        if primary {
+            LlmSlotFields {
+                url: self.primary_url.as_deref(),
+                model: self.primary_model.as_deref(),
+                token: self.primary_token.as_deref(),
+                delete_token: self.primary_token_delete.is_some(),
+                timeout: self.primary_timeout_ms.as_deref(),
+                extra_json: self.primary_extra_json.as_deref(),
+            }
+        } else {
+            LlmSlotFields {
+                url: self.fallback_url.as_deref(),
+                model: self.fallback_model.as_deref(),
+                token: self.fallback_token.as_deref(),
+                delete_token: self.fallback_token_delete.is_some(),
+                timeout: self.fallback_timeout_ms.as_deref(),
+                extra_json: self.fallback_extra_json.as_deref(),
+            }
+        }
+    }
+}
+
+/// Поля формы одного слота.
+#[derive(Clone, Copy)]
+struct LlmSlotFields<'a> {
+    url: Option<&'a str>,
+    model: Option<&'a str>,
+    token: Option<&'a str>,
+    delete_token: bool,
+    timeout: Option<&'a str>,
+    extra_json: Option<&'a str>,
+}
+
+/// Метка успешного сохранения в адресе страницы.
+#[derive(Deserialize)]
+pub(crate) struct LlmQuery {
+    #[serde(default)]
+    saved: Option<String>,
+    #[serde(default)]
+    secret: Option<String>,
 }
 
 /// `GET /admin`: главная страница за сессией.
@@ -357,6 +451,83 @@ pub(crate) async fn password_submit(
     }
 }
 
+/// `GET /admin/llm`: настройки разбора за сессией.
+pub(crate) async fn llm_page(
+    State(state): State<AdminState>,
+    _session: AdminSession,
+    Query(query): Query<LlmQuery>,
+) -> Response {
+    match state.llm_settings().read_settings().await {
+        Ok(settings) => render(ConsolePage::new(Page::Llm(Box::new(llm_view(
+            &settings,
+            None,
+            query.saved.is_some(),
+            query.secret.as_deref() == Some("key_missing"),
+        ))))),
+        Err(error) => internal(error),
+    }
+}
+
+/// `POST /admin/llm`: применить изменённые поля одной группой.
+///
+/// Поля из окружения не попадают в набор изменений, поэтому POST их не
+/// меняет. Ошибка валидации возвращает форму с введёнными несекретными
+/// значениями; токен в форму не возвращается никогда. Без ключа шифрования
+/// токен отклоняется, а остальные поля сохраняются отдельной группой.
+pub(crate) async fn llm_submit(
+    State(state): State<AdminState>,
+    _session: AdminSession,
+    Form(form): Form<LlmForm>,
+) -> Response {
+    let settings = match state.llm_settings().read_settings().await {
+        Ok(settings) => settings,
+        Err(error) => return internal(error),
+    };
+    let pending = collect_changes(&form, &settings);
+    if pending.is_empty() {
+        return redirect(LLM_PATH);
+    }
+
+    let now = Utc::now();
+    let all: Vec<LlmChange> = pending.iter().map(|change| change.change.clone()).collect();
+    let has_secret = pending.iter().any(PendingChange::is_secret);
+
+    if has_secret {
+        match state.llm_settings().apply(&all).await {
+            Ok(_) => {
+                audit_changes(&state, &pending, now).await;
+                return redirect(LLM_SAVED_PATH);
+            }
+            Err(LlmApplyError::Setting(SettingError::SecretKeyMissing { .. })) => {
+                let plain: Vec<LlmChange> = pending
+                    .iter()
+                    .filter(|change: &&PendingChange| !change.is_secret())
+                    .map(|change| change.change.clone())
+                    .collect();
+                if plain.is_empty() {
+                    return redirect(LLM_SECRET_ONLY_REJECTED_PATH);
+                }
+                match state.llm_settings().apply(&plain).await {
+                    Ok(_) => {
+                        audit_plain_changes(&state, &pending, now).await;
+                        return redirect(LLM_SECRET_REJECTED_PATH);
+                    }
+                    Err(error) => return llm_error_page(&state, &form, &error).await,
+                }
+            }
+            Err(error) => return llm_error_page(&state, &form, &error).await,
+        }
+    }
+
+    match state.llm_settings().apply(&all).await {
+        Ok(_) => {
+            audit_changes(&state, &pending, now).await;
+            redirect(LLM_SAVED_PATH)
+        }
+        Err(error) => llm_error_page(&state, &form, &error).await,
+    }
+}
+
 /// `GET /admin/wizard`: текущий шаг мастера за сессией.
 pub(crate) async fn wizard_page(
     State(state): State<AdminState>,
@@ -431,23 +602,12 @@ pub(crate) async fn wizard_household(
         return wizard_stale(step, telegram_enabled);
     }
 
-    let (name, timezone) = match (normalize_text(&form.name, 100, "household name"))
+    let (name, timezone) = match normalize_text(&form.name, 100, "household name")
         .and_then(|name| validate_timezone(&form.timezone).map(|timezone| (name, timezone)))
     {
         Ok(values) => values,
         Err(error) => {
-            let message = error.to_string();
-            return render(
-                ConsolePage::new(Page::Wizard {
-                    step,
-                    household_skip_allowed: telegram_enabled,
-                    form: WizardForm::Household {
-                        name: form.name,
-                        timezone: form.timezone,
-                    },
-                })
-                .error(&message),
-            );
+            return household_form_error(step, telegram_enabled, &form, &error.to_string());
         }
     };
 
@@ -460,8 +620,33 @@ pub(crate) async fn wizard_household(
             Ok(step) => redirect(step.target_path()),
             Err(error) => internal(error),
         },
+        // Валидация повторилась уже в репозитории: это ошибка формы, а не сбой
+        // сервера, и введённые значения возвращаются.
+        Err(DomainError::Validation(message)) => {
+            household_form_error(step, telegram_enabled, &form, &message)
+        }
         Err(error) => internal(error),
     }
+}
+
+/// Форма household с сообщением об ошибке валидации.
+fn household_form_error(
+    step: WizardStep,
+    telegram_enabled: bool,
+    form: &HouseholdForm,
+    message: &str,
+) -> Response {
+    render(
+        ConsolePage::new(Page::Wizard {
+            step,
+            household_skip_allowed: telegram_enabled,
+            form: WizardForm::Household {
+                name: form.name.clone(),
+                timezone: form.timezone.clone(),
+            },
+        })
+        .error(message),
+    )
 }
 
 /// `POST /admin/wizard/token`: выпустить токен Home Assistant и показать его
@@ -594,6 +779,222 @@ fn target_or_home(target: Result<&'static str, DomainError>) -> &'static str {
             );
             HOME_PATH
         }
+    }
+}
+
+/// Одно изменение формы вместе с именем настройки для аудита.
+struct PendingChange {
+    /// Изменение для [`LlmSettings::apply`].
+    change: LlmChange,
+    /// Имя настройки; в аудит попадает без значения.
+    key: &'static str,
+    /// Признак для аудита: `changed`, `set` или `deleted`.
+    audit_value: &'static str,
+}
+
+impl PendingChange {
+    /// Изменение записывает секрет: значение в аудит не попадает.
+    fn is_secret(&self) -> bool {
+        matches!(&self.change, LlmChange::SetSecret { .. })
+    }
+}
+
+/// Набор изменений по полям формы.
+///
+/// Поле из окружения не попадает в набор: POST не может его изменить.
+/// Отсутствующее поле тоже пропускается, пустое обычное значение удаляет ключ.
+fn collect_changes(form: &LlmForm, settings: &[ResolvedSetting]) -> Vec<PendingChange> {
+    let mut changes = Vec::new();
+
+    if !is_readonly(settings, "llm.enabled") {
+        let current = bool_of(settings, "llm.enabled").unwrap_or(false);
+        let submitted = form.enabled.is_some();
+        if submitted != current {
+            changes.push(PendingChange {
+                change: LlmChange::set("llm.enabled", Value::Bool(submitted)),
+                key: "llm.enabled",
+                audit_value: "changed",
+            });
+        }
+    }
+
+    collect_slot_changes(&mut changes, settings, PRIMARY_KEYS, &form.slot(true));
+    collect_slot_changes(&mut changes, settings, FALLBACK_KEYS, &form.slot(false));
+
+    push_text_change(
+        &mut changes,
+        settings,
+        "llm.connect_timeout_ms",
+        form.connect_timeout_ms.as_deref(),
+    );
+    push_text_change(
+        &mut changes,
+        settings,
+        "llm.daily_quota",
+        form.daily_quota.as_deref(),
+    );
+
+    changes
+}
+
+/// Ключи строк одного слота для формы.
+#[derive(Clone, Copy)]
+struct SlotKeys {
+    url: &'static str,
+    model: &'static str,
+    token: &'static str,
+    timeout: &'static str,
+    extra_json: &'static str,
+}
+
+const PRIMARY_KEYS: SlotKeys = SlotKeys {
+    url: "llm.primary.url",
+    model: "llm.primary.model",
+    token: "llm.primary.token",
+    timeout: "llm.primary.timeout_ms",
+    extra_json: "llm.primary.extra_json",
+};
+
+const FALLBACK_KEYS: SlotKeys = SlotKeys {
+    url: "llm.fallback.url",
+    model: "llm.fallback.model",
+    token: "llm.fallback.token",
+    timeout: "llm.fallback.timeout_ms",
+    extra_json: "llm.fallback.extra_json",
+};
+
+fn collect_slot_changes(
+    changes: &mut Vec<PendingChange>,
+    settings: &[ResolvedSetting],
+    keys: SlotKeys,
+    form: &LlmSlotFields<'_>,
+) {
+    push_text_change(changes, settings, keys.url, form.url);
+    push_text_change(changes, settings, keys.model, form.model);
+    push_text_change(changes, settings, keys.timeout, form.timeout);
+    push_text_change(changes, settings, keys.extra_json, form.extra_json);
+
+    if is_readonly(settings, keys.token) {
+        return;
+    }
+    if form.delete_token {
+        changes.push(PendingChange {
+            change: LlmChange::delete(keys.token),
+            key: keys.token,
+            audit_value: "deleted",
+        });
+    } else if let Some(token) = form.token.filter(|token| !token.trim().is_empty()) {
+        changes.push(PendingChange {
+            change: LlmChange::secret(keys.token, token),
+            key: keys.token,
+            audit_value: "set",
+        });
+    }
+}
+
+fn push_text_change(
+    changes: &mut Vec<PendingChange>,
+    settings: &[ResolvedSetting],
+    key: &'static str,
+    submitted: Option<&str>,
+) {
+    if is_readonly(settings, key) {
+        return;
+    }
+    let Some(submitted) = submitted else {
+        return;
+    };
+    let submitted = submitted.trim();
+    if submitted == text_of(settings, key).trim() {
+        return;
+    }
+    let change = if submitted.is_empty() {
+        LlmChange::delete(key)
+    } else {
+        LlmChange::set(key, Value::String(submitted.to_owned()))
+    };
+    changes.push(PendingChange {
+        change,
+        key,
+        audit_value: "changed",
+    });
+}
+
+/// Записать в аудит имена изменённых настроек без значений.
+async fn audit_changes(state: &AdminState, changes: &[PendingChange], now: DateTime<Utc>) {
+    for change in changes {
+        state
+            .audit
+            .admin_setting_changed(change.key, change.audit_value, now)
+            .await;
+    }
+}
+
+/// Записать в аудит только несекретные изменения: токен отклонён.
+async fn audit_plain_changes(state: &AdminState, changes: &[PendingChange], now: DateTime<Utc>) {
+    for change in changes.iter().filter(|change| !change.is_secret()) {
+        state
+            .audit
+            .admin_setting_changed(change.key, change.audit_value, now)
+            .await;
+    }
+}
+
+/// Страница с ошибкой применения; неизвестные сбои — `500` без подробностей.
+async fn llm_error_page(state: &AdminState, form: &LlmForm, error: &LlmApplyError) -> Response {
+    let Some(message) = llm_error_message(error) else {
+        return internal(error);
+    };
+    match state.llm_settings().read_settings().await {
+        Ok(settings) => render(
+            ConsolePage::new(Page::Llm(Box::new(llm_view(
+                &settings,
+                Some(form),
+                false,
+                false,
+            ))))
+            .error(&message),
+        ),
+        Err(error) => internal(error),
+    }
+}
+
+/// Понятное сообщение формы с именем поля; `None` — внутренняя ошибка.
+fn llm_error_message(error: &LlmApplyError) -> Option<String> {
+    match error {
+        LlmApplyError::MissingField { key } => Some(format!(
+            "Не хватает поля `{key}`: у слота должны быть и адрес, и модель."
+        )),
+        LlmApplyError::InvalidField { key } => {
+            Some(format!("Поле `{key}` содержит неверное значение."))
+        }
+        LlmApplyError::Chain { .. } => {
+            Some("Не удалось собрать цепочку LLM; ничего не сохранено.".to_owned())
+        }
+        LlmApplyError::Setting(error) => setting_error_message(error),
+        LlmApplyError::Database(_) | LlmApplyError::Task(_) => None,
+    }
+}
+
+fn setting_error_message(error: &SettingError) -> Option<String> {
+    match error {
+        SettingError::UnknownKey { key } => Some(format!("Неизвестная настройка `{key}`.")),
+        SettingError::PlainValueForSecret { key } => {
+            Some(format!("Поле `{key}` можно сохранить только как секрет."))
+        }
+        SettingError::SecretValueForPlain { key } => {
+            Some(format!("Поле `{key}` не является секретом."))
+        }
+        SettingError::InvalidValue { key, reason } => {
+            Some(format!("Неверное значение поля `{key}`: {reason}."))
+        }
+        SettingError::SecretKeyMissing { key } => Some(format!(
+            "Не удалось сохранить секрет `{key}`: нужен ключ шифрования TASKLERQ_SECRET_KEY."
+        )),
+        SettingError::Cipher { key, .. } => Some(format!(
+            "Не удалось зашифровать секрет `{key}`; ничего не сохранено."
+        )),
+        SettingError::Database(_) => None,
     }
 }
 
@@ -732,6 +1133,225 @@ fn render_with_status(page: ConsolePage<'_>, status: StatusCode) -> Response {
     }
 }
 
+/// Вид страницы настроек LLM.
+struct LlmView {
+    /// Настройки сохранены.
+    saved: bool,
+    /// Токен отклонён: нет ключа шифрования.
+    secret_rejected: bool,
+    /// Флажок включения разбора.
+    enabled: LlmToggle,
+    /// Основной слот.
+    primary: LlmSlotView,
+    /// Резервный слот.
+    fallback: LlmSlotView,
+    /// Таймаут установки соединения.
+    connect_timeout: LlmTextField,
+    /// Суточная квота.
+    daily_quota: LlmTextField,
+}
+
+/// Логическое поле формы.
+struct LlmToggle {
+    /// Флажок установлен.
+    checked: bool,
+    /// Подпись источника.
+    source: &'static str,
+    /// Значение задано окружением.
+    readonly: bool,
+}
+
+/// Текстовое поле формы.
+#[derive(Clone)]
+struct LlmTextField {
+    /// Значение; секретов здесь не бывает.
+    value: String,
+    /// Подпись источника.
+    source: &'static str,
+    /// Значение задано окружением.
+    readonly: bool,
+}
+
+/// Состояние секрета без значения.
+#[derive(Clone)]
+struct LlmTokenView {
+    /// «задан», «не задан» или «введите заново».
+    label: &'static str,
+    /// Подпись источника.
+    source: &'static str,
+    /// Секрет задан окружением: заменить и удалить нельзя.
+    readonly: bool,
+}
+
+/// Поля одного слота на странице.
+struct LlmSlotView {
+    /// Адрес.
+    url: LlmTextField,
+    /// Модель.
+    model: LlmTextField,
+    /// Таймаут запроса.
+    timeout: LlmTextField,
+    /// Дополнительные параметры JSON.
+    extra_json: LlmTextField,
+    /// Токен: только состояние.
+    token: LlmTokenView,
+}
+
+/// Собрать вид страницы из действующих значений.
+///
+/// `form` задаёт несекретные значения после отказа формы; `None` — значения из
+/// настроек. Секрет из формы не берётся никогда.
+fn llm_view(
+    settings: &[ResolvedSetting],
+    form: Option<&LlmForm>,
+    saved: bool,
+    secret_rejected: bool,
+) -> LlmView {
+    LlmView {
+        saved,
+        secret_rejected,
+        enabled: toggle_view(
+            settings,
+            "llm.enabled",
+            form.map(|form| form.enabled.is_some()),
+        ),
+        primary: slot_view(settings, PRIMARY_KEYS, form, true),
+        fallback: slot_view(settings, FALLBACK_KEYS, form, false),
+        connect_timeout: text_view(
+            settings,
+            "llm.connect_timeout_ms",
+            form.and_then(|form| form.connect_timeout_ms.as_deref()),
+        ),
+        daily_quota: text_view(
+            settings,
+            "llm.daily_quota",
+            form.and_then(|form| form.daily_quota.as_deref()),
+        ),
+    }
+}
+
+fn slot_view(
+    settings: &[ResolvedSetting],
+    keys: SlotKeys,
+    form: Option<&LlmForm>,
+    primary: bool,
+) -> LlmSlotView {
+    let fields = form.map(|form| form.slot(primary));
+    LlmSlotView {
+        url: text_view(settings, keys.url, fields.and_then(|fields| fields.url)),
+        model: text_view(settings, keys.model, fields.and_then(|fields| fields.model)),
+        timeout: text_view(
+            settings,
+            keys.timeout,
+            fields.and_then(|fields| fields.timeout),
+        ),
+        extra_json: text_view(
+            settings,
+            keys.extra_json,
+            fields.and_then(|fields| fields.extra_json),
+        ),
+        token: token_view(settings, keys.token),
+    }
+}
+
+fn toggle_view(settings: &[ResolvedSetting], key: &str, submitted: Option<bool>) -> LlmToggle {
+    let source = source_of(settings, key);
+    let readonly = source == SettingSource::Env;
+    let current = bool_of(settings, key).unwrap_or(false);
+    LlmToggle {
+        checked: if readonly {
+            current
+        } else {
+            submitted.unwrap_or(current)
+        },
+        source: source_label(source),
+        readonly,
+    }
+}
+
+fn text_view(settings: &[ResolvedSetting], key: &str, submitted: Option<&str>) -> LlmTextField {
+    let source = source_of(settings, key);
+    let readonly = source == SettingSource::Env;
+    let value = if readonly {
+        text_of(settings, key)
+    } else {
+        submitted.map_or_else(|| text_of(settings, key), str::to_owned)
+    };
+    LlmTextField {
+        value,
+        source: source_label(source),
+        readonly,
+    }
+}
+
+fn token_view(settings: &[ResolvedSetting], key: &str) -> LlmTokenView {
+    let source = source_of(settings, key);
+    let state = resolved(settings, key)
+        .and_then(|setting| setting.secret)
+        .unwrap_or(SecretState::NotSet);
+    LlmTokenView {
+        label: secret_label(state),
+        source: source_label(source),
+        readonly: source == SettingSource::Env,
+    }
+}
+
+fn secret_label(state: SecretState) -> &'static str {
+    match state {
+        SecretState::NotSet => "не задан",
+        SecretState::Set => "задан",
+        SecretState::KeyMissing => "ключ шифрования не задан — введите токен заново",
+        SecretState::Undecryptable => "не расшифровывается — введите токен заново",
+    }
+}
+
+fn source_label(source: SettingSource) -> &'static str {
+    match source {
+        SettingSource::Env => "окружение",
+        SettingSource::Db => "база",
+        SettingSource::Default => "по умолчанию",
+    }
+}
+
+fn resolved<'a>(settings: &'a [ResolvedSetting], key: &str) -> Option<&'a ResolvedSetting> {
+    settings.iter().find(|setting| setting.key == key)
+}
+
+fn source_of(settings: &[ResolvedSetting], key: &str) -> SettingSource {
+    resolved(settings, key).map_or(SettingSource::Default, |setting| setting.source)
+}
+
+fn is_readonly(settings: &[ResolvedSetting], key: &str) -> bool {
+    source_of(settings, key) == SettingSource::Env
+}
+
+fn text_of(settings: &[ResolvedSetting], key: &str) -> String {
+    resolved(settings, key)
+        .and_then(|setting| setting.value.as_ref())
+        .map(value_text)
+        .unwrap_or_default()
+}
+
+fn value_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Object(_) => serde_json::to_string(value).unwrap_or_default(),
+        other => other.to_string(),
+    }
+}
+
+fn bool_of(settings: &[ResolvedSetting], key: &str) -> Option<bool> {
+    match resolved(settings, key)?.value.as_ref()? {
+        Value::Bool(value) => Some(*value),
+        Value::String(text) => match text.as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Данные страницы; тип страницы задаёт и заголовок, и навигацию.
 enum Page {
     /// Главная за сессией.
@@ -769,6 +1389,8 @@ enum Page {
         /// Открытый токен; в базу и журнал не попадает.
         token: String,
     },
+    /// Настройки разбора.
+    Llm(Box<LlmView>),
 }
 
 /// Поля шага мастера, которые возвращаются в форму после отказа.
@@ -801,6 +1423,7 @@ impl Page {
             Self::InvalidLink => INVALID_LINK_TITLE,
             Self::Wizard { step, .. } => step.title(),
             Self::TokenIssued { .. } => "Токен Home Assistant",
+            Self::Llm(_) => "Разбор записей",
         }
     }
 
@@ -815,6 +1438,7 @@ impl Page {
                 | Self::Password { .. }
                 | Self::Wizard { .. }
                 | Self::TokenIssued { .. }
+                | Self::Llm(_)
         )
     }
 
@@ -866,6 +1490,30 @@ impl Page {
                 }
             }
             Self::TokenIssued { token } => TokenIssuedBody { token }.render(),
+            Self::Llm(view) => {
+                let primary = SlotBody {
+                    legend: "Основной слот",
+                    prefix: "primary",
+                    slot: &view.primary,
+                }
+                .render()?;
+                let fallback = SlotBody {
+                    legend: "Резервный слот",
+                    prefix: "fallback",
+                    slot: &view.fallback,
+                }
+                .render()?;
+                LlmBody {
+                    saved: view.saved,
+                    secret_rejected: view.secret_rejected,
+                    enabled: &view.enabled,
+                    connect_timeout: &view.connect_timeout,
+                    daily_quota: &view.daily_quota,
+                    primary,
+                    fallback,
+                }
+                .render()
+            }
         }
     }
 }
@@ -922,6 +1570,7 @@ impl<'a> ConsolePage<'a> {
 {% if nav %}
 <nav class="console-nav">
 <a href="/admin">Главная</a>
+<a href="/admin/llm">Разбор</a>
 <a href="/admin/password">Сменить пароль</a>
 <form method="post" action="/admin/logout">
 <button type="submit">Выйти</button>
@@ -1083,7 +1732,7 @@ struct SkipBody {
 #[template(
     source = r#"<h1>{{ title }}</h1>
 <p>{{ description }}</p>
-<p class="console-notice">Действие на этом шаге появится позже.</p>
+<p><a href="/admin/llm">Настроить разбор</a></p>
 {{ skip|safe }}
 "#,
     ext = "html"
@@ -1166,11 +1815,133 @@ struct TokenIssuedBody<'a> {
     token: &'a str,
 }
 
+/// Содержимое одного слота формы LLM.
+#[derive(Template)]
+#[template(
+    source = r#"<fieldset>
+<legend>{{ legend }}</legend>
+<p><label for="llm-{{ prefix }}-url">Адрес</label>
+<input id="llm-{{ prefix }}-url" name="{{ prefix }}_url" type="text" value="{{ slot.url.value }}"{% if slot.url.readonly %} readonly{% endif %}>
+<span class="console-source">источник: {{ slot.url.source }}</span></p>
+<p><label for="llm-{{ prefix }}-model">Модель</label>
+<input id="llm-{{ prefix }}-model" name="{{ prefix }}_model" type="text" value="{{ slot.model.value }}"{% if slot.model.readonly %} readonly{% endif %}>
+<span class="console-source">источник: {{ slot.model.source }}</span></p>
+<p>Токен: <strong>{{ slot.token.label }}</strong>
+<span class="console-source">источник: {{ slot.token.source }}</span></p>
+{% if slot.token.readonly %}
+{% else %}
+<p><label for="llm-{{ prefix }}-token">Заменить токен (пустое поле — не менять)</label>
+<input id="llm-{{ prefix }}-token" name="{{ prefix }}_token" type="password" autocomplete="new-password"></p>
+<p><label><input name="{{ prefix }}_token_delete" type="checkbox" value="1"> Удалить токен</label></p>
+{% endif %}
+<p><label for="llm-{{ prefix }}-timeout">Таймаут запроса, мс</label>
+<input id="llm-{{ prefix }}-timeout" name="{{ prefix }}_timeout_ms" type="text" inputmode="numeric" value="{{ slot.timeout.value }}"{% if slot.timeout.readonly %} readonly{% endif %}>
+<span class="console-source">источник: {{ slot.timeout.source }}</span></p>
+<p><label for="llm-{{ prefix }}-extra">Дополнительные параметры JSON</label>
+<input id="llm-{{ prefix }}-extra" name="{{ prefix }}_extra_json" type="text" value="{{ slot.extra_json.value }}"{% if slot.extra_json.readonly %} readonly{% endif %}>
+<span class="console-source">источник: {{ slot.extra_json.source }}</span></p>
+</fieldset>
+"#,
+    ext = "html"
+)]
+struct SlotBody<'a> {
+    /// Название слота.
+    legend: &'static str,
+    /// Префикс имён полей.
+    prefix: &'static str,
+    /// Поля слота.
+    slot: &'a LlmSlotView,
+}
+
+/// Содержимое страницы настроек LLM.
+#[derive(Template)]
+#[template(
+    source = r#"<h1>Разбор записей</h1>
+{% if saved %}
+<p role="status" class="console-notice">Настройки LLM сохранены.</p>
+{% endif %}
+{% if secret_rejected %}
+<p role="alert" class="console-alert">Токен не сохранён: не задан ключ шифрования TASKLERQ_SECRET_KEY.{% if saved %} Остальные поля сохранены.{% endif %}</p>
+{% endif %}
+<form method="post" action="/admin/llm">
+<fieldset>
+<legend>Разбор</legend>
+<p><label><input id="llm-enabled" name="enabled" type="checkbox" value="1"{% if enabled.checked %} checked{% endif %}{% if enabled.readonly %} disabled{% endif %}> Включить разбор</label>
+<span class="console-source">источник: {{ enabled.source }}</span></p>
+</fieldset>
+{{ primary|safe }}
+{{ fallback|safe }}
+<fieldset>
+<legend>Общие</legend>
+<p><label for="llm-connect-timeout">Таймаут соединения, мс</label>
+<input id="llm-connect-timeout" name="connect_timeout_ms" type="text" inputmode="numeric" value="{{ connect_timeout.value }}"{% if connect_timeout.readonly %} readonly{% endif %}>
+<span class="console-source">источник: {{ connect_timeout.source }}</span></p>
+<p><label for="llm-daily-quota">Суточная квота</label>
+<input id="llm-daily-quota" name="daily_quota" type="text" inputmode="numeric" value="{{ daily_quota.value }}"{% if daily_quota.readonly %} readonly{% endif %}>
+<span class="console-source">источник: {{ daily_quota.source }}</span></p>
+</fieldset>
+<p><button type="submit">Сохранить</button></p>
+</form>
+"#,
+    ext = "html"
+)]
+struct LlmBody<'a> {
+    /// Настройки сохранены.
+    saved: bool,
+    /// Токен отклонён: нет ключа шифрования.
+    secret_rejected: bool,
+    /// Флажок разбора.
+    enabled: &'a LlmToggle,
+    /// Таймаут соединения.
+    connect_timeout: &'a LlmTextField,
+    /// Суточная квота.
+    daily_quota: &'a LlmTextField,
+    /// Уже отрисованный основной слот.
+    primary: String,
+    /// Уже отрисованный резервный слот.
+    fallback: String,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ConsolePage, Page, WizardForm, target_or_home};
+    use super::{
+        ConsolePage, HouseholdForm, LlmSlotView, LlmTextField, LlmToggle, LlmTokenView, LlmView,
+        Page, WizardForm, household_form_error, target_or_home,
+    };
     use crate::admin_console::wizard::WizardStep;
     use crate::domain::error::DomainError;
+
+    fn llm_view_for_tests(token_label: &'static str) -> LlmView {
+        let text = |value: &str| LlmTextField {
+            value: value.to_owned(),
+            source: "база",
+            readonly: false,
+        };
+        let slot = || LlmSlotView {
+            url: text("https://llm.example.test/v1"),
+            model: text("vendor/model"),
+            timeout: text("10000"),
+            extra_json: text("{}"),
+            token: LlmTokenView {
+                label: token_label,
+                source: "база",
+                readonly: false,
+            },
+        };
+        LlmView {
+            saved: true,
+            secret_rejected: false,
+            enabled: LlmToggle {
+                checked: true,
+                source: "база",
+                readonly: false,
+            },
+            primary: slot(),
+            fallback: slot(),
+            connect_timeout: text("1000"),
+            daily_quota: text("200"),
+        }
+    }
 
     #[test]
     fn user_text_is_escaped() {
@@ -1213,6 +1984,7 @@ mod tests {
             Page::TokenIssued {
                 token: "tlq_token".to_owned(),
             },
+            Page::Llm(Box::new(llm_view_for_tests("задан"))),
         ] {
             let html = ConsolePage::new(page).render().expect("the page renders");
             assert!(html.contains("/admin/assets/console-"), "{html}");
@@ -1292,5 +2064,38 @@ mod tests {
     fn a_failed_wizard_target_leads_home() {
         assert_eq!(target_or_home(Ok("/admin/wizard")), "/admin/wizard");
         assert_eq!(target_or_home(Err(DomainError::NotFound)), "/admin");
+    }
+
+    #[test]
+    fn the_llm_page_shows_only_the_secret_state() {
+        let html = ConsolePage::new(Page::Llm(Box::new(llm_view_for_tests("задан"))))
+            .render()
+            .expect("the page renders");
+
+        assert!(html.contains("action=\"/admin/llm\""), "{html}");
+        assert!(html.contains("источник: база"), "{html}");
+        assert!(html.contains("Токен: <strong>задан</strong>"), "{html}");
+        assert!(html.contains("Заменить токен"), "{html}");
+        assert!(
+            html.contains("name=\"primary_token\" type=\"password\""),
+            "the replacement token field never carries a value: {html}"
+        );
+        assert!(!html.contains("value=\"tlq_"), "{html}");
+    }
+
+    #[test]
+    fn a_validation_error_keeps_the_household_form() {
+        let form = HouseholdForm {
+            name: "Дом".to_owned(),
+            timezone: "Europe/Moscow".to_owned(),
+        };
+        let response = household_form_error(
+            WizardStep::Household,
+            false,
+            &form,
+            "household name is invalid",
+        );
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
     }
 }

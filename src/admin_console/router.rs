@@ -18,11 +18,13 @@ use axum::routing::{get, post};
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
-use crate::config::IpNet;
+use crate::config::{IpNet, LlmConfig};
 use crate::domain::models::{Actor, ActorType};
 use crate::http::client::{Client, TrustedProxies};
+use crate::llm::{LlmHandle, LlmSettings};
 use crate::rate_limit::{RateDecision, RateLimiter};
 use crate::security_audit::{Audit, LimitKey, RateLimitEvent};
+use crate::settings::crypto::SecretCipher;
 
 use super::wizard::{WIZARD_PATH, WIZARD_SKIP_PATH, WizardSettings};
 use super::{assets, origin, pages};
@@ -53,6 +55,9 @@ pub struct AdminState {
     recovery_limiter: Arc<RateLimiter<IpAddr>>,
     /// Режим размещения, признак Telegram и параметры LLM для мастера.
     wizard: WizardSettings,
+    /// Тот же экземпляр применения настроек LLM, что у рантайма: страница
+    /// меняет настройки без перезапуска.
+    llm_settings: LlmSettings,
 }
 
 impl AdminState {
@@ -61,6 +66,12 @@ impl AdminState {
     /// Журнал передаётся снаружи: неудачные входы в консоль должны попадать в
     /// общий порог отказов аутентификации публичного роутера.
     pub fn new(pool: PgPool, trusted_proxies: Vec<IpNet>, audit: Audit) -> Self {
+        let llm_settings = LlmSettings::new(
+            pool.clone(),
+            LlmConfig::empty(),
+            SecretCipher::new(None, None),
+            LlmHandle::empty(),
+        );
         Self {
             pool,
             trusted_proxies,
@@ -70,7 +81,19 @@ impl AdminState {
             current_password_limiter: failure_limiter(),
             recovery_limiter: failure_limiter(),
             wizard: WizardSettings::default(),
+            llm_settings,
         }
+    }
+
+    /// Задать тот же экземпляр настроек LLM, что у рантайма.
+    pub fn with_llm(mut self, llm_settings: LlmSettings) -> Self {
+        self.llm_settings = llm_settings;
+        self
+    }
+
+    /// Применение настроек LLM без перезапуска.
+    pub fn llm_settings(&self) -> &LlmSettings {
+        &self.llm_settings
     }
 
     /// Задать параметры мастера: режим, Telegram, LLM и ключ шифрования.
@@ -164,6 +187,10 @@ pub fn build_router(state: AdminState) -> Router {
         .route(WIZARD_SKIP_PATH, post(pages::wizard_skip))
         .route("/admin/wizard/household", post(pages::wizard_household))
         .route("/admin/wizard/token", post(pages::wizard_token))
+        .route(
+            pages::LLM_PATH,
+            get(pages::llm_page).post(pages::llm_submit),
+        )
         .route(
             "/admin/setup",
             get(pages::setup_page).post(pages::setup_submit),
