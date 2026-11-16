@@ -8,6 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tasklerq::admin;
+use tasklerq::admin_console;
 use tasklerq::app::build_application;
 use tasklerq::capture::eval::TitleMatch;
 use tasklerq::capture::slot_check;
@@ -203,6 +204,8 @@ enum AdminCommand {
         #[command(subcommand)]
         command: SecretKeyCommand,
     },
+    /// Выпустить setup-код первого входа в веб-консоль.
+    SetupCode,
     /// Выгрузить данные household в JSON.
     Export(ExportArgs),
 }
@@ -465,6 +468,7 @@ async fn serve() -> Result<()> {
     };
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let setup_pool = pool.clone();
     let application = build_application(&config, pool, shutdown_rx)
         .await
         .context("telegram startup failed")?;
@@ -479,7 +483,16 @@ async fn serve() -> Result<()> {
 
     tracing::info!(%address, "http server listening");
     match admin_address {
-        Some(address) => tracing::info!(%address, "admin console listening"),
+        Some(address) => {
+            tracing::info!(%address, "admin console listening");
+            admin_console::codes::announce_setup_code(
+                &setup_pool,
+                &config,
+                Some(address.port()),
+                Utc::now(),
+            )
+            .await;
+        }
         None => tracing::info!("admin console is disabled"),
     }
 
@@ -501,6 +514,33 @@ async fn serve() -> Result<()> {
 
     tracing::info!("stopped");
     Ok(())
+}
+
+async fn setup_code() -> Result<()> {
+    init_cli_tracing();
+
+    let database = DatabaseConfig::from_env().context("invalid database configuration")?;
+    let pool = storage::db::connect(&database)
+        .await
+        .context("database connection failed")?;
+
+    match admin_console::codes::issue_setup_code(&pool, Utc::now())
+        .await
+        .map_err(explain)?
+    {
+        Some(issued) => {
+            println!("{}", issued.code);
+            eprintln!(
+                "Откройте http://<адрес хоста>:<порт>/admin/setup и введите код. \
+                 Повторно код не показывается."
+            );
+            Ok(())
+        }
+        None => bail!(
+            "учётная запись администратора уже существует; \
+             сменить пароль: tasklerq admin reset-password"
+        ),
+    }
 }
 
 async fn migrate() -> Result<()> {
@@ -554,6 +594,7 @@ async fn run_admin(command: AdminCommand) -> Result<()> {
         AdminCommand::SecretKey { command } => {
             run_admin_database(DatabaseCommand::SecretKey(command)).await
         }
+        AdminCommand::SetupCode => setup_code().await,
         AdminCommand::Export(args) => run_admin_database(DatabaseCommand::Export(args)).await,
     }
 }

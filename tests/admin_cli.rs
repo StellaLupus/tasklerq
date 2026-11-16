@@ -14,6 +14,7 @@ use chrono::Utc;
 use serde_json::Value;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use tasklerq::admin_console::codes::{self, Purpose};
 use tasklerq::auth::tokens::{SCOPES, hash_token};
 use tasklerq::config::{SecretKey, SecretString};
 use tasklerq::settings::crypto::{KeyId, SecretCipher, SecretContext, SecretError, key_id};
@@ -1920,4 +1921,89 @@ async fn secret_key_rotate_rejects_an_invalid_key_without_printing_it() {
         !combined.contains(invalid),
         "the invalid key value must not be printed:\n{combined}"
     );
+}
+
+/// `admin setup-code` печатает код один раз, а новый выпуск гасит прежний.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_code_prints_a_usable_code_and_revokes_the_previous_one() {
+    let db = cli_database().await;
+
+    let first = run(&db.url, &["admin", "setup-code"]).await;
+    assert!(first.status.success(), "{first:?}");
+    let first_text = stdout(&first);
+    let first_code = first_text
+        .lines()
+        .next()
+        .expect("the code line")
+        .trim()
+        .to_owned();
+    assert!(
+        first_code.len() >= 22,
+        "the setup code must carry at least 128 bits: {first_text}"
+    );
+    assert!(
+        stderr(&first).contains("/admin/setup"),
+        "the command must point to the setup page:\n{}",
+        stderr(&first)
+    );
+
+    let second = run(&db.url, &["admin", "setup-code"]).await;
+    assert!(second.status.success(), "{second:?}");
+    let second_text = stdout(&second);
+    let second_code = second_text
+        .lines()
+        .next()
+        .expect("the code line")
+        .trim()
+        .to_owned();
+    assert_ne!(first_code, second_code, "every issue makes a new code");
+
+    let combined = format!("{}{}", stdout(&second), stderr(&second));
+    assert_eq!(
+        combined.matches(&second_code).count(),
+        1,
+        "the code must be printed once and not logged again:\n{combined}"
+    );
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let previous = codes::use_code(&mut conn, Purpose::Setup, &first_code, Utc::now()).await;
+    assert!(
+        previous.is_err(),
+        "the previous setup code must be revoked by the new issue"
+    );
+    codes::use_code(&mut conn, Purpose::Setup, &second_code, Utc::now())
+        .await
+        .expect("the printed code must work as a setup code");
+}
+
+/// `admin setup-code` при существующей учётке завершается ошибкой и новой
+/// строки не создаёт.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_code_with_an_account_suggests_reset_password() {
+    let db = cli_database().await;
+    sqlx::query(
+        "INSERT INTO admin_accounts (id, username, password_hash)
+         VALUES ($1, 'admin', '$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA')",
+    )
+    .bind(Uuid::now_v7())
+    .execute(&db.pool)
+    .await
+    .expect("administrator account");
+
+    let output = run(&db.url, &["admin", "setup-code"]).await;
+    assert!(
+        !output.status.success(),
+        "setup-code must fail when the account exists: {output:?}"
+    );
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        combined.contains("reset-password"),
+        "the error must suggest reset-password:\n{combined}"
+    );
+
+    let codes: i64 = sqlx::query_scalar("SELECT count(*) FROM admin_one_time_codes")
+        .fetch_one(&db.pool)
+        .await
+        .expect("code count");
+    assert_eq!(codes, 0, "no code is issued for an existing account");
 }

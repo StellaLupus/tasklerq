@@ -1642,6 +1642,44 @@ async fn admin_one_time_codes_migration_enforces_purpose_expiry_and_household() 
     );
 }
 
+/// Срок одноразового кода должен быть позже его создания.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_one_time_codes_migration_requires_expiry_after_creation() {
+    let db = support::empty_db().await;
+    migrations::run(&db.pool)
+        .await
+        .expect("migrations should apply on a clean database");
+
+    for (fill, offset) in [('a', "now()"), ('b', "now() - interval '1 minute'")] {
+        let expired = sqlx::query(&format!(
+            "INSERT INTO admin_one_time_codes (id, purpose, code_hash, expires_at, created_at)
+             VALUES ($1, 'recovery', $2, {offset}, now())"
+        ))
+        .bind(Uuid::now_v7())
+        .bind(code_hash(fill))
+        .execute(&db.pool)
+        .await;
+        assert_eq!(
+            error_code(&expired).as_deref(),
+            Some("23514"),
+            "expires_at must be strictly later than created_at: {offset}"
+        );
+    }
+
+    let valid = sqlx::query(
+        "INSERT INTO admin_one_time_codes (id, purpose, code_hash, created_at, expires_at)
+         VALUES ($1, 'recovery', $2, now() - interval '1 minute', now() + interval '14 minutes')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(code_hash('c'))
+    .execute(&db.pool)
+    .await;
+    assert!(
+        valid.is_ok(),
+        "a recovery code created in the past may still be valid: {valid:?}"
+    );
+}
+
 /// Сессии: уникальный хеш токена и порядок времён.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_sessions_migration_requires_a_unique_token_hash() {

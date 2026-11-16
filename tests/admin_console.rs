@@ -8,14 +8,19 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
+use chrono::{Duration as ChronoDuration, Utc};
 use http_body_util::BodyExt;
+use tasklerq::admin_console::codes::{self, Purpose};
 use tasklerq::admin_console::router::{AdminState, build_router as build_admin_router};
 use tasklerq::app::build_application;
+use tasklerq::auth::tokens::hash_token;
 use tasklerq::config::Config;
+use tasklerq::domain::error::DomainError;
 use tasklerq::http::router::{AppState, build_router};
 use tasklerq::http::server::{bind_listeners, serve_listeners};
 use tasklerq::security_audit::Audit;
 use tower::ServiceExt;
+use uuid::Uuid;
 
 const REQUEST_ID: &str = "test-request-id";
 
@@ -297,4 +302,161 @@ fn spawn_server(
         shutdown: shutdown_tx,
         task,
     }
+}
+
+/// Код хранится только хешем, а использование возвращает строку один раз.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_time_code_is_stored_as_a_hash_and_used_once() {
+    let db = support::isolated_db().await;
+    let now = Utc::now();
+
+    let issued = codes::issue(&db.pool, Purpose::Setup, None, now)
+        .await
+        .expect("a setup code should be issued");
+    assert!(
+        issued.code.len() >= 22,
+        "the code must carry at least 128 bits: {}",
+        issued.code
+    );
+    assert_eq!(issued.record.purpose, "setup");
+    assert!(
+        issued.record.expires_at.is_none(),
+        "a setup code lives until the next issue"
+    );
+
+    let raw_matches: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM admin_one_time_codes WHERE code_hash = $1")
+            .bind(&issued.code)
+            .fetch_one(&db.pool)
+            .await
+            .expect("code count");
+    assert_eq!(raw_matches, 0, "the table must not contain the open code");
+
+    let stored: Vec<String> = sqlx::query_scalar("SELECT code_hash FROM admin_one_time_codes")
+        .fetch_all(&db.pool)
+        .await
+        .expect("stored hashes");
+    assert_eq!(
+        stored,
+        vec![hash_token(&issued.code)],
+        "only the SHA-256 hash is stored"
+    );
+    assert!(
+        !format!("{issued:?}").contains(&issued.code),
+        "Debug must not print the open code"
+    );
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let consumed = codes::use_code(&mut conn, Purpose::Setup, &issued.code, now)
+        .await
+        .expect("the first use must succeed");
+    assert_eq!(consumed.id, issued.record.id);
+    assert!(consumed.used_at.is_some(), "the code is marked as used");
+
+    let second = codes::use_code(&mut conn, Purpose::Setup, &issued.code, now).await;
+    assert!(
+        matches!(second, Err(DomainError::NotFound)),
+        "the second use must be indistinguishable from an unknown code"
+    );
+}
+
+/// Истёкший, чужой по назначению и неизвестный код — «не найден».
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_and_foreign_codes_are_not_found() {
+    let db = support::isolated_db().await;
+    let now = Utc::now();
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    let recovery = codes::issue(&db.pool, Purpose::Recovery, None, now)
+        .await
+        .expect("a recovery code should be issued");
+
+    let wrong_purpose = codes::use_code(&mut conn, Purpose::Setup, &recovery.code, now).await;
+    assert!(
+        matches!(wrong_purpose, Err(DomainError::NotFound)),
+        "a recovery code must not be accepted as a setup code"
+    );
+    codes::use_code(&mut conn, Purpose::Recovery, &recovery.code, now)
+        .await
+        .expect("the wrong purpose must not consume the recovery code");
+
+    // CHECK `expires_at > created_at` требует created_at в прошлом.
+    let expired_code = "expired-recovery-code";
+    sqlx::query(
+        "INSERT INTO admin_one_time_codes (id, purpose, code_hash, created_at, expires_at)
+         VALUES ($1, 'recovery', $2, $3, $4)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(hash_token(expired_code))
+    .bind(now - ChronoDuration::minutes(20))
+    .bind(now - ChronoDuration::minutes(5))
+    .execute(&db.pool)
+    .await
+    .expect("an expired code is storable");
+
+    let expired = codes::use_code(&mut conn, Purpose::Recovery, expired_code, now).await;
+    assert!(
+        matches!(expired, Err(DomainError::NotFound)),
+        "an expired code must be indistinguishable from an unknown code"
+    );
+
+    let unknown = codes::use_code(&mut conn, Purpose::Setup, "no-such-code", now).await;
+    assert!(
+        matches!(unknown, Err(DomainError::NotFound)),
+        "an unknown code must not be distinguished"
+    );
+}
+
+/// Новый выпуск гасит прежний код той же пары и не трогает чужое назначение.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issuing_a_code_revokes_the_previous_one_of_the_same_purpose() {
+    let db = support::isolated_db().await;
+    let now = Utc::now();
+
+    let first = codes::issue(&db.pool, Purpose::Setup, None, now)
+        .await
+        .expect("the first setup code");
+    let recovery = codes::issue(&db.pool, Purpose::Recovery, None, now)
+        .await
+        .expect("a recovery code");
+    let second = codes::issue(&db.pool, Purpose::Setup, None, now)
+        .await
+        .expect("the second setup code");
+    assert_ne!(first.code, second.code, "every issue makes a new code");
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let revoked = codes::use_code(&mut conn, Purpose::Setup, &first.code, now).await;
+    assert!(
+        matches!(revoked, Err(DomainError::NotFound)),
+        "the previous setup code must be revoked by the new issue"
+    );
+
+    codes::use_code(&mut conn, Purpose::Recovery, &recovery.code, now)
+        .await
+        .expect("a code of another purpose must stay active");
+    codes::use_code(&mut conn, Purpose::Setup, &second.code, now)
+        .await
+        .expect("the newest code must work");
+}
+
+/// `recovery` живёт 15 минут, `setup` — без срока.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_code_lives_fifteen_minutes() {
+    let db = support::isolated_db().await;
+    let now = Utc::now();
+
+    let setup = codes::issue(&db.pool, Purpose::Setup, None, now)
+        .await
+        .expect("setup code");
+    assert!(setup.record.expires_at.is_none());
+
+    let recovery = codes::issue(&db.pool, Purpose::Recovery, None, now)
+        .await
+        .expect("recovery code");
+    let expires_at = recovery.record.expires_at.expect("recovery has an expiry");
+    let ttl = (expires_at - now).num_seconds();
+    assert!(
+        (899..=900).contains(&ttl),
+        "a recovery code must live 15 minutes, got {ttl} seconds"
+    );
 }
