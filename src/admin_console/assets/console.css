@@ -1,0 +1,127 @@
+/* Стили консоли администратора: формы, сообщения и навигация.
+   Без внешних шрифтов и адресов: консоль работает в LAN без интернета. */
+
+:root {
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: #f4f2ee;
+  color: #1c1c1a;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  line-height: 1.5;
+}
+
+a {
+  color: #2f5d50;
+}
+
+.console-header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1.5rem;
+  background: #1f3d35;
+  color: #ffffff;
+}
+
+.console-brand {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.console-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: center;
+}
+
+.console-nav a {
+  color: #ffffff;
+}
+
+.console-nav form {
+  margin: 0;
+}
+
+.console-nav button {
+  padding: 0.25rem 0.75rem;
+  border: 1px solid currentColor;
+  background: transparent;
+  color: inherit;
+}
+
+.console-main {
+  max-width: 32rem;
+  margin: 2rem auto;
+  padding: 0 1.5rem;
+}
+
+h1 {
+  margin-top: 0;
+  font-size: 1.5rem;
+}
+
+form p {
+  margin: 0 0 1rem;
+}
+
+label {
+  display: block;
+  margin-bottom: 0.25rem;
+  font-weight: 600;
+}
+
+input {
+  width: 100%;
+  padding: 0.5rem;
+  border: 1px solid #b9b5ab;
+  border-radius: 0.25rem;
+  font: inherit;
+}
+
+input:focus-visible {
+  outline: 2px solid #2f5d50;
+  outline-offset: 1px;
+}
+
+button {
+  padding: 0.5rem 1rem;
+  border: 1px solid #2f5d50;
+  border-radius: 0.25rem;
+  background: #2f5d50;
+  color: #ffffff;
+  font: inherit;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #264b41;
+}
+
+.console-alert {
+  padding: 0.75rem 1rem;
+  border-left: 4px solid #8a1f11;
+  background: #fbe9e7;
+  color: #8a1f11;
+}
+
+.console-notice {
+  padding: 0.75rem 1rem;
+  border-left: 4px solid #2f5d50;
+  background: #e6efe9;
+}
+
+code {
+  padding: 0 0.25rem;
+  background: #e8e5df;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}

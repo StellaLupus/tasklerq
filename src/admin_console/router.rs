@@ -2,14 +2,16 @@
 //!
 //! Консоль живёт на отдельном listener: публичный [`crate::http::router`] не
 //! содержит её маршрутов. Все ответы консоли, включая редиректы и ошибки,
-//! получают запрет кеширования и встраивания во фреймы одним слоем на роутере.
+//! получают запрет кеширования и встраивания во фреймы одним слоем на роутере;
+//! исключение — встроенные ресурсы с хешем содержимого в имени (см.
+//! [`security_headers`]).
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{ConnectInfo, MatchedPath, Request, State};
-use axum::http::{HeaderMap, HeaderValue, Method, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -22,7 +24,7 @@ use crate::http::client::{Client, TrustedProxies};
 use crate::rate_limit::{RateDecision, RateLimiter};
 use crate::security_audit::{Audit, LimitKey, RateLimitEvent};
 
-use super::{origin, pages};
+use super::{assets, origin, pages};
 
 /// Сколько неудач допускается в окне лимита консоли.
 pub const FAILURE_LIMIT: u32 = 5;
@@ -157,11 +159,12 @@ pub fn build_router(state: AdminState) -> Router {
             get(pages::password_page).post(pages::password_submit),
         )
         .route("/admin/logout", post(pages::logout))
+        .route("/admin/assets/{file}", get(assets::serve))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_trusted_origin,
         ))
-        .layer(axum::middleware::map_response(security_headers))
+        .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)
 }
 
@@ -211,9 +214,18 @@ async fn require_trusted_origin(
 /// `no-store` не даёт прокси и браузеру сохранить страницу с формой или
 /// cookie; запрет фреймов закрывает clickjacking. Один слой на роутере
 /// покрывает и HTML, и `303`, и ошибки обработчиков.
-async fn security_headers(mut response: Response) -> Response {
+///
+/// Исключение — ресурсы с хешем содержимого в имени: они не меняются, поэтому
+/// их `Cache-Control` ставит сам обработчик (долгий срок и `immutable`).
+/// Остальные заголовки безопасности у них те же.
+async fn security_headers(request: Request, next: Next) -> Response {
+    let cacheable_asset = request.uri().path().starts_with(assets::PREFIX);
+    let mut response = next.run(request).await;
+    let immutable = cacheable_asset && response.status() == StatusCode::OK;
     let headers = response.headers_mut();
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if !immutable {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static("frame-ancestors 'none'"),

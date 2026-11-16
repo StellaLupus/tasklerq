@@ -1,5 +1,6 @@
 //! Веб-консоль администратора: отдельный listener и собственный роутер.
 
+pub mod assets;
 pub mod attempt;
 pub mod change;
 pub mod codes;

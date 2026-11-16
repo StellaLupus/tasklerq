@@ -13,7 +13,9 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use http_body_util::BodyExt;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use tasklerq::admin_console::assets;
 use tasklerq::admin_console::codes::{self, Purpose};
 use tasklerq::admin_console::login;
 use tasklerq::admin_console::password::Password;
@@ -311,6 +313,11 @@ fn assert_security_headers(headers: &HeaderMap, context: &str) {
         Some("no-store"),
         "Cache-Control on {context}"
     );
+    assert_frame_headers(headers, context);
+}
+
+/// Запрет встраивания во фреймы: общий для HTML и встроенных ресурсов.
+fn assert_frame_headers(headers: &HeaderMap, context: &str) {
     assert_eq!(
         headers
             .get(header::CONTENT_SECURITY_POLICY)
@@ -2687,4 +2694,365 @@ async fn a_stale_current_password_does_not_overwrite_a_newer_one() {
         .await
         .expect("the stored hash");
     assert_eq!(stored, "final-password-hash");
+}
+
+/// Значение атрибута из HTML, начинающееся с пути встроенного ресурса.
+fn linked_asset(body: &[u8], ext: &str) -> String {
+    let text = String::from_utf8_lossy(body);
+    let suffix = format!(".{ext}");
+    text.split('"')
+        .find(|value| value.starts_with("/admin/assets/") && value.ends_with(&suffix))
+        .unwrap_or_else(|| panic!("no /admin/assets/*{suffix} link in {text}"))
+        .to_owned()
+}
+
+/// В ответе нет внешних адресов: ни схем, ни протокол-относительных ссылок.
+fn assert_no_external_urls(body: &[u8], context: &str) {
+    let text = String::from_utf8_lossy(body);
+    for forbidden in ["http://", "https://", "src=\"//", "href=\"//"] {
+        assert!(
+            !text.contains(forbidden),
+            "{context} must not reference {forbidden}: {text}"
+        );
+    }
+}
+
+/// Скрипты и стили страницы — только встроенные ресурсы консоли.
+fn assert_local_assets(body: &[u8], context: &str) {
+    let text = String::from_utf8_lossy(body);
+    assert!(
+        text.contains("href=\"/admin/assets/console-"),
+        "{context} must link the console CSS: {text}"
+    );
+    assert!(
+        text.contains("src=\"/admin/assets/htmx-"),
+        "{context} must link htmx: {text}"
+    );
+    for (index, _) in text.match_indices("src=\"") {
+        let value = &text[index + "src=\"".len()..];
+        let value = value.split('"').next().unwrap_or_default();
+        assert!(
+            value.starts_with("/admin/assets/"),
+            "{context} loads a script from {value}: {text}"
+        );
+    }
+}
+
+/// Короткий hex SHA-256 — та же часть имени, что у ресурса с хешем.
+fn content_hash(body: &[u8]) -> String {
+    let digest = Sha256::digest(body);
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_page_is_self_contained_and_uses_plain_forms() {
+    let db = support::isolated_db().await;
+    let app = console(&db.pool, Vec::new());
+
+    let (status, headers, body) = send(&app, Method::GET, "/admin/setup").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_security_headers(&headers, "GET /admin/setup");
+    assert_no_external_urls(&body, "GET /admin/setup");
+    assert_local_assets(&body, "GET /admin/setup");
+    assert!(
+        String::from_utf8_lossy(&body).contains("<form method=\"post\" action=\"/admin/setup\">"),
+        "the form works without JavaScript: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn login_and_recovery_pages_are_self_contained_and_use_plain_forms() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console(&db.pool, Vec::new());
+    let issued = codes::issue(&db.pool, Purpose::Recovery, None, Utc::now())
+        .await
+        .expect("a recovery code");
+
+    let (status, headers, body) = send(&app, Method::GET, "/admin/login").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_security_headers(&headers, "GET /admin/login");
+    assert_no_external_urls(&body, "GET /admin/login");
+    assert_local_assets(&body, "GET /admin/login");
+    assert!(
+        String::from_utf8_lossy(&body).contains("<form method=\"post\" action=\"/admin/login\">"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let path = format!("/admin/recover/{}", issued.code);
+    let (status, headers, body) = send(&app, Method::GET, &path).await;
+    assert_eq!(status, StatusCode::OK, "the valid link shows the form");
+    assert_security_headers(&headers, "GET a recovery page");
+    assert_no_external_urls(&body, "GET a recovery page");
+    assert_local_assets(&body, "GET a recovery page");
+    assert!(
+        String::from_utf8_lossy(&body).contains(&format!(
+            "<form method=\"post\" action=\"/admin/recover/{}\">",
+            issued.code
+        )),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, headers, body) = send(&app, Method::GET, "/admin/recover/no-such-code").await;
+    assert_eq!(status, StatusCode::GONE);
+    assert_security_headers(&headers, "an invalid recovery link");
+    assert_no_external_urls(&body, "an invalid recovery link");
+    assert!(String::from_utf8_lossy(&body).contains("недействительна"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_pages_show_navigation_and_plain_forms() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console(&db.pool, Vec::new());
+    let now = precise_now();
+    insert_session(&db.pool, "navigation-session", now, now).await;
+
+    for path in ["/admin", "/admin/password"] {
+        let (status, headers, body) =
+            send_with_cookie(&app, Method::GET, path, "tlq_admin=navigation-session").await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_security_headers(&headers, path);
+        assert_no_external_urls(&body, path);
+        assert_local_assets(&body, path);
+
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("href=\"/admin\""), "{path}: {text}");
+        assert!(text.contains("href=\"/admin/password\""), "{path}: {text}");
+        assert!(
+            text.contains("<form method=\"post\" action=\"/admin/logout\">"),
+            "logout is a plain form on {path}: {text}"
+        );
+    }
+
+    let (_, _, body) = send_with_cookie(
+        &app,
+        Method::GET,
+        "/admin/password",
+        "tlq_admin=navigation-session",
+    )
+    .await;
+    assert!(
+        String::from_utf8_lossy(&body)
+            .contains("<form method=\"post\" action=\"/admin/password\">"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refusals_and_form_errors_stay_local() {
+    let db = support::isolated_db().await;
+    let app = console(&db.pool, Vec::new());
+    let fields = [
+        ("code", "no-such-code"),
+        ("username", "admin"),
+        ("password", "valid-password-12"),
+    ];
+
+    let (status, headers, body) = send_form(&app, "/admin/setup", &fields).await;
+    assert_eq!(status, StatusCode::OK, "an unknown code is a form error");
+    assert_security_headers(&headers, "a setup form error");
+    assert_no_external_urls(&body, "a setup form error");
+    assert!(String::from_utf8_lossy(&body).contains("Код недействителен"));
+
+    // Пять неудач разрешены; шестая упирается в лимит.
+    for _ in 1..5 {
+        let (status, _, _) = send_form(&app, "/admin/setup", &fields).await;
+        assert_eq!(status, StatusCode::OK, "a failure inside the limit");
+    }
+    let (status, headers, body) = send_form(&app, "/admin/setup", &fields).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_security_headers(&headers, "a rate-limited setup");
+    assert_no_external_urls(&body, "a rate-limited setup");
+
+    let headers = headers_with(&[("host", "nas:18081"), ("origin", "http://evil.example")]);
+    let (status, headers, body) =
+        send_form_raw(&app, "/admin/setup", test_peer(), headers, &[("code", "x")]).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_security_headers(&headers, "a request with a foreign origin");
+    assert_no_external_urls(&body, "a request with a foreign origin");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn embedded_assets_are_served_by_content_hash() {
+    let db = support::isolated_db().await;
+    let app = console(&db.pool, Vec::new());
+
+    // Страница без сессии уже ссылается на встроенные ресурсы.
+    let (status, _, body) = send(&app, Method::GET, "/admin/setup").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_local_assets(&body, "GET /admin/setup");
+    let css = linked_asset(&body, "css");
+    let htmx = linked_asset(&body, "js");
+
+    let (status, headers, css_body) = send(&app, Method::GET, &css).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/css; charset=utf-8")
+    );
+    let cache = headers
+        .get(header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        .expect("a Cache-Control header");
+    assert!(cache.contains("immutable"), "{cache}");
+    assert!(!cache.contains("no-store"), "{cache}");
+    assert_frame_headers(&headers, "the console CSS");
+    assert_eq!(css_body, assets::CONSOLE_CSS);
+    assert!(
+        css.contains(&content_hash(assets::CONSOLE_CSS)),
+        "the CSS path carries the content hash: {css}"
+    );
+
+    let (status, headers, js_body) = send(&app, Method::GET, &htmx).await;
+    assert_eq!(status, StatusCode::OK);
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .expect("a Content-Type header");
+    assert!(
+        content_type.starts_with("text/javascript"),
+        "{content_type}"
+    );
+    assert_frame_headers(&headers, "htmx");
+    assert_eq!(
+        js_body,
+        assets::HTMX_JS,
+        "the embedded htmx is served as is"
+    );
+    assert!(
+        htmx.contains(&content_hash(assets::HTMX_JS)),
+        "the htmx path carries the content hash: {htmx}"
+    );
+
+    let unknown_hash = css.replace(&content_hash(assets::CONSOLE_CSS), "0000000000000000");
+    assert_ne!(unknown_hash, css);
+    let (status, _, _) = send(&app, Method::GET, &unknown_hash).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "an unknown hash is not served"
+    );
+
+    let (status, _, _) = send(&app, Method::GET, "/admin/assets/htmx.min.js").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the hash is part of the path"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_whole_flow_works_with_plain_form_posts() {
+    const NEW_PASSWORD: &str = "changed-password-1";
+
+    let db = support::isolated_db().await;
+    let app = console(&db.pool, Vec::new());
+    let issued = codes::issue(&db.pool, Purpose::Setup, None, Utc::now())
+        .await
+        .expect("a setup code");
+
+    // Ни один запрос не несёт HX-Request: это обычные form-urlencoded POST.
+    let (status, headers, _) = send_form(
+        &app,
+        "/admin/setup",
+        &[
+            ("code", &issued.code),
+            ("username", "admin"),
+            ("password", TEST_PASSWORD),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin"));
+    let cookie = cookie_pair(&set_cookie(&headers).expect("setup starts a session"));
+
+    let (status, headers, _) = send_form_from(
+        &app,
+        "/admin/logout",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/login"));
+    assert_eq!(session_count(&db.pool).await, 0, "logout ends the session");
+
+    let (status, headers, _) = send_form(
+        &app,
+        "/admin/login",
+        &[("username", "admin"), ("password", TEST_PASSWORD)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin"));
+    let cookie = cookie_pair(&set_cookie(&headers).expect("login starts a session"));
+
+    let (status, headers, _) = send_form_from(
+        &app,
+        "/admin/password",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("current_password", TEST_PASSWORD),
+            ("new_password", NEW_PASSWORD),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/password?changed=1"));
+
+    let (status, _, body) =
+        send_with_cookie(&app, Method::GET, "/admin/password?changed=1", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(String::from_utf8_lossy(&body).contains("Пароль изменён."));
+    assert_eq!(
+        session_count(&db.pool).await,
+        1,
+        "the current session survives the change"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recovery_code_from_the_address_is_escaped() {
+    let db = support::isolated_db().await;
+    let app = console(&db.pool, Vec::new());
+    let code = "<script>";
+    let now = precise_now();
+    sqlx::query(
+        "INSERT INTO admin_one_time_codes (id, purpose, code_hash, created_at, expires_at)
+         VALUES ($1, 'recovery', $2, $3, $4)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(hash_token(code))
+    .bind(now)
+    .bind(now + ChronoDuration::minutes(15))
+    .execute(&db.pool)
+    .await
+    .expect("a recovery code");
+
+    let (status, headers, body) = send(&app, Method::GET, "/admin/recover/%3Cscript%3E").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_security_headers(&headers, "a recovery form");
+    assert_no_external_urls(&body, "a recovery form");
+
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("action=\"/admin/recover/&#60;script&#62;\""),
+        "the code is escaped in the form action: {text}"
+    );
+    assert!(
+        !text.contains("\"/admin/recover/<script>\""),
+        "the raw code must not reach the markup: {text}"
+    );
 }

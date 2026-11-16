@@ -1,8 +1,17 @@
 //! Страницы консоли: setup, вход, восстановление, смена пароля, главная и выход.
 //!
-//! До 5.8 разметка минимальна: строки HTML без шаблонизатора, общий макет,
-//! CSS и htmx появятся в 5.8. Формы — обычные POST без JavaScript; вводимое имя
-//! и код экранируются перед вставкой в ответ, пароль обратно не показывается.
+//! Разметка — один askama-шаблон [`ConsolePage`] с общим макетом: шапка,
+//! навигация вошедшего администратора и блок сообщения; страница выбирается
+//! [`PageKind`]. Шаблон задан строкой в этом файле: askama 0.16 ищет файловые
+//! шаблоны только в `<корень>/templates` (черты `config` и `code-in-doc`
+//! выключены), а каталог вне `src/` не попадает в образ сборки — Dockerfile
+//! копирует только `src/`. Файловые шаблоны в `src/admin_console/templates/`
+//! стали бы возможны после добавления `templates` в `COPY` Dockerfile.
+//! Значения пользователя подставляет askama и экранирует их сам, `|safe` не
+//! используется.
+//!
+//! Формы — обычные POST без JavaScript; htmx подключён макетом для будущего
+//! хода проверки слота, но ни одна форма этого пункта от него не зависит.
 //!
 //! Сверка `Origin` живёт отдельным слоем роутера
 //! ([`super::router::require_trusted_origin`]): сюда запрос с чужим origin не
@@ -13,12 +22,14 @@
 
 use std::net::SocketAddr;
 
+use askama::Template;
 use axum::extract::{ConnectInfo, Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use chrono::Utc;
 use serde::Deserialize;
 
+use super::assets;
 use super::change::{self, ChangeError, ChangeOutcome};
 use super::login::{self, LoginError, LoginOutcome};
 use super::password::{self, Password};
@@ -36,8 +47,6 @@ const SETUP_PATH: &str = "/admin/setup";
 const HOME_PATH: &str = "/admin";
 /// Путь страницы смены пароля; `?changed=1` показывает подтверждение.
 const PASSWORD_PATH: &str = "/admin/password";
-/// Путь формы восстановления; сам код подставляется из адреса.
-const RECOVER_PATH: &str = "/admin/recover";
 
 const SETUP_FORM_ERROR: &str = "Код недействителен.";
 const LOGIN_FORM_ERROR: &str = "Неверное имя или пароль.";
@@ -89,20 +98,14 @@ pub(crate) struct PasswordQuery {
 }
 
 /// `GET /admin`: главная страница за сессией.
-pub(crate) async fn index(_session: AdminSession) -> Html<&'static str> {
-    Html(
-        "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">\
-         <title>Tasklerq</title></head><body><h1>Tasklerq</h1>\
-         <p><a href=\"/admin/password\">Сменить пароль</a></p>\
-         <form method=\"post\" action=\"/admin/logout\">\
-         <button type=\"submit\">Выйти</button></form></body></html>",
-    )
+pub(crate) async fn index(_session: AdminSession) -> Response {
+    render(ConsolePage::new(PageKind::Home).authenticated())
 }
 
 /// `GET /admin/setup`: форма первого входа, пока учётной записи нет.
 pub(crate) async fn setup_page(State(state): State<AdminState>) -> Response {
     match account_exists(&state).await {
-        Ok(false) => Html(setup_html(None)).into_response(),
+        Ok(false) => render(ConsolePage::new(PageKind::Setup)),
         Ok(true) => redirect(LOGIN_PATH),
         Err(error) => internal(error),
     }
@@ -123,11 +126,12 @@ pub(crate) async fn setup_submit(
 
     let username = form.username.trim();
     if username.is_empty() {
-        return Html(setup_html(Some(EMPTY_USERNAME_ERROR))).into_response();
+        return render(ConsolePage::new(PageKind::Setup).error(EMPTY_USERNAME_ERROR));
     }
     // Неверная длина — ошибка формы до лимита, argon2 и кода.
     if let Err(error) = password::validate(form.password.expose()) {
-        return Html(setup_html(Some(&error.to_string()))).into_response();
+        let message = error.to_string();
+        return render(ConsolePage::new(PageKind::Setup).error(&message));
     }
 
     let client = state.client(peer, &headers);
@@ -146,7 +150,9 @@ pub(crate) async fn setup_submit(
             Err(error) => internal(error),
         },
         Ok(SetupOutcome::AlreadyConfigured) => redirect(LOGIN_PATH),
-        Ok(SetupOutcome::InvalidCode) => Html(setup_html(Some(SETUP_FORM_ERROR))).into_response(),
+        Ok(SetupOutcome::InvalidCode) => {
+            render(ConsolePage::new(PageKind::Setup).error(SETUP_FORM_ERROR))
+        }
         Ok(SetupOutcome::RateLimited(decision)) => too_many_requests(decision),
         Err(SetupError::Database(error)) => internal(error),
         Err(SetupError::Password(error)) => internal(error),
@@ -164,7 +170,7 @@ pub(crate) async fn login_page(State(state): State<AdminState>, headers: HeaderM
 
     match session::lookup(&state, &headers, Utc::now()).await {
         Ok(Some(_)) => redirect(HOME_PATH),
-        Ok(None) => Html(login_html(None)).into_response(),
+        Ok(None) => render(ConsolePage::new(PageKind::Login)),
         Err(error) => internal(error),
     }
 }
@@ -189,7 +195,9 @@ pub(crate) async fn login_submit(
             Err(error) => internal(error),
         },
         // Неверное имя и неверный пароль дают один и тот же ответ.
-        Ok(LoginOutcome::Rejected) => Html(login_html(Some(LOGIN_FORM_ERROR))).into_response(),
+        Ok(LoginOutcome::Rejected) => {
+            render(ConsolePage::new(PageKind::Login).error(LOGIN_FORM_ERROR))
+        }
         // Пароль не проверялся: лимит исчерпан записанными неудачами.
         Ok(LoginOutcome::RateLimited(decision)) => too_many_requests(decision),
         Err(LoginError::Database(error)) => internal(error),
@@ -210,7 +218,7 @@ pub(crate) async fn recover_page(
 ) -> Response {
     let client = state.client(peer, &headers);
     match recovery::check(&state, &client, &code, Utc::now()).await {
-        Ok(RecoveryCheck::Valid) => Html(recovery_html(None, &code)).into_response(),
+        Ok(RecoveryCheck::Valid) => render(ConsolePage::new(PageKind::Recovery).code(&code)),
         Ok(RecoveryCheck::Invalid) => invalid_link(),
         Ok(RecoveryCheck::RateLimited(decision)) => too_many_requests(decision),
         Err(RecoveryError::Database(error)) => internal(error),
@@ -229,7 +237,12 @@ pub(crate) async fn recover_submit(
 ) -> Response {
     // Длина проверяется до лимита, argon2 и кода: ошибка формы код не сжигает.
     if let Err(error) = password::validate(form.password.expose()) {
-        return Html(recovery_html(Some(&error.to_string()), &code)).into_response();
+        let message = error.to_string();
+        return render(
+            ConsolePage::new(PageKind::Recovery)
+                .code(&code)
+                .error(&message),
+        );
     }
 
     let client = state.client(peer, &headers);
@@ -248,7 +261,11 @@ pub(crate) async fn password_page(
     _session: AdminSession,
     Query(query): Query<PasswordQuery>,
 ) -> Response {
-    Html(password_html(None, query.changed.is_some())).into_response()
+    render(
+        ConsolePage::new(PageKind::Password)
+            .authenticated()
+            .changed(query.changed.is_some()),
+    )
 }
 
 /// `POST /admin/password`: проверить текущий пароль и сменить его.
@@ -261,7 +278,12 @@ pub(crate) async fn password_submit(
 ) -> Response {
     // Неверная длина нового пароля — ошибка формы без argon2 и без лимита.
     if let Err(error) = password::validate(form.new_password.expose()) {
-        return Html(password_html(Some(&error.to_string()), false)).into_response();
+        let message = error.to_string();
+        return render(
+            ConsolePage::new(PageKind::Password)
+                .authenticated()
+                .error(&message),
+        );
     }
 
     let client = state.client(peer, &headers);
@@ -276,9 +298,11 @@ pub(crate) async fn password_submit(
     .await
     {
         Ok(ChangeOutcome::Changed) => redirect(&format!("{PASSWORD_PATH}?changed=1")),
-        Ok(ChangeOutcome::WrongPassword) => {
-            Html(password_html(Some(WRONG_PASSWORD_ERROR), false)).into_response()
-        }
+        Ok(ChangeOutcome::WrongPassword) => render(
+            ConsolePage::new(PageKind::Password)
+                .authenticated()
+                .error(WRONG_PASSWORD_ERROR),
+        ),
         Ok(ChangeOutcome::RateLimited(decision)) => too_many_requests(decision),
         Err(ChangeError::Database(error)) => internal(error),
         Err(ChangeError::Password(error)) => internal(error),
@@ -338,17 +362,9 @@ fn too_many_requests(decision: RateDecision) -> Response {
 /// `410 Gone` отличает её от отсутствующей страницы, но не раскрывает причину:
 /// клиент не должен различать «нет такого кода», «уже использован» и «истёк».
 fn invalid_link() -> Response {
-    (
-        StatusCode::GONE,
-        Html(page(
-            INVALID_LINK_TITLE,
-            "<h1>Ссылка недействительна</h1>\
-             <p>Ссылка восстановления недействительна или истекла. \
-             Выпустите новую командой <code>tasklerq admin reset-password</code>.</p>\
-             <p><a href=\"/admin/login\">Перейти ко входу</a></p>",
-        )),
-    )
-        .into_response()
+    let mut response = render(ConsolePage::new(PageKind::InvalidLink));
+    *response.status_mut() = StatusCode::GONE;
+    response
 }
 
 /// `303` с одной `Set-Cookie`.
@@ -371,117 +387,223 @@ fn internal(error: impl std::fmt::Display) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
 }
 
-/// Общий каркас страницы до макета 5.8.
-fn page(title: &str, body: &str) -> String {
-    format!(
-        "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">\
-         <title>{title}</title></head><body>{body}</body></html>",
-        title = escape(title),
-    )
+/// Отрисовать страницу; сбой отрисовки — `500` без подробностей.
+fn render(page: ConsolePage<'_>) -> Response {
+    match page.render() {
+        Ok(body) => Html(body).into_response(),
+        Err(error) => internal(error),
+    }
 }
 
-/// Форма первого входа. Код обратно не показывается.
-fn setup_html(error: Option<&str>) -> String {
-    let error = error_block(error);
-    page(
-        "Первый вход",
-        &format!(
-            "<h1>Первый вход</h1>{error}\
-             <form method=\"post\" action=\"/admin/setup\">\
-             <p><label>Код <input name=\"code\" type=\"text\" autocomplete=\"one-time-code\" required></label></p>\
-             <p><label>Имя <input name=\"username\" type=\"text\" autocomplete=\"username\" required></label></p>\
-             <p><label>Пароль <input name=\"password\" type=\"password\" autocomplete=\"new-password\" minlength=\"12\" maxlength=\"1024\" required></label></p>\
-             <p><button type=\"submit\">Создать учётную запись</button></p>\
-             </form>",
-        ),
-    )
+/// Какая страница показана: содержимое выбирает шаблон.
+#[derive(Clone, Copy)]
+enum PageKind {
+    /// Главная за сессией.
+    Home,
+    /// Первый вход по setup-коду.
+    Setup,
+    /// Вход.
+    Login,
+    /// Новый пароль по ссылке восстановления.
+    Recovery,
+    /// Смена пароля за сессией.
+    Password,
+    /// Недействительная ссылка восстановления.
+    InvalidLink,
 }
 
-/// Форма входа.
-fn login_html(error: Option<&str>) -> String {
-    let error = error_block(error);
-    page(
-        "Вход",
-        &format!(
-            "<h1>Вход</h1>{error}\
-             <form method=\"post\" action=\"/admin/login\">\
-             <p><label>Имя <input name=\"username\" type=\"text\" autocomplete=\"username\" required></label></p>\
-             <p><label>Пароль <input name=\"password\" type=\"password\" autocomplete=\"current-password\" required></label></p>\
-             <p><button type=\"submit\">Войти</button></p>\
-             </form>",
-        ),
-    )
-}
-
-/// Форма нового пароля по ссылке восстановления.
-fn recovery_html(error: Option<&str>, code: &str) -> String {
-    let error = error_block(error);
-    page(
-        "Восстановление доступа",
-        &format!(
-            "<h1>Восстановление доступа</h1>{error}\
-             <form method=\"post\" action=\"{RECOVER_PATH}/{code}\">\
-             <p><label>Новый пароль <input name=\"password\" type=\"password\" autocomplete=\"new-password\" minlength=\"12\" maxlength=\"1024\" required></label></p>\
-             <p><button type=\"submit\">Сохранить пароль</button></p>\
-             </form>",
-            code = escape(code),
-        ),
-    )
-}
-
-/// Форма смены пароля за сессией.
-fn password_html(error: Option<&str>, changed: bool) -> String {
-    let error = error_block(error);
-    let changed = if changed {
-        "<p role=\"status\">Пароль изменён.</p>"
-    } else {
-        ""
-    };
-    page(
-        "Смена пароля",
-        &format!(
-            "<h1>Смена пароля</h1>{changed}{error}\
-             <form method=\"post\" action=\"{PASSWORD_PATH}\">\
-             <p><label>Текущий пароль <input name=\"current_password\" type=\"password\" autocomplete=\"current-password\" required></label></p>\
-             <p><label>Новый пароль <input name=\"new_password\" type=\"password\" autocomplete=\"new-password\" minlength=\"12\" maxlength=\"1024\" required></label></p>\
-             <p><button type=\"submit\">Сменить пароль</button></p>\
-             </form>",
-        ),
-    )
-}
-
-/// Блок сообщения об ошибке формы.
-fn error_block(error: Option<&str>) -> String {
-    error.map_or_else(String::new, |message| {
-        format!("<p role=\"alert\">{}</p>", escape(message))
-    })
-}
-
-/// Экранирование текста для HTML.
-fn escape(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&#39;"),
-            _ => escaped.push(ch),
+impl PageKind {
+    /// Заголовок страницы.
+    fn title(self) -> &'static str {
+        match self {
+            Self::Home => "Tasklerq",
+            Self::Setup => "Первый вход",
+            Self::Login => "Вход",
+            Self::Recovery => "Восстановление доступа",
+            Self::Password => "Смена пароля",
+            Self::InvalidLink => INVALID_LINK_TITLE,
         }
     }
-    escaped
+}
+
+/// Общий макет и страница консоли.
+///
+/// Один шаблон на все страницы: макет (шапка, навигация, сообщение) общий,
+/// различается только блок содержимого. Формы — обычные POST на пути консоли.
+#[derive(Template)]
+#[template(
+    source = r#"<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title }}</title>
+<link rel="stylesheet" href="{{ css }}">
+<script src="{{ htmx }}" defer></script>
+</head>
+<body>
+<header class="console-header">
+<span class="console-brand">Tasklerq</span>
+{% if nav %}
+<nav class="console-nav">
+<a href="/admin">Главная</a>
+<a href="/admin/password">Сменить пароль</a>
+<form method="post" action="/admin/logout">
+<button type="submit">Выйти</button>
+</form>
+</nav>
+{% endif %}
+</header>
+<main class="console-main">
+{% match error %}
+{% when Some with (message) %}
+<p role="alert" class="console-alert">{{ message }}</p>
+{% when None %}
+{% endmatch %}
+{% match page %}
+{% when PageKind::Home %}
+<h1>Tasklerq</h1>
+<p>Консоль администратора.</p>
+{% when PageKind::Setup %}
+<h1>Первый вход</h1>
+<form method="post" action="/admin/setup">
+<p><label for="setup-code">Код</label>
+<input id="setup-code" name="code" type="text" autocomplete="one-time-code" required></p>
+<p><label for="setup-username">Имя</label>
+<input id="setup-username" name="username" type="text" autocomplete="username" required></p>
+<p><label for="setup-password">Пароль</label>
+<input id="setup-password" name="password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></p>
+<p><button type="submit">Создать учётную запись</button></p>
+</form>
+{% when PageKind::Login %}
+<h1>Вход</h1>
+<form method="post" action="/admin/login">
+<p><label for="login-username">Имя</label>
+<input id="login-username" name="username" type="text" autocomplete="username" required></p>
+<p><label for="login-password">Пароль</label>
+<input id="login-password" name="password" type="password" autocomplete="current-password" required></p>
+<p><button type="submit">Войти</button></p>
+</form>
+{% when PageKind::Recovery %}
+<h1>Восстановление доступа</h1>
+<form method="post" action="/admin/recover/{{ code }}">
+<p><label for="recovery-password">Новый пароль</label>
+<input id="recovery-password" name="password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></p>
+<p><button type="submit">Сохранить пароль</button></p>
+</form>
+{% when PageKind::Password %}
+<h1>Смена пароля</h1>
+{% if changed %}
+<p role="status" class="console-notice">Пароль изменён.</p>
+{% endif %}
+<form method="post" action="/admin/password">
+<p><label for="current-password">Текущий пароль</label>
+<input id="current-password" name="current_password" type="password" autocomplete="current-password" required></p>
+<p><label for="new-password">Новый пароль</label>
+<input id="new-password" name="new_password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></p>
+<p><button type="submit">Сменить пароль</button></p>
+</form>
+{% when PageKind::InvalidLink %}
+<h1>Ссылка недействительна</h1>
+<p>Ссылка восстановления недействительна или истекла. Выпустите новую командой <code>tasklerq admin reset-password</code>.</p>
+<p><a href="/admin/login">Перейти ко входу</a></p>
+{% endmatch %}
+</main>
+</body>
+</html>
+"#,
+    ext = "html"
+)]
+struct ConsolePage<'a> {
+    /// Путь CSS с хешем содержимого.
+    css: &'static str,
+    /// Путь htmx с хешем содержимого.
+    htmx: &'static str,
+    /// Заголовок страницы.
+    title: &'static str,
+    /// Навигация вошедшего администратора.
+    nav: bool,
+    /// Сообщение формы или причина отказа.
+    error: Option<&'a str>,
+    /// Какая страница показана.
+    page: PageKind,
+    /// Код восстановления в адресе формы.
+    code: &'a str,
+    /// Пароль только что изменён.
+    changed: bool,
+}
+
+impl<'a> ConsolePage<'a> {
+    /// Страница с общим макетом и подключёнными ресурсами.
+    fn new(page: PageKind) -> Self {
+        Self {
+            css: assets::console_css_path(),
+            htmx: assets::htmx_path(),
+            title: page.title(),
+            nav: false,
+            error: None,
+            page,
+            code: "",
+            changed: false,
+        }
+    }
+
+    /// Показать навигацию вошедшего администратора.
+    fn authenticated(mut self) -> Self {
+        self.nav = true;
+        self
+    }
+
+    /// Показать сообщение формы.
+    fn error(mut self, message: &'a str) -> Self {
+        self.error = Some(message);
+        self
+    }
+
+    /// Подставить код восстановления в адрес формы.
+    fn code(mut self, code: &'a str) -> Self {
+        self.code = code;
+        self
+    }
+
+    /// Показать подтверждение смены пароля.
+    fn changed(mut self, changed: bool) -> Self {
+        self.changed = changed;
+        self
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::escape;
+    use askama::Template;
+
+    use super::{ConsolePage, PageKind};
 
     #[test]
     fn user_text_is_escaped() {
-        assert_eq!(
-            escape("<b>\"Имя\" & 'x'</b>"),
-            "&lt;b&gt;&quot;Имя&quot; &amp; &#39;x&#39;&lt;/b&gt;"
+        let page = ConsolePage::new(PageKind::Setup).error("<script>alert(\"x\")</script>");
+        let html = page.render().expect("the page renders");
+
+        assert!(!html.contains("<script>alert"), "{html}");
+        assert!(
+            html.contains("&#60;script&#62;alert(&#34;x&#34;)&#60;/script&#62;"),
+            "{html}"
         );
+    }
+
+    #[test]
+    fn every_page_has_the_shared_layout() {
+        for page in [
+            PageKind::Home,
+            PageKind::Setup,
+            PageKind::Login,
+            PageKind::Recovery,
+            PageKind::Password,
+            PageKind::InvalidLink,
+        ] {
+            let html = ConsolePage::new(page).render().expect("the page renders");
+            assert!(html.contains("/admin/assets/console-"), "{html}");
+            assert!(html.contains("/admin/assets/htmx-"), "{html}");
+        }
     }
 }
