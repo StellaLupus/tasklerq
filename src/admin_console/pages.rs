@@ -41,7 +41,10 @@ use super::router::AdminState;
 use super::session::{self, AdminSession, LOGIN_PATH};
 use super::setup::{self, SetupError, SetupOutcome};
 use super::wizard::{self, WizardStep};
+use crate::admin;
 use crate::domain::error::DomainError;
+use crate::domain::settings::validate_timezone;
+use crate::domain::validation::normalize_text;
 use crate::rate_limit::RateDecision;
 use crate::storage::repositories::admin_accounts;
 
@@ -52,11 +55,19 @@ const HOME_PATH: &str = "/admin";
 /// Путь страницы смены пароля; `?changed=1` показывает подтверждение.
 const PASSWORD_PATH: &str = "/admin/password";
 
+/// Часовой пояс по умолчанию: то же значение, что у `admin household create`.
+const DEFAULT_TIMEZONE: &str = "Europe/Moscow";
+/// Имя токена Home Assistant по умолчанию.
+const DEFAULT_TOKEN_NAME: &str = "Home Assistant";
+/// Scopes токена, который выпускает мастер.
+const HOME_ASSISTANT_SCOPES: [&str; 3] = ["ha:read", "ha:write", "capture:write"];
+
 const SETUP_FORM_ERROR: &str = "Код недействителен.";
 const LOGIN_FORM_ERROR: &str = "Неверное имя или пароль.";
 const EMPTY_USERNAME_ERROR: &str = "Имя не должно быть пустым.";
 const WRONG_PASSWORD_ERROR: &str = "Неверный текущий пароль.";
 const WIZARD_SKIP_ERROR: &str = "Этот шаг нельзя пропустить.";
+const WIZARD_STALE_STEP_ERROR: &str = "Этот шаг мастера уже завершён или недоступен.";
 const INVALID_LINK_TITLE: &str = "Ссылка недействительна";
 
 /// Поля формы setup.
@@ -102,11 +113,28 @@ pub(crate) struct PasswordQuery {
     changed: Option<String>,
 }
 
-/// Поля формы пропуска шага мастера.
+/// Поля формы шага мастера.
 #[derive(Deserialize)]
 pub(crate) struct SkipForm {
     /// Значение шага: `household`, `llm` или `token`.
     step: String,
+}
+
+/// Поля формы household.
+#[derive(Deserialize)]
+pub(crate) struct HouseholdForm {
+    /// Название household.
+    name: String,
+    /// Часовой пояс IANA.
+    timezone: String,
+}
+
+/// Поля формы токена Home Assistant: имя по желанию.
+#[derive(Deserialize)]
+pub(crate) struct TokenForm {
+    /// Название токена; пустое значение заменяется именем по умолчанию.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 /// `GET /admin`: главная страница за сессией.
@@ -162,11 +190,10 @@ pub(crate) async fn setup_submit(
     )
     .await
     {
-        Ok(SetupOutcome::Created(_)) => match wizard_target(&state).await {
-            Ok(path) => match session::start(&state, &client, Utc::now()).await {
-                Ok((_, cookie)) => redirect_with_cookie(path, cookie),
-                Err(error) => internal(error),
-            },
+        // Сессия выдаётся до вычисления адреса: сбой снимка мастера не должен
+        // оставить созданную учётку без cookie.
+        Ok(SetupOutcome::Created(_)) => match session::start(&state, &client, Utc::now()).await {
+            Ok((_, cookie)) => redirect_with_cookie(post_auth_target(&state).await, cookie),
             Err(error) => internal(error),
         },
         Ok(SetupOutcome::AlreadyConfigured) => redirect(LOGIN_PATH),
@@ -189,7 +216,9 @@ pub(crate) async fn login_page(State(state): State<AdminState>, headers: HeaderM
     }
 
     match session::lookup(&state, &headers, Utc::now()).await {
-        Ok(Some(_)) => redirect(HOME_PATH),
+        // Живая сессия ведёт туда же, куда после входа, а не всегда на главную:
+        // незавершённый мастер должен открыться с текущего шага.
+        Ok(Some(_)) => redirect(post_auth_target(&state).await),
         Ok(None) => render(ConsolePage::new(Page::Login)),
         Err(error) => internal(error),
     }
@@ -210,11 +239,10 @@ pub(crate) async fn login_submit(
 
     let client = state.client(peer, &headers);
     match login::authenticate(&state, &client, &form.username, form.password, Utc::now()).await {
-        Ok(LoginOutcome::Accepted(_)) => match wizard_target(&state).await {
-            Ok(path) => match session::start(&state, &client, Utc::now()).await {
-                Ok((_, cookie)) => redirect_with_cookie(path, cookie),
-                Err(error) => internal(error),
-            },
+        // Пароль уже проверен: сессия выдаётся даже если снимок мастера не
+        // прочитался, иначе успешный вход выглядит как `500` без cookie.
+        Ok(LoginOutcome::Accepted(_)) => match session::start(&state, &client, Utc::now()).await {
+            Ok((_, cookie)) => redirect_with_cookie(post_auth_target(&state).await, cookie),
             Err(error) => internal(error),
         },
         // Неверное имя и неверный пароль дают один и тот же ответ.
@@ -340,12 +368,9 @@ pub(crate) async fn wizard_page(
             match step {
                 WizardStep::Done => redirect(HOME_PATH),
                 WizardStep::Setup => redirect(SETUP_PATH),
-                WizardStep::Household | WizardStep::Llm | WizardStep::Token => {
-                    render(ConsolePage::new(Page::Wizard {
-                        step,
-                        household_skip_allowed: state.wizard().telegram_enabled,
-                    }))
-                }
+                WizardStep::Household | WizardStep::Llm | WizardStep::Token => render(
+                    ConsolePage::new(wizard_step_page(step, state.wizard().telegram_enabled)),
+                ),
             }
         }
         Err(error) => internal(error),
@@ -380,8 +405,128 @@ pub(crate) async fn wizard_skip(
     };
     state.audit.admin_setting_changed(key, "true", now).await;
 
-    match wizard::read_state(&state.pool, state.wizard(), now).await {
-        Ok(snapshot) => redirect(wizard::wizard_step(&snapshot).target_path()),
+    match current_step(&state, now).await {
+        Ok(step) => redirect(step.target_path()),
+        Err(error) => internal(error),
+    }
+}
+
+/// `POST /admin/wizard/household`: создать household без владельца.
+///
+/// Шаг выполняется, только пока он текущий: повторный POST после создания
+/// household отклоняется и второй дом не появляется. Ошибка валидации
+/// возвращает форму с введёнными значениями; значения экранирует askama.
+pub(crate) async fn wizard_household(
+    State(state): State<AdminState>,
+    _session: AdminSession,
+    Form(form): Form<HouseholdForm>,
+) -> Response {
+    let now = Utc::now();
+    let telegram_enabled = state.wizard().telegram_enabled;
+    let step = match current_step(&state, now).await {
+        Ok(step) => step,
+        Err(error) => return internal(error),
+    };
+    if step != WizardStep::Household {
+        return wizard_stale(step, telegram_enabled);
+    }
+
+    let (name, timezone) = match (normalize_text(&form.name, 100, "household name"))
+        .and_then(|name| validate_timezone(&form.timezone).map(|timezone| (name, timezone)))
+    {
+        Ok(values) => values,
+        Err(error) => {
+            let message = error.to_string();
+            return render(
+                ConsolePage::new(Page::Wizard {
+                    step,
+                    household_skip_allowed: telegram_enabled,
+                    form: WizardForm::Household {
+                        name: form.name,
+                        timezone: form.timezone,
+                    },
+                })
+                .error(&message),
+            );
+        }
+    };
+
+    match admin::create_household(&state.pool, state.wizard().tenancy, &name, &timezone, now).await
+    {
+        Ok(_) => redirect(wizard::WIZARD_PATH),
+        // Household успел появиться параллельно: второй не создаётся, ведём на
+        // актуальный шаг.
+        Err(DomainError::Conflict { .. }) => match current_step(&state, now).await {
+            Ok(step) => redirect(step.target_path()),
+            Err(error) => internal(error),
+        },
+        Err(error) => internal(error),
+    }
+}
+
+/// `POST /admin/wizard/token`: выпустить токен Home Assistant и показать его
+/// один раз.
+///
+/// Открытое значение живёт только в теле ответа: в базу и аудит попадает хеш и
+/// метаданные, cookie и адрес токен не получают. Повторный POST, когда шаг уже
+/// завершён, отклоняется и второй токен не выпускает.
+pub(crate) async fn wizard_token(
+    State(state): State<AdminState>,
+    _session: AdminSession,
+    Form(form): Form<TokenForm>,
+) -> Response {
+    let now = Utc::now();
+    let telegram_enabled = state.wizard().telegram_enabled;
+    let step = match current_step(&state, now).await {
+        Ok(step) => step,
+        Err(error) => return internal(error),
+    };
+    if step != WizardStep::Token {
+        return wizard_stale(step, telegram_enabled);
+    }
+
+    let submitted_name = form.name.unwrap_or_default();
+    let chosen_name = submitted_name.trim();
+    let chosen_name = if chosen_name.is_empty() {
+        DEFAULT_TOKEN_NAME
+    } else {
+        chosen_name
+    };
+    let name = match normalize_text(chosen_name, 64, "token name") {
+        Ok(name) => name,
+        Err(error) => {
+            let message = error.to_string();
+            return render(
+                ConsolePage::new(Page::Wizard {
+                    step,
+                    household_skip_allowed: telegram_enabled,
+                    form: WizardForm::Token {
+                        name: submitted_name,
+                    },
+                })
+                .error(&message),
+            );
+        }
+    };
+
+    let scopes: Vec<String> = HOME_ASSISTANT_SCOPES
+        .iter()
+        .map(|scope| (*scope).to_owned())
+        .collect();
+    match admin::create_token(
+        &state.pool,
+        state.wizard().tenancy,
+        None,
+        &name,
+        &scopes,
+        None,
+        now,
+    )
+    .await
+    {
+        Ok(issued) => render(ConsolePage::new(Page::TokenIssued {
+            token: issued.token,
+        })),
         Err(error) => internal(error),
     }
 }
@@ -415,10 +560,41 @@ async fn account_exists(state: &AdminState) -> Result<bool, DomainError> {
     Ok(admin_accounts::get(&mut conn).await?.is_some())
 }
 
+/// Текущий шаг мастера по снимку состояния.
+async fn current_step(
+    state: &AdminState,
+    now: chrono::DateTime<Utc>,
+) -> Result<WizardStep, DomainError> {
+    let snapshot = wizard::read_state(&state.pool, state.wizard(), now).await?;
+    Ok(wizard::wizard_step(&snapshot))
+}
+
 /// Куда вести после входа или setup: текущий шаг мастера или главная.
 async fn wizard_target(state: &AdminState) -> Result<&'static str, DomainError> {
-    let snapshot = wizard::read_state(&state.pool, state.wizard(), Utc::now()).await?;
-    Ok(wizard::wizard_step(&snapshot).target_path())
+    Ok(current_step(state, Utc::now()).await?.target_path())
+}
+
+/// Адрес после состоявшегося входа: сбой снимка мастера ведёт на главную.
+///
+/// Учётка и сессия к этому моменту уже есть, поэтому ошибка не должна
+/// превращаться в `500` без cookie; главная покажет «Продолжить настройку»,
+/// когда снимок снова прочитается.
+async fn post_auth_target(state: &AdminState) -> &'static str {
+    target_or_home(wizard_target(state).await)
+}
+
+/// Выбор адреса по результату [`wizard_target`]; ошибка уходит в журнал.
+fn target_or_home(target: Result<&'static str, DomainError>) -> &'static str {
+    match target {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "admin console wizard target failed; leading to the main page"
+            );
+            HOME_PATH
+        }
+    }
 }
 
 /// `303` без cookie.
@@ -458,17 +634,47 @@ fn invalid_link() -> Response {
 /// Если пропускать уже нечего, повторный POST уводит на главную (или на setup),
 /// а не показывает сырой текст ошибки.
 fn wizard_rejection(current: WizardStep, telegram_enabled: bool) -> Response {
+    wizard_step_rejection(current, telegram_enabled, WIZARD_SKIP_ERROR)
+}
+
+/// Отказ шага, который сейчас не текущий: без записи и без второго действия.
+fn wizard_stale(current: WizardStep, telegram_enabled: bool) -> Response {
+    wizard_step_rejection(current, telegram_enabled, WIZARD_STALE_STEP_ERROR)
+}
+
+/// Повтор текущего шага с сообщением и статусом `400`.
+fn wizard_step_rejection(
+    current: WizardStep,
+    telegram_enabled: bool,
+    message: &'static str,
+) -> Response {
     match current {
         WizardStep::Household | WizardStep::Llm | WizardStep::Token => render_with_status(
-            ConsolePage::new(Page::Wizard {
-                step: current,
-                household_skip_allowed: telegram_enabled,
-            })
-            .error(WIZARD_SKIP_ERROR),
+            ConsolePage::new(wizard_step_page(current, telegram_enabled)).error(message),
             StatusCode::BAD_REQUEST,
         ),
         WizardStep::Setup => redirect(SETUP_PATH),
         WizardStep::Done => redirect(HOME_PATH),
+    }
+}
+
+/// Страница шага мастера с пустой формой и значениями по умолчанию.
+fn wizard_step_page(step: WizardStep, telegram_enabled: bool) -> Page {
+    let form = match step {
+        WizardStep::Household => WizardForm::Household {
+            name: String::new(),
+            timezone: DEFAULT_TIMEZONE.to_owned(),
+        },
+        WizardStep::Token => WizardForm::Token {
+            name: DEFAULT_TOKEN_NAME.to_owned(),
+        },
+        WizardStep::Setup | WizardStep::Llm | WizardStep::Done => WizardForm::None,
+    };
+
+    Page::Wizard {
+        step,
+        household_skip_allowed: telegram_enabled,
+        form,
     }
 }
 
@@ -555,6 +761,31 @@ enum Page {
         step: WizardStep,
         /// Telegram включён: household можно пропустить.
         household_skip_allowed: bool,
+        /// Данные формы шага.
+        form: WizardForm,
+    },
+    /// Токен только что выпущен: открытое значение показывается один раз.
+    TokenIssued {
+        /// Открытый токен; в базу и журнал не попадает.
+        token: String,
+    },
+}
+
+/// Поля шага мастера, которые возвращаются в форму после отказа.
+enum WizardForm {
+    /// У шага нет формы (LLM).
+    None,
+    /// Форма household.
+    Household {
+        /// Название.
+        name: String,
+        /// Часовой пояс IANA.
+        timezone: String,
+    },
+    /// Форма токена.
+    Token {
+        /// Название токена.
+        name: String,
     },
 }
 
@@ -569,6 +800,7 @@ impl Page {
             Self::Password { .. } => "Смена пароля",
             Self::InvalidLink => INVALID_LINK_TITLE,
             Self::Wizard { step, .. } => step.title(),
+            Self::TokenIssued { .. } => "Токен Home Assistant",
         }
     }
 
@@ -579,7 +811,10 @@ impl Page {
     fn nav(&self) -> bool {
         matches!(
             self,
-            Self::Home { .. } | Self::Password { .. } | Self::Wizard { .. }
+            Self::Home { .. }
+                | Self::Password { .. }
+                | Self::Wizard { .. }
+                | Self::TokenIssued { .. }
         )
     }
 
@@ -598,16 +833,39 @@ impl Page {
             Self::Wizard {
                 step,
                 household_skip_allowed,
-            } => WizardBody {
-                title: step.title(),
-                description: step.description(),
-                skip: if step.can_skip(*household_skip_allowed) {
+                form,
+            } => {
+                let skip = if step.can_skip(*household_skip_allowed) {
                     step.slug()
                 } else {
                     None
-                },
+                };
+                let skip = SkipBody { skip }.render()?;
+                match form {
+                    WizardForm::Household { name, timezone } => HouseholdBody {
+                        title: step.title(),
+                        description: step.description(),
+                        name,
+                        timezone,
+                        skip,
+                    }
+                    .render(),
+                    WizardForm::Token { name } => TokenBody {
+                        title: step.title(),
+                        description: step.description(),
+                        name,
+                        skip,
+                    }
+                    .render(),
+                    WizardForm::None => WizardBody {
+                        title: step.title(),
+                        description: step.description(),
+                        skip,
+                    }
+                    .render(),
+                }
             }
-            .render(),
+            Self::TokenIssued { token } => TokenIssuedBody { token }.render(),
         }
     }
 }
@@ -800,13 +1058,10 @@ struct PasswordBody {
 )]
 struct InvalidLinkBody;
 
-/// Содержимое шага мастера.
+/// Форма пропуска шага мастера.
 #[derive(Template)]
 #[template(
-    source = r#"<h1>{{ title }}</h1>
-<p>{{ description }}</p>
-<p class="console-notice">Действие на этом шаге появится позже.</p>
-{% match skip %}
+    source = r#"{% match skip %}
 {% when Some with (step) %}
 <form method="post" action="/admin/wizard/skip">
 <input type="hidden" name="step" value="{{ step }}">
@@ -818,19 +1073,104 @@ struct InvalidLinkBody;
 "#,
     ext = "html"
 )]
+struct SkipBody {
+    /// Значение формы пропуска; `None` — пропуск недоступен.
+    skip: Option<&'static str>,
+}
+
+/// Содержимое шага мастера без формы (LLM).
+#[derive(Template)]
+#[template(
+    source = r#"<h1>{{ title }}</h1>
+<p>{{ description }}</p>
+<p class="console-notice">Действие на этом шаге появится позже.</p>
+{{ skip|safe }}
+"#,
+    ext = "html"
+)]
 struct WizardBody {
     /// Название шага.
     title: &'static str,
     /// Короткое пояснение шага.
     description: &'static str,
-    /// Значение формы пропуска; `None` — пропуск недоступен.
-    skip: Option<&'static str>,
+    /// Уже отрисованная форма пропуска.
+    skip: String,
+}
+
+/// Содержимое шага household.
+#[derive(Template)]
+#[template(
+    source = r#"<h1>{{ title }}</h1>
+<p>{{ description }}</p>
+<form method="post" action="/admin/wizard/household">
+<p><label for="household-name">Название</label>
+<input id="household-name" name="name" type="text" value="{{ name }}" maxlength="100" required></p>
+<p><label for="household-timezone">Часовой пояс</label>
+<input id="household-timezone" name="timezone" type="text" value="{{ timezone }}" maxlength="64" required></p>
+<p><button type="submit">Создать дом</button></p>
+</form>
+{{ skip|safe }}
+"#,
+    ext = "html"
+)]
+struct HouseholdBody<'a> {
+    /// Название шага.
+    title: &'static str,
+    /// Короткое пояснение шага.
+    description: &'static str,
+    /// Название household из формы.
+    name: &'a str,
+    /// Часовой пояс из формы.
+    timezone: &'a str,
+    /// Уже отрисованная форма пропуска.
+    skip: String,
+}
+
+/// Содержимое шага токена Home Assistant.
+#[derive(Template)]
+#[template(
+    source = r#"<h1>{{ title }}</h1>
+<p>{{ description }}</p>
+<form method="post" action="/admin/wizard/token">
+<p><label for="token-name">Название токена</label>
+<input id="token-name" name="name" type="text" value="{{ name }}" maxlength="64"></p>
+<p><button type="submit">Выпустить токен</button></p>
+</form>
+{{ skip|safe }}
+"#,
+    ext = "html"
+)]
+struct TokenBody<'a> {
+    /// Название шага.
+    title: &'static str,
+    /// Короткое пояснение шага.
+    description: &'static str,
+    /// Название токена из формы.
+    name: &'a str,
+    /// Уже отрисованная форма пропуска.
+    skip: String,
+}
+
+/// Страница с токеном, который показывается один раз.
+#[derive(Template)]
+#[template(
+    source = r#"<h1>Токен Home Assistant</h1>
+<p>Скопируйте токен и вставьте его в настройки Home Assistant. Токен показывается один раз: после перехода он больше не будет доступен.</p>
+<p><input id="issued-token" name="token" type="text" value="{{ token }}" readonly></p>
+<p><a href="/admin/wizard">Продолжить</a></p>
+"#,
+    ext = "html"
+)]
+struct TokenIssuedBody<'a> {
+    /// Открытый токен.
+    token: &'a str,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ConsolePage, Page};
+    use super::{ConsolePage, Page, WizardForm, target_or_home};
     use crate::admin_console::wizard::WizardStep;
+    use crate::domain::error::DomainError;
 
     #[test]
     fn user_text_is_escaped() {
@@ -860,6 +1200,18 @@ mod tests {
             Page::Wizard {
                 step: WizardStep::Llm,
                 household_skip_allowed: false,
+                form: WizardForm::None,
+            },
+            Page::Wizard {
+                step: WizardStep::Household,
+                household_skip_allowed: false,
+                form: WizardForm::Household {
+                    name: "Дом".to_owned(),
+                    timezone: "Europe/Moscow".to_owned(),
+                },
+            },
+            Page::TokenIssued {
+                token: "tlq_token".to_owned(),
             },
         ] {
             let html = ConsolePage::new(page).render().expect("the page renders");
@@ -883,23 +1235,62 @@ mod tests {
         assert!(!login.contains("action=\"/admin/logout\""), "{login}");
     }
 
+    fn household(name: &str, timezone: &str, telegram: bool) -> Page {
+        Page::Wizard {
+            step: WizardStep::Household,
+            household_skip_allowed: telegram,
+            form: WizardForm::Household {
+                name: name.to_owned(),
+                timezone: timezone.to_owned(),
+            },
+        }
+    }
+
     #[test]
     fn the_household_skip_button_depends_on_telegram() {
-        let without = ConsolePage::new(Page::Wizard {
-            step: WizardStep::Household,
-            household_skip_allowed: false,
-        })
-        .render()
-        .expect("the page renders");
+        let without = ConsolePage::new(household("", "Europe/Moscow", false))
+            .render()
+            .expect("the page renders");
         assert!(!without.contains("Пропустить"), "{without}");
 
-        let with = ConsolePage::new(Page::Wizard {
-            step: WizardStep::Household,
-            household_skip_allowed: true,
-        })
-        .render()
-        .expect("the page renders");
+        let with = ConsolePage::new(household("", "Europe/Moscow", true))
+            .render()
+            .expect("the page renders");
         assert!(with.contains("Пропустить"), "{with}");
         assert!(with.contains("value=\"household\""), "{with}");
+    }
+
+    #[test]
+    fn the_household_form_keeps_values_and_escapes_them() {
+        let html = ConsolePage::new(household("Дом <b>", "\"x\"", false))
+            .render()
+            .expect("the page renders");
+
+        assert!(
+            html.contains("action=\"/admin/wizard/household\""),
+            "{html}"
+        );
+        assert!(html.contains("value=\"Дом &#60;b&#62;\""), "{html}");
+        assert!(html.contains("value=\"&#34;x&#34;\""), "{html}");
+        assert!(!html.contains("Дом <b>"), "{html}");
+    }
+
+    #[test]
+    fn the_token_page_shows_the_value_once() {
+        let page = Page::TokenIssued {
+            token: "tlq_open_token".to_owned(),
+        };
+        let html = ConsolePage::new(page).render().expect("the page renders");
+
+        assert_eq!(html.matches("tlq_open_token").count(), 1, "{html}");
+        assert!(html.contains("readonly"), "{html}");
+        assert!(html.contains("показывается один раз"), "{html}");
+        assert!(html.contains("href=\"/admin/wizard\""), "{html}");
+    }
+
+    #[test]
+    fn a_failed_wizard_target_leads_home() {
+        assert_eq!(target_or_home(Ok("/admin/wizard")), "/admin/wizard");
+        assert_eq!(target_or_home(Err(DomainError::NotFound)), "/admin");
     }
 }

@@ -189,7 +189,7 @@
   и интеграционно: household из CLI пропускает шаг; после повторного входа —
   первый незавершённый шаг; без Telegram кнопки пропуска household нет (spec
   admin-console «Мастер первого запуска», design, решение 13).
-- [ ] 6.2 Шаг household через `admin::create_household` без владельца; шаг
+- [x] 6.2 Шаг household через `admin::create_household` без владельца; шаг
   токена HA через `admin::create_token` со scopes
   `ha:read,ha:write,capture:write`, показ один раз. Проверить в
   `tests/admin_console.rs`: сценарий «только Home Assistant» — household без

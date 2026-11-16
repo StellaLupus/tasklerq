@@ -162,6 +162,8 @@ pub fn build_router(state: AdminState) -> Router {
         .route("/admin", get(pages::index))
         .route(WIZARD_PATH, get(pages::wizard_page))
         .route(WIZARD_SKIP_PATH, post(pages::wizard_skip))
+        .route("/admin/wizard/household", post(pages::wizard_household))
+        .route("/admin/wizard/token", post(pages::wizard_token))
         .route(
             "/admin/setup",
             get(pages::setup_page).post(pages::setup_submit),

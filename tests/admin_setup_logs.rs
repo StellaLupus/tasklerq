@@ -20,9 +20,11 @@ use sqlx::postgres::PgPoolOptions;
 use support::logs::LogBuffer;
 use tasklerq::admin_console::codes::{self, Purpose};
 use tasklerq::admin_console::router::{AdminState, build_router as build_admin_router};
-use tasklerq::config::Config;
+use tasklerq::auth::tokens::hash_token;
+use tasklerq::config::{Config, TenancyMode};
 use tasklerq::security_audit::Audit;
 use tasklerq::storage::migrations;
+use tasklerq::storage::repositories::households;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -344,6 +346,119 @@ fn the_password_never_appears_in_the_logs() {
         !logs.contains(PASSWORD),
         "the password must not be logged:\n{logs}"
     );
+}
+
+/// Выпущенный в мастере токен не попадает в журнал.
+#[test]
+fn the_issued_household_token_never_appears_in_the_logs() {
+    let (logs, (status, token)) = capture(|| {
+        runtime().block_on(async {
+            let (pool, _url) = setup_db().await;
+            insert_account(&pool).await;
+
+            let mut tx = pool.begin().await.expect("household transaction");
+            households::create_empty(
+                &mut tx,
+                TenancyMode::Single,
+                "Дом",
+                "Europe/Moscow",
+                &tasklerq::admin::admin_actor(),
+                chrono::Utc::now(),
+            )
+            .await
+            .expect("household");
+            tx.commit().await.expect("commit the household");
+
+            // LLM пропущен: мастер открывается сразу на шаге токена.
+            let mut conn = pool.acquire().await.expect("connection");
+            tasklerq::settings::write_value(&mut conn, "wizard.llm_skipped", Value::Bool(true))
+                .await
+                .expect("the LLM skip is written");
+            drop(conn);
+
+            let session_token = "log-test-session-token";
+            sqlx::query(
+                "INSERT INTO admin_sessions (id, token_hash, created_at, last_seen_at)
+                 VALUES ($1, $2, $3, $3)",
+            )
+            .bind(Uuid::now_v7())
+            .bind(hash_token(session_token))
+            .bind(chrono::Utc::now())
+            .execute(&pool)
+            .await
+            .expect("session row");
+
+            let app = build_admin_router(AdminState::new(
+                pool.clone(),
+                Vec::new(),
+                Audit::new(pool.clone()),
+            ));
+            let cookie = format!("tlq_admin={session_token}");
+            let (status, body) = post_form_with_cookie(
+                &app,
+                "/admin/wizard/token",
+                &cookie,
+                &[("name", "Home Assistant")],
+            )
+            .await;
+
+            let token = body
+                .split("value=\"")
+                .find_map(|chunk| chunk.strip_prefix("tlq_"))
+                .map(|rest| format!("tlq_{}", rest.split('"').next().unwrap_or_default()))
+                .unwrap_or_default();
+            (status, token)
+        })
+    });
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the token page is rendered:\n{logs}"
+    );
+    assert!(token.starts_with("tlq_"), "a token is shown:\n{logs}");
+    assert!(
+        !logs.contains(&token),
+        "the open token must not be logged:\n{logs}"
+    );
+}
+
+/// `POST` формы с cookie сессии и телом ответа.
+async fn post_form_with_cookie(
+    app: &Router,
+    path: &str,
+    cookie: &str,
+    fields: &[(&str, &str)],
+) -> (StatusCode, String) {
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(fields)
+        .finish();
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header(header::HOST, "nas:18081")
+        .header(header::ORIGIN, "http://nas:18081")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::COOKIE, cookie)
+        .body(Body::from(body))
+        .expect("request should build");
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 4_040))));
+
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("router should respond");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body should be readable")
+        .to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// `POST` формы с пиром, как у боевого listener через `ConnectInfo`.

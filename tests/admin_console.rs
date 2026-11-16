@@ -4,6 +4,7 @@ mod support;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
@@ -15,6 +16,7 @@ use http_body_util::BodyExt;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use support::telegram::{FakeTelegram, Harness};
 use tasklerq::admin_console::assets;
 use tasklerq::admin_console::change::{self, ChangeOutcome};
 use tasklerq::admin_console::codes::{self, Purpose};
@@ -26,16 +28,19 @@ use tasklerq::admin_console::setup::{self, SetupOutcome};
 use tasklerq::admin_console::wizard::WizardSettings;
 use tasklerq::app::build_application;
 use tasklerq::auth::tokens::hash_token;
-use tasklerq::config::{Config, IpNet, LlmConfig, TenancyMode};
+use tasklerq::config::{CaptureConfig, Config, IpNet, LlmConfig, TenancyConfig, TenancyMode};
 use tasklerq::domain::error::DomainError;
+use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::client::{Client, Scheme};
 use tasklerq::http::router::{AppState, build_router};
 use tasklerq::http::server::{bind_listeners, serve_listeners};
+use tasklerq::llm::{LlmHandle, LlmSnapshot};
 use tasklerq::rate_limit::{Reservation, ip_key};
 use tasklerq::security_audit::Audit;
 use tasklerq::settings::crypto::SecretCipher;
 use tasklerq::storage::repositories::admin_accounts;
 use tasklerq::storage::repositories::households;
+use tasklerq::telegram::bot::Bot;
 use tower::ServiceExt;
 use url::form_urlencoded;
 use uuid::Uuid;
@@ -1545,8 +1550,8 @@ async fn login_accepts_the_right_credentials_and_hides_the_reason_on_failure() {
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(
         location(&headers),
-        Some("/admin"),
-        "an active session opens the main page instead of the login form"
+        Some("/admin/wizard"),
+        "an active session goes to the same wizard step as after the login itself"
     );
 
     let (bad_password_status, bad_password_headers, bad_password_body) = send_form(
@@ -3553,8 +3558,12 @@ async fn wizard_pages_are_self_contained_and_keep_the_home_reachable() {
         "the skip is a plain POST form: {text}"
     );
     assert!(
-        text.contains("Действие на этом шаге появится позже."),
-        "the page says the action is coming later: {text}"
+        text.contains("<form method=\"post\" action=\"/admin/wizard/household\">"),
+        "the household step has its own plain POST form: {text}"
+    );
+    assert!(
+        text.contains("value=\"Europe/Moscow\""),
+        "the timezone defaults to the CLI default: {text}"
     );
 
     let (status, headers, body) = send_with_cookie(&app, Method::GET, "/admin", &cookie).await;
@@ -3639,6 +3648,495 @@ async fn the_token_step_can_be_skipped_and_finishes_the_wizard() {
 }
 
 /// Активный токен household снимает шаг токена.
+/// Число неудалённых household.
+async fn household_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM households WHERE deleted_at IS NULL")
+        .fetch_one(pool)
+        .await
+        .expect("household count")
+}
+
+/// Число действующих участников household.
+async fn member_count(pool: &PgPool, household_id: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM users WHERE household_id = $1 AND deleted_at IS NULL")
+        .bind(household_id)
+        .fetch_one(pool)
+        .await
+        .expect("member count")
+}
+
+/// Число неотозванных токенов household.
+async fn token_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM api_tokens WHERE revoked_at IS NULL")
+        .fetch_one(pool)
+        .await
+        .expect("token count")
+}
+
+/// Открытый токен со страницы выпуска: единственное поле `issued-token`.
+fn issued_token(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let field = text
+        .find("id=\"issued-token\"")
+        .map(|start| &text[start..])
+        .expect("the page shows the token field");
+    let value = field
+        .find("value=\"")
+        .map(|start| &field[start + "value=\"".len()..])
+        .expect("the token field carries a value");
+    value
+        .split('"')
+        .next()
+        .expect("the value is quoted")
+        .to_owned()
+}
+
+/// Публичный роутер с включённым разбором и подменным слотом.
+fn capture_router(pool: &PgPool, ai: Arc<support::llm::BackendDouble>) -> Router {
+    build_router(
+        AppState::new(pool.clone(), Audit::new(pool.clone())).with_capture(CaptureState::new(
+            CaptureConfig {
+                enabled: true,
+                voice_timeout_ms: 8_000,
+                voice_fallback_raw: false,
+                rate_limit_per_min: 10,
+                max_text_chars: 2_000,
+            },
+            LlmHandle::new(LlmSnapshot::for_tests_without_settings(
+                Some(Arc::new(support::llm::chain(ai, None))),
+                200,
+            )),
+        )),
+    )
+}
+
+/// Бот в режиме `single` на базе теста.
+fn single_bot(pool: &PgPool, telegram_id: i64) -> Harness {
+    let bot = Bot::new("tasklerqbot")
+        .with_tenancy_config(TenancyConfig {
+            mode: TenancyMode::Single,
+            bootstrap_owner: None,
+        })
+        .with_audit(Audit::new(pool.clone()));
+    Harness::with_handler(pool, telegram_id, Arc::new(bot), FakeTelegram::new())
+}
+
+/// Сценарий «только Home Assistant»: setup, household из формы, пропуск LLM и
+/// однократно показанный токен, который сразу работает в `POST /api/v1/capture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_home_assistant_only_scenario_creates_a_household_and_shows_the_token_once() {
+    let db = support::isolated_db().await;
+    let app = console_with(&db.pool, TenancyMode::Single, false, LlmConfig::empty());
+    let setup_code = codes::issue(&db.pool, Purpose::Setup, None, Utc::now())
+        .await
+        .expect("a setup code");
+
+    let (status, headers, _) = send_form(
+        &app,
+        "/admin/setup",
+        &[
+            ("code", &setup_code.code),
+            ("username", "admin"),
+            ("password", TEST_PASSWORD),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/wizard"));
+    let cookie = cookie_pair(&set_cookie(&headers).expect("setup starts a session"));
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin/wizard", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("action=\"/admin/wizard/household\""),
+        "the household step is a form now: {text}"
+    );
+
+    let (status, headers, _) = send_form_from(
+        &app,
+        "/admin/wizard/household",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("name", "Дом"), ("timezone", "Europe/Moscow")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/wizard"));
+
+    let household_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM households WHERE deleted_at IS NULL")
+            .fetch_one(&db.pool)
+            .await
+            .expect("the household row");
+    assert_eq!(
+        member_count(&db.pool, household_id).await,
+        0,
+        "the console creates the household without an owner"
+    );
+
+    let (status, headers, _) = send_form_from(
+        &app,
+        "/admin/wizard/skip",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("step", "llm")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/wizard"));
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin/wizard", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("action=\"/admin/wizard/token\""),
+        "the token step is a form now: {text}"
+    );
+    assert!(text.contains("Токен Home Assistant"), "{text}");
+
+    let (status, headers, body) = send_form_from(
+        &app,
+        "/admin/wizard/token",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("name", "")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the token is shown in the response");
+    assert_security_headers(&headers, "the issued token page");
+    assert_no_external_urls(&body, "the issued token page");
+
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("показывается один раз"), "{text}");
+    assert!(text.contains("readonly"), "{text}");
+    assert!(text.contains("href=\"/admin/wizard\""), "{text}");
+    let token = issued_token(&body);
+    assert!(token.starts_with("tlq_"), "{token}");
+    assert_eq!(
+        text.matches(&token).count(),
+        1,
+        "the open token is shown exactly once: {text}"
+    );
+
+    let (stored_hash, scopes): (String, Vec<String>) =
+        sqlx::query_as("SELECT token_hash, scopes FROM api_tokens WHERE revoked_at IS NULL")
+            .fetch_one(&db.pool)
+            .await
+            .expect("the token row");
+    assert_eq!(stored_hash, hash_token(&token), "only the hash is stored");
+    assert_eq!(
+        scopes,
+        vec!["ha:read", "ha:write", "capture:write"],
+        "the Home Assistant token carries exactly the required scopes"
+    );
+    let leaked: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM api_tokens
+          WHERE token_hash = $1 OR name = $1 OR prefix = $1",
+    )
+    .bind(&token)
+    .fetch_one(&db.pool)
+    .await
+    .expect("the open token must not be stored");
+    assert_eq!(leaked, 0, "the open token is not written to the table");
+
+    let created = audit_payloads(&db.pool, "household_created").await;
+    assert_eq!(created.len(), 1, "one household event: {created:?}");
+    for (actor, household) in audit_actor(&db.pool, "household_created").await {
+        assert_eq!(actor, "system");
+        assert_eq!(household, Some(household_id));
+    }
+    let issued_events = audit_payloads(&db.pool, "token_created").await;
+    assert_eq!(issued_events.len(), 1, "one token event: {issued_events:?}");
+    for (actor, household) in audit_actor(&db.pool, "token_created").await {
+        assert_eq!(actor, "system");
+        assert_eq!(household, Some(household_id));
+    }
+    assert!(
+        !issued_events[0].to_string().contains(&token),
+        "the audit event must not carry the open token"
+    );
+
+    let ai = support::llm::BackendDouble::new(vec![Ok(support::llm::v4::response(vec![
+        support::llm::v4::shopping("молоко"),
+    ]))]);
+    let public = capture_router(&db.pool, ai);
+    let (status, json) = support::request(
+        &public,
+        Method::POST,
+        "/api/v1/capture",
+        Some(&token),
+        Some(serde_json::json!({
+            "text": "купить молоко",
+            "source": "ha_voice",
+            "mode": "auto"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the issued token captures: {json}");
+    assert_eq!(json["status"], "applied", "{json}");
+
+    let (status, headers, _) = send_with_cookie(&app, Method::GET, "/admin/wizard", &cookie).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        location(&headers),
+        Some("/admin"),
+        "the token stays issued and the wizard is finished"
+    );
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        !text.contains(&token),
+        "the token is not shown again: {text}"
+    );
+    assert!(!text.contains("Продолжить настройку"), "{text}");
+}
+
+/// Шаг household: ошибка валидации сохраняет ввод, повторный POST не создаёт
+/// второй household, чужой `Origin` и анонимный POST ничего не пишут.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_household_step_validates_and_creates_only_one_household() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console(&db.pool, Vec::new());
+
+    let (status, headers, _) = send_form(
+        &app,
+        "/admin/wizard/household",
+        &[("name", "Дом"), ("timezone", "Europe/Moscow")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "an anonymous POST goes to the login page"
+    );
+    assert_eq!(location(&headers), Some("/admin/login"));
+    assert_eq!(household_count(&db.pool).await, 0);
+
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let (status, response_headers, _) = send_form_from(
+        &app,
+        "/admin/wizard/household",
+        test_peer(),
+        headers_with(&[
+            ("host", "nas:18081"),
+            ("origin", "http://evil.example"),
+            ("cookie", &cookie),
+        ]),
+        &[("name", "Дом"), ("timezone", "Europe/Moscow")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_security_headers(&response_headers, "a household form with a foreign origin");
+    assert_eq!(household_count(&db.pool).await, 0);
+
+    let (status, _, body) = send_form_from(
+        &app,
+        "/admin/wizard/household",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("name", "Дом <b>"), ("timezone", "Not/AZone")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "a bad timezone is a form error");
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("role=\"alert\""), "{text}");
+    assert!(
+        text.contains("Дом &#60;b&#62;"),
+        "the entered name is kept and escaped: {text}"
+    );
+    assert!(
+        !text.contains("Дом <b>"),
+        "the entered name must not reach the markup raw: {text}"
+    );
+    assert!(
+        text.contains("value=\"Not/AZone\""),
+        "the entered timezone is kept: {text}"
+    );
+    assert_eq!(household_count(&db.pool).await, 0);
+
+    let (status, headers, _) = send_form_from(
+        &app,
+        "/admin/wizard/household",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("name", "Дом"), ("timezone", "Europe/Moscow")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/wizard"));
+    assert_eq!(household_count(&db.pool).await, 1);
+
+    let (status, _, _) = send_form_from(
+        &app,
+        "/admin/wizard/household",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("name", "Второй"), ("timezone", "Europe/Moscow")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the household step is no longer current"
+    );
+    assert_eq!(
+        household_count(&db.pool).await,
+        1,
+        "a repeated POST must not create a second household"
+    );
+}
+
+/// Telegram включён и household пропущен: бот создаёт household и владельца.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_household_skip_leaves_the_first_bot_user_to_onboard() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Single, true, LlmConfig::empty());
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let (status, headers, _) = send_form_from(
+        &app,
+        "/admin/wizard/skip",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("step", "household")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/wizard"));
+    assert_eq!(
+        household_count(&db.pool).await,
+        0,
+        "the skip leaves the household to the bot"
+    );
+
+    let telegram_id = support::next_telegram_id();
+    let mut bot = single_bot(&db.pool, telegram_id);
+    bot.text("/start").await;
+    bot.assert_screen_contains("Как назовём ваше пространство");
+    bot.text("Семья").await;
+    bot.press("Москва").await;
+    bot.assert_screen_contains("Созданы списки");
+
+    assert_eq!(household_count(&db.pool).await, 1);
+    let household_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM households WHERE deleted_at IS NULL")
+            .fetch_one(&db.pool)
+            .await
+            .expect("the household row");
+    let owner: Option<String> = sqlx::query_scalar(
+        "SELECT role::text FROM users
+          WHERE household_id = $1 AND telegram_user_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(household_id)
+    .bind(telegram_id)
+    .fetch_optional(&db.pool)
+    .await
+    .expect("the onboarding owner");
+    assert_eq!(owner.as_deref(), Some("owner"));
+}
+
+/// В `multi` шагов household и токена нет: POST отклоняется без записи.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_mode_refuses_the_household_and_token_steps() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let (status, _, _) = send_form_from(
+        &app,
+        "/admin/wizard/household",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("name", "Дом"), ("timezone", "Europe/Moscow")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(household_count(&db.pool).await, 0);
+
+    let (status, _, _) = send_form_from(
+        &app,
+        "/admin/wizard/token",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("name", "Home Assistant")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(token_count(&db.pool).await, 0);
+}
+
+/// Сбой вычисления адреса мастера после состоявшегося входа не отнимает
+/// сессию: ответ — `303` на `/admin` с cookie.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_wizard_target_after_login_still_sets_the_cookie() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console(&db.pool, Vec::new());
+
+    // Снимок мастера читает `settings`; без таблицы он падает уже после
+    // проверки пароля и создания сессии.
+    sqlx::query("ALTER TABLE settings RENAME TO settings_unavailable")
+        .execute(&db.pool)
+        .await
+        .expect("the settings table is hidden from the snapshot");
+
+    let (status, headers, _) = send_form(
+        &app,
+        "/admin/login",
+        &[("username", "admin"), ("password", TEST_PASSWORD)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        location(&headers),
+        Some("/admin"),
+        "the failed snapshot must not replace the session with a 500"
+    );
+    assert!(
+        set_cookie(&headers).is_some(),
+        "the login already succeeded and the cookie must be set"
+    );
+    assert_eq!(session_count(&db.pool).await, 1);
+}
+
+/// Тот же хвост у setup: учётка создана, сессия выдана, адрес мастера не
+/// вычислился — ведём на главную.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_wizard_target_after_setup_still_sets_the_cookie() {
+    let db = support::isolated_db().await;
+    let app = console(&db.pool, Vec::new());
+    let setup_code = codes::issue(&db.pool, Purpose::Setup, None, Utc::now())
+        .await
+        .expect("a setup code");
+
+    sqlx::query("ALTER TABLE settings RENAME TO settings_unavailable")
+        .execute(&db.pool)
+        .await
+        .expect("the settings table is hidden from the snapshot");
+
+    let (status, headers, _) = send_form(
+        &app,
+        "/admin/setup",
+        &[
+            ("code", &setup_code.code),
+            ("username", "admin"),
+            ("password", TEST_PASSWORD),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin"));
+    assert!(set_cookie(&headers).is_some());
+    assert_eq!(account_count(&db.pool).await, 1);
+    assert_eq!(session_count(&db.pool).await, 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_active_token_removes_the_token_step() {
     let db = support::isolated_db().await;
