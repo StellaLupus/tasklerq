@@ -33,7 +33,7 @@
 
 ## 2. Хранилище настроек и шифрование
 
-- [ ] 2.1 Миграция `0020_settings.sql`: таблица `settings` (scope,
+- [x] 2.1 Миграция `0020_settings.sql`: таблица `settings` (scope,
   household_id, key, `value jsonb`, `secret bytea`, updated_at; уникальность по
   `(scope, coalesce(household_id, nil), key)`; CHECK ровно одно из
   value/secret; CHECK согласованности scope и household_id). Проверить в

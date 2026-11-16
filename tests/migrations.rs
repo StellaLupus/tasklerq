@@ -809,6 +809,278 @@ async fn llm_slot_settings_migration_applies_on_a_clean_database() {
     );
 }
 
+fn settings_error_code(result: &Result<(), sqlx::Error>) -> Option<String> {
+    match result {
+        Err(sqlx::Error::Database(database)) => database.code().map(|code| code.into_owned()),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_setting(
+    pool: &sqlx::PgPool,
+    scope: &str,
+    household_id: Option<Uuid>,
+    key: &str,
+    value: Option<serde_json::Value>,
+    secret: Option<Vec<u8>>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO settings (scope, household_id, key, value, secret)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(scope)
+    .bind(household_id)
+    .bind(key)
+    .bind(value)
+    .bind(secret)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// Таблица `settings`: форма, уровни и ограничения ключа и значения.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_migration_enforces_scope_key_and_secret_rules() {
+    let db = support::empty_db().await;
+    migrations::run(&db.pool)
+        .await
+        .expect("migrations should apply on a clean database");
+
+    let columns: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT column_name, data_type, is_nullable
+         FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'settings'
+         ORDER BY ordinal_position",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("settings columns");
+    let shape: Vec<(&str, &str, &str)> = columns
+        .iter()
+        .map(|(name, data_type, nullable)| (name.as_str(), data_type.as_str(), nullable.as_str()))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("scope", "text", "NO"),
+            ("household_id", "uuid", "YES"),
+            ("key", "text", "NO"),
+            ("value", "jsonb", "YES"),
+            ("secret", "bytea", "YES"),
+            ("updated_at", "timestamp with time zone", "NO"),
+        ],
+        "settings must keep the value and the encrypted secret apart"
+    );
+
+    let updated_at_default: Option<String> = sqlx::query_scalar(
+        "SELECT column_default
+         FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'settings'
+           AND column_name = 'updated_at'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("updated_at default");
+    assert!(
+        updated_at_default
+            .as_deref()
+            .is_some_and(|default| default.contains("now()")),
+        "updated_at must default to now(): {updated_at_default:?}"
+    );
+
+    let household_a = Uuid::now_v7();
+    let household_b = Uuid::now_v7();
+    for (id, name) in [(household_a, "Первый"), (household_b, "Второй")] {
+        sqlx::query(
+            "INSERT INTO households (id, name, timezone)
+             VALUES ($1, $2, 'Europe/Moscow')",
+        )
+        .bind(id)
+        .bind(name)
+        .execute(&db.pool)
+        .await
+        .expect("household");
+    }
+
+    insert_setting(
+        &db.pool,
+        "installation",
+        None,
+        "llm.enabled",
+        Some(json!({"enabled": true})),
+        None,
+    )
+    .await
+    .expect("an installation setting is valid");
+
+    let duplicate_installation = insert_setting(
+        &db.pool,
+        "installation",
+        None,
+        "llm.enabled",
+        Some(json!({"enabled": false})),
+        None,
+    )
+    .await;
+    assert_eq!(
+        settings_error_code(&duplicate_installation).as_deref(),
+        Some("23505"),
+        "installation keys must be unique even though household_id is NULL"
+    );
+
+    insert_setting(
+        &db.pool,
+        "household",
+        Some(household_a),
+        "llm.primary.url",
+        Some(json!("https://llm.example/v1")),
+        None,
+    )
+    .await
+    .expect("a household setting is valid");
+
+    let duplicate_household = insert_setting(
+        &db.pool,
+        "household",
+        Some(household_a),
+        "llm.primary.url",
+        Some(json!("https://other.example/v1")),
+        None,
+    )
+    .await;
+    assert_eq!(
+        settings_error_code(&duplicate_household).as_deref(),
+        Some("23505"),
+        "a key must be unique within one household"
+    );
+
+    insert_setting(
+        &db.pool,
+        "household",
+        Some(household_b),
+        "llm.primary.url",
+        Some(json!("https://third.example/v1")),
+        None,
+    )
+    .await
+    .expect("another household may set the same key");
+
+    insert_setting(
+        &db.pool,
+        "installation",
+        None,
+        "llm.primary.url",
+        Some(json!("https://installation.example/v1")),
+        None,
+    )
+    .await
+    .expect("the installation level may set the same key as a household");
+
+    let both = insert_setting(
+        &db.pool,
+        "installation",
+        None,
+        "llm.primary.token",
+        Some(json!("plain")),
+        Some(vec![0, 1, 2]),
+    )
+    .await;
+    assert_eq!(
+        settings_error_code(&both).as_deref(),
+        Some("23514"),
+        "value and secret are mutually exclusive"
+    );
+
+    let neither = insert_setting(
+        &db.pool,
+        "installation",
+        None,
+        "llm.primary.token",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        settings_error_code(&neither).as_deref(),
+        Some("23514"),
+        "a setting must carry either a value or a secret"
+    );
+
+    let installation_with_household = insert_setting(
+        &db.pool,
+        "installation",
+        Some(household_a),
+        "llm.daily_quota",
+        Some(json!(200)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        settings_error_code(&installation_with_household).as_deref(),
+        Some("23514"),
+        "an installation setting must not reference a household"
+    );
+
+    let household_without_household = insert_setting(
+        &db.pool,
+        "household",
+        None,
+        "llm.daily_quota",
+        Some(json!(200)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        settings_error_code(&household_without_household).as_deref(),
+        Some("23514"),
+        "a household setting must reference a household"
+    );
+
+    let unknown_scope = insert_setting(
+        &db.pool,
+        "user",
+        Some(household_a),
+        "llm.daily_quota",
+        Some(json!(200)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        settings_error_code(&unknown_scope).as_deref(),
+        Some("23514"),
+        "only the installation and household levels exist"
+    );
+
+    let blank_key = insert_setting(
+        &db.pool,
+        "installation",
+        None,
+        "   ",
+        Some(json!(200)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        settings_error_code(&blank_key).as_deref(),
+        Some("23514"),
+        "a blank key must be rejected"
+    );
+
+    // Настройки household живут вместе с ним, как остальные его данные.
+    sqlx::query("DELETE FROM households WHERE id = $1")
+        .bind(household_a)
+        .execute(&db.pool)
+        .await
+        .expect("household deletion");
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM settings WHERE household_id = $1")
+        .bind(household_a)
+        .fetch_one(&db.pool)
+        .await
+        .expect("settings after household deletion");
+    assert_eq!(left, 0, "household settings must be deleted with it");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn llm_slots_migration_keeps_existing_runs_without_a_slot() {
     let db = support::empty_db().await;
