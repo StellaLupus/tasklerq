@@ -2010,10 +2010,21 @@ async fn setup_code_with_an_account_suggests_reset_password() {
 
 /// Запуск CLI с явным `ADMIN_BIND_ADDR`; без значения переменная убрана.
 async fn run_with_admin_addr(url: &str, admin_bind_addr: Option<&str>, args: &[&str]) -> Output {
+    run_with_admin_addr_and_log(url, admin_bind_addr, "error", args).await
+}
+
+/// То же с явным `RUST_LOG`: проверки контракта stdout не должны прятать
+/// предупреждения фильтром `error`.
+async fn run_with_admin_addr_and_log(
+    url: &str,
+    admin_bind_addr: Option<&str>,
+    rust_log: &str,
+    args: &[&str],
+) -> Output {
     let mut command = bin();
     command
         .env("DATABASE_URL", url)
-        .env("RUST_LOG", "error")
+        .env("RUST_LOG", rust_log)
         .env_remove("ADMIN_BIND_ADDR")
         .args(args)
         .stdin(Stdio::null());
@@ -2167,5 +2178,76 @@ async fn setup_code_warns_when_the_console_is_disabled() {
     assert!(
         hint.contains("disabled") && hint.contains("выключена"),
         "the CLI must warn that the console is disabled:\n{hint}"
+    );
+}
+
+/// Невалидный `ADMIN_BIND_ADDR` не роняет выпуск кода и ссылки: подсказка
+/// остаётся без порта и не выдаёт себя за `disabled`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invalid_admin_bind_addr_does_not_fail_the_cli() {
+    let db = cli_database().await;
+
+    // `info`, а не `error`: предупреждение журнала не должно прятаться за
+    // фильтром и обязано не попадать в stdout перед кодом.
+    let setup = run_with_admin_addr_and_log(
+        &db.url,
+        Some("localhost:abc"),
+        "info",
+        &["admin", "setup-code"],
+    )
+    .await;
+    assert!(setup.status.success(), "{setup:?}");
+    let code_text = stdout(&setup);
+    let mut code_lines = code_text.lines();
+    let code = code_lines.next().expect("the setup code line");
+    assert!(code.len() >= 22, "the setup code is printed:\n{code_text}");
+    assert!(
+        code_lines.next().is_none(),
+        "stdout must contain only the setup code:\n{code_text}"
+    );
+    let hint = stderr(&setup);
+    assert!(
+        hint.contains("ADMIN_BIND_ADDR не разобран"),
+        "the hint must name the invalid parameter:\n{hint}"
+    );
+    assert!(
+        hint.contains("/admin/setup"),
+        "the hint must still point to the setup page:\n{hint}"
+    );
+    assert!(
+        !hint.contains("выключена"),
+        "an invalid value must not look like `disabled`:\n{hint}"
+    );
+
+    insert_admin_account(&db.pool).await;
+    let reset = run_with_admin_addr_and_log(
+        &db.url,
+        Some("not-an-address"),
+        "info",
+        &["admin", "reset-password"],
+    )
+    .await;
+    assert!(reset.status.success(), "{reset:?}");
+    let reset_text = stdout(&reset);
+    let mut reset_lines = reset_text.lines();
+    let path = reset_lines.next().expect("the recovery path line");
+    assert!(
+        path.starts_with("/admin/recover/"),
+        "the recovery path is printed:\n{reset_text}"
+    );
+    assert!(
+        reset_lines
+            .next()
+            .is_some_and(|line| line.starts_with("Срок действия: ")),
+        "the lifetime follows the path:\n{reset_text}"
+    );
+    assert!(
+        reset_lines.next().is_none(),
+        "stdout must contain only the path and lifetime:\n{reset_text}"
+    );
+    let hint = stderr(&reset);
+    assert!(
+        hint.contains("ADMIN_BIND_ADDR не разобран") && hint.contains("/admin/recover/"),
+        "the hint must point to the recovery page without a port:\n{hint}"
     );
 }

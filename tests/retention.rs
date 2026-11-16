@@ -32,6 +32,50 @@ fn config() -> RetentionConfig {
     }
 }
 
+async fn insert_admin_code(
+    pool: &PgPool,
+    code_hash: &str,
+    purpose: &str,
+    created_at: DateTime<Utc>,
+    expires_at: Option<DateTime<Utc>>,
+    used_at: Option<DateTime<Utc>>,
+) {
+    sqlx::query(
+        "INSERT INTO admin_one_time_codes (
+             id, purpose, code_hash, created_at, expires_at, used_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(purpose)
+    .bind(code_hash)
+    .bind(created_at)
+    .bind(expires_at)
+    .bind(used_at)
+    .execute(pool)
+    .await
+    .expect("admin one-time code");
+}
+
+async fn insert_admin_session(
+    pool: &PgPool,
+    token_hash: &str,
+    created_at: DateTime<Utc>,
+    last_seen_at: DateTime<Utc>,
+) {
+    sqlx::query(
+        "INSERT INTO admin_sessions (id, token_hash, created_at, last_seen_at)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(token_hash)
+    .bind(created_at)
+    .bind(last_seen_at)
+    .execute(pool)
+    .await
+    .expect("admin session");
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn insert_delivery(
     pool: &PgPool,
@@ -716,6 +760,140 @@ async fn retention_worker_skips_the_run_when_the_advisory_lock_is_held() {
         .execute(&mut *holder)
         .await
         .expect("unlock");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_purges_old_admin_codes_and_absolute_expired_sessions() {
+    use tasklerq::auth::tokens::hash_token;
+
+    let db = support::isolated_db().await;
+    let now = Utc::now();
+
+    // Использованный 8 дней назад — удаляется, 6 дней назад — остаётся.
+    insert_admin_code(
+        &db.pool,
+        &hash_token("used-old"),
+        "setup",
+        now - Duration::days(10),
+        None,
+        Some(now - Duration::days(8)),
+    )
+    .await;
+    insert_admin_code(
+        &db.pool,
+        &hash_token("used-recent"),
+        "setup",
+        now - Duration::days(10),
+        None,
+        Some(now - Duration::days(6)),
+    )
+    .await;
+
+    // Истёкший 8 дней назад — удаляется, 1 день назад — остаётся.
+    insert_admin_code(
+        &db.pool,
+        &hash_token("expired-old"),
+        "recovery",
+        now - Duration::days(9),
+        Some(now - Duration::days(8)),
+        None,
+    )
+    .await;
+    insert_admin_code(
+        &db.pool,
+        &hash_token("expired-recent"),
+        "recovery",
+        now - Duration::days(2),
+        Some(now - Duration::days(1)),
+        None,
+    )
+    .await;
+
+    // Действующий recovery и неиспользованный setup без срока не трогаем.
+    insert_admin_code(
+        &db.pool,
+        &hash_token("active"),
+        "recovery",
+        now,
+        Some(now + Duration::minutes(15)),
+        None,
+    )
+    .await;
+    insert_admin_code(
+        &db.pool,
+        &hash_token("setup-without-expiry"),
+        "setup",
+        now - Duration::days(60),
+        None,
+        None,
+    )
+    .await;
+
+    // Сессия старше абсолютного срока удаляется, даже если заходили недавно;
+    // созданная 29 дней назад — остаётся.
+    insert_admin_session(
+        &db.pool,
+        &hash_token("old-session"),
+        now - Duration::days(31),
+        now - Duration::minutes(1),
+    )
+    .await;
+    insert_admin_session(
+        &db.pool,
+        &hash_token("recent-session"),
+        now - Duration::days(29),
+        now,
+    )
+    .await;
+    // Неактивная 10 дней, но младше абсолютного срока: 7 дней неактивности
+    // проверяются при обращении к сессии, а не в retention.
+    insert_admin_session(
+        &db.pool,
+        &hash_token("idle-session"),
+        now - Duration::days(20),
+        now - Duration::days(10),
+    )
+    .await;
+
+    let stats = retention::run(&db.pool, &config(), now)
+        .await
+        .expect("retention");
+
+    assert_eq!(stats.purged_admin_codes, 2);
+    assert_eq!(stats.purged_admin_sessions, 1);
+
+    for (label, remains) in [
+        ("used-old", false),
+        ("used-recent", true),
+        ("expired-old", false),
+        ("expired-recent", true),
+        ("active", true),
+        ("setup-without-expiry", true),
+    ] {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM admin_one_time_codes WHERE code_hash = $1)",
+        )
+        .bind(hash_token(label))
+        .fetch_one(&db.pool)
+        .await
+        .expect("code exists");
+        assert_eq!(exists, remains, "admin code {label}");
+    }
+
+    for (label, remains) in [
+        ("old-session", false),
+        ("recent-session", true),
+        ("idle-session", true),
+    ] {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM admin_sessions WHERE token_hash = $1)",
+        )
+        .bind(hash_token(label))
+        .fetch_one(&db.pool)
+        .await
+        .expect("session exists");
+        assert_eq!(exists, remains, "admin session {label}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

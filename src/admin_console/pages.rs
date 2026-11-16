@@ -303,6 +303,9 @@ pub(crate) async fn password_submit(
                 .authenticated()
                 .error(WRONG_PASSWORD_ERROR),
         ),
+        // Пароль уже изменён параллельным восстановлением, сессия удалена:
+        // отправляем войти заново.
+        Ok(ChangeOutcome::AlreadyChanged) => redirect(LOGIN_PATH),
         Ok(ChangeOutcome::RateLimited(decision)) => too_many_requests(decision),
         Err(ChangeError::Database(error)) => internal(error),
         Err(ChangeError::Password(error)) => internal(error),
@@ -363,8 +366,33 @@ fn too_many_requests(decision: RateDecision) -> Response {
 /// клиент не должен различать «нет такого кода», «уже использован» и «истёк».
 fn invalid_link() -> Response {
     let mut response = render(ConsolePage::new(PageKind::InvalidLink));
-    *response.status_mut() = StatusCode::GONE;
+    // Сбой отрисовки уже `500`: подменять его на `410` нельзя, иначе ошибка
+    // шаблона выглядит как недействительная ссылка.
+    if response.status() == StatusCode::OK {
+        *response.status_mut() = StatusCode::GONE;
+    }
     response
+}
+
+/// Percent-encode значение как один сегмент пути.
+///
+/// Код восстановления приходит из адреса и подставляется в `action` формы.
+/// `?`, `#` и другие разделители без кодирования ломают адрес, поэтому
+/// оставляем только unreserved-символы RFC 3986; base64url кода не меняется.
+fn encode_path_segment(raw: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut encoded = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    encoded
 }
 
 /// `303` с одной `Set-Cookie`.
@@ -528,7 +556,7 @@ struct ConsolePage<'a> {
     /// Какая страница показана.
     page: PageKind,
     /// Код восстановления в адресе формы.
-    code: &'a str,
+    code: String,
     /// Пароль только что изменён.
     changed: bool,
 }
@@ -543,7 +571,7 @@ impl<'a> ConsolePage<'a> {
             nav: false,
             error: None,
             page,
-            code: "",
+            code: String::new(),
             changed: false,
         }
     }
@@ -561,8 +589,8 @@ impl<'a> ConsolePage<'a> {
     }
 
     /// Подставить код восстановления в адрес формы.
-    fn code(mut self, code: &'a str) -> Self {
-        self.code = code;
+    fn code(mut self, code: &str) -> Self {
+        self.code = encode_path_segment(code);
         self
     }
 

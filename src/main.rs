@@ -521,7 +521,7 @@ async fn serve() -> Result<()> {
 async fn setup_code() -> Result<()> {
     init_cli_tracing();
 
-    let port = admin_console_port()?;
+    let address = admin_console_address();
     let database = DatabaseConfig::from_env().context("invalid database configuration")?;
     let pool = storage::db::connect(&database)
         .await
@@ -533,14 +533,18 @@ async fn setup_code() -> Result<()> {
     {
         Some(issued) => {
             println!("{}", issued.code);
-            match port {
-                Some(port) => eprintln!(
+            match address {
+                ConsoleAddress::Port(port) => eprintln!(
                     "Откройте http://<адрес хоста>:{port}/admin/setup и введите код. \
                      Повторно код не показывается."
                 ),
-                None => eprintln!(
+                ConsoleAddress::Disabled => eprintln!(
                     "Консоль выключена (ADMIN_BIND_ADDR=disabled): включите её и выпустите \
                      код заново. Повторно код не показывается."
+                ),
+                ConsoleAddress::Invalid => eprintln!(
+                    "ADMIN_BIND_ADDR не разобран: откройте /admin/setup на хосте, где слушает \
+                     консоль. Повторно код не показывается."
                 ),
             }
             Ok(())
@@ -560,7 +564,7 @@ async fn setup_code() -> Result<()> {
 async fn reset_password() -> Result<()> {
     init_cli_tracing();
 
-    let port = admin_console_port()?;
+    let address = admin_console_address();
     let database = DatabaseConfig::from_env().context("invalid database configuration")?;
     let pool = storage::db::connect(&database)
         .await
@@ -587,42 +591,52 @@ async fn reset_password() -> Result<()> {
         "Срок действия: {} минут.",
         admin_console::codes::RECOVERY_TTL_MINUTES
     );
-    match port {
-        Some(port) => eprintln!(
+    match address {
+        ConsoleAddress::Port(port) => eprintln!(
             "Откройте http://<адрес хоста>:{port}/admin/recover/{} в течение {} минут. \
              Повторно ссылка не показывается.",
             issued.code,
             admin_console::codes::RECOVERY_TTL_MINUTES
         ),
-        None => eprintln!(
+        ConsoleAddress::Disabled => eprintln!(
             "Консоль выключена (ADMIN_BIND_ADDR=disabled): ссылка не откроется, пока \
              консоль не включена. Повторно ссылка не показывается."
+        ),
+        ConsoleAddress::Invalid => eprintln!(
+            "ADMIN_BIND_ADDR не разобран: откройте /admin/recover/{} на хосте, где слушает \
+             консоль, в течение {} минут. Повторно ссылка не показывается.",
+            issued.code,
+            admin_console::codes::RECOVERY_TTL_MINUTES
         ),
     }
 
     Ok(())
 }
 
-/// Порт консоли из `ADMIN_BIND_ADDR` для подсказки в CLI.
+/// Куда CLI подсказывает открыть страницу консоли.
+enum ConsoleAddress {
+    /// Консоль слушает этот порт.
+    Port(u16),
+    /// `ADMIN_BIND_ADDR=disabled`.
+    Disabled,
+    /// Значение не разобралось: `serve` с ним не запустится, но команда
+    /// выпуска кода работает.
+    Invalid,
+}
+
+/// Адрес консоли из `ADMIN_BIND_ADDR` для подсказки в CLI.
 ///
-/// `None` — консоль выключена. Значение по умолчанию совпадает с
-/// [`Config`]: без переменной консоль слушает `0.0.0.0:8081`.
-fn admin_console_port() -> Result<Option<u16>> {
+/// Разбор общий с [`Config`]: невалидное значение не роняет команду, потому
+/// что код или ссылка нужны и без работающего listener'а.
+fn admin_console_address() -> ConsoleAddress {
     let raw = std::env::var("ADMIN_BIND_ADDR").ok();
-    match raw.as_deref().map(str::trim) {
-        None | Some("") => Ok(Some(
-            "0.0.0.0:8081"
-                .parse::<std::net::SocketAddr>()
-                .expect("the default admin address is valid")
-                .port(),
-        )),
-        Some("disabled") => Ok(None),
-        Some(raw) => raw
-            .parse::<std::net::SocketAddr>()
-            .map(|address| Some(address.port()))
-            .map_err(|_| {
-                anyhow!("ADMIN_BIND_ADDR: ожидается адрес вида 0.0.0.0:8081 или `disabled`")
-            }),
+    match config::parse_admin_bind_addr(raw.as_deref()) {
+        Ok(Some(address)) => ConsoleAddress::Port(address.port()),
+        Ok(None) => ConsoleAddress::Disabled,
+        // В журнал не пишем: JSON-подписчик выводит в stdout, а команда печатает
+        // код или ссылку первой строкой. Подсказка ниже и так сообщает о
+        // невалидном значении.
+        Err(_) => ConsoleAddress::Invalid,
     }
 }
 

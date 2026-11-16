@@ -372,6 +372,30 @@ pub struct CaptureConfig {
     pub max_text_chars: u32,
 }
 
+/// Адрес listener консоли по умолчанию.
+const DEFAULT_ADMIN_BIND_ADDR: &str = "0.0.0.0:8081";
+
+/// Разобрать `ADMIN_BIND_ADDR` одинаково для сервиса и CLI.
+///
+/// Отсутствие значения (в том числе пустое) — адрес по умолчанию, `disabled` —
+/// консоль выключена. Ошибка называет параметр, но не повторяет значение.
+pub fn parse_admin_bind_addr(raw: Option<&str>) -> Result<Option<SocketAddr>, ConfigError> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(Some(
+            DEFAULT_ADMIN_BIND_ADDR
+                .parse()
+                .expect("the default admin bind address is valid"),
+        )),
+        Some("disabled") => Ok(None),
+        Some(raw) => raw.parse::<SocketAddr>().map(Some).map_err(|_| {
+            ConfigError::invalid(
+                "ADMIN_BIND_ADDR",
+                "expected an address like 0.0.0.0:8081 or `disabled`",
+            )
+        }),
+    }
+}
+
 /// Параметры одного слота LLM: OpenAI-совместимый адрес и модель.
 #[derive(Clone)]
 pub struct SlotConfig {
@@ -554,20 +578,7 @@ impl Config {
                 ConfigError::invalid("BIND_ADDR", "expected an address like 0.0.0.0:8080")
             })?;
 
-        let admin_bind_addr = match source.get("ADMIN_BIND_ADDR") {
-            None => Some(
-                "0.0.0.0:8081"
-                    .parse()
-                    .expect("default admin bind address is valid"),
-            ),
-            Some("disabled") => None,
-            Some(raw) => Some(raw.parse::<SocketAddr>().map_err(|_| {
-                ConfigError::invalid(
-                    "ADMIN_BIND_ADDR",
-                    "expected an address like 0.0.0.0:8081 or `disabled`",
-                )
-            })?),
-        };
+        let admin_bind_addr = parse_admin_bind_addr(source.get("ADMIN_BIND_ADDR"))?;
 
         let admin_trusted_proxies = match source.get("ADMIN_TRUSTED_PROXIES") {
             None => Vec::new(),

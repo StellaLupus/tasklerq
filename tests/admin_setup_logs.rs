@@ -207,6 +207,52 @@ fn disabled_console_logs_no_setup_code() {
 }
 
 #[test]
+fn a_database_failure_logs_no_setup_code() {
+    let (logs, url) = capture(|| {
+        runtime().block_on(async {
+            let (pool, url) = setup_db().await;
+            let config = config(&url, "127.0.0.1:0");
+            pool.close().await;
+            codes::announce_setup_code(&pool, &config, Some(18081), chrono::Utc::now()).await;
+            url
+        })
+    });
+
+    assert!(
+        setup_code_events(&logs).is_empty(),
+        "a failed issue must not announce a code:\n{logs}"
+    );
+    let failures: Vec<Value> = logs
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| {
+            event["fields"]["message"].as_str().is_some_and(|message| {
+                message.contains("failed to issue the admin console setup code")
+            })
+        })
+        .collect();
+    assert_eq!(
+        failures.len(),
+        1,
+        "the failure must leave one warning:\n{logs}"
+    );
+    assert_eq!(failures[0]["level"], "WARN", "{logs}");
+    assert!(
+        failures[0]["fields"].get("code").is_none(),
+        "the warning must not carry a code:\n{logs}"
+    );
+
+    runtime().block_on(async {
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("database connection");
+        assert_eq!(code_count(&pool).await, 0, "no code rows are added");
+    });
+}
+
+#[test]
 fn restart_revokes_the_previous_setup_code() {
     let (logs, url) = capture(|| {
         runtime().block_on(async {

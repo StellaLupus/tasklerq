@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{ConnectInfo, MatchedPath, Request, State};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, header};
 use axum::middleware::Next;
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -215,15 +215,14 @@ async fn require_trusted_origin(
 /// cookie; запрет фреймов закрывает clickjacking. Один слой на роутере
 /// покрывает и HTML, и `303`, и ошибки обработчиков.
 ///
-/// Исключение — ресурсы с хешем содержимого в имени: они не меняются, поэтому
-/// их `Cache-Control` ставит сам обработчик (долгий срок и `immutable`).
-/// Остальные заголовки безопасности у них те же.
+/// `no-store` ставится только тем ответам, где обработчик не задал свой
+/// `Cache-Control`: так встроенные ресурсы с хешем содержимого в имени
+/// сохраняют долгий срок и `immutable`, а их `404` и все страницы получают
+/// `no-store`. Остальные заголовки безопасности общие.
 async fn security_headers(request: Request, next: Next) -> Response {
-    let cacheable_asset = request.uri().path().starts_with(assets::PREFIX);
     let mut response = next.run(request).await;
-    let immutable = cacheable_asset && response.status() == StatusCode::OK;
     let headers = response.headers_mut();
-    if !immutable {
+    if !headers.contains_key(header::CACHE_CONTROL) {
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
     headers.insert(

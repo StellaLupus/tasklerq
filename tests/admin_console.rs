@@ -16,10 +16,12 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tasklerq::admin_console::assets;
+use tasklerq::admin_console::change::{self, ChangeOutcome};
 use tasklerq::admin_console::codes::{self, Purpose};
 use tasklerq::admin_console::login;
-use tasklerq::admin_console::password::Password;
+use tasklerq::admin_console::password::{self, Password};
 use tasklerq::admin_console::router::{AdminState, build_router as build_admin_router};
+use tasklerq::admin_console::session::AdminSession;
 use tasklerq::admin_console::setup::{self, SetupOutcome};
 use tasklerq::app::build_application;
 use tasklerq::auth::tokens::hash_token;
@@ -2696,6 +2698,119 @@ async fn a_stale_current_password_does_not_overwrite_a_newer_one() {
     assert_eq!(stored, "final-password-hash");
 }
 
+/// Ждать, пока `UPDATE admin_accounts` встанет на блокировке строки.
+async fn wait_for_blocked_admin_account_update(pool: &PgPool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let blocked: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database()
+               AND wait_event_type = 'Lock'
+               AND query LIKE 'UPDATE admin_accounts%'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("pg_stat_activity");
+        if blocked > 0 {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the password update did not block on the racing transaction"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Смена пароля, проигравшая гонку восстановлению, не считается неудачей.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_password_race_with_recovery_is_not_a_failed_attempt() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let now = precise_now();
+    let session_id = insert_session(&db.pool, "race-session", now, now).await;
+
+    let state = AdminState::new(db.pool.clone(), Vec::new(), Audit::new(db.pool.clone()));
+    let client = Client {
+        ip: "127.0.0.1".parse().expect("ip"),
+        scheme: Scheme::Http,
+        host: Some("nas:18081".into()),
+    };
+
+    // Параллельное восстановление уже пишет новый хеш, но транзакция не
+    // закоммичена: проверка текущего пароля видит прежний хеш, а запись встаёт
+    // на блокировке строки. После коммита условие `password_hash = $3` уже не
+    // совпадает — это детерминированная гонка без таймингов.
+    let newer_hash = password::hash(Password::new("newer-password-12"))
+        .await
+        .expect("the newer password hash");
+    let mut racing = db.pool.begin().await.expect("racing transaction");
+    sqlx::query("UPDATE admin_accounts SET password_hash = $1")
+        .bind(&newer_hash)
+        .execute(&mut *racing)
+        .await
+        .expect("the newer hash is written in the racing transaction");
+
+    let task_state = state.clone();
+    let task_client = client.clone();
+    let task = tokio::spawn(async move {
+        change::change(
+            &task_state,
+            AdminSession { id: session_id },
+            &task_client,
+            Password::new(TEST_PASSWORD),
+            Password::new("changed-password-12"),
+            Utc::now(),
+        )
+        .await
+    });
+
+    wait_for_blocked_admin_account_update(&db.pool).await;
+    racing.commit().await.expect("commit the newer hash");
+
+    let outcome = task
+        .await
+        .expect("the change task must join")
+        .expect("the change must not fail");
+    assert!(
+        matches!(outcome, ChangeOutcome::AlreadyChanged),
+        "a lost race is a separate outcome: {outcome:?}"
+    );
+
+    // Неудача в бакет не попала: пять неверных текущих паролей ещё проходят,
+    // шестой упирается в лимит.
+    for attempt in 1..=5 {
+        let outcome = change::change(
+            &state,
+            AdminSession { id: session_id },
+            &client,
+            Password::new("wrong-password-12"),
+            Password::new("another-password-12"),
+            Utc::now(),
+        )
+        .await
+        .expect("a wrong current password must not fail the request");
+        assert!(
+            matches!(outcome, ChangeOutcome::WrongPassword),
+            "attempt {attempt} inside the limit: {outcome:?}"
+        );
+    }
+    let limited = change::change(
+        &state,
+        AdminSession { id: session_id },
+        &client,
+        Password::new("wrong-password-12"),
+        Password::new("another-password-12"),
+        Utc::now(),
+    )
+    .await
+    .expect("a rate-limited request is still a result");
+    assert!(
+        matches!(limited, ChangeOutcome::RateLimited(_)),
+        "the race must not consume the failure bucket: {limited:?}"
+    );
+}
+
 /// Значение атрибута из HTML, начинающееся с пути встроенного ресурса.
 fn linked_asset(body: &[u8], ext: &str) -> String {
     let text = String::from_utf8_lossy(body);
@@ -2908,6 +3023,13 @@ async fn embedded_assets_are_served_by_content_hash() {
     assert!(!cache.contains("no-store"), "{cache}");
     assert_frame_headers(&headers, "the console CSS");
     assert_eq!(css_body, assets::CONSOLE_CSS);
+    let css_text = String::from_utf8_lossy(&css_body);
+    for forbidden in ["http://", "https://", "//", "url(", "@import"] {
+        assert!(
+            !css_text.contains(forbidden),
+            "the console CSS must not reference {forbidden}: {css_text}"
+        );
+    }
     assert!(
         css.contains(&content_hash(assets::CONSOLE_CSS)),
         "the CSS path carries the content hash: {css}"
@@ -2936,12 +3058,13 @@ async fn embedded_assets_are_served_by_content_hash() {
 
     let unknown_hash = css.replace(&content_hash(assets::CONSOLE_CSS), "0000000000000000");
     assert_ne!(unknown_hash, css);
-    let (status, _, _) = send(&app, Method::GET, &unknown_hash).await;
+    let (status, headers, _) = send(&app, Method::GET, &unknown_hash).await;
     assert_eq!(
         status,
         StatusCode::NOT_FOUND,
         "an unknown hash is not served"
     );
+    assert_security_headers(&headers, "an unknown asset");
 
     let (status, _, _) = send(&app, Method::GET, "/admin/assets/htmx.min.js").await;
     assert_eq!(
@@ -3024,7 +3147,7 @@ async fn the_whole_flow_works_with_plain_form_posts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_recovery_code_from_the_address_is_escaped() {
+async fn a_recovery_code_from_the_address_is_percent_encoded() {
     let db = support::isolated_db().await;
     let app = console(&db.pool, Vec::new());
     let code = "<script>";
@@ -3048,11 +3171,33 @@ async fn a_recovery_code_from_the_address_is_escaped() {
 
     let text = String::from_utf8_lossy(&body);
     assert!(
-        text.contains("action=\"/admin/recover/&#60;script&#62;\""),
-        "the code is escaped in the form action: {text}"
+        text.contains("action=\"/admin/recover/%3Cscript%3E\""),
+        "the code is percent-encoded in the form action: {text}"
     );
     assert!(
         !text.contains("\"/admin/recover/<script>\""),
         "the raw code must not reach the markup: {text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recovery_code_with_path_separators_stays_one_segment() {
+    let db = support::isolated_db().await;
+    let app = console(&db.pool, Vec::new());
+
+    // Короткий пароль возвращает форму с кодом из адреса до проверки кода и
+    // лимита. `?` и `#` в action превратили бы код в query/fragment.
+    let (status, _, body) =
+        send_form(&app, "/admin/recover/a%3Fb%23c", &[("password", "short")]).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("action=\"/admin/recover/a%3Fb%23c\""),
+        "path separators are percent-encoded in the form action: {text}"
+    );
+    assert!(
+        !text.contains("action=\"/admin/recover/a?b#c\""),
+        "the raw separators must not reach the markup: {text}"
     );
 }
