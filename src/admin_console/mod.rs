@@ -2,6 +2,7 @@
 
 pub mod codes;
 pub mod login;
+pub mod origin;
 pub mod pages;
 pub mod password;
 pub mod router;

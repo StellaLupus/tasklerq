@@ -303,6 +303,8 @@ async fn post_form(app: &Router, path: &str, fields: &[(&str, &str)]) -> StatusC
     let mut request = Request::builder()
         .method(Method::POST)
         .uri(path)
+        .header(header::HOST, "nas:18081")
+        .header(header::ORIGIN, "http://nas:18081")
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .body(Body::from(body))
         .expect("request should build");

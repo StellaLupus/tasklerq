@@ -9,7 +9,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
-use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, header};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use http_body_util::BodyExt;
 use sqlx::PgPool;
@@ -112,6 +112,8 @@ async fn send_form(
     send_form_from(app, path, test_peer(), HeaderMap::new(), fields).await
 }
 
+/// POST формы с заголовками браузера своей страницы: `Host` и совпадающий с
+/// ним `Origin`. Явно переданные значения не перекрываются.
 async fn send_form_from(
     app: &Router,
     path: &str,
@@ -119,15 +121,52 @@ async fn send_form_from(
     extra_headers: HeaderMap,
     fields: &[(&str, &str)],
 ) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let headers = with_same_origin(extra_headers);
+    send_form_raw(app, path, peer, headers, fields).await
+}
+
+/// POST формы без подставленного origin — для проверок самого отказа.
+async fn send_form_raw(
+    app: &Router,
+    path: &str,
+    peer: SocketAddr,
+    headers: HeaderMap,
+    fields: &[(&str, &str)],
+) -> (StatusCode, HeaderMap, Vec<u8>) {
     let body = form_urlencoded::Serializer::new(String::new())
         .extend_pairs(fields)
         .finish();
-    let mut headers = extra_headers;
+    let mut headers = headers;
     headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/x-www-form-urlencoded"),
     );
     send_from(app, Method::POST, path, peer, headers, Body::from(body)).await
+}
+
+/// Заголовки `Host` и `Origin` одной и той же страницы, как их шлёт браузер.
+///
+/// Без них изменяющий запрос отклоняется ещё до обработчика.
+fn with_same_origin(mut headers: HeaderMap) -> HeaderMap {
+    headers
+        .entry(header::HOST)
+        .or_insert(HeaderValue::from_static("nas:18081"));
+    headers
+        .entry(header::ORIGIN)
+        .or_insert(HeaderValue::from_static("http://nas:18081"));
+    headers
+}
+
+/// Заголовки из пар; повторяющиеся имена сохраняются.
+fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for (name, value) in pairs {
+        headers.append(
+            HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+            HeaderValue::from_str(value).expect("header value"),
+        );
+    }
+    headers
 }
 
 /// Запрос с cookie сессии.
@@ -137,7 +176,7 @@ async fn send_with_cookie(
     path: &str,
     cookie: &str,
 ) -> (StatusCode, HeaderMap, Vec<u8>) {
-    let mut headers = HeaderMap::new();
+    let mut headers = with_same_origin(HeaderMap::new());
     headers.insert(
         header::COOKIE,
         HeaderValue::from_str(cookie).expect("cookie header"),
@@ -945,6 +984,267 @@ async fn login_accepts_the_right_credentials_and_hides_the_reason_on_failure() {
     );
 }
 
+/// Чужой `Origin` на входе — `403` до обработчика: ни сессии, ни cookie.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn login_with_a_foreign_origin_is_refused_before_the_handler() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console(&db.pool, Vec::new());
+    let fields = [("username", "admin"), ("password", TEST_PASSWORD)];
+
+    for origin in ["http://nas:8123", "https://evil.example"] {
+        let headers = headers_with(&[("host", "nas:18081"), ("origin", origin)]);
+        let (status, response_headers, body) =
+            send_form_from(&app, "/admin/login", test_peer(), headers, &fields).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "Origin {origin}");
+        assert!(
+            set_cookie(&response_headers).is_none(),
+            "Origin {origin} must not receive a session cookie"
+        );
+        assert!(
+            !String::from_utf8_lossy(&body).contains("Origin"),
+            "the refusal must not explain the reason: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_security_headers(&response_headers, "a login with a foreign origin");
+    }
+    assert_eq!(
+        session_count(&db.pool).await,
+        0,
+        "a foreign origin must not create a session"
+    );
+
+    let (status, response_headers, _) = send_form(&app, "/admin/login", &fields).await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "a request with its own origin logs in"
+    );
+    assert!(set_cookie(&response_headers).is_some());
+    assert_eq!(session_count(&db.pool).await, 1);
+}
+
+/// `Referer` заменяет отсутствующий `Origin`; чужой `Referer` и отсутствие
+/// обоих заголовков — `403`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn login_uses_the_referer_when_the_origin_is_missing() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console(&db.pool, Vec::new());
+    let fields = [("username", "admin"), ("password", TEST_PASSWORD)];
+
+    let headers = headers_with(&[
+        ("host", "nas:18081"),
+        ("referer", "http://nas:18081/admin/login?next=%2Fadmin"),
+    ]);
+    let (status, response_headers, _) =
+        send_form_raw(&app, "/admin/login", test_peer(), headers, &fields).await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "a matching Referer without Origin logs in"
+    );
+    assert!(set_cookie(&response_headers).is_some());
+
+    let headers = headers_with(&[
+        ("host", "nas:18081"),
+        ("referer", "http://evil.example/admin/login"),
+    ]);
+    let (status, _, _) = send_form_raw(&app, "/admin/login", test_peer(), headers, &fields).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a foreign Referer is refused"
+    );
+
+    let headers = headers_with(&[
+        ("host", "nas:18081"),
+        ("origin", "null"),
+        ("referer", "http://nas:18081/admin/login"),
+    ]);
+    let (status, _, _) = send_form_raw(&app, "/admin/login", test_peer(), headers, &fields).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "Origin: null must not fall back to a matching Referer"
+    );
+
+    let headers = headers_with(&[("host", "nas:18081")]);
+    let (status, _, _) = send_form_raw(&app, "/admin/login", test_peer(), headers, &fields).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a request without Origin and Referer is refused"
+    );
+
+    assert_eq!(session_count(&db.pool).await, 1);
+}
+
+/// `GET` без `Origin` не проверяется: страницы отвечают как раньше.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_pages_do_not_need_an_origin() {
+    let db = support::isolated_db().await;
+    let app = console(&db.pool, Vec::new());
+
+    let (status, _, _) = send(&app, Method::GET, "/admin/setup").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, headers, _) = send(&app, Method::GET, "/admin").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/login"));
+}
+
+/// Сверка покрывает не только POST: любой изменяющий метод без своего
+/// origin отклоняется до маршрутизации.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_changing_method_is_checked() {
+    let db = support::isolated_db().await;
+    let app = console(&db.pool, Vec::new());
+
+    for method in [Method::PUT, Method::PATCH, Method::DELETE] {
+        let headers = headers_with(&[("host", "nas:18081"), ("origin", "http://evil.example")]);
+        let (status, _, _) = send_from(
+            &app,
+            method.clone(),
+            "/admin/login",
+            test_peer(),
+            headers,
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{method} with a foreign origin"
+        );
+    }
+
+    let headers = headers_with(&[("host", "nas:18081"), ("origin", "http://nas:18081")]);
+    let (status, _, _) = send_from(
+        &app,
+        Method::PUT,
+        "/admin/login",
+        test_peer(),
+        headers,
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::METHOD_NOT_ALLOWED,
+        "a matching origin reaches the router"
+    );
+}
+
+/// Setup с чужим `Origin` не создаёт учётку и не расходует код.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_with_a_foreign_origin_keeps_the_code_for_the_right_request() {
+    let db = support::isolated_db().await;
+    let app = console(&db.pool, Vec::new());
+    let issued = codes::issue(&db.pool, Purpose::Setup, None, Utc::now())
+        .await
+        .expect("a setup code should be issued");
+    let fields = [
+        ("code", issued.code.as_str()),
+        ("username", "admin"),
+        ("password", "valid-password-12"),
+    ];
+
+    let headers = headers_with(&[("host", "nas:18081"), ("origin", "http://evil.example")]);
+    let (status, _, _) = send_form_from(&app, "/admin/setup", test_peer(), headers, &fields).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(account_count(&db.pool).await, 0, "no account is created");
+    let used_at: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT used_at FROM admin_one_time_codes WHERE id = $1")
+            .bind(issued.record.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("the setup code row");
+    assert!(used_at.is_none(), "the code is not consumed");
+
+    let (status, response_headers, _) = send_form(&app, "/admin/setup", &fields).await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "the code still works from its own origin"
+    );
+    assert_eq!(location(&response_headers), Some("/admin"));
+    assert_eq!(account_count(&db.pool).await, 1);
+}
+
+/// Выход с чужим `Origin` не завершает сессию.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logout_with_a_foreign_origin_keeps_the_session() {
+    let db = support::isolated_db().await;
+    let app = console(&db.pool, Vec::new());
+    let now = precise_now();
+    insert_session(&db.pool, "foreign-origin-token", now, now).await;
+    let cookie = "tlq_admin=foreign-origin-token";
+
+    let headers = headers_with(&[
+        ("host", "nas:18081"),
+        ("origin", "http://nas:8123"),
+        ("cookie", cookie),
+    ]);
+    let (status, response_headers, _) = send_from(
+        &app,
+        Method::POST,
+        "/admin/logout",
+        test_peer(),
+        headers,
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        set_cookie(&response_headers).is_none(),
+        "a rejected logout must not clear the cookie"
+    );
+
+    let (status, _, _) = send_with_cookie(&app, Method::GET, "/admin", cookie).await;
+    assert_eq!(status, StatusCode::OK, "the session is still valid");
+    assert_eq!(session_count(&db.pool).await, 1);
+}
+
+/// Доверенный прокси задаёт origin через `X-Forwarded-*`; от недоверенного
+/// пира те же заголовки игнорируются.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_origin_comes_from_forwarded_headers_only_of_a_trusted_proxy() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console(
+        &db.pool,
+        vec![IpNet::parse("127.0.0.1").expect("a loopback network")],
+    );
+    let fields = [("username", "admin"), ("password", TEST_PASSWORD)];
+
+    let headers = headers_with(&[
+        ("host", "nas:18081"),
+        ("x-forwarded-proto", "https"),
+        ("x-forwarded-host", "console.example"),
+        ("origin", "https://console.example"),
+    ]);
+    let (status, response_headers, _) =
+        send_form_from(&app, "/admin/login", test_peer(), headers.clone(), &fields).await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "the trusted proxy defines a matching origin"
+    );
+    assert!(set_cookie(&response_headers).is_some());
+
+    let untrusted: SocketAddr = SocketAddr::from(([203, 0, 113, 9], 4_040));
+    let (status, response_headers, _) =
+        send_form_from(&app, "/admin/login", untrusted, headers, &fields).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an untrusted peer falls back to http and Host"
+    );
+    assert!(set_cookie(&response_headers).is_none());
+    assert_eq!(session_count(&db.pool).await, 1);
+}
+
 /// Без учётки страница входа уступает место setup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn login_without_an_account_redirects_to_setup() {
@@ -1139,6 +1439,11 @@ async fn secure_cookie_follows_the_trusted_proxy() {
     let fields = [("username", "admin"), ("password", TEST_PASSWORD)];
     let mut forwarded = HeaderMap::new();
     forwarded.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+    // Origin доверенного прокси: https и X-Forwarded-Host/Vhost.
+    forwarded.insert(
+        header::ORIGIN,
+        HeaderValue::from_static("https://nas:18081"),
+    );
 
     let (status, headers, _) = send_form_from(
         &app,
@@ -1156,6 +1461,8 @@ async fn secure_cookie_follows_the_trusted_proxy() {
     );
 
     let untrusted: SocketAddr = SocketAddr::from(([203, 0, 113, 9], 4_040));
+    // Недоверенный пир остаётся на http и `Host`, поэтому origin другой.
+    forwarded.insert(header::ORIGIN, HeaderValue::from_static("http://nas:18081"));
     let (status, headers, _) =
         send_form_from(&app, "/admin/login", untrusted, forwarded, &fields).await;
     assert_eq!(status, StatusCode::SEE_OTHER);

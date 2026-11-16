@@ -7,7 +7,9 @@
 use std::net::SocketAddr;
 
 use axum::Router;
-use axum::http::{HeaderMap, HeaderValue, header};
+use axum::extract::{ConnectInfo, Request, State};
+use axum::http::{HeaderMap, HeaderValue, Method, header};
+use axum::middleware::Next;
 use axum::response::Response;
 use axum::routing::{get, post};
 use sqlx::PgPool;
@@ -15,7 +17,7 @@ use sqlx::PgPool;
 use crate::config::IpNet;
 use crate::http::client::{Client, TrustedProxies};
 
-use super::pages;
+use super::{origin, pages};
 
 /// Состояние консоли: база и доверенные прокси.
 #[derive(Clone)]
@@ -49,6 +51,10 @@ impl AdminState {
 }
 
 /// Собрать роутер консоли.
+///
+/// Сверка `Origin` стоит отдельным слоем, а не вызовом в каждом обработчике:
+/// новые формы получают защиту автоматически. `security_headers` добавлен
+/// последним, поэтому покрывает и `403` слоя сверки.
 pub fn build_router(state: AdminState) -> Router {
     Router::new()
         .route("/admin", get(pages::index))
@@ -61,8 +67,47 @@ pub fn build_router(state: AdminState) -> Router {
             get(pages::login_page).post(pages::login_submit),
         )
         .route("/admin/logout", post(pages::logout))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_trusted_origin,
+        ))
         .layer(axum::middleware::map_response(security_headers))
         .with_state(state)
+}
+
+/// Отклонить не-GET-запрос без `Origin`/`Referer` своего же origin.
+///
+/// Проверка стоит до обработчика: ни сессия, ни код не используются, ни одна
+/// строка не пишется. Причина уходит в журнал без значений cookie и заголовков.
+async fn require_trusted_origin(
+    State(state): State<AdminState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let method = request.method();
+    if method == Method::GET || method == Method::HEAD {
+        return next.run(request).await;
+    }
+
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(peer)| *peer);
+    let allowed = peer.is_some_and(|peer| {
+        let client = state.client(peer, request.headers());
+        origin::allows(&client, request.headers())
+    });
+
+    if !allowed {
+        tracing::info!(
+            method = %request.method(),
+            path = %request.uri().path(),
+            "admin console request rejected: origin does not match"
+        );
+        return origin::forbidden();
+    }
+
+    next.run(request).await
 }
 
 /// Заголовки всех ответов консоли.
