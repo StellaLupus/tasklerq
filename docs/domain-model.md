@@ -39,6 +39,14 @@ erDiagram
     USERS ||--o{ NOTIFICATION_DELIVERIES : receives
     NOTIFICATION_BATCHES ||--o{ NOTIFICATION_DELIVERIES : contains
     HOUSEHOLDS ||--o{ AUDIT_EVENTS : records
+    HOUSEHOLDS ||--o{ SETTINGS : configures
+    SETTINGS {
+        text scope
+        uuid household_id
+        text key
+        jsonb value
+        bytea secret
+    }
     LLM_SLOT_CHECKS {
         text slot PK
         text fingerprint
@@ -434,6 +442,75 @@ jsonb`, `created_at`. Типы: `household_created`, `member_joined`,
 токенов и хешей; имена хранятся снимком на момент события. Участники и
 household, созданные через `tasklerq admin`, попадают в журнал от имени
 системного актора (`actor_type = system`).
+
+### 3.14 `settings`
+
+| Поле | Тип | Ограничения |
+| --- | --- | --- |
+| `scope` | `text` | `installation` или `household`. |
+| `household_id` | `uuid` | FK → households, ON DELETE CASCADE; NULL только при `scope = 'installation'`. |
+| `key` | `text` | Непустой ключ из фиксированного перечня в коде. |
+| `value` | `jsonb` | Обычное значение; NULL у секрета. |
+| `secret` | `bytea` | Шифротекст секрета; NULL у обычного значения. |
+| `updated_at` | `timestamptz` | NOT NULL, по умолчанию `now()`. |
+
+Ограничения:
+
+- ровно одно из `value`/`secret` (`num_nonnulls(value, secret) = 1`);
+- `installation` всегда без `household_id`, `household` — всегда с ним;
+- уникальность `(scope, coalesce(household_id, nil uuid), key)`: `UNIQUE`
+  считает NULL различными, поэтому nil-uuid в индексе заменяет отсутствующий
+  household. Этот же индекс — цель upsert при записи настройки.
+
+Уровни. `installation` — настройка всей инсталляции, `household` — одного
+household. Сейчас перечень содержит только installation-ключи; household-строки
+появятся вместе с настройками Telegram. Уровень строки входит в AAD, поэтому
+секрет нельзя перенести между уровнями или household.
+
+Источники. Действующее значение собирает `settings::effective_llm` из трёх
+слоёв: окружение → база (`settings`) → умолчание; у каждого поля известен
+источник `env`, `db` или `default`. Окружение перекрывает базу и для отдельного
+поля, и для слота целиком: слот считается заданным окружением, если задан его
+URL или модель, и тогда все поля слота берутся из окружения. Слот из базы
+настроен, только если есть и адрес, и модель; иначе он ненастроен с причиной
+`not_set`, `incomplete` или `invalid`. Нерасшифрованный секрет делает
+ненастроенным весь слот, а не только поле токена. Флаг `llm.enabled`: явное
+значение из окружения, затем `llm.enabled` из базы, затем умолчание — включён,
+только если основной слот задан окружением.
+
+Перечень ключей (совпадает с `SETTING_KEYS` в `src/settings/mod.rs`):
+
+| Ключ | Уровень | Вид | Форма | Источник |
+| --- | --- | --- | --- | --- |
+| `llm.enabled` | installation | обычный | bool | env → база → умолчание |
+| `llm.primary.url` | installation | обычный | абсолютный `http(s)` URL | слот: env целиком → база |
+| `llm.primary.model` | installation | обычный | непустая строка | слот: env целиком → база |
+| `llm.primary.token` | installation | **секрет** | непустая строка | слот: env целиком → база |
+| `llm.primary.timeout_ms` | installation | обычный | 100..600000 мс | слот: env целиком → база → умолчание |
+| `llm.primary.extra_json` | installation | обычный | JSON-объект | слот: env целиком → база → `{}` |
+| `llm.fallback.url` | installation | обычный | абсолютный `http(s)` URL | слот: env целиком → база |
+| `llm.fallback.model` | installation | обычный | непустая строка | слот: env целиком → база |
+| `llm.fallback.token` | installation | **секрет** | непустая строка | слот: env целиком → база |
+| `llm.fallback.timeout_ms` | installation | обычный | 100..600000 мс | слот: env целиком → база → умолчание |
+| `llm.fallback.extra_json` | installation | обычный | JSON-объект | слот: env целиком → база → `{}` |
+| `llm.connect_timeout_ms` | installation | обычный | 10..60000 мс | env → база → умолчание |
+| `llm.daily_quota` | installation | обычный | целое 1..100000 | env → база → умолчание |
+| `wizard.llm_skipped` | installation | обычный | bool | база → умолчание |
+
+Неизвестные ключи (например, записанные более новой версией) при чтении
+игнорируются, чтобы откат на прежний образ не ломал запуск. Их секреты всё
+равно проверяются readiness и перешифровываются при ротации: контекст берётся
+из полей строки, а не из перечня.
+
+Формат `secret`: XChaCha20-Poly1305; 1 байт версии формата (сейчас `1`),
+8 байт id ключа (первые байты SHA-256 ключа), 24 байта nonce, затем шифротекст
+с тегом Poly1305 (16 байт). AAD — версия и поля строки `scope`,
+`household_id`, `key`; каждому полю предшествует длина `u32` big-endian,
+отсутствующий `household_id` кодируется длиной 0. Поэтому шифротекст,
+перенесённый в другую строку, уровень или household, не расшифровывается.
+Шифрование всегда идёт текущим ключом `TASKLERQ_SECRET_KEY`; расшифровка —
+текущим или прежним `TASKLERQ_SECRET_KEY_OLD` по id из шифротекста. Ключ
+хранится в окружении, а не в базе.
 
 ## 4. Перечисления
 

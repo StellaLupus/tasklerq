@@ -1616,6 +1616,8 @@ async fn run_rotate(url: &str, current: Option<u8>, old: Option<u8>) -> Output {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn secret_key_rotate_reencrypts_secrets_with_the_new_key() {
     let db = cli_database().await;
+    let household = support::create_household(&db.pool).await;
+    let household_id = household.household_id;
     store_secret(
         &db.pool,
         None,
@@ -1632,32 +1634,73 @@ async fn secret_key_rotate_reencrypts_secrets_with_the_new_key() {
         &key_cipher(1),
     )
     .await;
+    // Строка household и неизвестный этой версии ключ: контекст шифротекста
+    // строится из полей строки, а не из перечня ключей.
+    store_secret(
+        &db.pool,
+        Some(household_id),
+        "llm.primary.token",
+        "SECRET-household-token",
+        &key_cipher(1),
+    )
+    .await;
+    store_secret(
+        &db.pool,
+        None,
+        "llm.zzz.unknown",
+        "SECRET-unknown-token",
+        &key_cipher(1),
+    )
+    .await;
 
     let output = run_rotate(&db.url, Some(2), Some(1)).await;
 
     assert!(output.status.success(), "{output:?}");
     let text = stdout(&output);
-    assert!(text.contains("2 перешифровано"), "{text}");
+    assert!(text.contains("4 перешифровано"), "{text}");
     assert!(
         !text.contains("SECRET-"),
         "values must not be printed:\n{text}"
     );
 
-    for (key, plaintext) in [
-        ("llm.primary.token", "SECRET-primary-token"),
-        ("llm.fallback.token", "SECRET-fallback-token"),
-    ] {
-        let (blob, _) = stored_row(&db.pool, None, key).await;
+    let cases = [
+        (
+            None,
+            "llm.primary.token",
+            SecretContext::installation("llm.primary.token"),
+            "SECRET-primary-token",
+        ),
+        (
+            None,
+            "llm.fallback.token",
+            SecretContext::installation("llm.fallback.token"),
+            "SECRET-fallback-token",
+        ),
+        (
+            Some(household_id),
+            "llm.primary.token",
+            SecretContext::household(household_id, "llm.primary.token"),
+            "SECRET-household-token",
+        ),
+        (
+            None,
+            "llm.zzz.unknown",
+            SecretContext::installation("llm.zzz.unknown"),
+            "SECRET-unknown-token",
+        ),
+    ];
+
+    for (household, key, context, plaintext) in cases {
+        let (blob, _) = stored_row(&db.pool, household, key).await;
         assert_eq!(
             key_id(&blob),
             Some(KeyId::of(&secret_key(2))),
             "{key} must be under the new key"
         );
-        let context = SecretContext::installation(key);
         assert_eq!(
             key_cipher(2)
                 .decrypt(&context, &blob)
-                .expect("the new key reads the secret")
+                .expect("the new key reads the secret with the row context")
                 .expose(),
             plaintext
         );
@@ -1667,6 +1710,61 @@ async fn secret_key_rotate_reencrypts_secrets_with_the_new_key() {
             "{key} must not be readable by the old key alone"
         );
     }
+
+    let (household_blob, _) = stored_row(&db.pool, Some(household_id), "llm.primary.token").await;
+    assert_eq!(
+        key_cipher(2).decrypt(
+            &SecretContext::installation("llm.primary.token"),
+            &household_blob
+        ),
+        Err(SecretError::Undecryptable),
+        "a household row must not decrypt with the installation context"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secret_key_rotate_rejects_a_tampered_secret_under_the_current_key() {
+    let db = cli_database().await;
+    store_secret(
+        &db.pool,
+        None,
+        "llm.primary.token",
+        "SECRET-primary-token",
+        &key_cipher(2),
+    )
+    .await;
+
+    sqlx::query(
+        "UPDATE settings
+            SET secret = set_byte(secret, octet_length(secret) - 1,
+                                  get_byte(secret, octet_length(secret) - 1) # 1)
+          WHERE scope = 'installation' AND household_id IS NULL
+            AND key = 'llm.primary.token'",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("the secret is tampered with");
+    let before = stored_row(&db.pool, None, "llm.primary.token").await;
+
+    let output = run_rotate(&db.url, Some(2), Some(1)).await;
+
+    assert!(!output.status.success(), "{output:?}");
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        combined.contains("llm.primary.token"),
+        "the CLI must name the setting it cannot decrypt:\n{combined}"
+    );
+    assert!(
+        !combined.contains("SECRET-"),
+        "secret values must not be printed:\n{combined}"
+    );
+
+    let after = stored_row(&db.pool, None, "llm.primary.token").await;
+    assert_eq!(after.0, before.0, "a tampered row must stay unchanged");
+    assert_eq!(
+        after.1, before.1,
+        "a failed rotation must not change updated_at"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

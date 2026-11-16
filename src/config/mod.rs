@@ -580,11 +580,9 @@ impl Config {
                 .map_err(|reason| ConfigError::invalid("ADMIN_TRUSTED_PROXIES", reason))?,
         };
 
-        let secret_key = read_secret_key(source.get("TASKLERQ_SECRET_KEY"), "TASKLERQ_SECRET_KEY")?;
-        let secret_key_old = read_secret_key(
-            source.get("TASKLERQ_SECRET_KEY_OLD"),
-            "TASKLERQ_SECRET_KEY_OLD",
-        )?;
+        let keys = SecretKeyConfig::from_source(source)?;
+        let secret_key = keys.current;
+        let secret_key_old = keys.old;
 
         let telegram_mode = TelegramMode::parse(source.get("TELEGRAM_MODE").unwrap_or("webhook"))?;
         let telegram = Self::telegram_config(source, telegram_mode, environment)?;
