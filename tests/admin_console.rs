@@ -4005,7 +4005,7 @@ async fn the_token_step_with_several_households_is_a_form_error() {
         "/admin/wizard/token",
         test_peer(),
         headers_with(&[("cookie", &cookie)]),
-        &[("name", "Home Assistant")],
+        &[("name", "Мой токен HA")],
     )
     .await;
     assert_eq!(
@@ -4018,7 +4018,94 @@ async fn the_token_step_with_several_households_is_a_form_error() {
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains("Токен Home Assistant"), "{text}");
     assert!(text.contains("больше одного household"), "{text}");
+    assert!(
+        text.contains("value=\"Мой токен HA\""),
+        "the submitted token name is kept: {text}"
+    );
     assert!(text.contains("action=\"/admin/wizard/token\""), "{text}");
+    assert!(!text.contains("id=\"issued-token\""), "{text}");
+    assert_eq!(token_count(&db.pool).await, 0, "no token is issued");
+}
+
+/// Дом удалён между шагом токена и POST: `Validation` — про отсутствие
+/// household, а не про несколько. Введённое имя токена сохраняется.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_token_step_without_a_household_says_so() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    insert_household(&db.pool).await;
+    let app = console(&db.pool, Vec::new());
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    // Шаг LLM пропущен: мастер стоит на токене.
+    let (status, _, _) = send_form_from(
+        &app,
+        "/admin/wizard/skip",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("step", "llm")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    // Удаление дома держим незакоммиченным: `current_step` ещё видит household
+    // по старой версии строки, а выпуск токена ждёт блокировку строки. После
+    // commit дом исчезает, и `create_wizard_token` получает ноль active.
+    let mut tx = db.pool.begin().await.expect("delete transaction");
+    sqlx::query("UPDATE households SET deleted_at = now() WHERE deleted_at IS NULL")
+        .execute(&mut *tx)
+        .await
+        .expect("the household is marked deleted");
+
+    let post = {
+        let app = app.clone();
+        let cookie = cookie.clone();
+        tokio::spawn(async move {
+            send_form_from(
+                &app,
+                "/admin/wizard/token",
+                test_peer(),
+                headers_with(&[("cookie", &cookie)]),
+                &[("name", "Мой токен HA")],
+            )
+            .await
+        })
+    };
+
+    // Дождаться, пока POST встанет на блокировке строки household.
+    let mut blocked = false;
+    for _ in 0..200 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("pg_stat_activity is readable");
+        if waiting > 0 {
+            blocked = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(blocked, "the token POST waits for the household row lock");
+    tx.commit().await.expect("the household deletion commits");
+
+    let (status, headers, body) = post.await.expect("the token POST finishes");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a missing household is a form error: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_security_headers(&headers, "POST /admin/wizard/token");
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("нет активного household"), "{text}");
+    assert!(!text.contains("больше одного household"), "{text}");
+    assert!(
+        text.contains("value=\"Мой токен HA\""),
+        "the submitted token name is kept: {text}"
+    );
     assert!(!text.contains("id=\"issued-token\""), "{text}");
     assert_eq!(token_count(&db.pool).await, 0, "no token is issued");
 }

@@ -57,7 +57,7 @@ use crate::domain::validation::normalize_text;
 use crate::http::health::{self, ReadinessInput};
 use crate::llm::{LlmApplyError, LlmChange, OpenAiBackend};
 use crate::rate_limit::RateDecision;
-use crate::settings::{ResolvedSetting, SecretState, SettingError, SettingSource};
+use crate::settings::{ResolvedSetting, SecretProblem, SecretState, SettingError, SettingSource};
 use crate::storage::repositories::admin_accounts;
 use crate::storage::repositories::households;
 use crate::storage::repositories::llm_slot_settings;
@@ -93,6 +93,10 @@ const WIZARD_SKIP_ERROR: &str = "Этот шаг нельзя пропустит
 const WIZARD_STALE_STEP_ERROR: &str = "Этот шаг мастера уже завершён или недоступен.";
 const WIZARD_TOKEN_AMBIGUOUS_ERROR: &str = "В режиме single больше одного household: выпустите токен командой \
      `tasklerq admin token create --household <id>`.";
+const WIZARD_TOKEN_NO_HOUSEHOLD_ERROR: &str = "В инсталляции нет активного household: создайте дом и \
+     повторите выпуск токена.";
+const WIZARD_TOKEN_CHANGED_ERROR: &str =
+    "Не удалось выпустить токен: состояние инсталляции изменилось. Повторите попытку.";
 const INVALID_LINK_TITLE: &str = "Ссылка недействительна";
 
 /// Поля формы setup.
@@ -405,13 +409,26 @@ fn slot_status_label(status: SlotStatus) -> &'static str {
 }
 
 /// Понятная подпись предупреждения readiness; код показывается рядом.
+///
+/// Коды сопоставляются с константами [`health`], а не с литералами:
+/// `readiness()` строит предупреждения только из них. Новый код в
+/// `WARNING_CODES` без подписи ловит тест
+/// `every_readiness_warning_has_a_console_label`, а изменение строки кода —
+/// тесты `/readyz`, которые сверяют ответ байт-в-байт.
 fn warning_label(code: &str) -> String {
     match code {
-        "multiple_households" => "в режиме single больше одного household".to_owned(),
-        "llm_unavailable" => "все настроенные слоты LLM недоступны".to_owned(),
-        "secret_key_missing" => "нет ключа шифрования сохранённых секретов".to_owned(),
-        "secret_undecryptable" => "сохранённые секреты не расшифровываются".to_owned(),
-        _ => match code.strip_prefix("llm_slot_unverified:") {
+        health::WARNING_MULTIPLE_HOUSEHOLDS => "в режиме single больше одного household".to_owned(),
+        health::WARNING_LLM_UNAVAILABLE => "все настроенные слоты LLM недоступны".to_owned(),
+        _ if code == SecretProblem::KeyMissing.code() => {
+            "нет ключа шифрования сохранённых секретов".to_owned()
+        }
+        _ if code == SecretProblem::Undecryptable.code() => {
+            "сохранённые секреты не расшифровываются".to_owned()
+        }
+        _ => match code
+            .strip_prefix(health::WARNING_LLM_SLOT_UNVERIFIED)
+            .and_then(|rest| rest.strip_prefix(':'))
+        {
             Some(rest) => {
                 let mut parts = rest.splitn(2, ':');
                 let slot = parts.next().unwrap_or_default();
@@ -1055,13 +1072,29 @@ pub(crate) async fn wizard_token(
             .error(WIZARD_STALE_STEP_ERROR),
             StatusCode::BAD_REQUEST,
         ),
-        // В `single` активных household несколько: выбрать дом за мастера
-        // нельзя, токен не выпускается. Это ошибка ввода, а не сбой сервера.
-        Err(DomainError::Validation(_)) => render_with_status(
-            ConsolePage::new(wizard_step_page(step, telegram_enabled))
-                .error(WIZARD_TOKEN_AMBIGUOUS_ERROR),
-            StatusCode::BAD_REQUEST,
-        ),
+        // `Validation` приходит и при нескольких active household (выбрать дом
+        // за мастера нельзя), и при нуле — дом удалили между шагом и POST.
+        // Причину различает число active household; введённое имя сохраняется,
+        // как в соседних ветках.
+        Err(DomainError::Validation(_)) => {
+            let message = match active_household_count(&state).await {
+                Ok(0) => WIZARD_TOKEN_NO_HOUSEHOLD_ERROR,
+                Ok(1) => WIZARD_TOKEN_CHANGED_ERROR,
+                Ok(_) => WIZARD_TOKEN_AMBIGUOUS_ERROR,
+                Err(error) => return internal(error),
+            };
+            render_with_status(
+                ConsolePage::new(Page::Wizard {
+                    step,
+                    household_skip_allowed: telegram_enabled,
+                    form: WizardForm::Token {
+                        name: submitted_name,
+                    },
+                })
+                .error(message),
+                StatusCode::BAD_REQUEST,
+            )
+        }
         Err(error) => internal(error),
     }
 }
@@ -1093,6 +1126,13 @@ pub(crate) async fn logout(
 async fn account_exists(state: &AdminState) -> Result<bool, DomainError> {
     let mut conn = state.pool.acquire().await?;
     Ok(admin_accounts::get(&mut conn).await?.is_some())
+}
+
+/// Число активных household; по нему различается причина `Validation` на шаге
+/// токена.
+async fn active_household_count(state: &AdminState) -> Result<i64, DomainError> {
+    let mut conn = state.pool.acquire().await?;
+    households::count_active(&mut conn).await
 }
 
 /// Текущий шаг мастера по снимку состояния.
