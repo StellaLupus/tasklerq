@@ -92,6 +92,9 @@ impl Ingress {
 pub struct IngressSlot {
     ingress: Arc<ArcSwapOption<Ingress>>,
     switching: Arc<AtomicBool>,
+    /// Есть живое поколение Telegram; приём webhook есть только у webhook-режима,
+    /// поэтому для polling и readiness состояние хранится отдельно.
+    active: Arc<AtomicBool>,
 }
 
 impl IngressSlot {
@@ -105,9 +108,24 @@ impl IngressSlot {
         self.ingress.load_full()
     }
 
+    /// Отметить наличие живого поколения.
+    ///
+    /// Признак нужен readiness: лаг очереди проверяется, только пока есть кому
+    /// её разбирать. Значение ставит супервизор при запуске и остановке
+    /// поколения, а не при чтении настроек.
+    pub fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::SeqCst);
+    }
+
+    /// Есть живое поколение Telegram.
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::SeqCst)
+    }
+
     /// Начать смену поколения: приём снимается, webhook отвечает `503`.
     pub fn begin_switch(&self) {
         self.switching.store(true, Ordering::SeqCst);
+        self.active.store(false, Ordering::SeqCst);
         self.ingress.store(None);
     }
 

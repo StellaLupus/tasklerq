@@ -387,7 +387,12 @@ async fn only_post_is_allowed() {
 async fn readiness_fails_while_an_update_waits_longer_than_the_limit() {
     let db = db().await;
     let app = build_router(
-        AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_queue_lag_limit(60),
+        AppState::new(db.pool.clone(), Audit::new(db.pool.clone()))
+            .with_telegram(Ingress::new(
+                &SecretString::new(SECRET),
+                Arc::new(Notify::new()),
+            ))
+            .with_queue_lag_limit(60),
     );
     let ready = |app: Router| async move {
         app.oneshot(

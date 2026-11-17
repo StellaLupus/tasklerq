@@ -92,8 +92,12 @@ impl AppState {
     }
 
     /// Включить приём Telegram webhook.
+    ///
+    /// Приём означает живое поколение: readiness проверяет лаг очереди, пока
+    /// поколение активно.
     pub fn with_telegram(self, ingress: Ingress) -> Self {
         self.telegram.store(Some(ingress));
+        self.telegram.set_active(true);
         self
     }
 

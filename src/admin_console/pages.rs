@@ -327,6 +327,7 @@ async fn home_view(state: &AdminState, now: DateTime<Utc>) -> Result<HomeView, D
         pool: &state.pool,
         tenancy_mode: state.wizard().tenancy,
         queue_lag_limit: state.queue_lag_limit(),
+        telegram_active: state.telegram().is_active(),
         secret_cipher: state.llm_settings().cipher(),
         llm_slots: state.llm_slots(),
         now,

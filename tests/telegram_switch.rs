@@ -198,6 +198,19 @@ async fn post_webhook(
     (status, retry_after)
 }
 
+async fn ready_status(app: &axum::Router) -> StatusCode {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health/ready")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response")
+        .status()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bot_enabled_by_reload_handles_start_without_restart() {
     let db = support::isolated_db().await;
@@ -240,6 +253,81 @@ async fn a_bot_enabled_by_reload_handles_start_without_restart() {
         "the /start reply must reach the mock Bot API without a restart"
     );
 
+    stop(application, shutdown_tx).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readiness_checks_queue_lag_only_while_a_generation_is_active() {
+    let db = support::isolated_db().await;
+    let server = MockServer::start().await;
+    mount_bot_answers(&server).await;
+
+    let config = config(&server, &[]);
+    let cipher = cipher(&config);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let application = build_application(&config, db.pool.clone(), shutdown_rx)
+        .await
+        .expect("application");
+
+    // Старое готовое обновление не должно разбираться воркером: блокируем
+    // строку, чтобы `claim_next` пропустил её через `SKIP LOCKED`, а
+    // `oldest_ready` продолжал видеть.
+    let update_id = 70_100_i64;
+    sqlx::query(
+        "INSERT INTO telegram_updates (update_id, payload, available_at, received_at)
+         VALUES ($1, '{}'::jsonb, now() - interval '10 minutes',
+                 now() - interval '10 minutes')",
+    )
+    .bind(update_id)
+    .execute(&db.pool)
+    .await
+    .expect("stuck update");
+    let mut lock = db.pool.begin().await.expect("lock transaction");
+    let locked: Option<i64> = sqlx::query_scalar(
+        "SELECT update_id FROM telegram_updates WHERE update_id = $1 FOR UPDATE",
+    )
+    .bind(update_id)
+    .fetch_optional(&mut *lock)
+    .await
+    .expect("lock stuck update");
+    assert_eq!(locked, Some(update_id));
+
+    assert_eq!(
+        ready_status(&application.router).await,
+        StatusCode::OK,
+        "a disabled bot must not check the update queue"
+    );
+
+    write_webhook(&db.pool, &cipher, &server, "secret-lag").await;
+    assert!(
+        application
+            .telegram_supervisor
+            .reload()
+            .await
+            .expect("webhook reload")
+    );
+    assert_eq!(
+        ready_status(&application.router).await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an active generation with a stuck update is not ready"
+    );
+
+    write_value(&db.pool, "telegram.mode", json!("disabled")).await;
+    assert!(
+        !application
+            .telegram_supervisor
+            .reload()
+            .await
+            .expect("disable reload"),
+        "a disabled configuration has no generation"
+    );
+    assert_eq!(
+        ready_status(&application.router).await,
+        StatusCode::OK,
+        "disabling the bot must stop the queue lag check even with a pending update"
+    );
+
+    lock.rollback().await.expect("release stuck update");
     stop(application, shutdown_tx).await;
 }
 

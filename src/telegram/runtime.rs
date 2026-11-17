@@ -262,6 +262,7 @@ impl TelegramSupervisor {
         let outbox = OutboxWorker::new(self.pool.clone(), api.clone());
         tasks.push(tokio::spawn(outbox.run(wake_outbox, shutdown)));
 
+        self.ingress.set_active(true);
         *self.generation.lock().expect("telegram supervisor lock") =
             Some(Generation { stop, tasks, api });
         Ok(true)
@@ -282,6 +283,7 @@ impl TelegramSupervisor {
         let Some(Generation { stop, tasks, .. }) = generation else {
             return false;
         };
+        self.ingress.set_active(false);
         self.ingress.store(None);
         // Сигнал обязателен и при уже сработавшем shutdown: задачам нужно
         // увидеть `true`, а не закрытие канала.

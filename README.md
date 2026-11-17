@@ -146,8 +146,9 @@ docker compose up -d postgres
 # 3. Применить миграции
 make migrate
 
-# 4. Раскомментировать TELEGRAM_BOT_TOKEN в .env (блок Telegram — альтернатива
-#    консоли), вписать токен тестового бота и запустить сервис локально.
+# 4. Раскомментировать в .env TELEGRAM_BOT_TOKEN и TELEGRAM_BOT_USERNAME (блок
+#    Telegram — альтернатива консоли), вписать токен и имя тестового бота
+#    @tasklerq_example_bot и запустить сервис локально.
 #    polling действует только вместе с токеном; без токена бот подключается
 #    на странице «Telegram» в консоли администратора.
 TELEGRAM_MODE=polling make dev

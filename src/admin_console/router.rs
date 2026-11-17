@@ -26,6 +26,7 @@ use crate::llm::LlmSettings;
 use crate::rate_limit::{RateDecision, RateLimiter};
 use crate::security_audit::{Audit, LimitKey, RateLimitEvent};
 use crate::telegram::runtime::TelegramSupervisor;
+use crate::telegram::webhook::IngressSlot;
 
 use super::checks::CheckState;
 use super::wizard::{WIZARD_PATH, WIZARD_SKIP_PATH, WizardSettings};
@@ -67,6 +68,9 @@ pub struct AdminState {
     /// Допустимый возраст необработанного обновления Telegram для предупреждений
     /// readiness на главной; `None` — очередь не проверяется.
     queue_lag_limit: Option<chrono::Duration>,
+    /// Живое состояние поколения Telegram: порог очереди действует, только пока
+    /// оно активно. По умолчанию поколения нет.
+    telegram: IngressSlot,
     /// Ход проверки слота; одна проверка на процесс.
     checks: CheckState,
     /// Супервизор поколений Telegram: переключение настроек без перезапуска.
@@ -98,6 +102,7 @@ impl AdminState {
             llm_settings,
             llm_slots,
             queue_lag_limit: None,
+            telegram: IngressSlot::default(),
             checks: CheckState::new(),
             telegram_supervisor: None,
         }
@@ -108,6 +113,7 @@ impl AdminState {
     /// Консоль переключает бота без перезапуска тем же супервизором, что
     /// запустил текущее поколение.
     pub fn with_telegram_supervisor(mut self, supervisor: Arc<TelegramSupervisor>) -> Self {
+        self.telegram = supervisor.ingress();
         self.telegram_supervisor = Some(supervisor);
         self
     }
@@ -142,6 +148,11 @@ impl AdminState {
     /// Порог задержки очереди Telegram для readiness на главной.
     pub fn queue_lag_limit(&self) -> Option<chrono::Duration> {
         self.queue_lag_limit
+    }
+
+    /// Живое состояние поколения Telegram для readiness на главной.
+    pub fn telegram(&self) -> &IngressSlot {
+        &self.telegram
     }
 
     /// Состояние проверки слота.

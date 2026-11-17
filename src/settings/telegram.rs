@@ -82,6 +82,10 @@ pub struct EffectiveTelegram {
     state: TelegramState,
     api_base_url: Option<url::Url>,
     settings: Vec<ResolvedSetting>,
+    /// Токен, расшифрованный из выбранного источника; есть и при неполной
+    /// группе (например, webhook без секрета), потому что им диагностируют
+    /// `getWebhookInfo`.
+    bot_token: Option<SecretString>,
 }
 
 #[derive(Clone, Debug)]
@@ -107,6 +111,15 @@ impl EffectiveTelegram {
             TelegramState::Configured { config, .. } => Some(config),
             TelegramState::Unavailable { .. } => None,
         }
+    }
+
+    /// Расшифрованный токен бота независимо от полноты группы.
+    ///
+    /// Нужен диагностике `admin webhook info`: неполная группа (нет секрета
+    /// или адреса webhook) всё ещё описывает бота, к которому можно обратиться.
+    /// Нерасшифрованный или незаданный токен — `None`.
+    pub fn bot_token(&self) -> Option<&SecretString> {
+        self.bot_token.as_ref()
     }
 
     /// Источник полей группы; `None`, если группа ненастроена.
@@ -166,11 +179,13 @@ pub fn effective_telegram(
 ) -> EffectiveTelegram {
     let resolved = resolve_telegram(config, stored, cipher);
     let settings = telegram_settings_from(&resolved);
+    let bot_token = resolved.token_value.clone();
 
     EffectiveTelegram {
         state: resolved.state,
         api_base_url: config.telegram_api_base_url.clone(),
         settings,
+        bot_token,
     }
 }
 
@@ -191,6 +206,8 @@ struct ResolvedTelegram {
     mode: Option<TelegramMode>,
     mode_source: SettingSource,
     token: SecretState,
+    /// Расшифрованный токен выбранного источника; есть и у неполной группы.
+    token_value: Option<SecretString>,
     token_source: SettingSource,
     bot_id: Option<i64>,
     bot_id_source: SettingSource,
@@ -380,6 +397,7 @@ fn resolve_telegram(
         }
     };
 
+    let token_value = bot_token.clone();
     let state = match env_group {
         Some(group) => {
             // Группа из окружения уже прошла валидацию запуска: токен задан, а
@@ -500,6 +518,7 @@ fn resolve_telegram(
         mode,
         mode_source,
         token,
+        token_value,
         token_source,
         bot_id,
         bot_id_source,

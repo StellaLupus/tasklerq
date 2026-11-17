@@ -107,22 +107,19 @@ pub async fn build_application_with_update_limit(
         config.clone(),
         secret_cipher.clone(),
     );
-    let telegram_started = supervisor.start(&telegram).await?;
+    supervisor.start(&telegram).await?;
 
     let mut state = AppState::new(pool.clone(), audit.clone())
         .with_tenancy_mode(config.tenancy.mode)
         .with_secret_cipher(secret_cipher.clone())
         .with_llm_slots(llm_slots.clone())
-        .with_telegram_slot(supervisor.ingress());
-    let mut workers = Vec::new();
-    let mut queue_lag_seconds = None;
-    if telegram_started {
-        state = state.with_queue_lag_limit(config.queue.ready_lag_seconds);
-        queue_lag_seconds = Some(config.queue.ready_lag_seconds);
-    }
+        .with_telegram_slot(supervisor.ingress())
+        // Порог задаётся всегда; readiness применяет его, только пока живо
+        // поколение Telegram, и видит включение и выключение из консоли.
+        .with_queue_lag_limit(config.queue.ready_lag_seconds);
     // Супервизор запускается всегда: поколение, включённое из консоли после
     // старта, тоже должно дождаться graceful shutdown процесса.
-    workers.push(tokio::spawn(Arc::clone(&supervisor).run()));
+    let mut workers = vec![tokio::spawn(Arc::clone(&supervisor).run())];
     if config.capture.enabled {
         state = state.with_capture(CaptureState::new(config.capture, llm));
     }
@@ -131,7 +128,7 @@ pub async fn build_application_with_update_limit(
     // ни того, ни другого.
     let admin_router = config.admin_bind_addr.map(|_| {
         let wizard = WizardSettings::new(config.tenancy.mode, telegram.is_enabled());
-        let mut admin = AdminState::new(
+        let admin = AdminState::new(
             pool.clone(),
             config.admin_trusted_proxies.clone(),
             audit,
@@ -139,10 +136,8 @@ pub async fn build_application_with_update_limit(
         )
         .with_wizard(wizard)
         .with_llm_slots(llm_slots)
-        .with_telegram_supervisor(Arc::clone(&supervisor));
-        if let Some(seconds) = queue_lag_seconds {
-            admin = admin.with_queue_lag_limit(seconds);
-        }
+        .with_telegram_supervisor(Arc::clone(&supervisor))
+        .with_queue_lag_limit(config.queue.ready_lag_seconds);
         build_admin_router(admin)
     });
 

@@ -1018,28 +1018,26 @@ async fn telegram_bot_token(config: &Config) -> Result<SecretString> {
             .context("TELEGRAM_BOT_TOKEN is not configured");
     }
 
-    let keys = SecretKeyConfig::from_env().context("invalid secret key configuration")?;
-    let cipher = SecretCipher::new(keys.current, keys.old);
-    let database = DatabaseConfig::from_env().context("invalid database configuration")?;
-    let pool = storage::db::connect(&database)
+    let cipher = SecretCipher::from_config(config);
+    let pool = storage::db::connect(&config.database)
         .await
         .context("database connection failed")?;
     let effective = settings::read_effective_telegram(&pool, config, &cipher)
         .await
         .context("failed to read telegram settings from the database")?;
+    // Неполная группа (например, webhook без секрета) всё равно описывает бота:
+    // этой командой и диагностируют недорегистрированный webhook.
+    if let Some(token) = effective.bot_token() {
+        return Ok(token.clone());
+    }
     let reason = effective
         .problem()
         .map_or("not_set", |problem| problem.code());
 
-    effective
-        .config()
-        .and_then(|group| group.bot_token.clone())
-        .with_context(|| {
-            format!(
-                "telegram bot is not configured ({reason}): set TELEGRAM_BOT_TOKEN or \
-                 configure the bot in the admin console"
-            )
-        })
+    bail!(
+        "telegram bot is not configured ({reason}): set TELEGRAM_BOT_TOKEN or \
+         configure the bot in the admin console"
+    )
 }
 
 async fn webhook_info() -> Result<()> {

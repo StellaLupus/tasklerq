@@ -77,6 +77,9 @@ pub struct ReadinessInput<'a> {
     /// Допустимый возраст необработанного обновления Telegram; `None` — очередь
     /// не проверяется.
     pub queue_lag_limit: Option<Duration>,
+    /// Есть живое поколение Telegram: без него очередь никто не разбирает и
+    /// порог не применяется.
+    pub telegram_active: bool,
     /// Ключи для проверки сохранённых секретов.
     pub secret_cipher: &'a SecretCipher,
     /// Статус проверки слотов LLM.
@@ -117,13 +120,14 @@ impl ReadinessFailure {
 }
 
 /// `GET /health/ready`: база доступна и принимает запросы, миграции применены,
-/// а очередь обновлений Telegram не застряла (если воркер запущен).
+/// а очередь обновлений Telegram не застряла (пока живо поколение бота).
 pub async fn ready(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
     let now = Utc::now();
     let warnings = readiness(ReadinessInput {
         pool: &state.pool,
         tenancy_mode: state.tenancy_mode,
         queue_lag_limit: state.queue_lag_limit,
+        telegram_active: state.telegram.is_active(),
         secret_cipher: &state.secret_cipher,
         llm_slots: &state.llm_slots,
         now,
@@ -149,6 +153,7 @@ pub async fn readiness(input: ReadinessInput<'_>) -> Result<Vec<String>, Readine
         pool,
         tenancy_mode,
         queue_lag_limit,
+        telegram_active,
         secret_cipher,
         llm_slots,
         now,
@@ -195,9 +200,11 @@ pub async fn readiness(input: ReadinessInput<'_>) -> Result<Vec<String>, Readine
             ReadinessFailure::Database
         })?;
 
-        if let Some(limit) = queue_lag_limit {
+        if let Some(limit) = queue_lag_limit.filter(|_| telegram_active) {
             // Упавший или остановленный воркер заметен по самому старому
-            // обновлению, которое давно могло быть обработано.
+            // обновлению, которое давно могло быть обработано. Без живого
+            // поколения очередь никто не разбирает, поэтому порог не
+            // применяется: выключение бота не делает сервис неготовым.
             let oldest = queue::oldest_ready(&mut conn, now).await.map_err(|error| {
                 tracing::warn!(error = %error, "readiness check failed");
                 ReadinessFailure::Database
