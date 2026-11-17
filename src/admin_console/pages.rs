@@ -15,7 +15,9 @@
 //! стоит только на уже отрисованном фрагменте askama, не на данных страницы.
 //!
 //! Формы — обычные POST без JavaScript; htmx подключён макетом для опроса хода
-//! проверки слота, и страница хода работает без него по ссылке «Обновить».
+//! проверки слота. Без JavaScript страница хода не перезагружается сама: ссылку
+//! «Обновить» показывает `<noscript>`, поэтому браузер с htmx не делает второй
+//! запрос параллельно с опросом.
 //!
 //! Сверка `Origin` живёт отдельным слоем роутера
 //! ([`super::router::require_trusted_origin`]): сюда запрос с чужим origin не
@@ -70,7 +72,7 @@ const PASSWORD_PATH: &str = "/admin/password";
 pub(crate) const LLM_PATH: &str = "/admin/llm";
 /// Путь страницы хода проверки слота.
 pub(crate) const LLM_CHECK_PATH: &str = "/admin/llm/check";
-/// Путь фрагмента хода для htmx; полная страница работает без JavaScript.
+/// Путь фрагмента хода для htmx; без JavaScript страница обновляется ссылкой.
 pub(crate) const LLM_CHECK_FRAGMENT_PATH: &str = "/admin/llm/check-fragment";
 /// Успешное сохранение настроек LLM.
 const LLM_SAVED_PATH: &str = "/admin/llm?saved=1";
@@ -89,6 +91,8 @@ const EMPTY_USERNAME_ERROR: &str = "Имя не должно быть пусты
 const WRONG_PASSWORD_ERROR: &str = "Неверный текущий пароль.";
 const WIZARD_SKIP_ERROR: &str = "Этот шаг нельзя пропустить.";
 const WIZARD_STALE_STEP_ERROR: &str = "Этот шаг мастера уже завершён или недоступен.";
+const WIZARD_TOKEN_AMBIGUOUS_ERROR: &str = "В режиме single больше одного household: выпустите токен командой \
+     `tasklerq admin token create --household <id>`.";
 const INVALID_LINK_TITLE: &str = "Ссылка недействительна";
 
 /// Поля формы setup.
@@ -762,21 +766,14 @@ async fn save_llm(
 
 /// `GET /admin/llm/check`: страница хода проверки слота.
 ///
-/// Открывается после POST и без JavaScript: заголовок `Refresh` перезагружает
-/// страницу, пока прогон идёт, а ссылка «Обновить» делает то же вручную.
+/// Пока прогон идёт, ход обновляет htmx-опрос фрагмента. Без JavaScript
+/// автоперезагрузки нет: `<noscript>` показывает ссылку «Обновить», и браузер с
+/// JavaScript не делает второй запрос параллельно с опросом.
 pub(crate) async fn llm_check_page(
     State(state): State<AdminState>,
     _session: AdminSession,
 ) -> Response {
-    let snapshot = state.checks().current();
-    let running = snapshot.as_ref().is_some_and(CheckSnapshot::running);
-    let mut response = render(ConsolePage::new(Page::Check(snapshot)));
-    if running {
-        response
-            .headers_mut()
-            .insert(header::REFRESH, header::HeaderValue::from_static("2"));
-    }
-    response
+    render(ConsolePage::new(Page::Check(state.checks().current())))
 }
 
 /// `GET /admin/llm/check-fragment`: ход проверки для htmx.
@@ -1056,6 +1053,13 @@ pub(crate) async fn wizard_token(
                 },
             })
             .error(WIZARD_STALE_STEP_ERROR),
+            StatusCode::BAD_REQUEST,
+        ),
+        // В `single` активных household несколько: выбрать дом за мастера
+        // нельзя, токен не выпускается. Это ошибка ввода, а не сбой сервера.
+        Err(DomainError::Validation(_)) => render_with_status(
+            ConsolePage::new(wizard_step_page(step, telegram_enabled))
+                .error(WIZARD_TOKEN_AMBIGUOUS_ERROR),
             StatusCode::BAD_REQUEST,
         ),
         Err(error) => internal(error),
@@ -2542,8 +2546,9 @@ struct CheckButtonBody {
 
 /// Содержимое страницы хода проверки.
 ///
-/// Без JavaScript страницу обновляет заголовок ответа `Refresh`; в разметке
-/// `<noscript>` и `<meta http-equiv>` не нужны.
+/// Пока прогон идёт, ход опрашивает себя через htmx; без JavaScript видна
+/// `<noscript>`-ссылка «Обновить». Заголовок `Refresh` не ставится: он
+/// перезагружал бы страницу у браузера с JavaScript параллельно с опросом.
 #[derive(Template)]
 #[template(
     source = r#"<h1>Проверка слота</h1>
@@ -2568,7 +2573,7 @@ struct CheckPageBody {
 {% when CheckPhase::Running %}
 <div id="llm-check" hx-get="/admin/llm/check-fragment" hx-trigger="every 2s" hx-swap="outerHTML">
 <p role="status">Проверка слота {{ view.slot }} идёт: пройдено {{ view.done }} из {{ view.total }} фраз.</p>
-<p><a href="/admin/llm/check">Обновить</a></p>
+<noscript><p><a href="/admin/llm/check">Обновить</a></p></noscript>
 </div>
 {% when CheckPhase::Report %}
 <div id="llm-check">
@@ -2596,7 +2601,7 @@ mod tests {
     use super::{
         ConsolePage, HomeSlot, HomeView, HomeWarning, HouseholdForm, LlmCheck, LlmChecks,
         LlmSlotView, LlmTextField, LlmToggle, LlmTokenView, LlmView, Page, WizardForm,
-        household_form_error, phrase_word, target_or_home,
+        household_form_error, phrase_word, target_or_home, warning_label,
     };
     use crate::admin_console::checks::{CheckOutcome, CheckSlot, CheckSnapshot};
     use crate::admin_console::wizard::WizardStep;
@@ -2841,7 +2846,10 @@ mod tests {
             .expect("the page renders");
         assert!(html.contains("пройдено 3 из 22 фраз"), "{html}");
         assert!(html.contains("hx-trigger=\"every 2s\""), "{html}");
-        assert!(html.contains("href=\"/admin/llm/check\""), "{html}");
+        assert!(
+            html.contains("<noscript><p><a href=\"/admin/llm/check\">Обновить</a></p></noscript>"),
+            "the no-JavaScript fallback is a link, not a page reload: {html}"
+        );
         assert!(
             !html.contains("http-equiv=\"refresh\""),
             "the page must not carry a meta refresh in the body: {html}"
@@ -2864,6 +2872,32 @@ mod tests {
         assert!(!html.contains("hx-trigger=\"every 2s\""), "{html}");
         assert!(html.contains("пройдено 21 из 22"), "{html}");
         assert!(html.contains("Набор capture-v4"), "{html}");
+    }
+
+    #[test]
+    fn every_readiness_warning_has_a_console_label() {
+        let health = crate::http::health::WARNING_CODES
+            .iter()
+            .map(|code| (*code).to_owned())
+            .chain([
+                format!(
+                    "{}:primary",
+                    crate::http::health::WARNING_LLM_SLOT_UNVERIFIED
+                ),
+                format!(
+                    "{}:primary:strict",
+                    crate::http::health::WARNING_LLM_SLOT_UNVERIFIED
+                ),
+            ]);
+
+        for code in health {
+            let label = warning_label(&code);
+            assert_ne!(
+                label, "неизвестное предупреждение",
+                "readiness warning `{code}` has no console label"
+            );
+            assert!(!label.is_empty(), "the label for `{code}` is empty");
+        }
     }
 
     #[test]

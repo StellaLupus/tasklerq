@@ -3965,6 +3965,64 @@ async fn a_double_token_post_issues_exactly_one_token() {
     }
 }
 
+/// В `single` с несколькими household шаг токена — ошибка формы `400`, не `500`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_token_step_with_several_households_is_a_form_error() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    // Два household: `admin household create` в `single` второй бы отклонил,
+    // но такая база — штатное состояние с предупреждением `multiple_households`.
+    for name in ["Первый дом", "Второй дом"] {
+        tasklerq::admin::create_household(
+            &db.pool,
+            TenancyMode::Multi,
+            name,
+            "Europe/Moscow",
+            Utc::now(),
+        )
+        .await
+        .expect("a household");
+    }
+    let app = console(&db.pool, Vec::new());
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    // Шаг LLM пропущен: мастер стоит на токене.
+    let (status, _, _) = send_form_from(
+        &app,
+        "/admin/wizard/skip",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("step", "llm")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin/wizard", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(String::from_utf8_lossy(&body).contains("Токен Home Assistant"));
+
+    let (status, headers, body) = send_form_from(
+        &app,
+        "/admin/wizard/token",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("name", "Home Assistant")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an ambiguous household is a form error: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_security_headers(&headers, "POST /admin/wizard/token");
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("Токен Home Assistant"), "{text}");
+    assert!(text.contains("больше одного household"), "{text}");
+    assert!(text.contains("action=\"/admin/wizard/token\""), "{text}");
+    assert!(!text.contains("id=\"issued-token\""), "{text}");
+    assert_eq!(token_count(&db.pool).await, 0, "no token is issued");
+}
+
 /// Главная показывает версию, готовность, режим, household, Telegram и слоты.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_home_page_shows_the_installation_state_and_readiness() {
@@ -5353,25 +5411,25 @@ async fn a_check_from_the_console_shows_progress_and_saves_the_cli_fingerprint()
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(location(&headers), Some("/admin/llm/check"));
 
-    // Страница хода работает без JavaScript: у фрагмента есть htmx-опрос и
-    // ссылка «Обновить», у полной страницы — заголовок `Refresh`, а не
-    // невалидный `<meta http-equiv>` в `<body>`.
+    // Страница хода обновляется опросом htmx; без JavaScript — <noscript>-
+    // ссылкой «Обновить». Заголовка `Refresh` нет: иначе браузер с JavaScript
+    // перезагружал бы страницу параллельно с опросом.
     let (status, headers, body) =
         send_with_cookie(&app, Method::GET, "/admin/llm/check", &cookie).await;
     assert_eq!(status, StatusCode::OK);
     assert_security_headers(&headers, "GET /admin/llm/check");
-    assert_eq!(
-        headers
-            .get(header::REFRESH)
-            .and_then(|value| value.to_str().ok()),
-        Some("2"),
-        "a running check refreshes the plain page via the response header"
+    assert!(
+        headers.get(header::REFRESH).is_none(),
+        "a running check must not also refresh the page via a response header"
     );
     assert_no_external_urls(&body, "GET /admin/llm/check");
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains("Проверка слота primary идёт"), "{text}");
     assert!(text.contains("из 22 фраз"), "{text}");
-    assert!(text.contains("href=\"/admin/llm/check\""), "{text}");
+    assert!(
+        text.contains("<noscript><p><a href=\"/admin/llm/check\">Обновить</a></p></noscript>"),
+        "without JavaScript the page offers a manual refresh link: {text}"
+    );
     assert!(
         !text.contains("http-equiv=\"refresh\""),
         "the body must not carry a meta refresh: {text}"

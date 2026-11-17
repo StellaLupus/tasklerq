@@ -16,6 +16,26 @@ use crate::telegram::queue;
 use super::error::ApiError;
 use super::router::AppState;
 
+/// Код предупреждения: в `single` активных household больше одного.
+pub const WARNING_MULTIPLE_HOUSEHOLDS: &str = "multiple_households";
+/// Код предупреждения: предохранители всех настроенных слотов LLM разомкнуты.
+pub const WARNING_LLM_UNAVAILABLE: &str = "llm_unavailable";
+/// Префикс кода предупреждения о непроверенном слоте LLM; за ним идёт `:slot`
+/// и, для сохранённой проверки, `:режим`.
+pub const WARNING_LLM_SLOT_UNVERIFIED: &str = "llm_slot_unverified";
+
+/// Коды предупреждений, которые может вернуть [`readiness`] без параметров.
+///
+/// Параметрический `llm_slot_unverified:<slot>[:<режим>]` проверяется тестом
+/// консоли отдельно, от [`WARNING_LLM_SLOT_UNVERIFIED`]: у каждого кода должна
+/// быть понятная подпись, поэтому новый код без подписи не проходит проверку.
+pub const WARNING_CODES: &[&str] = &[
+    WARNING_MULTIPLE_HOUSEHOLDS,
+    WARNING_LLM_UNAVAILABLE,
+    crate::settings::SecretProblem::KeyMissing.code(),
+    crate::settings::SecretProblem::Undecryptable.code(),
+];
+
 /// Ответ health-эндпоинта.
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
@@ -196,7 +216,7 @@ pub async fn readiness(input: ReadinessInput<'_>) -> Result<Vec<String>, Readine
                 ReadinessFailure::Database
             })?;
             if active > 1 {
-                warnings.push("multiple_households".to_owned());
+                warnings.push(WARNING_MULTIPLE_HOUSEHOLDS.to_owned());
             }
         }
     }
@@ -205,17 +225,17 @@ pub async fn readiness(input: ReadinessInput<'_>) -> Result<Vec<String>, Readine
     // деградацией, и падение readiness вывело бы из работы то, что от него не
     // зависит.
     if llm_slots.all_breakers_open(now) {
-        warnings.push("llm_unavailable".to_owned());
+        warnings.push(WARNING_LLM_UNAVAILABLE.to_owned());
     }
     for report in llm_slots.statuses(pool, now).await {
         if !report.status.is_passed() {
             match report.titles {
                 Some(titles) => warnings.push(format!(
-                    "llm_slot_unverified:{}:{}",
+                    "{WARNING_LLM_SLOT_UNVERIFIED}:{}:{}",
                     report.slot,
                     titles.as_str()
                 )),
-                None => warnings.push(format!("llm_slot_unverified:{}", report.slot)),
+                None => warnings.push(format!("{WARNING_LLM_SLOT_UNVERIFIED}:{}", report.slot)),
             }
         }
     }

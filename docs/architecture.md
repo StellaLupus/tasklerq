@@ -65,10 +65,11 @@ flowchart TB
 | Компонент | Роль | Технологии |
 | --- | --- | --- |
 | **Tasklerq core** | Домен, API, webhook, очереди, планировщик | Rust, axum, tokio, sqlx |
+| **Admin console** | Отдельный listener для оператора инсталляции: вход, мастер, настройки LLM, проверка слота | axum, askama, htmx, `src/admin_console/` |
 | **Telegram adapter** | RichMessage, вызовы Bot API | reqwest, teloxide-core types |
 | **PostgreSQL** | Source of truth, очередь обновлений, outbox, черновики | PostgreSQL 18 (`postgres:18-alpine`) |
 | **HA custom component** | Мост между REST API и сущностями HA | Python, aiohttp, HA integration |
-| **LLM slots** | Разбор текста через OpenAI-совместимый API: основной и необязательный резервный эндпоинты | `src/llm/`, reqwest, JSON Schema `response_format` |
+| **LLM slots** | Разбор текста через OpenAI-совместимый API: основной и необязательный резервный эндпоинты; источник — окружение или консоль, действует [снимок](#снимок-действующей-конфигурации-llm) | `src/llm/`, reqwest, JSON Schema `response_format` |
 | **Reverse proxy** | TLS, публикация webhook | Synology DSM Reverse Proxy |
 
 ## 3. Потоки данных
@@ -214,9 +215,9 @@ sequenceDiagram
 | --- | --- |
 | вид слота (`openai`) | токен |
 | модель | суточная квота |
-| хост адреса с портом (без схемы, пути, учётных данных и query) | схема и путь адреса, `extra_json` |
-| таймаут запроса слота | источник значения (окружение или база) |
-| хеш контракта промпта и схемы ответа | |
+| хост адреса (порт включается, только если задан явно; без схемы, пути, учётных данных и query) | схема и путь адреса, `extra_json` |
+| таймаут запроса слота | таймаут установки соединения |
+| хеш контракта промпта и схемы ответа | источник значения (окружение или база) |
 | хеш smoke-набора | |
 | стандарт сравнения названий | |
 
@@ -311,6 +312,29 @@ sequenceDiagram
 household — экран «Нужен администратор». В `multi` онбординг доступен каждому
 новому пользователю.
 
+### 3.6. Фоновые задачи
+
+Шаг «переход повторяющихся событий» вынесен из планировщика в отдельный
+`DomainTicker` (`src/jobs/domain.rs`). Он работает всегда, как retention, и
+переводит прошедшие серии событий на первое непрошедшее вхождение без Telegram:
+сценарий «только Home Assistant» тоже должен продвигать календарь. Остальные
+шаги `Scheduler` (отмена устаревших доставок, планирование напоминаний, сводок и
+сводных сообщений) остаются в Telegram-рантайме: без бота доставлять некому.
+`RetentionWorker` и `DomainTicker` запускаются в `app::build_application`
+независимо от режима Telegram.
+
+### 3.7. Консоль администратора
+
+Консоль — второй HTTP-listener на `ADMIN_BIND_ADDR` (по умолчанию
+`0.0.0.0:8081`), а не набор путей публичного роутера. Она собрана в
+`src/admin_console/`: `router.rs` (маршруты и слой `Origin`), `session.rs`
+(cookie и проверка сессии), `setup.rs`, `login.rs`, `change.rs`, `recovery.rs`
+(сценарии входа и пароля), `codes.rs` (одноразовые коды), `wizard.rs` (шаги
+мастера), `checks.rs` (ход проверки слота) и `pages.rs` (HTML-шаблоны askama).
+Сессии и коды хранятся в PostgreSQL, секреты настроек — в `settings` под ключом
+из окружения. Консоль переиспользует административные операции
+`src/admin/mod.rs` и работает от системного актора.
+
 ## 4. Модули Rust
 
 ```text
@@ -377,13 +401,20 @@ src/
 ├── settings/
 │   ├── mod.rs           # ключи настроек, effective_llm, чтение и запись
 │   └── crypto.rs        # XChaCha20-Poly1305 и контекст строки
+├── admin_console/
+│   ├── router.rs        # отдельный listener, маршруты, сверка Origin
+│   ├── session.rs       # cookie tlq_admin и проверка сессии
+│   ├── codes.rs         # setup- и recovery-коды, их хеши и сроки
+│   ├── wizard.rs        # шаг мастера и пропуски
+│   └── pages.rs         # страницы, формы и шаблоны askama
 ├── storage/
 │   ├── repositories/    # sqlx-репозитории
 │   ├── migrations.rs
 │   ├── db.rs
 │   └── seed.rs
 ├── jobs/
-│   ├── scheduler.rs     # тик 30 с
+│   ├── scheduler.rs     # тик 30 с в Telegram-рантайме
+│   ├── domain.rs        # DomainTicker: переход повторяющихся событий всегда
 │   ├── delivery.rs      # доставка уведомлений
 │   ├── digest.rs        # утренняя сводка
 │   ├── batch.rs         # сводное сообщение отложенных
@@ -592,8 +623,12 @@ Telegram ──443──▶ Synology Reverse Proxy ──▶ 127.0.0.1:18080 tas
 - Tasklerq — bridge-контейнер; host-порт `18080` публикуется только на
   loopback (`8080` занят Zigbee2MQTT).
 - HA работает в `network_mode: host`; HA → Tasklerq:
-  `http://127.0.0.1:18080`. Tasklerq обращается к слотам LLM по адресам
-  `LLM_PRIMARY_URL`/`LLM_FALLBACK_URL`, а не к Home Assistant.
+  `http://127.0.0.1:18080`. Слоты LLM Tasklerq берёт из окружения или из
+  настроек консоли (действует снимок), а не из Home Assistant; в сеть уходят
+  запросы к OpenAI-совместимому API.
+- Консоль администратора — второй listener на `ADMIN_BIND_ADDR` (в контейнере
+  `0.0.0.0:8081`). Порт не публикуется по умолчанию; при публикации доступен
+  только через пароль, для внешнего доступа — HTTPS-прокси с отдельным хостом.
 - PostgreSQL — контейнер `postgres:18-alpine`; в dev compose он публикует
   `127.0.0.1:15433`, на NAS живёт в сети `shared-db`. Tasklerq не управляет
   сервером БД.
@@ -616,6 +651,7 @@ Telegram ──443──▶ Synology Reverse Proxy ──▶ 127.0.0.1:18080 tas
 | Ввод | Валидация, экранирование HTML, параметризованный SQL. |
 | LLM | Делимитеры, schema-only, без инструментов, валидация, подтверждение. |
 | Секреты | env/secret files, redaction, ротация. |
+| Консоль | Отдельный listener, cookie-сессия, точная сверка `Origin`, лимит неудач, аудит. |
 | Абьюз | Rate limits, LLM-квота, 429. |
 | Приватность | Минимизация, отсутствие текста в логах, retention. |
 
@@ -628,8 +664,17 @@ Telegram ──443──▶ Synology Reverse Proxy ──▶ 127.0.0.1:18080 tas
 - Метрики: обновления, задержка очереди, outbox, capture по источникам,
   fallback, LLM, HTTP, пул БД.
 - `/health/live` — процесс; `/health/ready` — БД, миграции, очередь.
+- Предупреждения readiness для LLM и консоли: `llm_unavailable`,
+  `llm_slot_unverified:<slot>[:<режим>]`, `multiple_households`,
+  `secret_key_missing`, `secret_undecryptable`. Статус слотов и серия
+  `llm_slot_verified` пересчитываются по версии снимка на следующем запросе
+  readiness, а не в момент сохранения настроек — см.
+  [«Снимок действующей конфигурации LLM»](#снимок-действующей-конфигурации-llm).
+- События безопасности и консоли — в `audit_events`: входы, отказы, изменения
+  настроек без значений; неудачные входы в консоль входят в общий порог отказов
+  аутентификации с webhook.
 - Алерты: readiness >2 мин, queue lag >5 мин, LLM errors >20%, backup failed,
-  webhook auth failures >50/5 мин.
+  отказы аутентификации >50/5 мин (webhook и вход в консоль).
 
 Текст сообщений, токены и имена в логи не попадают.
 

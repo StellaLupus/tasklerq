@@ -433,7 +433,9 @@ jsonb`, `created_at`. Типы: `household_created`, `member_joined`,
 `member_left`, `member_removed`, `role_changed`, `invite_created`,
 `invite_used`, `invite_revoked`, `token_created`, `token_revoked`,
 `auth_failed`, `rate_limited`, `llm_validation_failed`,
-`auth_failure_threshold_exceeded`, `household_deleted`.
+`auth_failure_threshold_exceeded`, `household_deleted`, `admin_login`,
+`admin_login_failed`, `admin_setup_code_failed`, `admin_account_created`,
+`admin_password_changed`, `admin_recovery_issued`, `admin_setting_changed`.
 
 Раздел «Журнал» владельца показывает события членства
 (`household_created`, `member_*`, `role_changed`, `invite_*`,
@@ -496,6 +498,8 @@ URL или модель, и тогда все поля слота берутся
 | `llm.connect_timeout_ms` | installation | обычный | 10..60000 мс | env → база → умолчание |
 | `llm.daily_quota` | installation | обычный | целое 1..100000 | env → база → умолчание |
 | `wizard.llm_skipped` | installation | обычный | bool | база → умолчание |
+| `wizard.household_skipped` | installation | обычный | bool | база → умолчание |
+| `wizard.token_skipped` | installation | обычный | bool | база → умолчание |
 
 Неизвестные ключи (например, записанные более новой версией) при чтении
 игнорируются, чтобы откат на прежний образ не ломал запуск. Их секреты всё
@@ -511,6 +515,60 @@ URL или модель, и тогда все поля слота берутся
 Шифрование всегда идёт текущим ключом `TASKLERQ_SECRET_KEY`; расшифровка —
 текущим или прежним `TASKLERQ_SECRET_KEY_OLD` по id из шифротекста. Ключ
 хранится в окружении, а не в базе.
+
+### 3.15 `admin_accounts`, `admin_sessions`, `admin_one_time_codes`
+
+Учётная запись администратора консоли не связана с `users`: это оператор
+инсталляции, а не участник household.
+
+`admin_accounts`:
+
+| Поле | Тип | Ограничения |
+| --- | --- | --- |
+| `id` | `uuid` | PRIMARY KEY. |
+| `username` | `text` | NOT NULL, непустой после `btrim`. |
+| `password_hash` | `text` | NOT NULL, строка PHC argon2id с параметрами. |
+| `created_at` | `timestamptz` | NOT NULL, по умолчанию `now()`. |
+| `password_changed_at` | `timestamptz` | NOT NULL, по умолчанию `now()`. |
+
+Уникальный индекс по константному выражению `((true))` держит не более одной
+строки. Внешних ключей нет; `password_changed_at` всегда заполнен, потому что
+учётка создаётся только вместе с паролем.
+
+`admin_sessions`:
+
+| Поле | Тип | Ограничения |
+| --- | --- | --- |
+| `id` | `uuid` | PRIMARY KEY. |
+| `token_hash` | `text` | NOT NULL, UNIQUE, 64 строчных hex-символа (SHA-256 токена). |
+| `created_at` | `timestamptz` | NOT NULL, по умолчанию `now()`. |
+| `last_seen_at` | `timestamptz` | NOT NULL, по умолчанию `now()`; CHECK `last_seen_at >= created_at`. |
+
+Сессия истекает через 7 дней без активности (от `last_seen_at`) и через 30 дней
+после входа (от `created_at`); `last_seen_at` обновляется не чаще раза в минуту.
+Индекс по `created_at` — для retention: строки старше 30 дней удаляются.
+Открытый токен сессии в базе не хранится, только его хеш.
+
+`admin_one_time_codes`:
+
+| Поле | Тип | Ограничения |
+| --- | --- | --- |
+| `id` | `uuid` | PRIMARY KEY. |
+| `purpose` | `text` | NOT NULL; CHECK `setup` или `recovery`. |
+| `household_id` | `uuid` | FK → households, ON DELETE CASCADE; NULL во всех текущих назначениях (CHECK). |
+| `code_hash` | `text` | NOT NULL, UNIQUE, 64 строчных hex-символа. |
+| `expires_at` | `timestamptz` | NULL только для `setup`; CHECK «у не-`setup` срок задан» и `expires_at > created_at`. |
+| `used_at` | `timestamptz` | NULL, пока код не использован. |
+| `created_at` | `timestamptz` | NOT NULL, по умолчанию `now()`. |
+
+`setup` живёт без срока, пока учётной записи нет: его гасит выпуск следующего
+кода или создание учётки. `recovery` живёт 15 минут. Использование —
+`UPDATE ... WHERE code_hash = $1 AND used_at IS NULL AND (expires_at IS NULL OR
+expires_at > now()) RETURNING ...` в одной транзакции с действием; повторный,
+погашенный или истёкший код строку не возвращает. Выпуск нового кода гасит
+прежние с той же парой `(purpose, household_id)`. Retention удаляет
+использованные и истёкшие коды старше 7 дней; действующий код и неиспользованный
+`setup` без срока остаются.
 
 ## 4. Перечисления
 
@@ -534,7 +592,7 @@ URL или модель, и тогда все поля слота берутся
 | `notification_kind` | `reminder`, `digest`, `assignment`, `snooze` |
 | `notification_status` | `pending`, `sent`, `cancelled` |
 | `capture_job_status` | `pending`, `running`, `done`, `dead` |
-| `audit_event_type` | `household_created`, `member_joined`, `member_left`, `member_removed`, `role_changed`, `invite_created`, `invite_used`, `invite_revoked`, `token_created`, `token_revoked`, `auth_failed`, `rate_limited`, `llm_validation_failed`, `auth_failure_threshold_exceeded`, `household_deleted` |
+| `audit_event_type` | `household_created`, `member_joined`, `member_left`, `member_removed`, `role_changed`, `invite_created`, `invite_used`, `invite_revoked`, `token_created`, `token_revoked`, `auth_failed`, `rate_limited`, `llm_validation_failed`, `auth_failure_threshold_exceeded`, `household_deleted`, `admin_login`, `admin_login_failed`, `admin_setup_code_failed`, `admin_account_created`, `admin_password_changed`, `admin_recovery_issued`, `admin_setting_changed` |
 
 ## 5. Инварианты
 
