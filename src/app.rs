@@ -3,6 +3,8 @@
 //! Эту функцию вызывают и `serve()` в `main.rs`, и интеграционные тесты, чтобы
 //! тест проверял production-путь, а не отдельную ручную сборку.
 
+use std::sync::Arc;
+
 use axum::Router;
 use sqlx::PgPool;
 use tokio::sync::watch;
@@ -21,7 +23,7 @@ use crate::security_audit::Audit;
 use crate::settings;
 use crate::settings::crypto::SecretCipher;
 use crate::storage::repositories::households;
-use crate::telegram::runtime::{self, StartError};
+use crate::telegram::runtime::{self, StartError, TelegramSupervisor};
 
 /// Собранное приложение и его фоновые задачи.
 pub struct Application {
@@ -29,21 +31,23 @@ pub struct Application {
     pub router: Router,
     /// Роутер консоли; `None`, если `ADMIN_BIND_ADDR=disabled`.
     pub admin_router: Option<Router>,
-    /// Фоновые задачи: Telegram (в режиме `disabled` их нет), retention и
-    /// доменный тикер.
+    /// Фоновые задачи: супервизор Telegram (в режиме `disabled` его нет),
+    /// retention и доменный тикер.
     pub workers: Vec<JoinHandle<()>>,
     /// Применение сохранённых настроек LLM к снимку без перезапуска: вход
     /// будущей консоли администратора и тестов.
     pub llm_settings: LlmSettings,
     /// Действующий режим Telegram: из окружения, базы или `disabled`.
     pub telegram_mode: TelegramMode,
+    /// Супервизор поколений Telegram: консоль будет менять бота через него.
+    pub telegram_supervisor: Arc<TelegramSupervisor>,
 }
 
 /// Собрать состояние и роутер так же, как это делает `serve()`.
 ///
-/// В режиме `TELEGRAM_MODE=disabled` без токена [`runtime::start`] ничего не
-/// запускает: ingress и воркеры Telegram отсутствуют, а HTTP API и capture
-/// работают. Retention и доменный тикер запускаются всегда и попадают в
+/// В режиме `TELEGRAM_MODE=disabled` без токена супервизор ничего не запускает:
+/// ingress и воркеры Telegram отсутствуют, а HTTP API и capture работают.
+/// Retention и доменный тикер запускаются всегда и попадают в
 /// [`Application::workers`].
 pub async fn build_application(
     config: &Config,
@@ -87,30 +91,31 @@ pub async fn build_application_with_update_limit(
     // делят состояние подавления и счётчики отказов.
     let audit = Audit::new(pool.clone());
     let telegram_mode = telegram.mode();
-    let telegram_runtime = runtime::start_with_update_limit(
-        config,
-        &telegram,
-        &pool,
+    let supervisor = runtime::TelegramSupervisor::new(
+        pool.clone(),
         shutdown.clone(),
         llm.clone(),
         audit.clone(),
+        config.tenancy,
+        config.queue.max_attempts,
         update_limit,
-    )
-    .await?;
+    );
+    let telegram_started = supervisor.start(&telegram).await?;
 
     let mut state = AppState::new(pool.clone(), audit.clone())
         .with_tenancy_mode(config.tenancy.mode)
         .with_secret_cipher(secret_cipher.clone())
-        .with_llm_slots(llm_slots.clone());
+        .with_llm_slots(llm_slots.clone())
+        .with_telegram_slot(supervisor.ingress());
     let mut workers = Vec::new();
     let mut queue_lag_seconds = None;
-    if let Some(runtime) = telegram_runtime {
-        if let Some(ingress) = runtime.ingress {
-            state = state.with_telegram(ingress);
-        }
+    if telegram_started {
         state = state.with_queue_lag_limit(config.queue.ready_lag_seconds);
         queue_lag_seconds = Some(config.queue.ready_lag_seconds);
-        workers = runtime.tasks;
+        // Супервизор останавливает поколение по процессному shutdown и ждёт его
+        // задачи, поэтому graceful shutdown процесса видит их наравне с
+        // остальными воркерами.
+        workers.push(tokio::spawn(Arc::clone(&supervisor).run()));
     }
     if config.capture.enabled {
         state = state.with_capture(CaptureState::new(config.capture, llm));
@@ -147,6 +152,7 @@ pub async fn build_application_with_update_limit(
         workers,
         llm_settings,
         telegram_mode,
+        telegram_supervisor: supervisor,
     })
 }
 

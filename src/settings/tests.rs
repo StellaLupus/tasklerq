@@ -446,6 +446,16 @@ fn an_environment_token_takes_the_whole_group_and_ignores_database_rows() {
         SettingSource::Default,
         "the database bot id does not leak into an environment group"
     );
+    assert_eq!(
+        telegram_setting(&effective, "telegram.public_base_url").source,
+        SettingSource::Default,
+        "the database public base url does not leak into an environment group"
+    );
+    assert_eq!(
+        telegram_setting(&effective, "telegram.public_base_url").value,
+        None,
+        "without PUBLIC_BASE_URL the environment group has no public address"
+    );
 }
 
 #[test]

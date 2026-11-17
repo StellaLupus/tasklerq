@@ -15,7 +15,7 @@ use crate::config::TenancyMode;
 use crate::llm::LlmHandle;
 use crate::security_audit::Audit;
 use crate::settings::crypto::SecretCipher;
-use crate::telegram::webhook::{self, Ingress};
+use crate::telegram::webhook::{self, Ingress, IngressSlot};
 
 /// Состояние приложения, доступное обработчикам.
 #[derive(Clone)]
@@ -24,8 +24,9 @@ pub struct AppState {
     pub pool: PgPool,
     /// Журнал событий безопасности.
     pub audit: Audit,
-    /// Приём Telegram webhook; `None`, если webhook выключен.
-    pub telegram: Option<Ingress>,
+    /// Приём Telegram webhook и признак смены поколения; приём пуст, если
+    /// webhook выключен или идёт переключение.
+    pub telegram: IngressSlot,
     /// Допустимый возраст необработанного обновления Telegram; `None`, если
     /// воркер обновлений не запущен и очередь не проверяется.
     pub queue_lag_limit: Option<chrono::Duration>,
@@ -51,7 +52,7 @@ impl AppState {
         Self {
             audit,
             pool,
-            telegram: None,
+            telegram: IngressSlot::default(),
             queue_lag_limit: None,
             tenancy_mode: TenancyMode::Single,
             capture: None,
@@ -91,8 +92,17 @@ impl AppState {
     }
 
     /// Включить приём Telegram webhook.
-    pub fn with_telegram(mut self, ingress: Ingress) -> Self {
-        self.telegram = Some(ingress);
+    pub fn with_telegram(self, ingress: Ingress) -> Self {
+        self.telegram.store(Some(ingress));
+        self
+    }
+
+    /// Подключить слот приёма супервизора Telegram.
+    ///
+    /// Так обработчик и супервизор делят текущее поколение: смена поколения
+    /// видна без пересборки роутера.
+    pub fn with_telegram_slot(mut self, telegram: IngressSlot) -> Self {
+        self.telegram = telegram;
         self
     }
 }

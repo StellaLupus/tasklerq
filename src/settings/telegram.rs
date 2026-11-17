@@ -279,10 +279,15 @@ fn resolve_telegram(
     let env_group = config.telegram.as_ref();
 
     // Публичный адрес — общий: `PUBLIC_BASE_URL` приоритетнее настройки.
+    //
+    // Группа из окружения целиком игнорирует строки базы: без
+    // `PUBLIC_BASE_URL` адрес не читается из `telegram.public_base_url`, как и
+    // `bot_id` с `webhook_url_override`.
     let (public_base_url, public_base_url_source, public_base_invalid) =
         match (&config.public_base_url, env_group.is_some()) {
             (Some(url), _) => (Some(url.clone()), SettingSource::Env, false),
-            (None, _) => match db_url(stored, "telegram.public_base_url", require_https) {
+            (None, true) => (None, SettingSource::Default, false),
+            (None, false) => match db_url(stored, "telegram.public_base_url", require_https) {
                 DbUrl::Absent => (None, SettingSource::Default, false),
                 DbUrl::Valid(url) => (Some(url), SettingSource::Db, false),
                 DbUrl::Invalid => (None, SettingSource::Db, true),

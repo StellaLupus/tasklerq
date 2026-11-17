@@ -24,7 +24,7 @@
 
 ## 2. Супервизор поколений
 
-- [ ] 2.1 `TelegramSupervisor` в `src/telegram/runtime.rs`: поколение со своим
+- [x] 2.1 `TelegramSupervisor` в `src/telegram/runtime.rs`: поколение со своим
   watch-каналом, производным от процессного shutdown; `Ingress` в
   `ArcSwapOption` в `AppState`; `webhook::receive` — `503` с `Retry-After` во
   время переключения и `404` в выключенном режиме. `build_application`

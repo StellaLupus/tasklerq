@@ -16,7 +16,9 @@ use support::db;
 use tasklerq::config::SecretString;
 use tasklerq::http::router::{AppState, build_router};
 use tasklerq::security_audit::Audit;
-use tasklerq::telegram::webhook::{Ingress, MAX_BODY_BYTES, SECRET_HEADER, WEBHOOKS_PER_SECOND};
+use tasklerq::telegram::webhook::{
+    Ingress, MAX_BODY_BYTES, SECRET_HEADER, SWITCH_RETRY_AFTER, WEBHOOKS_PER_SECOND,
+};
 use tokio::sync::Notify;
 use tower::ServiceExt;
 
@@ -294,6 +296,31 @@ async fn route_is_absent_when_webhook_mode_is_off() {
     let (status, _) = post(&app, Some(SECRET), update(5_000_020, "private", 42)).await;
 
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn route_answers_503_while_the_generation_is_switching() {
+    let db = db().await;
+    let ingress = Ingress::new(&SecretString::new(SECRET), Arc::new(Notify::new()));
+    let state = AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_telegram(ingress);
+    state.telegram.begin_switch();
+    let app = build_router(state).layer(MockConnectInfo(peer()));
+
+    let (status, retry_after) = post_forwarded(
+        &app,
+        Some(SECRET),
+        "203.0.113.9",
+        update(5_000_021, "private", 42),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(retry_after, Some(SWITCH_RETRY_AFTER.to_string()));
+    assert_eq!(
+        stored(&db.pool, 5_000_021).await,
+        0,
+        "an update during a switch must not be stored"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

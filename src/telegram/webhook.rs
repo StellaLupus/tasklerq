@@ -6,7 +6,9 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use arc_swap::ArcSwapOption;
 use axum::body::{Body, to_bytes};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -32,6 +34,10 @@ pub const SECRET_HEADER: &str = "x-telegram-bot-api-secret-token";
 
 /// Максимальный размер тела обновления.
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// Сколько секунд Telegram должен подождать перед повтором, пока идёт смена
+/// поколения.
+pub const SWITCH_RETRY_AFTER: u64 = 5;
 
 /// Не больше 120 webhook-запросов в секунду с одного IP.
 pub const WEBHOOKS_PER_SECOND: u32 = 120;
@@ -77,6 +83,45 @@ impl Ingress {
     }
 }
 
+/// Общий слот приёма webhook: текущее поколение и признак его смены.
+///
+/// Супервизор Telegram кладёт сюда приём поколения и снимает его на время
+/// переключения. Слот разделяется между супервизором и [`crate::http::router::AppState`],
+/// поэтому обработчик видит смену поколения без пересборки роутера.
+#[derive(Clone, Default)]
+pub struct IngressSlot {
+    ingress: Arc<ArcSwapOption<Ingress>>,
+    switching: Arc<AtomicBool>,
+}
+
+impl IngressSlot {
+    /// Поставить приём текущего поколения; `None` — режим без webhook.
+    pub fn store(&self, ingress: Option<Ingress>) {
+        self.ingress.store(ingress.map(Arc::new));
+    }
+
+    /// Текущий приём; `None` — webhook выключен или идёт переключение.
+    pub fn load(&self) -> Option<Arc<Ingress>> {
+        self.ingress.load_full()
+    }
+
+    /// Начать смену поколения: приём снимается, webhook отвечает `503`.
+    pub fn begin_switch(&self) {
+        self.switching.store(true, Ordering::SeqCst);
+        self.ingress.store(None);
+    }
+
+    /// Смена поколения закончена: приём уже в слоте (или его нет по режиму).
+    pub fn end_switch(&self) {
+        self.switching.store(false, Ordering::SeqCst);
+    }
+
+    /// Идёт смена поколения.
+    pub fn is_switching(&self) -> bool {
+        self.switching.load(Ordering::SeqCst)
+    }
+}
+
 /// `POST /webhooks/telegram`.
 pub async fn receive(
     State(state): State<AppState>,
@@ -84,7 +129,13 @@ pub async fn receive(
     headers: HeaderMap,
     body: Body,
 ) -> Result<StatusCode, ApiError> {
-    let Some(ingress) = &state.telegram else {
+    let Some(ingress) = state.telegram.load() else {
+        // Поколение меняется: Telegram повторит доставку, а отказ не считается
+        // ни ошибкой секрета, ни выключенным режимом.
+        if state.telegram.is_switching() {
+            return Err(ApiError::service_unavailable("Telegram is switching")
+                .with_retry_after(SWITCH_RETRY_AFTER));
+        }
         return Err(ApiError::not_found("Route not found"));
     };
 
