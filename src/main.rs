@@ -21,7 +21,7 @@ use tasklerq::domain::settings::DEFAULT_TIMEZONE;
 use tasklerq::http::server;
 use tasklerq::llm::OpenAiBackend;
 use tasklerq::redaction;
-use tasklerq::settings::{self, crypto::SecretCipher};
+use tasklerq::settings::{self, SettingSource, crypto::SecretCipher};
 use tasklerq::storage;
 use tokio::signal;
 use tracing_subscriber::EnvFilter;
@@ -478,12 +478,13 @@ async fn serve() -> Result<()> {
         .await
         .context("telegram startup failed")?;
     let telegram_mode = application.telegram_mode;
+    let telegram_source = application.telegram_source;
     let workers = application.workers;
     let app = application.router;
     let admin = listeners.admin.zip(application.admin_router);
     tracing::info!(
         mode = telegram_mode.as_str(),
-        workers = workers.len(),
+        source = telegram_source.map_or("none", SettingSource::as_str),
         "telegram configured"
     );
 

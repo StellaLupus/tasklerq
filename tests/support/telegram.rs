@@ -229,6 +229,10 @@ impl TelegramApi for FakeTelegram {
         Ok(())
     }
 
+    async fn delete_webhook(&self) -> Result<(), TelegramError> {
+        Ok(())
+    }
+
     async fn get_webhook_info(&self) -> Result<WebhookInfo, TelegramError> {
         Ok(WebhookInfo {
             url: String::new(),

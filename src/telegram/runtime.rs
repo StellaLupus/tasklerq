@@ -1,22 +1,25 @@
 //! Запуск Telegram-части сервиса: приём, воркеры и доставка.
 //!
 //! [`TelegramSupervisor`] владеет текущим поколением: клиентом Bot API, его
-//! задачами и собственным каналом остановки, производным от процессного
-//! shutdown. Первое поколение запускается при сборке приложения; смена
-//! поколения на лету появится вместе с консолью оператора.
+//! задачами и собственным каналом остановки. Первое поколение запускается при
+//! сборке приложения, следующее — [`TelegramSupervisor::reload`] по настройкам
+//! из базы. Процессный shutdown останавливает текущее поколение и ждёт его
+//! задачи независимо от того, когда поколение запущено.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use sqlx::PgPool;
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Mutex as AsyncMutex, Notify, watch};
 use tokio::task::JoinHandle;
 use url::Url;
 
-use crate::config::{TelegramMode, TenancyConfig};
+use crate::config::{Config, TelegramMode, TenancyConfig};
 use crate::jobs::scheduler::Scheduler;
 use crate::llm::LlmHandle;
 use crate::security_audit::Audit;
 use crate::settings::EffectiveTelegram;
+use crate::settings::crypto::SecretCipher;
 
 use super::api::{DEFAULT_BASE_URL, HttpTelegramApi, TelegramApi};
 use super::bot::Bot;
@@ -25,12 +28,19 @@ use super::outbox::OutboxWorker;
 use super::webhook::{Ingress, IngressSlot};
 use super::worker::{UPDATES_PER_MINUTE, UpdateWorker, poll};
 
-/// Поколение Telegram: канал остановки и фоновые задачи.
+/// Сколько ждать кооперативной остановки поколения перед `abort`.
+pub const STOP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Поколение Telegram: клиент Bot API, канал остановки и фоновые задачи.
 struct Generation {
-    /// Канал остановки поколения; срабатывает и от процессного shutdown.
+    /// Канал остановки поколения.
     stop: watch::Sender<bool>,
     /// Задачи поколения; завершаются по сигналу `stop`.
     tasks: Vec<JoinHandle<()>>,
+    /// Клиент поколения. Пока не используется после остановки; понадобится
+    /// смене бота для `deleteWebhook` прежним токеном.
+    #[allow(dead_code)]
+    api: Arc<dyn TelegramApi>,
 }
 
 /// Супервизор поколений Telegram.
@@ -47,8 +57,15 @@ pub struct TelegramSupervisor {
     max_attempts: u32,
     update_limit: Option<u32>,
     shutdown: watch::Receiver<bool>,
+    /// Окружение и параметры разбора настроек: те же, что при старте.
+    config: Config,
+    cipher: SecretCipher,
     ingress: IngressSlot,
     generation: Mutex<Option<Generation>>,
+    /// Сериализует смены поколения, включая остановку по shutdown процесса.
+    switch: AsyncMutex<()>,
+    /// Сколько ждать кооперативной остановки; переопределяется тестом.
+    stop_timeout: Mutex<Duration>,
 }
 
 /// Ошибка запуска Telegram-части.
@@ -59,12 +76,24 @@ pub enum StartError {
     Client(#[from] reqwest::Error),
 }
 
+/// Ошибка переключения поколения по сохранённым настройкам.
+#[derive(Debug, thiserror::Error)]
+pub enum ReloadError {
+    /// Не удалось прочитать настройки из базы.
+    #[error("could not read telegram settings")]
+    Database(#[from] sqlx::Error),
+    /// Не удалось запустить новое поколение.
+    #[error(transparent)]
+    Start(#[from] StartError),
+}
+
 impl TelegramSupervisor {
     /// Создать супервизор. Поколение запускается методом [`Self::start`].
     ///
     /// `update_limit = None` использует боевой [`UPDATES_PER_MINUTE`].
     /// Переопределение нужно нагрузочному тесту, который проверяет обработчик,
     /// а не ветку лимита.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool: PgPool,
         shutdown: watch::Receiver<bool>,
@@ -73,6 +102,8 @@ impl TelegramSupervisor {
         tenancy: TenancyConfig,
         max_attempts: u32,
         update_limit: Option<u32>,
+        config: Config,
+        cipher: SecretCipher,
     ) -> Arc<Self> {
         Arc::new(Self {
             pool,
@@ -82,8 +113,12 @@ impl TelegramSupervisor {
             max_attempts,
             update_limit,
             shutdown,
+            config,
+            cipher,
             ingress: IngressSlot::default(),
             generation: Mutex::new(None),
+            switch: AsyncMutex::new(()),
+            stop_timeout: Mutex::new(STOP_TIMEOUT),
         })
     }
 
@@ -92,11 +127,15 @@ impl TelegramSupervisor {
         self.ingress.clone()
     }
 
+    /// Переопределить ожидание кооперативной остановки (для тестов).
+    pub fn set_stop_timeout(&self, timeout: Duration) {
+        *self.stop_timeout.lock().expect("telegram stop timeout") = timeout;
+    }
+
     /// Отметить начало смены поколения.
     ///
-    /// Вызывается перед заменой настроек: приём снимается, webhook отвечает
-    /// `503` с `Retry-After`, пока новое поколение не встанет. В выключенном
-    /// режиме (поколения нет и не будет) ответ остаётся `404`.
+    /// Вручную не вызывается: [`Self::start`] и [`Self::reload`] делают это
+    /// сами и снимают признак на любом выходе.
     pub fn begin_switch(&self) {
         self.ingress.begin_switch();
     }
@@ -107,11 +146,36 @@ impl TelegramSupervisor {
     /// `disabled` ничего не запускается: API и capture продолжают работать без
     /// бота. `Ok(false)` — поколения нет.
     pub async fn start(&self, telegram: &EffectiveTelegram) -> Result<bool, StartError> {
+        let _switch = self.switch.lock().await;
+        self.switch_to(telegram).await
+    }
+
+    /// Переключить поколение по действующей конфигурации из базы и окружения.
+    ///
+    /// Настройки читаются так же, как при старте, поэтому смена токена, секрета
+    /// и режима не требует перезапуска. Ошибка чтения базы оставляет текущее
+    /// поколение работать. `Ok(false)` — бот выключен по новой конфигурации.
+    pub async fn reload(&self) -> Result<bool, ReloadError> {
+        let _switch = self.switch.lock().await;
+        let telegram =
+            crate::settings::read_effective_telegram(&self.pool, &self.config, &self.cipher)
+                .await?;
+        Ok(self.switch_to(&telegram).await?)
+    }
+
+    /// Заменить поколение; вызывается под мьютексом переключения.
+    async fn switch_to(&self, telegram: &EffectiveTelegram) -> Result<bool, StartError> {
+        // Процесс уже завершается: `run` либо остановит текущее поколение, либо
+        // уже сделал это. Новое поколение после его выхода никто бы не ждал.
+        if *self.shutdown.borrow() {
+            return Ok(false);
+        }
+        // Приём снимается на всё время переключения, а признак снимается на
+        // любом выходе, включая ошибку сборки клиента.
+        self.begin_switch();
+        let _switch = SwitchGuard(&self.ingress);
         self.stop_generation().await;
-        let started = self.start_generation(telegram).await?;
-        // Новое поколение готово: webhook снова отвечает по действующему режиму.
-        self.ingress.end_switch();
-        Ok(started)
+        self.start_generation(telegram).await
     }
 
     async fn start_generation(&self, telegram: &EffectiveTelegram) -> Result<bool, StartError> {
@@ -134,8 +198,8 @@ impl TelegramSupervisor {
         let wake_updates = Arc::new(Notify::new());
         let wake_outbox = Arc::new(Notify::new());
         // Канал поколения отдельный от процессного: остановка поколения не
-        // должна ждать останова процесса. Задача-мост переводит в него
-        // процессный shutdown.
+        // должна ждать останова процесса. Процессный shutdown переводит в него
+        // `run()` после завершения текущего переключения.
         let (stop, shutdown) = watch::channel(false);
         let mut tasks = Vec::new();
 
@@ -152,6 +216,13 @@ impl TelegramSupervisor {
                 }
             }
             TelegramMode::Polling => {
+                // Пока у бота стоит webhook, `getUpdates` отвечает `409`.
+                // Снимаем его до запуска polling, чтобы смена режима на лету
+                // действительно начинала принимать обновления.
+                match api.delete_webhook().await {
+                    Ok(()) => tracing::info!("telegram webhook removed for polling"),
+                    Err(error) => tracing::warn!(error = error.code(), "deleteWebhook failed"),
+                }
                 tasks.push(tokio::spawn(poll(
                     self.pool.clone(),
                     api.clone(),
@@ -188,69 +259,80 @@ impl TelegramSupervisor {
         let scheduler = Scheduler::new(self.pool.clone(), wake_outbox.clone());
         tasks.push(tokio::spawn(scheduler.run(shutdown.clone())));
 
-        let outbox = OutboxWorker::new(self.pool.clone(), api);
-        tasks.push(tokio::spawn(outbox.run(wake_outbox, shutdown.clone())));
-
-        tasks.push(spawn_shutdown_bridge(
-            self.shutdown.clone(),
-            stop.clone(),
-            shutdown,
-        ));
+        let outbox = OutboxWorker::new(self.pool.clone(), api.clone());
+        tasks.push(tokio::spawn(outbox.run(wake_outbox, shutdown)));
 
         *self.generation.lock().expect("telegram supervisor lock") =
-            Some(Generation { stop, tasks });
+            Some(Generation { stop, tasks, api });
         Ok(true)
     }
 
     /// Остановить текущее поколение и дождаться его задач.
     ///
     /// `false` — поколения не было. Процессный shutdown при этом не трогается:
-    /// это база для смены поколения из консоли.
+    /// это база для смены поколения из консоли. Если задача не остановилась за
+    /// [`Self::set_stop_timeout`], она получает `abort`, а в журнал уходит
+    /// ошибка без секретов.
     async fn stop_generation(&self) -> bool {
         let generation = self
             .generation
             .lock()
             .expect("telegram supervisor lock")
             .take();
-        let Some(generation) = generation else {
+        let Some(Generation { stop, tasks, .. }) = generation else {
             return false;
         };
         self.ingress.store(None);
-        // Сигнал обязателен и при уже сработавшем процессном shutdown: задачам
-        // нужно увидеть `true`, а не закрытие канала.
-        let _ = generation.stop.send(true);
-        for task in generation.tasks {
-            let _ = task.await;
+        // Сигнал обязателен и при уже сработавшем shutdown: задачам нужно
+        // увидеть `true`, а не закрытие канала.
+        let _ = stop.send(true);
+
+        let timeout = *self.stop_timeout.lock().expect("telegram stop timeout");
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut tasks = tasks;
+        for index in 0..tasks.len() {
+            if tokio::time::timeout_at(deadline, &mut tasks[index])
+                .await
+                .is_err()
+            {
+                tracing::error!(
+                    timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                    tasks = tasks.len(),
+                    "telegram generation did not stop in time; aborting its tasks"
+                );
+                for task in &tasks[index..] {
+                    task.abort();
+                }
+                for task in &mut tasks[index..] {
+                    let _ = task.await;
+                }
+                break;
+            }
         }
         true
     }
 
     /// Дождаться процессного shutdown и остановить поколение.
     ///
-    /// Задача живёт в [`crate::app::Application::workers`], поэтому graceful
-    /// shutdown процесса ждёт задачи поколения так же, как остальные воркеры.
+    /// Задача живёт в [`crate::app::Application::workers`] всегда, поэтому
+    /// graceful shutdown процесса ждёт задачи текущего поколения, даже если оно
+    /// запущено переключением после старта. Мьютекс переключения не даёт
+    /// shutdown разойтись с идущей сменой поколения.
     pub async fn run(self: Arc<Self>) {
         let mut shutdown = self.shutdown.clone();
         wait_stopped(&mut shutdown).await;
+        let _switch = self.switch.lock().await;
         self.stop_generation().await;
     }
 }
 
-/// Перевести процессный shutdown в канал остановки поколения.
-fn spawn_shutdown_bridge(
-    mut process: watch::Receiver<bool>,
-    stop: watch::Sender<bool>,
-    mut generation: watch::Receiver<bool>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        if !*process.borrow() {
-            tokio::select! {
-                _ = process.changed() => {}
-                _ = wait_stopped(&mut generation) => return,
-            }
-        }
-        let _ = stop.send(true);
-    })
+/// Снять признак переключения при выходе из [`TelegramSupervisor::switch_to`].
+struct SwitchGuard<'a>(&'a IngressSlot);
+
+impl Drop for SwitchGuard<'_> {
+    fn drop(&mut self) {
+        self.0.end_switch();
+    }
 }
 
 /// Дождаться `true` в канале остановки; закрытие отправителя тоже прекращает
@@ -274,7 +356,7 @@ mod tests {
     use sqlx::postgres::PgPoolOptions;
 
     use super::*;
-    use crate::config::TenancyMode;
+    use crate::config::{SecretString, TenancyMode};
 
     /// Супервизор без соединений с базой: тесты поколений в базу не ходят.
     fn test_supervisor(shutdown: watch::Receiver<bool>) -> Arc<TelegramSupervisor> {
@@ -282,6 +364,12 @@ mod tests {
             .max_connections(1)
             .connect_lazy("postgres://tasklerq:secret@127.0.0.1:1/tasklerq")
             .expect("lazy pool");
+        let config = Config::from_map([(
+            "DATABASE_URL",
+            "postgres://tasklerq:secret@127.0.0.1:1/tasklerq",
+        )])
+        .expect("test config");
+        let cipher = SecretCipher::from_config(&config);
         TelegramSupervisor::new(
             pool.clone(),
             shutdown,
@@ -293,13 +381,22 @@ mod tests {
             },
             3,
             None,
+            config,
+            cipher,
+        )
+    }
+
+    /// Клиент поколения, который никуда не ходит: тесты не вызывают Bot API.
+    fn idle_api() -> Arc<dyn TelegramApi> {
+        Arc::new(
+            HttpTelegramApi::new(SecretString::new("1:test"), DEFAULT_BASE_URL)
+                .expect("http client"),
         )
     }
 
     /// Поставить поколение из задач, которые ждут только его остановки.
     fn install_generation(
         supervisor: &TelegramSupervisor,
-        process: &watch::Receiver<bool>,
         workers: usize,
         finished: &Arc<AtomicUsize>,
     ) {
@@ -313,15 +410,14 @@ mod tests {
                 finished.fetch_add(1, Ordering::SeqCst);
             }));
         }
-        tasks.push(spawn_shutdown_bridge(
-            process.clone(),
-            stop.clone(),
-            stop_rx.clone(),
-        ));
         *supervisor
             .generation
             .lock()
-            .expect("telegram supervisor lock") = Some(Generation { stop, tasks });
+            .expect("telegram supervisor lock") = Some(Generation {
+            stop,
+            tasks,
+            api: idle_api(),
+        });
     }
 
     async fn wait_finished(finished: &AtomicUsize, expected: usize) {
@@ -337,19 +433,19 @@ mod tests {
     #[tokio::test]
     async fn process_shutdown_stops_generation_tasks() {
         let (process, process_rx) = watch::channel(false);
-        let supervisor = test_supervisor(process_rx.clone());
+        let supervisor = test_supervisor(process_rx);
         let finished = Arc::new(AtomicUsize::new(0));
-        install_generation(&supervisor, &process_rx, 2, &finished);
+        install_generation(&supervisor, 2, &finished);
 
+        let run = tokio::spawn(supervisor.clone().run());
         process.send(true).expect("process shutdown signal");
 
-        // Задачи видят только сигнал поколения: он приходит из моста.
         wait_finished(&finished, 2).await;
+        run.await.expect("shutdown task must finish");
         assert!(
-            supervisor.stop_generation().await,
-            "the generation handle must still be joinable"
+            supervisor.generation.lock().expect("lock").is_none(),
+            "process shutdown must take the generation handle"
         );
-        assert!(supervisor.generation.lock().expect("lock").is_none());
     }
 
     #[tokio::test]
@@ -357,7 +453,7 @@ mod tests {
         let (_process, process_rx) = watch::channel(false);
         let supervisor = test_supervisor(process_rx.clone());
         let finished = Arc::new(AtomicUsize::new(0));
-        install_generation(&supervisor, &process_rx, 2, &finished);
+        install_generation(&supervisor, 2, &finished);
 
         assert!(supervisor.stop_generation().await);
 
@@ -366,6 +462,60 @@ mod tests {
             !*process_rx.borrow(),
             "stopping a generation must not signal process shutdown"
         );
+        assert!(supervisor.generation.lock().expect("lock").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_switch_after_process_shutdown_starts_nothing() {
+        let (_process, process_rx) = watch::channel(true);
+        let supervisor = test_supervisor(process_rx);
+        let finished = Arc::new(AtomicUsize::new(0));
+        install_generation(&supervisor, 1, &finished);
+
+        let config = Config::from_map([(
+            "DATABASE_URL",
+            "postgres://tasklerq:secret@127.0.0.1:1/tasklerq",
+        )])
+        .expect("test config");
+        let cipher = SecretCipher::from_config(&config);
+        let telegram = crate::settings::effective_telegram(&config, &[], &cipher);
+
+        assert!(
+            !supervisor
+                .switch_to(&telegram)
+                .await
+                .expect("no generation after shutdown"),
+            "a switch must not start a generation after process shutdown"
+        );
+        assert!(
+            supervisor.generation.lock().expect("lock").is_some(),
+            "the running generation is left for `run` to stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stuck_generation_is_aborted_after_the_timeout() {
+        let (_process, process_rx) = watch::channel(false);
+        let supervisor = test_supervisor(process_rx);
+        let (stop, _stop_rx) = watch::channel(false);
+        let task = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        *supervisor
+            .generation
+            .lock()
+            .expect("telegram supervisor lock") = Some(Generation {
+            stop,
+            tasks: vec![task],
+            api: idle_api(),
+        });
+        supervisor.set_stop_timeout(Duration::from_millis(50));
+
+        let stopped = tokio::time::timeout(Duration::from_secs(5), supervisor.stop_generation())
+            .await
+            .expect("the supervisor must not wait for a stuck task");
+
+        assert!(stopped);
         assert!(supervisor.generation.lock().expect("lock").is_none());
     }
 }

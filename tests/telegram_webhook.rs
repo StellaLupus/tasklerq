@@ -13,13 +13,16 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use support::db;
-use tasklerq::config::SecretString;
+use tasklerq::config::{Config, SecretString, TenancyConfig, TenancyMode};
 use tasklerq::http::router::{AppState, build_router};
+use tasklerq::llm::LlmHandle;
 use tasklerq::security_audit::Audit;
+use tasklerq::settings::{self, crypto::SecretCipher};
+use tasklerq::telegram::runtime::TelegramSupervisor;
 use tasklerq::telegram::webhook::{
     Ingress, MAX_BODY_BYTES, SECRET_HEADER, SWITCH_RETRY_AFTER, WEBHOOKS_PER_SECOND,
 };
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tower::ServiceExt;
 
 const SECRET: &str = "webhook-secret";
@@ -299,13 +302,34 @@ async fn route_is_absent_when_webhook_mode_is_off() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn route_answers_503_while_the_generation_is_switching() {
+async fn route_answers_503_while_the_supervisor_switches_and_404_afterwards() {
     let db = db().await;
-    let ingress = Ingress::new(&SecretString::new(SECRET), Arc::new(Notify::new()));
-    let state = AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_telegram(ingress);
-    state.telegram.begin_switch();
+    let config = Config::from_map([(
+        "DATABASE_URL",
+        "postgres://tasklerq:secret@127.0.0.1:5432/tasklerq",
+    )])
+    .expect("headless config");
+    let cipher = SecretCipher::from_config(&config);
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let supervisor = TelegramSupervisor::new(
+        db.pool.clone(),
+        shutdown_rx,
+        LlmHandle::empty(),
+        Audit::new(db.pool.clone()),
+        TenancyConfig {
+            mode: TenancyMode::Single,
+            bootstrap_owner: None,
+        },
+        3,
+        None,
+        config.clone(),
+        cipher.clone(),
+    );
+    let state = AppState::new(db.pool.clone(), Audit::new(db.pool.clone()))
+        .with_telegram_slot(supervisor.ingress());
     let app = build_router(state).layer(MockConnectInfo(peer()));
 
+    supervisor.begin_switch();
     let (status, retry_after) = post_forwarded(
         &app,
         Some(SECRET),
@@ -321,6 +345,22 @@ async fn route_answers_503_while_the_generation_is_switching() {
         0,
         "an update during a switch must not be stored"
     );
+
+    // Конфигурация без Telegram: переключение заканчивается выключенным
+    // режимом, и маршрут снова отвечает `404`, а не остаётся в `503`.
+    let telegram = settings::effective_telegram(&config, &[], &cipher);
+    assert!(
+        !supervisor.start(&telegram).await.expect("generation start"),
+        "a headless configuration has no generation"
+    );
+    let (status, _) = post_forwarded(
+        &app,
+        Some(SECRET),
+        "203.0.113.9",
+        update(5_000_022, "private", 42),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

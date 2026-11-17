@@ -915,8 +915,9 @@ async fn build_application_starts_retention_without_telegram() {
         .expect("application should build in disabled mode");
     assert_eq!(
         application.workers.len(),
-        2,
-        "retention and the domain ticker must run even without Telegram"
+        3,
+        "retention, the domain ticker and the Telegram supervisor must run even without Telegram; \
+         the supervisor waits for a generation enabled later by a reload"
     );
 
     shutdown_tx.send(true).expect("shutdown signal");

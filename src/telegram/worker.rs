@@ -19,7 +19,7 @@ use crate::metrics;
 use crate::rate_limit::{RateLimiter, retry_after_seconds};
 use crate::security_audit::{Audit, LimitKey, RateLimitEvent};
 
-use super::api::TelegramApi;
+use super::api::{TelegramApi, TelegramError};
 use super::bot::{Answer, Bot, Outcome};
 use super::outbox::{self, Outgoing};
 use super::queue::{self, Failure};
@@ -33,6 +33,8 @@ pub const UPDATES_PER_MINUTE: u32 = 20;
 pub const DEFERRED_QUEUE_LIMIT: i64 = 20;
 /// Окно лимита обновлений, секунды.
 const UPDATE_WINDOW_SECONDS: i64 = 60;
+/// Пауза перед повтором `getUpdates` после `409 Conflict`, секунды.
+pub const POLL_CONFLICT_RETRY_SECONDS: u64 = 3;
 
 /// Итог одного прохода воркера.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -461,6 +463,21 @@ pub async fn poll(
         };
         let updates = match batch {
             Ok(updates) => updates,
+            // `409` — прежнее поколение или другой экземпляр ещё держит long
+            // polling. Это временное состояние: повторяем запрос, а не
+            // завершаем воркер.
+            Err(TelegramError::Conflict) => {
+                tracing::warn!(
+                    error = "conflict",
+                    retry_after = POLL_CONFLICT_RETRY_SECONDS,
+                    "getUpdates conflict: another consumer is polling; retrying"
+                );
+                tokio::select! {
+                    _ = shutdown.changed() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(POLL_CONFLICT_RETRY_SECONDS)) => {}
+                }
+                continue;
+            }
             Err(error) => {
                 tracing::warn!(error = error.code(), "getUpdates failed");
                 tokio::time::sleep(Duration::from_secs(3)).await;

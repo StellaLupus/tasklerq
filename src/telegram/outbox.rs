@@ -480,6 +480,21 @@ impl OutboxWorker {
         now: DateTime<Utc>,
         clock: Instant,
     ) -> Result<usize, sqlx::Error> {
+        self.run_batch(now, clock, None).await
+    }
+
+    /// Проход с проверкой остановки между сообщениями пакета.
+    ///
+    /// Начатый `deliver_one` не прерывается: вызов Bot API, запись
+    /// `message_id` и commit идут до конца. Сигнал проверяется перед следующим
+    /// сообщением, иначе медленный API не давал бы поколению остановиться
+    /// между пакетами.
+    async fn run_batch(
+        &mut self,
+        now: DateTime<Utc>,
+        clock: Instant,
+        shutdown: Option<&watch::Receiver<bool>>,
+    ) -> Result<usize, sqlx::Error> {
         // Головы очередей по чатам: следующее сообщение чата не обгоняет
         // предыдущее, даже если оно ждёт повтора после ошибки. Сообщение,
         // изначально запланированное на будущее (отложенное напоминание),
@@ -504,6 +519,9 @@ impl OutboxWorker {
 
         let mut sent = 0;
         for seq in candidates {
+            if shutdown.is_some_and(|shutdown| *shutdown.borrow()) {
+                break;
+            }
             match self.deliver_one(seq, now, clock).await? {
                 Delivery::Sent => sent += 1,
                 Delivery::Skipped | Delivery::Deferred | Delivery::Dead | Delivery::Idle => {}
@@ -675,20 +693,21 @@ impl OutboxWorker {
                 return;
             }
             // Паника не должна молча останавливать доставку.
-            let delivered = match AssertUnwindSafe(self.run_once(Utc::now(), Instant::now()))
-                .catch_unwind()
-                .await
-            {
-                Ok(Ok(delivered)) => delivered,
-                Ok(Err(error)) => {
-                    tracing::error!(%error, "outbox pass failed");
-                    0
-                }
-                Err(_) => {
-                    tracing::error!("outbox pass panicked");
-                    0
-                }
-            };
+            let delivered =
+                match AssertUnwindSafe(self.run_batch(Utc::now(), Instant::now(), Some(&shutdown)))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(Ok(delivered)) => delivered,
+                    Ok(Err(error)) => {
+                        tracing::error!(%error, "outbox pass failed");
+                        0
+                    }
+                    Err(_) => {
+                        tracing::error!("outbox pass panicked");
+                        0
+                    }
+                };
             if delivered > 0 {
                 continue;
             }

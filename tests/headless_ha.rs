@@ -104,8 +104,9 @@ async fn headless_disabled_telegram_serves_the_home_assistant_scenario() {
         .expect("application should build in disabled mode");
     assert_eq!(
         application.workers.len(),
-        2,
-        "disabled Telegram starts retention and the domain ticker"
+        3,
+        "disabled Telegram still starts the supervisor for a later reload, plus retention and \
+         the domain ticker"
     );
 
     // Первый тик доменного тикера срабатывает сразу после старта: ручной тик

@@ -46,6 +46,9 @@ pub enum TelegramError {
     /// Бот заблокирован пользователем или чат недоступен.
     #[error("forbidden: {0}")]
     Forbidden(String),
+    /// `409 Conflict`: другой экземпляр или поколение держит long polling.
+    #[error("conflict: another consumer is polling")]
+    Conflict,
     /// Запрос отклонён Telegram; повтор бессмысленен.
     #[error("bad request: {0}")]
     BadRequest(String),
@@ -68,6 +71,7 @@ impl TelegramError {
             Self::MessageGone => "message_gone",
             Self::MessageUndeletable => "message_undeletable",
             Self::Forbidden(_) => "forbidden",
+            Self::Conflict => "conflict",
             Self::BadRequest(_) => "bad_request",
             Self::Transient(_) => "transient",
         }
@@ -139,6 +143,9 @@ pub trait TelegramApi: Send + Sync {
 
     /// Зарегистрировать webhook с секретом.
     async fn set_webhook(&self, url: &str, secret_token: &str) -> Result<(), TelegramError>;
+
+    /// Снять webhook перед long polling.
+    async fn delete_webhook(&self) -> Result<(), TelegramError>;
 
     /// Прочитать состояние webhook.
     async fn get_webhook_info(&self) -> Result<WebhookInfo, TelegramError>;
@@ -226,6 +233,7 @@ struct EnvelopeParameters {
 pub fn parse_response<T: DeserializeOwned>(status: u16, body: &str) -> Result<T, TelegramError> {
     let envelope: Envelope<T> = match serde_json::from_str(body) {
         Ok(envelope) => envelope,
+        Err(_) if status == 409 => return Err(TelegramError::Conflict),
         Err(_) if status >= 500 => {
             return Err(TelegramError::Transient(format!("http {status}")));
         }
@@ -247,6 +255,9 @@ pub fn parse_response<T: DeserializeOwned>(status: u16, body: &str) -> Result<T,
             .and_then(|parameters| parameters.retry_after)
             .unwrap_or(1);
         return Err(TelegramError::RetryAfter(retry_after));
+    }
+    if code == 409 {
+        return Err(TelegramError::Conflict);
     }
     if lowered.contains("message is not modified") {
         return Err(TelegramError::NotModified);
@@ -383,6 +394,16 @@ impl TelegramApi for HttpTelegramApi {
                 "allowed_updates": ["message", "callback_query"],
                 "drop_pending_updates": false,
             }),
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn delete_webhook(&self) -> Result<(), TelegramError> {
+        self.call::<Value>(
+            "deleteWebhook",
+            &json!({"drop_pending_updates": false}),
             None,
         )
         .await

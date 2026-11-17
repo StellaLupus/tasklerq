@@ -25,6 +25,7 @@ use crate::http::client::{Client, TrustedProxies};
 use crate::llm::LlmSettings;
 use crate::rate_limit::{RateDecision, RateLimiter};
 use crate::security_audit::{Audit, LimitKey, RateLimitEvent};
+use crate::telegram::runtime::TelegramSupervisor;
 
 use super::checks::CheckState;
 use super::wizard::{WIZARD_PATH, WIZARD_SKIP_PATH, WizardSettings};
@@ -68,6 +69,8 @@ pub struct AdminState {
     queue_lag_limit: Option<chrono::Duration>,
     /// Ход проверки слота; одна проверка на процесс.
     checks: CheckState,
+    /// Супервизор поколений Telegram: переключение настроек без перезапуска.
+    telegram_supervisor: Option<Arc<TelegramSupervisor>>,
 }
 
 impl AdminState {
@@ -96,7 +99,22 @@ impl AdminState {
             llm_slots,
             queue_lag_limit: None,
             checks: CheckState::new(),
+            telegram_supervisor: None,
         }
+    }
+
+    /// Задать супервизор поколений Telegram.
+    ///
+    /// Консоль переключает бота без перезапуска тем же супервизором, что
+    /// запустил текущее поколение.
+    pub fn with_telegram_supervisor(mut self, supervisor: Arc<TelegramSupervisor>) -> Self {
+        self.telegram_supervisor = Some(supervisor);
+        self
+    }
+
+    /// Супервизор поколений Telegram, если консоль собрана рантаймом.
+    pub fn telegram_supervisor(&self) -> Option<&Arc<TelegramSupervisor>> {
+        self.telegram_supervisor.as_ref()
     }
 
     /// Задать тот же экземпляр проверки слотов, что у readiness.

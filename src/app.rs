@@ -31,14 +31,18 @@ pub struct Application {
     pub router: Router,
     /// Роутер консоли; `None`, если `ADMIN_BIND_ADDR=disabled`.
     pub admin_router: Option<Router>,
-    /// Фоновые задачи: супервизор Telegram (в режиме `disabled` его нет),
-    /// retention и доменный тикер.
+    /// Фоновые задачи: супервизор Telegram, retention и доменный тикер.
+    /// Супервизор живёт всегда и ждёт текущее поколение, даже если бот включён
+    /// переключением после старта.
     pub workers: Vec<JoinHandle<()>>,
     /// Применение сохранённых настроек LLM к снимку без перезапуска: вход
     /// будущей консоли администратора и тестов.
     pub llm_settings: LlmSettings,
-    /// Действующий режим Telegram: из окружения, базы или `disabled`.
+    /// Действующий режим Telegram на момент старта: из окружения, базы или
+    /// `disabled`.
     pub telegram_mode: TelegramMode,
+    /// Источник группы Telegram на момент старта; `None` — группа не настроена.
+    pub telegram_source: Option<settings::SettingSource>,
     /// Супервизор поколений Telegram: консоль будет менять бота через него.
     pub telegram_supervisor: Arc<TelegramSupervisor>,
 }
@@ -91,6 +95,7 @@ pub async fn build_application_with_update_limit(
     // делят состояние подавления и счётчики отказов.
     let audit = Audit::new(pool.clone());
     let telegram_mode = telegram.mode();
+    let telegram_source = telegram.source();
     let supervisor = runtime::TelegramSupervisor::new(
         pool.clone(),
         shutdown.clone(),
@@ -99,6 +104,8 @@ pub async fn build_application_with_update_limit(
         config.tenancy,
         config.queue.max_attempts,
         update_limit,
+        config.clone(),
+        secret_cipher.clone(),
     );
     let telegram_started = supervisor.start(&telegram).await?;
 
@@ -112,11 +119,10 @@ pub async fn build_application_with_update_limit(
     if telegram_started {
         state = state.with_queue_lag_limit(config.queue.ready_lag_seconds);
         queue_lag_seconds = Some(config.queue.ready_lag_seconds);
-        // Супервизор останавливает поколение по процессному shutdown и ждёт его
-        // задачи, поэтому graceful shutdown процесса видит их наравне с
-        // остальными воркерами.
-        workers.push(tokio::spawn(Arc::clone(&supervisor).run()));
     }
+    // Супервизор запускается всегда: поколение, включённое из консоли после
+    // старта, тоже должно дождаться graceful shutdown процесса.
+    workers.push(tokio::spawn(Arc::clone(&supervisor).run()));
     if config.capture.enabled {
         state = state.with_capture(CaptureState::new(config.capture, llm));
     }
@@ -132,7 +138,8 @@ pub async fn build_application_with_update_limit(
             llm_settings.clone(),
         )
         .with_wizard(wizard)
-        .with_llm_slots(llm_slots);
+        .with_llm_slots(llm_slots)
+        .with_telegram_supervisor(Arc::clone(&supervisor));
         if let Some(seconds) = queue_lag_seconds {
             admin = admin.with_queue_lag_limit(seconds);
         }
@@ -152,14 +159,16 @@ pub async fn build_application_with_update_limit(
         workers,
         llm_settings,
         telegram_mode,
+        telegram_source,
         telegram_supervisor: supervisor,
     })
 }
 
 /// Собрать действующую конфигурацию Telegram из базы и окружения.
 ///
-/// Бот, настроенный только в консоли, начинает работать после перезапуска.
-/// Сбой чтения базы не роняет сервис: действует конфигурация из окружения
+/// Бот, настроенный только в консоли, подхватывается переключением поколения
+/// (в том числе при следующем старте). Сбой чтения базы не роняет сервис:
+/// действует конфигурация из окружения
 /// (без строк настройки Telegram выключен), а в журнал уходит предупреждение без
 /// значений настроек.
 async fn build_effective_telegram(
