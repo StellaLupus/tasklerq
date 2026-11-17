@@ -229,7 +229,7 @@
   ли веб-UI в v0.3» закрыть; строки в журнале решений про отдельный listener и
   секреты в базе под ключом. Проверить: документ не противоречит
   `TENANCY_MODE=multi`.
-- [ ] 7.2 Итоговая проверка: `cargo fmt --check`,
+- [x] 7.2 Итоговая проверка: `cargo fmt --check`,
   `cargo clippy --all-targets -- -D warnings`, `cargo test`,
   `openspec validate 0013-admin-console-foundation --strict`; ручной прогон в
   `docker compose`: пустая база → setup-код из лога → мастер → токен HA →
