@@ -82,7 +82,11 @@ fn minimal_development_config_is_valid() {
     let config = config(base_env()).expect("config should be valid");
 
     assert_eq!(config.env, Environment::Development);
-    assert_eq!(config.telegram.mode, TelegramMode::Disabled);
+    assert!(
+        config.telegram.is_none(),
+        "TELEGRAM_MODE without a token is ignored"
+    );
+    assert_eq!(config.telegram_ignored_env, vec!["TELEGRAM_MODE"]);
     assert_eq!(config.database.max_connections, 10);
     assert!(config.capture.enabled);
     assert_eq!(config.llm.enabled, Some(false));
@@ -109,7 +113,10 @@ fn defaults_match_documented_values() {
     let config = config(vars).expect("defaults should produce a valid config");
 
     assert_eq!(config.bind_addr, "0.0.0.0:8080".parse().unwrap());
-    assert_eq!(config.telegram.mode, TelegramMode::Webhook);
+    assert_eq!(
+        config.telegram.as_ref().map(|telegram| telegram.mode),
+        Some(TelegramMode::Webhook)
+    );
     // Флаг больше не имеет умолчания `true`: без переменной он не задан.
     assert_eq!(config.llm.enabled, None);
     assert!(config.capture.enabled);
@@ -608,7 +615,8 @@ fn secret_key_errors_name_the_parameter_and_expected_format() {
 
 #[derive(Debug)]
 enum TelegramExpected {
-    Ok(TelegramMode),
+    /// `None` — окружение не задаёт группу Telegram.
+    Ok(Option<TelegramMode>),
     Missing(&'static str),
     Invalid(&'static str),
 }
@@ -619,7 +627,7 @@ fn telegram_case(
     token: Option<&str>,
     secret: Option<&str>,
     webhook_url: Option<&str>,
-) -> Result<TelegramConfig, ConfigError> {
+) -> Result<Option<TelegramConfig>, ConfigError> {
     let mut vars = base_env();
     vars.insert("ENV".to_owned(), environment.to_owned());
     if environment == "production" {
@@ -665,7 +673,7 @@ fn telegram_config_covers_modes_and_required_values() {
             None,
             None,
             None,
-            TelegramExpected::Ok(TelegramMode::Disabled),
+            TelegramExpected::Ok(None),
         ),
         (
             "development",
@@ -673,7 +681,7 @@ fn telegram_config_covers_modes_and_required_values() {
             Some("123:token"),
             Some("secret"),
             Some("http://127.0.0.1:8080/webhooks/telegram"),
-            TelegramExpected::Ok(TelegramMode::Disabled),
+            TelegramExpected::Ok(Some(TelegramMode::Disabled)),
         ),
         (
             "development",
@@ -705,7 +713,7 @@ fn telegram_config_covers_modes_and_required_values() {
             Some("123:token"),
             Some("secret"),
             Some("http://127.0.0.1:8080/webhooks/telegram"),
-            TelegramExpected::Ok(TelegramMode::Webhook),
+            TelegramExpected::Ok(Some(TelegramMode::Webhook)),
         ),
         (
             "production",
@@ -713,7 +721,7 @@ fn telegram_config_covers_modes_and_required_values() {
             Some("123:token"),
             Some("secret"),
             Some("https://tasklerq.example.com/webhooks/telegram"),
-            TelegramExpected::Ok(TelegramMode::Webhook),
+            TelegramExpected::Ok(Some(TelegramMode::Webhook)),
         ),
         (
             "production",
@@ -737,7 +745,7 @@ fn telegram_config_covers_modes_and_required_values() {
             Some("123:token"),
             None,
             None,
-            TelegramExpected::Ok(TelegramMode::Polling),
+            TelegramExpected::Ok(Some(TelegramMode::Polling)),
         ),
         (
             "production",
@@ -748,26 +756,162 @@ fn telegram_config_covers_modes_and_required_values() {
             TelegramExpected::Invalid("TELEGRAM_MODE"),
         ),
         (
+            "production",
+            Some("polling"),
+            None,
+            None,
+            None,
+            TelegramExpected::Missing("TELEGRAM_BOT_TOKEN"),
+        ),
+        (
             "development",
             None,
             Some("123:token"),
             Some("secret"),
             Some("http://127.0.0.1:8080/webhooks/telegram"),
-            TelegramExpected::Ok(TelegramMode::Webhook),
+            TelegramExpected::Ok(Some(TelegramMode::Webhook)),
+        ),
+        (
+            "development",
+            None,
+            None,
+            None,
+            None,
+            TelegramExpected::Ok(None),
+        ),
+        (
+            "production",
+            None,
+            None,
+            None,
+            None,
+            TelegramExpected::Ok(None),
         ),
     ];
 
     for (environment, mode, token, secret, webhook_url, expected) in cases {
         let result = telegram_case(environment, mode, token, secret, webhook_url);
         match expected {
-            TelegramExpected::Ok(mode) => {
+            TelegramExpected::Ok(expected_mode) => {
                 let config = result.expect("telegram config should be valid");
-                assert_eq!(config.mode, mode);
+                assert_eq!(
+                    config.map(|telegram| telegram.mode),
+                    expected_mode,
+                    "{environment} {mode:?} {token:?}"
+                );
             }
             TelegramExpected::Missing(name) => assert_missing(result.unwrap_err(), name),
             TelegramExpected::Invalid(name) => assert_invalid(result.unwrap_err(), name),
         }
     }
+}
+
+#[test]
+fn database_url_alone_leaves_telegram_unset() {
+    let config = Config::from_map([(
+        "DATABASE_URL",
+        "postgres://tasklerq:db-password@127.0.0.1:5432/tasklerq?sslmode=disable",
+    )])
+    .expect("strict minimal config");
+
+    assert!(config.telegram.is_none());
+    assert!(config.telegram_ignored_env.is_empty());
+    assert!(config.telegram_api_base_url.is_none());
+}
+
+#[test]
+fn telegram_mode_disabled_without_token_is_ignored() {
+    let config = config_with(&[("TELEGRAM_MODE", "disabled")]).expect("config");
+
+    assert!(config.telegram.is_none());
+    assert_eq!(config.telegram_ignored_env, vec!["TELEGRAM_MODE"]);
+}
+
+#[test]
+fn lone_telegram_variables_without_token_are_ignored() {
+    let mut vars = minimal_env();
+    vars.insert(
+        "TELEGRAM_BOT_USERNAME".to_owned(),
+        "@lone-bot-name".to_owned(),
+    );
+    vars.insert(
+        "TELEGRAM_WEBHOOK_URL".to_owned(),
+        "http://127.0.0.1:8080/webhooks/telegram".to_owned(),
+    );
+    vars.insert(
+        "TELEGRAM_WEBHOOK_SECRET".to_owned(),
+        "lone-webhook-secret".to_owned(),
+    );
+
+    let config = config(vars).expect("lone variables must not stop startup");
+
+    assert!(config.telegram.is_none());
+    assert_eq!(
+        config.telegram_ignored_env,
+        vec![
+            "TELEGRAM_BOT_USERNAME",
+            "TELEGRAM_WEBHOOK_URL",
+            "TELEGRAM_WEBHOOK_SECRET",
+        ]
+    );
+}
+
+#[test]
+fn ignored_telegram_variables_are_logged_without_values() {
+    let mut vars = minimal_env();
+    vars.insert("TELEGRAM_MODE".to_owned(), "disabled".to_owned());
+    vars.insert(
+        "TELEGRAM_BOT_USERNAME".to_owned(),
+        "SECRET-lone-username".to_owned(),
+    );
+    vars.insert(
+        "TELEGRAM_WEBHOOK_URL".to_owned(),
+        "http://127.0.0.1:8080/SECRET-lone-webhook".to_owned(),
+    );
+    vars.insert(
+        "TELEGRAM_WEBHOOK_SECRET".to_owned(),
+        "SECRET-lone-webhook-secret".to_owned(),
+    );
+    let config = config(vars).expect("config should be valid");
+    let buffer = LogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(buffer.clone())
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || config.log_startup());
+
+    let logs = buffer.contents();
+    for name in [
+        "TELEGRAM_MODE",
+        "TELEGRAM_BOT_USERNAME",
+        "TELEGRAM_WEBHOOK_URL",
+        "TELEGRAM_WEBHOOK_SECRET",
+    ] {
+        assert!(
+            logs.contains(name),
+            "the warning names the ignored variable {name}: {logs}"
+        );
+    }
+    assert!(
+        logs.contains("\"level\":\"WARN\""),
+        "warnings are logged at WARN level: {logs}"
+    );
+    assert!(
+        logs.contains("ignored"),
+        "the warning says the variable is ignored: {logs}"
+    );
+    assert!(
+        !logs.contains("SECRET-lone"),
+        "the warning must not contain values: {logs}"
+    );
+}
+
+#[test]
+fn invalid_telegram_mode_without_token_is_still_rejected() {
+    let error = config_with(&[("TELEGRAM_MODE", "saas")])
+        .expect_err("an unknown mode is invalid even without a token");
+    assert_invalid(error, "TELEGRAM_MODE");
 }
 
 const PRIMARY_URL: &str = "https://llm.example.com/v1";
@@ -1326,7 +1470,9 @@ fn telegram_api_base_url_allows_http_only_in_development() {
         "http://127.0.0.1:8080".to_owned(),
     );
     let loaded = config(vars).expect("http is allowed in development");
-    assert_eq!(loaded.telegram.api_base_url.expect("url").scheme(), "http");
+    // Адрес Bot API не описывает бота: он применяется и без токена в окружении.
+    assert!(loaded.telegram.is_none());
+    assert_eq!(loaded.telegram_api_base_url.expect("url").scheme(), "http");
 
     let mut vars = base_env();
     vars.insert("ENV".to_owned(), "production".to_owned());
@@ -1354,7 +1500,7 @@ fn telegram_api_base_url_allows_http_only_in_development() {
         "https://api.telegram.org".to_owned(),
     );
     let loaded = config(vars).expect("https is always allowed");
-    assert_eq!(loaded.telegram.api_base_url.expect("url").scheme(), "https");
+    assert_eq!(loaded.telegram_api_base_url.expect("url").scheme(), "https");
 }
 
 /// Активные строки `.env.example`: без комментариев и пустых строк.

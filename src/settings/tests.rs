@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use super::*;
-use crate::config::{LlmConfig, SecretKey};
+use crate::config::{Config, LlmConfig, SecretKey, TelegramMode};
 
 fn slot(url: &str, model: &str) -> SlotConfig {
     SlotConfig {
@@ -36,6 +36,15 @@ fn llm(enabled: Option<bool>, primary: Option<SlotConfig>) -> LlmConfig {
 fn cipher() -> SecretCipher {
     let key = SecretKey::parse(&BASE64.encode([0_u8; 32])).expect("32 zero bytes are a key");
     SecretCipher::new(Some(key), None)
+}
+
+fn cipher_for(byte: u8) -> SecretCipher {
+    let key = SecretKey::parse(&BASE64.encode([byte; 32])).expect("32 bytes are a key");
+    SecretCipher::new(Some(key), None)
+}
+
+fn cipher_without_key() -> SecretCipher {
+    SecretCipher::new(None, None)
 }
 
 fn plain(key: &str, value: Value) -> StoredSetting {
@@ -290,7 +299,12 @@ fn settings_show_defaults_and_reject_invalid_database_scalars() {
 
 #[test]
 fn the_key_list_marks_exactly_the_token_keys_as_secret_and_names_are_unique() {
-    let secret_keys = ["llm.primary.token", "llm.fallback.token"];
+    let secret_keys = [
+        "llm.primary.token",
+        "llm.fallback.token",
+        "telegram.bot_token",
+        "telegram.webhook_secret",
+    ];
     for key in SETTING_KEYS {
         assert_eq!(
             secret_keys.contains(&key.name),
@@ -323,4 +337,296 @@ fn secret_contexts_are_built_from_the_setting_scope() {
         secret_context(SettingScope::Household, Some(household), key),
         SecretContext::household(household, key)
     );
+}
+
+/// Конфигурация с окружением, в котором Telegram задан только перечисленными
+/// переменными.
+fn telegram_config(pairs: &[(&str, &str)]) -> Config {
+    let mut vars: Vec<(String, String)> = [
+        ("ENV", "development"),
+        (
+            "DATABASE_URL",
+            "postgres://tasklerq:secret@localhost:5432/tasklerq",
+        ),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.to_owned(), value.to_owned()))
+    .collect();
+    vars.extend(
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
+    );
+    Config::from_map(vars).expect("test environment is valid")
+}
+
+fn telegram_env_group() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("TELEGRAM_MODE", "webhook"),
+        ("TELEGRAM_BOT_TOKEN", "env-token"),
+        ("TELEGRAM_WEBHOOK_SECRET", "env-webhook-secret"),
+        (
+            "TELEGRAM_WEBHOOK_URL",
+            "http://127.0.0.1:8080/webhooks/telegram",
+        ),
+    ]
+}
+
+fn stored_telegram(mode: &str, token: Option<&str>) -> Vec<StoredSetting> {
+    let mut stored = vec![plain("telegram.mode", json!(mode))];
+    if let Some(token) = token {
+        stored.push(secret("telegram.bot_token", token));
+    }
+    stored
+}
+
+fn telegram_setting<'a>(effective: &'a EffectiveTelegram, key: &str) -> &'a ResolvedSetting {
+    effective
+        .settings()
+        .iter()
+        .find(|setting| setting.key == key)
+        .unwrap_or_else(|| panic!("known key {key}"))
+}
+
+#[test]
+fn an_environment_token_takes_the_whole_group_and_ignores_database_rows() {
+    let env = telegram_config(&telegram_env_group());
+    let stored = vec![
+        plain("telegram.mode", json!("disabled")),
+        plain("telegram.bot_username", json!("dbbot")),
+        plain("telegram.bot_id", json!(42)),
+        plain("telegram.public_base_url", json!("https://db.example.test")),
+        secret("telegram.webhook_secret", "db-webhook-secret"),
+        secret("telegram.bot_token", "db-token"),
+    ];
+
+    let effective = effective_telegram(&env, &stored, &cipher());
+
+    assert_eq!(effective.source(), Some(SettingSource::Env));
+    assert!(effective.is_enabled());
+    let group = effective.config().expect("group");
+    assert_eq!(group.mode, TelegramMode::Webhook);
+    assert_eq!(
+        group.bot_token.as_ref().map(SecretString::expose),
+        Some("env-token")
+    );
+    assert_eq!(
+        group.webhook_secret.as_ref().map(SecretString::expose),
+        Some("env-webhook-secret")
+    );
+    assert_eq!(group.bot_username, "tasklerqbot");
+    assert_eq!(
+        group.webhook_url.as_ref().map(|url| url.as_str()),
+        Some("http://127.0.0.1:8080/webhooks/telegram")
+    );
+
+    for key in [
+        "telegram.mode",
+        "telegram.bot_token",
+        "telegram.bot_username",
+        "telegram.webhook_secret",
+    ] {
+        assert_eq!(
+            telegram_setting(&effective, key).source,
+            SettingSource::Env,
+            "{key} must come from the environment"
+        );
+    }
+    assert_eq!(
+        telegram_setting(&effective, "telegram.bot_token").value,
+        None,
+        "a secret is never shown"
+    );
+    assert_eq!(
+        telegram_setting(&effective, "telegram.bot_token").secret,
+        Some(SecretState::Set)
+    );
+    assert_eq!(
+        telegram_setting(&effective, "telegram.bot_id").source,
+        SettingSource::Default,
+        "the database bot id does not leak into an environment group"
+    );
+}
+
+#[test]
+fn a_database_group_is_enabled_after_restart() {
+    let env = telegram_config(&[]);
+    let mut stored = stored_telegram("polling", Some("db-token"));
+    stored.push(plain("telegram.bot_username", json!("@db_bot")));
+
+    let effective = effective_telegram(&env, &stored, &cipher());
+
+    assert!(effective.is_enabled());
+    assert_eq!(effective.source(), Some(SettingSource::Db));
+    let group = effective.config().expect("group");
+    assert_eq!(group.mode, TelegramMode::Polling);
+    assert_eq!(group.bot_username, "db_bot");
+    assert_eq!(
+        group.bot_token.as_ref().map(SecretString::expose),
+        Some("db-token")
+    );
+    for key in [
+        "telegram.mode",
+        "telegram.bot_token",
+        "telegram.bot_username",
+    ] {
+        assert_eq!(
+            telegram_setting(&effective, key).source,
+            SettingSource::Db,
+            "{key}"
+        );
+    }
+}
+
+#[test]
+fn no_rows_means_telegram_is_disabled() {
+    let effective = effective_telegram(&telegram_config(&[]), &[], &cipher());
+
+    assert!(!effective.is_configured());
+    assert!(!effective.is_enabled());
+    assert_eq!(effective.mode(), TelegramMode::Disabled);
+    assert_eq!(effective.problem(), Some(TelegramProblem::NotSet));
+}
+
+#[test]
+fn a_database_mode_disabled_turns_the_bot_off() {
+    let effective = effective_telegram(
+        &telegram_config(&[]),
+        &stored_telegram("disabled", Some("db-token")),
+        &cipher(),
+    );
+
+    assert!(effective.is_configured());
+    assert!(!effective.is_enabled());
+    assert_eq!(effective.mode(), TelegramMode::Disabled);
+}
+
+#[test]
+fn an_undecryptable_token_makes_the_whole_group_unavailable() {
+    let stored = stored_telegram("polling", Some("db-token"));
+
+    let wrong = effective_telegram(&telegram_config(&[]), &stored, &cipher_for(2));
+    assert!(!wrong.is_configured());
+    assert_eq!(wrong.problem(), Some(TelegramProblem::SecretUndecryptable));
+    assert_eq!(
+        telegram_setting(&wrong, "telegram.bot_token").secret,
+        Some(SecretState::Undecryptable)
+    );
+
+    let missing = effective_telegram(&telegram_config(&[]), &stored, &cipher_without_key());
+    assert!(!missing.is_configured());
+    assert_eq!(missing.problem(), Some(TelegramProblem::SecretKeyMissing));
+}
+
+#[test]
+fn a_webhook_group_from_the_database_requires_a_secret_and_an_address() {
+    let missing_secret = effective_telegram(
+        &telegram_config(&[]),
+        &stored_telegram("webhook", Some("db-token")),
+        &cipher(),
+    );
+    assert_eq!(missing_secret.problem(), Some(TelegramProblem::Incomplete));
+
+    let mut stored = stored_telegram("webhook", Some("db-token"));
+    stored.push(secret("telegram.webhook_secret", "db-webhook-secret"));
+    stored.push(plain(
+        "telegram.public_base_url",
+        json!("https://db.example.test"),
+    ));
+    let complete = effective_telegram(&telegram_config(&[]), &stored, &cipher());
+    assert!(complete.is_enabled());
+    assert_eq!(
+        complete
+            .config()
+            .and_then(|group| group.webhook_url.as_ref())
+            .map(|url| url.as_str()),
+        Some("https://db.example.test/webhooks/telegram")
+    );
+}
+
+#[test]
+fn the_webhook_address_chain_prefers_the_override_then_the_public_base() {
+    let mut stored = stored_telegram("webhook", Some("db-token"));
+    stored.push(secret("telegram.webhook_secret", "db-webhook-secret"));
+    stored.push(plain(
+        "telegram.public_base_url",
+        json!("https://public.example.test/"),
+    ));
+    stored.push(plain(
+        "telegram.webhook_url_override",
+        json!("https://hooks.example.test/telegram"),
+    ));
+
+    let override_group = effective_telegram(&telegram_config(&[]), &stored, &cipher());
+    assert_eq!(
+        override_group
+            .config()
+            .and_then(|group| group.webhook_url.as_ref())
+            .map(|url| url.as_str()),
+        Some("https://hooks.example.test/telegram")
+    );
+
+    let mut without_override = stored.clone();
+    without_override.retain(|row| row.key != "telegram.webhook_url_override");
+    let public_group = effective_telegram(&telegram_config(&[]), &without_override, &cipher());
+    assert_eq!(
+        public_group
+            .config()
+            .and_then(|group| group.webhook_url.as_ref())
+            .map(|url| url.as_str()),
+        Some("https://public.example.test/webhooks/telegram"),
+        "a trailing slash must not double the path separator"
+    );
+
+    // PUBLIC_BASE_URL окружения приоритетнее настройки базы.
+    let with_env_base = telegram_config(&[("PUBLIC_BASE_URL", "https://env.example.test")]);
+    let env_base_group = effective_telegram(&with_env_base, &without_override, &cipher());
+    assert_eq!(
+        env_base_group
+            .config()
+            .and_then(|group| group.webhook_url.as_ref())
+            .map(|url| url.as_str()),
+        Some("https://env.example.test/webhooks/telegram")
+    );
+    assert_eq!(
+        telegram_setting(&env_base_group, "telegram.public_base_url").source,
+        SettingSource::Env
+    );
+}
+
+#[test]
+fn a_database_webhook_address_must_be_https_in_production() {
+    let mut stored = stored_telegram("webhook", Some("db-token"));
+    stored.push(secret("telegram.webhook_secret", "db-webhook-secret"));
+    stored.push(plain(
+        "telegram.webhook_url_override",
+        json!("http://hooks.example.test/telegram"),
+    ));
+
+    let dev = effective_telegram(&telegram_config(&[]), &stored, &cipher());
+    assert!(dev.is_enabled(), "http is allowed in development");
+
+    let production = telegram_config(&[
+        ("ENV", "production"),
+        ("PUBLIC_BASE_URL", "https://tasklerq.example.com"),
+    ]);
+    let rejected = effective_telegram(&production, &stored, &cipher());
+    assert!(!rejected.is_configured());
+    assert_eq!(
+        rejected.problem(),
+        Some(TelegramProblem::InvalidField {
+            field: "telegram.webhook_url_override"
+        })
+    );
+}
+
+#[test]
+fn debug_output_does_not_contain_telegram_secrets() {
+    let env = telegram_config(&telegram_env_group());
+    let effective = effective_telegram(&env, &[], &cipher());
+    let debug = format!("{effective:?}");
+
+    for secret in ["env-token", "env-webhook-secret"] {
+        assert!(!debug.contains(secret), "{secret} leaked in {debug}");
+    }
 }

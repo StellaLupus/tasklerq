@@ -4,12 +4,13 @@
 //! Перечень ключей фиксирован в коде: неизвестные строки таблицы игнорируются,
 //! чтобы откат на старый образ не ломал чтение. Обычные значения лежат в
 //! `value` (jsonb), секреты — в `secret` (шифротекст [`crypto`]); для сборки
-//! действующей конфигурации LLM есть [`effective_llm`].
+//! действующей конфигурации LLM есть [`effective_llm`], для Telegram —
+//! [`effective_telegram`].
 //!
-//! Приоритет окружения над базой действует и для отдельного поля, и для слота
-//! целиком: если слот задан окружением, значения базы для него не используются.
-//! Нерасшифрованный секрет делает весь слот ненастроенным, а не «слотом без
-//! токена».
+//! Приоритет окружения над базой действует и для отдельного поля, и для группы
+//! целиком: если группа задана окружением, значения базы для неё не
+//! используются. Нерасшифрованный секрет делает всю группу ненастроенной, а не
+//! «группой без токена».
 
 pub mod crypto;
 
@@ -21,9 +22,10 @@ use sqlx::{PgConnection, PgPool};
 use thiserror::Error;
 
 use crate::config::{
-    DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_DAILY_QUOTA, DEFAULT_SLOT_TIMEOUT_MS, LlmConfig,
-    SecretString, SlotConfig, loggable_url, parse_connect_timeout_ms, parse_daily_quota,
-    parse_extra_json, parse_slot_timeout_ms, parse_slot_url,
+    Config, DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_DAILY_QUOTA, DEFAULT_SLOT_TIMEOUT_MS, LlmConfig,
+    SecretString, SlotConfig, TelegramConfig, TelegramMode, loggable_url, parse_bot_id,
+    parse_bot_username, parse_connect_timeout_ms, parse_daily_quota, parse_extra_json,
+    parse_slot_timeout_ms, parse_slot_url, parse_telegram_mode,
 };
 use crate::settings::crypto::{SecretCipher, SecretContext, SecretError, SettingScope, key_id};
 use crate::storage::repositories::settings::{self as repository, StoredSecret, StoredSetting};
@@ -76,6 +78,12 @@ pub enum ValueKind {
     ExtraJson,
     /// Целое число — суточная квота.
     Quota,
+    /// Режим Telegram: `webhook`, `polling` или `disabled`.
+    TelegramMode,
+    /// Положительный идентификатор бота.
+    BotId,
+    /// Имя бота без `@`: латинские буквы, цифры и `_`.
+    BotUsername,
 }
 
 /// Описание известного ключа настройки.
@@ -100,9 +108,9 @@ impl SettingKey {
 
 /// Перечень ключей настроек, которые знает эта версия.
 ///
-/// Ключи уровня household появятся вместе с Telegram-настройками; пока все
-/// перечисленные — уровня инсталляции. `wizard.*_skipped` читаются только из
-/// базы: окружение их не задаёт.
+/// Все перечисленные ключи — уровня инсталляции: LLM, Telegram и шаги мастера.
+/// `wizard.*_skipped` и `telegram.*` читаются только из базы: окружение задаёт
+/// их своими переменными, а не ключами настроек.
 pub const SETTING_KEYS: &[SettingKey] = &[
     SettingKey {
         name: "llm.enabled",
@@ -199,6 +207,48 @@ pub const SETTING_KEYS: &[SettingKey] = &[
         scope: SettingScope::Installation,
         kind: SettingKind::Plain,
         value_kind: ValueKind::Bool,
+    },
+    SettingKey {
+        name: "telegram.mode",
+        scope: SettingScope::Installation,
+        kind: SettingKind::Plain,
+        value_kind: ValueKind::TelegramMode,
+    },
+    SettingKey {
+        name: "telegram.bot_token",
+        scope: SettingScope::Installation,
+        kind: SettingKind::Secret,
+        value_kind: ValueKind::Text,
+    },
+    SettingKey {
+        name: "telegram.bot_id",
+        scope: SettingScope::Installation,
+        kind: SettingKind::Plain,
+        value_kind: ValueKind::BotId,
+    },
+    SettingKey {
+        name: "telegram.bot_username",
+        scope: SettingScope::Installation,
+        kind: SettingKind::Plain,
+        value_kind: ValueKind::BotUsername,
+    },
+    SettingKey {
+        name: "telegram.public_base_url",
+        scope: SettingScope::Installation,
+        kind: SettingKind::Plain,
+        value_kind: ValueKind::Url,
+    },
+    SettingKey {
+        name: "telegram.webhook_url_override",
+        scope: SettingScope::Installation,
+        kind: SettingKind::Plain,
+        value_kind: ValueKind::Url,
+    },
+    SettingKey {
+        name: "telegram.webhook_secret",
+        scope: SettingScope::Installation,
+        kind: SettingKind::Secret,
+        value_kind: ValueKind::Text,
     },
 ];
 
@@ -479,6 +529,151 @@ impl EffectiveLlm {
     pub fn settings(&self) -> &[ResolvedSetting] {
         &self.settings
     }
+}
+
+/// Почему группа Telegram не настроена.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TelegramProblem {
+    /// Ни одной строки группы нет ни в окружении, ни в базе.
+    NotSet,
+    /// Режим `webhook`, но нет секрета или адреса webhook.
+    Incomplete,
+    /// Значение из базы не прошло разбор; имени поля достаточно, значение не
+    /// попадает в причину.
+    InvalidField {
+        /// Имя настройки, значение которой не разобралось.
+        field: &'static str,
+    },
+    /// Токен или секрет webhook есть, но ключа шифрования нет.
+    SecretKeyMissing,
+    /// Токен или секрет webhook не расшифровывается текущим или прежним ключом.
+    SecretUndecryptable,
+}
+
+impl TelegramProblem {
+    /// Короткий код для журнала и консоли.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::NotSet => "not_set",
+            Self::Incomplete => "incomplete",
+            Self::InvalidField { .. } => "invalid",
+            Self::SecretKeyMissing => "secret_key_missing",
+            Self::SecretUndecryptable => "secret_undecryptable",
+        }
+    }
+}
+
+/// Действующая конфигурация Telegram: окружение, база и публичный адрес.
+///
+/// Группа целиком берётся из одного источника. `Debug` не содержит токена и
+/// секрета webhook: [`TelegramConfig`] хранит их в [`SecretString`], а у
+/// [`ResolvedSetting`] секретные значения всегда `None`.
+#[derive(Clone, Debug)]
+pub struct EffectiveTelegram {
+    state: TelegramState,
+    api_base_url: Option<url::Url>,
+    settings: Vec<ResolvedSetting>,
+}
+
+#[derive(Clone, Debug)]
+enum TelegramState {
+    /// Группа задана целиком одним источником.
+    Configured {
+        /// Источник всех полей группы.
+        source: SettingSource,
+        /// Разобранные поля.
+        config: TelegramConfig,
+    },
+    /// Группа не настроена; причина используется журналом и консолью.
+    Unavailable {
+        /// Причина без значений.
+        problem: TelegramProblem,
+    },
+}
+
+impl EffectiveTelegram {
+    /// Поля группы; `None`, если группа ненастроена.
+    pub fn config(&self) -> Option<&TelegramConfig> {
+        match &self.state {
+            TelegramState::Configured { config, .. } => Some(config),
+            TelegramState::Unavailable { .. } => None,
+        }
+    }
+
+    /// Источник полей группы; `None`, если группа ненастроена.
+    pub const fn source(&self) -> Option<SettingSource> {
+        match &self.state {
+            TelegramState::Configured { source, .. } => Some(*source),
+            TelegramState::Unavailable { .. } => None,
+        }
+    }
+
+    /// Группа настроена (даже если режим `disabled`).
+    pub const fn is_configured(&self) -> bool {
+        matches!(&self.state, TelegramState::Configured { .. })
+    }
+
+    /// Бот включён: группа настроена и режим не `disabled`.
+    pub fn is_enabled(&self) -> bool {
+        self.config().is_some_and(|config| config.mode.is_enabled())
+    }
+
+    /// Действующий режим; у ненастроенной группы — `disabled`.
+    pub fn mode(&self) -> TelegramMode {
+        self.config()
+            .map_or(TelegramMode::Disabled, |config| config.mode)
+    }
+
+    /// Служебный адрес Bot API из окружения.
+    pub fn api_base_url(&self) -> Option<&url::Url> {
+        self.api_base_url.as_ref()
+    }
+
+    /// Причина ненастроенной группы.
+    pub const fn problem(&self) -> Option<TelegramProblem> {
+        match &self.state {
+            TelegramState::Configured { .. } => None,
+            TelegramState::Unavailable { problem } => Some(*problem),
+        }
+    }
+
+    /// Все известные ключи с источниками; секреты без значений.
+    pub fn settings(&self) -> &[ResolvedSetting] {
+        &self.settings
+    }
+}
+
+/// Собрать действующую конфигурацию Telegram из окружения и уже прочитанных
+/// строк.
+///
+/// Чистая функция: база прочитана заранее, расшифровка идёт через `cipher`.
+/// Группа целиком берётся из одного источника: токен в окружении — вся группа
+/// из окружения, иначе из базы, иначе бот выключен. Нерасшифрованный токен или
+/// секрет webhook делает ненастроенной всю группу.
+pub fn effective_telegram(
+    config: &Config,
+    stored: &[StoredSetting],
+    cipher: &SecretCipher,
+) -> EffectiveTelegram {
+    let resolved = resolve_telegram(config, stored, cipher);
+    let settings = telegram_settings_from(&resolved);
+
+    EffectiveTelegram {
+        state: resolved.state,
+        api_base_url: config.telegram_api_base_url.clone(),
+        settings,
+    }
+}
+
+/// Прочитать настройки инсталляции и собрать действующую конфигурацию Telegram.
+pub async fn read_effective_telegram(
+    pool: &PgPool,
+    config: &Config,
+    cipher: &SecretCipher,
+) -> Result<EffectiveTelegram, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    let stored = repository::all(&mut conn, SettingScope::Installation.as_str(), None).await?;
+    Ok(effective_telegram(config, &stored, cipher))
 }
 
 /// Собрать действующую конфигурацию LLM из окружения и уже прочитанных строк.
@@ -831,6 +1026,18 @@ fn validate_value(key: &SettingKey, value: &Value) -> Result<(), SettingError> {
             Some(raw) => parse_daily_quota(&raw).err(),
             None => Some("expected an integer".to_owned()),
         },
+        ValueKind::TelegramMode => match value {
+            Value::String(raw) => parse_telegram_mode(raw).err(),
+            _ => Some("expected `webhook`, `polling` or `disabled`".to_owned()),
+        },
+        ValueKind::BotId => match value_text(value) {
+            Some(raw) => parse_bot_id(&raw).err(),
+            None => Some("expected a positive integer".to_owned()),
+        },
+        ValueKind::BotUsername => match value {
+            Value::String(raw) => parse_bot_username(raw).err(),
+            _ => Some("expected a Telegram username like tasklerqbot".to_owned()),
+        },
     };
 
     match reason {
@@ -1047,6 +1254,393 @@ fn resolve_slot(
 const fn invalid(field: &'static str) -> EffectiveSlot {
     EffectiveSlot::Unavailable {
         problem: SlotProblem::InvalidField { field },
+    }
+}
+
+/// Действующие поля Telegram и источники каждого ключа.
+struct ResolvedTelegram {
+    state: TelegramState,
+    mode: Option<TelegramMode>,
+    mode_source: SettingSource,
+    token: SecretState,
+    token_source: SettingSource,
+    bot_id: Option<i64>,
+    bot_id_source: SettingSource,
+    bot_username: Option<String>,
+    bot_username_source: SettingSource,
+    public_base_url: Option<url::Url>,
+    public_base_url_source: SettingSource,
+    webhook_override: Option<url::Url>,
+    webhook_override_source: SettingSource,
+    webhook_secret: SecretState,
+    webhook_secret_source: SettingSource,
+}
+
+/// Значение адреса из строки настроек.
+enum DbUrl {
+    /// Строки нет.
+    Absent,
+    /// Строка разобрана.
+    Valid(url::Url),
+    /// Строка есть, но значение невалидно.
+    Invalid,
+}
+
+/// Разобрать адрес из строки настроек; в production — только https.
+fn db_url(stored: &[StoredSetting], key: &str, require_https: bool) -> DbUrl {
+    let Some(row) = find_row(stored, key) else {
+        return DbUrl::Absent;
+    };
+    let Some(raw) = setting_text(row) else {
+        return DbUrl::Invalid;
+    };
+    match parse_slot_url(&raw) {
+        Ok(url) if !require_https || url.scheme() == "https" => DbUrl::Valid(url),
+        _ => DbUrl::Invalid,
+    }
+}
+
+/// Присоединить путь webhook к публичному адресу без двойного `/`.
+fn webhook_address(base: &url::Url) -> url::Url {
+    let mut url = base.clone();
+    url.set_path(&format!(
+        "{}/webhooks/telegram",
+        url.path().trim_end_matches('/')
+    ));
+    url.set_query(None);
+    url.set_fragment(None);
+    url
+}
+
+/// Расшифровать секретную строку; пустое значение считается незаданным.
+fn decrypt_setting(
+    stored: &[StoredSetting],
+    key: &'static str,
+    cipher: &SecretCipher,
+) -> (Option<SecretString>, SecretState) {
+    let Some(row) = find_row(stored, key) else {
+        return (None, SecretState::NotSet);
+    };
+    let Some(blob) = row.secret.as_deref() else {
+        return (None, SecretState::NotSet);
+    };
+    let context = secret_context(SettingScope::Installation, None, key);
+    match cipher.decrypt(&context, blob) {
+        Ok(secret) if !secret.expose().trim().is_empty() => (Some(secret), SecretState::Set),
+        Ok(_) => (None, SecretState::NotSet),
+        Err(SecretError::KeyMissing) => (None, SecretState::KeyMissing),
+        Err(SecretError::Undecryptable) => (None, SecretState::Undecryptable),
+    }
+}
+
+/// Источник обычного ключа, который лежит в базе.
+fn db_source(stored: &[StoredSetting], key: &str) -> SettingSource {
+    if stored.iter().any(|row| row.key == key) {
+        SettingSource::Db
+    } else {
+        SettingSource::Default
+    }
+}
+
+fn resolve_telegram(
+    config: &Config,
+    stored: &[StoredSetting],
+    cipher: &SecretCipher,
+) -> ResolvedTelegram {
+    let require_https = config.env.is_production();
+    let env_group = config.telegram.as_ref();
+
+    // Публичный адрес — общий: `PUBLIC_BASE_URL` приоритетнее настройки.
+    let (public_base_url, public_base_url_source, public_base_invalid) =
+        match (&config.public_base_url, env_group.is_some()) {
+            (Some(url), _) => (Some(url.clone()), SettingSource::Env, false),
+            (None, _) => match db_url(stored, "telegram.public_base_url", require_https) {
+                DbUrl::Absent => (None, SettingSource::Default, false),
+                DbUrl::Valid(url) => (Some(url), SettingSource::Db, false),
+                DbUrl::Invalid => (None, SettingSource::Db, true),
+            },
+        };
+
+    let (mode, mode_source) = match env_group {
+        Some(group) => (Some(group.mode), SettingSource::Env),
+        None => match find_row(stored, "telegram.mode") {
+            None => (Some(TelegramMode::Webhook), SettingSource::Default),
+            Some(row) => {
+                let parsed = row
+                    .value
+                    .as_ref()
+                    .map(json_text)
+                    .and_then(|raw| parse_telegram_mode(&raw).ok());
+                (parsed, SettingSource::Db)
+            }
+        },
+    };
+
+    let (bot_token, token, token_source) = match env_group {
+        Some(group) => (
+            group.bot_token.clone(),
+            SecretState::Set,
+            SettingSource::Env,
+        ),
+        None => {
+            let (secret, state) = decrypt_setting(stored, "telegram.bot_token", cipher);
+            (secret, state, db_source(stored, "telegram.bot_token"))
+        }
+    };
+
+    let (bot_id, bot_id_source, bot_id_invalid) = match env_group {
+        Some(_) => (None, SettingSource::Default, false),
+        None => match find_row(stored, "telegram.bot_id") {
+            None => (None, SettingSource::Default, false),
+            Some(row) => {
+                let parsed = row
+                    .value
+                    .as_ref()
+                    .map(json_text)
+                    .and_then(|raw| parse_bot_id(&raw).ok());
+                (parsed, SettingSource::Db, parsed.is_none())
+            }
+        },
+    };
+
+    let (bot_username, bot_username_source, bot_username_invalid) = match env_group {
+        Some(group) => (Some(group.bot_username.clone()), SettingSource::Env, false),
+        None => match find_row(stored, "telegram.bot_username") {
+            None => (
+                Some("tasklerqbot".to_owned()),
+                SettingSource::Default,
+                false,
+            ),
+            Some(row) => {
+                let parsed = row.value.as_ref().and_then(|value| match value {
+                    Value::String(raw) => parse_bot_username(raw).ok(),
+                    _ => None,
+                });
+                let invalid = parsed.is_none();
+                (parsed, SettingSource::Db, invalid)
+            }
+        },
+    };
+
+    let (webhook_override, webhook_override_source, webhook_override_invalid) = match env_group {
+        Some(_) => (None, SettingSource::Default, false),
+        None => match db_url(stored, "telegram.webhook_url_override", require_https) {
+            DbUrl::Absent => (None, SettingSource::Default, false),
+            DbUrl::Valid(url) => (Some(url), SettingSource::Db, false),
+            DbUrl::Invalid => (None, SettingSource::Db, true),
+        },
+    };
+
+    let (webhook_secret_value, webhook_secret, webhook_secret_source) = match env_group {
+        Some(group) => (
+            group.webhook_secret.clone(),
+            if group.webhook_secret.is_some() {
+                SecretState::Set
+            } else {
+                SecretState::NotSet
+            },
+            SettingSource::Env,
+        ),
+        None => {
+            let (secret, state) = decrypt_setting(stored, "telegram.webhook_secret", cipher);
+            (secret, state, db_source(stored, "telegram.webhook_secret"))
+        }
+    };
+
+    let state = match env_group {
+        Some(group) => {
+            // Группа из окружения уже прошла валидацию запуска: токен задан, а
+            // для webhook есть секрет и адрес.
+            match (mode, bot_token) {
+                (Some(mode), Some(token)) => TelegramState::Configured {
+                    source: SettingSource::Env,
+                    config: TelegramConfig {
+                        mode,
+                        bot_token: Some(token),
+                        webhook_secret: webhook_secret_value,
+                        webhook_url: group.webhook_url.clone(),
+                        bot_username: bot_username
+                            .clone()
+                            .unwrap_or_else(|| "tasklerqbot".to_owned()),
+                    },
+                },
+                _ => TelegramState::Unavailable {
+                    problem: TelegramProblem::NotSet,
+                },
+            }
+        }
+        None => {
+            let problem = if mode.is_none() {
+                Some(TelegramProblem::InvalidField {
+                    field: "telegram.mode",
+                })
+            } else if bot_id_invalid {
+                Some(TelegramProblem::InvalidField {
+                    field: "telegram.bot_id",
+                })
+            } else if bot_username_invalid {
+                Some(TelegramProblem::InvalidField {
+                    field: "telegram.bot_username",
+                })
+            } else if public_base_invalid {
+                Some(TelegramProblem::InvalidField {
+                    field: "telegram.public_base_url",
+                })
+            } else if webhook_override_invalid {
+                Some(TelegramProblem::InvalidField {
+                    field: "telegram.webhook_url_override",
+                })
+            } else {
+                None
+            };
+            let problem = problem
+                .or(match token {
+                    SecretState::KeyMissing => Some(TelegramProblem::SecretKeyMissing),
+                    SecretState::Undecryptable => Some(TelegramProblem::SecretUndecryptable),
+                    SecretState::NotSet | SecretState::Set => None,
+                })
+                .or(match webhook_secret {
+                    SecretState::KeyMissing => Some(TelegramProblem::SecretKeyMissing),
+                    SecretState::Undecryptable => Some(TelegramProblem::SecretUndecryptable),
+                    SecretState::NotSet | SecretState::Set => None,
+                });
+
+            let mode = mode.unwrap_or(TelegramMode::Disabled);
+            let webhook_url = webhook_override
+                .clone()
+                .or_else(|| public_base_url.as_ref().map(webhook_address));
+
+            match problem {
+                Some(problem) => TelegramState::Unavailable { problem },
+                None if mode == TelegramMode::Disabled => TelegramState::Configured {
+                    source: SettingSource::Db,
+                    config: TelegramConfig {
+                        mode,
+                        bot_token,
+                        webhook_secret: webhook_secret_value,
+                        webhook_url,
+                        bot_username: bot_username
+                            .clone()
+                            .unwrap_or_else(|| "tasklerqbot".to_owned()),
+                    },
+                },
+                None if require_https && mode == TelegramMode::Polling => {
+                    TelegramState::Unavailable {
+                        problem: TelegramProblem::InvalidField {
+                            field: "telegram.mode",
+                        },
+                    }
+                }
+                None if bot_token.is_none() => TelegramState::Unavailable {
+                    problem: TelegramProblem::NotSet,
+                },
+                None if mode == TelegramMode::Webhook
+                    && (webhook_secret != SecretState::Set || webhook_url.is_none()) =>
+                {
+                    TelegramState::Unavailable {
+                        problem: TelegramProblem::Incomplete,
+                    }
+                }
+                None => TelegramState::Configured {
+                    source: SettingSource::Db,
+                    config: TelegramConfig {
+                        mode,
+                        bot_token,
+                        webhook_secret: webhook_secret_value,
+                        webhook_url,
+                        bot_username: bot_username
+                            .clone()
+                            .unwrap_or_else(|| "tasklerqbot".to_owned()),
+                    },
+                },
+            }
+        }
+    };
+
+    ResolvedTelegram {
+        state,
+        mode,
+        mode_source,
+        token,
+        token_source,
+        bot_id,
+        bot_id_source,
+        bot_username,
+        bot_username_source,
+        public_base_url,
+        public_base_url_source,
+        webhook_override,
+        webhook_override_source,
+        webhook_secret,
+        webhook_secret_source,
+    }
+}
+
+fn telegram_settings_from(resolved: &ResolvedTelegram) -> Vec<ResolvedSetting> {
+    SETTING_KEYS
+        .iter()
+        .filter(|key| key.name.starts_with("telegram."))
+        .map(|key| match key.name {
+            "telegram.mode" => plain_resolved(
+                key,
+                resolved
+                    .mode
+                    .map(|mode| Value::String(mode.as_str().to_owned())),
+                resolved.mode_source,
+            ),
+            "telegram.bot_id" => plain_resolved(
+                key,
+                resolved.bot_id.map(Value::from),
+                resolved.bot_id_source,
+            ),
+            "telegram.bot_username" => plain_resolved(
+                key,
+                resolved.bot_username.clone().map(Value::String),
+                resolved.bot_username_source,
+            ),
+            "telegram.public_base_url" => plain_resolved(
+                key,
+                resolved
+                    .public_base_url
+                    .as_ref()
+                    .map(|url| Value::String(url.to_string())),
+                resolved.public_base_url_source,
+            ),
+            "telegram.webhook_url_override" => plain_resolved(
+                key,
+                resolved
+                    .webhook_override
+                    .as_ref()
+                    .map(|url| Value::String(url.to_string())),
+                resolved.webhook_override_source,
+            ),
+            "telegram.bot_token" => ResolvedSetting {
+                key: key.name,
+                source: resolved.token_source,
+                value: None,
+                secret: Some(resolved.token),
+            },
+            "telegram.webhook_secret" => ResolvedSetting {
+                key: key.name,
+                source: resolved.webhook_secret_source,
+                value: None,
+                secret: Some(resolved.webhook_secret),
+            },
+            _ => default_setting(key),
+        })
+        .collect()
+}
+
+fn plain_resolved(
+    key: &'static SettingKey,
+    value: Option<Value>,
+    source: SettingSource,
+) -> ResolvedSetting {
+    ResolvedSetting {
+        key: key.name,
+        source,
+        value,
+        secret: None,
     }
 }
 

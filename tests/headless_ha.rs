@@ -13,7 +13,7 @@ use chrono::{DateTime, Duration, SubsecRound, Utc};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tasklerq::app::build_application;
-use tasklerq::config::{Config, TelegramMode};
+use tasklerq::config::Config;
 use tasklerq::domain::models::RecurrenceFreq;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -76,9 +76,10 @@ async fn headless_disabled_telegram_serves_the_home_assistant_scenario() {
         ("LLM_CAPTURE_ENABLED", "false"),
     ])
     .expect("headless config without a bot token must load");
-    assert_eq!(config.telegram.mode, TelegramMode::Disabled);
-    assert!(config.telegram.bot_token.is_none());
-    assert!(config.telegram.webhook_secret.is_none());
+    assert!(
+        config.telegram.is_none(),
+        "TELEGRAM_MODE without a token is ignored"
+    );
 
     // Повторяющееся событие, закончившееся до старта. Его должен перевести
     // доменный тикер, который запускается и без Telegram. Время усечено до

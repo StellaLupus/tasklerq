@@ -2,7 +2,7 @@
 
 ## 1. Настройки Telegram
 
-- [ ] 1.1 Ключи группы Telegram в `src/settings/` и сборка
+- [x] 1.1 Ключи группы Telegram в `src/settings/` и сборка
   `EffectiveTelegram`: окружение целиком только при заданном
   `TELEGRAM_BOT_TOKEN`; `TELEGRAM_MODE=disabled` и одиночные `TELEGRAM_*` без
   токена — предупреждение и игнорирование; `webhook`/`polling` без токена —

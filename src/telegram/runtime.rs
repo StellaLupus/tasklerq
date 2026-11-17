@@ -7,10 +7,11 @@ use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 use url::Url;
 
-use crate::config::{Config, TelegramMode};
+use crate::config::Config;
 use crate::jobs::scheduler::Scheduler;
 use crate::llm::LlmHandle;
 use crate::security_audit::Audit;
+use crate::settings::EffectiveTelegram;
 
 use super::api::{DEFAULT_BASE_URL, HttpTelegramApi, TelegramApi};
 use super::bot::Bot;
@@ -18,6 +19,7 @@ use super::capture_worker::CaptureWorker;
 use super::outbox::OutboxWorker;
 use super::webhook::Ingress;
 use super::worker::{UPDATES_PER_MINUTE, UpdateWorker, poll};
+use crate::config::TelegramMode;
 
 /// Запущенная Telegram-часть.
 pub struct Runtime {
@@ -35,16 +37,18 @@ pub enum StartError {
     Client(#[from] reqwest::Error),
 }
 
-/// Запустить воркеры согласно `TELEGRAM_MODE`. В режиме `disabled` ничего не
-/// запускается: API и capture продолжают работать без бота.
+/// Запустить воркеры согласно действующей конфигурации Telegram. В режиме
+/// `disabled` ничего не запускается: API и capture продолжают работать без
+/// бота.
 pub async fn start(
     config: &Config,
+    telegram: &EffectiveTelegram,
     pool: &PgPool,
     shutdown: watch::Receiver<bool>,
     llm: LlmHandle,
     audit: Audit,
 ) -> Result<Option<Runtime>, StartError> {
-    start_with_update_limit(config, pool, shutdown, llm, audit, None).await
+    start_with_update_limit(config, telegram, pool, shutdown, llm, audit, None).await
 }
 
 /// Запустить Telegram-часть с явным лимитом обновлений на пользователя.
@@ -53,25 +57,27 @@ pub async fn start(
 /// нужно нагрузочному тесту, который проверяет обработчик, а не ветку лимита.
 pub async fn start_with_update_limit(
     config: &Config,
+    telegram: &EffectiveTelegram,
     pool: &PgPool,
     shutdown: watch::Receiver<bool>,
     llm: LlmHandle,
     audit: Audit,
     update_limit: Option<u32>,
 ) -> Result<Option<Runtime>, StartError> {
-    let telegram = &config.telegram;
-    let Some(token) = telegram.bot_token.clone() else {
+    let Some(group) = telegram.config() else {
         return Ok(None);
     };
-    if telegram.mode == TelegramMode::Disabled {
+    let Some(token) = group.bot_token.clone() else {
+        return Ok(None);
+    };
+    if group.mode == TelegramMode::Disabled {
         return Ok(None);
     }
 
     let api: Arc<dyn TelegramApi> = Arc::new(HttpTelegramApi::new(
         token,
         telegram
-            .api_base_url
-            .as_ref()
+            .api_base_url()
             .map_or(DEFAULT_BASE_URL, Url::as_str),
     )?);
     let wake_updates = Arc::new(Notify::new());
@@ -79,9 +85,9 @@ pub async fn start_with_update_limit(
     let mut tasks = Vec::new();
     let mut ingress = None;
 
-    match telegram.mode {
+    match group.mode {
         TelegramMode::Webhook => {
-            if let (Some(url), Some(secret)) = (&telegram.webhook_url, &telegram.webhook_secret) {
+            if let (Some(url), Some(secret)) = (&group.webhook_url, &group.webhook_secret) {
                 match api.set_webhook(url.as_str(), secret.expose()).await {
                     Ok(()) => tracing::info!("telegram webhook registered"),
                     // Недоступность Telegram при старте не должна ронять сервис.
@@ -101,7 +107,7 @@ pub async fn start_with_update_limit(
         TelegramMode::Disabled => {}
     }
 
-    let bot = Bot::new(telegram.bot_username.clone())
+    let bot = Bot::new(group.bot_username.clone())
         .with_llm(llm.clone())
         .with_tenancy_config(config.tenancy)
         .with_audit(audit.clone());

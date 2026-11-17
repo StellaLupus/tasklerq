@@ -475,11 +475,12 @@ async fn serve() -> Result<()> {
     let application = build_application(&config, pool, shutdown_rx)
         .await
         .context("telegram startup failed")?;
+    let telegram_mode = application.telegram_mode;
     let workers = application.workers;
     let app = application.router;
     let admin = listeners.admin.zip(application.admin_router);
     tracing::info!(
-        mode = config.telegram.mode.as_str(),
+        mode = telegram_mode.as_str(),
         workers = workers.len(),
         "telegram configured"
     );
@@ -1008,12 +1009,11 @@ async fn webhook_info() -> Result<()> {
     let config = Config::from_env().context("invalid configuration")?;
     let token = config
         .telegram
-        .bot_token
-        .clone()
+        .as_ref()
+        .and_then(|telegram| telegram.bot_token.clone())
         .context("TELEGRAM_BOT_TOKEN is not configured")?;
     let base_url = config
-        .telegram
-        .api_base_url
+        .telegram_api_base_url
         .as_ref()
         .map_or(tasklerq::telegram::api::DEFAULT_BASE_URL, |url| {
             url.as_str()

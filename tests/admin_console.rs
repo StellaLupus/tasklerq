@@ -4326,7 +4326,12 @@ async fn the_home_page_never_shows_secrets_or_user_content() {
         )
         .with_wizard(WizardSettings::new(
             config.tenancy.mode,
-            config.telegram.mode.is_enabled(),
+            config
+                .telegram
+                .as_ref()
+                .expect("telegram is configured")
+                .mode
+                .is_enabled(),
         )),
     );
     let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;

@@ -12,11 +12,11 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Map, Value, json};
 use sqlx::PgPool;
 use tasklerq::app::build_application;
-use tasklerq::config::{Config, LlmConfig, SecretKey, SecretString, SlotConfig};
+use tasklerq::config::{Config, LlmConfig, SecretKey, SecretString, SlotConfig, TelegramMode};
 use tasklerq::settings::crypto::{SecretCipher, SecretContext};
 use tasklerq::settings::{
     self, SETTING_KEYS, SecretProblem, SecretState, SettingSource, SlotProblem, effective_llm,
-    read_effective_llm,
+    read_effective_llm, read_effective_telegram,
 };
 use tasklerq::storage::repositories::settings as repository;
 use tokio::sync::watch;
@@ -43,6 +43,26 @@ fn env_llm(pairs: &[(&str, &str)]) -> LlmConfig {
     Config::from_map(vars)
         .expect("test environment is valid")
         .llm
+}
+
+/// Окружение без Telegram: группа берётся из настроек.
+fn env_telegram(pairs: &[(&str, &str)]) -> Config {
+    let mut vars: Vec<(String, String)> = [
+        ("ENV", "development"),
+        (
+            "DATABASE_URL",
+            "postgres://tasklerq:secret@localhost:5432/tasklerq",
+        ),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.to_owned(), value.to_owned()))
+    .collect();
+    vars.extend(
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
+    );
+    Config::from_map(vars).expect("test environment is valid")
 }
 
 fn key(byte: u8) -> SecretKey {
@@ -863,4 +883,153 @@ async fn a_slot_stored_only_in_settings_serves_http_capture_after_restart() {
             .expect("worker must stop on shutdown")
             .expect("worker task must join");
     }
+}
+
+#[tokio::test]
+async fn telegram_keys_are_written_and_read_from_the_database() {
+    let db = support::isolated_db().await;
+    set_plain(&db.pool, "telegram.mode", json!("polling")).await;
+    set_plain(&db.pool, "telegram.bot_id", json!(123_456)).await;
+    set_plain(&db.pool, "telegram.bot_username", json!("@db_bot")).await;
+    set_plain(
+        &db.pool,
+        "telegram.public_base_url",
+        json!("https://tg.example.test"),
+    )
+    .await;
+    set_secret(&db.pool, "telegram.bot_token", "db-token", &cipher(1)).await;
+
+    let effective = read_effective_telegram(&db.pool, &env_telegram(&[]), &cipher(1))
+        .await
+        .expect("settings are read");
+
+    assert!(effective.is_enabled());
+    assert_eq!(effective.source(), Some(SettingSource::Db));
+    assert_eq!(effective.mode(), TelegramMode::Polling);
+    let group = effective.config().expect("group");
+    assert_eq!(group.bot_username, "db_bot");
+    assert_eq!(
+        group.bot_token.as_ref().map(SecretString::expose),
+        Some("db-token")
+    );
+
+    for (name, expected) in [
+        ("telegram.mode", json!("polling")),
+        ("telegram.bot_id", json!(123_456)),
+        ("telegram.bot_username", json!("db_bot")),
+    ] {
+        let setting = effective
+            .settings()
+            .iter()
+            .find(|setting| setting.key == name)
+            .unwrap_or_else(|| panic!("known key {name}"));
+        assert_eq!(setting.source, SettingSource::Db, "{name}");
+        assert_eq!(setting.value.as_ref(), Some(&expected), "{name}");
+    }
+    let token = effective
+        .settings()
+        .iter()
+        .find(|setting| setting.key == "telegram.bot_token")
+        .expect("token key");
+    assert_eq!(token.source, SettingSource::Db);
+    assert_eq!(token.secret, Some(SecretState::Set));
+    assert_eq!(token.value, None, "a secret is never shown");
+}
+
+#[tokio::test]
+async fn telegram_writes_reject_invalid_values_and_wrong_kinds() {
+    let db = support::isolated_db().await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+
+    for (name, value) in [
+        ("telegram.mode", json!("saas")),
+        ("telegram.mode", json!(true)),
+        ("telegram.bot_id", json!("abc")),
+        ("telegram.bot_id", json!(0)),
+        ("telegram.bot_username", json!("bad-name!")),
+        (
+            "telegram.public_base_url",
+            json!("not a url SECRET-telegram"),
+        ),
+        ("telegram.webhook_url_override", json!("ftp://example.test")),
+    ] {
+        let error = settings::write_value(&mut conn, name, value)
+            .await
+            .expect_err("an invalid value must be rejected");
+        assert!(
+            matches!(error, settings::SettingError::InvalidValue { .. }),
+            "{name}: {error:?}"
+        );
+        assert!(!error.to_string().contains("SECRET-telegram"));
+    }
+    drop(conn);
+    for name in [
+        "telegram.mode",
+        "telegram.bot_id",
+        "telegram.bot_username",
+        "telegram.public_base_url",
+        "telegram.webhook_url_override",
+    ] {
+        assert_eq!(row_count(&db.pool, name).await, 0, "{name}");
+    }
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let secret_as_plain = settings::write_value(&mut conn, "telegram.bot_token", json!("plain"))
+        .await
+        .expect_err("a secret cannot be written as a plain value");
+    assert!(matches!(
+        secret_as_plain,
+        settings::SettingError::PlainValueForSecret { .. }
+    ));
+    let plain_as_secret = settings::write_secret(
+        &mut conn,
+        "telegram.mode",
+        &SecretString::new("polling"),
+        &cipher(1),
+    )
+    .await
+    .expect_err("a plain setting cannot be written as a secret");
+    assert!(matches!(
+        plain_as_secret,
+        settings::SettingError::SecretValueForPlain { .. }
+    ));
+    for value in ["", "   "] {
+        let blank = settings::write_secret(
+            &mut conn,
+            "telegram.bot_token",
+            &SecretString::new(value),
+            &cipher(1),
+        )
+        .await
+        .expect_err("a blank secret must be rejected");
+        assert!(matches!(blank, settings::SettingError::InvalidValue { .. }));
+    }
+}
+
+#[tokio::test]
+async fn an_undecryptable_telegram_token_disables_the_group_from_the_database() {
+    let db = support::isolated_db().await;
+    set_plain(&db.pool, "telegram.mode", json!("polling")).await;
+    set_secret(&db.pool, "telegram.bot_token", "db-token", &cipher(1)).await;
+
+    let effective = read_effective_telegram(&db.pool, &env_telegram(&[]), &cipher(2))
+        .await
+        .expect("settings are read");
+
+    assert!(!effective.is_enabled());
+    assert!(!effective.is_configured());
+    assert_eq!(
+        effective
+            .settings()
+            .iter()
+            .find(|setting| setting.key == "telegram.bot_token")
+            .and_then(|setting| setting.secret),
+        Some(SecretState::Undecryptable)
+    );
+
+    // Отдельного кода не нужно: readiness проверяет все зашифрованные строки.
+    let health = settings::read_secret_health(&db.pool, &cipher(2))
+        .await
+        .expect("secret rows are read");
+    assert_eq!(health.problem(), Some(SecretProblem::Undecryptable));
 }
