@@ -161,7 +161,7 @@ async fn build_effective_telegram(
     config: &Config,
     cipher: &SecretCipher,
 ) -> settings::EffectiveTelegram {
-    match settings::read_effective_telegram(pool, config, cipher).await {
+    let effective = match settings::read_effective_telegram(pool, config, cipher).await {
         Ok(effective) => effective,
         Err(error) => {
             tracing::warn!(
@@ -170,7 +170,28 @@ async fn build_effective_telegram(
             );
             settings::effective_telegram(config, &[], cipher)
         }
+    };
+    warn_if_telegram_unavailable(&effective);
+    effective
+}
+
+/// Предупредить, что сохранённая группа Telegram не настроена.
+///
+/// В строке только код причины и имя ключа: значение могло не разобраться, а
+/// секрет нельзя показывать. `not_set` — обычное состояние «бота нет», о нём
+/// не предупреждаем.
+fn warn_if_telegram_unavailable(telegram: &settings::EffectiveTelegram) {
+    let Some(problem) = telegram.problem() else {
+        return;
+    };
+    if problem == settings::TelegramProblem::NotSet {
+        return;
     }
+    tracing::warn!(
+        code = problem.code(),
+        setting = problem.field(),
+        "telegram bot is not configured: the bot stays disabled"
+    );
 }
 
 /// Собрать снимок LLM из окружения, базы и умолчаний.

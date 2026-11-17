@@ -202,34 +202,67 @@ psql "postgres://postgres@127.0.0.1:15433/postgres"
 
 ## 5. Telegram-бот
 
-Бот уже создан: **[@tasklerq_example_bot](https://t.me/tasklerq_example_bot)**. Deep links для
-приглашений имеют вид `https://t.me/tasklerq_example_bot?start=<code>`.
+Основной путь подключения — консоль оператора, страница «Telegram» (change
+`0014`, пункт 3.1): там задаются токен из @BotFather, имя бота, публичный адрес
+инсталляции и при необходимости отдельный адрес webhook. Сохранение включает и
+переключает бота без перезапуска процесса; секрет webhook консоль генерирует
+сама. `.env` — альтернатива для установок без консоли, автоматизации и
+запасного варианта.
 
-1. **@BotFather** → `/mybots` → `@tasklerq_example_bot` → **API Token** → получите
+Правило источника: окружение описывает группу Telegram целиком, только если
+задан `TELEGRAM_BOT_TOKEN`. Тогда `TELEGRAM_*` перекрывают консоль полностью.
+Без токена `TELEGRAM_*` игнорируются с предупреждением в логе, а настройки
+берутся из консоли; без настроек бот выключен. Исключение —
+`TELEGRAM_MODE=webhook` или `polling` без токена: это ошибка запуска.
+`TELEGRAM_MODE=disabled` без токена (строка прежнего `.env.example`) не
+запирает консоль: значение игнорируется.
+
+Адрес регистрации webhook:
+
+- группа из базы — переопределение адреса webhook в консоли, иначе публичный
+  адрес (`PUBLIC_BASE_URL` или настройка консоли) + `/webhooks/telegram`;
+- группа из окружения — `TELEGRAM_WEBHOOK_URL`, он обязателен в режиме
+  `webhook`.
+
+`TELEGRAM_API_BASE_URL` — служебная переменная для подмены Bot API (тесты и
+проверки); она действует при любом источнике настроек.
+
+### 5.1. Через `.env` (альтернатива)
+
+1. **@BotFather** → `/mybots` → бот → **API Token** → получите
    `TELEGRAM_BOT_TOKEN`.
 2. Придумайте `TELEGRAM_WEBHOOK_SECRET`:
 
-```bash
-openssl rand -hex 32
-```
+   ```bash
+   openssl rand -hex 32
+   ```
 
 3. Пропишите в `.env`:
 
-```dotenv
-TELEGRAM_BOT_TOKEN=123456:AA...
-TELEGRAM_WEBHOOK_SECRET=...
-PUBLIC_BASE_URL=https://tasklerq.example.com
-TELEGRAM_WEBHOOK_URL=https://tasklerq.example.com/webhooks/telegram
-TELEGRAM_MODE=webhook
-```
+   ```dotenv
+   TELEGRAM_BOT_TOKEN=123456:AA...
+   TELEGRAM_MODE=webhook
+   TELEGRAM_WEBHOOK_SECRET=...
+   PUBLIC_BASE_URL=https://tasklerq.example.com
+   TELEGRAM_WEBHOOK_URL=https://tasklerq.example.com/webhooks/telegram
+   ```
+
+   Без `TELEGRAM_MODE` при заданном токене действует `webhook`. Для локальной
+   разработки вместо webhook можно задать `TELEGRAM_MODE=polling`: polling
+   запрещён в `ENV=production`.
 
 4. Пересоздайте Tasklerq, чтобы он прочитал `.env` (после правки `.env`
    `restart` не помогает), затем проверьте webhook:
 
-```bash
-sudo /usr/local/bin/docker compose up -d --force-recreate tasklerq
-curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo" | jq
-```
+   ```bash
+   sudo /usr/local/bin/docker compose up -d --force-recreate tasklerq
+   sudo /usr/local/bin/docker compose exec tasklerq \
+     tasklerq admin webhook info
+   ```
+
+   Команда берёт токен из действующей конфигурации: из окружения или, если
+   токена там нет, из консоли (база и тот же `TASKLERQ_SECRET_KEY`). URL и
+   `last_error_message` печатаются без токена.
 
 Ожидаемо:
 
@@ -268,24 +301,28 @@ curl -sS -X POST \
 
 ## 6. Переменные окружения
 
+Переменные `TELEGRAM_*` — альтернатива консоли. Обязательность в таблице
+указана для этого пути: без `TELEGRAM_BOT_TOKEN` группа из окружения не
+действует, и перечисленные ниже требования не применяются.
+
 | Переменная | Обязательна | Пример | Назначение |
 | --- | --- | --- | --- |
 | `ENV` | нет | `production` | `production` (по умолчанию) или `development`. В production запрещает polling и требует HTTPS-адреса. |
 | `BIND_ADDR` | нет | `0.0.0.0:8080` | Внутренний адрес HTTP-сервера. |
-| `PUBLIC_BASE_URL` | нет | `https://tasklerq.example.com` | Публичный URL инсталляции. Если задан в production, должен быть HTTPS. |
+| `PUBLIC_BASE_URL` | нет | `https://tasklerq.example.com` | Публичный URL инсталляции. Если задан в production, должен быть HTTPS. Используется для адреса webhook, когда публичный адрес не задан в консоли. |
 | `ADMIN_BIND_ADDR` | нет | `0.0.0.0:8081` | Адрес listener консоли администратора; `disabled` выключает консоль. Внутри контейнера по умолчанию `0.0.0.0:8081`. |
 | `ADMIN_TRUSTED_PROXIES` | нет | `172.16.0.0/12` | Список сетей CIDR через запятую. Только от этих пиров консоль принимает `X-Forwarded-For`, `X-Forwarded-Proto` и `X-Forwarded-Host`; пусто — не доверяет никому. |
-| `TASKLERQ_SECRET_KEY` | нет | вывод `openssl rand -base64 32` | Ключ шифрования секретов в базе: base64, ровно 32 байта. Без него секретные настройки в консоли не сохраняются. Храните отдельно от резервных копий базы. |
+| `TASKLERQ_SECRET_KEY` | нет | вывод `openssl rand -base64 32` | Ключ шифрования секретов в базе: base64, ровно 32 байта. Без него секретные настройки в консоли, включая токен Telegram, не сохраняются и не читаются. Храните отдельно от резервных копий базы. |
 | `TASKLERQ_SECRET_KEY_OLD` | нет | — | Прежний ключ на время ротации, base64, ровно 32 байта: им расшифровываются старые секреты, новые шифруются текущим. |
 | `DATABASE_URL` | да | `postgres://tasklerq:...@postgres:5432/tasklerq?sslmode=disable` | PostgreSQL в сети `shared-db`. |
 | `DATABASE_MAX_CONNECTIONS` | нет | `10` | Размер пула. |
-| `TELEGRAM_BOT_TOKEN` | при `webhook`/`polling` | `123:AA...` | Токен бота; не нужен при `disabled`. |
-| `TELEGRAM_WEBHOOK_SECRET` | при `webhook` | `hex` | Секрет webhook. |
-| `TELEGRAM_WEBHOOK_URL` | при `webhook` | `https://tasklerq.example.com/webhooks/telegram` | Регистрация webhook. |
-| `TELEGRAM_BOT_USERNAME` | нет | `tasklerqbot` | Имя бота без `@` для ссылок-приглашений. |
+| `TELEGRAM_BOT_TOKEN` | при Telegram из окружения | `123:AA...` | Токен бота. Задаёт источник всей группы: с ним `TELEGRAM_*` перекрывают консоль, без него они игнорируются с предупреждением (кроме ошибки для `webhook`/`polling`), а бот берётся из консоли. |
+| `TELEGRAM_WEBHOOK_SECRET` | при `webhook` и токене в окружении | `hex` | Секрет webhook для группы из окружения. |
+| `TELEGRAM_WEBHOOK_URL` | при `webhook` и токене в окружении | `https://tasklerq.example.com/webhooks/telegram` | Адрес регистрации webhook для группы из окружения. |
+| `TELEGRAM_BOT_USERNAME` | нет | `tasklerqbot` | Имя бота без `@` для ссылок-приглашений; по умолчанию `tasklerqbot`. |
 | `HTTPS_PROXY`, `NO_PROXY` | нет | — | Стандартные переменные HTTP-клиента: исходящие HTTPS-запросы (Bot API, слоты LLM) идут через указанный прокси, кроме адресов из `NO_PROXY` (например, `localhost,127.0.0.1,host.docker.internal`). Нужны, только если прямой доступ к Telegram или провайдеру LLM из сети сервера закрыт; прокси должен быть достижим из сети контейнера. |
-| `TELEGRAM_API_BASE_URL` | нет | `https://api.telegram.org` | Служебный базовый адрес Bot API; вне `ENV=development` допускается только `https`. Подменяется на mock-сервер в тестах. |
-| `TELEGRAM_MODE` | нет | `webhook` | `webhook`/`polling` (dev)/`disabled` (headless). |
+| `TELEGRAM_API_BASE_URL` | нет | `https://api.telegram.org` | Служебный базовый адрес Bot API; вне `ENV=development` допускается только `https`. Действует при любом источнике группы. Подменяется на mock-сервер в тестах. |
+| `TELEGRAM_MODE` | нет | `webhook` | `webhook`/`polling` (только development)/`disabled`. Действует только вместе с `TELEGRAM_BOT_TOKEN`; без токена значение игнорируется с предупреждением, а `webhook`/`polling` — ошибка запуска. Если токен задан, а переменная нет, действует `webhook`. |
 | `TENANCY_MODE` | нет | `single` | `single` (по умолчанию) — один household на инсталляцию; `multi` — несколько. |
 | `BOOTSTRAP_OWNER_TELEGRAM_ID` | нет | не задано | Положительный Telegram ID первого владельца. При включённом Telegram рекомендуется задать: иначе первым владельцем станет первый написавший боту. |
 | `CAPTURE_API_ENABLED` | нет | `true` | Включить `POST /api/v1/capture`. |
@@ -405,9 +442,11 @@ LLM_PRIMARY_EXTRA_JSON='{"reasoning":{"effort":"minimal"}}'
 Не добавляйте `provider.require_parameters`: у Haiku через OpenRouter этот
 параметр приводит к отказу маршрутизации. Клиент его сам не отправляет.
 
-Если Telegram не нужен, установите `TELEGRAM_MODE=disabled`; `TELEGRAM_BOT_TOKEN`
-и webhook-секрет в этом режиме не требуются. HTTP API, HA-компонент и внешний
-capture продолжают работать, а `POST /webhooks/telegram` отвечает `404`.
+Если Telegram не нужен, не задавайте `TELEGRAM_BOT_TOKEN` и не настраивайте
+бота в консоли: без настроек бот выключен. Строка `TELEGRAM_MODE=disabled` без
+токена теперь игнорируется с предупреждением в логе, а `webhook`/`polling` без
+токена — ошибка запуска. HTTP API, HA-компонент и внешний capture продолжают
+работать, а `POST /webhooks/telegram` отвечает `404`.
 Серверная часть этого сценария (`todo`, `calendar`, capture и undo без бота)
 проверяется тестом [`tests/headless_ha.rs`](../tests/headless_ha.rs).
 
@@ -804,7 +843,7 @@ household, настройки LLM и токен для Home Assistant без п�
 | `tasklerq admin household delete --household <id> [--yes]` | Мягко удалить household: household и активные участники помечаются удалёнными, токены и приглашения отзываются. Без `--yes` просит ввести название household; без TTY завершается ошибкой и ничего не меняет. Уведомления участникам не отправляются. |
 | `tasklerq admin user add --telegram-id <id> --role owner\|member [--name "Имя"] [--household <id>]` | Добавить участника, записать `member_joined`, отклонить занятый Telegram ID и второго `owner`. |
 | `tasklerq admin queue stats` | Количество заданий `telegram_updates`, `outbox`, `capture_jobs` и `notification_deliveries` по статусам, возраст самого старого готового обновления. Содержимое сообщений не печатается. |
-| `tasklerq admin webhook info` | `getWebhookInfo`: URL без учётных данных, `pending_update_count`, последняя ошибка, `max_connections`, `ip_address`. Токен бота не выводится. |
+| `tasklerq admin webhook info` | `getWebhookInfo`: URL без учётных данных, `pending_update_count`, последняя ошибка, `max_connections`, `ip_address`. Токен бота не выводится; берётся из окружения, иначе из настроек консоли (база). |
 | `tasklerq admin setup-code` | Выпустить setup-код первого входа в консоль. Код печатается один раз, прежний неиспользованный гасится; если учётная запись уже есть, команда завершается ошибкой и предлагает `reset-password`. |
 | `tasklerq admin reset-password` | Выпустить ссылку восстановления пароля на 15 минут и вывести путь `/admin/recover/<код>`. В базе хранится только хеш; ссылка показывается один раз. |
 | `tasklerq admin secret-key rotate` | Перешифровать секреты прежним ключом `TASKLERQ_SECRET_KEY_OLD` на текущий `TASKLERQ_SECRET_KEY` в одной транзакции. Если хоть одна строка не расшифровывается ни одним ключом, ничего не меняется. |
@@ -1081,6 +1120,24 @@ migrations`. Тогда откатывайтесь восстановление�
 8. Ротация ключа шифрования секретов: новый ключ в `TASKLERQ_SECRET_KEY`,
    прежний — в `TASKLERQ_SECRET_KEY_OLD`, пересоздать контейнер, выполнить
    `tasklerq admin secret-key rotate`, убрать `_OLD` (раздел 15.3).
+
+### Telegram в консоли (0014)
+
+1. Строка `TELEGRAM_MODE=disabled` без `TELEGRAM_BOT_TOKEN` больше не задаёт
+   режим: она игнорируется с предупреждением в логе, а ботом управляет консоль.
+   Если бот не нужен, не задавайте токен и не настраивайте его в консоли;
+   `webhook`/`polling` без токена — ошибка запуска.
+2. Перенос бота в консоль: введите токен на странице «Telegram», проверьте
+   публичный адрес и адрес webhook, затем удалите все `TELEGRAM_*` из `.env` и
+   пересоздайте контейнер. Одно пересоздание нужно, чтобы окружение перестало
+   перекрывать базу; дальше подключение и переключение идут без перезапуска
+   (раздел 5).
+3. Откат на образ 0013: он не читает настройки Telegram из базы. Перед сменой
+   тега верните в `.env` `TELEGRAM_BOT_TOKEN` и `TELEGRAM_MODE`, а для
+   `webhook` — ещё `TELEGRAM_WEBHOOK_SECRET` и `TELEGRAM_WEBHOOK_URL`, затем
+   пересоздайте контейнер. Без `TELEGRAM_*` прежний образ не стартует:
+   `TELEGRAM_MODE` по умолчанию `webhook` требует токен. Если бот не нужен,
+   задайте перед откатом `TELEGRAM_MODE=disabled`.
 
 Откат на образ без консоли:
 
@@ -1532,8 +1589,9 @@ proxy, проверка слотов LLM, backup), остаются в 15.2 и �
 - [ ] Внешний capture требует `capture:write`; анонимный запрос — `401`.
 - [ ] Лимиты capture (`10/мин` на токен, тело 16 КБ, текст 2000) включены.
 - [ ] `Idempotency-Key` уникален; повтор не создаёт дубликаты.
-- [ ] `TELEGRAM_MODE=webhook` в production; для headless — `disabled` без
-  `TELEGRAM_BOT_TOKEN`.
+- [ ] Telegram из окружения: `TELEGRAM_MODE=webhook` в production вместе с
+  `TELEGRAM_BOT_TOKEN`; альтернатива — бот, настроенный в консоли. Для headless
+  токен не задан, а бот не настроен в консоли.
 - [ ] `TELEGRAM_API_BASE_URL` не задан в production (используется официальный
   Telegram Bot API).
 - [ ] `LLM_PRIMARY_URL`, `LLM_PRIMARY_MODEL` заданы; `LLM_FALLBACK_*` — вместе
@@ -1619,7 +1677,7 @@ proxy, проверка слотов LLM, backup), остаются в 15.2 и �
 1. Проверьте `TELEGRAM_WEBHOOK_SECRET` в `.env`. `getWebhookInfo` секрет не
    показывает, поэтому совпадение секрета с зарегистрированным проверяется
    только повторной регистрацией webhook (раздел 5, п. 5).
-2. Проверьте webhook: `sudo /usr/local/bin/docker compose exec tasklerq tasklerq admin webhook info` — URL и `last_error_message` без токена бота. Команда не ходит в БД и работает, даже когда PostgreSQL недоступен; если контейнер не запущен, используйте `docker compose run --rm tasklerq admin webhook info`.
+2. Проверьте webhook: `sudo /usr/local/bin/docker compose exec tasklerq tasklerq admin webhook info` — URL и `last_error_message` без токена бота. При токене в окружении команда не ходит в БД и работает, даже когда PostgreSQL недоступен; бот из консоли требует доступной базы и `TASKLERQ_SECRET_KEY`. Если контейнер не запущен, используйте `docker compose run --rm tasklerq admin webhook info`.
 3. Перерегистрируйте webhook с секретом из `.env` (раздел 5, п. 5), затем
    повторите `tasklerq admin webhook info`.
 4. Проверьте, что Synology Reverse Proxy передаёт заголовок
@@ -1636,17 +1694,23 @@ proxy, проверка слотов LLM, backup), остаются в 15.2 и �
    был секрет пустым или неверным. `429` — сработал лимит 120 запросов/с с IP.
    `404` возвращается, когда `state.telegram == None`
    (`src/telegram/webhook.rs`, обработчик `receive`), а `Ingress` создаётся
-   только в режиме `webhook` и только при заданных `TELEGRAM_WEBHOOK_URL` и
-   `TELEGRAM_WEBHOOK_SECRET` (`src/telegram/runtime.rs`). Поэтому причины
-   `404` такие:
+   только в режиме `webhook` и только для настроенной группы Telegram
+   (`src/telegram/runtime.rs`). Поэтому причины `404` такие:
 
-   - `TELEGRAM_MODE=disabled` — маршрут выключен, бот не нужен;
-   - `TELEGRAM_MODE=polling` — webhook не поднимается (режим допустим только
-     вне `ENV=production`);
+   - бот не настроен: нет строк Telegram в консоли и нет `TELEGRAM_BOT_TOKEN`
+     в окружении;
+   - режим `disabled` в консоли или в окружении — маршрут выключен, бот не
+     нужен;
+   - режим `polling` — webhook не поднимается (режим допустим только вне
+     `ENV=production`);
+   - группа из базы неполная (например, нет секрета webhook) — сервис
+     стартует, но бот выключен, а причина есть в стартовом логе;
    - запрос пришёл не на `/webhooks/telegram` или не дошёл до Tasklerq
-     (ошибка в URL, маршруте reverse proxy или edge). В режиме `webhook`
-     маршрут есть всегда: без `TELEGRAM_WEBHOOK_URL` или
-     `TELEGRAM_WEBHOOK_SECRET` конфигурация не стартует (`src/config/mod.rs`).
+     (ошибка в URL, маршруте reverse proxy или edge).
+
+   Для группы из окружения в режиме `webhook` маршрут есть всегда: без
+   `TELEGRAM_WEBHOOK_URL` или `TELEGRAM_WEBHOOK_SECRET` конфигурация не
+   стартует (`src/config/mod.rs`).
 
    Каждый `401` увеличивает
    `webhook_auth_failures_total` и пишется в `audit_events` как `auth_failed`
@@ -2200,7 +2264,6 @@ cat > .env <<'EOF'
 ENV=development
 BIND_ADDR=0.0.0.0:8080
 DATABASE_URL=postgres://tasklerq:tasklerq@127.0.0.1:15433/tasklerq?sslmode=disable
-TELEGRAM_MODE=disabled
 LLM_CAPTURE_ENABLED=false
 RUST_LOG=debug
 EOF
@@ -2209,8 +2272,10 @@ EOF
 cargo run --locked -- serve
 ```
 
-Для `TELEGRAM_MODE=polling` нужен реальный токен тестового бота; `disabled`
-оставляет API и capture без Telegram.
+Без `TELEGRAM_BOT_TOKEN` и настроек в консоли бот выключен, а API и capture
+продолжают работать. `TELEGRAM_MODE=disabled` теперь игнорируется с
+предупреждением в логе: режимом управляет наличие токена и консоль. Для
+`TELEGRAM_MODE=polling` нужен реальный токен тестового бота.
 
 Для webhook локально:
 

@@ -17,6 +17,7 @@ use sqlx::postgres::PgPoolOptions;
 use tasklerq::admin_console::codes::{self, Purpose};
 use tasklerq::auth::tokens::{SCOPES, hash_token};
 use tasklerq::config::{SecretKey, SecretString};
+use tasklerq::settings as settings_api;
 use tasklerq::settings::crypto::{KeyId, SecretCipher, SecretContext, SecretError, key_id};
 use tasklerq::storage::migrations;
 use tasklerq::storage::repositories::invites;
@@ -1149,6 +1150,72 @@ async fn webhook_info_network_error_hides_the_bot_token_and_database_password() 
             "webhook info leaked {secret}:\n{combined}"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webhook_info_reads_the_bot_token_from_the_console_settings() {
+    const BOT_TOKEN: &str = "789012:SECRET-db-bot-token-webhook-info";
+
+    let db = cli_database().await;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/bot{BOT_TOKEN}/getWebhookInfo")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ok": true,
+            "result": {
+                "url": "https://hooks.example.test/webhooks/telegram",
+                "pending_update_count": 3,
+                "last_error_date": null,
+                "last_error_message": null
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let secret_key = BASE64.encode([9_u8; 32]);
+    let key = SecretKey::parse(&secret_key).expect("32 bytes are a key");
+    let cipher = SecretCipher::new(Some(key), None);
+    let mut conn = db.pool.acquire().await.expect("connection");
+    settings_api::write_value(&mut conn, "telegram.mode", serde_json::json!("polling"))
+        .await
+        .expect("mode");
+    settings_api::write_secret(
+        &mut conn,
+        "telegram.bot_token",
+        &SecretString::new(BOT_TOKEN),
+        &cipher,
+    )
+    .await
+    .expect("bot token");
+    drop(conn);
+
+    let output = bin()
+        .env("DATABASE_URL", &db.url)
+        .env("ENV", "development")
+        .env("TASKLERQ_SECRET_KEY", &secret_key)
+        .env("TELEGRAM_API_BASE_URL", server.uri())
+        .env("RUST_LOG", "error")
+        .args(["admin", "webhook", "info"])
+        .output()
+        .await
+        .expect("the CLI should run");
+
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(
+        text.contains("url: https://hooks.example.test/webhooks/telegram"),
+        "{text}"
+    );
+    assert_eq!(field(&text, "pending_update_count"), "3");
+    assert!(
+        !text.contains(BOT_TOKEN),
+        "stdout leaked the bot token:\n{text}"
+    );
+    assert!(
+        !stderr(&output).contains(BOT_TOKEN),
+        "stderr leaked the bot token:\n{}",
+        stderr(&output)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

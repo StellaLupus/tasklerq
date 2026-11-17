@@ -507,7 +507,12 @@ fn an_undecryptable_token_makes_the_whole_group_unavailable() {
 
     let wrong = effective_telegram(&telegram_config(&[]), &stored, &cipher_for(2));
     assert!(!wrong.is_configured());
-    assert_eq!(wrong.problem(), Some(TelegramProblem::SecretUndecryptable));
+    assert_eq!(
+        wrong.problem(),
+        Some(TelegramProblem::SecretUndecryptable {
+            field: "telegram.bot_token"
+        })
+    );
     assert_eq!(
         telegram_setting(&wrong, "telegram.bot_token").secret,
         Some(SecretState::Undecryptable)
@@ -515,7 +520,12 @@ fn an_undecryptable_token_makes_the_whole_group_unavailable() {
 
     let missing = effective_telegram(&telegram_config(&[]), &stored, &cipher_without_key());
     assert!(!missing.is_configured());
-    assert_eq!(missing.problem(), Some(TelegramProblem::SecretKeyMissing));
+    assert_eq!(
+        missing.problem(),
+        Some(TelegramProblem::SecretKeyMissing {
+            field: "telegram.bot_token"
+        })
+    );
 }
 
 #[test]
@@ -525,7 +535,12 @@ fn a_webhook_group_from_the_database_requires_a_secret_and_an_address() {
         &stored_telegram("webhook", Some("db-token")),
         &cipher(),
     );
-    assert_eq!(missing_secret.problem(), Some(TelegramProblem::Incomplete));
+    assert_eq!(
+        missing_secret.problem(),
+        Some(TelegramProblem::Incomplete {
+            field: "telegram.webhook_secret"
+        })
+    );
 
     let mut stored = stored_telegram("webhook", Some("db-token"));
     stored.push(secret("telegram.webhook_secret", "db-webhook-secret"));
@@ -617,6 +632,109 @@ fn a_database_webhook_address_must_be_https_in_production() {
         Some(TelegramProblem::InvalidField {
             field: "telegram.webhook_url_override"
         })
+    );
+}
+
+#[test]
+fn every_telegram_setting_key_is_resolved_from_the_database() {
+    let stored = vec![
+        plain("telegram.mode", json!("polling")),
+        secret("telegram.bot_token", "db-token"),
+        plain("telegram.bot_id", json!(42)),
+        plain("telegram.bot_username", json!("db_bot")),
+        plain("telegram.public_base_url", json!("https://db.example.test")),
+        plain(
+            "telegram.webhook_url_override",
+            json!("https://hooks.example.test/telegram"),
+        ),
+        secret("telegram.webhook_secret", "db-webhook-secret"),
+    ];
+    let effective = effective_telegram(&telegram_config(&[]), &stored, &cipher());
+
+    let keys: Vec<_> = SETTING_KEYS
+        .iter()
+        .filter(|key| key.name.starts_with("telegram."))
+        .collect();
+    assert!(!keys.is_empty(), "the telegram key group must not be empty");
+    for key in keys {
+        assert_eq!(
+            telegram_setting(&effective, key.name).source,
+            SettingSource::Db,
+            "{} must get a source from the stored row, not a default",
+            key.name
+        );
+    }
+}
+
+#[test]
+fn invalid_telegram_fields_from_the_database_name_the_key() {
+    for (key, value) in [
+        ("telegram.mode", json!("sometimes")),
+        ("telegram.bot_id", json!("not-an-id")),
+        ("telegram.bot_username", json!("bad name")),
+        ("telegram.public_base_url", json!("not a url")),
+    ] {
+        let mut stored = stored_telegram("polling", Some("db-token"));
+        stored.retain(|row| row.key != key);
+        stored.push(plain(key, value));
+
+        let effective = effective_telegram(&telegram_config(&[]), &stored, &cipher());
+
+        assert!(!effective.is_configured(), "{key}");
+        assert_eq!(
+            effective.problem(),
+            Some(TelegramProblem::InvalidField { field: key }),
+            "{key}"
+        );
+    }
+}
+
+#[test]
+fn polling_from_the_database_is_rejected_in_production() {
+    let production = telegram_config(&[
+        ("ENV", "production"),
+        ("PUBLIC_BASE_URL", "https://tasklerq.example.com"),
+    ]);
+
+    let effective = effective_telegram(
+        &production,
+        &stored_telegram("polling", Some("db-token")),
+        &cipher(),
+    );
+
+    assert!(!effective.is_configured());
+    assert_eq!(
+        effective.problem(),
+        Some(TelegramProblem::InvalidField {
+            field: "telegram.mode"
+        })
+    );
+}
+
+#[test]
+fn a_webhook_url_in_the_environment_does_not_reach_a_database_group() {
+    let config = telegram_config(&[("TELEGRAM_WEBHOOK_URL", "https://env.example.test/hook")]);
+    assert!(config.telegram.is_none());
+    assert_eq!(config.telegram_ignored_env, vec!["TELEGRAM_WEBHOOK_URL"]);
+
+    let mut stored = stored_telegram("webhook", Some("db-token"));
+    stored.push(secret("telegram.webhook_secret", "db-webhook-secret"));
+    stored.push(plain(
+        "telegram.public_base_url",
+        json!("https://db.example.test"),
+    ));
+
+    let effective = effective_telegram(&config, &stored, &cipher());
+
+    assert!(effective.is_enabled());
+    assert_eq!(effective.source(), Some(SettingSource::Db));
+    assert_eq!(
+        effective
+            .config()
+            .and_then(|group| group.webhook_url.as_ref())
+            .map(|url| url.as_str()),
+        Some("https://db.example.test/webhooks/telegram"),
+        "a lone TELEGRAM_WEBHOOK_URL without a token must not affect the address"
     );
 }
 

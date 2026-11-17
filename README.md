@@ -146,7 +146,10 @@ docker compose up -d postgres
 # 3. Применить миграции
 make migrate
 
-# 4. Запустить сервис локально в режиме polling
+# 4. Раскомментировать TELEGRAM_BOT_TOKEN в .env (блок Telegram — альтернатива
+#    консоли), вписать токен тестового бота и запустить сервис локально.
+#    polling действует только вместе с токеном; без токена бот подключается
+#    на странице «Telegram» в консоли администратора.
 TELEGRAM_MODE=polling make dev
 
 # 5. Открыть @tasklerq_example_bot в Telegram и отправить /start
@@ -162,8 +165,9 @@ curl -X POST http://127.0.0.1:8080/api/v1/capture \
   -d '{"text":"купить молоко","source":"api","mode":"auto","hint":"shopping"}'
 ```
 
-Headless-режим без Telegram: `TELEGRAM_MODE=disabled` — HTTP API, HA-компонент
-и внешний capture продолжают работать.
+Headless-режим без Telegram: не задавайте `TELEGRAM_BOT_TOKEN` и не настраивайте
+бота в консоли — HTTP API, HA-компонент и внешний capture продолжают работать.
+`TELEGRAM_MODE=disabled` без токена игнорируется с предупреждением в логе.
 
 Production-развёртывание — через webhook и HTTPS; готовый образ
 [`stellalupus/tasklerq`](https://hub.docker.com/r/stellalupus/tasklerq)

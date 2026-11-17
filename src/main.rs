@@ -12,7 +12,9 @@ use tasklerq::admin_console;
 use tasklerq::app::build_application;
 use tasklerq::capture::eval::TitleMatch;
 use tasklerq::capture::slot_check;
-use tasklerq::config::{self, Config, DatabaseConfig, LlmConfig, SecretKeyConfig, TenancyConfig};
+use tasklerq::config::{
+    self, Config, DatabaseConfig, LlmConfig, SecretKeyConfig, SecretString, TenancyConfig,
+};
 use tasklerq::domain::error::DomainError;
 use tasklerq::domain::models::UserRole;
 use tasklerq::domain::settings::DEFAULT_TIMEZONE;
@@ -677,8 +679,9 @@ async fn run_admin(command: AdminCommand) -> Result<()> {
     init_cli_tracing();
 
     match command {
-        // Webhook не требует базы: команда работает даже при недоступном
-        // PostgreSQL и использует ту же конфигурацию Telegram, что сервис.
+        // Webhook использует ту же действующую конфигурацию Telegram, что и
+        // сервис: при токене в окружении база не нужна, иначе команда читает
+        // настройки консоли тем же ключом шифрования.
         AdminCommand::Webhook { .. } => webhook_info().await,
         AdminCommand::Token { command } => {
             run_admin_database(DatabaseCommand::Token(command)).await
@@ -1005,13 +1008,42 @@ fn webhook_display_url(raw: &str) -> String {
     clean(&shown)
 }
 
+async fn telegram_bot_token(config: &Config) -> Result<SecretString> {
+    // Окружение описывает группу целиком при токене: база не нужна.
+    if let Some(group) = &config.telegram {
+        return group
+            .bot_token
+            .clone()
+            .context("TELEGRAM_BOT_TOKEN is not configured");
+    }
+
+    let keys = SecretKeyConfig::from_env().context("invalid secret key configuration")?;
+    let cipher = SecretCipher::new(keys.current, keys.old);
+    let database = DatabaseConfig::from_env().context("invalid database configuration")?;
+    let pool = storage::db::connect(&database)
+        .await
+        .context("database connection failed")?;
+    let effective = settings::read_effective_telegram(&pool, config, &cipher)
+        .await
+        .context("failed to read telegram settings from the database")?;
+    let reason = effective
+        .problem()
+        .map_or("not_set", |problem| problem.code());
+
+    effective
+        .config()
+        .and_then(|group| group.bot_token.clone())
+        .with_context(|| {
+            format!(
+                "telegram bot is not configured ({reason}): set TELEGRAM_BOT_TOKEN or \
+                 configure the bot in the admin console"
+            )
+        })
+}
+
 async fn webhook_info() -> Result<()> {
     let config = Config::from_env().context("invalid configuration")?;
-    let token = config
-        .telegram
-        .as_ref()
-        .and_then(|telegram| telegram.bot_token.clone())
-        .context("TELEGRAM_BOT_TOKEN is not configured")?;
+    let token = telegram_bot_token(&config).await?;
     let base_url = config
         .telegram_api_base_url
         .as_ref()

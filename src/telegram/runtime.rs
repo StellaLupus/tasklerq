@@ -7,7 +7,7 @@ use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 use url::Url;
 
-use crate::config::Config;
+use crate::config::{Config, TelegramMode};
 use crate::jobs::scheduler::Scheduler;
 use crate::llm::LlmHandle;
 use crate::security_audit::Audit;
@@ -19,7 +19,6 @@ use super::capture_worker::CaptureWorker;
 use super::outbox::OutboxWorker;
 use super::webhook::Ingress;
 use super::worker::{UPDATES_PER_MINUTE, UpdateWorker, poll};
-use crate::config::TelegramMode;
 
 /// Запущенная Telegram-часть.
 pub struct Runtime {

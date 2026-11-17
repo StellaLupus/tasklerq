@@ -352,6 +352,9 @@ impl DatabaseConfig {
     }
 }
 
+/// Имя бота по умолчанию для ссылок-приглашений.
+pub const DEFAULT_BOT_USERNAME: &str = "tasklerqbot";
+
 /// Параметры Telegram из окружения: группа целиком.
 ///
 /// Группа существует, только если задан `TELEGRAM_BOT_TOKEN`; иначе настройки
@@ -775,7 +778,11 @@ impl Config {
 
         let bot_username = named(
             "TELEGRAM_BOT_USERNAME",
-            parse_bot_username(source.get("TELEGRAM_BOT_USERNAME").unwrap_or("tasklerqbot")),
+            parse_bot_username(
+                source
+                    .get("TELEGRAM_BOT_USERNAME")
+                    .unwrap_or(DEFAULT_BOT_USERNAME),
+            ),
         )?;
 
         Ok((
