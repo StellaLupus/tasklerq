@@ -19,12 +19,13 @@ use tasklerq::admin;
 use tasklerq::admin_console::router::{AdminState, build_router as build_admin_router};
 use tasklerq::auth::tokens::hash_token;
 use tasklerq::capture::prompt::PROMPT_VERSION;
-use tasklerq::config::{CaptureConfig, SecretString, TenancyMode};
+use tasklerq::config::{CaptureConfig, LlmConfig, SecretString, TenancyMode};
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
-use tasklerq::llm::{Chain, LlmHandle, LlmSnapshot};
+use tasklerq::llm::{Chain, LlmHandle, LlmSettings, LlmSnapshot};
 use tasklerq::metrics;
 use tasklerq::security_audit::{Audit, WEBHOOK_FAILURE_THRESHOLD};
+use tasklerq::settings::crypto::SecretCipher;
 use tasklerq::storage::repositories::capture_jobs::{self, NewJob};
 use tasklerq::storage::repositories::members;
 use tasklerq::telegram::bot::{Bot, Outcome};
@@ -916,7 +917,17 @@ async fn a_console_login_failure_shares_the_auth_failure_threshold() {
     );
 
     let before = metrics::render();
-    let console = build_admin_router(AdminState::new(db.pool.clone(), Vec::new(), audit.clone()));
+    let console = build_admin_router(AdminState::new(
+        db.pool.clone(),
+        Vec::new(),
+        audit.clone(),
+        LlmSettings::new(
+            db.pool.clone(),
+            LlmConfig::empty(),
+            SecretCipher::new(None, None),
+            LlmHandle::empty(),
+        ),
+    ));
     let mut request = Request::builder()
         .method("POST")
         .uri("/admin/login")

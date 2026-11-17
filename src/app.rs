@@ -94,13 +94,15 @@ pub async fn build_application_with_update_limit(
     let mut state = AppState::new(pool.clone(), audit.clone())
         .with_tenancy_mode(config.tenancy.mode)
         .with_secret_cipher(secret_cipher.clone())
-        .with_llm_slots(llm_slots);
+        .with_llm_slots(llm_slots.clone());
     let mut workers = Vec::new();
+    let mut queue_lag_seconds = None;
     if let Some(runtime) = telegram {
         if let Some(ingress) = runtime.ingress {
             state = state.with_telegram(ingress);
         }
         state = state.with_queue_lag_limit(config.queue.ready_lag_seconds);
+        queue_lag_seconds = Some(config.queue.ready_lag_seconds);
         workers = runtime.tasks;
     }
     if config.capture.enabled {
@@ -110,17 +112,19 @@ pub async fn build_application_with_update_limit(
     // Консоль получает собственный роутер и listener. `disabled` не создаёт
     // ни того, ни другого.
     let admin_router = config.admin_bind_addr.map(|_| {
-        let wizard = WizardSettings::new(
-            config.tenancy.mode,
-            config.telegram.mode.is_enabled(),
-            config.llm.clone(),
-            secret_cipher.clone(),
-        );
-        build_admin_router(
-            AdminState::new(pool.clone(), config.admin_trusted_proxies.clone(), audit)
-                .with_wizard(wizard)
-                .with_llm(llm_settings.clone()),
+        let wizard = WizardSettings::new(config.tenancy.mode, config.telegram.mode.is_enabled());
+        let mut admin = AdminState::new(
+            pool.clone(),
+            config.admin_trusted_proxies.clone(),
+            audit,
+            llm_settings.clone(),
         )
+        .with_wizard(wizard)
+        .with_llm_slots(llm_slots);
+        if let Some(seconds) = queue_lag_seconds {
+            admin = admin.with_queue_lag_limit(seconds);
+        }
+        build_admin_router(admin)
     });
 
     // Retention и доменный тикер не зависят от Telegram: чистят базу и

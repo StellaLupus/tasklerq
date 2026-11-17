@@ -44,16 +44,20 @@ use super::router::AdminState;
 use super::session::{self, AdminSession, LOGIN_PATH};
 use super::setup::{self, SetupError, SetupOutcome};
 use super::wizard::{self, WizardStep};
+use crate::VERSION;
 use crate::admin;
 use crate::capture::eval::TitleMatch;
 use crate::capture::slot_check::{self, CheckError, PreparedCheck};
+use crate::capture::slot_status::SlotStatus;
 use crate::domain::error::DomainError;
 use crate::domain::settings::{DEFAULT_TIMEZONE, validate_timezone};
 use crate::domain::validation::normalize_text;
+use crate::http::health::{self, ReadinessInput};
 use crate::llm::{LlmApplyError, LlmChange, OpenAiBackend};
 use crate::rate_limit::RateDecision;
 use crate::settings::{ResolvedSetting, SecretState, SettingError, SettingSource};
 use crate::storage::repositories::admin_accounts;
+use crate::storage::repositories::households;
 use crate::storage::repositories::llm_slot_settings;
 
 /// Путь страницы первого входа.
@@ -252,12 +256,170 @@ pub(crate) struct CheckForm {
 }
 
 /// `GET /admin`: главная страница за сессией.
+///
+/// Показывает состояние инсталляции без секретов и пользовательского
+/// содержимого: версию, готовность с предупреждениями, режим размещения, число
+/// household, Telegram и статусы слотов. Готовность считает та же сборка, что
+/// `/health/ready`.
 pub(crate) async fn index(State(state): State<AdminState>, _session: AdminSession) -> Response {
-    match wizard::read_state(&state.pool, state.wizard(), Utc::now()).await {
-        Ok(snapshot) => render(ConsolePage::new(Page::Home {
-            setup_incomplete: wizard::wizard_step(&snapshot) != WizardStep::Done,
-        })),
+    match home_view(&state, Utc::now()).await {
+        Ok(view) => render(ConsolePage::new(Page::Home(Box::new(view)))),
         Err(error) => internal(error),
+    }
+}
+
+/// Данные главной страницы.
+struct HomeView {
+    /// Версия сервиса.
+    version: &'static str,
+    /// Мастер ещё не завершён: показать ссылку «Продолжить настройку».
+    setup_incomplete: bool,
+    /// Сервис готов.
+    ready: bool,
+    /// Причина неготовности без технических подробностей.
+    readiness_problem: Option<&'static str>,
+    /// Предупреждения readiness с подписями.
+    warnings: Vec<HomeWarning>,
+    /// Есть ли предупреждения.
+    has_warnings: bool,
+    /// Режим размещения: `single` или `multi`.
+    tenancy: &'static str,
+    /// Число активных household.
+    households: i64,
+    /// Telegram включён.
+    telegram_enabled: bool,
+    /// Статусы основного и резервного слотов.
+    slots: Vec<HomeSlot>,
+}
+
+/// Предупреждение readiness на главной.
+struct HomeWarning {
+    /// Код предупреждения; справочно рядом с подписью.
+    code: String,
+    /// Понятная подпись.
+    label: String,
+}
+
+/// Статус одного слота LLM на главной.
+struct HomeSlot {
+    /// Название слота.
+    label: &'static str,
+    /// Статус без адреса, модели и токена.
+    status: String,
+    /// Показать ссылку на проверку.
+    check_link: bool,
+}
+
+/// Собрать данные главной: готовность, счёт household и статусы слотов.
+async fn home_view(state: &AdminState, now: DateTime<Utc>) -> Result<HomeView, DomainError> {
+    let snapshot =
+        wizard::read_state(&state.pool, state.wizard(), state.llm_settings(), now).await?;
+
+    let readiness = health::readiness(ReadinessInput {
+        pool: &state.pool,
+        tenancy_mode: state.wizard().tenancy,
+        queue_lag_limit: state.queue_lag_limit(),
+        secret_cipher: state.llm_settings().cipher(),
+        llm_slots: state.llm_slots(),
+        now,
+    })
+    .await;
+    let (ready, readiness_problem, codes) = match readiness {
+        Ok(codes) => (true, None, codes),
+        Err(failure) => (false, Some(failure.label()), Vec::new()),
+    };
+    let warnings: Vec<HomeWarning> = codes
+        .into_iter()
+        .map(|code| HomeWarning {
+            label: warning_label(&code),
+            code,
+        })
+        .collect();
+
+    let mut conn = state.pool.acquire().await?;
+    let active_households = households::count_active(&mut conn).await?;
+    drop(conn);
+
+    let slots = home_slots(state, now).await;
+
+    Ok(HomeView {
+        version: VERSION,
+        setup_incomplete: wizard::wizard_step(&snapshot) != WizardStep::Done,
+        ready,
+        readiness_problem,
+        has_warnings: !warnings.is_empty(),
+        warnings,
+        tenancy: match state.wizard().tenancy {
+            crate::config::TenancyMode::Single => "single",
+            crate::config::TenancyMode::Multi => "multi",
+        },
+        households: active_households,
+        telegram_enabled: state.wizard().telegram_enabled,
+        slots,
+    })
+}
+
+/// Статусы слотов из снимка и сохранённых проверок.
+///
+/// Ненастроенный слот — «не настроен»; настроенный без проверки — «не проверен».
+/// Ссылка на проверку есть у настроенного слота, который проверку не прошёл.
+async fn home_slots(state: &AdminState, now: DateTime<Utc>) -> Vec<HomeSlot> {
+    let snapshot = state.llm_settings().handle().load();
+    let effective = snapshot.effective();
+    let statuses = state.llm_slots().statuses(&state.pool, now).await;
+
+    CheckSlot::ALL
+        .into_iter()
+        .map(|slot| {
+            let configured = slot.config(effective).is_some();
+            let report = statuses.iter().find(|report| report.slot == slot.name());
+            let status = match (configured, report) {
+                (false, _) => "не настроен",
+                (true, None) => "не проверен",
+                (true, Some(report)) => slot_status_label(report.status),
+            };
+            HomeSlot {
+                label: match slot {
+                    CheckSlot::Primary => "Основной слот",
+                    CheckSlot::Fallback => "Резервный слот",
+                },
+                status: status.to_owned(),
+                check_link: configured && report.is_none_or(|report| !report.status.is_passed()),
+            }
+        })
+        .collect()
+}
+
+/// Подпись статуса слота без адреса и модели.
+fn slot_status_label(status: SlotStatus) -> &'static str {
+    match status {
+        SlotStatus::Unverified => "не проверен",
+        SlotStatus::Stale => "устарел",
+        SlotStatus::Passed => "проверен",
+        SlotStatus::Failed { .. } => "не прошёл проверку",
+    }
+}
+
+/// Понятная подпись предупреждения readiness; код показывается рядом.
+fn warning_label(code: &str) -> String {
+    match code {
+        "multiple_households" => "в режиме single больше одного household".to_owned(),
+        "llm_unavailable" => "все настроенные слоты LLM недоступны".to_owned(),
+        "secret_key_missing" => "нет ключа шифрования сохранённых секретов".to_owned(),
+        "secret_undecryptable" => "сохранённые секреты не расшифровываются".to_owned(),
+        _ => match code.strip_prefix("llm_slot_unverified:") {
+            Some(rest) => {
+                let mut parts = rest.splitn(2, ':');
+                let slot = parts.next().unwrap_or_default();
+                match parts.next() {
+                    Some(mode) => {
+                        format!("слот LLM {slot}: проверка ({mode}) не пройдена")
+                    }
+                    None => format!("слот LLM {slot} не проверен"),
+                }
+            }
+            None => "неизвестное предупреждение".to_owned(),
+        },
     }
 }
 
@@ -600,13 +762,21 @@ async fn save_llm(
 
 /// `GET /admin/llm/check`: страница хода проверки слота.
 ///
-/// Открывается после POST и без JavaScript: ссылка «Обновить» перезагружает
-/// страницу, пока прогон идёт.
+/// Открывается после POST и без JavaScript: заголовок `Refresh` перезагружает
+/// страницу, пока прогон идёт, а ссылка «Обновить» делает то же вручную.
 pub(crate) async fn llm_check_page(
     State(state): State<AdminState>,
     _session: AdminSession,
 ) -> Response {
-    render(ConsolePage::new(Page::Check(state.checks().current())))
+    let snapshot = state.checks().current();
+    let running = snapshot.as_ref().is_some_and(CheckSnapshot::running);
+    let mut response = render(ConsolePage::new(Page::Check(snapshot)));
+    if running {
+        response
+            .headers_mut()
+            .insert(header::REFRESH, header::HeaderValue::from_static("2"));
+    }
+    response
 }
 
 /// `GET /admin/llm/check-fragment`: ход проверки для htmx.
@@ -672,13 +842,18 @@ pub(crate) async fn llm_check_start(
         return redirect(LLM_CHECK_PATH);
     }
 
-    let checks = state.checks().clone();
+    let check_state = state.checks().clone();
+    let checks = check_state.clone();
     let task_state = state.clone();
-    tokio::spawn(async move {
+    check_state.spawn(async move {
         let progress = |done, total| checks.advance(done, total);
-        match slot_check::run_check_with_progress(&task_state.pool, prepared, titles, progress)
-            .await
-        {
+        let outcome =
+            slot_check::run_check_with_progress(&task_state.pool, prepared, titles, progress).await;
+        // Успешный прогон записал строку проверки; кеш статусов привязан к
+        // версии снимка, поэтому без сброса главная и `/health/ready` до
+        // минуты показывали бы прежний статус.
+        task_state.llm_slots().invalidate();
+        match outcome {
             Ok(result) => checks.finish_result(result),
             Err(CheckError::Busy) => checks.fail("Слот не проверен: проверка уже идёт."),
             Err(error) => checks.fail(format!("Проверка не выполнена: {error}")),
@@ -693,7 +868,14 @@ pub(crate) async fn wizard_page(
     State(state): State<AdminState>,
     _session: AdminSession,
 ) -> Response {
-    match wizard::read_state(&state.pool, state.wizard(), Utc::now()).await {
+    match wizard::read_state(
+        &state.pool,
+        state.wizard(),
+        state.llm_settings(),
+        Utc::now(),
+    )
+    .await
+    {
         Ok(snapshot) => {
             let step = wizard::wizard_step(&snapshot);
             match step {
@@ -719,10 +901,11 @@ pub(crate) async fn wizard_skip(
     Form(form): Form<SkipForm>,
 ) -> Response {
     let now = Utc::now();
-    let snapshot = match wizard::read_state(&state.pool, state.wizard(), now).await {
-        Ok(snapshot) => snapshot,
-        Err(error) => return internal(error),
-    };
+    let snapshot =
+        match wizard::read_state(&state.pool, state.wizard(), state.llm_settings(), now).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return internal(error),
+        };
     let current = wizard::wizard_step(&snapshot);
     let telegram_enabled = state.wizard().telegram_enabled;
     let Some(step) = WizardStep::from_slug(&form.step)
@@ -858,20 +1041,23 @@ pub(crate) async fn wizard_token(
         .iter()
         .map(|scope| (*scope).to_owned())
         .collect();
-    match admin::create_token(
-        &state.pool,
-        state.wizard().tenancy,
-        None,
-        &name,
-        &scopes,
-        None,
-        now,
-    )
-    .await
+    match admin::create_wizard_token(&state.pool, state.wizard().tenancy, &name, &scopes, now).await
     {
-        Ok(issued) => render(ConsolePage::new(Page::TokenIssued {
+        Ok(Some(issued)) => render(ConsolePage::new(Page::TokenIssued {
             token: issued.token,
         })),
+        // Параллельный POST уже выпустил токен: второй не выпускается.
+        Ok(None) => render_with_status(
+            ConsolePage::new(Page::Wizard {
+                step,
+                household_skip_allowed: telegram_enabled,
+                form: WizardForm::Token {
+                    name: submitted_name,
+                },
+            })
+            .error(WIZARD_STALE_STEP_ERROR),
+            StatusCode::BAD_REQUEST,
+        ),
         Err(error) => internal(error),
     }
 }
@@ -910,7 +1096,8 @@ async fn current_step(
     state: &AdminState,
     now: chrono::DateTime<Utc>,
 ) -> Result<WizardStep, DomainError> {
-    let snapshot = wizard::read_state(&state.pool, state.wizard(), now).await?;
+    let snapshot =
+        wizard::read_state(&state.pool, state.wizard(), state.llm_settings(), now).await?;
     Ok(wizard::wizard_step(&snapshot))
 }
 
@@ -1621,12 +1808,23 @@ fn bool_of(settings: &[ResolvedSetting], key: &str) -> Option<bool> {
     }
 }
 
+/// Состояние хода проверки для шаблона.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CheckPhase {
+    /// Проверка ещё не запускалась.
+    Idle,
+    /// Проверка идёт.
+    Running,
+    /// Отчёт готов.
+    Report,
+    /// Проверка не выполнена.
+    Failed,
+}
+
 /// Вид хода проверки для шаблона.
 struct CheckView {
-    /// Проверка уже запускалась.
-    started: bool,
-    /// Проверка идёт.
-    running: bool,
+    /// Состояние хода: отчёт и ошибка не различаются по пустоте строки.
+    phase: CheckPhase,
     /// Имя слота.
     slot: &'static str,
     /// Сколько фраз пройдено.
@@ -1635,7 +1833,7 @@ struct CheckView {
     total: usize,
     /// Сколько фраз пройдено в готовом отчёте.
     passed: usize,
-    /// Отчёт с причинами и оценкой задержки; пусто — отчёта нет.
+    /// Отчёт с причинами и оценкой задержки.
     report: String,
     /// Результат сохранён.
     saved: bool,
@@ -1647,8 +1845,7 @@ struct CheckView {
 fn check_view(snapshot: Option<&CheckSnapshot>) -> CheckView {
     let Some(snapshot) = snapshot else {
         return CheckView {
-            started: false,
-            running: false,
+            phase: CheckPhase::Idle,
             slot: "",
             done: 0,
             total: 0,
@@ -1659,8 +1856,7 @@ fn check_view(snapshot: Option<&CheckSnapshot>) -> CheckView {
         };
     };
     let mut view = CheckView {
-        started: true,
-        running: snapshot.running(),
+        phase: CheckPhase::Running,
         slot: snapshot.slot,
         done: snapshot.done,
         total: snapshot.total,
@@ -1677,12 +1873,16 @@ fn check_view(snapshot: Option<&CheckSnapshot>) -> CheckView {
             total,
             saved,
         }) => {
+            view.phase = CheckPhase::Report;
             view.passed = *passed;
             view.total = *total;
             view.report = report.clone();
             view.saved = *saved;
         }
-        Some(CheckOutcome::Failed { message }) => view.error = message.clone(),
+        Some(CheckOutcome::Failed { message }) => {
+            view.phase = CheckPhase::Failed;
+            view.error = message.clone();
+        }
     }
     view
 }
@@ -1705,10 +1905,7 @@ fn phrase_word(count: usize) -> &'static str {
 /// Данные страницы; тип страницы задаёт и заголовок, и навигацию.
 enum Page {
     /// Главная за сессией.
-    Home {
-        /// Мастер ещё не завершён: показать ссылку «Продолжить настройку».
-        setup_incomplete: bool,
-    },
+    Home(Box<HomeView>),
     /// Первый вход по setup-коду.
     Setup,
     /// Вход.
@@ -1767,7 +1964,7 @@ impl Page {
     /// Заголовок страницы.
     fn title(&self) -> &'static str {
         match self {
-            Self::Home { .. } => "Tasklerq",
+            Self::Home(_) => "Tasklerq",
             Self::Setup => "Первый вход",
             Self::Login => "Вход",
             Self::Recovery { .. } => "Восстановление доступа",
@@ -1787,7 +1984,7 @@ impl Page {
     fn nav(&self) -> bool {
         matches!(
             self,
-            Self::Home { .. }
+            Self::Home(_)
                 | Self::Password { .. }
                 | Self::Wizard { .. }
                 | Self::TokenIssued { .. }
@@ -1799,10 +1996,7 @@ impl Page {
     /// Отрисовать содержимое страницы без макета.
     fn render_body(&self) -> Result<String, askama::Error> {
         match self {
-            Self::Home { setup_incomplete } => HomeBody {
-                setup_incomplete: *setup_incomplete,
-            }
-            .render(),
+            Self::Home(view) => HomeBody { view }.render(),
             Self::Setup => SetupBody.render(),
             Self::Login => LoginBody.render(),
             Self::Recovery { code } => RecoveryBody { code }.render(),
@@ -1889,11 +2083,7 @@ impl Page {
             Self::Check(snapshot) => {
                 let view = check_view(snapshot.as_ref());
                 let check = CheckBody { view: &view }.render()?;
-                CheckPageBody {
-                    running: view.running,
-                    check,
-                }
-                .render()
+                CheckPageBody { check }.render()
             }
         }
     }
@@ -1993,15 +2183,43 @@ struct Layout<'a> {
 #[template(
     source = r#"<h1>Tasklerq</h1>
 <p>Консоль администратора.</p>
-{% if setup_incomplete %}
+{% if view.setup_incomplete %}
 <p class="console-notice">Настройка ещё не завершена. <a href="/admin/wizard">Продолжить настройку</a></p>
 {% endif %}
+<section>
+<h2>Состояние инсталляции</h2>
+<dl class="console-state">
+<dt>Версия</dt><dd>{{ view.version }}</dd>
+<dt>Готовность</dt><dd>{% if view.ready %}готов{% else %}не готов{% endif %}{% match view.readiness_problem %}{% when Some with (reason) %} — {{ reason }}{% when None %}{% endmatch %}</dd>
+<dt>Режим размещения</dt><dd>{{ view.tenancy }}</dd>
+<dt>Household</dt><dd>{{ view.households }}</dd>
+<dt>Telegram</dt><dd>{% if view.telegram_enabled %}включён{% else %}выключен{% endif %}</dd>
+</dl>
+</section>
+{% if view.has_warnings %}
+<section>
+<h2>Предупреждения readiness</h2>
+<ul class="console-warnings">
+{% for warning in view.warnings %}
+<li><code>{{ warning.code }}</code> — {{ warning.label }}</li>
+{% endfor %}
+</ul>
+</section>
+{% endif %}
+<section>
+<h2>Слоты LLM</h2>
+<ul class="console-slots">
+{% for slot in view.slots %}
+<li>{{ slot.label }}: {{ slot.status }}{% if slot.check_link %} — <a href="/admin/llm">Проверить</a>{% endif %}</li>
+{% endfor %}
+</ul>
+</section>
 "#,
     ext = "html"
 )]
-struct HomeBody {
-    /// Мастер ещё не завершён.
-    setup_incomplete: bool,
+struct HomeBody<'a> {
+    /// Данные состояния инсталляции.
+    view: &'a HomeView,
 }
 
 /// Содержимое первого входа.
@@ -2323,47 +2541,48 @@ struct CheckButtonBody {
 }
 
 /// Содержимое страницы хода проверки.
+///
+/// Без JavaScript страницу обновляет заголовок ответа `Refresh`; в разметке
+/// `<noscript>` и `<meta http-equiv>` не нужны.
 #[derive(Template)]
 #[template(
     source = r#"<h1>Проверка слота</h1>
-{% if running %}<noscript><meta http-equiv="refresh" content="2"></noscript>{% endif %}
 {{ check|safe }}
 "#,
     ext = "html"
 )]
 struct CheckPageBody {
-    /// Проверка идёт: без JavaScript страницу обновит meta refresh.
-    running: bool,
     /// Уже отрисованный ход.
     check: String,
 }
 
-/// Ход проверки; фрагмент страницы хода для htmx.
+/// Ход проверки; он же содержимое страницы и фрагмент для htmx.
 #[derive(Template)]
 #[template(
-    source = r#"{% if !view.started %}
+    source = r#"{% match view.phase %}
+{% when CheckPhase::Idle %}
 <div id="llm-check">
 <p>Проверка ещё не запускалась.</p>
 <p><a href="/admin/llm">Вернуться к настройкам</a></p>
 </div>
-{% else %}{% if view.running %}
+{% when CheckPhase::Running %}
 <div id="llm-check" hx-get="/admin/llm/check-fragment" hx-trigger="every 2s" hx-swap="outerHTML">
 <p role="status">Проверка слота {{ view.slot }} идёт: пройдено {{ view.done }} из {{ view.total }} фраз.</p>
 <p><a href="/admin/llm/check">Обновить</a></p>
 </div>
-{% else %}{% if view.report.is_empty() %}
-<div id="llm-check">
-<p role="alert">{{ view.error }}</p>
-<p><a href="/admin/llm">Вернуться к настройкам</a></p>
-</div>
-{% else %}
+{% when CheckPhase::Report %}
 <div id="llm-check">
 <p role="status" class="console-notice">Проверка слота {{ view.slot }} завершена: пройдено {{ view.passed }} из {{ view.total }}.</p>
 {% if !view.saved %}<p role="alert">Результат проверки не сохранён.</p>{% endif %}
 <pre>{{ view.report }}</pre>
 <p><a href="/admin/llm">Вернуться к настройкам</a> · <a href="/admin/llm/check">Обновить</a></p>
 </div>
-{% endif %}{% endif %}{% endif %}
+{% when CheckPhase::Failed %}
+<div id="llm-check">
+<p role="alert">{{ view.error }}</p>
+<p><a href="/admin/llm">Вернуться к настройкам</a></p>
+</div>
+{% endmatch %}
 "#,
     ext = "html"
 )]
@@ -2375,13 +2594,36 @@ struct CheckBody<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConsolePage, HouseholdForm, LlmCheck, LlmChecks, LlmSlotView, LlmTextField, LlmToggle,
-        LlmTokenView, LlmView, Page, WizardForm, household_form_error, phrase_word, target_or_home,
+        ConsolePage, HomeSlot, HomeView, HomeWarning, HouseholdForm, LlmCheck, LlmChecks,
+        LlmSlotView, LlmTextField, LlmToggle, LlmTokenView, LlmView, Page, WizardForm,
+        household_form_error, phrase_word, target_or_home,
     };
     use crate::admin_console::checks::{CheckOutcome, CheckSlot, CheckSnapshot};
     use crate::admin_console::wizard::WizardStep;
     use crate::capture::eval::TitleMatch;
     use crate::domain::error::DomainError;
+
+    fn home_view_for_tests(setup_incomplete: bool) -> HomeView {
+        HomeView {
+            version: "0.0.0-test",
+            setup_incomplete,
+            ready: true,
+            readiness_problem: None,
+            warnings: vec![HomeWarning {
+                code: "llm_slot_unverified:primary".to_owned(),
+                label: "слот LLM primary не проверен".to_owned(),
+            }],
+            has_warnings: true,
+            tenancy: "single",
+            households: 1,
+            telegram_enabled: false,
+            slots: vec![HomeSlot {
+                label: "Основной слот",
+                status: "не проверен".to_owned(),
+                check_link: true,
+            }],
+        }
+    }
 
     fn llm_view_for_tests(token_label: &'static str) -> LlmView {
         let text = |value: &str| LlmTextField {
@@ -2434,9 +2676,7 @@ mod tests {
     #[test]
     fn every_page_has_the_shared_layout() {
         for page in [
-            Page::Home {
-                setup_incomplete: false,
-            },
+            Page::Home(Box::new(home_view_for_tests(false))),
             Page::Setup,
             Page::Login,
             Page::Recovery {
@@ -2470,11 +2710,9 @@ mod tests {
 
     #[test]
     fn the_navigation_follows_the_page_kind() {
-        let home = ConsolePage::new(Page::Home {
-            setup_incomplete: false,
-        })
-        .render()
-        .expect("home renders");
+        let home = ConsolePage::new(Page::Home(Box::new(home_view_for_tests(false))))
+            .render()
+            .expect("home renders");
         assert!(home.contains("action=\"/admin/logout\""), "{home}");
 
         let login = ConsolePage::new(Page::Login)
@@ -2604,7 +2842,10 @@ mod tests {
         assert!(html.contains("пройдено 3 из 22 фраз"), "{html}");
         assert!(html.contains("hx-trigger=\"every 2s\""), "{html}");
         assert!(html.contains("href=\"/admin/llm/check\""), "{html}");
-        assert!(html.contains("<noscript>"), "{html}");
+        assert!(
+            !html.contains("http-equiv=\"refresh\""),
+            "the page must not carry a meta refresh in the body: {html}"
+        );
 
         let finished = CheckSnapshot {
             slot: "primary",

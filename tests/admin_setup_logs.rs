@@ -21,12 +21,30 @@ use support::logs::LogBuffer;
 use tasklerq::admin_console::codes::{self, Purpose};
 use tasklerq::admin_console::router::{AdminState, build_router as build_admin_router};
 use tasklerq::auth::tokens::hash_token;
-use tasklerq::config::{Config, TenancyMode};
+use tasklerq::config::{Config, LlmConfig, TenancyMode};
+use tasklerq::llm::{LlmHandle, LlmSettings};
 use tasklerq::security_audit::Audit;
+use tasklerq::settings::crypto::SecretCipher;
 use tasklerq::storage::migrations;
 use tasklerq::storage::repositories::households;
 use tower::ServiceExt;
 use uuid::Uuid;
+
+/// Консоль без настроек разбора: этим тестам LLM не нужен.
+fn console(pool: &PgPool) -> Router {
+    let llm = LlmSettings::new(
+        pool.clone(),
+        LlmConfig::empty(),
+        SecretCipher::new(None, None),
+        LlmHandle::empty(),
+    );
+    build_admin_router(AdminState::new(
+        pool.clone(),
+        Vec::new(),
+        Audit::new(pool.clone()),
+        llm,
+    ))
+}
 
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -311,11 +329,7 @@ fn the_password_never_appears_in_the_logs() {
     let (logs, (setup_status, login_status)) = capture(|| {
         runtime().block_on(async {
             let (pool, _url) = setup_db().await;
-            let app = build_admin_router(AdminState::new(
-                pool.clone(),
-                Vec::new(),
-                Audit::new(pool.clone()),
-            ));
+            let app = console(&pool);
             let issued = codes::issue(&pool, Purpose::Setup, None, chrono::Utc::now())
                 .await
                 .expect("a setup code");
@@ -388,11 +402,7 @@ fn the_issued_household_token_never_appears_in_the_logs() {
             .await
             .expect("session row");
 
-            let app = build_admin_router(AdminState::new(
-                pool.clone(),
-                Vec::new(),
-                Audit::new(pool.clone()),
-            ));
+            let app = console(&pool);
             let cookie = format!("tlq_admin={session_token}");
             let (status, body) = post_form_with_cookie(
                 &app,
@@ -503,11 +513,7 @@ fn a_rejected_recovery_post_does_not_log_the_code() {
             let issued = codes::issue(&pool, Purpose::Recovery, None, chrono::Utc::now())
                 .await
                 .expect("a recovery code");
-            let app = build_admin_router(AdminState::new(
-                pool.clone(),
-                Vec::new(),
-                Audit::new(pool.clone()),
-            ));
+            let app = console(&pool);
             let path = format!("/admin/recover/{}", issued.code);
             let status = post_form_with_origin(
                 &app,

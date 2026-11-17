@@ -290,6 +290,11 @@ impl CheckLock {
                     error = %error,
                     "could not release the llm slot check lock; closing its connection"
                 );
+                // Соединение закрывается здесь же: `Drop` не должен добавить
+                // второе предупреждение о том же соединении.
+                if let Some(mut conn) = self.conn.take() {
+                    conn.close_on_drop();
+                }
             }
         }
     }

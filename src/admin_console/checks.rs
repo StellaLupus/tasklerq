@@ -11,10 +11,16 @@
 //! занят, и POST ведёт на ход текущего прогона, даже если нажата кнопка другого
 //! слота.
 
+use std::future::Future;
 use std::sync::{Arc, Mutex};
+
+use tokio::task::JoinHandle;
 
 use crate::capture::slot_check::CheckResult;
 use crate::llm::{FALLBACK_SLOT, PRIMARY_SLOT};
+
+/// Сообщение, когда фоновая задача проверки завершилась аварийно.
+pub const CHECK_INTERRUPTED: &str = "Проверка прервана: фоновая задача завершилась с ошибкой.";
 
 /// Слот, который проверяет кнопка консоли.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +190,38 @@ impl CheckState {
         }
     }
 
+    /// Дождаться фоновой задачи и завершить ход, если она упала.
+    ///
+    /// Паника или отмена задачи иначе оставили бы `outcome: None` навсегда:
+    /// страница опрашивала бы «идёт» до перезапуска процесса. Завершённый
+    /// прогон сам записывает отчёт, поэтому здесь ничего не меняется.
+    pub async fn watch(&self, task: JoinHandle<()>) {
+        if task.await.is_err() {
+            let mut run = self.inner.lock().expect("check state lock");
+            if let Some(current) = run.as_mut()
+                && current.outcome.is_none()
+            {
+                current.outcome = Some(CheckOutcome::Failed {
+                    message: CHECK_INTERRUPTED.to_owned(),
+                });
+            }
+        }
+    }
+
+    /// Запустить прогон отдельной задачей и следить за её завершением.
+    ///
+    /// Запуск и наблюдатель живут вместе: обработчик не может забыть повесить
+    /// наблюдателя, и паника фоновой задачи не оставляет ход «идущим».
+    /// Возвращаемый handle — задача наблюдателя; боевой путь его не ждёт.
+    pub fn spawn<F>(&self, run: F) -> JoinHandle<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let watcher = self.clone();
+        let task = tokio::spawn(run);
+        tokio::spawn(async move { watcher.watch(task).await })
+    }
+
     /// Текущий ход проверки; `None` — проверок ещё не было.
     pub fn current(&self) -> Option<CheckSnapshot> {
         self.inner
@@ -273,5 +311,27 @@ mod tests {
             assert_eq!(CheckSlot::from_slug(slot.slug()), Some(slot));
         }
         assert_eq!(CheckSlot::from_slug("other"), None);
+    }
+
+    #[tokio::test]
+    async fn a_panic_in_the_background_task_interrupts_the_run() {
+        let state = CheckState::new();
+        assert!(state.try_start(PRIMARY_SLOT, 22));
+        state.advance(3, 22);
+
+        let watcher = state.spawn(async {
+            panic!("the substitute backend failed");
+        });
+        watcher.await.expect("the watcher task joins");
+
+        let snapshot = state.current().expect("the run is kept");
+        assert!(
+            !snapshot.running(),
+            "a crashed task must not leave the run running forever"
+        );
+        let Some(CheckOutcome::Failed { message }) = snapshot.outcome else {
+            panic!("an interrupted run carries a failure");
+        };
+        assert!(message.contains("прервана"), "{message}");
     }
 }

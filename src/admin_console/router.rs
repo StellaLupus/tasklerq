@@ -18,13 +18,13 @@ use axum::routing::{get, post};
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
-use crate::config::{IpNet, LlmConfig};
+use crate::capture::slot_status::LlmSlotHealth;
+use crate::config::IpNet;
 use crate::domain::models::{Actor, ActorType};
 use crate::http::client::{Client, TrustedProxies};
-use crate::llm::{LlmHandle, LlmSettings};
+use crate::llm::LlmSettings;
 use crate::rate_limit::{RateDecision, RateLimiter};
 use crate::security_audit::{Audit, LimitKey, RateLimitEvent};
-use crate::settings::crypto::SecretCipher;
 
 use super::checks::CheckState;
 use super::wizard::{WIZARD_PATH, WIZARD_SKIP_PATH, WizardSettings};
@@ -57,8 +57,15 @@ pub struct AdminState {
     /// Режим размещения, признак Telegram и параметры LLM для мастера.
     wizard: WizardSettings,
     /// Тот же экземпляр применения настроек LLM, что у рантайма: страница
-    /// меняет настройки без перезапуска.
+    /// меняет настройки без перезапуска, а мастер берёт оттуда же окружение и
+    /// ключи шифрования.
     llm_settings: LlmSettings,
+    /// Статус проверки слотов LLM; по умолчанию поверх того же снимка, что у
+    /// `llm_settings`, а боевой путь получает общий экземпляр с readiness.
+    llm_slots: Arc<LlmSlotHealth>,
+    /// Допустимый возраст необработанного обновления Telegram для предупреждений
+    /// readiness на главной; `None` — очередь не проверяется.
+    queue_lag_limit: Option<chrono::Duration>,
     /// Ход проверки слота; одна проверка на процесс.
     checks: CheckState,
 }
@@ -67,14 +74,15 @@ impl AdminState {
     /// Создать состояние консоли.
     ///
     /// Журнал передаётся снаружи: неудачные входы в консоль должны попадать в
-    /// общий порог отказов аутентификации публичного роутера.
-    pub fn new(pool: PgPool, trusted_proxies: Vec<IpNet>, audit: Audit) -> Self {
-        let llm_settings = LlmSettings::new(
-            pool.clone(),
-            LlmConfig::empty(),
-            SecretCipher::new(None, None),
-            LlmHandle::empty(),
-        );
+    /// общий порог отказов аутентификации публичного роутера. Настройки LLM
+    /// обязательны: без них страница писала бы в базу, но не в снимок рантайма.
+    pub fn new(
+        pool: PgPool,
+        trusted_proxies: Vec<IpNet>,
+        audit: Audit,
+        llm_settings: LlmSettings,
+    ) -> Self {
+        let llm_slots = Arc::new(LlmSlotHealth::new(llm_settings.handle().clone()));
         Self {
             pool,
             trusted_proxies,
@@ -85,13 +93,21 @@ impl AdminState {
             recovery_limiter: failure_limiter(),
             wizard: WizardSettings::default(),
             llm_settings,
+            llm_slots,
+            queue_lag_limit: None,
             checks: CheckState::new(),
         }
     }
 
-    /// Задать тот же экземпляр настроек LLM, что у рантайма.
-    pub fn with_llm(mut self, llm_settings: LlmSettings) -> Self {
-        self.llm_settings = llm_settings;
+    /// Задать тот же экземпляр проверки слотов, что у readiness.
+    pub fn with_llm_slots(mut self, llm_slots: Arc<LlmSlotHealth>) -> Self {
+        self.llm_slots = llm_slots;
+        self
+    }
+
+    /// Задать порог задержки очереди Telegram, как у readiness.
+    pub fn with_queue_lag_limit(mut self, seconds: u32) -> Self {
+        self.queue_lag_limit = Some(chrono::Duration::seconds(i64::from(seconds)));
         self
     }
 
@@ -100,15 +116,25 @@ impl AdminState {
         &self.llm_settings
     }
 
+    /// Статус проверки слотов LLM для главной.
+    pub fn llm_slots(&self) -> &LlmSlotHealth {
+        &self.llm_slots
+    }
+
+    /// Порог задержки очереди Telegram для readiness на главной.
+    pub fn queue_lag_limit(&self) -> Option<chrono::Duration> {
+        self.queue_lag_limit
+    }
+
     /// Состояние проверки слота.
     pub fn checks(&self) -> &CheckState {
         &self.checks
     }
 
-    /// Задать параметры мастера: режим, Telegram, LLM и ключ шифрования.
+    /// Задать параметры мастера: режим и Telegram.
     ///
-    /// Без вызова действует `single` без Telegram и LLM: страницы мастера
-    /// открываются, но шаги household и LLM остаются незавершёнными.
+    /// Окружение LLM и ключи шифрования не дублируются: их читает
+    /// [`Self::llm_settings`].
     pub fn with_wizard(mut self, wizard: WizardSettings) -> Self {
         self.wizard = wizard;
         self

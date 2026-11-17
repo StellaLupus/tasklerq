@@ -12,9 +12,8 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::PgPool;
 
-use crate::config::{LlmConfig, TenancyMode};
+use crate::config::TenancyMode;
 use crate::domain::error::DomainError;
-use crate::settings::crypto::SecretCipher;
 use crate::settings::{self, EffectiveLlm};
 use crate::storage::repositories::{admin_accounts, households, tokens};
 
@@ -175,31 +174,23 @@ pub fn wizard_step(state: &WizardState) -> WizardStep {
 }
 
 /// Настройки, от которых зависит снимок мастера.
+///
+/// Окружение LLM и ключи шифрования сюда не входят: их читает тот же
+/// [`LlmSettings`](crate::llm::LlmSettings), что применяет настройки разбора.
 #[derive(Clone, Debug)]
 pub struct WizardSettings {
     /// Режим размещения.
     pub tenancy: TenancyMode,
     /// Telegram включён (`TELEGRAM_MODE` не `disabled`).
     pub telegram_enabled: bool,
-    /// Параметры LLM из окружения.
-    pub llm: LlmConfig,
-    /// Ключи шифрования для чтения секретов LLM.
-    pub cipher: SecretCipher,
 }
 
 impl WizardSettings {
     /// Собрать настройки чтения снимка мастера.
-    pub fn new(
-        tenancy: TenancyMode,
-        telegram_enabled: bool,
-        llm: LlmConfig,
-        cipher: SecretCipher,
-    ) -> Self {
+    pub fn new(tenancy: TenancyMode, telegram_enabled: bool) -> Self {
         Self {
             tenancy,
             telegram_enabled,
-            llm,
-            cipher,
         }
     }
 }
@@ -209,8 +200,6 @@ impl Default for WizardSettings {
         Self {
             tenancy: TenancyMode::Single,
             telegram_enabled: false,
-            llm: LlmConfig::empty(),
-            cipher: SecretCipher::new(None, None),
         }
     }
 }
@@ -221,9 +210,13 @@ pub fn llm_configured(effective: &EffectiveLlm) -> bool {
 }
 
 /// Прочитать снимок состояния мастера из базы.
+///
+/// Окружение LLM и ключи шифрования берутся из общего
+/// [`LlmSettings`](crate::llm::LlmSettings): у мастера нет своей копии.
 pub async fn read_state(
     pool: &PgPool,
     settings: &WizardSettings,
+    llm: &crate::llm::LlmSettings,
     now: DateTime<Utc>,
 ) -> Result<WizardState, DomainError> {
     let (account_exists, household, tokens) = {
@@ -234,7 +227,7 @@ pub async fn read_state(
         (account_exists, household, tokens)
     };
 
-    let effective = settings::read_effective_llm(pool, &settings.llm, &settings.cipher).await?;
+    let effective = settings::read_effective_llm(pool, llm.env(), llm.cipher()).await?;
     let skipped = |key: Option<&str>| {
         key.is_some_and(|key| {
             effective

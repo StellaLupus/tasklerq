@@ -32,9 +32,11 @@ use tasklerq::admin_console::wizard::WizardSettings;
 use tasklerq::app::build_application;
 use tasklerq::auth::tokens::hash_token;
 use tasklerq::capture::eval::SmokeSet;
+use tasklerq::capture::prompt;
 use tasklerq::capture::slot_check;
+use tasklerq::capture::slot_status::LlmSlotHealth;
 use tasklerq::config::{
-    CaptureConfig, Config, IpNet, LlmConfig, SecretKey, TenancyConfig, TenancyMode,
+    CaptureConfig, Config, IpNet, LlmConfig, SecretKey, SecretString, TenancyConfig, TenancyMode,
 };
 use tasklerq::domain::error::DomainError;
 use tasklerq::http::api::capture::CaptureState;
@@ -48,6 +50,7 @@ use tasklerq::settings;
 use tasklerq::settings::crypto::SecretCipher;
 use tasklerq::storage::repositories::admin_accounts;
 use tasklerq::storage::repositories::households;
+use tasklerq::storage::repositories::llm_slot_checks::{self, NewCheck};
 use tasklerq::telegram::bot::Bot;
 use tower::ServiceExt;
 use url::form_urlencoded;
@@ -228,21 +231,33 @@ async fn send_with_cookie(
     send_from(app, method, path, test_peer(), headers, Body::empty()).await
 }
 
-fn console(pool: &PgPool, trusted_proxies: Vec<IpNet>) -> Router {
-    build_admin_router(AdminState::new(
+/// Настройки LLM для тестов, которым разбор не нужен.
+fn empty_llm_settings(pool: &PgPool) -> LlmSettings {
+    LlmSettings::new(
+        pool.clone(),
+        LlmConfig::empty(),
+        SecretCipher::new(None, None),
+        LlmHandle::empty(),
+    )
+}
+
+/// Состояние консоли без настроек разбора.
+fn console_state(pool: &PgPool, trusted_proxies: Vec<IpNet>) -> AdminState {
+    AdminState::new(
         pool.clone(),
         trusted_proxies,
         Audit::new(pool.clone()),
-    ))
+        empty_llm_settings(pool),
+    )
 }
 
-/// Консоль с явным режимом и признаком Telegram.
+fn console(pool: &PgPool, trusted_proxies: Vec<IpNet>) -> Router {
+    build_admin_router(console_state(pool, trusted_proxies))
+}
+
+/// Консоль с явным режимом, признаком Telegram и параметрами LLM.
 fn console_with(pool: &PgPool, tenancy: TenancyMode, telegram: bool, llm: LlmConfig) -> Router {
-    build_admin_router(
-        AdminState::new(pool.clone(), Vec::new(), Audit::new(pool.clone())).with_wizard(
-            WizardSettings::new(tenancy, telegram, llm, SecretCipher::new(None, None)),
-        ),
-    )
+    console_with_llm_and_mode(pool, tenancy, telegram, llm, SecretCipher::new(None, None)).0
 }
 
 /// Ключ шифрования из повторяющегося байта.
@@ -281,17 +296,32 @@ fn llm_env(pairs: &[(&str, &str)]) -> LlmConfig {
 
 /// Консоль с тем же экземпляром настроек LLM, что у рантайма.
 fn console_with_llm(pool: &PgPool, llm: LlmConfig, cipher: SecretCipher) -> (Router, LlmSettings) {
+    console_with_llm_and_mode(pool, TenancyMode::Single, false, llm, cipher)
+}
+
+/// Консоль с явным режимом, Telegram и тем же экземпляром настроек LLM.
+fn console_with_llm_and_mode(
+    pool: &PgPool,
+    tenancy: TenancyMode,
+    telegram: bool,
+    llm: LlmConfig,
+    cipher: SecretCipher,
+) -> (Router, LlmSettings) {
     // Как в `build_application`: снимок стартует из окружения, базы и умолчаний.
     let handle = LlmHandle::new(LlmSnapshot::from_effective(settings::effective_llm(
         &llm,
         &[],
         &cipher,
     )));
-    let settings = LlmSettings::new(pool.clone(), llm.clone(), cipher.clone(), handle);
+    let settings = LlmSettings::new(pool.clone(), llm, cipher, handle);
     let app = build_admin_router(
-        AdminState::new(pool.clone(), Vec::new(), Audit::new(pool.clone()))
-            .with_wizard(WizardSettings::new(TenancyMode::Single, false, llm, cipher))
-            .with_llm(settings.clone()),
+        AdminState::new(
+            pool.clone(),
+            Vec::new(),
+            Audit::new(pool.clone()),
+            settings.clone(),
+        )
+        .with_wizard(WizardSettings::new(tenancy, telegram)),
     );
     (app, settings)
 }
@@ -405,6 +435,43 @@ async fn saved_fingerprint(pool: &PgPool, slot: &str) -> String {
         .fetch_one(pool)
         .await
         .expect("the saved check")
+}
+
+/// Время сохранения проверки слота.
+async fn saved_checked_at(pool: &PgPool, slot: &str) -> DateTime<Utc> {
+    sqlx::query_scalar("SELECT checked_at FROM llm_slot_checks WHERE slot = $1")
+        .bind(slot)
+        .fetch_one(pool)
+        .await
+        .expect("the saved check time")
+}
+
+/// Записать проверку слота с текущим отпечатком конфигурации.
+async fn store_current_check(pool: &PgPool, slot: &str, config: &tasklerq::config::SlotConfig) {
+    let fingerprint = slot_check::fingerprint(
+        config,
+        &prompt::contract_hash(),
+        &slot_check::set_hash(slot_check::BUILTIN_SET),
+        tasklerq::capture::eval::TitleMatch::Strict,
+    );
+    let parts = fingerprint.parts.to_json();
+    let report = json!({"total": 22, "passed": 22});
+    let mut conn = pool.acquire().await.expect("connection");
+    llm_slot_checks::upsert(
+        &mut conn,
+        NewCheck {
+            slot,
+            fingerprint: &fingerprint.value,
+            fingerprint_parts: &parts,
+            passed: 22,
+            total: 22,
+            p95_ms: 1_000,
+            report: &report,
+        },
+        Utc::now(),
+    )
+    .await
+    .expect("the slot check is stored");
 }
 
 /// Число строк `settings` с указанными ключами.
@@ -635,15 +702,12 @@ async fn public_router_does_not_serve_console_paths() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn console_router_redirects_to_login_without_a_session() {
     let db = support::db().await;
-    let app = build_admin_router(AdminState::new(
-        db.pool.clone(),
-        Vec::new(),
-        Audit::new(db.pool.clone()),
-    ));
+    let app = console(&db.pool, Vec::new());
 
     let (status, headers, _) = send(&app, Method::GET, "/admin").await;
 
     assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_security_headers(&headers, "GET /admin without a session");
     assert_eq!(
         headers
             .get(header::LOCATION)
@@ -754,11 +818,7 @@ async fn enabled_console_serves_on_its_own_listener_only() {
     let admin_address = admin.local_addr().expect("admin listener address");
 
     let public = build_router(AppState::new(db.pool.clone(), Audit::new(db.pool.clone())));
-    let console = build_admin_router(AdminState::new(
-        db.pool.clone(),
-        Vec::new(),
-        Audit::new(db.pool.clone()),
-    ));
+    let console = console(&db.pool, Vec::new());
     let server = spawn_server(listeners.public, public, Some((admin, console)));
 
     let client = no_redirect_client();
@@ -1140,7 +1200,7 @@ async fn an_existing_account_keeps_the_setup_code_unused() {
         .await
         .expect("a setup code should be issued");
 
-    let state = AdminState::new(db.pool.clone(), Vec::new(), Audit::new(db.pool.clone()));
+    let state = console_state(&db.pool, Vec::new());
     let result = setup::create_account(
         &state,
         &Client {
@@ -1570,7 +1630,7 @@ async fn all_four_failure_buckets_are_independent() {
     }
 
     let db = support::db().await;
-    let state = AdminState::new(db.pool.clone(), Vec::new(), Audit::new(db.pool.clone()));
+    let state = console_state(&db.pool, Vec::new());
     let ip: std::net::IpAddr = "203.0.113.5".parse().expect("an IP address");
     let now = Utc::now();
 
@@ -2750,7 +2810,7 @@ async fn a_wrong_current_password_keeps_the_password_and_is_rate_limited() {
 async fn a_cancelled_login_still_counts_as_a_failure() {
     let db = support::isolated_db().await;
     insert_account(&db.pool, "admin").await;
-    let state = AdminState::new(db.pool.clone(), Vec::new(), Audit::new(db.pool.clone()));
+    let state = console_state(&db.pool, Vec::new());
     let app = build_admin_router(state.clone());
 
     let mut lock = db.pool.begin().await.expect("lock transaction");
@@ -2972,7 +3032,7 @@ async fn a_password_race_with_recovery_is_not_a_failed_attempt() {
     let now = precise_now();
     let session_id = insert_session(&db.pool, "race-session", now, now).await;
 
-    let state = AdminState::new(db.pool.clone(), Vec::new(), Audit::new(db.pool.clone()));
+    let state = console_state(&db.pool, Vec::new());
     let client = Client {
         ip: "127.0.0.1".parse().expect("ip"),
         scheme: Scheme::Http,
@@ -3842,6 +3902,317 @@ async fn the_token_step_can_be_skipped_and_finishes_the_wizard() {
         "a repeated skip after the wizard is finished goes home"
     );
     assert_eq!(location(&headers), Some("/admin"));
+}
+
+/// Два одновременных POST шага токена выпускают ровно один токен.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_double_token_post_issues_exactly_one_token() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    insert_household(&db.pool).await;
+    let app = console(&db.pool, Vec::new());
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    // Шаг LLM пропущен: мастер стоит на токене.
+    let (status, _, _) = send_form_from(
+        &app,
+        "/admin/wizard/skip",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("step", "llm")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin/wizard", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(String::from_utf8_lossy(&body).contains("Токен Home Assistant"));
+
+    let first = send_form_from(
+        &app,
+        "/admin/wizard/token",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("name", "Home Assistant")],
+    );
+    let second = send_form_from(
+        &app,
+        "/admin/wizard/token",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("name", "Home Assistant")],
+    );
+    let (first, second) = tokio::join!(first, second);
+
+    assert_eq!(
+        token_count(&db.pool).await,
+        1,
+        "a double click must not issue two tokens"
+    );
+    let issued_pages = [&first, &second]
+        .iter()
+        .filter(|(_, _, body)| String::from_utf8_lossy(body).contains("id=\"issued-token\""))
+        .count();
+    assert_eq!(issued_pages, 1, "the open token is shown exactly once");
+    for (status, headers, _) in [first, second] {
+        assert!(
+            matches!(
+                status,
+                StatusCode::OK | StatusCode::SEE_OTHER | StatusCode::BAD_REQUEST
+            ),
+            "a concurrent request is refused without a server error: {status}"
+        );
+        assert_security_headers(&headers, "POST /admin/wizard/token");
+    }
+}
+
+/// Главная показывает версию, готовность, режим, household, Telegram и слоты.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_home_page_shows_the_installation_state_and_readiness() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+
+    // Два household в режиме `single`: readiness предупреждает, главная
+    // показывает оба кода, затем одно удаляется и счёт уменьшается.
+    let first = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Первый дом",
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("the first household");
+    let second = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Второй дом",
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("the second household");
+    assert_ne!(first.id, second.id);
+
+    let llm = llm_env(&[
+        ("LLM_CAPTURE_ENABLED", "true"),
+        ("LLM_PRIMARY_URL", "https://llm.example.test/v1"),
+        ("LLM_PRIMARY_MODEL", "vendor/primary"),
+    ]);
+    let cipher = SecretCipher::new(None, None);
+    let effective = settings::effective_llm(&llm, &[], &cipher);
+    let handle = LlmHandle::new(LlmSnapshot::from_effective(effective.clone()));
+    let llm_settings = LlmSettings::new(db.pool.clone(), llm, cipher.clone(), handle.clone());
+    let slots = Arc::new(LlmSlotHealth::new(handle));
+
+    // Публичный роутер и консоль делят снимок, ключи и статус слотов: их
+    // предупреждения readiness должны совпадать.
+    let public = build_router(
+        AppState::new(db.pool.clone(), Audit::new(db.pool.clone()))
+            .with_tenancy_mode(TenancyMode::Single)
+            .with_secret_cipher(cipher.clone())
+            .with_llm_slots(slots.clone()),
+    );
+    let app = build_admin_router(
+        AdminState::new(
+            db.pool.clone(),
+            Vec::new(),
+            Audit::new(db.pool.clone()),
+            llm_settings,
+        )
+        .with_wizard(WizardSettings::new(TenancyMode::Single, false))
+        .with_llm_slots(slots.clone()),
+    );
+
+    let (status, _, ready) = send(&public, Method::GET, "/health/ready").await;
+    assert_eq!(status, StatusCode::OK);
+    let ready: Value = serde_json::from_slice(&ready).expect("readiness JSON");
+    assert_eq!(
+        ready["warnings"],
+        json!(["multiple_households", "llm_slot_unverified:primary"]),
+        "{ready}"
+    );
+
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    let (status, headers, body) = send_with_cookie(&app, Method::GET, "/admin", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_security_headers(&headers, "GET /admin");
+    assert_no_external_urls(&body, "GET /admin");
+    assert_local_assets(&body, "GET /admin");
+    let text = String::from_utf8_lossy(&body);
+
+    assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
+    assert!(
+        text.contains("<dt>Режим размещения</dt><dd>single</dd>"),
+        "{text}"
+    );
+    assert!(text.contains("<dt>Household</dt><dd>2</dd>"), "{text}");
+    assert!(text.contains("Telegram</dt><dd>выключен"), "{text}");
+    assert!(text.contains("multiple_households"), "{text}");
+    assert!(
+        text.contains("в режиме single больше одного household"),
+        "{text}"
+    );
+    assert!(text.contains("llm_slot_unverified:primary"), "{text}");
+    assert!(text.contains("слот LLM primary не проверен"), "{text}");
+    assert!(text.contains("Основной слот: не проверен"), "{text}");
+    assert!(text.contains("Резервный слот: не настроен"), "{text}");
+    assert!(
+        text.contains("Основной слот: не проверен — <a href=\"/admin/llm\">Проверить</a>"),
+        "an unchecked slot links to the check page: {text}"
+    );
+
+    // Активный household остаётся один, предупреждение исчезает.
+    tasklerq::admin::delete_household(&db.pool, second.id, Utc::now())
+        .await
+        .expect("the second household is deleted");
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("<dt>Household</dt><dd>1</dd>"), "{text}");
+    assert!(!text.contains("multiple_households"), "{text}");
+
+    // Текущий отпечаток делает слот проверенным, ненастроенный резервный
+    // остаётся «не настроен».
+    let primary = effective
+        .primary()
+        .config()
+        .expect("the primary slot is configured")
+        .clone();
+    store_current_check(&db.pool, "primary", &primary).await;
+    slots.invalidate();
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("Основной слот: проверен"), "{text}");
+    assert!(!text.contains("Основной слот: не проверен"), "{text}");
+    assert!(text.contains("Резервный слот: не настроен"), "{text}");
+}
+
+/// Главная не показывает секреты и пользовательское содержимое.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_home_page_never_shows_secrets_or_user_content() {
+    const TELEGRAM_TOKEN: &str = "SECRET-telegram-token";
+    const WEBHOOK_SECRET: &str = "SECRET-webhook-secret";
+    const ENV_SLOT_TOKEN: &str = "SECRET-env-slot-token";
+    const STORED_SLOT_TOKEN: &str = "SECRET-stored-slot-token";
+    const HOUSEHOLD_NAME: &str = "Секретный дом";
+    const MEMBER_NAME: &str = "Иван Секретов";
+
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let database_url = support::database_url().await;
+    let key_bytes = [0x42_u8; 32];
+    let key_text = BASE64.encode(key_bytes);
+    let config = Config::from_map([
+        ("ENV", "development"),
+        ("PUBLIC_BASE_URL", "http://127.0.0.1:18080"),
+        ("DATABASE_URL", database_url.as_str()),
+        ("TELEGRAM_MODE", "webhook"),
+        ("TELEGRAM_BOT_TOKEN", TELEGRAM_TOKEN),
+        ("TELEGRAM_WEBHOOK_SECRET", WEBHOOK_SECRET),
+        (
+            "TELEGRAM_WEBHOOK_URL",
+            "http://127.0.0.1:18080/webhooks/telegram",
+        ),
+        ("TENANCY_MODE", "multi"),
+        ("TASKLERQ_SECRET_KEY", key_text.as_str()),
+        ("LLM_CAPTURE_ENABLED", "true"),
+        ("LLM_PRIMARY_URL", "https://llm.example.test/v1"),
+        ("LLM_PRIMARY_MODEL", "vendor/primary"),
+        ("LLM_PRIMARY_TOKEN", ENV_SLOT_TOKEN),
+    ])
+    .expect("test config is valid");
+    let cipher = SecretCipher::from_config(&config);
+
+    let household = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        HOUSEHOLD_NAME,
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("the household is created");
+    tasklerq::admin::add_user(
+        &db.pool,
+        TenancyMode::Multi,
+        Some(household.id),
+        tasklerq::domain::models::UserRole::Owner,
+        424_242,
+        Some(MEMBER_NAME),
+        Utc::now(),
+    )
+    .await
+    .expect("the member is added");
+    let issued = tasklerq::admin::create_token(
+        &db.pool,
+        TenancyMode::Multi,
+        Some(household.id),
+        "API token",
+        &["capture:write".to_owned()],
+        None,
+        Utc::now(),
+    )
+    .await
+    .expect("the API token is issued");
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    settings::write_secret(
+        &mut conn,
+        "llm.primary.token",
+        &SecretString::new(STORED_SLOT_TOKEN),
+        &cipher,
+    )
+    .await
+    .expect("the stored slot secret");
+    drop(conn);
+
+    let effective = settings::effective_llm(&config.llm, &[], &cipher);
+    let handle = LlmHandle::new(LlmSnapshot::from_effective(effective));
+    let llm_settings =
+        LlmSettings::new(db.pool.clone(), config.llm.clone(), cipher.clone(), handle);
+    let app = build_admin_router(
+        AdminState::new(
+            db.pool.clone(),
+            Vec::new(),
+            Audit::new(db.pool.clone()),
+            llm_settings,
+        )
+        .with_wizard(WizardSettings::new(
+            config.tenancy.mode,
+            config.telegram.mode.is_enabled(),
+        )),
+    );
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let (status, headers, body) = send_with_cookie(&app, Method::GET, "/admin", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_security_headers(&headers, "GET /admin with secrets");
+    assert_no_external_urls(&body, "GET /admin with secrets");
+    let text = String::from_utf8_lossy(&body);
+
+    assert!(text.contains("Telegram</dt><dd>включён"), "{text}");
+    assert!(
+        text.contains("<dt>Режим размещения</dt><dd>multi</dd>"),
+        "{text}"
+    );
+    for secret in [
+        TELEGRAM_TOKEN,
+        WEBHOOK_SECRET,
+        ENV_SLOT_TOKEN,
+        STORED_SLOT_TOKEN,
+        key_text.as_str(),
+        issued.token.as_str(),
+        HOUSEHOLD_NAME,
+        MEMBER_NAME,
+        "llm.example.test",
+    ] {
+        assert!(
+            !text.contains(secret),
+            "the home page leaked `{secret}`: {text}"
+        );
+    }
 }
 
 /// Число неудалённых household.
@@ -4913,11 +5284,23 @@ async fn a_check_from_the_console_shows_progress_and_saves_the_cli_fingerprint()
     mount_smoke_answers(
         &server,
         Duration::from_millis(60),
-        Some(("simple-1", Duration::from_millis(1_200))),
+        // 1150 мс при таймауте 1000 мс: задержка не мигает на границе
+        // округления `{:.1}` под нагрузкой.
+        Some(("simple-1", Duration::from_millis(1_150))),
     )
     .await;
     let (app, _) = console_with_server(&db.pool, &server, 1_000);
     let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    // Заполнить кеш статусов до прогона: после проверки главная должна
+    // увидеть новую строку, не дожидаясь `CACHE_TTL`.
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(&body).contains("Основной слот: не проверен"),
+        "the slot starts unchecked: {}",
+        String::from_utf8_lossy(&body)
+    );
 
     // Кнопка есть только у настроенного слота и показывает число фраз набора.
     let (status, headers, body) = send_with_cookie(&app, Method::GET, "/admin/llm", &cookie).await;
@@ -4971,17 +5354,28 @@ async fn a_check_from_the_console_shows_progress_and_saves_the_cli_fingerprint()
     assert_eq!(location(&headers), Some("/admin/llm/check"));
 
     // Страница хода работает без JavaScript: у фрагмента есть htmx-опрос и
-    // ссылка «Обновить», у полной страницы — meta refresh в noscript.
+    // ссылка «Обновить», у полной страницы — заголовок `Refresh`, а не
+    // невалидный `<meta http-equiv>` в `<body>`.
     let (status, headers, body) =
         send_with_cookie(&app, Method::GET, "/admin/llm/check", &cookie).await;
     assert_eq!(status, StatusCode::OK);
     assert_security_headers(&headers, "GET /admin/llm/check");
+    assert_eq!(
+        headers
+            .get(header::REFRESH)
+            .and_then(|value| value.to_str().ok()),
+        Some("2"),
+        "a running check refreshes the plain page via the response header"
+    );
     assert_no_external_urls(&body, "GET /admin/llm/check");
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains("Проверка слота primary идёт"), "{text}");
     assert!(text.contains("из 22 фраз"), "{text}");
     assert!(text.contains("href=\"/admin/llm/check\""), "{text}");
-    assert!(text.contains("<noscript>"), "{text}");
+    assert!(
+        !text.contains("http-equiv=\"refresh\""),
+        "the body must not carry a meta refresh: {text}"
+    );
     assert!(text.contains("hx-trigger=\"every 2s\""), "{text}");
 
     // Ход растёт: первая фраза медленная, следующие отвечают по очереди.
@@ -5023,13 +5417,30 @@ async fn a_check_from_the_console_shows_progress_and_saves_the_cli_fingerprint()
     let text = wait_for_check_report(&app, &cookie).await;
     assert!(text.contains("пройдено 21 из 22"), "{text}");
     assert!(text.contains("simple-1"), "{text}");
-    assert!(text.contains("timeout: ответ за 1.2 с"), "{text}");
+    assert!(text.contains("timeout: ответ за 1."), "{text}");
     assert!(text.contains("Задержка p95:"), "{text}");
     assert!(
         !text.contains("hx-trigger=\"every 2s\""),
         "a finished check must stop polling: {text}"
     );
+
+    // Главная использует общий кеш статусов: после прогона строка проверки
+    // видна сразу, а не через минуту. Проверка здесь заведомо не прошла из-за
+    // медленной фразы, поэтому статус — «не прошёл проверку», а не «не проверен».
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let home = String::from_utf8_lossy(&body);
+    assert!(
+        home.contains("Основной слот: не прошёл проверку"),
+        "the console check must invalidate the cached status: {home}"
+    );
+    assert!(
+        !home.contains("Основной слот: не проверен"),
+        "the previous status must not survive the check: {home}"
+    );
+
     let console_fingerprint = saved_fingerprint(&db.pool, "primary").await;
+    let console_checked_at = saved_checked_at(&db.pool, "primary").await;
 
     // Ненастроенный резервный слот: POST отклонён без обращения к LLM.
     let requests_before = server.received_requests().await.expect("requests").len();
@@ -5063,6 +5474,10 @@ async fn a_check_from_the_console_shows_progress_and_saves_the_cli_fingerprint()
         saved_fingerprint(&db.pool, "primary").await,
         console_fingerprint,
         "the console and capture-eval save the same check fingerprint"
+    );
+    assert!(
+        saved_checked_at(&db.pool, "primary").await > console_checked_at,
+        "capture-eval must rewrite the row, not just leave an equal fingerprint"
     );
 }
 
