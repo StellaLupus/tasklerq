@@ -168,7 +168,7 @@ fn chain_is_built_from_slot_configs() {
         extra: Map::new(),
     };
     let config = LlmConfig {
-        enabled: true,
+        enabled: Some(true),
         primary: Some(slot_config(
             "https://primary.example/v1",
             "primary/model",
@@ -180,7 +180,10 @@ fn chain_is_built_from_slot_configs() {
             Duration::from_secs(4),
         )),
         connect_timeout: Duration::from_millis(500),
+        connect_timeout_from_env: false,
         daily_quota: 200,
+        daily_quota_from_env: false,
+        ignored_env: Vec::new(),
     };
 
     let chain = Chain::from_config(&config)
@@ -194,7 +197,7 @@ fn chain_is_built_from_slot_configs() {
     );
 
     let disabled = LlmConfig {
-        enabled: false,
+        enabled: Some(false),
         ..config
     };
     assert!(

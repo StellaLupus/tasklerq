@@ -16,7 +16,7 @@ use tasklerq::config::CaptureConfig;
 use tasklerq::domain::validation::MAX_TITLE;
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
-use tasklerq::llm::{Chain, LlmError};
+use tasklerq::llm::{Chain, LlmError, LlmHandle, LlmSnapshot};
 use tasklerq::security_audit::Audit;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -47,8 +47,10 @@ fn app_with(pool: &PgPool, ai: Option<Arc<StubAi>>, config: CaptureConfig, quota
 
 fn app_chain(pool: &PgPool, llm: Option<Arc<Chain>>, config: CaptureConfig, quota: u32) -> Router {
     build_router(
-        AppState::new(pool.clone(), Audit::new(pool.clone()))
-            .with_capture(CaptureState::new(config, llm, quota)),
+        AppState::new(pool.clone(), Audit::new(pool.clone())).with_capture(CaptureState::new(
+            config,
+            LlmHandle::new(LlmSnapshot::for_tests_without_settings(llm, quota)),
+        )),
     )
 }
 
@@ -1070,10 +1072,10 @@ mod telegram_split {
     use super::*;
 
     use chrono::Duration;
+    use tasklerq::config::DEFAULT_DAILY_QUOTA;
+    use tasklerq::llm::{LlmHandle, LlmSnapshot};
     use tasklerq::telegram::bot::Bot;
-    use tasklerq::telegram::capture_worker::{
-        CaptureWorker, DEFAULT_DAILY_QUOTA, MAX_ATTEMPTS, Pass,
-    };
+    use tasklerq::telegram::capture_worker::{CaptureWorker, MAX_ATTEMPTS, Pass};
     use tokio::sync::Notify;
 
     use support::telegram::{FakeTelegram, Harness};
@@ -1090,11 +1092,19 @@ mod telegram_split {
         llm_capture: bool,
     ) -> Stand {
         let id = support::next_telegram_id();
-        let handler = Bot::new("tasklerqbot")
-            .with_llm_capture(llm_capture)
-            .with_tenancy(tasklerq::config::TenancyMode::Multi);
         let ai = StubAi::new(answers);
-        let llm = Arc::new(support::llm::chain(ai.clone(), None));
+        let chain = Arc::new(support::llm::chain(ai.clone(), None));
+        let llm = LlmHandle::new(LlmSnapshot::for_tests_without_settings(
+            Some(chain),
+            DEFAULT_DAILY_QUOTA,
+        ));
+        let handler = Bot::new("tasklerqbot")
+            .with_llm(if llm_capture {
+                llm.clone()
+            } else {
+                LlmHandle::empty()
+            })
+            .with_tenancy(tasklerq::config::TenancyMode::Multi);
         let mut bot =
             Harness::with_handler(pool, id, Arc::new(handler.clone()), FakeTelegram::new());
         bot.text("/start").await;
@@ -1109,8 +1119,7 @@ mod telegram_split {
             Arc::new(Notify::new()),
             Audit::new(pool.clone()),
         )
-        .only_chat(id)
-        .with_quota(DEFAULT_DAILY_QUOTA);
+        .only_chat(id);
         Stand { bot, worker, ai }
     }
 

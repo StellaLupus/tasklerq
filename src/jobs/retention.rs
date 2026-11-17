@@ -18,6 +18,12 @@ pub const FIRST_RUN_DELAY: StdDuration = StdDuration::from_secs(60);
 /// Интервал между прогонами: раз в сутки.
 pub const RUN_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 
+/// Сколько дней хранятся использованные и истёкшие одноразовые коды консоли.
+///
+/// Действующие коды и неиспользованный setup-код без срока не удаляются: срок
+/// задаёт не таймер, а создание учётной записи.
+const ADMIN_CODE_RETENTION_DAYS: i64 = 7;
+
 /// Фиксированный ключ advisory-блокировки retention.
 ///
 /// Ключ общий для всех экземпляров сервиса: пока один чистит базу, второй
@@ -61,6 +67,10 @@ pub struct RetentionStats {
     pub purged_notification_batches: u64,
     /// Удалённые просроченные формы.
     pub purged_conversations: u64,
+    /// Удалённые использованные и истёкшие коды консоли.
+    pub purged_admin_codes: u64,
+    /// Удалённые сессии консоли старше абсолютного срока.
+    pub purged_admin_sessions: u64,
 }
 
 /// Выполнить retention на момент `now`.
@@ -265,6 +275,29 @@ async fn run_in_tx(
 
     let purged_conversations = crate::telegram::views::purge_conversations(&mut *conn, now).await?;
 
+    // Коды консоли: использованные и истёкшие живут 7 дней. Действующий код и
+    // неиспользованный setup-код без срока (`expires_at IS NULL`) остаются.
+    let admin_codes_cutoff = now - Duration::days(ADMIN_CODE_RETENTION_DAYS);
+    let purged_admin_codes = delete_before(
+        &mut *conn,
+        "DELETE FROM admin_one_time_codes
+         WHERE (used_at IS NOT NULL AND used_at < $1)
+            OR (expires_at IS NOT NULL AND expires_at < $1)",
+        admin_codes_cutoff,
+    )
+    .await?;
+
+    // Только абсолютный срок: 7 дней неактивности проверяются при обращении к
+    // сессии, а не в retention. Срок берётся из той же константы, что и у
+    // проверки cookie.
+    let admin_sessions_cutoff = now - Duration::days(crate::admin_console::session::ABSOLUTE_DAYS);
+    let purged_admin_sessions = delete_before(
+        &mut *conn,
+        "DELETE FROM admin_sessions WHERE created_at < $1",
+        admin_sessions_cutoff,
+    )
+    .await?;
+
     Ok(RetentionStats {
         expired_drafts,
         purged_items,
@@ -283,6 +316,8 @@ async fn run_in_tx(
         purged_notification_deliveries,
         purged_notification_batches,
         purged_conversations,
+        purged_admin_codes,
+        purged_admin_sessions,
     })
 }
 
@@ -384,6 +419,8 @@ async fn execute_once(
             purged_notification_deliveries = stats.purged_notification_deliveries,
             purged_notification_batches = stats.purged_notification_batches,
             purged_conversations = stats.purged_conversations,
+            purged_admin_codes = stats.purged_admin_codes,
+            purged_admin_sessions = stats.purged_admin_sessions,
             "retention finished"
         );
     }

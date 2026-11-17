@@ -16,7 +16,7 @@ use tasklerq::capture::prompt::PROMPT_VERSION;
 use tasklerq::config::CaptureConfig;
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
-use tasklerq::llm::{Chain, LlmError};
+use tasklerq::llm::{Chain, LlmError, LlmHandle, LlmSnapshot};
 use tasklerq::security_audit::Audit;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -47,8 +47,10 @@ fn app_with(pool: &PgPool, ai: Option<Arc<StubAi>>, config: CaptureConfig, quota
 
 fn app_chain(pool: &PgPool, llm: Option<Arc<Chain>>, config: CaptureConfig, quota: u32) -> Router {
     build_router(
-        AppState::new(pool.clone(), Audit::new(pool.clone()))
-            .with_capture(CaptureState::new(config, llm, quota)),
+        AppState::new(pool.clone(), Audit::new(pool.clone())).with_capture(CaptureState::new(
+            config,
+            LlmHandle::new(LlmSnapshot::for_tests_without_settings(llm, quota)),
+        )),
     )
 }
 

@@ -1,6 +1,7 @@
 //! Tasklerq — семейные задачи и покупки.
 
 pub mod admin;
+pub mod admin_console;
 pub mod app;
 pub mod auth;
 pub mod capture;
@@ -13,6 +14,7 @@ pub mod metrics;
 pub mod rate_limit;
 pub mod redaction;
 pub mod security_audit;
+pub mod settings;
 pub mod storage;
 pub mod telegram;
 

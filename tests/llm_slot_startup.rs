@@ -12,6 +12,9 @@ use std::time::Duration as StdDuration;
 use tasklerq::app::build_application;
 use tasklerq::capture::slot_status::{LlmSlotHealth, SlotStatus};
 use tasklerq::config::{Config, LlmConfig, SecretString, SlotConfig};
+use tasklerq::llm::{LlmHandle, LlmSnapshot};
+use tasklerq::settings;
+use tasklerq::settings::crypto::SecretCipher;
 use tokio::sync::watch;
 
 /// Сериализует тесты, которые читают или пишут `llm_slot_verified`: реестр
@@ -94,13 +97,20 @@ async fn an_unreadable_database_without_a_cache_marks_slots_unverified() {
         None,
     );
     let llm = LlmConfig {
-        enabled: true,
+        enabled: Some(true),
         primary: Some(primary),
         fallback: None,
         connect_timeout: StdDuration::from_millis(1_000),
+        connect_timeout_from_env: false,
         daily_quota: 200,
+        daily_quota_from_env: false,
+        ignored_env: Vec::new(),
     };
-    let health = LlmSlotHealth::new(Arc::new(chain), &llm).expect("llm health");
+    let effective = settings::effective_llm(&llm, &[], &SecretCipher::new(None, None));
+    let health = LlmSlotHealth::new(LlmHandle::new(LlmSnapshot::from_effective_and_chain(
+        effective,
+        Some(Arc::new(chain)),
+    )));
 
     let broken = sqlx::postgres::PgPoolOptions::new()
         .acquire_timeout(StdDuration::from_millis(500))

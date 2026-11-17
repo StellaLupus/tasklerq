@@ -8,6 +8,8 @@ use std::time::Duration as StdDuration;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use http_body_util::BodyExt;
 use serde_json::{Map, Value, json};
@@ -17,11 +19,15 @@ use tasklerq::capture::eval::TitleMatch;
 use tasklerq::capture::prompt;
 use tasklerq::capture::slot_check;
 use tasklerq::capture::slot_status::{CACHE_TTL, LlmSlotHealth, SlotStatus};
-use tasklerq::config::{CaptureConfig, Config, LlmConfig, SecretString, SlotConfig, TenancyMode};
+use tasklerq::config::{
+    CaptureConfig, Config, LlmConfig, SecretKey, SecretString, SlotConfig, TenancyMode,
+};
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
-use tasklerq::llm::Chain;
+use tasklerq::llm::{Chain, LlmChange, LlmHandle, LlmSettings, LlmSnapshot};
 use tasklerq::security_audit::Audit;
+use tasklerq::settings;
+use tasklerq::settings::crypto::SecretCipher;
 use tasklerq::storage::repositories::llm_slot_checks::{self, NewCheck};
 use tasklerq::storage::repositories::llm_slot_settings;
 use tokio::sync::watch;
@@ -73,6 +79,15 @@ fn llm_health(
     primary: &SlotConfig,
     fallback: Option<&SlotConfig>,
 ) -> (Arc<Chain>, Arc<LlmSlotHealth>) {
+    let (chain, _handle, health) = llm_health_with_handle(primary, fallback);
+    (chain, health)
+}
+
+/// То же, но с доступом к снимку для применения настроек в тесте.
+fn llm_health_with_handle(
+    primary: &SlotConfig,
+    fallback: Option<&SlotConfig>,
+) -> (Arc<Chain>, LlmHandle, Arc<LlmSlotHealth>) {
     let answer = || {
         support::llm::BackendDouble::always(Ok(support::llm::v4::response(vec![
             support::llm::v4::shopping("Молоко"),
@@ -80,14 +95,37 @@ fn llm_health(
     };
     let chain = Arc::new(support::llm::chain(answer(), fallback.map(|_| answer())));
     let llm = LlmConfig {
-        enabled: true,
+        enabled: Some(true),
         primary: Some(primary.clone()),
         fallback: fallback.cloned(),
         connect_timeout: StdDuration::from_millis(1_000),
+        connect_timeout_from_env: false,
         daily_quota: 200,
+        daily_quota_from_env: false,
+        ignored_env: Vec::new(),
     };
-    let health = Arc::new(LlmSlotHealth::new(chain.clone(), &llm).expect("llm health"));
-    (chain, health)
+    let effective = settings::effective_llm(&llm, &[], &SecretCipher::new(None, None));
+    let handle = LlmHandle::new(LlmSnapshot::from_effective_and_chain(
+        effective,
+        Some(chain.clone()),
+    ));
+    let health = Arc::new(LlmSlotHealth::new(handle.clone()));
+    (chain, handle, health)
+}
+
+/// Применение настроек без слотов в окружении: слот целиком приходит из базы.
+fn llm_settings(pool: &PgPool, handle: LlmHandle) -> LlmSettings {
+    let env = LlmConfig {
+        enabled: None,
+        primary: None,
+        fallback: None,
+        connect_timeout: StdDuration::from_millis(1_000),
+        connect_timeout_from_env: false,
+        daily_quota: 200,
+        daily_quota_from_env: false,
+        ignored_env: Vec::new(),
+    };
+    LlmSettings::new(pool.clone(), env, SecretCipher::new(None, None), handle)
 }
 
 async fn store_check(
@@ -129,6 +167,33 @@ async fn ready_with_llm(pool: &PgPool, health: Arc<LlmSlotHealth>) -> (StatusCod
         .with_tenancy_mode(TenancyMode::Single)
         .with_llm_slots(health);
     get(&build_router(state), "/health/ready").await
+}
+
+fn secret_key(byte: u8) -> SecretKey {
+    SecretKey::parse(&BASE64.encode([byte; 32])).expect("32 bytes are a key")
+}
+
+fn secret_cipher(current: Option<u8>, old: Option<u8>) -> SecretCipher {
+    SecretCipher::new(current.map(secret_key), old.map(secret_key))
+}
+
+async fn ready_with_secret_cipher(pool: &PgPool, cipher: SecretCipher) -> (StatusCode, Value) {
+    let state = AppState::new(pool.clone(), Audit::new(pool.clone()))
+        .with_tenancy_mode(TenancyMode::Single)
+        .with_secret_cipher(cipher);
+    get(&build_router(state), "/health/ready").await
+}
+
+async fn store_secret(pool: &PgPool, cipher: &SecretCipher) {
+    let mut conn = pool.acquire().await.expect("connection");
+    settings::write_secret(
+        &mut conn,
+        "llm.primary.token",
+        &SecretString::new("SECRET-stored-token"),
+        cipher,
+    )
+    .await
+    .expect("secret setting is written");
 }
 
 fn capture_config() -> CaptureConfig {
@@ -445,6 +510,73 @@ async fn a_changed_standard_makes_the_saved_check_stale() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_model_change_makes_the_slot_stale_without_waiting_for_the_cache() {
+    let db = support::isolated_db().await;
+    let primary = slot_config("vendor/primary");
+    let (_chain, handle, health) = llm_health_with_handle(&primary, None);
+    store_check(&db.pool, "primary", &primary, 22, 22, TitleMatch::Strict).await;
+
+    let (status, body) = ready_with_llm(&db.pool, health.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.get("warnings").is_none(),
+        "a passed slot must not warn before the change:\n{body}"
+    );
+
+    // Меняем только модель: адрес и включение разбора пишем в той же группе,
+    // потому что у настроек в этом тесте нет слотов из окружения.
+    llm_settings(&db.pool, handle)
+        .apply(&[
+            LlmChange::set("llm.primary.url", json!(primary.url.as_str())),
+            LlmChange::set("llm.primary.model", json!("vendor/other")),
+            LlmChange::set("llm.enabled", json!(true)),
+        ])
+        .await
+        .expect("a model change is applied");
+
+    // Ни перезапуска, ни `invalidate`, ни ожидания `CACHE_TTL`: кеш прежней
+    // версии снимка недействителен сразу.
+    let (status, body) = ready_with_llm(&db.pool, health).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["warnings"],
+        json!(["llm_slot_unverified:primary:strict"]),
+        "the changed model must be stale immediately:\n{body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slot_added_after_start_is_seen_by_readiness_without_a_restart() {
+    let db = support::isolated_db().await;
+    let handle = LlmHandle::empty();
+    let health = Arc::new(LlmSlotHealth::new(handle.clone()));
+
+    let (status, body) = ready_with_llm(&db.pool, health.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.get("warnings").is_none(),
+        "a service without slots has nothing to warn about:\n{body}"
+    );
+
+    llm_settings(&db.pool, handle)
+        .apply(&[
+            LlmChange::set("llm.primary.url", json!("https://api.example.test/v1")),
+            LlmChange::set("llm.primary.model", json!("vendor/primary")),
+            LlmChange::set("llm.enabled", json!(true)),
+        ])
+        .await
+        .expect("a slot is applied without a check");
+
+    let (status, body) = ready_with_llm(&db.pool, health).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["warnings"],
+        json!(["llm_slot_unverified:primary"]),
+        "a slot added in the console must appear in readiness at once:\n{body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unchecked_slot_does_not_block_capture() {
     let db = support::isolated_db().await;
     let household = support::create_household(&db.pool).await;
@@ -454,7 +586,10 @@ async fn an_unchecked_slot_does_not_block_capture() {
     let state = AppState::new(db.pool.clone(), Audit::new(db.pool.clone()))
         .with_tenancy_mode(TenancyMode::Single)
         .with_llm_slots(health)
-        .with_capture(CaptureState::new(capture_config(), Some(chain), 200));
+        .with_capture(CaptureState::new(
+            capture_config(),
+            LlmHandle::new(LlmSnapshot::for_tests_without_settings(Some(chain), 200)),
+        ));
     let app = build_router(state);
 
     let (status, body) = support::request(
@@ -585,6 +720,41 @@ async fn a_failed_readiness_refresh_keeps_the_previous_status_and_extends_the_ca
             passed: 17,
             total: 22
         }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_refresh_after_a_snapshot_change_does_not_return_the_old_cache() {
+    let db = support::isolated_db().await;
+    let primary = slot_config("vendor/primary");
+    let (_chain, handle, health) = llm_health_with_handle(&primary, None);
+    store_check(&db.pool, "primary", &primary, 22, 22, TitleMatch::Strict).await;
+    let now = Utc::now();
+    assert_eq!(
+        health.statuses(&db.pool, now).await[0].status,
+        SlotStatus::Passed
+    );
+
+    llm_settings(&db.pool, handle)
+        .apply(&[
+            LlmChange::set("llm.primary.url", json!(primary.url.as_str())),
+            LlmChange::set("llm.primary.model", json!("vendor/other")),
+            LlmChange::set("llm.enabled", json!(true)),
+        ])
+        .await
+        .expect("a model change is applied");
+
+    let broken = sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(StdDuration::from_millis(500))
+        .connect_lazy("postgres://tasklerq:secret@127.0.0.1:1/tasklerq")
+        .expect("lazy pool");
+    let statuses = health.statuses(&broken, now + CACHE_TTL).await;
+
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(
+        statuses[0].status,
+        SlotStatus::Unverified,
+        "a cached status of another snapshot version must not be kept"
     );
 }
 
@@ -729,6 +899,173 @@ async fn startup_names_the_saved_standard_of_a_passed_slot() {
     assert!(
         !text.contains("api.example.test"),
         "slot address leaked:\n{text}"
+    );
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    for worker in application.workers {
+        tokio::time::timeout(StdDuration::from_secs(5), worker)
+            .await
+            .expect("worker must stop on shutdown")
+            .expect("worker task must join");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readiness_reports_unreadable_stored_secrets_without_names() {
+    let db = support::isolated_db().await;
+    store_secret(&db.pool, &secret_cipher(Some(1), None)).await;
+
+    for (cipher, expected) in [
+        (secret_cipher(None, None), "secret_key_missing"),
+        (secret_cipher(Some(2), None), "secret_undecryptable"),
+    ] {
+        let (status, body) = ready_with_secret_cipher(&db.pool, cipher).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["warnings"], json!([expected]), "{body}");
+        let response = body.to_string();
+        assert!(!response.contains("llm.primary.token"), "{response}");
+        assert!(!response.contains("SECRET-stored-token"), "{response}");
+    }
+
+    for cipher in [
+        secret_cipher(Some(1), None),
+        secret_cipher(Some(2), Some(1)),
+    ] {
+        let (status, body) = ready_with_secret_cipher(&db.pool, cipher).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.get("warnings").is_none(),
+            "a readable secret must not warn:\n{body}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tampered_secret_is_reported_as_undecryptable() {
+    let db = support::isolated_db().await;
+    store_secret(&db.pool, &secret_cipher(Some(1), None)).await;
+
+    let mut blob: Vec<u8> = sqlx::query_scalar("SELECT secret FROM settings WHERE key = $1")
+        .bind("llm.primary.token")
+        .fetch_one(&db.pool)
+        .await
+        .expect("one secret row");
+    let last = blob.len() - 1;
+    blob[last] ^= 0x01;
+    sqlx::query("UPDATE settings SET secret = $1 WHERE key = $2")
+        .bind(&blob)
+        .bind("llm.primary.token")
+        .execute(&db.pool)
+        .await
+        .expect("tampered secret is stored");
+
+    let (status, body) = ready_with_secret_cipher(&db.pool, secret_cipher(Some(1), None)).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["warnings"], json!(["secret_undecryptable"]), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readiness_without_stored_secrets_does_not_warn_about_a_missing_key() {
+    let db = support::isolated_db().await;
+
+    let (status, body) = ready_with_secret_cipher(&db.pool, secret_cipher(None, None)).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.get("warnings").is_none(),
+        "no stored secrets means no key warning:\n{body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_secret_saved_after_start_is_seen_without_a_restart() {
+    let db = support::isolated_db().await;
+    let state = AppState::new(db.pool.clone(), Audit::new(db.pool.clone()))
+        .with_tenancy_mode(TenancyMode::Single)
+        .with_secret_cipher(secret_cipher(None, None));
+    let app = build_router(state);
+
+    let (status, body) = get(&app, "/health/ready").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.get("warnings").is_none(), "{body}");
+
+    store_secret(&db.pool, &secret_cipher(Some(1), None)).await;
+
+    let (status, body) = get(&app, "/health/ready").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["warnings"], json!(["secret_key_missing"]), "{body}");
+}
+
+#[tokio::test]
+async fn startup_warns_about_stored_secrets_without_a_key() {
+    let db = support::isolated_db().await;
+    let database_url = support::database_url().await;
+    let config = Config::from_map([
+        ("ENV", "development"),
+        ("PUBLIC_BASE_URL", "http://127.0.0.1:18080"),
+        ("DATABASE_URL", database_url.as_str()),
+        ("TELEGRAM_MODE", "disabled"),
+        ("TENANCY_MODE", "single"),
+        ("LLM_CAPTURE_ENABLED", "false"),
+    ])
+    .expect("test config should be valid");
+
+    // current_thread: подписчик `set_default` живёт на потоке теста, и все
+    // записи старта попадают в буфер.
+    let logs = support::logs::LogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(logs.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    // Секретов нет — строки о ключе тоже нет.
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let application = build_application(&config, db.pool.clone(), shutdown_rx)
+        .await
+        .expect("an empty settings table must not stop startup");
+    shutdown_tx.send(true).expect("shutdown signal");
+    for worker in application.workers {
+        tokio::time::timeout(StdDuration::from_secs(5), worker)
+            .await
+            .expect("worker must stop on shutdown")
+            .expect("worker task must join");
+    }
+    let before = logs.contents();
+    assert!(
+        !before.contains("secret_key_missing"),
+        "no stored secrets means no startup warning:\n{before}"
+    );
+
+    // Секрет записан ключом A, сервис запускается без ключа.
+    store_secret(&db.pool, &secret_cipher(Some(1), None)).await;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let application = build_application(&config, db.pool.clone(), shutdown_rx)
+        .await
+        .expect("an unreadable secret must not stop startup");
+
+    let text = logs.contents();
+    let warned = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .any(|record| {
+            record["level"] == "WARN"
+                && record["fields"]["code"] == "secret_key_missing"
+                && record["fields"]["secrets"] == 1
+        });
+    assert!(
+        warned,
+        "the startup log must warn with the code and row count:\n{text}"
+    );
+    assert!(
+        !text.contains("llm.primary.token"),
+        "the startup log must not name settings:\n{text}"
+    );
+    assert!(
+        !text.contains("SECRET-stored-token"),
+        "the startup log must not contain secret values:\n{text}"
     );
 
     shutdown_tx.send(true).expect("shutdown signal");

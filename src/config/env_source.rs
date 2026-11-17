@@ -32,15 +32,6 @@ impl EnvSource {
         self.get(name).ok_or(ConfigError::Missing { name })
     }
 
-    pub(super) fn required_url(
-        &self,
-        name: &'static str,
-        require_https: bool,
-    ) -> Result<Url, ConfigError> {
-        let raw = self.required(name)?;
-        parse_url(name, raw, require_https)
-    }
-
     pub(super) fn url(
         &self,
         name: &'static str,
@@ -57,10 +48,14 @@ impl EnvSource {
     }
 
     pub(super) fn bool(&self, name: &'static str, default: bool) -> Result<bool, ConfigError> {
+        Ok(self.optional_bool(name)?.unwrap_or(default))
+    }
+
+    pub(super) fn optional_bool(&self, name: &'static str) -> Result<Option<bool>, ConfigError> {
         match self.get(name) {
-            None => Ok(default),
-            Some("true") => Ok(true),
-            Some("false") => Ok(false),
+            None => Ok(None),
+            Some("true") => Ok(Some(true)),
+            Some("false") => Ok(Some(false)),
             Some(_) => Err(ConfigError::invalid(name, "expected `true` or `false`")),
         }
     }
@@ -102,39 +97,31 @@ pub(super) fn parse_url(
     raw: &str,
     require_https: bool,
 ) -> Result<Url, ConfigError> {
-    let url = Url::parse(raw).map_err(|_| {
-        ConfigError::invalid(
-            name,
-            "expected an absolute URL, for example https://tasklerq.example.com",
-        )
-    })?;
+    parse_url_reason(raw, require_https).map_err(|reason| ConfigError::invalid(name, reason))
+}
+
+/// Правила разбора URL без имени параметра: причина пригодна и для ошибки
+/// запуска, и для валидации значения из консоли.
+pub(super) fn parse_url_reason(raw: &str, require_https: bool) -> Result<Url, &'static str> {
+    let url = Url::parse(raw)
+        .map_err(|_| "expected an absolute URL, for example https://tasklerq.example.com")?;
 
     if !matches!(url.scheme(), "http" | "https") {
-        return Err(ConfigError::invalid(
-            name,
-            "expected an http:// or https:// URL",
-        ));
+        return Err("expected an http:// or https:// URL");
     }
     if url.host_str().is_none() {
-        return Err(ConfigError::invalid(name, "URL must contain a host"));
+        return Err("URL must contain a host");
     }
     if !url.username().is_empty() || url.password().is_some() {
-        return Err(ConfigError::invalid(
-            name,
-            "URL must not contain credentials",
-        ));
+        return Err("URL must not contain credentials");
     }
     if url.query().is_some() || url.fragment().is_some() {
-        return Err(ConfigError::invalid(
-            name,
-            "URL must not contain a query or fragment",
-        ));
+        return Err("URL must not contain a query or fragment");
     }
     if require_https && url.scheme() != "https" {
-        return Err(ConfigError::invalid(
-            name,
+        return Err(
             "expected an HTTPS URL in production, for example https://tasklerq.example.com",
-        ));
+        );
     }
 
     Ok(url)

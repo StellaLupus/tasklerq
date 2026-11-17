@@ -23,10 +23,12 @@ use tasklerq::config::{CaptureConfig, LlmConfig, SecretString, SlotConfig};
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
 use tasklerq::llm::{
-    Chain, ChatBackend, ChatCompletion, ChatMessage, ChatRequest, LlmError, ResponseFailure, Slot,
-    SystemClock,
+    Chain, ChatBackend, ChatCompletion, ChatMessage, ChatRequest, LlmError, LlmHandle, LlmSnapshot,
+    ResponseFailure, Slot, SystemClock,
 };
 use tasklerq::security_audit::Audit;
+use tasklerq::settings;
+use tasklerq::settings::crypto::SecretCipher;
 use tasklerq::storage::repositories::llm_slot_checks::{self, NewCheck};
 use tasklerq::telegram::api::TelegramError;
 use tasklerq::telegram::bot::{Bot, Outcome};
@@ -69,6 +71,13 @@ fn chain_always(answer: Result<Value, LlmError>) -> Arc<tasklerq::llm::Chain> {
         support::llm::BackendDouble::always(answer),
         None,
     ))
+}
+
+fn capture_state(config: CaptureConfig, llm: Option<Arc<Chain>>, quota: u32) -> CaptureState {
+    CaptureState::new(
+        config,
+        LlmHandle::new(LlmSnapshot::for_tests_without_settings(llm, quota)),
+    )
 }
 
 struct Noop;
@@ -216,7 +225,7 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
 
     let ingress = Ingress::new(&SecretString::new(SECRET), Arc::new(Notify::new()));
     let state = AppState::new(db.pool.clone(), Audit::new(db.pool.clone()))
-        .with_capture(CaptureState::new(
+        .with_capture(capture_state(
             capture_config(),
             Some(chain_always(Ok(support::llm::v4::response(vec![
                 support::llm::v4::shopping("Молоко"),
@@ -260,11 +269,12 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
     assert_eq!(status, StatusCode::OK);
 
     // Сбой валидации ответа LLM считается отдельной метрикой.
-    let bad_app = build_router(
-        AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_capture(
-            CaptureState::new(capture_config(), Some(chain_always(Ok(json!({})))), 200),
-        ),
-    );
+    let bad_app =
+        build_router(
+            AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_capture(
+                capture_state(capture_config(), Some(chain_always(Ok(json!({})))), 200),
+            ),
+        );
     let (status, _, _) = send(
         &bad_app,
         Method::POST,
@@ -278,13 +288,11 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
 
     // Недоступная LLM с разрешённым fallback создаёт позицию из исходного текста.
     let fallback_app = build_router(
-        AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_capture(
-            CaptureState::new(
-                fallback_capture_config(),
-                Some(chain_always(Err(LlmError::Transport))),
-                200,
-            ),
-        ),
+        AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_capture(capture_state(
+            fallback_capture_config(),
+            Some(chain_always(Err(LlmError::Transport))),
+            200,
+        )),
     );
     let (status, _, body) = send(
         &fallback_app,
@@ -403,8 +411,15 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
 
     // Capture из Telegram: отдельный household с реальным ботом.
     let capture_chat = next_telegram_id();
+    let capture_chain = chain_always(Ok(support::llm::v4::response(vec![
+        support::llm::v4::shopping("Молоко"),
+    ])));
+    let capture_llm = LlmHandle::new(LlmSnapshot::for_tests_without_settings(
+        Some(capture_chain),
+        200,
+    ));
     let handler = Bot::new("tasklerqbot")
-        .with_llm_capture(true)
+        .with_llm(capture_llm.clone())
         .with_tenancy(tasklerq::config::TenancyMode::Multi);
     let mut telegram = Harness::with_handler(
         &db.pool,
@@ -418,9 +433,7 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
     telegram.press("меню").await;
     let capture_worker = CaptureWorker::new(
         db.pool.clone(),
-        chain_always(Ok(support::llm::v4::response(vec![
-            support::llm::v4::shopping("Молоко"),
-        ]))),
+        capture_llm,
         handler,
         Arc::new(Notify::new()),
         Audit::new(db.pool.clone()),
@@ -656,18 +669,18 @@ async fn llm_slot_verified_is_one_only_for_a_passed_slot() {
         timeout: StdDuration::from_secs(10),
         extra: Map::new(),
     };
-    let chain = support::llm::chain(
-        support::llm::BackendDouble::always(Ok(support::llm::v4::response(vec![]))),
-        None,
-    );
     let llm = LlmConfig {
-        enabled: true,
+        enabled: Some(true),
         primary: Some(primary.clone()),
         fallback: None,
         connect_timeout: StdDuration::from_millis(1_000),
+        connect_timeout_from_env: false,
         daily_quota: 200,
+        daily_quota_from_env: false,
+        ignored_env: Vec::new(),
     };
-    let health = LlmSlotHealth::new(Arc::new(chain), &llm).expect("llm health");
+    let effective = settings::effective_llm(&llm, &[], &SecretCipher::new(None, None));
+    let health = LlmSlotHealth::new(LlmHandle::new(LlmSnapshot::from_effective(effective)));
     let now = Utc::now();
 
     // Нет строки проверки — слот не прошёл.

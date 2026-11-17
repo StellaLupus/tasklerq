@@ -17,6 +17,7 @@ use super::{ChatBackend, ChatRequest, LlmError, OpenAiBackend};
 use crate::capture::breaker::CircuitBreaker;
 use crate::config::{LlmConfig, SlotConfig};
 use crate::metrics;
+use crate::settings::EffectiveLlm;
 
 /// Имя основного слота в `llm_runs.slot`.
 pub const PRIMARY_SLOT: &str = "primary";
@@ -68,18 +69,32 @@ pub struct Slot {
     name: &'static str,
     backend: Arc<dyn ChatBackend>,
     timeout: Duration,
-    breaker: CircuitBreaker,
+    breaker: Arc<CircuitBreaker>,
 }
 
 impl Slot {
     /// Создать слот с явным бэкендом. Нужен и рабочей сборке, и тестам с
     /// двойниками.
     pub fn new(name: &'static str, backend: Arc<dyn ChatBackend>, timeout: Duration) -> Self {
+        Self::with_breaker(name, backend, timeout, Arc::new(CircuitBreaker::default()))
+    }
+
+    /// Создать слот с готовым предохранителем.
+    ///
+    /// Новая цепочка делит `Arc<CircuitBreaker>` с прежней, когда отпечаток
+    /// слота не изменился: неудачи разбора, начатого на старой цепочке,
+    /// учитываются и в новой.
+    pub fn with_breaker(
+        name: &'static str,
+        backend: Arc<dyn ChatBackend>,
+        timeout: Duration,
+        breaker: Arc<CircuitBreaker>,
+    ) -> Self {
         Self {
             name,
             backend,
             timeout,
-            breaker: CircuitBreaker::default(),
+            breaker,
         }
     }
 
@@ -90,8 +105,28 @@ impl Slot {
         config: &SlotConfig,
         connect_timeout: Duration,
     ) -> Result<Self, LlmError> {
+        Self::from_config_with_breaker(
+            name,
+            config,
+            connect_timeout,
+            Arc::new(CircuitBreaker::default()),
+        )
+    }
+
+    /// Создать слот из конфигурации с общим предохранителем.
+    pub fn from_config_with_breaker(
+        name: &'static str,
+        config: &SlotConfig,
+        connect_timeout: Duration,
+        breaker: Arc<CircuitBreaker>,
+    ) -> Result<Self, LlmError> {
         let backend = OpenAiBackend::from_slot(config, connect_timeout)?;
-        Ok(Self::new(name, Arc::new(backend), config.timeout))
+        Ok(Self::with_breaker(
+            name,
+            Arc::new(backend),
+            config.timeout,
+            breaker,
+        ))
     }
 
     /// Имя слота для `llm_runs` и журнала.
@@ -107,6 +142,12 @@ impl Slot {
     /// Предохранитель слота.
     pub fn breaker(&self) -> &CircuitBreaker {
         &self.breaker
+    }
+
+    /// Разделяемая ссылка на предохранитель: новая цепочка продолжает считать
+    /// неудачи с того же состояния.
+    pub fn breaker_handle(&self) -> Arc<CircuitBreaker> {
+        Arc::clone(&self.breaker)
     }
 }
 
@@ -209,17 +250,71 @@ impl Chain {
     /// Собрать цепочку из конфигурации. `None`, если разбор выключен или
     /// основной слот не задан.
     pub fn from_config(config: &LlmConfig) -> Result<Option<Self>, LlmError> {
-        if !config.enabled {
+        Self::build(
+            config.capture_enabled(),
+            config.primary.as_ref(),
+            config.fallback.as_ref(),
+            config.connect_timeout,
+            &mut |_, _| Arc::new(CircuitBreaker::default()),
+        )
+    }
+
+    /// Собрать цепочку из действующей конфигурации консоли.
+    ///
+    /// Источник полей уже разрешён правилом «окружение → база → умолчание»,
+    /// поэтому флаг не пересчитывается и `LlmConfig` не нужен.
+    pub fn from_effective(effective: &EffectiveLlm) -> Result<Option<Self>, LlmError> {
+        Self::from_effective_with(effective, |_, _| Arc::new(CircuitBreaker::default()))
+    }
+
+    /// Собрать цепочку из действующей конфигурации с готовыми предохранителями.
+    ///
+    /// Замыкание выдаёт предохранитель каждому слоту; замена настроек передаёт
+    /// сюда предохранитель прежней цепочки, если отпечаток слота не изменился.
+    pub fn from_effective_with<F>(
+        effective: &EffectiveLlm,
+        mut breaker: F,
+    ) -> Result<Option<Self>, LlmError>
+    where
+        F: FnMut(&'static str, &SlotConfig) -> Arc<CircuitBreaker>,
+    {
+        Self::build(
+            effective.enabled(),
+            effective.primary().config(),
+            effective.fallback().config(),
+            effective.connect_timeout(),
+            &mut breaker,
+        )
+    }
+
+    fn build(
+        enabled: bool,
+        primary: Option<&SlotConfig>,
+        fallback: Option<&SlotConfig>,
+        connect_timeout: Duration,
+        breaker: &mut dyn FnMut(&'static str, &SlotConfig) -> Arc<CircuitBreaker>,
+    ) -> Result<Option<Self>, LlmError> {
+        if !enabled {
             return Ok(None);
         }
-        let Some(primary_config) = &config.primary else {
+        let Some(primary_config) = primary else {
             return Ok(None);
         };
-        let primary = Slot::from_config(PRIMARY_SLOT, primary_config, config.connect_timeout)?;
-        let fallback = config
-            .fallback
-            .as_ref()
-            .map(|slot| Slot::from_config(FALLBACK_SLOT, slot, config.connect_timeout))
+        let primary = Slot::from_config_with_breaker(
+            PRIMARY_SLOT,
+            primary_config,
+            connect_timeout,
+            breaker(PRIMARY_SLOT, primary_config),
+        )?;
+        let fallback = fallback
+            .map(|slot| {
+                Slot::from_config_with_breaker(
+                    FALLBACK_SLOT,
+                    slot,
+                    connect_timeout,
+                    breaker(FALLBACK_SLOT, slot),
+                )
+            })
             .transpose()?;
         Ok(Some(Self::new(primary, fallback)))
     }

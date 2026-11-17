@@ -73,6 +73,50 @@ pub async fn create_token(
     Ok(issued)
 }
 
+/// Выпустить токен мастером первого запуска: только если активных нет.
+///
+/// Проверка «у household нет действующих токенов» и выпуск идут в одной
+/// транзакции под блокировкой строки household. Два одновременных POST шага
+/// токена поэтому выпускают один токен: второй видит его и получает `None`
+/// («шаг завершён»). CLI [`create_token`] это правило не использует — там
+/// несколько токенов допустимы.
+pub async fn create_wizard_token(
+    pool: &PgPool,
+    mode: TenancyMode,
+    name: &str,
+    scopes: &[String],
+    now: DateTime<Utc>,
+) -> Result<Option<IssuedToken>, DomainError> {
+    let mut tx = pool.begin().await?;
+    let household = match mode {
+        TenancyMode::Single => {
+            select_household(mode, households::list_active_for_update(&mut tx).await?)?
+        }
+        TenancyMode::Multi => return Err(DomainError::Validation("pass --household".into())),
+    };
+
+    let active =
+        crate::storage::repositories::tokens::list_active(&mut tx, household.id, now).await?;
+    if !active.is_empty() {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+
+    let issued = tokens::issue(
+        &mut tx,
+        household.id,
+        name,
+        scopes,
+        None,
+        &admin_actor(),
+        now,
+    )
+    .await?;
+    tx.commit().await?;
+
+    Ok(Some(issued))
+}
+
 /// Отозвать токен. Второй элемент — был ли токен отозван сейчас.
 pub async fn revoke_token(
     pool: &PgPool,

@@ -174,6 +174,9 @@ fn a_failed_event_advance_step_is_logged_with_its_name_and_still_delivers_remind
             .await
             .expect("trigger");
 
+            let advance = support::notifications::domain_ticker(&db.pool)
+                .tick(due - Duration::minutes(15))
+                .await;
             let result = support::notifications::scheduler(&db.pool)
                 .tick(due - Duration::minutes(15))
                 .await;
@@ -194,7 +197,7 @@ fn a_failed_event_advance_step_is_logged_with_its_name_and_still_delivers_remind
             .fetch_one(&db.pool)
             .await
             .expect("delivered reminders");
-            (result.is_err(), delivered)
+            (advance.is_err(), result.is_err(), delivered)
         })
     });
 
@@ -203,8 +206,12 @@ fn a_failed_event_advance_step_is_logged_with_its_name_and_still_delivers_remind
         result.0,
         "a failed event advance step must be reported by the tick"
     );
+    assert!(
+        !result.1,
+        "the advance failure must not be reported by the notification scheduler:\n{logs}"
+    );
     assert_eq!(
-        result.1, 1,
+        result.2, 1,
         "the reminder must still be delivered after the failed step:\n{logs}"
     );
     assert!(logs.contains("\"level\":\"ERROR\""), "{logs}");

@@ -340,3 +340,24 @@ pub async fn list_active(conn: &mut PgConnection) -> Result<Vec<Household>, Doma
 
     Ok(households)
 }
+
+/// Все неудалённые household с блокировкой строк до конца транзакции.
+///
+/// Нужен мастеру первого запуска: проверка «у household нет активных токенов»
+/// и выпуск токена идут в одной транзакции, поэтому второй параллельный запрос
+/// ждёт строку и видит уже выпущенный токен.
+pub async fn list_active_for_update(
+    conn: &mut PgConnection,
+) -> Result<Vec<Household>, DomainError> {
+    let households = sqlx::query_as::<_, Household>(
+        "SELECT id, name, timezone, created_at, updated_at, deleted_at
+         FROM households
+         WHERE deleted_at IS NULL
+         ORDER BY created_at, id
+         FOR UPDATE",
+    )
+    .fetch_all(conn)
+    .await?;
+
+    Ok(households)
+}

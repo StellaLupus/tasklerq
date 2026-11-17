@@ -119,6 +119,16 @@ pub fn llm_slot_verified(slot: &'static str, verified: bool) {
         .insert(key("llm_slot_verified", &[("slot", slot)]), value);
 }
 
+/// Убрать серию слота, которого больше нет в снимке.
+///
+/// Оставленная серия с прежним значением держала бы алерт `== 0` на слоте,
+/// который уже не настроен.
+pub fn llm_slot_verified_remove(slot: &'static str) {
+    lock()
+        .gauges
+        .remove(&key("llm_slot_verified", &[("slot", slot)]));
+}
+
 /// Ответ LLM не прошёл разбор схемы.
 pub fn llm_validation_failure() {
     add_counter("llm_validation_failures_total", &[]);

@@ -35,7 +35,7 @@ use crate::config::CaptureConfig;
 use crate::domain::error::DomainError;
 use crate::domain::models::{CaptureMode, CaptureSource, Item, List, ListKind};
 use crate::domain::validation::{MAX_TITLE, sanitize};
-use crate::llm::Chain;
+use crate::llm::LlmHandle;
 use crate::security_audit::{self, LimitKey, LlmValidation, RateLimitEvent};
 use crate::storage::repositories::capture_requests;
 use crate::storage::repositories::capture_requests::Reserved;
@@ -57,21 +57,18 @@ pub const BODY_LIMIT_BYTES: usize = 16 * 1024;
 pub struct CaptureState {
     /// Параметры внешнего capture.
     pub config: CaptureConfig,
-    /// Цепочка слотов LLM; `None`, если разбор выключен или настроен неверно.
-    pub llm: Option<Arc<Chain>>,
-    /// Суточная квота разборов на household.
-    pub quota: u32,
+    /// Снимок LLM: цепочка слотов и суточная квота.
+    pub llm: LlmHandle,
     /// Лимит частоты на токен.
     pub rate: Arc<RateLimiter>,
 }
 
 impl CaptureState {
     /// Создать состояние маршрута.
-    pub fn new(config: CaptureConfig, llm: Option<Arc<Chain>>, quota: u32) -> Self {
+    pub fn new(config: CaptureConfig, llm: LlmHandle) -> Self {
         Self {
             config,
             llm,
-            quota,
             rate: Arc::new(RateLimiter::new(config.rate_limit_per_min)),
         }
     }
@@ -285,6 +282,9 @@ async fn capture_inner(
         .capture
         .as_ref()
         .ok_or_else(|| ApiError::not_found("Route not found"))?;
+    // Снимок берётся один раз на весь разбор: смена настроек во время вызова
+    // не подменит цепочку и квоту уже начатого запроса.
+    let llm = capture.llm.load();
 
     let source: CaptureSource = request.source.into();
     // Идентификатор попытки для журнала и ответа `rejected`; у применённого
@@ -443,7 +443,7 @@ async fn capture_inner(
 
     // Выключенная или не настроенная LLM — это недоступность LLM: `auto` с
     // включённым fallback создаёт позицию из исходного текста, `draft` — 503.
-    let Some(chain) = capture.llm.as_deref() else {
+    let Some(chain) = llm.chain().map(|chain| chain.as_ref()) else {
         if fallback_allowed {
             return apply_fallback(&mut conn, fallback, now, "llm_disabled", reservation).await;
         }
@@ -456,7 +456,7 @@ async fn capture_inner(
     let used = llm_runs::count_since(&mut conn, auth.household_id, now - Duration::hours(24))
         .await
         .map_err(database_error)?;
-    if used >= i64::from(capture.quota) {
+    if used >= i64::from(llm.quota()) {
         tracing::warn!(
             metric = "capture_quota_exhausted",
             "llm capture quota is exhausted"

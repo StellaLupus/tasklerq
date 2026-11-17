@@ -37,7 +37,7 @@ async fn onboarded_named(pool: &PgPool, name: &str) -> Harness {
 /// Онбординг на стенде с включённым разбором текста.
 async fn onboarded_with_llm(pool: &PgPool, name: &str) -> Harness {
     let handler = Bot::new("tasklerqbot")
-        .with_llm_capture(true)
+        .with_llm(support::llm::capture_handle())
         .with_tenancy(TenancyMode::Multi);
     let mut bot = Harness::with_handler(
         pool,

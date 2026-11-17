@@ -17,6 +17,7 @@ use tasklerq::domain::models::{
     RecurrenceInput, UserRole,
 };
 use tasklerq::domain::recurrence::Due;
+use tasklerq::jobs::domain::DomainTicker;
 use tasklerq::jobs::scheduler::{Scheduler, all_day_occurrence_key, occurrence_key};
 use tasklerq::storage::repositories::notifications::{self, NewDelivery, NotificationKind};
 use tasklerq::storage::repositories::{items, users};
@@ -25,6 +26,10 @@ use uuid::Uuid;
 
 fn scheduler(pool: &PgPool) -> Scheduler {
     Scheduler::new(pool.clone(), Arc::new(Notify::new()))
+}
+
+fn ticker(pool: &PgPool) -> DomainTicker {
+    DomainTicker::new(pool.clone())
 }
 
 fn rounded_now() -> DateTime<Utc> {
@@ -784,7 +789,7 @@ async fn each_recurring_event_occurrence_gets_its_own_reminder() {
         0
     );
 
-    scheduler
+    ticker(&db.pool)
         .tick(start + Duration::hours(1))
         .await
         .expect("the event moves to the next occurrence");
@@ -874,6 +879,10 @@ async fn a_changed_occurrence_cancels_the_reminder_of_the_old_one() {
     assert_eq!(planned.delivered, 0);
     assert!(messages(&db.pool, chat).await.is_empty());
 
+    ticker(&db.pool)
+        .tick(local_utc(moscow, day, 8, 0))
+        .await
+        .expect("morning domain tick");
     let morning = scheduler
         .tick(local_utc(moscow, day, 8, 0))
         .await

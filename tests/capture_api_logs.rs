@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use tasklerq::config::CaptureConfig;
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
-use tasklerq::llm::{Chain, LlmError};
+use tasklerq::llm::{Chain, LlmError, LlmHandle, LlmSnapshot};
 use tasklerq::security_audit::Audit;
 use tower::ServiceExt;
 
@@ -27,6 +27,13 @@ fn chain(answer: Result<Value, LlmError>) -> Arc<Chain> {
         support::llm::BackendDouble::always(answer),
         None,
     ))
+}
+
+fn capture_state(config: CaptureConfig, ai: Option<Arc<Chain>>, quota: u32) -> CaptureState {
+    CaptureState::new(
+        config,
+        LlmHandle::new(LlmSnapshot::for_tests_without_settings(ai, quota)),
+    )
 }
 
 #[test]
@@ -48,7 +55,7 @@ fn capture_logs_have_metadata_but_not_the_text() {
             let household = support::create_household(&db.pool).await;
             let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
             let state = AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_capture(
-                CaptureState::new(
+                capture_state(
                     CaptureConfig {
                         enabled: true,
                         voice_timeout_ms: 8_000,
@@ -120,7 +127,7 @@ fn a_disabled_llm_logs_the_fallback_reason_without_the_text() {
             let household = support::create_household(&db.pool).await;
             let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
             let state = AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_capture(
-                CaptureState::new(
+                capture_state(
                     CaptureConfig {
                         enabled: true,
                         voice_timeout_ms: 8_000,
@@ -204,7 +211,7 @@ fn capture_logs_for(
             let household = support::create_household(&db.pool).await;
             let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
             let state = AppState::new(db.pool.clone(), Audit::new(db.pool.clone())).with_capture(
-                CaptureState::new(
+                capture_state(
                     CaptureConfig {
                         enabled: true,
                         voice_timeout_ms: 8_000,

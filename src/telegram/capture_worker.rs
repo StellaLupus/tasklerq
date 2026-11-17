@@ -25,7 +25,7 @@ use crate::capture::validate::validate_item;
 use crate::domain::error::DomainError;
 use crate::domain::models::{Actor, CaptureMode, Household, Item, ItemSource, ListKind, User};
 use crate::domain::validation::validate_new_item;
-use crate::llm::Chain;
+use crate::llm::LlmHandle;
 use crate::metrics;
 use crate::security_audit::{Audit, LlmValidation};
 use crate::storage::repositories::capture_jobs::{self, Failure, Job};
@@ -45,9 +45,6 @@ use crate::telegram::rich::button;
 
 /// Попыток на задание: повторяются только сбои транспорта и сервера слота.
 pub const MAX_ATTEMPTS: u32 = 3;
-
-/// Сколько разборов household может запустить за сутки по умолчанию.
-pub const DEFAULT_DAILY_QUOTA: u32 = 200;
 
 const FAILED: &str = "Не получилось разобрать сообщение. Проверьте текст и \
 добавьте задачу вручную.";
@@ -75,11 +72,10 @@ pub enum Pass {
 /// Воркер очереди `capture_jobs`.
 pub struct CaptureWorker {
     pool: PgPool,
-    llm: Arc<Chain>,
+    llm: LlmHandle,
     bot: Bot,
     wake_outbox: Arc<Notify>,
     only_chat: Option<i64>,
-    quota: u32,
     audit: Audit,
 }
 
@@ -304,7 +300,7 @@ impl CaptureWorker {
     /// общий журнал событий процесса.
     pub fn new(
         pool: PgPool,
-        llm: Arc<Chain>,
+        llm: LlmHandle,
         bot: Bot,
         wake_outbox: Arc<Notify>,
         audit: Audit,
@@ -316,7 +312,6 @@ impl CaptureWorker {
             bot,
             wake_outbox,
             only_chat: None,
-            quota: DEFAULT_DAILY_QUOTA,
         }
     }
 
@@ -324,13 +319,6 @@ impl CaptureWorker {
     #[must_use]
     pub fn only_chat(mut self, chat_id: i64) -> Self {
         self.only_chat = Some(chat_id);
-        self
-    }
-
-    /// Суточная квота разборов на household.
-    #[must_use]
-    pub fn with_quota(mut self, quota: u32) -> Self {
-        self.quota = quota;
         self
     }
 
@@ -347,6 +335,9 @@ impl CaptureWorker {
     }
 
     async fn process(&self, job: Job, now: DateTime<Utc>) -> Result<Pass, sqlx::Error> {
+        // Снимок берётся один раз на весь разбор: замена настроек во время
+        // вызова не подменит цепочку и квоту уже начатого задания.
+        let llm = self.llm.load();
         let (Some(text), Some(user_id)) = (job.text().map(str::to_owned), job.user_id) else {
             // Неизвестный вид входа или автора удалили: разбирать нечего.
             return self.abandon(&job, "unusable_job", now).await;
@@ -356,9 +347,32 @@ impl CaptureWorker {
             return self.abandon(&job, "user_gone", now).await;
         };
 
+        // Задание поставлено, когда цепочка была, но её убрали до обработки:
+        // повтор не поможет, пользователь получает редактор с исходным текстом.
+        let Some(chain) = llm.chain() else {
+            tracing::warn!(
+                metric = "capture_llm_disabled",
+                "llm capture is disabled while the job was queued"
+            );
+            return self
+                .fail(
+                    &job,
+                    &prepared,
+                    Issue {
+                        text: &text,
+                        code: "llm_disabled",
+                        retryable: false,
+                        message: CIRCUIT_OPEN,
+                        runs: Vec::new(),
+                    },
+                    now,
+                )
+                .await;
+        };
+
         // Квота и предохранитель проверяются до вызова: при отказе пользователь
         // сразу получает редактор с исходным текстом, а LLM не вызывается.
-        if self.quota_exhausted(&job, now).await? {
+        if self.quota_exhausted(&job, now, llm.quota()).await? {
             tracing::warn!(
                 metric = "capture_quota_exhausted",
                 "llm capture quota is exhausted"
@@ -380,7 +394,7 @@ impl CaptureWorker {
         }
 
         let outcome = llm::generate(
-            self.llm.as_ref(),
+            chain.as_ref(),
             &prepared.context,
             &text,
             now,
@@ -483,7 +497,12 @@ impl CaptureWorker {
     }
 
     /// Household исчерпал суточную квоту разборов.
-    async fn quota_exhausted(&self, job: &Job, now: DateTime<Utc>) -> Result<bool, sqlx::Error> {
+    async fn quota_exhausted(
+        &self,
+        job: &Job,
+        now: DateTime<Utc>,
+        quota: u32,
+    ) -> Result<bool, sqlx::Error> {
         let mut conn = self.pool.acquire().await?;
         let used = llm_runs::count_since(
             &mut conn,
@@ -491,7 +510,7 @@ impl CaptureWorker {
             now - chrono::Duration::hours(24),
         )
         .await?;
-        Ok(used >= i64::from(self.quota))
+        Ok(used >= i64::from(quota))
     }
 
     /// Общие поля журнала одного разбора.

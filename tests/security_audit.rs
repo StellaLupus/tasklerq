@@ -11,18 +11,21 @@ use async_trait::async_trait;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::connect_info::MockConnectInfo;
-use axum::http::{Method, Request, StatusCode};
+use axum::http::{Method, Request, StatusCode, header};
 use chrono::{Duration, Utc};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tasklerq::admin;
+use tasklerq::admin_console::router::{AdminState, build_router as build_admin_router};
 use tasklerq::auth::tokens::hash_token;
 use tasklerq::capture::prompt::PROMPT_VERSION;
-use tasklerq::config::{CaptureConfig, SecretString, TenancyMode};
+use tasklerq::config::{CaptureConfig, LlmConfig, SecretString, TenancyMode};
 use tasklerq::http::api::capture::CaptureState;
 use tasklerq::http::router::{AppState, build_router};
-use tasklerq::llm::Chain;
-use tasklerq::security_audit::Audit;
+use tasklerq::llm::{Chain, LlmHandle, LlmSettings, LlmSnapshot};
+use tasklerq::metrics;
+use tasklerq::security_audit::{Audit, WEBHOOK_FAILURE_THRESHOLD};
+use tasklerq::settings::crypto::SecretCipher;
 use tasklerq::storage::repositories::capture_jobs::{self, NewJob};
 use tasklerq::storage::repositories::members;
 use tasklerq::telegram::bot::{Bot, Outcome};
@@ -37,6 +40,10 @@ use support::telegram::FakeTelegram;
 use support::{TestHousehold, create_household, isolated_db, issue_token, next_telegram_id};
 
 const SECRET: &str = "configured-webhook-SECRET-value";
+
+/// Хеш пароля администратора, посчитанный боевыми параметрами argon2id.
+const ADMIN_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$BwcHBwcHBwcHBwcHBwcHBw$\
+     eZ8SueF3EIJEgtgpg1rLafWpNVv3dMTwc0KCOxG5CSg";
 
 fn peer() -> SocketAddr {
     SocketAddr::from(([172, 18, 0, 1], 4040))
@@ -113,6 +120,15 @@ async fn payloads(pool: &PgPool, event_type: &str) -> Vec<Value> {
     .fetch_all(pool)
     .await
     .expect("audit payloads")
+}
+
+/// Значение глобального счётчика метрик.
+fn counter(text: &str, name: &str) -> u64 {
+    let prefix = format!("{name} ");
+    text.lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -284,7 +300,7 @@ async fn rate_limits_are_audited_for_webhook_and_capture() {
     config.rate_limit_per_min = 1;
     let app = build_router(
         AppState::new(db.pool.clone(), Audit::new(db.pool.clone()))
-            .with_capture(CaptureState::new(config, None, 200)),
+            .with_capture(capture_state(config, None, 200)),
     );
     let body = json!({"text": "Купить лекарство", "source": "api", "mode": "draft"});
     let (first, _) = support::request(
@@ -524,6 +540,13 @@ fn chain(answer: Value) -> Arc<Chain> {
     ))
 }
 
+fn capture_state(config: CaptureConfig, ai: Option<Arc<Chain>>, quota: u32) -> CaptureState {
+    CaptureState::new(
+        config,
+        LlmHandle::new(LlmSnapshot::for_tests_without_settings(ai, quota)),
+    )
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn llm_validation_failures_are_audited_for_api_and_telegram() {
     const LLM_RESPONSE: &str = "LLM-RESPONSE-SECRET-NAME";
@@ -535,10 +558,11 @@ async fn llm_validation_failures_are_audited_for_api_and_telegram() {
     // HTTP API: ответ модели не прошёл разбор схемы.
     let token = issue_token(&db.pool, household.household_id, &["capture:write"]).await;
     let ai = chain(json!({"items": LLM_RESPONSE}));
-    let app = build_router(
-        AppState::new(db.pool.clone(), Audit::new(db.pool.clone()))
-            .with_capture(CaptureState::new(capture_config(), Some(ai), 200)),
-    );
+    let app =
+        build_router(
+            AppState::new(db.pool.clone(), Audit::new(db.pool.clone()))
+                .with_capture(capture_state(capture_config(), Some(ai), 200)),
+        );
     let (status, _) = support::request(
         &app,
         Method::POST,
@@ -579,7 +603,10 @@ async fn llm_validation_failures_are_audited_for_api_and_telegram() {
 
     let worker = CaptureWorker::new(
         db.pool.clone(),
-        chain(json!({"items": LLM_RESPONSE})),
+        LlmHandle::new(LlmSnapshot::for_tests_without_settings(
+            Some(chain(json!({"items": LLM_RESPONSE}))),
+            200,
+        )),
         Bot::new("tasklerqbot"),
         Arc::new(Notify::new()),
         Audit::new(db.pool.clone()),
@@ -709,10 +736,11 @@ async fn no_secret_or_user_content_reaches_audit_payloads() {
 
     // Capture с ответом модели, который не прошёл валидацию.
     let ai = chain(json!({"items": LLM_RESPONSE}));
-    let app = build_router(
-        AppState::new(db.pool.clone(), Audit::new(db.pool.clone()))
-            .with_capture(CaptureState::new(capture_config(), Some(ai), 200)),
-    );
+    let app =
+        build_router(
+            AppState::new(db.pool.clone(), Audit::new(db.pool.clone()))
+                .with_capture(capture_state(capture_config(), Some(ai), 200)),
+        );
     let _ = support::request(
         &app,
         Method::POST,
@@ -854,4 +882,84 @@ async fn a_webhook_without_the_secret_header_is_audited_as_missing_secret() {
         .find(|payload| payload["source"] == "webhook")
         .expect("webhook auth failure event");
     assert_eq!(event["reason"], "missing_secret", "{event}");
+}
+
+/// Неудачный вход в консоль учитывается в общем пороге отказов webhook.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_console_login_failure_shares_the_auth_failure_threshold() {
+    let db = isolated_db().await;
+    sqlx::query(
+        "INSERT INTO admin_accounts (id, username, password_hash)
+         VALUES ($1, $2, $3)",
+    )
+    .bind(Uuid::now_v7())
+    .bind("admin")
+    .bind(ADMIN_PASSWORD_HASH)
+    .execute(&db.pool)
+    .await
+    .expect("administrator account");
+
+    // Порог общий: журнал один на публичный роутер и консоль.
+    let audit = Audit::new(db.pool.clone());
+    let webhook = app_with_webhook(&db.pool, audit.clone(), 10_000);
+    for id in 0..WEBHOOK_FAILURE_THRESHOLD {
+        let update = 1_000 + i64::try_from(id).expect("update id");
+        assert_eq!(
+            post_webhook(&webhook, None, &update_payload(update).await).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert!(
+        payloads(&db.pool, "auth_failure_threshold_exceeded")
+            .await
+            .is_empty(),
+        "50 webhook failures do not exceed the threshold"
+    );
+
+    let before = metrics::render();
+    let console = build_admin_router(AdminState::new(
+        db.pool.clone(),
+        Vec::new(),
+        audit.clone(),
+        LlmSettings::new(
+            db.pool.clone(),
+            LlmConfig::empty(),
+            SecretCipher::new(None, None),
+            LlmHandle::empty(),
+        ),
+    ));
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/admin/login")
+        .header(header::HOST, "nas:18081")
+        .header(header::ORIGIN, "http://nas:18081")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from("username=admin&password=wrong-password-123"))
+        .expect("request");
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(peer()));
+    let status = console
+        .oneshot(request)
+        .await
+        .expect("console response")
+        .status();
+    assert_eq!(status, StatusCode::OK, "a failed login is a form error");
+
+    assert!(
+        !payloads(&db.pool, "admin_login_failed").await.is_empty(),
+        "the console failure is audited"
+    );
+    let threshold = payloads(&db.pool, "auth_failure_threshold_exceeded").await;
+    assert_eq!(threshold.len(), 1, "{threshold:?}");
+    assert_eq!(threshold[0]["threshold"], WEBHOOK_FAILURE_THRESHOLD);
+    assert_eq!(threshold[0]["count"], WEBHOOK_FAILURE_THRESHOLD + 1);
+    assert_eq!(threshold[0]["source"], "admin_console");
+    assert_eq!(
+        counter(
+            &metrics::render(),
+            "webhook_auth_failure_threshold_exceeded_total"
+        ) - counter(&before, "webhook_auth_failure_threshold_exceeded_total"),
+        1
+    );
 }

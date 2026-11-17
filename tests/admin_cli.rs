@@ -8,12 +8,19 @@ mod support;
 use std::process::{Output, Stdio};
 
 use axum::http::{Method, StatusCode};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::Utc;
 use serde_json::Value;
+use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use tasklerq::admin_console::codes::{self, Purpose};
 use tasklerq::auth::tokens::{SCOPES, hash_token};
+use tasklerq::config::{SecretKey, SecretString};
+use tasklerq::settings::crypto::{KeyId, SecretCipher, SecretContext, SecretError, key_id};
 use tasklerq::storage::migrations;
 use tasklerq::storage::repositories::invites;
+use tasklerq::storage::repositories::settings as settings_repository;
 use tokio::process::Command;
 use uuid::Uuid;
 use wiremock::matchers::{method, path};
@@ -1527,4 +1534,720 @@ async fn multi_export_requires_household_even_when_unique() {
     assert_eq!(export["household"]["id"], household_id);
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Ключ шифрования, все 32 байта которого равны `byte`, в base64.
+fn encoded_key(byte: u8) -> String {
+    BASE64.encode([byte; 32])
+}
+
+fn secret_key(byte: u8) -> SecretKey {
+    SecretKey::parse(&encoded_key(byte)).expect("32 bytes are a key")
+}
+
+fn key_cipher(byte: u8) -> SecretCipher {
+    SecretCipher::new(Some(secret_key(byte)), None)
+}
+
+async fn store_secret(
+    pool: &PgPool,
+    household: Option<Uuid>,
+    key: &str,
+    plaintext: &str,
+    cipher: &SecretCipher,
+) {
+    let context = match household {
+        Some(household_id) => SecretContext::household(household_id, key),
+        None => SecretContext::installation(key),
+    };
+    let blob = cipher
+        .encrypt(&context, &SecretString::new(plaintext))
+        .expect("encryption with the test key succeeds");
+    let scope = if household.is_some() {
+        "household"
+    } else {
+        "installation"
+    };
+    let mut conn = pool.acquire().await.expect("connection");
+    settings_repository::set_secret(&mut conn, scope, household, key, &blob)
+        .await
+        .expect("the secret row is written");
+}
+
+async fn stored_row(
+    pool: &PgPool,
+    household: Option<Uuid>,
+    key: &str,
+) -> (Vec<u8>, chrono::DateTime<Utc>) {
+    sqlx::query_as(
+        "SELECT secret, updated_at
+         FROM settings
+         WHERE scope = $1 AND household_id IS NOT DISTINCT FROM $2 AND key = $3",
+    )
+    .bind(if household.is_some() {
+        "household"
+    } else {
+        "installation"
+    })
+    .bind(household)
+    .bind(key)
+    .fetch_one(pool)
+    .await
+    .expect("the secret row exists")
+}
+
+async fn run_rotate(url: &str, current: Option<u8>, old: Option<u8>) -> Output {
+    let mut command = bin();
+    command
+        .env("DATABASE_URL", url)
+        .env("RUST_LOG", "error")
+        .env_remove("TASKLERQ_SECRET_KEY")
+        .env_remove("TASKLERQ_SECRET_KEY_OLD")
+        .args(["admin", "secret-key", "rotate"])
+        .stdin(Stdio::null());
+    if let Some(byte) = current {
+        command.env("TASKLERQ_SECRET_KEY", encoded_key(byte));
+    }
+    if let Some(byte) = old {
+        command.env("TASKLERQ_SECRET_KEY_OLD", encoded_key(byte));
+    }
+    command.output().await.expect("the CLI should run")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secret_key_rotate_reencrypts_secrets_with_the_new_key() {
+    let db = cli_database().await;
+    let household = support::create_household(&db.pool).await;
+    let household_id = household.household_id;
+    store_secret(
+        &db.pool,
+        None,
+        "llm.primary.token",
+        "SECRET-primary-token",
+        &key_cipher(1),
+    )
+    .await;
+    store_secret(
+        &db.pool,
+        None,
+        "llm.fallback.token",
+        "SECRET-fallback-token",
+        &key_cipher(1),
+    )
+    .await;
+    // Строка household и неизвестный этой версии ключ: контекст шифротекста
+    // строится из полей строки, а не из перечня ключей.
+    store_secret(
+        &db.pool,
+        Some(household_id),
+        "llm.primary.token",
+        "SECRET-household-token",
+        &key_cipher(1),
+    )
+    .await;
+    store_secret(
+        &db.pool,
+        None,
+        "llm.zzz.unknown",
+        "SECRET-unknown-token",
+        &key_cipher(1),
+    )
+    .await;
+
+    let output = run_rotate(&db.url, Some(2), Some(1)).await;
+
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("4 перешифровано"), "{text}");
+    assert!(
+        !text.contains("SECRET-"),
+        "values must not be printed:\n{text}"
+    );
+
+    let cases = [
+        (
+            None,
+            "llm.primary.token",
+            SecretContext::installation("llm.primary.token"),
+            "SECRET-primary-token",
+        ),
+        (
+            None,
+            "llm.fallback.token",
+            SecretContext::installation("llm.fallback.token"),
+            "SECRET-fallback-token",
+        ),
+        (
+            Some(household_id),
+            "llm.primary.token",
+            SecretContext::household(household_id, "llm.primary.token"),
+            "SECRET-household-token",
+        ),
+        (
+            None,
+            "llm.zzz.unknown",
+            SecretContext::installation("llm.zzz.unknown"),
+            "SECRET-unknown-token",
+        ),
+    ];
+
+    for (household, key, context, plaintext) in cases {
+        let (blob, _) = stored_row(&db.pool, household, key).await;
+        assert_eq!(
+            key_id(&blob),
+            Some(KeyId::of(&secret_key(2))),
+            "{key} must be under the new key"
+        );
+        assert_eq!(
+            key_cipher(2)
+                .decrypt(&context, &blob)
+                .expect("the new key reads the secret with the row context")
+                .expose(),
+            plaintext
+        );
+        assert_eq!(
+            key_cipher(1).decrypt(&context, &blob),
+            Err(SecretError::Undecryptable),
+            "{key} must not be readable by the old key alone"
+        );
+    }
+
+    let (household_blob, _) = stored_row(&db.pool, Some(household_id), "llm.primary.token").await;
+    assert_eq!(
+        key_cipher(2).decrypt(
+            &SecretContext::installation("llm.primary.token"),
+            &household_blob
+        ),
+        Err(SecretError::Undecryptable),
+        "a household row must not decrypt with the installation context"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secret_key_rotate_rejects_a_tampered_secret_under_the_current_key() {
+    let db = cli_database().await;
+    store_secret(
+        &db.pool,
+        None,
+        "llm.primary.token",
+        "SECRET-primary-token",
+        &key_cipher(2),
+    )
+    .await;
+
+    sqlx::query(
+        "UPDATE settings
+            SET secret = set_byte(secret, octet_length(secret) - 1,
+                                  get_byte(secret, octet_length(secret) - 1) # 1)
+          WHERE scope = 'installation' AND household_id IS NULL
+            AND key = 'llm.primary.token'",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("the secret is tampered with");
+    let before = stored_row(&db.pool, None, "llm.primary.token").await;
+
+    let output = run_rotate(&db.url, Some(2), Some(1)).await;
+
+    assert!(!output.status.success(), "{output:?}");
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        combined.contains("llm.primary.token"),
+        "the CLI must name the setting it cannot decrypt:\n{combined}"
+    );
+    assert!(
+        !combined.contains("SECRET-"),
+        "secret values must not be printed:\n{combined}"
+    );
+
+    let after = stored_row(&db.pool, None, "llm.primary.token").await;
+    assert_eq!(after.0, before.0, "a tampered row must stay unchanged");
+    assert_eq!(
+        after.1, before.1,
+        "a failed rotation must not change updated_at"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secret_key_rotate_does_not_touch_rows_under_the_current_key() {
+    let db = cli_database().await;
+    store_secret(
+        &db.pool,
+        None,
+        "llm.primary.token",
+        "SECRET-primary-token",
+        &key_cipher(1),
+    )
+    .await;
+
+    let first = run_rotate(&db.url, Some(2), Some(1)).await;
+    assert!(first.status.success(), "{first:?}");
+    let before = stored_row(&db.pool, None, "llm.primary.token").await;
+
+    let second = run_rotate(&db.url, Some(2), Some(1)).await;
+
+    assert!(second.status.success(), "{second:?}");
+    let text = stdout(&second);
+    assert!(text.contains("0 перешифровано"), "{text}");
+    assert!(text.contains("1 уже"), "{text}");
+    let after = stored_row(&db.pool, None, "llm.primary.token").await;
+    assert_eq!(after.0, before.0, "the ciphertext must stay unchanged");
+    assert_eq!(after.1, before.1, "a second run must not change updated_at");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secret_key_rotate_rolls_back_and_names_the_setting_it_cannot_decrypt() {
+    let db = cli_database().await;
+    let household = support::create_household(&db.pool).await;
+    let household_id = household.household_id;
+    store_secret(
+        &db.pool,
+        Some(household_id),
+        "llm.primary.token",
+        "SECRET-household-token",
+        &key_cipher(1),
+    )
+    .await;
+    store_secret(
+        &db.pool,
+        Some(household_id),
+        "llm.zzz.broken",
+        "SECRET-broken-token",
+        &key_cipher(3),
+    )
+    .await;
+    store_secret(
+        &db.pool,
+        None,
+        "llm.fallback.token",
+        "SECRET-installation-token",
+        &key_cipher(1),
+    )
+    .await;
+
+    let rows = [
+        (
+            Some(household_id),
+            "llm.primary.token",
+            stored_row(&db.pool, Some(household_id), "llm.primary.token").await,
+        ),
+        (
+            Some(household_id),
+            "llm.zzz.broken",
+            stored_row(&db.pool, Some(household_id), "llm.zzz.broken").await,
+        ),
+        (
+            None,
+            "llm.fallback.token",
+            stored_row(&db.pool, None, "llm.fallback.token").await,
+        ),
+    ];
+
+    let output = run_rotate(&db.url, Some(2), Some(1)).await;
+
+    assert!(!output.status.success(), "{output:?}");
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        combined.contains("llm.zzz.broken"),
+        "the CLI must name the undecryptable setting:\n{combined}"
+    );
+    assert!(
+        combined.contains(&household_id.to_string()),
+        "the CLI must name the household of the setting:\n{combined}"
+    );
+    assert!(
+        !combined.contains("SECRET-"),
+        "secret values must not be printed:\n{combined}"
+    );
+
+    for (household, key, before) in rows {
+        let after = stored_row(&db.pool, household, key).await;
+        assert_eq!(
+            after.0, before.0,
+            "{key} must stay byte-identical after rollback"
+        );
+        assert_eq!(
+            after.1, before.1,
+            "{key} must keep updated_at after rollback"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secret_key_rotate_without_the_current_key_explains_what_to_set() {
+    let db = cli_database().await;
+
+    let output = run_rotate(&db.url, None, Some(1)).await;
+
+    assert!(!output.status.success(), "{output:?}");
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        combined.contains("TASKLERQ_SECRET_KEY"),
+        "the error must name the missing parameter:\n{combined}"
+    );
+    assert!(
+        combined.contains("openssl rand -base64 32"),
+        "the error must hint at the key format:\n{combined}"
+    );
+    assert!(
+        !combined.contains(&encoded_key(1)),
+        "key values must not be printed:\n{combined}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secret_key_rotate_rejects_an_invalid_key_without_printing_it() {
+    let db = cli_database().await;
+    let invalid = "not-base64-SECRET-key";
+
+    let output = bin()
+        .env("DATABASE_URL", &db.url)
+        .env("RUST_LOG", "error")
+        .env("TASKLERQ_SECRET_KEY", invalid)
+        .env_remove("TASKLERQ_SECRET_KEY_OLD")
+        .args(["admin", "secret-key", "rotate"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .expect("the CLI should run");
+
+    assert!(!output.status.success(), "{output:?}");
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        combined.contains("TASKLERQ_SECRET_KEY"),
+        "the error must name the invalid parameter:\n{combined}"
+    );
+    assert!(
+        !combined.contains(invalid),
+        "the invalid key value must not be printed:\n{combined}"
+    );
+}
+
+/// `admin setup-code` печатает код один раз, а новый выпуск гасит прежний.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_code_prints_a_usable_code_and_revokes_the_previous_one() {
+    let db = cli_database().await;
+
+    let first = run(&db.url, &["admin", "setup-code"]).await;
+    assert!(first.status.success(), "{first:?}");
+    let first_text = stdout(&first);
+    let first_code = first_text
+        .lines()
+        .next()
+        .expect("the code line")
+        .trim()
+        .to_owned();
+    assert!(
+        first_code.len() >= 22,
+        "the setup code must carry at least 128 bits: {first_text}"
+    );
+    assert!(
+        stderr(&first).contains("/admin/setup"),
+        "the command must point to the setup page:\n{}",
+        stderr(&first)
+    );
+
+    let second = run(&db.url, &["admin", "setup-code"]).await;
+    assert!(second.status.success(), "{second:?}");
+    let second_text = stdout(&second);
+    let second_code = second_text
+        .lines()
+        .next()
+        .expect("the code line")
+        .trim()
+        .to_owned();
+    assert_ne!(first_code, second_code, "every issue makes a new code");
+
+    let combined = format!("{}{}", stdout(&second), stderr(&second));
+    assert_eq!(
+        combined.matches(&second_code).count(),
+        1,
+        "the code must be printed once and not logged again:\n{combined}"
+    );
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let previous = codes::use_code(&mut conn, Purpose::Setup, &first_code, Utc::now()).await;
+    assert!(
+        previous.is_err(),
+        "the previous setup code must be revoked by the new issue"
+    );
+    codes::use_code(&mut conn, Purpose::Setup, &second_code, Utc::now())
+        .await
+        .expect("the printed code must work as a setup code");
+}
+
+/// `admin setup-code` при существующей учётке завершается ошибкой и новой
+/// строки не создаёт.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_code_with_an_account_suggests_reset_password() {
+    let db = cli_database().await;
+    sqlx::query(
+        "INSERT INTO admin_accounts (id, username, password_hash)
+         VALUES ($1, 'admin', '$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA')",
+    )
+    .bind(Uuid::now_v7())
+    .execute(&db.pool)
+    .await
+    .expect("administrator account");
+
+    let output = run(&db.url, &["admin", "setup-code"]).await;
+    assert!(
+        !output.status.success(),
+        "setup-code must fail when the account exists: {output:?}"
+    );
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        combined.contains("reset-password"),
+        "the error must suggest reset-password:\n{combined}"
+    );
+
+    let codes: i64 = sqlx::query_scalar("SELECT count(*) FROM admin_one_time_codes")
+        .fetch_one(&db.pool)
+        .await
+        .expect("code count");
+    assert_eq!(codes, 0, "no code is issued for an existing account");
+}
+
+/// Запуск CLI с явным `ADMIN_BIND_ADDR`; без значения переменная убрана.
+async fn run_with_admin_addr(url: &str, admin_bind_addr: Option<&str>, args: &[&str]) -> Output {
+    run_with_admin_addr_and_log(url, admin_bind_addr, "error", args).await
+}
+
+/// То же с явным `RUST_LOG`: проверки контракта stdout не должны прятать
+/// предупреждения фильтром `error`.
+async fn run_with_admin_addr_and_log(
+    url: &str,
+    admin_bind_addr: Option<&str>,
+    rust_log: &str,
+    args: &[&str],
+) -> Output {
+    let mut command = bin();
+    command
+        .env("DATABASE_URL", url)
+        .env("RUST_LOG", rust_log)
+        .env_remove("ADMIN_BIND_ADDR")
+        .args(args)
+        .stdin(Stdio::null());
+    if let Some(value) = admin_bind_addr {
+        command.env("ADMIN_BIND_ADDR", value);
+    }
+    command.output().await.expect("the CLI should run")
+}
+
+async fn insert_admin_account(pool: &PgPool) {
+    sqlx::query(
+        "INSERT INTO admin_accounts (id, username, password_hash)
+         VALUES ($1, 'admin', '$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA')",
+    )
+    .bind(Uuid::now_v7())
+    .execute(pool)
+    .await
+    .expect("administrator account");
+}
+
+/// `admin reset-password` печатает путь, срок и порт, пишет аудит без кода и
+/// гасит прежнюю ссылку.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reset_password_prints_a_recovery_path_and_revokes_the_previous_link() {
+    let db = cli_database().await;
+    insert_admin_account(&db.pool).await;
+
+    let first = run_with_admin_addr(
+        &db.url,
+        Some("127.0.0.1:19181"),
+        &["admin", "reset-password"],
+    )
+    .await;
+    assert!(first.status.success(), "{first:?}");
+    let text = stdout(&first);
+    let path = text.lines().next().expect("the link line").trim();
+    let code = path
+        .strip_prefix("/admin/recover/")
+        .unwrap_or_else(|| panic!("the first line must be the recovery path:\n{text}"))
+        .to_owned();
+    assert!(code.len() >= 22, "at least 128 bits: {text}");
+    assert!(
+        text.contains("15"),
+        "the output must name the 15 minute lifetime:\n{text}"
+    );
+    let hint = stderr(&first);
+    assert!(
+        hint.contains(":19181"),
+        "the hint must use the port from ADMIN_BIND_ADDR:\n{hint}"
+    );
+    assert!(
+        hint.contains("/admin/recover/"),
+        "the hint must point to the recovery page:\n{hint}"
+    );
+    assert!(
+        !hint.contains("<порт>"),
+        "the literal placeholder must be replaced:\n{hint}"
+    );
+
+    let payloads: Vec<(String, Option<Uuid>, Value)> = sqlx::query_as(
+        "SELECT actor_type::text, household_id, payload FROM audit_events
+         WHERE event_type::text = 'admin_recovery_issued'
+         ORDER BY created_at, id",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("admin_recovery_issued events");
+    assert_eq!(payloads.len(), 1, "one issued link leaves one event");
+    assert_eq!(payloads[0].0, "system");
+    assert_eq!(payloads[0].1, None);
+    assert!(
+        !payloads[0].2.to_string().contains(&code),
+        "the code must not be written to the audit: {:?}",
+        payloads[0].2
+    );
+
+    let second = run_with_admin_addr(
+        &db.url,
+        Some("127.0.0.1:19181"),
+        &["admin", "reset-password"],
+    )
+    .await;
+    assert!(second.status.success(), "{second:?}");
+    let second_text = stdout(&second);
+    let second_path = second_text.lines().next().expect("the link line").trim();
+    let second_code = second_path
+        .strip_prefix("/admin/recover/")
+        .expect("the recovery path")
+        .to_owned();
+    assert_ne!(code, second_code, "every issue makes a new link");
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let previous = codes::use_code(&mut conn, Purpose::Recovery, &code, Utc::now()).await;
+    assert!(
+        previous.is_err(),
+        "the previous recovery link must be revoked by the new issue"
+    );
+    codes::use_code(&mut conn, Purpose::Recovery, &second_code, Utc::now())
+        .await
+        .expect("the printed link must work as a recovery code");
+}
+
+/// Без учётной записи ссылку выпускать некуда: подсказка ведёт к setup-коду.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reset_password_without_an_account_suggests_setup_code() {
+    let db = cli_database().await;
+
+    let output = run(&db.url, &["admin", "reset-password"]).await;
+    assert!(!output.status.success(), "{output:?}");
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        combined.contains("setup-code"),
+        "the error must suggest the setup command:\n{combined}"
+    );
+
+    let codes: i64 = sqlx::query_scalar("SELECT count(*) FROM admin_one_time_codes")
+        .fetch_one(&db.pool)
+        .await
+        .expect("code count");
+    assert_eq!(codes, 0, "no code is issued without an account");
+}
+
+/// `setup-code` называет порт из `ADMIN_BIND_ADDR` вместо заглушки.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_code_prints_the_admin_port_from_the_environment() {
+    let db = cli_database().await;
+
+    let output =
+        run_with_admin_addr(&db.url, Some("127.0.0.1:19182"), &["admin", "setup-code"]).await;
+    assert!(output.status.success(), "{output:?}");
+    let hint = stderr(&output);
+    assert!(
+        hint.contains(":19182"),
+        "the hint must name the console port:\n{hint}"
+    );
+    assert!(
+        !hint.contains("<порт>"),
+        "the literal placeholder must be replaced:\n{hint}"
+    );
+}
+
+/// `ADMIN_BIND_ADDR=disabled` — код выпускается, но CLI предупреждает, что
+/// консоль выключена.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_code_warns_when_the_console_is_disabled() {
+    let db = cli_database().await;
+
+    let output = run_with_admin_addr(&db.url, Some("disabled"), &["admin", "setup-code"]).await;
+    assert!(output.status.success(), "{output:?}");
+    let hint = stderr(&output);
+    assert!(
+        hint.contains("disabled") && hint.contains("выключена"),
+        "the CLI must warn that the console is disabled:\n{hint}"
+    );
+}
+
+/// Невалидный `ADMIN_BIND_ADDR` не роняет выпуск кода и ссылки: подсказка
+/// остаётся без порта и не выдаёт себя за `disabled`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invalid_admin_bind_addr_does_not_fail_the_cli() {
+    let db = cli_database().await;
+
+    // `info`, а не `error`: предупреждение журнала не должно прятаться за
+    // фильтром и обязано не попадать в stdout перед кодом.
+    let setup = run_with_admin_addr_and_log(
+        &db.url,
+        Some("localhost:abc"),
+        "info",
+        &["admin", "setup-code"],
+    )
+    .await;
+    assert!(setup.status.success(), "{setup:?}");
+    let code_text = stdout(&setup);
+    let mut code_lines = code_text.lines();
+    let code = code_lines.next().expect("the setup code line");
+    assert!(code.len() >= 22, "the setup code is printed:\n{code_text}");
+    assert!(
+        code_lines.next().is_none(),
+        "stdout must contain only the setup code:\n{code_text}"
+    );
+    let hint = stderr(&setup);
+    assert!(
+        hint.contains("ADMIN_BIND_ADDR не разобран"),
+        "the hint must name the invalid parameter:\n{hint}"
+    );
+    assert!(
+        hint.contains("/admin/setup"),
+        "the hint must still point to the setup page:\n{hint}"
+    );
+    assert!(
+        !hint.contains("выключена"),
+        "an invalid value must not look like `disabled`:\n{hint}"
+    );
+
+    insert_admin_account(&db.pool).await;
+    let reset = run_with_admin_addr_and_log(
+        &db.url,
+        Some("not-an-address"),
+        "info",
+        &["admin", "reset-password"],
+    )
+    .await;
+    assert!(reset.status.success(), "{reset:?}");
+    let reset_text = stdout(&reset);
+    let mut reset_lines = reset_text.lines();
+    let path = reset_lines.next().expect("the recovery path line");
+    assert!(
+        path.starts_with("/admin/recover/"),
+        "the recovery path is printed:\n{reset_text}"
+    );
+    assert!(
+        reset_lines
+            .next()
+            .is_some_and(|line| line.starts_with("Срок действия: ")),
+        "the lifetime follows the path:\n{reset_text}"
+    );
+    assert!(
+        reset_lines.next().is_none(),
+        "stdout must contain only the path and lifetime:\n{reset_text}"
+    );
+    let hint = stderr(&reset);
+    assert!(
+        hint.contains("ADMIN_BIND_ADDR не разобран") && hint.contains("/admin/recover/"),
+        "the hint must point to the recovery page without a port:\n{hint}"
+    );
 }

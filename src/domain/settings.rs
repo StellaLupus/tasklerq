@@ -17,6 +17,10 @@ pub const MAX_LEAD_MINUTES: u16 = 1440;
 /// Ключ настроек уведомлений в `users.settings`.
 pub const NOTIFICATIONS_KEY: &str = "notifications";
 
+/// Часовой пояс по умолчанию: умолчание `admin household create` и формы
+/// мастера в консоли.
+pub const DEFAULT_TIMEZONE: &str = "Europe/Moscow";
+
 /// Часовые пояса, которые бот предлагает при ошибке ввода.
 pub const SUGGESTED_TIMEZONES: &[&str] = &[
     "Europe/Kaliningrad",

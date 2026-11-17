@@ -7,21 +7,20 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use sqlx::Connection;
 use tasklerq::admin;
+use tasklerq::admin_console;
 use tasklerq::app::build_application;
-use tasklerq::capture::eval::{SmokeSet, TitleMatch, evaluate_with};
+use tasklerq::capture::eval::TitleMatch;
 use tasklerq::capture::slot_check;
-use tasklerq::config::{self, Config, DatabaseConfig, LlmConfig, SlotConfig, TenancyConfig};
+use tasklerq::config::{self, Config, DatabaseConfig, LlmConfig, SecretKeyConfig, TenancyConfig};
 use tasklerq::domain::error::DomainError;
 use tasklerq::domain::models::UserRole;
+use tasklerq::domain::settings::DEFAULT_TIMEZONE;
 use tasklerq::http::server;
 use tasklerq::llm::OpenAiBackend;
 use tasklerq::redaction;
+use tasklerq::settings::{self, crypto::SecretCipher};
 use tasklerq::storage;
-use tasklerq::storage::repositories::llm_slot_checks::{self, NewCheck};
-use tasklerq::storage::repositories::llm_slot_settings;
-use tokio::net::TcpListener;
 use tokio::signal;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -62,11 +61,12 @@ enum Command {
     },
     /// Прогнать smoke-набор `capture-v4` через один слот.
     ///
-    /// Читает конфигурацию слотов из окружения `LLM_*` и `DATABASE_URL`.
-    /// Набор по умолчанию (`src/capture/prompts/smoke-v4.json`) встроен в
-    /// бинарник: в образе Docker нет исходников `tests/`, а проверка идёт в
-    /// контейнере. `--set PATH` — другой набор для разработки; набор с версией
-    /// контракта, отличной от действующей, — ошибка до вызовов LLM.
+    /// Конфигурация слотов берётся из `settings` (консоль администратора),
+    /// окружения `LLM_*` и умолчаний; база — из `DATABASE_URL`. Набор по
+    /// умолчанию (`src/capture/prompts/smoke-v4.json`) встроен в бинарник: в
+    /// образе Docker нет исходников `tests/`, а проверка идёт в контейнере.
+    /// `--set PATH` — другой набор для разработки; набор с версией контракта,
+    /// отличной от действующей, — ошибка до вызовов LLM.
     ///
     /// Каждая фраза уходит в бэкенд выбранного слота напрямую: без цепочки,
     /// перехода на резервный слот и предохранителя. Ожидание — до 20 секунд,
@@ -74,7 +74,9 @@ enum Command {
     /// попадает в отчёт с фактическим временем. Фразы идут по очереди.
     ///
     /// Проверка доступна и при `LLM_CAPTURE_ENABLED=false`, если запрошенный
-    /// слот задан: так слот проверяют до включения разбора.
+    /// слот задан: так слот проверяют до включения разбора. Одновременно
+    /// выполняется не более одной проверки на инсталляцию: второй запуск
+    /// завершается ошибкой «проверка уже идёт» без обращения к LLM.
     ///
     /// `--titles strict|normalized` задаёт и сохраняет стандарт слота: строгий
     /// (форма — часть контракта) или с видом глагола и синонимами. Без флага
@@ -83,8 +85,8 @@ enum Command {
     ///
     /// Коды возврата: 0 — все фразы пройдены; 1 — слот не прошёл проверку;
     /// 2 — ошибка конфигурации, слота или набора (версия контракта проверяется
-    /// до вызовов LLM), а также недоступная база; результат в `llm_slot_checks`
-    /// не записан.
+    /// до вызовов LLM), недоступная база или идущая проверка; результат в
+    /// `llm_slot_checks` не записан.
     CaptureEval(CaptureEvalArgs),
     /// Отрисовать запросы разбора `capture-v4` из JSONL в JSONL.
     ///
@@ -169,14 +171,6 @@ impl SlotArg {
             Self::Fallback => tasklerq::llm::FALLBACK_SLOT,
         }
     }
-
-    /// Конфигурация слота; `None`, если слот не настроен.
-    fn pick(self, llm: &LlmConfig) -> Option<&SlotConfig> {
-        match self {
-            Self::Primary => llm.primary.as_ref(),
-            Self::Fallback => llm.fallback.as_ref(),
-        }
-    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -206,6 +200,15 @@ enum AdminCommand {
         #[command(subcommand)]
         command: UserCommand,
     },
+    /// Ключ шифрования секретных настроек.
+    SecretKey {
+        #[command(subcommand)]
+        command: SecretKeyCommand,
+    },
+    /// Выпустить setup-код первого входа в веб-консоль.
+    SetupCode,
+    /// Выпустить ссылку восстановления пароля администратора.
+    ResetPassword,
     /// Выгрузить данные household в JSON.
     Export(ExportArgs),
 }
@@ -220,6 +223,7 @@ enum DatabaseCommand {
     Queue(QueueCommand),
     Household(HouseholdCommand),
     User(UserCommand),
+    SecretKey(SecretKeyCommand),
     Export(ExportArgs),
 }
 
@@ -302,7 +306,7 @@ enum HouseholdCommand {
         #[arg(long)]
         name: String,
         /// Часовой пояс IANA.
-        #[arg(long, default_value = "Europe/Moscow")]
+        #[arg(long, default_value = DEFAULT_TIMEZONE)]
         timezone: String,
         /// Telegram ID владельца (положительное целое).
         #[arg(long, value_name = "ID", value_parser = clap::value_parser!(i64).range(1..))]
@@ -354,6 +358,16 @@ enum UserCommand {
 enum RoleArg {
     Owner,
     Member,
+}
+
+#[derive(Debug, Subcommand)]
+enum SecretKeyCommand {
+    /// Перешифровать секреты прежним ключом на текущий в одной транзакции.
+    ///
+    /// Текущий ключ — `TASKLERQ_SECRET_KEY`, прежний — `TASKLERQ_SECRET_KEY_OLD`.
+    /// Строки, уже зашифрованные текущим ключом, не меняются. Если хоть одна
+    /// строка не расшифровывается ни одним ключом, ничего не меняется.
+    Rotate,
 }
 
 impl From<RoleArg> for UserRole {
@@ -440,19 +454,30 @@ async fn serve() -> Result<()> {
         .await
         .context("database migration failed")?;
 
-    let listener = TcpListener::bind(config.bind_addr)
+    let listeners = server::bind_listeners(&config)
         .await
-        .with_context(|| format!("failed to bind {}", config.bind_addr))?;
-    let address = listener
+        .context("failed to bind http listeners")?;
+    let address = listeners
+        .public
         .local_addr()
         .context("failed to read the bound address")?;
+    let admin_address = match listeners.admin.as_ref() {
+        Some(listener) => Some(
+            listener
+                .local_addr()
+                .context("failed to read the bound admin console address")?,
+        ),
+        None => None,
+    };
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let setup_pool = pool.clone();
     let application = build_application(&config, pool, shutdown_rx)
         .await
         .context("telegram startup failed")?;
     let workers = application.workers;
     let app = application.router;
+    let admin = listeners.admin.zip(application.admin_router);
     tracing::info!(
         mode = config.telegram.mode.as_str(),
         workers = workers.len(),
@@ -460,8 +485,21 @@ async fn serve() -> Result<()> {
     );
 
     tracing::info!(%address, "http server listening");
+    match admin_address {
+        Some(address) => {
+            tracing::info!(%address, "admin console listening");
+            admin_console::codes::announce_setup_code(
+                &setup_pool,
+                &config,
+                Some(address.port()),
+                Utc::now(),
+            )
+            .await;
+        }
+        None => tracing::info!("admin console is disabled"),
+    }
 
-    server::serve(listener, app, async move {
+    server::serve_listeners(listeners.public, app, admin, async move {
         shutdown_signal().await;
         let _ = shutdown_tx.send(true);
     })
@@ -479,6 +517,128 @@ async fn serve() -> Result<()> {
 
     tracing::info!("stopped");
     Ok(())
+}
+
+async fn setup_code() -> Result<()> {
+    init_cli_tracing();
+
+    let address = admin_console_address();
+    let database = DatabaseConfig::from_env().context("invalid database configuration")?;
+    let pool = storage::db::connect(&database)
+        .await
+        .context("database connection failed")?;
+
+    match admin_console::codes::issue_setup_code(&pool, Utc::now())
+        .await
+        .map_err(explain)?
+    {
+        Some(issued) => {
+            println!("{}", issued.code);
+            match address {
+                ConsoleAddress::Port(port) => eprintln!(
+                    "Откройте http://<адрес хоста>:{port}/admin/setup и введите код. \
+                     Повторно код не показывается."
+                ),
+                ConsoleAddress::Disabled => eprintln!(
+                    "Консоль выключена (ADMIN_BIND_ADDR=disabled): включите её и выпустите \
+                     код заново. Повторно код не показывается."
+                ),
+                ConsoleAddress::Invalid => eprintln!(
+                    "ADMIN_BIND_ADDR не разобран: откройте /admin/setup на хосте, где слушает \
+                     консоль. Повторно код не показывается."
+                ),
+            }
+            Ok(())
+        }
+        None => bail!(
+            "учётная запись администратора уже существует; \
+             сменить пароль: tasklerq admin reset-password"
+        ),
+    }
+}
+
+/// Выпустить ссылку восстановления и напечатать её путь.
+///
+/// В базе остаётся только хеш кода; открытое значение печатается один раз.
+/// Полный адрес сервер не знает, поэтому путь выводится отдельно, а порт
+/// консоли подсказывается из `ADMIN_BIND_ADDR`.
+async fn reset_password() -> Result<()> {
+    init_cli_tracing();
+
+    let address = admin_console_address();
+    let database = DatabaseConfig::from_env().context("invalid database configuration")?;
+    let pool = storage::db::connect(&database)
+        .await
+        .context("database connection failed")?;
+
+    let now = Utc::now();
+    let Some(issued) = admin_console::codes::issue_recovery_code(&pool, now)
+        .await
+        .map_err(explain)?
+    else {
+        bail!(
+            "учётная запись администратора не создана; \
+             выпустите setup-код: tasklerq admin setup-code"
+        );
+    };
+
+    // Код в журнал и аудит не попадает: событие фиксирует только выпуск.
+    tasklerq::security_audit::Audit::new(pool.clone())
+        .admin_recovery_issued(now)
+        .await;
+
+    println!("/admin/recover/{}", issued.code);
+    println!(
+        "Срок действия: {} минут.",
+        admin_console::codes::RECOVERY_TTL_MINUTES
+    );
+    match address {
+        ConsoleAddress::Port(port) => eprintln!(
+            "Откройте http://<адрес хоста>:{port}/admin/recover/{} в течение {} минут. \
+             Повторно ссылка не показывается.",
+            issued.code,
+            admin_console::codes::RECOVERY_TTL_MINUTES
+        ),
+        ConsoleAddress::Disabled => eprintln!(
+            "Консоль выключена (ADMIN_BIND_ADDR=disabled): ссылка не откроется, пока \
+             консоль не включена. Повторно ссылка не показывается."
+        ),
+        ConsoleAddress::Invalid => eprintln!(
+            "ADMIN_BIND_ADDR не разобран: откройте /admin/recover/{} на хосте, где слушает \
+             консоль, в течение {} минут. Повторно ссылка не показывается.",
+            issued.code,
+            admin_console::codes::RECOVERY_TTL_MINUTES
+        ),
+    }
+
+    Ok(())
+}
+
+/// Куда CLI подсказывает открыть страницу консоли.
+enum ConsoleAddress {
+    /// Консоль слушает этот порт.
+    Port(u16),
+    /// `ADMIN_BIND_ADDR=disabled`.
+    Disabled,
+    /// Значение не разобралось: `serve` с ним не запустится, но команда
+    /// выпуска кода работает.
+    Invalid,
+}
+
+/// Адрес консоли из `ADMIN_BIND_ADDR` для подсказки в CLI.
+///
+/// Разбор общий с [`Config`]: невалидное значение не роняет команду, потому
+/// что код или ссылка нужны и без работающего listener'а.
+fn admin_console_address() -> ConsoleAddress {
+    let raw = std::env::var("ADMIN_BIND_ADDR").ok();
+    match config::parse_admin_bind_addr(raw.as_deref()) {
+        Ok(Some(address)) => ConsoleAddress::Port(address.port()),
+        Ok(None) => ConsoleAddress::Disabled,
+        // В журнал не пишем: JSON-подписчик выводит в stdout, а команда печатает
+        // код или ссылку первой строкой. Подсказка ниже и так сообщает о
+        // невалидном значении.
+        Err(_) => ConsoleAddress::Invalid,
+    }
 }
 
 async fn migrate() -> Result<()> {
@@ -529,6 +689,11 @@ async fn run_admin(command: AdminCommand) -> Result<()> {
             run_admin_database(DatabaseCommand::Household(command)).await
         }
         AdminCommand::User { command } => run_admin_database(DatabaseCommand::User(command)).await,
+        AdminCommand::SecretKey { command } => {
+            run_admin_database(DatabaseCommand::SecretKey(command)).await
+        }
+        AdminCommand::SetupCode => setup_code().await,
+        AdminCommand::ResetPassword => reset_password().await,
         AdminCommand::Export(args) => run_admin_database(DatabaseCommand::Export(args)).await,
     }
 }
@@ -725,6 +890,19 @@ async fn run_admin_database(command: DatabaseCommand) -> Result<()> {
                 println!("telegram_id: {}", user.telegram_user_id);
             }
         },
+        DatabaseCommand::SecretKey(command) => match command {
+            SecretKeyCommand::Rotate => {
+                let keys =
+                    SecretKeyConfig::from_env().context("invalid secret key configuration")?;
+                let cipher = SecretCipher::new(keys.current, keys.old);
+                let report = settings::rotate_secret_key(&pool, &cipher).await?;
+                println!(
+                    "{} перешифровано, {} уже под текущим ключом",
+                    report.rotated(),
+                    report.already_current()
+                );
+            }
+        },
         DatabaseCommand::Export(args) => {
             let export = admin::export(&pool, tenancy.mode, args.household, now)
                 .await
@@ -916,25 +1094,11 @@ fn explain(error: DomainError) -> anyhow::Error {
 /// слот, набор или запись результата.
 const CAPTURE_EVAL_ERROR_EXIT: u8 = 2;
 
-/// Всё, что нужно проверке слота, собранное до первого запроса к LLM.
-struct PreparedCheck {
-    /// Имя слота.
-    slot_name: &'static str,
-    /// Конфигурация слота.
-    slot: SlotConfig,
-    /// Клиент выбранного слота.
-    backend: OpenAiBackend,
-    /// Разобранный набор.
-    set: SmokeSet,
-    /// Исходный текст набора: из него считается хеш.
-    set_text: String,
-}
-
 /// Прогнать smoke-набор через слот.
 ///
 /// Коды возврата: 0 — пройдены все фразы, 1 — слот не прошёл проверку,
-/// 2 — проверка не выполнена (конфигурация, слот, набор, база). Ошибка
-/// конфигурации печатается здесь же, чтобы отличить её от провала слота.
+/// 2 — проверка не выполнена (конфигурация, слот, набор, база) или уже идёт.
+/// Ошибка конфигурации печатается здесь же, чтобы отличить её от провала слота.
 async fn capture_eval(args: CaptureEvalArgs) -> Result<ExitCode> {
     init_cli_tracing();
 
@@ -952,127 +1116,95 @@ async fn capture_eval(args: CaptureEvalArgs) -> Result<ExitCode> {
     }
 }
 
-/// Собрать проверку, прогнать набор и записать результат в `llm_slot_checks`.
+/// Подготовить слот, прогнать набор, напечатать отчёт и вернуть результат.
+///
+/// Отчёт печатается до проверки записи: если база откажет, результат проверки
+/// всё равно виден, а код возврата останется «проверка не выполнена».
 async fn run_capture_eval(args: CaptureEvalArgs) -> Result<tasklerq::capture::eval::Report> {
-    let prepared = prepare_check(&args)?;
+    let (pool, prepared) = prepare_check(&args).await?;
+    let result = slot_check::run_check(&pool, prepared, args.titles.map(TitleArg::mode)).await?;
+    print_check(&result);
+    result.saved?;
+    Ok(result.report)
+}
 
-    // База проверяется до вызовов LLM: недоступная база не должна стоить
-    // платных запросов. Здесь же читается действующий стандарт слота. Соединение
-    // сразу отпускается: прогон длится до нескольких минут, и серверный idle
-    // timeout мог бы оборвать его к моменту записи. Для записи результата берём
-    // соединение заново.
-    let database = DatabaseConfig::from_env().context("invalid database configuration")?;
-    let pool = storage::db::connect(&database)
-        .await
-        .context("database connection failed")?;
-    let mode = {
-        let mut conn = pool.acquire().await.context("database connection failed")?;
-        match args.titles {
-            Some(titles) => titles.mode(),
-            None => {
-                let stored = llm_slot_settings::titles(&mut conn, prepared.slot_name)
-                    .await
-                    .context("failed to read the slot standard")?;
-                match TitleMatch::from_code(&stored) {
-                    Some(titles) => titles,
-                    None => {
-                        tracing::warn!(
-                            slot = prepared.slot_name,
-                            titles = %stored,
-                            "unknown llm slot title standard; treating it as strict"
-                        );
-                        TitleMatch::Strict
-                    }
-                }
-            }
-        }
-    };
-
-    // Прогон один: вызовы слота платные и недетерминированные, поэтому оба
-    // режима судят одни и те же исходы.
-    let runs = slot_check::collect_runs(&prepared.backend, &prepared.set)
-        .await
-        .map_err(anyhow::Error::msg)
-        .context("invalid smoke set")?;
-    let report = evaluate_with(&prepared.set, &runs, prepared.slot.timeout, mode)
-        .map_err(anyhow::Error::msg)
-        .context("invalid smoke set")?;
-    let other_mode = match mode {
-        TitleMatch::Strict => TitleMatch::Normalized,
-        TitleMatch::Normalized => TitleMatch::Strict,
-    };
-    let other = evaluate_with(&prepared.set, &runs, prepared.slot.timeout, other_mode).ok();
-
-    let set_hash = slot_check::set_hash(&prepared.set_text);
-    let contract_hash = tasklerq::capture::prompt::contract_hash();
-    let fingerprint = slot_check::fingerprint(&prepared.slot, &contract_hash, &set_hash, mode);
-
-    // Отчёт печатается до записи: если база откажет, результат проверки всё
-    // равно виден, а код возврата останется «проверка не выполнена». Число по
-    // стандарту печатается всегда: без него отчёт не отвечает на главный вопрос.
-    println!("Слот: {} ({})", prepared.slot_name, prepared.slot.model);
-    println!("Отпечаток: {}", fingerprint.value);
-    match &other {
+/// Напечатать отчёт проверки до записи результата.
+fn print_check(check: &slot_check::CheckResult) {
+    println!("Слот: {} ({})", check.slot_name, check.model);
+    println!("Отпечаток: {}", check.fingerprint.value);
+    match &check.other {
         Some(other) => println!(
             "Названия: {} — {} из {} (стандарт), {} — {} из {} (справочно)",
-            mode.as_str(),
-            report.passed_count(),
-            report.total(),
-            other_mode.as_str(),
+            check.report.titles.as_str(),
+            check.report.passed_count(),
+            check.report.total(),
+            check.other_titles.as_str(),
             other.passed_count(),
             other.total(),
         ),
         None => println!(
             "Названия: {} — {} из {} (стандарт)",
-            mode.as_str(),
-            report.passed_count(),
-            report.total(),
+            check.report.titles.as_str(),
+            check.report.passed_count(),
+            check.report.total(),
         ),
     }
-    print!("{}", report.to_text());
-
-    // Стандарт и проверка записываются одной транзакцией: иначе смена стандарта
-    // без новой проверки оставила бы слот «устарел» без объяснения.
-    let report_json = report.to_json();
-    let parts_json = fingerprint.parts.to_json();
-    let mut conn = pool.acquire().await.context("database connection failed")?;
-    let mut tx = conn
-        .begin()
-        .await
-        .context("failed to save the slot check")?;
-    llm_slot_checks::upsert(
-        &mut tx,
-        NewCheck {
-            slot: prepared.slot_name,
-            fingerprint: &fingerprint.value,
-            fingerprint_parts: &parts_json,
-            passed: report.passed_count(),
-            total: report.total(),
-            p95_ms: u64::try_from(report.p95().as_millis()).unwrap_or(u64::MAX),
-            report: &report_json,
-        },
-        Utc::now(),
-    )
-    .await
-    .context("failed to save the slot check")?;
-    if args.titles.is_some() {
-        llm_slot_settings::set_titles(&mut tx, prepared.slot_name, mode.as_str())
-            .await
-            .context("failed to save the slot standard")?;
-    }
-    tx.commit().await.context("failed to save the slot check")?;
-    drop(conn);
-
-    Ok(report)
+    print!("{}", check.report.to_text());
 }
 
 /// Проверить конфигурацию и прочитать набор до любых обращений к LLM.
-fn prepare_check(args: &CaptureEvalArgs) -> Result<PreparedCheck> {
+///
+/// Слот собирается через [`settings::read_effective_llm`] (база, окружение и
+/// умолчания): иначе слот, заданный только в консоли, был бы для команды «не
+/// настроен». Если настройки или база недоступны, действует слот из окружения и
+/// умолчаний: проверка слота из `.env` работает и без базы, а настроенный слот
+/// упрётся в недоступную базу до вызовов LLM.
+async fn prepare_check(
+    args: &CaptureEvalArgs,
+) -> Result<(sqlx::PgPool, slot_check::PreparedCheck)> {
     let llm = LlmConfig::from_env().context("invalid llm configuration")?;
+    let keys = SecretKeyConfig::from_env().context("invalid secret key configuration")?;
+    let cipher = SecretCipher::new(keys.current, keys.old);
     let slot_name = args.slot.name();
-    let slot = args.slot.pick(&llm).cloned().ok_or_else(|| {
+
+    let database = DatabaseConfig::from_env().context("invalid database configuration")?;
+    let (pool, connection_error) = match storage::db::connect(&database).await {
+        Ok(pool) => (Some(pool), None),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "database connection failed; checking the slot from the environment"
+            );
+            (None, Some(error))
+        }
+    };
+    let effective = match &pool {
+        Some(pool) => match settings::read_effective_llm(pool, &llm, &cipher).await {
+            Ok(effective) => effective,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "could not read llm settings; checking the slot from the environment"
+                );
+                settings::effective_llm(&llm, &[], &cipher)
+            }
+        },
+        None => settings::effective_llm(&llm, &[], &cipher),
+    };
+
+    let effective_slot = match args.slot {
+        SlotArg::Primary => effective.primary(),
+        SlotArg::Fallback => effective.fallback(),
+    };
+    let slot = effective_slot.config().cloned().ok_or_else(|| {
         let prefix = slot_name.to_ascii_uppercase();
-        anyhow!("слот {slot_name} не настроен: задайте LLM_{prefix}_URL и LLM_{prefix}_MODEL")
+        let reason = effective_slot
+            .problem()
+            .map_or("not_set", |problem| problem.code());
+        anyhow!(
+            "слот {slot_name} не настроен ({reason}): задайте слот в консоли \
+             администратора или LLM_{prefix}_URL и LLM_{prefix}_MODEL"
+        )
     })?;
 
     let set_text = match &args.set {
@@ -1084,16 +1216,28 @@ fn prepare_check(args: &CaptureEvalArgs) -> Result<PreparedCheck> {
         .map_err(anyhow::Error::msg)
         .context("invalid smoke set")?;
 
-    let backend = OpenAiBackend::from_slot(&slot, llm.connect_timeout)
+    let backend = OpenAiBackend::from_slot(&slot, effective.connect_timeout())
         .map_err(|error| anyhow!("invalid slot configuration: {error}"))?;
 
-    Ok(PreparedCheck {
-        slot_name,
-        slot,
-        backend,
-        set,
-        set_text,
-    })
+    // Слот, набор и бэкенд проверены; только теперь недоступная база делает
+    // команду невозможной — до первого вызова LLM.
+    let Some(pool) = pool else {
+        return Err(anyhow::Error::new(
+            connection_error.expect("a missing pool carries its connection error"),
+        )
+        .context("database connection failed"));
+    };
+
+    Ok((
+        pool,
+        slot_check::PreparedCheck {
+            slot_name,
+            slot,
+            backend: Box::new(backend),
+            set,
+            set_text,
+        },
+    ))
 }
 
 /// Отрисовать запросы `capture-v4` для проекта дообучения.

@@ -157,6 +157,28 @@ pub async fn list_active(
     Ok(tokens)
 }
 
+/// Есть ли действующий токен хотя бы у одного активного household.
+///
+/// Правило активности то же, что у [`list_active`]. Нужно мастеру первого
+/// запуска: шаг токена пройден, если токен уже выпущен.
+pub async fn any_active(conn: &mut PgConnection, now: DateTime<Utc>) -> Result<bool, DomainError> {
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM api_tokens t
+             JOIN households h ON h.id = t.household_id
+             WHERE h.deleted_at IS NULL
+               AND t.revoked_at IS NULL
+               AND (t.expires_at IS NULL OR t.expires_at > $1)
+         )",
+    )
+    .bind(now)
+    .fetch_one(conn)
+    .await?;
+
+    Ok(exists)
+}
+
 /// Отозвать токен. Возвращает запись, если токен был отозван сейчас, и `None`,
 /// если он уже отозван или не существует.
 pub async fn revoke(

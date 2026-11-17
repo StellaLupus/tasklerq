@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tasklerq::llm::{
     Chain, ChatBackend, ChatCompletion, ChatMessage, ChatRequest, FALLBACK_SLOT, LlmError,
-    PRIMARY_SLOT, Slot,
+    LlmHandle, LlmSnapshot, PRIMARY_SLOT, Slot,
 };
 
 /// Один перехваченный запрос слота.
@@ -166,6 +166,25 @@ pub fn chain_from(
         Slot::new(FALLBACK_SLOT, backend, timeout)
     });
     Chain::new(Slot::new(PRIMARY_SLOT, primary, primary_timeout), fallback)
+}
+
+/// Снимок LLM с готовой цепочкой: бот и воркер видят разбор включённым.
+pub fn handle(chain: Arc<Chain>, quota: u32) -> LlmHandle {
+    LlmHandle::new(LlmSnapshot::for_tests_without_settings(Some(chain), quota))
+}
+
+/// Снимок «разбор включён» с безразличным двойником.
+///
+/// Нужен веткам бота, которые проверяют подсказки и постановку задания, а не
+/// сам вызов модели.
+pub fn capture_handle() -> LlmHandle {
+    handle(
+        Arc::new(chain(
+            BackendDouble::always(Ok(v4::response(Vec::new()))),
+            None,
+        )),
+        200,
+    )
 }
 
 /// Разомкнуть предохранитель основного слота.

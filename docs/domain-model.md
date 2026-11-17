@@ -39,6 +39,14 @@ erDiagram
     USERS ||--o{ NOTIFICATION_DELIVERIES : receives
     NOTIFICATION_BATCHES ||--o{ NOTIFICATION_DELIVERIES : contains
     HOUSEHOLDS ||--o{ AUDIT_EVENTS : records
+    HOUSEHOLDS ||--o{ SETTINGS : configures
+    SETTINGS {
+        text scope
+        uuid household_id
+        text key
+        jsonb value
+        bytea secret
+    }
     LLM_SLOT_CHECKS {
         text slot PK
         text fingerprint
@@ -425,7 +433,9 @@ jsonb`, `created_at`. Типы: `household_created`, `member_joined`,
 `member_left`, `member_removed`, `role_changed`, `invite_created`,
 `invite_used`, `invite_revoked`, `token_created`, `token_revoked`,
 `auth_failed`, `rate_limited`, `llm_validation_failed`,
-`auth_failure_threshold_exceeded`, `household_deleted`.
+`auth_failure_threshold_exceeded`, `household_deleted`, `admin_login`,
+`admin_login_failed`, `admin_setup_code_failed`, `admin_account_created`,
+`admin_password_changed`, `admin_recovery_issued`, `admin_setting_changed`.
 
 Раздел «Журнал» владельца показывает события членства
 (`household_created`, `member_*`, `role_changed`, `invite_*`,
@@ -434,6 +444,131 @@ jsonb`, `created_at`. Типы: `household_created`, `member_joined`,
 токенов и хешей; имена хранятся снимком на момент события. Участники и
 household, созданные через `tasklerq admin`, попадают в журнал от имени
 системного актора (`actor_type = system`).
+
+### 3.14 `settings`
+
+| Поле | Тип | Ограничения |
+| --- | --- | --- |
+| `scope` | `text` | `installation` или `household`. |
+| `household_id` | `uuid` | FK → households, ON DELETE CASCADE; NULL только при `scope = 'installation'`. |
+| `key` | `text` | Непустой ключ из фиксированного перечня в коде. |
+| `value` | `jsonb` | Обычное значение; NULL у секрета. |
+| `secret` | `bytea` | Шифротекст секрета; NULL у обычного значения. |
+| `updated_at` | `timestamptz` | NOT NULL, по умолчанию `now()`. |
+
+Ограничения:
+
+- ровно одно из `value`/`secret` (`num_nonnulls(value, secret) = 1`);
+- `installation` всегда без `household_id`, `household` — всегда с ним;
+- уникальность `(scope, coalesce(household_id, nil uuid), key)`: `UNIQUE`
+  считает NULL различными, поэтому nil-uuid в индексе заменяет отсутствующий
+  household. Этот же индекс — цель upsert при записи настройки.
+
+Уровни. `installation` — настройка всей инсталляции, `household` — одного
+household. Сейчас перечень содержит только installation-ключи; household-строки
+появятся вместе с настройками Telegram. Уровень строки входит в AAD, поэтому
+секрет нельзя перенести между уровнями или household.
+
+Источники. Действующее значение собирает `settings::effective_llm` из трёх
+слоёв: окружение → база (`settings`) → умолчание; у каждого поля известен
+источник `env`, `db` или `default`. Окружение перекрывает базу и для отдельного
+поля, и для слота целиком: слот считается заданным окружением, если задан его
+URL или модель, и тогда все поля слота берутся из окружения. Слот из базы
+настроен, только если есть и адрес, и модель; иначе он ненастроен с причиной
+`not_set`, `incomplete` или `invalid`. Нерасшифрованный секрет делает
+ненастроенным весь слот, а не только поле токена. Флаг `llm.enabled`: явное
+значение из окружения, затем `llm.enabled` из базы, затем умолчание — включён,
+только если основной слот задан окружением.
+
+Перечень ключей (совпадает с `SETTING_KEYS` в `src/settings/mod.rs`):
+
+| Ключ | Уровень | Вид | Форма | Источник |
+| --- | --- | --- | --- | --- |
+| `llm.enabled` | installation | обычный | bool | env → база → умолчание |
+| `llm.primary.url` | installation | обычный | абсолютный `http(s)` URL | слот: env целиком → база |
+| `llm.primary.model` | installation | обычный | непустая строка | слот: env целиком → база |
+| `llm.primary.token` | installation | **секрет** | непустая строка | слот: env целиком → база |
+| `llm.primary.timeout_ms` | installation | обычный | 100..600000 мс | слот: env целиком → база → умолчание |
+| `llm.primary.extra_json` | installation | обычный | JSON-объект | слот: env целиком → база → `{}` |
+| `llm.fallback.url` | installation | обычный | абсолютный `http(s)` URL | слот: env целиком → база |
+| `llm.fallback.model` | installation | обычный | непустая строка | слот: env целиком → база |
+| `llm.fallback.token` | installation | **секрет** | непустая строка | слот: env целиком → база |
+| `llm.fallback.timeout_ms` | installation | обычный | 100..600000 мс | слот: env целиком → база → умолчание |
+| `llm.fallback.extra_json` | installation | обычный | JSON-объект | слот: env целиком → база → `{}` |
+| `llm.connect_timeout_ms` | installation | обычный | 10..60000 мс | env → база → умолчание |
+| `llm.daily_quota` | installation | обычный | целое 1..100000 | env → база → умолчание |
+| `wizard.llm_skipped` | installation | обычный | bool | база → умолчание |
+| `wizard.household_skipped` | installation | обычный | bool | база → умолчание |
+| `wizard.token_skipped` | installation | обычный | bool | база → умолчание |
+
+Неизвестные ключи (например, записанные более новой версией) при чтении
+игнорируются, чтобы откат на прежний образ не ломал запуск. Их секреты всё
+равно проверяются readiness и перешифровываются при ротации: контекст берётся
+из полей строки, а не из перечня.
+
+Формат `secret`: XChaCha20-Poly1305; 1 байт версии формата (сейчас `1`),
+8 байт id ключа (первые байты SHA-256 ключа), 24 байта nonce, затем шифротекст
+с тегом Poly1305 (16 байт). AAD — версия и поля строки `scope`,
+`household_id`, `key`; каждому полю предшествует длина `u32` big-endian,
+отсутствующий `household_id` кодируется длиной 0. Поэтому шифротекст,
+перенесённый в другую строку, уровень или household, не расшифровывается.
+Шифрование всегда идёт текущим ключом `TASKLERQ_SECRET_KEY`; расшифровка —
+текущим или прежним `TASKLERQ_SECRET_KEY_OLD` по id из шифротекста. Ключ
+хранится в окружении, а не в базе.
+
+### 3.15 `admin_accounts`, `admin_sessions`, `admin_one_time_codes`
+
+Учётная запись администратора консоли не связана с `users`: это оператор
+инсталляции, а не участник household.
+
+`admin_accounts`:
+
+| Поле | Тип | Ограничения |
+| --- | --- | --- |
+| `id` | `uuid` | PRIMARY KEY. |
+| `username` | `text` | NOT NULL, непустой после `btrim`. |
+| `password_hash` | `text` | NOT NULL, строка PHC argon2id с параметрами. |
+| `created_at` | `timestamptz` | NOT NULL, по умолчанию `now()`. |
+| `password_changed_at` | `timestamptz` | NOT NULL, по умолчанию `now()`. |
+
+Уникальный индекс по константному выражению `((true))` держит не более одной
+строки. Внешних ключей нет; `password_changed_at` всегда заполнен, потому что
+учётка создаётся только вместе с паролем.
+
+`admin_sessions`:
+
+| Поле | Тип | Ограничения |
+| --- | --- | --- |
+| `id` | `uuid` | PRIMARY KEY. |
+| `token_hash` | `text` | NOT NULL, UNIQUE, 64 строчных hex-символа (SHA-256 токена). |
+| `created_at` | `timestamptz` | NOT NULL, по умолчанию `now()`. |
+| `last_seen_at` | `timestamptz` | NOT NULL, по умолчанию `now()`; CHECK `last_seen_at >= created_at`. |
+
+Сессия истекает через 7 дней без активности (от `last_seen_at`) и через 30 дней
+после входа (от `created_at`); `last_seen_at` обновляется не чаще раза в минуту.
+Индекс по `created_at` — для retention: строки старше 30 дней удаляются.
+Открытый токен сессии в базе не хранится, только его хеш.
+
+`admin_one_time_codes`:
+
+| Поле | Тип | Ограничения |
+| --- | --- | --- |
+| `id` | `uuid` | PRIMARY KEY. |
+| `purpose` | `text` | NOT NULL; CHECK `setup` или `recovery`. |
+| `household_id` | `uuid` | FK → households, ON DELETE CASCADE; NULL во всех текущих назначениях (CHECK). |
+| `code_hash` | `text` | NOT NULL, UNIQUE, 64 строчных hex-символа. |
+| `expires_at` | `timestamptz` | NULL только для `setup`; CHECK «у не-`setup` срок задан» и `expires_at > created_at`. |
+| `used_at` | `timestamptz` | NULL, пока код не использован. |
+| `created_at` | `timestamptz` | NOT NULL, по умолчанию `now()`. |
+
+`setup` живёт без срока, пока учётной записи нет: его гасит выпуск следующего
+кода или создание учётки. `recovery` живёт 15 минут. Использование —
+`UPDATE ... WHERE code_hash = $1 AND used_at IS NULL AND (expires_at IS NULL OR
+expires_at > now()) RETURNING ...` в одной транзакции с действием; повторный,
+погашенный или истёкший код строку не возвращает. Выпуск нового кода гасит
+прежние с той же парой `(purpose, household_id)`. Retention удаляет
+использованные и истёкшие коды старше 7 дней; действующий код и неиспользованный
+`setup` без срока остаются.
 
 ## 4. Перечисления
 
@@ -457,7 +592,7 @@ household, созданные через `tasklerq admin`, попадают в �
 | `notification_kind` | `reminder`, `digest`, `assignment`, `snooze` |
 | `notification_status` | `pending`, `sent`, `cancelled` |
 | `capture_job_status` | `pending`, `running`, `done`, `dead` |
-| `audit_event_type` | `household_created`, `member_joined`, `member_left`, `member_removed`, `role_changed`, `invite_created`, `invite_used`, `invite_revoked`, `token_created`, `token_revoked`, `auth_failed`, `rate_limited`, `llm_validation_failed`, `auth_failure_threshold_exceeded`, `household_deleted` |
+| `audit_event_type` | `household_created`, `member_joined`, `member_left`, `member_removed`, `role_changed`, `invite_created`, `invite_used`, `invite_revoked`, `token_created`, `token_revoked`, `auth_failed`, `rate_limited`, `llm_validation_failed`, `auth_failure_threshold_exceeded`, `household_deleted`, `admin_login`, `admin_login_failed`, `admin_setup_code_failed`, `admin_account_created`, `admin_password_changed`, `admin_recovery_issued`, `admin_setting_changed` |
 
 ## 5. Инварианты
 
