@@ -11,7 +11,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tasklerq::storage::repositories::{households, users};
-use tasklerq::telegram::api::{RichMessage, TelegramApi, TelegramError, WebhookInfo};
+use tasklerq::telegram::api::{BotMe, RichMessage, TelegramApi, TelegramError, WebhookInfo};
 use tasklerq::telegram::bot::model::{Action, Screen, Ui};
 use tasklerq::telegram::bot::{Bot, Ctx, display_timezone};
 use tasklerq::telegram::outbox::{OutboxWorker, Placement};
@@ -231,6 +231,13 @@ impl TelegramApi for FakeTelegram {
 
     async fn delete_webhook(&self) -> Result<(), TelegramError> {
         Ok(())
+    }
+
+    async fn get_me(&self) -> Result<BotMe, TelegramError> {
+        Ok(BotMe {
+            id: 4242,
+            username: Some("tasklerqbot".to_owned()),
+        })
     }
 
     async fn get_webhook_info(&self) -> Result<WebhookInfo, TelegramError> {

@@ -27,6 +27,8 @@ pub(crate) const WIZARD_SKIP_PATH: &str = "/admin/wizard/skip";
 pub enum WizardStep {
     /// Учётной записи нет: первый вход.
     Setup,
+    /// Telegram не настроен ни окружением, ни базой.
+    Telegram,
     /// В `single` нет household.
     Household,
     /// LLM не задан ни окружением, ни базой.
@@ -41,6 +43,7 @@ impl WizardStep {
     /// Значение поля `step` формы пропуска.
     pub const fn slug(self) -> Option<&'static str> {
         match self {
+            Self::Telegram => Some("telegram"),
             Self::Household => Some("household"),
             Self::Llm => Some("llm"),
             Self::Token => Some("token"),
@@ -51,6 +54,7 @@ impl WizardStep {
     /// Шаг по значению поля формы; только пропускаемые шаги.
     pub fn from_slug(slug: &str) -> Option<Self> {
         match slug {
+            "telegram" => Some(Self::Telegram),
             "household" => Some(Self::Household),
             "llm" => Some(Self::Llm),
             "token" => Some(Self::Token),
@@ -61,6 +65,7 @@ impl WizardStep {
     /// Ключ `settings`, которым отмечается пропуск шага.
     pub const fn setting_key(self) -> Option<&'static str> {
         match self {
+            Self::Telegram => Some("wizard.telegram_skipped"),
             Self::Household => Some("wizard.household_skipped"),
             Self::Llm => Some("wizard.llm_skipped"),
             Self::Token => Some("wizard.token_skipped"),
@@ -71,11 +76,11 @@ impl WizardStep {
     /// Допустим ли пропуск шага в этом режиме.
     ///
     /// Household пропускается только при включённом Telegram: без бота его и
-    /// владельца создать некому. LLM и токен пропускаются всегда.
+    /// владельца создать некому. Остальные шаги пропускаются всегда.
     pub const fn can_skip(self, telegram_enabled: bool) -> bool {
         match self {
             Self::Household => telegram_enabled,
-            Self::Llm | Self::Token => true,
+            Self::Telegram | Self::Llm | Self::Token => true,
             Self::Setup | Self::Done => false,
         }
     }
@@ -85,7 +90,7 @@ impl WizardStep {
         match self {
             Self::Setup => "/admin/setup",
             Self::Done => "/admin",
-            Self::Household | Self::Llm | Self::Token => WIZARD_PATH,
+            Self::Telegram | Self::Household | Self::Llm | Self::Token => WIZARD_PATH,
         }
     }
 
@@ -93,6 +98,7 @@ impl WizardStep {
     pub const fn title(self) -> &'static str {
         match self {
             Self::Setup => "Первый вход",
+            Self::Telegram => "Telegram",
             Self::Household => "Дом",
             Self::Llm => "Разбор записей",
             Self::Token => "Токен Home Assistant",
@@ -104,6 +110,9 @@ impl WizardStep {
     pub const fn description(self) -> &'static str {
         match self {
             Self::Setup => "Создайте учётную запись администратора.",
+            Self::Telegram => {
+                "Подключите бота Telegram: без него household и владельца создать некому."
+            }
             Self::Household => {
                 "Создайте household — дом, к которому относятся задачи, покупки и календарь."
             }
@@ -125,6 +134,8 @@ pub struct WizardState {
     pub account_exists: bool,
     /// Режим размещения.
     pub tenancy: TenancyMode,
+    /// Группа Telegram задана окружением или базой.
+    pub telegram_configured: bool,
     /// Telegram включён: пропуск household допустим.
     pub telegram_enabled: bool,
     /// Активный household есть.
@@ -133,6 +144,8 @@ pub struct WizardState {
     pub tokens: bool,
     /// Основной слот LLM задан окружением или базой.
     pub llm_configured: bool,
+    /// Шаг Telegram пропущен.
+    pub telegram_skipped: bool,
     /// Шаг household пропущен.
     pub household_skipped: bool,
     /// Шаг LLM пропущен.
@@ -141,14 +154,43 @@ pub struct WizardState {
     pub token_skipped: bool,
 }
 
+/// Действующее состояние Telegram для шагов мастера.
+///
+/// Считается по окружению и базе при каждом чтении снимка, а не фиксируется
+/// при старте: подключение бота в консоли сразу открывает пропуск household.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TelegramWizardState {
+    /// Группа задана целиком окружением или базой (режим `disabled` тоже
+    /// считается заданной группой).
+    pub configured: bool,
+    /// Бот включён: группа задана и режим не `disabled`.
+    pub enabled: bool,
+}
+
+impl TelegramWizardState {
+    /// Состояние для консоли, собранной без рантайма: группа не показывается
+    /// шагом мастера, а включённость берётся из статического признака.
+    pub const fn from_static(enabled: bool) -> Self {
+        Self {
+            configured: true,
+            enabled,
+        }
+    }
+}
+
 /// Вычислить текущий шаг мастера.
 ///
-/// Завершённые шаги не повторяются: household виден только пока его нет и
-/// пропуск допустим; LLM — пока слот не задан и шаг не пропущен; токен — только
-/// в `single` и только когда household уже есть.
+/// Завершённые шаги не повторяются: Telegram виден, только пока группа не
+/// задана и шаг не пропущен; household — пока его нет и пропуск допустим;
+/// LLM — пока слот не задан и шаг не пропущен; токен — только в `single` и
+/// только когда household уже есть.
 pub fn wizard_step(state: &WizardState) -> WizardStep {
     if !state.account_exists {
         return WizardStep::Setup;
+    }
+
+    if !state.telegram_configured && !state.telegram_skipped {
+        return WizardStep::Telegram;
     }
 
     let household_skipped = state.household_skipped
@@ -217,6 +259,7 @@ pub async fn read_state(
     pool: &PgPool,
     settings: &WizardSettings,
     llm: &crate::llm::LlmSettings,
+    telegram: TelegramWizardState,
     now: DateTime<Utc>,
 ) -> Result<WizardState, DomainError> {
     let (account_exists, household, tokens) = {
@@ -242,10 +285,12 @@ pub async fn read_state(
     Ok(WizardState {
         account_exists,
         tenancy: settings.tenancy,
-        telegram_enabled: settings.telegram_enabled,
+        telegram_configured: telegram.configured,
+        telegram_enabled: telegram.enabled,
         household,
         tokens,
         llm_configured: llm_configured(&effective),
+        telegram_skipped: skipped(WizardStep::Telegram.setting_key()),
         household_skipped: skipped(WizardStep::Household.setting_key()),
         llm_skipped: skipped(WizardStep::Llm.setting_key()),
         token_skipped: skipped(WizardStep::Token.setting_key()),
@@ -295,10 +340,12 @@ mod tests {
         WizardState {
             account_exists: true,
             tenancy,
+            telegram_configured: true,
             telegram_enabled: false,
             household: false,
             tokens: false,
             llm_configured: false,
+            telegram_skipped: false,
             household_skipped: false,
             llm_skipped: false,
             token_skipped: false,
@@ -333,6 +380,28 @@ mod tests {
             value: Some(value),
             secret: None,
         }
+    }
+
+    #[test]
+    fn an_unconfigured_telegram_comes_right_after_setup() {
+        let mut state = base(TenancyMode::Single);
+        state.telegram_configured = false;
+        assert_eq!(wizard_step(&state), WizardStep::Telegram);
+
+        state.telegram_skipped = true;
+        assert_eq!(
+            wizard_step(&state),
+            WizardStep::Household,
+            "a skipped Telegram step moves on to the household"
+        );
+    }
+
+    #[test]
+    fn a_configured_disabled_group_finishes_the_telegram_step() {
+        let mut state = base(TenancyMode::Single);
+        state.telegram_configured = true;
+        state.telegram_enabled = false;
+        assert_eq!(wizard_step(&state), WizardStep::Household);
     }
 
     #[test]
@@ -475,7 +544,12 @@ mod tests {
 
     #[test]
     fn skip_slugs_and_keys_round_trip() {
-        for step in [WizardStep::Household, WizardStep::Llm, WizardStep::Token] {
+        for step in [
+            WizardStep::Telegram,
+            WizardStep::Household,
+            WizardStep::Llm,
+            WizardStep::Token,
+        ] {
             let slug = step.slug().expect("a skippable step");
             assert_eq!(WizardStep::from_slug(slug), Some(step));
             assert_eq!(step.target_path(), WIZARD_PATH);
@@ -487,6 +561,7 @@ mod tests {
             assert!(step.can_skip(true));
         }
         assert!(!WizardStep::Household.can_skip(false));
+        assert!(WizardStep::Telegram.can_skip(false));
         assert!(WizardStep::Llm.can_skip(false));
         assert!(WizardStep::Token.can_skip(false));
         assert!(!WizardStep::Setup.can_skip(true));

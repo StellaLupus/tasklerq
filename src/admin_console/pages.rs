@@ -45,6 +45,7 @@ use super::recovery::{self, RecoveryCheck, RecoveryError, RecoveryOutcome};
 use super::router::AdminState;
 use super::session::{self, AdminSession, LOGIN_PATH};
 use super::setup::{self, SetupError, SetupOutcome};
+use super::telegram::{self, TelegramForm, TelegramSubmitOutcome, TelegramView};
 use super::wizard::{self, WizardStep};
 use crate::VERSION;
 use crate::admin;
@@ -57,7 +58,9 @@ use crate::domain::validation::normalize_text;
 use crate::http::health::{self, ReadinessInput};
 use crate::llm::{LlmApplyError, LlmChange, OpenAiBackend};
 use crate::rate_limit::RateDecision;
-use crate::settings::{ResolvedSetting, SecretProblem, SecretState, SettingError, SettingSource};
+use crate::settings::{
+    self, ResolvedSetting, SecretProblem, SecretState, SettingError, SettingSource,
+};
 use crate::storage::repositories::admin_accounts;
 use crate::storage::repositories::households;
 use crate::storage::repositories::llm_slot_settings;
@@ -70,6 +73,10 @@ const HOME_PATH: &str = "/admin";
 const PASSWORD_PATH: &str = "/admin/password";
 /// Путь страницы настроек LLM.
 pub(crate) const LLM_PATH: &str = "/admin/llm";
+/// Путь страницы Telegram.
+pub(crate) const TELEGRAM_PATH: &str = telegram::TELEGRAM_PATH;
+/// Путь перевыпуска секрета webhook.
+pub(crate) const TELEGRAM_SECRET_PATH: &str = telegram::TELEGRAM_SECRET_PATH;
 /// Путь страницы хода проверки слота.
 pub(crate) const LLM_CHECK_PATH: &str = "/admin/llm/check";
 /// Путь фрагмента хода для htmx; без JavaScript страница обновляется ссылкой.
@@ -255,6 +262,15 @@ pub(crate) struct LlmQuery {
     secret: Option<String>,
 }
 
+/// Метки страницы Telegram: сохранение и режим шага мастера.
+#[derive(Deserialize)]
+pub(crate) struct TelegramQuery {
+    #[serde(default)]
+    saved: Option<String>,
+    #[serde(default)]
+    wizard: Option<String>,
+}
+
 /// Поля формы проверки слота.
 #[derive(Deserialize)]
 pub(crate) struct CheckForm {
@@ -320,14 +336,21 @@ struct HomeSlot {
 
 /// Собрать данные главной: готовность, счёт household и статусы слотов.
 async fn home_view(state: &AdminState, now: DateTime<Utc>) -> Result<HomeView, DomainError> {
-    let snapshot =
-        wizard::read_state(&state.pool, state.wizard(), state.llm_settings(), now).await?;
+    let telegram = telegram_wizard_state(state).await?;
+    let snapshot = wizard::read_state(
+        &state.pool,
+        state.wizard(),
+        state.llm_settings(),
+        telegram,
+        now,
+    )
+    .await?;
 
     let readiness = health::readiness(ReadinessInput {
         pool: &state.pool,
         tenancy_mode: state.wizard().tenancy,
         queue_lag_limit: state.queue_lag_limit(),
-        telegram_active: state.telegram().is_active(),
+        telegram_active: state.telegram_active(),
         secret_cipher: state.llm_settings().cipher(),
         llm_slots: state.llm_slots(),
         now,
@@ -363,7 +386,7 @@ async fn home_view(state: &AdminState, now: DateTime<Utc>) -> Result<HomeView, D
             crate::config::TenancyMode::Multi => "multi",
         },
         households: active_households,
-        telegram_enabled: state.wizard().telegram_enabled,
+        telegram_enabled: snapshot.telegram_enabled,
         slots,
     })
 }
@@ -878,6 +901,78 @@ pub(crate) async fn llm_check_start(
     redirect(LLM_CHECK_PATH)
 }
 
+/// `GET /admin/telegram`: страница подключения бота за сессией.
+pub(crate) async fn telegram_page(
+    State(state): State<AdminState>,
+    _session: AdminSession,
+    Query(query): Query<TelegramQuery>,
+) -> Response {
+    let wizard = query.wizard.is_some();
+    match telegram::view(&state, None, query.saved.is_some(), wizard).await {
+        Ok(view) => render(ConsolePage::new(Page::Telegram(Box::new(view)))),
+        Err(error) => internal(error),
+    }
+}
+
+/// `POST /admin/telegram`: проверить токен, сохранить группу и применить.
+pub(crate) async fn telegram_submit(
+    State(state): State<AdminState>,
+    _session: AdminSession,
+    Form(form): Form<TelegramForm>,
+) -> Response {
+    let wizard = form.is_wizard();
+    match telegram::submit(&state, &form, Utc::now()).await {
+        Ok(TelegramSubmitOutcome::Saved { apply_error: None }) => redirect(if wizard {
+            wizard::WIZARD_PATH
+        } else {
+            telegram::TELEGRAM_SAVED_PATH
+        }),
+        Ok(TelegramSubmitOutcome::Saved {
+            apply_error: Some(message),
+        }) => telegram_message(&state, Some(&form), true, wizard, &message, StatusCode::OK).await,
+        Ok(TelegramSubmitOutcome::Rejected { status, message }) => {
+            telegram_message(&state, Some(&form), false, wizard, &message, status).await
+        }
+        Err(error) => internal(error),
+    }
+}
+
+/// `POST /admin/telegram/secret`: новый секрет webhook и переключение.
+pub(crate) async fn telegram_reissue_secret(
+    State(state): State<AdminState>,
+    _session: AdminSession,
+) -> Response {
+    match telegram::reissue_secret(&state, Utc::now()).await {
+        Ok(TelegramSubmitOutcome::Saved { apply_error: None }) => {
+            redirect(telegram::TELEGRAM_SAVED_PATH)
+        }
+        Ok(TelegramSubmitOutcome::Saved {
+            apply_error: Some(message),
+        }) => telegram_message(&state, None, true, false, &message, StatusCode::OK).await,
+        Ok(TelegramSubmitOutcome::Rejected { status, message }) => {
+            telegram_message(&state, None, false, false, &message, status).await
+        }
+        Err(error) => internal(error),
+    }
+}
+
+async fn telegram_message(
+    state: &AdminState,
+    form: Option<&TelegramForm>,
+    saved: bool,
+    wizard: bool,
+    message: &str,
+    status: StatusCode,
+) -> Response {
+    match telegram::view(state, form, saved, wizard).await {
+        Ok(view) => render_with_status(
+            ConsolePage::new(Page::Telegram(Box::new(view))).error(message),
+            status,
+        ),
+        Err(error) => internal(error),
+    }
+}
+
 /// `GET /admin/wizard`: текущий шаг мастера за сессией.
 pub(crate) async fn wizard_page(
     State(state): State<AdminState>,
@@ -887,6 +982,10 @@ pub(crate) async fn wizard_page(
         &state.pool,
         state.wizard(),
         state.llm_settings(),
+        match telegram_wizard_state(&state).await {
+            Ok(telegram) => telegram,
+            Err(error) => return internal(error),
+        },
         Utc::now(),
     )
     .await
@@ -896,8 +995,12 @@ pub(crate) async fn wizard_page(
             match step {
                 WizardStep::Done => redirect(HOME_PATH),
                 WizardStep::Setup => redirect(SETUP_PATH),
+                WizardStep::Telegram => match telegram::view(&state, None, false, true).await {
+                    Ok(view) => render(ConsolePage::new(Page::Telegram(Box::new(view)))),
+                    Err(error) => internal(error),
+                },
                 WizardStep::Household | WizardStep::Llm | WizardStep::Token => render(
-                    ConsolePage::new(wizard_step_page(step, state.wizard().telegram_enabled)),
+                    ConsolePage::new(wizard_step_page(step, snapshot.telegram_enabled)),
                 ),
             }
         }
@@ -916,13 +1019,23 @@ pub(crate) async fn wizard_skip(
     Form(form): Form<SkipForm>,
 ) -> Response {
     let now = Utc::now();
-    let snapshot =
-        match wizard::read_state(&state.pool, state.wizard(), state.llm_settings(), now).await {
-            Ok(snapshot) => snapshot,
+    let snapshot = match wizard::read_state(
+        &state.pool,
+        state.wizard(),
+        state.llm_settings(),
+        match telegram_wizard_state(&state).await {
+            Ok(telegram) => telegram,
             Err(error) => return internal(error),
-        };
+        },
+        now,
+    )
+    .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => return internal(error),
+    };
     let current = wizard::wizard_step(&snapshot);
-    let telegram_enabled = state.wizard().telegram_enabled;
+    let telegram_enabled = snapshot.telegram_enabled;
     let Some(step) = WizardStep::from_slug(&form.step)
         .filter(|step| *step == current && step.can_skip(telegram_enabled))
     else {
@@ -951,7 +1064,10 @@ pub(crate) async fn wizard_household(
     Form(form): Form<HouseholdForm>,
 ) -> Response {
     let now = Utc::now();
-    let telegram_enabled = state.wizard().telegram_enabled;
+    let telegram_enabled = match telegram_wizard_state(&state).await {
+        Ok(telegram) => telegram.enabled,
+        Err(error) => return internal(error),
+    };
     let step = match current_step(&state, now).await {
         Ok(step) => step,
         Err(error) => return internal(error),
@@ -1019,7 +1135,10 @@ pub(crate) async fn wizard_token(
     Form(form): Form<TokenForm>,
 ) -> Response {
     let now = Utc::now();
-    let telegram_enabled = state.wizard().telegram_enabled;
+    let telegram_enabled = match telegram_wizard_state(&state).await {
+        Ok(telegram) => telegram.enabled,
+        Err(error) => return internal(error),
+    };
     let step = match current_step(&state, now).await {
         Ok(step) => step,
         Err(error) => return internal(error),
@@ -1141,9 +1260,38 @@ async fn current_step(
     state: &AdminState,
     now: chrono::DateTime<Utc>,
 ) -> Result<WizardStep, DomainError> {
-    let snapshot =
-        wizard::read_state(&state.pool, state.wizard(), state.llm_settings(), now).await?;
+    let telegram = telegram_wizard_state(state).await?;
+    let snapshot = wizard::read_state(
+        &state.pool,
+        state.wizard(),
+        state.llm_settings(),
+        telegram,
+        now,
+    )
+    .await?;
     Ok(wizard::wizard_step(&snapshot))
+}
+
+/// Действующее состояние Telegram для шагов мастера.
+///
+/// Читается из окружения и базы при каждом запросе: подключение бота в консоли
+/// сразу меняет шаги, без перезапуска. Консоль без рантайма (тесты страниц)
+/// сохраняет прежнее поведение — шаг Telegram не показывается.
+async fn telegram_wizard_state(
+    state: &AdminState,
+) -> Result<wizard::TelegramWizardState, DomainError> {
+    let Some(config) = state.telegram_config() else {
+        return Ok(wizard::TelegramWizardState::from_static(
+            state.wizard().telegram_enabled,
+        ));
+    };
+    let effective =
+        settings::read_effective_telegram(&state.pool, config, state.llm_settings().cipher())
+            .await?;
+    Ok(wizard::TelegramWizardState {
+        configured: effective.is_configured(),
+        enabled: effective.is_enabled(),
+    })
 }
 
 /// Куда вести после входа или setup: текущий шаг мастера или главная.
@@ -1475,6 +1623,9 @@ fn wizard_step_rejection(
             ConsolePage::new(wizard_step_page(current, telegram_enabled)).error(message),
             StatusCode::BAD_REQUEST,
         ),
+        // У шага Telegram своя страница с формой: повторный отказ открывает её
+        // без записи, а не подставляет шаблон без полей.
+        WizardStep::Telegram => redirect(wizard::WIZARD_PATH),
         WizardStep::Setup => redirect(SETUP_PATH),
         WizardStep::Done => redirect(HOME_PATH),
     }
@@ -1490,7 +1641,9 @@ fn wizard_step_page(step: WizardStep, telegram_enabled: bool) -> Page {
         WizardStep::Token => WizardForm::Token {
             name: DEFAULT_TOKEN_NAME.to_owned(),
         },
-        WizardStep::Setup | WizardStep::Llm | WizardStep::Done => WizardForm::None,
+        WizardStep::Setup | WizardStep::Telegram | WizardStep::Llm | WizardStep::Done => {
+            WizardForm::None
+        }
     };
 
     Page::Wizard {
@@ -1983,6 +2136,8 @@ enum Page {
     },
     /// Настройки разбора.
     Llm(Box<LlmView>),
+    /// Подключение Telegram.
+    Telegram(Box<TelegramView>),
     /// Ход проверки слота.
     Check(Option<CheckSnapshot>),
 }
@@ -2018,6 +2173,7 @@ impl Page {
             Self::Wizard { step, .. } => step.title(),
             Self::TokenIssued { .. } => "Токен Home Assistant",
             Self::Llm(_) => "Разбор записей",
+            Self::Telegram(_) => "Telegram",
             Self::Check(_) => "Проверка слота",
         }
     }
@@ -2034,6 +2190,7 @@ impl Page {
                 | Self::Wizard { .. }
                 | Self::TokenIssued { .. }
                 | Self::Llm(_)
+                | Self::Telegram(_)
                 | Self::Check(_)
         )
     }
@@ -2083,6 +2240,17 @@ impl Page {
                 }
             }
             Self::TokenIssued { token } => TokenIssuedBody { token }.render(),
+            Self::Telegram(view) => {
+                let skip = if view.wizard {
+                    SkipBody {
+                        skip: Some(WizardStep::Telegram.slug().unwrap_or_default()),
+                    }
+                    .render()?
+                } else {
+                    String::new()
+                };
+                TelegramBody { view, skip }.render()
+            }
             Self::Llm(view) => {
                 let primary = SlotBody {
                     legend: "Основной слот",
@@ -2187,6 +2355,7 @@ impl<'a> ConsolePage<'a> {
 <nav class="console-nav">
 <a href="/admin">Главная</a>
 <a href="/admin/llm">Разбор</a>
+<a href="/admin/telegram">Telegram</a>
 <a href="/admin/password">Сменить пароль</a>
 <form method="post" action="/admin/logout">
 <button type="submit">Выйти</button>
@@ -2551,6 +2720,81 @@ struct LlmBody<'a> {
     fallback: String,
     /// Уже отрисованные кнопки проверки.
     checks: String,
+}
+
+/// Содержимое страницы Telegram.
+#[derive(Template)]
+#[template(
+    source = r#"<h1>Telegram</h1>
+{% if view.saved %}
+<p role="status" class="console-notice">Настройки Telegram сохранены.</p>
+{% endif %}
+<section>
+<h2>Состояние</h2>
+<dl class="console-state">
+<dt>Бот</dt><dd>{% if view.bot_name.is_empty() %}не подключён{% else %}{{ view.bot_name }}{% endif %}{% match view.bot_id %}{% when Some with (id) %} ({{ id }}){% when None %}{% endmatch %}</dd>
+<dt>Источник группы</dt><dd>{{ view.source }}</dd>
+<dt>Режим</dt><dd>{{ view.mode }}</dd>
+<dt>Адрес webhook</dt><dd>{% if view.webhook_address.is_empty() %}не задан{% else %}{{ view.webhook_address }}{% endif %}</dd>
+<dt>Токен</dt><dd>{{ view.token_label }} <span class="console-source">источник: {{ view.token_source }}</span></dd>
+<dt>Секрет webhook</dt><dd>{% if view.webhook_secret_set %}задан{% else %}не задан{% endif %}</dd>
+{% if view.webhook_info_failed %}
+<dt>Состояние webhook</dt><dd>не удалось получить</dd>
+{% else %}
+<dt>Ожидают обработки</dt><dd>{% match view.pending_update_count %}{% when Some with (count) %}{{ count }}{% when None %}{% endmatch %}</dd>
+{% match view.webhook_error_message %}
+{% when Some with (message) %}
+<dt>Последняя ошибка</dt><dd>{{ message }}{% match view.webhook_error_date %}{% when Some with (date) %} ({{ date }}){% when None %}{% endmatch %}</dd>
+{% when None %}
+{% endmatch %}
+{% endif %}
+</dl>
+</section>
+{% if view.readonly %}
+<p>Токен задан окружением TELEGRAM_BOT_TOKEN: страница доступна только для чтения.</p>
+{% else %}
+<form method="post" action="/admin/telegram">
+{% if view.wizard %}<input type="hidden" name="next" value="wizard">{% endif %}
+<fieldset>
+<legend>Режим</legend>
+<p><label><input name="mode" type="radio" value="webhook"{% if view.webhook_selected %} checked{% endif %}> webhook</label></p>
+{% if view.polling_allowed %}
+<p><label><input name="mode" type="radio" value="polling"{% if view.polling_selected %} checked{% endif %}> polling</label></p>
+{% endif %}
+<p><label><input name="mode" type="radio" value="disabled"{% if view.disabled_selected %} checked{% endif %}> выключен</label></p>
+</fieldset>
+<fieldset>
+<legend>Токен</legend>
+<p>Токен: <strong>{{ view.token_label }}</strong></p>
+<p><label for="telegram-token">Новый токен (пустое поле — не менять)</label>
+<input id="telegram-token" name="token" type="password" autocomplete="new-password"></p>
+</fieldset>
+<fieldset>
+<legend>Адрес</legend>
+<p><label for="telegram-public-base-url">Публичный адрес</label>
+<input id="telegram-public-base-url" name="public_base_url" type="text" value="{{ view.public_base_url.value }}"{% if view.public_base_url.readonly %} readonly{% endif %}>
+<span class="console-source">источник: {{ view.public_base_url.source }}</span></p>
+<p><label for="telegram-webhook-override">Переопределение адреса webhook (пусто — публичный адрес)</label>
+<input id="telegram-webhook-override" name="webhook_url_override" type="text" value="{{ view.webhook_url_override.value }}"{% if view.webhook_url_override.readonly %} readonly{% endif %}>
+<span class="console-source">источник: {{ view.webhook_url_override.source }}</span></p>
+</fieldset>
+<p><button type="submit">Сохранить</button></p>
+</form>
+{% if view.reissue_allowed %}
+<form method="post" action="/admin/telegram/secret">
+<p><button type="submit">Перевыпустить секрет webhook</button></p>
+</form>
+{% endif %}
+{% endif %}
+{{ skip|safe }}
+"#,
+    ext = "html"
+)]
+struct TelegramBody<'a> {
+    /// Данные страницы.
+    view: &'a TelegramView,
+    /// Уже отрисованная форма пропуска шага мастера.
+    skip: String,
 }
 
 /// Форма проверки одного слота.

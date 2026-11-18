@@ -246,7 +246,7 @@ fn db_url(stored: &[StoredSetting], key: &str, require_https: bool) -> DbUrl {
 }
 
 /// Присоединить путь webhook к публичному адресу без двойного `/`.
-fn webhook_address(base: &url::Url) -> url::Url {
+pub fn webhook_address(base: &url::Url) -> url::Url {
     let mut url = base.clone();
     url.set_path(&format!(
         "{}/webhooks/telegram",

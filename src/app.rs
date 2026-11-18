@@ -136,6 +136,7 @@ pub async fn build_application_with_update_limit(
         )
         .with_wizard(wizard)
         .with_llm_slots(llm_slots)
+        .with_telegram_config(config.clone())
         .with_telegram_supervisor(Arc::clone(&supervisor))
         .with_queue_lag_limit(config.queue.ready_lag_seconds);
         build_admin_router(admin)

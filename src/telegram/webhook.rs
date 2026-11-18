@@ -140,6 +140,40 @@ impl IngressSlot {
     }
 }
 
+/// Что делать с запросом по состоянию слота приёма.
+#[derive(Debug, PartialEq, Eq)]
+enum IngressGate<T> {
+    /// Обработать запрос текущим приёмом.
+    Handle(T),
+    /// Идёт смена поколения: ответить `503`.
+    Switching,
+    /// Приёма нет и переключения нет: ответить `404`.
+    NotFound,
+}
+
+/// Выбрать приём по первому чтению слота, признаку переключения и повторному
+/// чтению.
+///
+/// Повтор нужен из-за гонки: `load()` мог вернуть `None` прямо перед тем, как
+/// супервизор закончил `store(Some)` и снял признак переключения. Тогда
+/// живущее поколение не должно получить `404`; слот перечитывается один раз.
+fn select_ingress<T>(
+    first: Option<T>,
+    switching: bool,
+    reload: impl FnOnce() -> Option<T>,
+) -> IngressGate<T> {
+    if let Some(ingress) = first {
+        return IngressGate::Handle(ingress);
+    }
+    if switching {
+        return IngressGate::Switching;
+    }
+    match reload() {
+        Some(ingress) => IngressGate::Handle(ingress),
+        None => IngressGate::NotFound,
+    }
+}
+
 /// `POST /webhooks/telegram`.
 pub async fn receive(
     State(state): State<AppState>,
@@ -147,14 +181,20 @@ pub async fn receive(
     headers: HeaderMap,
     body: Body,
 ) -> Result<StatusCode, ApiError> {
-    let Some(ingress) = state.telegram.load() else {
+    // `load` и `is_switching` — два независимых чтения. Если первое вернуло
+    // `None`, а супервизор успел закончить переключение, признак уже снят:
+    // слот перечитывается один раз, чтобы не ответить `404` живому поколению.
+    let ingress = match select_ingress(state.telegram.load(), state.telegram.is_switching(), || {
+        state.telegram.load()
+    }) {
+        IngressGate::Handle(ingress) => ingress,
         // Поколение меняется: Telegram повторит доставку, а отказ не считается
         // ни ошибкой секрета, ни выключенным режимом.
-        if state.telegram.is_switching() {
+        IngressGate::Switching => {
             return Err(ApiError::service_unavailable("Telegram is switching")
                 .with_retry_after(SWITCH_RETRY_AFTER));
         }
-        return Err(ApiError::not_found("Route not found"));
+        IngressGate::NotFound => return Err(ApiError::not_found("Route not found")),
     };
 
     // Проверка лимита — до разбора тела и секрета: всплеск запросов с одного
@@ -257,4 +297,43 @@ pub async fn receive(
     }
 
     Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IngressGate, select_ingress};
+
+    #[test]
+    fn an_empty_slot_is_reread_once_before_a_404() {
+        assert_eq!(
+            select_ingress(None, false, || Some(7)),
+            IngressGate::Handle(7),
+            "a generation that started between the reads must serve the request"
+        );
+        assert_eq!(
+            select_ingress(None::<u8>, false, || None),
+            IngressGate::NotFound
+        );
+    }
+
+    #[test]
+    fn a_switch_is_not_mistaken_for_a_disabled_bot() {
+        let mut reread = false;
+        assert_eq!(
+            select_ingress(None::<u8>, true, || {
+                reread = true;
+                Some(1)
+            }),
+            IngressGate::Switching
+        );
+        assert!(!reread, "a switch is reported without a second read");
+    }
+
+    #[test]
+    fn a_loaded_ingress_is_used_as_is() {
+        assert_eq!(
+            select_ingress(Some(3), true, || panic!("the slot must not be reread")),
+            IngressGate::Handle(3)
+        );
+    }
 }

@@ -17,6 +17,7 @@ mod telegram;
 
 pub use telegram::{
     EffectiveTelegram, TelegramProblem, effective_telegram, read_effective_telegram,
+    webhook_address,
 };
 
 use std::fmt;
@@ -197,6 +198,12 @@ pub const SETTING_KEYS: &[SettingKey] = &[
     },
     SettingKey {
         name: "wizard.llm_skipped",
+        scope: SettingScope::Installation,
+        kind: SettingKind::Plain,
+        value_kind: ValueKind::Bool,
+    },
+    SettingKey {
+        name: "wizard.telegram_skipped",
         scope: SettingScope::Installation,
         kind: SettingKind::Plain,
         value_kind: ValueKind::Bool,
@@ -1202,9 +1209,10 @@ fn settings_from(stored: &[StoredSetting], resolved: &ResolvedLlm) -> Vec<Resolv
                     value: Some(Value::from(resolved.daily_quota)),
                     secret: None,
                 },
-                "wizard.llm_skipped" | "wizard.household_skipped" | "wizard.token_skipped" => {
-                    plain_from_db_or_default(key, stored)
-                }
+                "wizard.llm_skipped"
+                | "wizard.telegram_skipped"
+                | "wizard.household_skipped"
+                | "wizard.token_skipped" => plain_from_db_or_default(key, stored),
                 _ => default_setting(key),
             }
         })

@@ -78,6 +78,16 @@ impl TelegramError {
     }
 }
 
+/// Описание бота по данным `getMe`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct BotMe {
+    /// Идентификатор бота.
+    pub id: i64,
+    /// Имя бота без `@`; у бота оно обычно есть.
+    #[serde(default)]
+    pub username: Option<String>,
+}
+
 /// Состояние webhook по данным `getWebhookInfo`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct WebhookInfo {
@@ -146,6 +156,9 @@ pub trait TelegramApi: Send + Sync {
 
     /// Снять webhook перед long polling.
     async fn delete_webhook(&self) -> Result<(), TelegramError>;
+
+    /// Прочитать описание бота: id и имя.
+    async fn get_me(&self) -> Result<BotMe, TelegramError>;
 
     /// Прочитать состояние webhook.
     async fn get_webhook_info(&self) -> Result<WebhookInfo, TelegramError>;
@@ -408,6 +421,10 @@ impl TelegramApi for HttpTelegramApi {
         )
         .await
         .map(|_| ())
+    }
+
+    async fn get_me(&self) -> Result<BotMe, TelegramError> {
+        self.call("getMe", &json!({}), None).await
     }
 
     async fn get_webhook_info(&self) -> Result<WebhookInfo, TelegramError> {
