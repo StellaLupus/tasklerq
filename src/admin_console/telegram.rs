@@ -25,6 +25,7 @@ use crate::settings::webhook_address;
 use crate::settings::{
     self, ResolvedSetting, SecretState, SettingError, SettingSource, TelegramProblem,
 };
+use crate::storage::repositories::users;
 use crate::telegram::api::{DEFAULT_BASE_URL, HttpTelegramApi, TelegramApi};
 
 use super::router::AdminState;
@@ -46,6 +47,8 @@ pub(crate) const HTTPS_REQUIRED: &str =
 /// Токен из окружения перекрывает базу: страница только для чтения.
 pub(crate) const ENV_READ_ONLY: &str =
     "Токен задан окружением TELEGRAM_BOT_TOKEN: страница доступна только для чтения.";
+/// Имя бота, которого Telegram не сообщил.
+const UNNAMED_BOT: &str = "бот без имени";
 
 /// Поля формы Telegram.
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -65,6 +68,12 @@ pub(crate) struct TelegramForm {
     /// Возврат в мастер после сохранения.
     #[serde(default)]
     pub(crate) next: Option<String>,
+    /// Явное подтверждение смены бота.
+    #[serde(default)]
+    pub(crate) confirm_bot_change: Option<String>,
+    /// id бота, показанного на форме подтверждения.
+    #[serde(default)]
+    pub(crate) confirm_bot_id: Option<String>,
 }
 
 impl TelegramForm {
@@ -72,6 +81,25 @@ impl TelegramForm {
     pub(crate) fn is_wizard(&self) -> bool {
         self.next.as_deref() == Some(WIZARD_NEXT)
     }
+
+    /// Администратор подтвердил смену бота.
+    pub(crate) fn confirms_bot_change(&self) -> bool {
+        self.confirm_bot_change
+            .as_deref()
+            .is_some_and(|value| matches!(value.trim(), "1" | "on" | "true" | "yes"))
+    }
+}
+
+/// Смена бота, ожидающая подтверждения.
+pub(crate) struct BotChange {
+    /// Имя сохранённого бота.
+    pub(crate) previous_name: String,
+    /// Имя бота, токен которого введён.
+    pub(crate) new_name: String,
+    /// id бота, токен которого введён; не секрет.
+    pub(crate) new_id: i64,
+    /// Активные участники всех household инсталляции.
+    pub(crate) participants: i64,
 }
 
 /// Текстовое поле страницы: значение, источник и признак «только чтение».
@@ -130,6 +158,9 @@ pub(crate) struct TelegramView {
     pub(crate) webhook_error_date: Option<String>,
     /// `getWebhookInfo` не удался.
     pub(crate) webhook_info_failed: bool,
+    /// Смена бота ждёт подтверждения: обычная форма заменяется формой
+    /// подтверждения, токен в неё не возвращается.
+    pub(crate) bot_change: Option<BotChange>,
 }
 
 /// Итог сохранения формы.
@@ -139,6 +170,8 @@ pub(crate) enum TelegramSubmitOutcome {
         /// Сообщение об ошибке применения без секретов.
         apply_error: Option<String>,
     },
+    /// Другой бот требует явного подтверждения; ничего не сохранено.
+    ConfirmBotChange(BotChange),
     /// Ввод отклонён: страница показывается с этим сообщением.
     Rejected {
         /// HTTP-статус ответа.
@@ -241,6 +274,7 @@ pub(crate) async fn view(
         webhook_error_message,
         webhook_error_date,
         webhook_info_failed,
+        bot_change: None,
     })
 }
 
@@ -328,6 +362,11 @@ pub(crate) async fn submit(
             .filter(|token| !token.is_empty())
             .map(|token| SecretString::new(token.to_owned()))
     };
+    if form.confirms_bot_change() && mode != TelegramMode::Disabled && submitted_token.is_none() {
+        return Ok(rejected_bad_request(
+            "Введите токен бота ещё раз, чтобы подтвердить смену.",
+        ));
+    }
     let me = if mode == TelegramMode::Disabled {
         None
     } else {
@@ -354,6 +393,52 @@ pub(crate) async fn submit(
             })
             .unwrap_or_else(|| DEFAULT_BOT_USERNAME.to_owned())
     });
+    let new_bot_id = me.as_ref().map(|me| me.id);
+    let bot_changed = matches!(
+        (current_bot_id(settings), new_bot_id),
+        (Some(previous), Some(new_id)) if previous != new_id
+    );
+    if let (true, Some(new_id)) = (bot_changed, new_bot_id) {
+        // Подтверждение привязано к показанному боту: если на втором вводе
+        // оказался другой токен, форма показывается снова уже с его именем.
+        let confirmed_id = form
+            .confirm_bot_id
+            .as_deref()
+            .map(str::trim)
+            .and_then(|raw| parse_bot_id(raw).ok());
+        let confirmed = form.confirms_bot_change() && confirmed_id == Some(new_id);
+        if !confirmed {
+            // Бот один на инсталляцию, поэтому считаются участники всех
+            // household.
+            let mut conn = state.pool.acquire().await?;
+            let participants = users::count_active_installation(&mut conn).await?;
+            drop(conn);
+            if participants > 0 {
+                let new_name = me
+                    .as_ref()
+                    .and_then(|me| me.username.as_deref())
+                    .and_then(|raw| parse_bot_username(raw).ok())
+                    .unwrap_or_else(|| UNNAMED_BOT.to_owned());
+                let previous_name = {
+                    let name = text_of(settings, "telegram.bot_username");
+                    if name.is_empty() {
+                        UNNAMED_BOT.to_owned()
+                    } else {
+                        name
+                    }
+                };
+                return Ok(TelegramSubmitOutcome::ConfirmBotChange(BotChange {
+                    previous_name,
+                    new_name,
+                    new_id,
+                    participants,
+                }));
+            }
+        }
+    }
+    let previous_token = bot_changed
+        .then(|| effective.bot_token().cloned())
+        .flatten();
 
     let new_secret = if mode == TelegramMode::Webhook
         && !secret_state(settings, "telegram.webhook_secret").is_set()
@@ -445,7 +530,7 @@ pub(crate) async fn submit(
     }
 
     Ok(TelegramSubmitOutcome::Saved {
-        apply_error: apply_settings(state, mode).await,
+        apply_error: apply_settings(state, mode, bot_changed, previous_token).await,
     })
 }
 
@@ -500,7 +585,7 @@ pub(crate) async fn reissue_secret(
         .await;
 
     Ok(TelegramSubmitOutcome::Saved {
-        apply_error: apply_settings(state, mode).await,
+        apply_error: apply_settings(state, mode, false, None).await,
     })
 }
 
@@ -510,11 +595,29 @@ pub(crate) async fn reissue_secret(
 /// ожидаемый адрес: `start_generation` не превращает отказ `setWebhook` в
 /// ошибку (недоступность Telegram при старте не должна ронять сервис), поэтому
 /// страница сама сверяет `getWebhookInfo` с адресом из настроек.
-async fn apply_settings(state: &AdminState, mode: TelegramMode) -> Option<String> {
+async fn apply_settings(
+    state: &AdminState,
+    mode: TelegramMode,
+    bot_changed: bool,
+    previous_token: Option<SecretString>,
+) -> Option<String> {
     let supervisor = state.telegram_supervisor()?;
-    if let Err(error) = supervisor.reload().await {
+    let report = if bot_changed {
+        supervisor.reload_replacing_bot(previous_token).await
+    } else {
+        supervisor.reload_reporting().await
+    };
+    let report = match report {
+        Ok(report) => report,
+        Err(error) => {
+            return Some(format!(
+                "Настройки сохранены, но применить их не удалось: {error}."
+            ));
+        }
+    };
+    if let Some(code) = report.previous_webhook_error {
         return Some(format!(
-            "Настройки сохранены, но применить их не удалось: {error}."
+            "Настройки сохранены, но не удалось снять webhook прежнего бота ({code})."
         ));
     }
     if mode != TelegramMode::Webhook {

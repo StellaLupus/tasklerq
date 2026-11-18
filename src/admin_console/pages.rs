@@ -45,7 +45,7 @@ use super::recovery::{self, RecoveryCheck, RecoveryError, RecoveryOutcome};
 use super::router::AdminState;
 use super::session::{self, AdminSession, LOGIN_PATH};
 use super::setup::{self, SetupError, SetupOutcome};
-use super::telegram::{self, TelegramForm, TelegramSubmitOutcome, TelegramView};
+use super::telegram::{self, BotChange, TelegramForm, TelegramSubmitOutcome, TelegramView};
 use super::wizard::{self, WizardStep};
 use crate::VERSION;
 use crate::admin;
@@ -930,6 +930,9 @@ pub(crate) async fn telegram_submit(
         Ok(TelegramSubmitOutcome::Saved {
             apply_error: Some(message),
         }) => telegram_message(&state, Some(&form), true, wizard, &message, StatusCode::OK).await,
+        Ok(TelegramSubmitOutcome::ConfirmBotChange(change)) => {
+            telegram_confirmation(&state, &form, wizard, change).await
+        }
         Ok(TelegramSubmitOutcome::Rejected { status, message }) => {
             telegram_message(&state, Some(&form), false, wizard, &message, status).await
         }
@@ -949,8 +952,27 @@ pub(crate) async fn telegram_reissue_secret(
         Ok(TelegramSubmitOutcome::Saved {
             apply_error: Some(message),
         }) => telegram_message(&state, None, true, false, &message, StatusCode::OK).await,
+        Ok(TelegramSubmitOutcome::ConfirmBotChange(_)) => {
+            internal("bot change confirmation is not expected for a secret reissue")
+        }
         Ok(TelegramSubmitOutcome::Rejected { status, message }) => {
             telegram_message(&state, None, false, false, &message, status).await
+        }
+        Err(error) => internal(error),
+    }
+}
+
+/// Показать форму подтверждения смены бота; введённый токен не возвращается.
+async fn telegram_confirmation(
+    state: &AdminState,
+    form: &TelegramForm,
+    wizard: bool,
+    change: BotChange,
+) -> Response {
+    match telegram::view(state, Some(form), false, wizard).await {
+        Ok(mut view) => {
+            view.bot_change = Some(change);
+            render(ConsolePage::new(Page::Telegram(Box::new(view))))
         }
         Err(error) => internal(error),
     }
@@ -2753,6 +2775,43 @@ struct LlmBody<'a> {
 {% if view.readonly %}
 <p>Токен задан окружением TELEGRAM_BOT_TOKEN: страница доступна только для чтения.</p>
 {% else %}
+{% match view.bot_change %}
+{% when Some with (change) %}
+<section>
+<h2>Подтвердить смену бота</h2>
+<p role="alert">Сейчас подключён бот {{ change.previous_name }}, вводится бот {{ change.new_name }}.</p>
+<p role="alert">Участников в инсталляции: {{ change.participants }}. Новый бот не сможет писать участникам, пока они не отправят ему /start.</p>
+<form method="post" action="/admin/telegram">
+{% if view.wizard %}<input type="hidden" name="next" value="wizard">{% endif %}
+<input type="hidden" name="confirm_bot_change" value="1">
+<input type="hidden" name="confirm_bot_id" value="{{ change.new_id }}">
+<fieldset>
+<legend>Режим</legend>
+<p><label><input name="mode" type="radio" value="webhook"{% if view.webhook_selected %} checked{% endif %}> webhook</label></p>
+{% if view.polling_allowed %}
+<p><label><input name="mode" type="radio" value="polling"{% if view.polling_selected %} checked{% endif %}> polling</label></p>
+{% endif %}
+<p><label><input name="mode" type="radio" value="disabled"{% if view.disabled_selected %} checked{% endif %}> выключен</label></p>
+</fieldset>
+<fieldset>
+<legend>Токен</legend>
+<p>Введите токен нового бота ещё раз: страница не сохраняет его в форме.</p>
+<p><label for="telegram-confirm-token">Токен нового бота</label>
+<input id="telegram-confirm-token" name="token" type="password" autocomplete="new-password"></p>
+</fieldset>
+<fieldset>
+<legend>Адрес</legend>
+<p><label for="telegram-confirm-public-base-url">Публичный адрес</label>
+<input id="telegram-confirm-public-base-url" name="public_base_url" type="text" value="{{ view.public_base_url.value }}"{% if view.public_base_url.readonly %} readonly{% endif %}>
+<span class="console-source">источник: {{ view.public_base_url.source }}</span></p>
+<p><label for="telegram-confirm-webhook-override">Переопределение адреса webhook (пусто — публичный адрес)</label>
+<input id="telegram-confirm-webhook-override" name="webhook_url_override" type="text" value="{{ view.webhook_url_override.value }}"{% if view.webhook_url_override.readonly %} readonly{% endif %}>
+<span class="console-source">источник: {{ view.webhook_url_override.source }}</span></p>
+</fieldset>
+<p><button type="submit">Подтвердить смену бота</button></p>
+</form>
+</section>
+{% when None %}
 <form method="post" action="/admin/telegram">
 {% if view.wizard %}<input type="hidden" name="next" value="wizard">{% endif %}
 <fieldset>
@@ -2785,6 +2844,7 @@ struct LlmBody<'a> {
 <p><button type="submit">Перевыпустить секрет webhook</button></p>
 </form>
 {% endif %}
+{% endmatch %}
 {% endif %}
 {{ skip|safe }}
 "#,
