@@ -12656,13 +12656,22 @@ async fn queues_fragment_shows_status_counts_without_message_content() {
     }
 }
 
-/// Возраст самого старого готового обновления выделяется только сверх порога
-/// readiness; порог задаётся тем же `queue_lag_limit`, что у главной.
+/// Возраст самого старого готового обновления выделяется сверх порога readiness,
+/// когда бот работает — тем же условием, что у главной.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queues_highlight_only_the_age_over_the_readiness_limit() {
     let db = support::isolated_db().await;
-    insert_account(&db.pool, "admin").await;
-    let app = console_with_queue_limit(&db.pool, 300);
+    let server = MockServer::start().await;
+    mount_bot_base(&server).await;
+    mount_get_me(&server, 555_007, "tasklerq_queues_bot").await;
+    mount_webhook_info(&server, 0, None).await;
+
+    let config = telegram_config(
+        &db.pool,
+        Some(&server),
+        &[("QUEUE_READY_LAG_SECONDS", "300")],
+    )
+    .await;
     let update_id = 90_200_i64;
     sqlx::query(
         "INSERT INTO telegram_updates (update_id, payload, available_at, received_at)
@@ -12674,7 +12683,42 @@ async fn queues_highlight_only_the_age_over_the_readiness_limit() {
     .await
     .expect("the stale update");
 
-    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    // Держим обновление заблокированным, пока консоль запускает бота: воркер
+    // не должен разобрать строку раньше проверки, а `oldest_ready` её видит.
+    let mut lock = db.pool.begin().await.expect("lock transaction");
+    let locked: Option<i64> = sqlx::query_scalar(
+        "SELECT update_id FROM telegram_updates WHERE update_id = $1 FOR UPDATE",
+    )
+    .bind(update_id)
+    .fetch_optional(&mut *lock)
+    .await
+    .expect("lock the stale update");
+    assert_eq!(locked, Some(update_id));
+
+    let (application, app, cookie, shutdown_tx) = telegram_app(&config, &db.pool).await;
+    let (status, _, body) = send_form_from(
+        &app,
+        "/admin/telegram",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("mode", "webhook"),
+            ("token", "123:SECRET-queues-bot-token"),
+            ("public_base_url", "https://tasklerq.example.com"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        application.telegram_supervisor.ingress().is_active(),
+        "the queues page must see the same live bot as readiness"
+    );
+
     let (status, _, body) =
         send_with_cookie(&app, Method::GET, "/admin/queues/fragment", &cookie).await;
     assert_eq!(status, StatusCode::OK);
@@ -12692,50 +12736,43 @@ async fn queues_highlight_only_the_age_over_the_readiness_limit() {
         "the age is shown in whole minutes:\n{stale}"
     );
 
+    lock.rollback().await.expect("release the stale update");
+    stop_application(application, shutdown_tx).await;
+}
+
+/// Порог задан, но бот не работает: readiness его не применяет, поэтому возраст
+/// показывается без выделения и без текста о пороге.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queues_without_a_running_bot_do_not_highlight_an_age_over_the_limit() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with_queue_limit(&db.pool, 300);
     sqlx::query(
-        "UPDATE telegram_updates
-         SET available_at = now() - interval '1 minute',
-             received_at = now() - interval '1 minute'
-         WHERE update_id = $1",
+        "INSERT INTO telegram_updates (update_id, payload, available_at, received_at)
+         VALUES ($1, '{}'::jsonb, now() - interval '7 minutes',
+                 now() - interval '7 minutes')",
     )
-    .bind(update_id)
+    .bind(90_202_i64)
     .execute(&db.pool)
     .await
-    .expect("the fresh update");
+    .expect("the stale update");
 
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
     let (status, _, body) =
         send_with_cookie(&app, Method::GET, "/admin/queues/fragment", &cookie).await;
     assert_eq!(status, StatusCode::OK);
-    let fresh = String::from_utf8_lossy(&body);
+    let fragment = String::from_utf8_lossy(&body);
     assert!(
-        !fresh.contains("status-bad"),
-        "an age within the limit is not highlighted:\n{fresh}"
+        !fragment.contains("status-bad"),
+        "without a live bot the readiness limit is not applied:\n{fragment}"
     );
     assert!(
-        fresh.contains("1 мин"),
-        "the fresh age is still shown:\n{fresh}"
+        !fragment.contains("порог readiness"),
+        "the page must not name a limit it does not apply:\n{fragment}"
     );
-
-    // Граница: полсекунды сверх порога уже превышение, хотя целых секунд
-    // ровно столько же, сколько у порога.
-    sqlx::query(
-        "UPDATE telegram_updates
-         SET available_at = now() - interval '300.5 seconds',
-             received_at = now() - interval '300.5 seconds'
-         WHERE update_id = $1",
-    )
-    .bind(update_id)
-    .execute(&db.pool)
-    .await
-    .expect("the update half a second over the limit");
-
-    let (status, _, body) =
-        send_with_cookie(&app, Method::GET, "/admin/queues/fragment", &cookie).await;
-    assert_eq!(status, StatusCode::OK);
-    let boundary = String::from_utf8_lossy(&body);
     assert!(
-        boundary.contains("status-bad"),
-        "half a second over the threshold is highlighted:\n{boundary}"
+        fragment.contains("7 мин"),
+        "the age is still shown:\n{fragment}"
     );
 }
 

@@ -2,7 +2,8 @@
 //!
 //! Данные берутся из [`admin::queue_stats`]: только статусы и количества,
 //! содержимое заданий не читается. Порог задержки — тот же, что у readiness на
-//! главной ([`super::router::AdminState::queue_lag_limit`]); без порога возраст
+//! главной ([`super::router::AdminState::queue_lag_limit`]), и применяется тем же
+//! условием: пока живо поколение Telegram. Без порога или без бота возраст
 //! показывается без выделения.
 //!
 //! Панель опрашивает себя через htmx раз в 10 секунд; без JavaScript ссылку
@@ -120,9 +121,14 @@ pub(crate) async fn fragment(State(state): State<AdminState>, _session: AdminSes
 }
 
 /// Собрать статистику и применить тот же порог задержки, что у главной.
+///
+/// Readiness не применяет порог, пока нет живого поколения Telegram: очередь
+/// тогда никто не разбирает. Страница очередей повторяет это условие, иначе
+/// выключенный бот давал бы на ней красное выделение, которого нет на главной.
 async fn load(state: &AdminState) -> Result<QueuesView, DomainError> {
     let stats = admin::queue_stats(&state.pool, Utc::now()).await?;
-    Ok(QueuesView::new(stats, state.queue_lag_limit()))
+    let limit = state.queue_lag_limit().filter(|_| state.telegram_active());
+    Ok(QueuesView::new(stats, limit))
 }
 
 /// Отрисовать содержимое страницы без макета.
@@ -188,7 +194,9 @@ struct PanelBody<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::format_age;
+    use super::{QueuesView, format_age};
+    use crate::admin::QueueStats;
+    use chrono::{Duration, Utc};
 
     #[test]
     fn ages_are_shown_in_seconds_or_minutes() {
@@ -197,5 +205,25 @@ mod tests {
         assert_eq!(format_age(60), "1 мин");
         assert_eq!(format_age(425), "7 мин 5 с");
         assert_eq!(format_age(-1), "0 с");
+    }
+
+    /// В сравнении с порогом важен точный возраст: полсекунды сверх границы —
+    /// уже превышение, хотя целых секунд столько же, сколько у порога.
+    #[test]
+    fn only_an_age_over_the_limit_is_a_violation() {
+        let now = Utc::now();
+        let stats = |age: Duration| QueueStats {
+            oldest_ready: Some(now - age),
+            now,
+            ..QueueStats::default()
+        };
+        let limit = Some(Duration::seconds(300));
+
+        let within = QueuesView::new(stats(Duration::seconds(60)), limit);
+        assert_eq!(within.oldest_age, "1 мин");
+        assert!(within.oldest_violation.is_none());
+
+        let over = QueuesView::new(stats(Duration::milliseconds(300_500)), limit);
+        assert_eq!(over.oldest_violation.as_deref(), Some("5 мин"));
     }
 }
