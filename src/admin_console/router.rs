@@ -262,7 +262,10 @@ fn failure_limiter() -> Arc<RateLimiter<IpAddr>> {
 pub fn build_router(state: AdminState) -> Router {
     Router::new()
         .route("/admin", get(pages::index))
-        .route("/admin/households", get(households::list))
+        .route(
+            "/admin/households",
+            get(households::list).post(households::create),
+        )
         .route("/admin/households/{id}", get(households::detail))
         .route(WIZARD_PATH, get(pages::wizard_page))
         .route(WIZARD_SKIP_PATH, post(pages::wizard_skip))

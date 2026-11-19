@@ -8,7 +8,7 @@
   `tests/admin_console.rs`: список показывает число участников, открытых задач
   и токенов без содержимого задач; в `single` меню ведёт на household (spec
   admin-console «Управление household в консоли», design, решение 2).
-- [ ] 1.2 Создание household через `admin::create_household`; в `multi` после
+- [x] 1.2 Создание household через `admin::create_household`; в `multi` после
   создания — предложение ссылки-claim. Проверить: в `single` второй household
   отклонён с текстом `admin::describe`, данные не изменились; в `multi`
   созданы household и три списка (spec admin-console «Управление household в

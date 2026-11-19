@@ -9924,28 +9924,55 @@ async fn households_list_shows_counts_without_task_content_or_full_telegram_ids(
     assert_security_headers(&headers, "GET /admin/households");
     let text = String::from_utf8_lossy(&body);
 
+    let flat_row = household_row(&text, "Квартира");
     for expected in [
-        "Квартира",
-        "Дача",
-        "Europe/Moscow",
-        "Asia/Yekaterinburg",
-        "участники: 2",
-        "участники: 1",
-        "владелец: есть",
-        "владелец: нет",
-        "открытых задач: 1",
-        "открытых задач: 0",
-        "активных токенов: 1",
-        "активных токенов: 0",
+        "Europe/Moscow".to_owned(),
+        "участники: 2".to_owned(),
+        "владелец: есть".to_owned(),
+        "открытых задач: 1".to_owned(),
+        "активных токенов: 1".to_owned(),
+        format!("href=\"/admin/households/{}\"", flat.id),
     ] {
-        assert!(text.contains(expected), "missing `{expected}` in:\n{text}");
-    }
-    for id in [flat.id, dacha.id] {
         assert!(
-            text.contains(&format!("href=\"/admin/households/{id}\"")),
-            "no link to {id} in:\n{text}"
+            flat_row.contains(&expected),
+            "missing `{expected}` in the Квартира row:\n{flat_row}"
         );
     }
+    let dacha_row = household_row(&text, "Дача");
+    for expected in [
+        "Asia/Yekaterinburg".to_owned(),
+        "участники: 1".to_owned(),
+        "владелец: нет".to_owned(),
+        "открытых задач: 0".to_owned(),
+        "активных токенов: 0".to_owned(),
+        format!("href=\"/admin/households/{}\"", dacha.id),
+    ] {
+        assert!(
+            dacha_row.contains(&expected),
+            "missing `{expected}` in the Дача row:\n{dacha_row}"
+        );
+    }
+
+    let path = format!("/admin/households/{}", flat.id);
+    let (status, _, body) = send_with_cookie(&app, Method::GET, &path, &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let card = String::from_utf8_lossy(&body);
+    for expected in [
+        "<dt>Часовой пояс</dt><dd>Europe/Moscow</dd>",
+        "<dt>Владелец</dt><dd>есть</dd>",
+        "<dt>Участники</dt><dd>2</dd>",
+        "<dt>Открытые задачи</dt><dd>1</dd>",
+        "<dt>Активные токены</dt><dd>1</dd>",
+    ] {
+        assert!(
+            card.contains(expected),
+            "missing `{expected}` on the card:\n{card}"
+        );
+    }
+    assert!(
+        !card.contains("action=\"/admin/owner\""),
+        "a household with an owner has no claim block:\n{card}"
+    );
     assert!(
         !text.contains(TASK_TITLE),
         "the list must not show task content:\n{text}"
@@ -9967,13 +9994,25 @@ async fn single_mode_households_redirects_to_the_only_household_and_nav_links_to
     let app = console_with(&db.pool, TenancyMode::Single, false, LlmConfig::empty());
     let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
 
-    // Пока household нет, ошибки нет: пустой список с пояснением.
+    // Пока household нет, ошибки нет: пустой список с формой создания.
     let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin/households", &cookie).await;
     assert_eq!(status, StatusCode::OK);
+    let empty = String::from_utf8_lossy(&body);
     assert!(
-        String::from_utf8_lossy(&body).contains("Активных household нет"),
-        "an empty installation explains the empty list:\n{}",
-        String::from_utf8_lossy(&body)
+        empty.contains("Активных household нет"),
+        "an empty installation explains the empty list:\n{empty}"
+    );
+    assert!(
+        empty.contains("action=\"/admin/households\""),
+        "an empty installation offers the creation form:\n{empty}"
+    );
+    assert!(
+        empty.contains("name=\"timezone\"") && empty.contains("value=\"Europe/Moscow\""),
+        "the form defaults to the wizard timezone:\n{empty}"
+    );
+    assert!(
+        !empty.contains("появится позже"),
+        "the empty list must not promise a future form:\n{empty}"
     );
 
     let household = tasklerq::admin::create_household(
@@ -10069,5 +10108,240 @@ async fn households_pages_require_a_session_like_the_rest_of_the_console() {
         let (status, headers, _) = send(&app, Method::GET, &path).await;
         assert_eq!(status, StatusCode::SEE_OTHER, "{path}");
         assert_eq!(location(&headers), Some("/admin/login"), "{path}");
+    }
+}
+
+/// Строка списка household с указанным названием целиком: от `<li>` до `</li>`.
+fn household_row<'a>(html: &'a str, name: &str) -> &'a str {
+    let marker = format!(">{name}</a>");
+    let name_position = html
+        .find(&marker)
+        .unwrap_or_else(|| panic!("no row for {name} in:\n{html}"));
+    let start = html[..name_position]
+        .rfind("<li>")
+        .unwrap_or_else(|| panic!("no row start for {name} in:\n{html}"));
+    let end = name_position
+        + html[name_position..]
+            .find("</li>")
+            .map(|offset| offset + "</li>".len())
+            .unwrap_or_else(|| panic!("no row end for {name} in:\n{html}"));
+    &html[start..end]
+}
+
+/// В `single` второй household отклоняется текстом `admin::describe`, форма
+/// сохраняет ввод, а данные не меняются.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_in_single_mode_refuse_a_second_one_with_the_describe_text() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Single, false, LlmConfig::empty());
+    let now = Utc::now();
+    tasklerq::admin::create_household(&db.pool, TenancyMode::Single, "Дом", "Europe/Moscow", now)
+        .await
+        .expect("the first household");
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let refused = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Single,
+        "Дача",
+        "Europe/Moscow",
+        now,
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "single mode must refuse the second household"
+    );
+    let expected = tasklerq::admin::describe(&refused.expect_err("a refused household"));
+
+    let (status, _, body) = send_form_from(
+        &app,
+        "/admin/households",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("name", "Дача"), ("timezone", "Europe/Moscow")],
+    )
+    .await;
+    assert!(
+        status.is_client_error(),
+        "a domain refusal is a 4xx, not {status}"
+    );
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains(&expected),
+        "the page explains the refusal with `{expected}`:\n{text}"
+    );
+    assert!(
+        text.contains("value=\"Дача\""),
+        "the form keeps the submitted name:\n{text}"
+    );
+    assert_eq!(
+        household_count(&db.pool).await,
+        1,
+        "the refused creation changes nothing"
+    );
+}
+
+/// В `multi` создание household даёт три списка и карточку с предложением
+/// выпустить ссылку-claim владельца.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_creation_in_multi_offers_the_owner_claim() {
+    let db = support::isolated_db().await;
+    let config = telegram_config(&db.pool, None, &[]).await;
+    let cipher = SecretCipher::from_config(&config);
+    seed_bot(
+        &db.pool,
+        &cipher,
+        "polling",
+        "123:SECRET-created-household",
+        "created-household-secret",
+        902_001,
+        "tasklerq_create_bot",
+    )
+    .await;
+    let (app, cookie) = owner_console_with_login(&db.pool, &config, TenancyMode::Multi).await;
+
+    let (status, headers, body) = send_form_from(
+        &app,
+        "/admin/households",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("name", "Дача"), ("timezone", "Europe/Moscow")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "a created household redirects: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let location = location(&headers).expect("a redirect to the new household");
+    let id = Uuid::parse_str(
+        location
+            .strip_prefix("/admin/households/")
+            .unwrap_or_else(|| panic!("unexpected redirect target {location}")),
+    )
+    .expect("the redirect carries the household id");
+
+    let name: String = sqlx::query_scalar("SELECT name FROM households WHERE id = $1")
+        .bind(id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("the created household");
+    assert_eq!(name, "Дача");
+    let lists: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM lists
+         WHERE household_id = $1 AND deleted_at IS NULL
+         ORDER BY position",
+    )
+    .bind(id)
+    .fetch_all(&db.pool)
+    .await
+    .expect("the default lists");
+    assert_eq!(lists, vec!["Задачи", "Покупки", "Календарь"]);
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, location, &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("action=\"/admin/owner\""),
+        "the card offers the claim link:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("name=\"target\" value=\"{id}\"")),
+        "the claim form targets the new household:\n{text}"
+    );
+    assert!(text.contains("Выпустить ссылку"), "{text}");
+}
+
+/// Неверный часовой пояс и пустое название — ошибка формы с сохранённым
+/// вводом; household не создаётся.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_invalid_form_keeps_the_input_and_creates_nothing() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let (status, _, body) = send_form_from(
+        &app,
+        "/admin/households",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("name", "Дача"), ("timezone", "Mars/Olympus")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "an invalid timezone is a form error: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("value=\"Дача\""),
+        "the submitted name comes back:\n{text}"
+    );
+    assert!(
+        text.contains("value=\"Mars/Olympus\""),
+        "the submitted timezone comes back:\n{text}"
+    );
+    assert_eq!(household_count(&db.pool).await, 0);
+
+    let (status, _, body) = send_form_from(
+        &app,
+        "/admin/households",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("name", "   "), ("timezone", "Europe/Moscow")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "an empty name is a form error: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("must not be empty"),
+        "the page explains the empty name:\n{text}"
+    );
+    assert_eq!(household_count(&db.pool).await, 0);
+}
+
+/// В `single` с несколькими активными household список показывается без
+/// перехода: единственного дома нет.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn single_mode_with_several_households_shows_the_list() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Single, false, LlmConfig::empty());
+    let now = Utc::now();
+    let mut ids = Vec::new();
+    for name in ["Квартира", "Дача"] {
+        let household = tasklerq::admin::create_household(
+            &db.pool,
+            TenancyMode::Multi,
+            name,
+            "Europe/Moscow",
+            now,
+        )
+        .await
+        .expect("a household");
+        ids.push(household.id);
+    }
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin/households", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "the list stays in place");
+    let text = String::from_utf8_lossy(&body);
+    for (name, id) in [("Квартира", ids[0]), ("Дача", ids[1])] {
+        assert!(
+            text.contains(&format!("href=\"/admin/households/{id}\"")),
+            "the list links to {name}:\n{text}"
+        );
+        assert!(household_row(&text, name).contains(name), "{text}");
     }
 }

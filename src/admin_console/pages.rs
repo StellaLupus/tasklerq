@@ -181,9 +181,9 @@ pub(crate) struct SkipForm {
 #[derive(Deserialize)]
 pub(crate) struct HouseholdForm {
     /// Название household.
-    name: String,
+    pub(crate) name: String,
     /// Часовой пояс IANA.
-    timezone: String,
+    pub(crate) timezone: String,
 }
 
 /// Поля формы токена Home Assistant: имя по желанию.
@@ -1953,8 +1953,20 @@ pub(crate) fn render_household_list(view: super::households::HouseholdList) -> R
 }
 
 /// Отрисовать карточку household в общем макете.
-pub(crate) fn render_household_detail(view: super::households::HouseholdDetail) -> Response {
+pub(crate) fn render_household_detail(view: super::households::HouseholdView) -> Response {
     render(ConsolePage::new(Page::Household(Box::new(view))))
+}
+
+/// Отрисовать список household с сообщением отказа формы.
+pub(crate) fn render_household_list_error(
+    view: super::households::HouseholdList,
+    message: &str,
+    status: StatusCode,
+) -> Response {
+    render_with_status(
+        ConsolePage::new(Page::Households(Box::new(view))).error(message),
+        status,
+    )
 }
 
 /// Вид страницы настроек LLM.
@@ -2397,7 +2409,7 @@ enum Page {
     /// Список household.
     Households(Box<super::households::HouseholdList>),
     /// Карточка household.
-    Household(Box<super::households::HouseholdDetail>),
+    Household(Box<super::households::HouseholdView>),
 }
 
 /// Поля шага мастера, которые возвращаются в форму после отказа.
