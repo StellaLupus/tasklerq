@@ -449,7 +449,9 @@ pub(crate) async fn submit(
     };
 
     let mut changes: Vec<(&'static str, &'static str)> = Vec::new();
-    if text_of(settings, "telegram.mode") != mode.as_str() {
+    if source_of(settings, "telegram.mode") != SettingSource::Db
+        || text_of(settings, "telegram.mode") != mode.as_str()
+    {
         changes.push(("telegram.mode", "changed"));
     }
     if let Some(me) = &me {
@@ -615,15 +617,25 @@ async fn apply_settings(
             ));
         }
     };
-    if let Some(code) = report.previous_webhook_error {
-        return Some(format!(
-            "Настройки сохранены, но не удалось снять webhook прежнего бота ({code})."
-        ));
-    }
+    let previous_error = report.previous_webhook_error.map(|code| {
+        format!("Настройки сохранены, но не удалось снять webhook прежнего бота ({code}).")
+    });
     if mode != TelegramMode::Webhook {
-        return None;
+        return previous_error;
     }
 
+    // Сверка нового webhook идёт после снятия прежнего: отказ `deleteWebhook`
+    // не должен скрывать, что новый адрес не зарегистрирован. Если не удались
+    // обе операции, сообщение о новом webhook показывается первым.
+    match (verify_new_webhook(state).await, previous_error) {
+        (Some(new), Some(previous)) => Some(format!("{new} {previous}")),
+        (Some(new), None) => Some(new),
+        (None, previous) => previous,
+    }
+}
+
+/// Сверить фактический webhook нового бота с адресом из настроек.
+async fn verify_new_webhook(state: &AdminState) -> Option<String> {
     let config = state.telegram_config()?;
     let effective =
         settings::read_effective_telegram(&state.pool, config, state.llm_settings().cipher())
@@ -631,6 +643,7 @@ async fn apply_settings(
             .ok()?;
     let expected = configured_webhook_address(&effective, effective.settings())?;
     let token = effective.bot_token()?;
+
     match webhook_info(config, token).await {
         Some(info) if info.url == expected => None,
         Some(_) => Some(
@@ -706,7 +719,7 @@ fn collect_url_change(
     match submitted {
         SubmittedField::Keep => {}
         SubmittedField::Delete => {
-            if resolved(settings, key).is_some() {
+            if source_of(settings, key) == SettingSource::Db {
                 changes.push((key, "deleted"));
             }
         }

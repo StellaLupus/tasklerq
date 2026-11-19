@@ -278,6 +278,7 @@ pub fn build_router(state: AdminState) -> Router {
             pages::TELEGRAM_SECRET_PATH,
             post(pages::telegram_reissue_secret),
         )
+        .route(pages::OWNER_PATH, post(pages::owner_submit))
         .route(pages::LLM_CHECK_PATH, get(pages::llm_check_page))
         .route(
             pages::LLM_CHECK_FRAGMENT_PATH,

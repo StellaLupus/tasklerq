@@ -76,14 +76,28 @@ pub async fn issue(
     household_id: Option<Uuid>,
     now: DateTime<Utc>,
 ) -> Result<IssuedCode, DomainError> {
-    let expires_at = purpose.ttl().and_then(|ttl| now.checked_add_signed(ttl));
-
     let mut tx = pool.begin().await?;
-    let issued =
-        repository::issue(&mut tx, purpose.as_str(), household_id, expires_at, now).await?;
+    let issued = issue_locked(&mut tx, purpose, household_id, now).await?;
     tx.commit().await?;
 
     Ok(issued)
+}
+
+/// Выпустить код в транзакции вызывающего.
+///
+/// Нужен путям, которые проверяют цель и выпускают код одной транзакцией:
+/// ссылка-claim держит блокировку household, пока не увидит отсутствие
+/// владельца и не вставит новый код. Политика срока остаётся здесь же, поэтому
+/// [`issue`] и [`issue_locked`] не расходятся.
+pub async fn issue_locked(
+    conn: &mut PgConnection,
+    purpose: Purpose,
+    household_id: Option<Uuid>,
+    now: DateTime<Utc>,
+) -> Result<IssuedCode, DomainError> {
+    let expires_at = purpose.ttl().and_then(|ttl| now.checked_add_signed(ttl));
+    lock_purpose(conn, purpose, household_id).await?;
+    repository::issue(conn, purpose.as_str(), household_id, expires_at, now).await
 }
 
 /// Взять блокировку выпуска кодов назначения в транзакции вызывающего.

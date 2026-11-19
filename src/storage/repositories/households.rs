@@ -213,7 +213,14 @@ pub async fn create_empty(
 }
 
 /// Взять блокировку инсталляции и проверить единственность в `single`.
-async fn lock_installation(conn: &mut PgConnection, mode: TenancyMode) -> Result<(), DomainError> {
+///
+/// Вызывающий держит блокировку до конца транзакции: проверка «household ещё
+/// нет» и вставка идут без окна для параллельного создания. Ссылка-claim
+/// пустой инсталляции берёт ту же блокировку.
+pub(crate) async fn lock_installation(
+    conn: &mut PgConnection,
+    mode: TenancyMode,
+) -> Result<(), DomainError> {
     sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
         .bind(INSTALLATION_LOCK_CLASS)
         .bind(INSTALLATION_LOCK_OBJECT)
@@ -390,6 +397,31 @@ pub async fn installation(conn: &mut PgConnection) -> Result<Installation, Domai
         },
         _ => Installation::Multiple,
     })
+}
+
+/// Активные household без активного владельца.
+///
+/// Владелец — пользователь с ролью `owner` и `deleted_at IS NULL`; удалённый
+/// владелец не скрывает household из списка ссылки-claim.
+pub async fn list_active_without_owner(
+    conn: &mut PgConnection,
+) -> Result<Vec<Household>, DomainError> {
+    let households = sqlx::query_as::<_, Household>(
+        "SELECT h.id, h.name, h.timezone, h.created_at, h.updated_at, h.deleted_at
+         FROM households h
+         WHERE h.deleted_at IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM users u
+               WHERE u.household_id = h.id
+                 AND u.role = 'owner'
+                 AND u.deleted_at IS NULL
+           )
+         ORDER BY h.created_at, h.id",
+    )
+    .fetch_all(conn)
+    .await?;
+
+    Ok(households)
 }
 
 /// Все неудалённые household (для административных команд).

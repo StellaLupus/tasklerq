@@ -7,6 +7,7 @@ pub mod checks;
 pub mod codes;
 pub mod login;
 pub mod origin;
+pub mod owner;
 pub mod pages;
 pub mod password;
 pub mod recovery;

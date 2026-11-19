@@ -39,7 +39,9 @@ use serde_json::Value;
 use super::assets;
 use super::change::{self, ChangeError, ChangeOutcome};
 use super::checks::{CheckOutcome, CheckSlot, CheckSnapshot};
+use super::codes::OWNER_CLAIM_TTL_HOURS;
 use super::login::{self, LoginError, LoginOutcome};
+use super::owner::{self, OwnerIssueOutcome, OwnerLinkForm};
 use super::password::{self, Password};
 use super::recovery::{self, RecoveryCheck, RecoveryError, RecoveryOutcome};
 use super::router::AdminState;
@@ -77,6 +79,8 @@ pub(crate) const LLM_PATH: &str = "/admin/llm";
 pub(crate) const TELEGRAM_PATH: &str = telegram::TELEGRAM_PATH;
 /// Путь перевыпуска секрета webhook.
 pub(crate) const TELEGRAM_SECRET_PATH: &str = telegram::TELEGRAM_SECRET_PATH;
+/// Путь выпуска ссылки-claim владельца.
+pub(crate) const OWNER_PATH: &str = owner::OWNER_PATH;
 /// Путь страницы хода проверки слота.
 pub(crate) const LLM_CHECK_PATH: &str = "/admin/llm/check";
 /// Путь фрагмента хода для htmx; без JavaScript страница обновляется ссылкой.
@@ -286,8 +290,50 @@ pub(crate) struct CheckForm {
 /// household, Telegram и статусы слотов. Готовность считает та же сборка, что
 /// `/health/ready`.
 pub(crate) async fn index(State(state): State<AdminState>, _session: AdminSession) -> Response {
-    match home_view(&state, Utc::now()).await {
-        Ok(view) => render(ConsolePage::new(Page::Home(Box::new(view)))),
+    home_response(&state, Utc::now(), None).await
+}
+
+/// Главная с необязательным сообщением формы и его статусом.
+async fn home_response(
+    state: &AdminState,
+    now: DateTime<Utc>,
+    error: Option<(&str, StatusCode)>,
+) -> Response {
+    match home_view(state, now).await {
+        Ok(view) => {
+            let page = ConsolePage::new(Page::Home(Box::new(view)));
+            match error {
+                Some((message, status)) => render_with_status(page.error(message), status),
+                None => render(page),
+            }
+        }
+        Err(error) => internal(error),
+    }
+}
+
+/// Выпустить ссылку-claim владельца для выбранной цели.
+///
+/// Открытый код показывается только в этом ответе; при повторном открытии
+/// страницы он недоступен, потому что в базе хранится хеш.
+pub(crate) async fn owner_submit(
+    State(state): State<AdminState>,
+    _session: AdminSession,
+    Form(form): Form<OwnerLinkForm>,
+) -> Response {
+    let now = Utc::now();
+    match owner::issue(&state, &form.target, now).await {
+        Ok(OwnerIssueOutcome::Issued(link)) => {
+            let view = OwnerLinkView {
+                link: link.link,
+                expires_at: link.expires_at.to_rfc3339(),
+                ttl_hours: OWNER_CLAIM_TTL_HOURS,
+                svg: link.svg,
+            };
+            render(ConsolePage::new(Page::OwnerLinkIssued(Box::new(view))))
+        }
+        Ok(OwnerIssueOutcome::Rejected(message)) => {
+            home_response(&state, now, Some((&message, StatusCode::BAD_REQUEST))).await
+        }
         Err(error) => internal(error),
     }
 }
@@ -312,6 +358,10 @@ struct HomeView {
     households: i64,
     /// Telegram включён.
     telegram_enabled: bool,
+    /// Цели ссылки-claim владельца.
+    owner_targets: Vec<owner::OwnerTarget>,
+    /// Бот включён и его имя известно: можно выпускать ссылку.
+    owner_telegram_ready: bool,
     /// Статусы основного и резервного слотов.
     slots: Vec<HomeSlot>,
 }
@@ -322,6 +372,18 @@ struct HomeWarning {
     code: String,
     /// Понятная подпись.
     label: String,
+}
+
+/// Выпущенная ссылка-claim: открытый код показывается один раз.
+struct OwnerLinkView {
+    /// Ссылка `https://t.me/<бот>?start=own_<код>`.
+    link: String,
+    /// Срок действия в RFC 3339.
+    expires_at: String,
+    /// Срок в часах для подписи.
+    ttl_hours: i64,
+    /// SVG QR-кода, сгенерированный сервером.
+    svg: String,
 }
 
 /// Статус одного слота LLM на главной.
@@ -372,6 +434,9 @@ async fn home_view(state: &AdminState, now: DateTime<Utc>) -> Result<HomeView, D
     let active_households = households::count_active(&mut conn).await?;
     drop(conn);
 
+    let owner_targets = owner::targets(state).await?;
+    let owner_telegram_ready = owner_targets.telegram_ready;
+
     let slots = home_slots(state, now).await;
 
     Ok(HomeView {
@@ -387,6 +452,8 @@ async fn home_view(state: &AdminState, now: DateTime<Utc>) -> Result<HomeView, D
         },
         households: active_households,
         telegram_enabled: snapshot.telegram_enabled,
+        owner_targets: owner_targets.targets,
+        owner_telegram_ready,
         slots,
     })
 }
@@ -2160,6 +2227,8 @@ enum Page {
     Llm(Box<LlmView>),
     /// Подключение Telegram.
     Telegram(Box<TelegramView>),
+    /// Выпущенная ссылка-claim владельца.
+    OwnerLinkIssued(Box<OwnerLinkView>),
     /// Ход проверки слота.
     Check(Option<CheckSnapshot>),
 }
@@ -2196,6 +2265,7 @@ impl Page {
             Self::TokenIssued { .. } => "Токен Home Assistant",
             Self::Llm(_) => "Разбор записей",
             Self::Telegram(_) => "Telegram",
+            Self::OwnerLinkIssued(_) => "Ссылка-claim владельца",
             Self::Check(_) => "Проверка слота",
         }
     }
@@ -2213,6 +2283,7 @@ impl Page {
                 | Self::TokenIssued { .. }
                 | Self::Llm(_)
                 | Self::Telegram(_)
+                | Self::OwnerLinkIssued(_)
                 | Self::Check(_)
         )
     }
@@ -2315,6 +2386,7 @@ impl Page {
                 }
                 .render()
             }
+            Self::OwnerLinkIssued(view) => OwnerLinkBody { view }.render(),
             Self::Check(snapshot) => {
                 let view = check_view(snapshot.as_ref());
                 let check = CheckBody { view: &view }.render()?;
@@ -2442,6 +2514,26 @@ struct Layout<'a> {
 </ul>
 </section>
 {% endif %}
+{% if !view.owner_targets.is_empty() %}
+<section>
+<h2>Владелец</h2>
+{% if view.owner_telegram_ready %}
+<p>Выпустите одноразовую ссылку для того, кто станет владельцем.</p>
+<ul class="console-owner-targets">
+{% for target in view.owner_targets %}
+<li>{{ target.label }}
+<form method="post" action="/admin/owner">
+<input type="hidden" name="target" value="{{ target.value }}">
+<button type="submit">Выпустить ссылку</button>
+</form>
+</li>
+{% endfor %}
+</ul>
+{% else %}
+<p class="console-notice">Сначала подключите бота на странице <a href="/admin/telegram">Telegram</a>.</p>
+{% endif %}
+</section>
+{% endif %}
 <section>
 <h2>Слоты LLM</h2>
 <ul class="console-slots">
@@ -2456,6 +2548,24 @@ struct Layout<'a> {
 struct HomeBody<'a> {
     /// Данные состояния инсталляции.
     view: &'a HomeView,
+}
+
+/// Содержимое выпущенной ссылки-claim.
+#[derive(Template)]
+#[template(
+    source = r#"<h1>Ссылка-claim владельца</h1>
+<p>Передайте ссылку или QR-код тому, кто станет владельцем.</p>
+<p><a href="{{ view.link }}" rel="noreferrer">{{ view.link }}</a></p>
+<p>Срок действия: {{ view.ttl_hours }} ч, до {{ view.expires_at }}.</p>
+<div class="console-qr">{{ view.svg|safe }}</div>
+<p class="console-notice">Код сохранён только хешем: при повторном открытии страницы ссылка недоступна. Ссылку можно выпустить заново.</p>
+<p><a href="/admin">На главную</a></p>
+"#,
+    ext = "html"
+)]
+struct OwnerLinkBody<'a> {
+    /// Ссылка, срок и SVG QR-кода.
+    view: &'a OwnerLinkView,
 }
 
 /// Содержимое первого входа.
@@ -2967,6 +3077,8 @@ mod tests {
             tenancy: "single",
             households: 1,
             telegram_enabled: false,
+            owner_targets: Vec::new(),
+            owner_telegram_ready: false,
             slots: vec![HomeSlot {
                 label: "Основной слот",
                 status: "не проверен".to_owned(),

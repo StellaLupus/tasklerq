@@ -8312,7 +8312,19 @@ async fn an_outbox_message_queued_before_rotation_is_delivered_by_the_new_token(
         .await
         .expect("make the queued message due");
     wait_for_token_requests(&server, "sendMessage", BOT_B_TOKEN, 1).await;
+    wait_for_outbox_status(&db.pool, seq, "sent").await;
+    let (status, message_id): (String, Option<i64>) =
+        sqlx::query_as("SELECT status::text, message_id FROM outbox WHERE seq = $1")
+            .bind(seq)
+            .fetch_one(&db.pool)
+            .await
+            .expect("outbox row");
+    assert_eq!(status, "sent");
+    assert_eq!(message_id, Some(1));
 
+    // Проверяем вызовы после того, как строка зафиксирована как `sent`:
+    // повторная доставка прежним поколением проявилась бы уже после этого.
+    tokio::time::sleep(Duration::from_millis(200)).await;
     let sends: Vec<_> = bot_requests(&server, "sendMessage")
         .await
         .into_iter()
@@ -8336,16 +8348,6 @@ async fn an_outbox_message_queued_before_rotation_is_delivered_by_the_new_token(
             .all(|request| request_bot_token(request).as_deref() != Some(BOT_A_TOKEN)),
         "the old token must not deliver anything after the rotation"
     );
-
-    wait_for_outbox_status(&db.pool, seq, "sent").await;
-    let (status, message_id): (String, Option<i64>) =
-        sqlx::query_as("SELECT status::text, message_id FROM outbox WHERE seq = $1")
-            .bind(seq)
-            .fetch_one(&db.pool)
-            .await
-            .expect("outbox row");
-    assert_eq!(status, "sent");
-    assert_eq!(message_id, Some(1));
 
     stop_application(application, shutdown_tx).await;
 }
@@ -8412,6 +8414,14 @@ async fn token_rotation_keeps_both_tokens_out_of_the_page_and_the_log() {
 
     let html = String::from_utf8_lossy(&page);
     let logged = logs.contents();
+    assert!(
+        !logged.trim().is_empty(),
+        "the log buffer must not be empty, otherwise the redaction check proves nothing"
+    );
+    assert!(
+        logged.contains("telegram webhook registered"),
+        "the new webhook registration must reach the captured log:\n{logged}"
+    );
     for token in [BOT_A_TOKEN, BOT_B_TOKEN] {
         assert!(
             !html.contains(token),
@@ -8422,6 +8432,720 @@ async fn token_rotation_keeps_both_tokens_out_of_the_page_and_the_log() {
             "the log leaked a telegram token:\n{logged}"
         );
     }
+
+    stop_application(application, shutdown_tx).await;
+}
+
+/// Консоль с настройками Telegram и без супервизора: страница и выпуск
+/// ссылки-claim не трогают рантайм.
+fn owner_console(pool: &PgPool, config: &Config, tenancy: TenancyMode) -> Router {
+    let cipher = SecretCipher::from_config(config);
+    let handle = LlmHandle::new(LlmSnapshot::from_effective(settings::effective_llm(
+        &config.llm,
+        &[],
+        &cipher,
+    )));
+    let llm = LlmSettings::new(pool.clone(), config.llm.clone(), cipher, handle);
+    build_admin_router(
+        AdminState::new(pool.clone(), Vec::new(), Audit::new(pool.clone()), llm)
+            .with_wizard(WizardSettings::new(tenancy, true))
+            .with_telegram_config(config.clone()),
+    )
+}
+
+/// Консоль и cookie администратора.
+async fn owner_console_with_login(
+    pool: &PgPool,
+    config: &Config,
+    tenancy: TenancyMode,
+) -> (Router, String) {
+    let app = owner_console(pool, config, tenancy);
+    insert_account(pool, "admin").await;
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    (app, cookie)
+}
+
+/// Активный household без владельца.
+async fn household_without_owner(pool: &PgPool, name: &str) -> Uuid {
+    let mut tx = pool.begin().await.expect("household transaction");
+    let household = households::create_empty(
+        &mut tx,
+        TenancyMode::Multi,
+        name,
+        "Europe/Moscow",
+        &tasklerq::admin::admin_actor(),
+        Utc::now(),
+    )
+    .await
+    .expect("household is created");
+    tx.commit().await.expect("commit the household");
+    household.id
+}
+
+/// Назначить household владельца напрямую, как после claim.
+async fn add_owner(pool: &PgPool, household_id: Uuid, telegram_id: i64) {
+    sqlx::query(
+        "INSERT INTO users (
+             id, household_id, telegram_user_id, telegram_chat_id, display_name, role
+         )
+         VALUES ($1, $2, $3, $3, 'Owner', 'owner')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(household_id)
+    .bind(telegram_id)
+    .execute(pool)
+    .await
+    .expect("owner row");
+}
+
+/// Код из ссылки `https://t.me/<бот>?start=own_<код>`.
+fn owner_code_from(html: &str) -> String {
+    let marker = "?start=own_";
+    let start = html
+        .find(marker)
+        .unwrap_or_else(|| panic!("no owner claim link in:\n{html}"))
+        + marker.len();
+    html[start..].chars().take(22).collect()
+}
+
+/// Внешние адреса из атрибутов `href` и `src`.
+fn external_resource_urls(html: &str) -> Vec<&str> {
+    let mut urls = Vec::new();
+    for attribute in ["href=\"", "src=\""] {
+        let mut rest = html;
+        while let Some(position) = rest.find(attribute) {
+            let start = position + attribute.len();
+            let Some(end) = rest[start..].find('"') else {
+                break;
+            };
+            let url = &rest[start..start + end];
+            if url.starts_with("http") {
+                urls.push(url);
+            }
+            rest = &rest[start + end..];
+        }
+    }
+    urls
+}
+
+/// Бот, принимающий `/start own_…`, на той же базе.
+fn owner_claim_harness(pool: &PgPool, telegram_id: i64, tenancy: TenancyMode) -> Harness {
+    let bot = Bot::new("tasklerq_owner_bot")
+        .with_tenancy_config(TenancyConfig {
+            mode: tenancy,
+            bootstrap_owner: None,
+        })
+        .with_audit(Audit::new(pool.clone()));
+    Harness::with_handler(pool, telegram_id, Arc::new(bot), FakeTelegram::new())
+}
+
+/// Число действующих кодов `owner_claim` для цели.
+async fn active_claim_count(pool: &PgPool, household_id: Option<Uuid>) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM admin_one_time_codes
+         WHERE purpose = 'owner_claim' AND household_id IS NOT DISTINCT FROM $1
+           AND used_at IS NULL",
+    )
+    .bind(household_id)
+    .fetch_one(pool)
+    .await
+    .expect("active owner claim codes")
+}
+
+/// Действует ли открытое значение `owner_claim`.
+async fn claim_is_active(pool: &PgPool, code: &str) -> bool {
+    let mut conn = pool.acquire().await.expect("connection");
+    codes::find_active(&mut conn, Purpose::OwnerClaim, code, Utc::now())
+        .await
+        .expect("find the owner claim")
+        .is_some()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_owner_claim_link_is_issued_with_an_inline_qr_and_works_in_telegram() {
+    let db = support::isolated_db().await;
+    let config = telegram_config(&db.pool, None, &[]).await;
+    let cipher = SecretCipher::from_config(&config);
+    seed_bot(
+        &db.pool,
+        &cipher,
+        "polling",
+        "123:SECRET-owner-claim",
+        "owner-claim-secret",
+        901_001,
+        "tasklerq_owner_bot",
+    )
+    .await;
+    let household = household_without_owner(&db.pool, "Дом").await;
+    let (app, cookie) = owner_console_with_login(&db.pool, &config, TenancyMode::Multi).await;
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let home = String::from_utf8_lossy(&body);
+    assert!(
+        home.contains("Дом"),
+        "the household target is listed:\n{home}"
+    );
+    assert!(
+        home.contains("Выпустить ссылку"),
+        "the household without an owner offers the link:\n{home}"
+    );
+
+    let target = household.to_string();
+    let (status, _, body) = send_form_from(
+        &app,
+        "/admin/owner",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("target", target.as_str())],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let html = String::from_utf8_lossy(&body);
+    assert!(
+        html.contains("https://t.me/tasklerq_owner_bot?start=own_"),
+        "the response shows the claim link:\n{html}"
+    );
+    assert!(html.contains("<svg"), "the QR is inline SVG:\n{html}");
+    assert!(
+        !html.contains("&lt;svg"),
+        "askama must not escape the generated SVG:\n{html}"
+    );
+    assert!(
+        !html.contains("src=\"http"),
+        "no external image or script may be loaded:\n{html}"
+    );
+    for url in external_resource_urls(&html) {
+        assert!(
+            url.starts_with("https://t.me/"),
+            "only the claim link may point outside: {url}\n{html}"
+        );
+    }
+    assert!(
+        audit_payloads(&db.pool, "admin_recovery_issued")
+            .await
+            .is_empty(),
+        "issuing an owner claim link is not a recovery link"
+    );
+
+    let code = owner_code_from(&html);
+    let mut bot = owner_claim_harness(&db.pool, support::next_telegram_id(), TenancyMode::Multi);
+    bot.text(&format!("/start own_{code}")).await;
+
+    let owner: Option<Uuid> = sqlx::query_scalar(
+        "SELECT household_id FROM users
+         WHERE telegram_user_id = $1 AND role = 'owner' AND deleted_at IS NULL",
+    )
+    .bind(bot.chat)
+    .fetch_optional(&db.pool)
+    .await
+    .expect("claiming owner");
+    assert_eq!(owner, Some(household), "the bot accepts the issued link");
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let home = String::from_utf8_lossy(&body);
+    assert!(
+        !home.contains("Выпустить ссылку"),
+        "a household with an owner must not be offered:\n{home}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_single_installation_gets_a_claim_code_without_a_household() {
+    let db = support::isolated_db().await;
+    let config = telegram_config(&db.pool, None, &[]).await;
+    let cipher = SecretCipher::from_config(&config);
+    seed_bot(
+        &db.pool,
+        &cipher,
+        "polling",
+        "123:SECRET-empty-claim",
+        "empty-claim-secret",
+        901_002,
+        "tasklerq_empty_bot",
+    )
+    .await;
+    let (app, cookie) = owner_console_with_login(&db.pool, &config, TenancyMode::Single).await;
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let home = String::from_utf8_lossy(&body);
+    assert!(
+        home.contains("Пустая инсталляция"),
+        "an empty single installation is a target:\n{home}"
+    );
+    assert!(home.contains("Выпустить ссылку"), "{home}");
+
+    let (status, _, body) = send_form_from(
+        &app,
+        "/admin/owner",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("target", "empty")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let html = String::from_utf8_lossy(&body);
+    assert!(html.contains("https://t.me/tasklerq_empty_bot?start=own_"));
+
+    let household_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT household_id FROM admin_one_time_codes
+         WHERE purpose = 'owner_claim' AND used_at IS NULL",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("the issued code");
+    assert_eq!(
+        household_id, None,
+        "an empty installation code has no household"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_household_with_an_owner_gets_no_claim_link_and_rejects_the_post() {
+    let db = support::isolated_db().await;
+    let config = telegram_config(&db.pool, None, &[]).await;
+    let cipher = SecretCipher::from_config(&config);
+    seed_bot(
+        &db.pool,
+        &cipher,
+        "polling",
+        "123:SECRET-owned-claim",
+        "owned-claim-secret",
+        901_003,
+        "tasklerq_owned_bot",
+    )
+    .await;
+    let household = household_without_owner(&db.pool, "Дом с владельцем").await;
+    add_owner(&db.pool, household, support::next_telegram_id()).await;
+    let (app, cookie) = owner_console_with_login(&db.pool, &config, TenancyMode::Multi).await;
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let home = String::from_utf8_lossy(&body);
+    assert!(
+        !home.contains("Выпустить ссылку"),
+        "a household with an owner must not be listed:\n{home}"
+    );
+
+    let target = household.to_string();
+    let (status, _, body) = send_form_from(
+        &app,
+        "/admin/owner",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("target", target.as_str())],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let html = String::from_utf8_lossy(&body);
+    assert!(
+        html.contains("уже есть владелец"),
+        "the rejected post explains why:\n{html}"
+    );
+    assert!(!html.contains("?start=own_"), "{html}");
+    assert_eq!(active_claim_count(&db.pool, Some(household)).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reissuing_cancels_only_the_previous_link_of_the_same_household() {
+    let db = support::isolated_db().await;
+    let config = telegram_config(&db.pool, None, &[]).await;
+    let cipher = SecretCipher::from_config(&config);
+    seed_bot(
+        &db.pool,
+        &cipher,
+        "polling",
+        "123:SECRET-reissue-claim",
+        "reissue-claim-secret",
+        901_004,
+        "tasklerq_reissue_bot",
+    )
+    .await;
+    let dacha = household_without_owner(&db.pool, "Дача").await;
+    let flat = household_without_owner(&db.pool, "Квартира").await;
+    let (app, cookie) = owner_console_with_login(&db.pool, &config, TenancyMode::Multi).await;
+
+    let issue = |target: Uuid| {
+        let app = app.clone();
+        let cookie = cookie.clone();
+        async move {
+            let target = target.to_string();
+            let (status, _, body) = send_form_from(
+                &app,
+                "/admin/owner",
+                test_peer(),
+                headers_with(&[("cookie", &cookie)]),
+                &[("target", target.as_str())],
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+            owner_code_from(&String::from_utf8_lossy(&body))
+        }
+    };
+
+    let first_dacha = issue(dacha).await;
+    let flat_code = issue(flat).await;
+    assert!(
+        claim_is_active(&db.pool, &first_dacha).await,
+        "another household must not cancel the dacha link"
+    );
+
+    let second_dacha = issue(dacha).await;
+    assert_ne!(first_dacha, second_dacha);
+    assert!(
+        !claim_is_active(&db.pool, &first_dacha).await,
+        "reissuing for the same household cancels the previous code"
+    );
+    assert!(claim_is_active(&db.pool, &second_dacha).await);
+    assert!(
+        claim_is_active(&db.pool, &flat_code).await,
+        "the apartment link keeps working"
+    );
+    assert_eq!(active_claim_count(&db.pool, Some(dacha)).await, 1);
+    assert_eq!(active_claim_count(&db.pool, Some(flat)).await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disabled_telegram_shows_the_hint_and_issues_no_code() {
+    let db = support::isolated_db().await;
+    let config = telegram_config(&db.pool, None, &[]).await;
+    let household = household_without_owner(&db.pool, "Дом без бота").await;
+    let (app, cookie) = owner_console_with_login(&db.pool, &config, TenancyMode::Multi).await;
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let home = String::from_utf8_lossy(&body);
+    assert!(
+        home.contains("Сначала подключите бота"),
+        "the disabled bot is explained:\n{home}"
+    );
+    assert!(
+        !home.contains("Выпустить ссылку"),
+        "no button without a bot:\n{home}"
+    );
+
+    let target = household.to_string();
+    let (status, _, body) = send_form_from(
+        &app,
+        "/admin/owner",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("target", target.as_str())],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let html = String::from_utf8_lossy(&body);
+    assert!(html.contains("Сначала подключите бота"), "{html}");
+    assert!(!html.contains("?start=own_"), "{html}");
+    assert_eq!(active_claim_count(&db.pool, Some(household)).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_owner_claim_post_requires_the_same_origin() {
+    let db = support::isolated_db().await;
+    let config = telegram_config(&db.pool, None, &[]).await;
+    let cipher = SecretCipher::from_config(&config);
+    seed_bot(
+        &db.pool,
+        &cipher,
+        "polling",
+        "123:SECRET-origin-claim",
+        "origin-claim-secret",
+        901_005,
+        "tasklerq_origin_bot",
+    )
+    .await;
+    let household = household_without_owner(&db.pool, "Дом origin").await;
+    let (app, cookie) = owner_console_with_login(&db.pool, &config, TenancyMode::Multi).await;
+
+    let target = household.to_string();
+    let attempts = [
+        headers_with(&[("cookie", cookie.as_str())]),
+        headers_with(&[
+            ("cookie", cookie.as_str()),
+            ("host", "nas:18081"),
+            ("origin", "http://evil.example"),
+        ]),
+    ];
+    for headers in attempts {
+        let (status, _, _) = send_form_raw(
+            &app,
+            "/admin/owner",
+            test_peer(),
+            headers,
+            &[("target", target.as_str())],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    assert_eq!(active_claim_count(&db.pool, Some(household)).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_empty_target_is_rejected_outside_single_mode() {
+    let db = support::isolated_db().await;
+    let config = telegram_config(&db.pool, None, &[]).await;
+    let cipher = SecretCipher::from_config(&config);
+    seed_bot(
+        &db.pool,
+        &cipher,
+        "polling",
+        "123:SECRET-multi-empty",
+        "multi-empty-secret",
+        901_006,
+        "tasklerq_multi_empty_bot",
+    )
+    .await;
+    let (app, cookie) = owner_console_with_login(&db.pool, &config, TenancyMode::Multi).await;
+
+    let (status, _, body) = send_form_from(
+        &app,
+        "/admin/owner",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("target", "empty")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let html = String::from_utf8_lossy(&body);
+    assert!(html.contains("В режиме multi выберите household"), "{html}");
+    assert!(!html.contains("?start=own_"), "{html}");
+    assert_eq!(active_claim_count(&db.pool, None).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_empty_target_is_rejected_when_a_household_exists() {
+    let db = support::isolated_db().await;
+    let config = telegram_config(&db.pool, None, &[]).await;
+    let cipher = SecretCipher::from_config(&config);
+    seed_bot(
+        &db.pool,
+        &cipher,
+        "polling",
+        "123:SECRET-single-not-empty",
+        "single-not-empty-secret",
+        901_007,
+        "tasklerq_single_not_empty_bot",
+    )
+    .await;
+    household_without_owner(&db.pool, "Дом в single").await;
+    let (app, cookie) = owner_console_with_login(&db.pool, &config, TenancyMode::Single).await;
+
+    let (status, _, body) = send_form_from(
+        &app,
+        "/admin/owner",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("target", "empty")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let html = String::from_utf8_lossy(&body);
+    assert!(html.contains("Инсталляция уже не пуста"), "{html}");
+    assert!(!html.contains("?start=own_"), "{html}");
+    assert_eq!(active_claim_count(&db.pool, None).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_or_missing_household_target_is_rejected() {
+    let db = support::isolated_db().await;
+    let config = telegram_config(&db.pool, None, &[]).await;
+    let cipher = SecretCipher::from_config(&config);
+    seed_bot(
+        &db.pool,
+        &cipher,
+        "polling",
+        "123:SECRET-bad-target",
+        "bad-target-secret",
+        901_008,
+        "tasklerq_bad_target_bot",
+    )
+    .await;
+    let (app, cookie) = owner_console_with_login(&db.pool, &config, TenancyMode::Multi).await;
+
+    let unknown = Uuid::now_v7().to_string();
+    for target in ["not-a-uuid", unknown.as_str()] {
+        let (status, _, body) = send_form_from(
+            &app,
+            "/admin/owner",
+            test_peer(),
+            headers_with(&[("cookie", &cookie)]),
+            &[("target", target)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let html = String::from_utf8_lossy(&body);
+        assert!(
+            html.contains("Неизвестная цель") || html.contains("Household не найден"),
+            "{html}"
+        );
+        assert!(!html.contains("?start=own_"), "{html}");
+    }
+    assert_eq!(active_claim_count(&db.pool, None).await, 0);
+}
+
+/// Первое сохранение группы webhook и его события `admin_setting_changed`.
+async fn first_webhook_save_changes(pool: &PgPool) -> Vec<(String, String)> {
+    let server = MockServer::start().await;
+    mount_get_me(&server, 901_100, "tasklerq_first_save_bot").await;
+    let config = telegram_config(pool, Some(&server), &[]).await;
+    let app = owner_console(pool, &config, TenancyMode::Single);
+    insert_account(pool, "admin").await;
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let (status, _, body) = send_form_from(
+        &app,
+        "/admin/telegram",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("mode", "webhook"),
+            ("token", "123:SECRET-first-save"),
+            ("public_base_url", "https://tasklerq.example.com"),
+            ("webhook_url_override", ""),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    audit_payloads(pool, "admin_setting_changed")
+        .await
+        .into_iter()
+        .map(|payload| {
+            (
+                payload["key"].as_str().unwrap_or_default().to_owned(),
+                payload["value"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// Удаление отсутствующей строки `telegram.webhook_url_override` не пишет
+/// `deleted`: сохранение с пустым адресом не меняет базу.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_absent_webhook_override_is_not_audited_as_deleted() {
+    let db = support::isolated_db().await;
+    let changes = first_webhook_save_changes(&db.pool).await;
+    assert!(
+        !changes
+            .iter()
+            .any(|(key, value)| key == "telegram.webhook_url_override" && value == "deleted"),
+        "no row means no deletion: {changes:?}"
+    );
+}
+
+/// Первое сохранение в режиме webhook аудирует `telegram.mode`: значение
+/// совпадает со умолчанием, но строка появляется в базе.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_first_webhook_save_audits_the_mode() {
+    let db = support::isolated_db().await;
+    let changes = first_webhook_save_changes(&db.pool).await;
+    assert!(
+        changes
+            .iter()
+            .any(|(key, value)| key == "telegram.mode" && value == "changed"),
+        "the first save writes the mode row and must audit it: {changes:?}"
+    );
+}
+
+/// Отказ `deleteWebhook` прежнего бота не скрывает отказ `setWebhook` нового:
+/// сообщение о новом webhook показывается первым.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_old_webhook_removal_does_not_hide_the_new_webhook_failure() {
+    let db = support::isolated_db().await;
+    let server = MockServer::start().await;
+    mount_bot_base(&server).await;
+    mount_get_me_for(&server, BOT_B_TOKEN, 43, "tasklerq_new_owner_bot").await;
+    mount_webhook_info(&server, 0, None).await;
+    Mock::given(method("POST"))
+        .and(path_regex(format!(r"^/bot{BOT_A_TOKEN}/deleteWebhook$")))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "ok": false,
+            "error_code": 400,
+            "description": "Bad Request: old webhook removal failed"
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(format!(r"^/bot{BOT_B_TOKEN}/setWebhook$")))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "ok": false,
+            "error_code": 400,
+            "description": "Bad Request: new webhook registration failed"
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(format!(r"^/bot{BOT_B_TOKEN}/getWebhookInfo$")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "result": {"url": "", "pending_update_count": 0}
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    let config = telegram_config(&db.pool, Some(&server), &[]).await;
+    let (application, app, cookie, shutdown_tx) = telegram_app(&config, &db.pool).await;
+    let cipher = SecretCipher::from_config(&config);
+    seed_bot(
+        &db.pool,
+        &cipher,
+        "webhook",
+        BOT_A_TOKEN,
+        BOT_A_SECRET,
+        42,
+        "tasklerq_old_owner_bot",
+    )
+    .await;
+    assert!(
+        application
+            .telegram_supervisor
+            .reload()
+            .await
+            .expect("bot A reload")
+    );
+    wait_for_token_requests(&server, "setWebhook", BOT_A_TOKEN, 1).await;
+
+    let (status, _, body) = send_form_from(
+        &app,
+        "/admin/telegram",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("mode", "webhook"),
+            ("token", BOT_B_TOKEN),
+            ("public_base_url", "https://tasklerq.example.com"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let text = String::from_utf8_lossy(&body);
+    let new_message = "Telegram не подтвердил адрес webhook";
+    let old_message = "не удалось снять webhook прежнего бота";
+    assert!(
+        text.contains(new_message),
+        "the new webhook failure must be reported:\n{text}"
+    );
+    assert!(
+        text.contains(old_message),
+        "the old webhook removal failure must still be reported:\n{text}"
+    );
+    let new_at = text.find(new_message).expect("new webhook message");
+    let old_at = text.find(old_message).expect("old webhook message");
+    assert!(
+        new_at < old_at,
+        "the new webhook failure must come first:\n{text}"
+    );
 
     stop_application(application, shutdown_tx).await;
 }
