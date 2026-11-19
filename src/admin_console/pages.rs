@@ -1,5 +1,6 @@
 //! Страницы консоли: setup, вход, восстановление, смена пароля, мастер,
-//! настройки LLM и главная. Страницы household — в [`super::households`].
+//! настройки LLM и главная. Страницы household — в [`super::households`],
+//! очередей — в [`super::queues`].
 //!
 //! Макет (`Layout`) общий: шапка, навигация вошедшего администратора, сообщение
 //! и место для содержимого. Содержимое рисует небольшой askama-шаблон своей
@@ -1948,6 +1949,11 @@ fn render_with_status(page: ConsolePage<'_>, status: StatusCode) -> Response {
     }
 }
 
+/// Отрисовать страницу очередей в общем макете.
+pub(crate) fn render_queues(view: super::queues::QueuesView) -> Response {
+    render(ConsolePage::new(Page::Queues(Box::new(view))))
+}
+
 /// Отрисовать список household в общем макете.
 pub(crate) fn render_household_list(view: super::households::HouseholdList) -> Response {
     render(ConsolePage::new(Page::Households(Box::new(view))))
@@ -2465,6 +2471,8 @@ enum Page {
     TelegramLinkIssued(Box<TelegramLinkView>),
     /// Ход проверки слота.
     Check(Option<CheckSnapshot>),
+    /// Очереди инсталляции.
+    Queues(Box<super::queues::QueuesView>),
     /// Список household.
     Households(Box<super::households::HouseholdList>),
     /// Карточка household.
@@ -2512,6 +2520,7 @@ impl Page {
             Self::OwnerLinkIssued(_) => "Ссылка-claim владельца",
             Self::TelegramLinkIssued(_) => "Ссылка привязки Telegram",
             Self::Check(_) => "Проверка слота",
+            Self::Queues(_) => "Очереди",
             Self::Households(_) | Self::Household(_) => "Household",
             Self::HouseholdTokenIssued(_) => "API-токен",
             Self::HouseholdTokenRevoke(_) => "Отзыв токена",
@@ -2535,6 +2544,7 @@ impl Page {
                 | Self::OwnerLinkIssued(_)
                 | Self::TelegramLinkIssued(_)
                 | Self::Check(_)
+                | Self::Queues(_)
                 | Self::Households(_)
                 | Self::Household(_)
                 | Self::HouseholdTokenIssued(_)
@@ -2553,6 +2563,7 @@ impl Page {
             | Self::HouseholdTokenRevoke(_)
             | Self::HouseholdDelete(_) => "household",
             Self::Llm(_) | Self::Check(_) => "llm",
+            Self::Queues(_) => "queues",
             Self::Telegram(view) if !view.wizard => "telegram",
             Self::Password { .. } => "password",
             _ => "",
@@ -2666,6 +2677,7 @@ impl Page {
                 let check = CheckBody { view: &view }.render()?;
                 CheckPageBody { check }.render()
             }
+            Self::Queues(view) => super::queues::render_page_body(view),
             Self::Households(view) => super::households::render_list_body(view),
             Self::Household(view) => view.render_body(),
             Self::HouseholdTokenIssued(view) => view.render_body(),
@@ -2747,6 +2759,7 @@ impl<'a> ConsolePage<'a> {
 <nav class="console-nav" aria-label="Разделы">
 <a href="/admin"{% if section == "home" %} aria-current="page"{% endif %}>Главная</a>
 <a href="/admin/households"{% if section == "household" %} aria-current="page"{% endif %}>Household</a>
+<a href="/admin/queues"{% if section == "queues" %} aria-current="page"{% endif %}>Очереди</a>
 <a href="/admin/llm"{% if section == "llm" %} aria-current="page"{% endif %}>Разбор</a>
 <a href="/admin/telegram"{% if section == "telegram" %} aria-current="page"{% endif %}>Telegram</a>
 </nav>

@@ -11,6 +11,7 @@ pub mod origin;
 pub mod owner;
 pub mod pages;
 pub mod password;
+pub mod queues;
 pub mod recovery;
 pub mod router;
 pub mod session;

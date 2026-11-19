@@ -145,10 +145,16 @@ struct TokenRow {
     revocable: bool,
 }
 
+/// Токен можно отозвать: он не отозван и не истёк на момент `now`.
+fn revocable(token: &ApiToken, now: DateTime<Utc>) -> bool {
+    token.revoked_at.is_none() && !token.expires_at.is_some_and(|expires_at| expires_at <= now)
+}
+
 impl TokenRow {
     /// Собрать строку из записи `admin`; состояние — на момент `now`.
     fn new(token: ApiToken, timezone: Tz, now: DateTime<Utc>) -> Self {
         let expired = token.expires_at.is_some_and(|expires_at| expires_at <= now);
+        let is_revocable = revocable(&token, now);
         let state = if token.revoked_at.is_some() {
             "отозван"
         } else if expired {
@@ -167,7 +173,7 @@ impl TokenRow {
             ),
             state,
             expires_at: token.expires_at.map(|at| format_at(at, timezone)),
-            revocable: token.revoked_at.is_none() && !expired,
+            revocable: is_revocable,
         }
     }
 }
@@ -889,7 +895,7 @@ async fn household_token(
 ///
 /// Страница только показывает имя и префикс; принадлежность токена household
 /// проверяет [`household_token`], поэтому чужой токен и неверный UUID дают
-/// `404`.
+/// `404`. Уже отозванный или истёкший токен отзывать нечего: `303` на карточку.
 pub(crate) async fn revoke_token_page(
     State(state): State<AdminState>,
     Path((raw_id, raw_token_id)): Path<(String, String)>,
@@ -901,6 +907,7 @@ pub(crate) async fn revoke_token_page(
         return not_found();
     };
     match household_token(&state, household_id, token_id).await {
+        Ok(token) if !revocable(&token, Utc::now()) => household_card(household_id),
         Ok(token) => {
             render_household_token_revoke(HouseholdTokenRevokeView::new(household_id, token))
         }
@@ -912,7 +919,8 @@ pub(crate) async fn revoke_token_page(
 /// подтверждением.
 ///
 /// Без `confirm=yes` данные не меняются: страница возвращается с отказом. Чужой
-/// токен — `404` до всякого отзыва. Сам отзыв выполняет
+/// токен — `404` до всякого отзыва. Уже отозванный или истёкший токен менять
+/// нечего — `303` на карточку и без подтверждения. Сам отзыв выполняет
 /// [`admin::revoke_household_token`], поэтому аудит и системный актор те же, что
 /// у CLI.
 pub(crate) async fn revoke_token(
@@ -926,10 +934,14 @@ pub(crate) async fn revoke_token(
     else {
         return not_found();
     };
+    let now = Utc::now();
     let token = match household_token(&state, household_id, token_id).await {
         Ok(token) => token,
         Err(response) => return *response,
     };
+    if !revocable(&token, now) {
+        return household_card(household_id);
+    }
 
     if form.confirm.as_deref() != Some("yes") {
         return render_household_token_revoke_error(
@@ -939,7 +951,7 @@ pub(crate) async fn revoke_token(
         );
     }
 
-    match admin::revoke_household_token(&state.pool, household_id, token_id, Utc::now()).await {
+    match admin::revoke_household_token(&state.pool, household_id, token_id, now).await {
         Ok(_) => Redirect::to(&format!("/admin/households/{household_id}")).into_response(),
         Err(DomainError::NotFound) => not_found(),
         Err(DomainError::Database(error)) => internal(error),
@@ -1035,6 +1047,11 @@ fn delete_refusal(
         message,
         status,
     )
+}
+
+/// `303` на карточку household: отзывать нечего или действие завершено.
+fn household_card(household_id: Uuid) -> Response {
+    Redirect::to(&format!("/admin/households/{household_id}")).into_response()
 }
 
 /// `404` без подробностей: какой из случаев скрыт, не сообщается.

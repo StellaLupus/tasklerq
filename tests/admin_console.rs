@@ -10847,6 +10847,23 @@ fn token_row<'a>(html: &'a str, name: &str) -> &'a str {
     &html[start..end]
 }
 
+/// Строка очереди с указанной подписью целиком: от `<li>` до `</li>`.
+fn queue_row<'a>(html: &'a str, label: &str) -> &'a str {
+    let marker = format!(">{label}</span>");
+    let label_position = html
+        .find(&marker)
+        .unwrap_or_else(|| panic!("no queue row for {label} in:\n{html}"));
+    let start = html[..label_position]
+        .rfind("<li>")
+        .unwrap_or_else(|| panic!("no queue row start for {label} in:\n{html}"));
+    let end = label_position
+        + html[label_position..]
+            .find("</li>")
+            .map(|offset| offset + "</li>".len())
+            .unwrap_or_else(|| panic!("no queue row end for {label} in:\n{html}"));
+    &html[start..end]
+}
+
 /// Активное приглашение household, вставленное напрямую как после `invite create`.
 async fn insert_active_invite(pool: &PgPool, household_id: Uuid, created_by: Uuid) -> Uuid {
     let id = Uuid::now_v7();
@@ -12169,4 +12186,331 @@ async fn households_token_revoke_of_another_household_is_not_found() {
     let bad_path = format!("/admin/households/{}/tokens/not-a-uuid/revoke", flat.id);
     let (status, _, _) = send_with_cookie(&app, Method::GET, &bad_path, &cookie).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "an invalid token id");
+}
+
+/// Консоль с тем же порогом задержки очереди, что выставляет readiness.
+fn console_with_queue_limit(pool: &PgPool, seconds: u32) -> Router {
+    build_admin_router(console_state(pool, Vec::new()).with_queue_lag_limit(seconds))
+}
+
+/// Страница очередей и её фрагмент показывают числа по статусам и не раскрывают
+/// тексты сообщений; страница опрашивает фрагмент раз в 10 секунд.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queues_fragment_shows_status_counts_without_message_content() {
+    const TELEGRAM_TEXT: &str = "СЕКРЕТНОЕ ОБНОВЛЕНИЕ TELEGRAM";
+    const OUTBOX_TEXT: &str = "СЕКРЕТНОЕ ИСХОДЯЩЕЕ СООБЩЕНИЕ";
+    const CAPTURE_TEXT: &str = "СЕКРЕТНЫЙ ТЕКСТ РАЗБОРА";
+
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Single, false, LlmConfig::empty());
+    let household = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Single,
+        "Дом",
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("the household");
+
+    sqlx::query(
+        "INSERT INTO telegram_updates (update_id, payload, available_at, received_at)
+         VALUES ($1, $2, now(), now())",
+    )
+    .bind(1_i64)
+    .bind(json!({"message": {"text": TELEGRAM_TEXT, "chat": {"id": 42}}}))
+    .execute(&db.pool)
+    .await
+    .expect("the telegram update");
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    outbox::enqueue(
+        &mut conn,
+        42,
+        &Outgoing::Message {
+            html: OUTBOX_TEXT.to_owned(),
+            rich: false,
+            delete_after: None,
+            disable_preview: false,
+        },
+        None,
+        Utc::now(),
+    )
+    .await
+    .expect("the outgoing message");
+    drop(conn);
+
+    sqlx::query(
+        "INSERT INTO capture_jobs (id, household_id, chat_id, payload, available_at)
+         VALUES ($1, $2, $3, $4, now())",
+    )
+    .bind(Uuid::now_v7())
+    .bind(household.id)
+    .bind(42_i64)
+    .bind(json!({"text": CAPTURE_TEXT}))
+    .execute(&db.pool)
+    .await
+    .expect("the capture job");
+
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    let (status, headers, body) =
+        send_with_cookie(&app, Method::GET, "/admin/queues/fragment", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_security_headers(&headers, "GET /admin/queues/fragment");
+    let fragment = String::from_utf8_lossy(&body);
+
+    for label in [
+        "обновления Telegram",
+        "исходящие сообщения",
+        "разборы",
+        "доставки уведомлений",
+    ] {
+        assert!(
+            fragment.contains(label),
+            "missing the `{label}` queue:\n{fragment}"
+        );
+    }
+    for label in ["обновления Telegram", "исходящие сообщения", "разборы"]
+    {
+        let row = queue_row(&fragment, label);
+        assert!(
+            row.contains("pending: 1"),
+            "the `{label}` queue counts pending jobs:\n{row}"
+        );
+    }
+    let deliveries = queue_row(&fragment, "доставки уведомлений");
+    assert!(
+        deliveries.contains("пусто"),
+        "an empty queue is shown explicitly:\n{deliveries}"
+    );
+    for attribute in [
+        "hx-get=\"/admin/queues/fragment\"",
+        "hx-trigger=\"every 10s\"",
+        "hx-swap=\"outerHTML\"",
+    ] {
+        assert!(
+            fragment.contains(attribute),
+            "the fragment must poll itself: missing {attribute}:\n{fragment}"
+        );
+    }
+    assert!(
+        fragment.contains("<noscript>") && fragment.contains("Обновить"),
+        "without JavaScript the fragment offers a refresh link:\n{fragment}"
+    );
+    for secret in [TELEGRAM_TEXT, OUTBOX_TEXT, CAPTURE_TEXT] {
+        assert!(
+            !fragment.contains(secret),
+            "the fragment must not show job content `{secret}`:\n{fragment}"
+        );
+    }
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin/queues", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = String::from_utf8_lossy(&body);
+    assert!(
+        page.contains("hx-trigger=\"every 10s\""),
+        "the page polls the fragment every 10 seconds:\n{page}"
+    );
+    assert!(
+        page.contains("href=\"/admin/queues\" aria-current=\"page\""),
+        "the navigation highlights the queues section:\n{page}"
+    );
+    for secret in [TELEGRAM_TEXT, OUTBOX_TEXT, CAPTURE_TEXT] {
+        assert!(
+            !page.contains(secret),
+            "the page must not show job content `{secret}`:\n{page}"
+        );
+    }
+}
+
+/// Возраст самого старого готового обновления выделяется только сверх порога
+/// readiness; порог задаётся тем же `queue_lag_limit`, что у главной.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queues_highlight_only_the_age_over_the_readiness_limit() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with_queue_limit(&db.pool, 300);
+    let update_id = 90_200_i64;
+    sqlx::query(
+        "INSERT INTO telegram_updates (update_id, payload, available_at, received_at)
+         VALUES ($1, '{}'::jsonb, now() - interval '7 minutes',
+                 now() - interval '7 minutes')",
+    )
+    .bind(update_id)
+    .execute(&db.pool)
+    .await
+    .expect("the stale update");
+
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    let (status, _, body) =
+        send_with_cookie(&app, Method::GET, "/admin/queues/fragment", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let stale = String::from_utf8_lossy(&body);
+    assert!(
+        stale.contains("status-bad"),
+        "an age of 7 minutes over a 5 minute limit is highlighted:\n{stale}"
+    );
+    assert!(
+        stale.contains("порог readiness"),
+        "the page names the readiness limit it exceeds:\n{stale}"
+    );
+    assert!(
+        stale.contains("7 мин"),
+        "the age is shown in whole minutes:\n{stale}"
+    );
+
+    sqlx::query(
+        "UPDATE telegram_updates
+         SET available_at = now() - interval '1 minute',
+             received_at = now() - interval '1 minute'
+         WHERE update_id = $1",
+    )
+    .bind(update_id)
+    .execute(&db.pool)
+    .await
+    .expect("the fresh update");
+
+    let (status, _, body) =
+        send_with_cookie(&app, Method::GET, "/admin/queues/fragment", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let fresh = String::from_utf8_lossy(&body);
+    assert!(
+        !fresh.contains("status-bad"),
+        "an age within the limit is not highlighted:\n{fresh}"
+    );
+    assert!(
+        fresh.contains("1 мин"),
+        "the fresh age is still shown:\n{fresh}"
+    );
+}
+
+/// Страницы очередей за сессией, как остальные страницы консоли.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queues_pages_require_a_session_like_the_rest_of_the_console() {
+    let db = support::isolated_db().await;
+    let app = console(&db.pool, Vec::new());
+
+    for path in ["/admin/queues", "/admin/queues/fragment"] {
+        let (status, headers, _) = send(&app, Method::GET, path).await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "{path}");
+        assert_eq!(location(&headers), Some("/admin/login"), "{path}");
+    }
+}
+
+/// Отозванный или истёкший токен не предлагает отзыв: GET и POST ведут на
+/// карточку household и ничего не меняют.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_revoked_or_expired_token_does_not_offer_a_revoke() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
+    let now = Utc::now();
+    let household = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Дом",
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("the household");
+    let revoked = tasklerq::admin::create_token(
+        &db.pool,
+        TenancyMode::Multi,
+        Some(household.id),
+        "Отозванный",
+        &["ha:read".to_owned()],
+        None,
+        now,
+    )
+    .await
+    .expect("the revoked token");
+    let expired = tasklerq::admin::create_token(
+        &db.pool,
+        TenancyMode::Multi,
+        Some(household.id),
+        "Истёкший",
+        &["ha:read".to_owned()],
+        Some(30),
+        now,
+    )
+    .await
+    .expect("the expired token");
+    let revoked_at: DateTime<Utc> = now - ChronoDuration::days(1);
+    sqlx::query("UPDATE api_tokens SET revoked_at = $1 WHERE token_hash = $2")
+        .bind(revoked_at)
+        .bind(hash_token(&revoked.token))
+        .execute(&db.pool)
+        .await
+        .expect("the revoked token state");
+    let expired_at: DateTime<Utc> = now - ChronoDuration::days(1);
+    sqlx::query("UPDATE api_tokens SET expires_at = $1 WHERE token_hash = $2")
+        .bind(expired_at)
+        .bind(hash_token(&expired.token))
+        .execute(&db.pool)
+        .await
+        .expect("the expired token state");
+    let revoked_id: Uuid = sqlx::query_scalar("SELECT id FROM api_tokens WHERE token_hash = $1")
+        .bind(hash_token(&revoked.token))
+        .fetch_one(&db.pool)
+        .await
+        .expect("the revoked token row");
+    let expired_id: Uuid = sqlx::query_scalar("SELECT id FROM api_tokens WHERE token_hash = $1")
+        .bind(hash_token(&expired.token))
+        .fetch_one(&db.pool)
+        .await
+        .expect("the expired token row");
+    let revoked_before: DateTime<Utc> =
+        sqlx::query_scalar("SELECT revoked_at FROM api_tokens WHERE id = $1")
+            .bind(revoked_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("the revoked timestamp");
+
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    let card_path = format!("/admin/households/{}", household.id);
+    for token_id in [revoked_id, expired_id] {
+        let path = format!(
+            "/admin/households/{}/tokens/{token_id}/revoke",
+            household.id
+        );
+        let (status, headers, body) = send_with_cookie(&app, Method::GET, &path, &cookie).await;
+        assert_eq!(
+            status,
+            StatusCode::SEE_OTHER,
+            "GET does not offer a revoke page: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(location(&headers), Some(card_path.as_str()), "{path}");
+
+        for fields in [vec![("confirm", "yes")], Vec::new()] {
+            let (status, headers, _) = send_form_from(
+                &app,
+                &path,
+                test_peer(),
+                headers_with(&[("cookie", &cookie)]),
+                &fields,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::SEE_OTHER,
+                "POST of an already inactive token redirects"
+            );
+            assert_eq!(location(&headers), Some(card_path.as_str()), "{path}");
+        }
+    }
+
+    let unchanged: DateTime<Utc> =
+        sqlx::query_scalar("SELECT revoked_at FROM api_tokens WHERE id = $1")
+            .bind(revoked_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("the revoked timestamp");
+    assert_eq!(unchanged, revoked_before, "the revoke time is unchanged");
+    assert!(
+        audit_payloads(&db.pool, "token_revoked").await.is_empty(),
+        "nothing is revoked, so no event is written"
+    );
 }

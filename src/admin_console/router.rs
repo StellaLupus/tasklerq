@@ -29,7 +29,7 @@ use crate::telegram::runtime::TelegramSupervisor;
 
 use super::checks::CheckState;
 use super::wizard::{WIZARD_PATH, WIZARD_SKIP_PATH, WizardSettings};
-use super::{assets, households, origin, pages};
+use super::{assets, households, origin, pages, queues};
 
 /// Сколько неудач допускается в окне лимита консоли.
 pub const FAILURE_LIMIT: u32 = 5;
@@ -266,6 +266,8 @@ pub fn build_router(state: AdminState) -> Router {
             "/admin/households",
             get(households::list).post(households::create),
         )
+        .route(queues::QUEUES_PATH, get(queues::page))
+        .route(queues::QUEUES_FRAGMENT_PATH, get(queues::fragment))
         .route("/admin/households/{id}", get(households::detail))
         .route(
             "/admin/households/{id}/members",
