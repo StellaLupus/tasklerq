@@ -1481,6 +1481,7 @@ async fn admin_console_migration_creates_tables_and_audit_values() {
             ("telegram_user_id", "bigint", "YES"),
             ("pending_telegram_user_id", "bigint", "YES"),
             ("pending_telegram_name", "text", "YES"),
+            ("telegram_name", "text", "YES"),
             ("console_origin", "text", "YES"),
         ],
         "admin_accounts must keep the design fields, always have a password, \
@@ -1889,14 +1890,36 @@ async fn admin_telegram_migration_enforces_the_telegram_binding() {
         .await
         .expect("the account is created before the binding");
 
-    sqlx::query("UPDATE admin_accounts SET telegram_user_id = 7000000001")
-        .execute(&db.pool)
-        .await
-        .expect("a confirmed telegram id is stored");
-    sqlx::query("UPDATE admin_accounts SET telegram_user_id = NULL")
+    sqlx::query(
+        "UPDATE admin_accounts
+         SET telegram_user_id = 7000000001, telegram_name = 'Администратор'",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("a confirmed telegram id is stored with its name");
+    sqlx::query("UPDATE admin_accounts SET telegram_user_id = NULL, telegram_name = NULL")
         .execute(&db.pool)
         .await
         .expect("NULL stays the unbound state");
+
+    // Подтверждённый id и его имя тоже задаются только вместе.
+    let only_bound_id = sqlx::query("UPDATE admin_accounts SET telegram_user_id = 7000000003")
+        .execute(&db.pool)
+        .await;
+    assert_check_violation(&only_bound_id, "admin_accounts_telegram_name");
+
+    let only_bound_name = sqlx::query("UPDATE admin_accounts SET telegram_name = 'Без id'")
+        .execute(&db.pool)
+        .await;
+    assert_check_violation(&only_bound_name, "admin_accounts_telegram_name");
+
+    sqlx::query(
+        "UPDATE admin_accounts
+         SET telegram_user_id = 7000000003, telegram_name = 'Администратор'",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("a confirmed telegram id and name are stored together");
 
     // Кандидат и его имя задаются только вместе.
     let only_id = sqlx::query("UPDATE admin_accounts SET pending_telegram_user_id = 7000000002")
@@ -1958,8 +1981,10 @@ async fn admin_telegram_migration_enforces_the_telegram_binding() {
         .await
         .expect("the singleton index is dropped inside the transaction");
     let duplicate = sqlx::query(
-        "INSERT INTO admin_accounts (id, username, password_hash, telegram_user_id)
-         VALUES ($1, 'second', '$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA', 7000000001)",
+        "INSERT INTO admin_accounts
+             (id, username, password_hash, telegram_user_id, telegram_name)
+         VALUES ($1, 'second', '$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA',
+                 7000000001, 'Второй')",
     )
     .bind(Uuid::now_v7())
     .execute(&mut *tx)

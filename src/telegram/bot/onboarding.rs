@@ -89,10 +89,7 @@ pub async fn on_start(ctx: &mut Ctx<'_>, argument: &str) -> Result<(), Fail> {
     match parse_start_argument(argument) {
         StartArgument::None | StartArgument::Invalid => default_start(ctx).await,
         StartArgument::OwnerClaim(code) => claim_start(ctx, code).await,
-        // 5.1 добавит здесь запись кандидата по действующему коду
-        // `telegram_link`; до этого префикс только распознаётся, а поведение
-        // совпадает с `/start` без аргумента.
-        StartArgument::AdminLink(_) => default_start(ctx).await,
+        StartArgument::AdminLink(code) => link_start(ctx, code).await,
         StartArgument::Invite(code) => {
             if ctx.user.is_some() {
                 ctx.banner(MEMBER_BANNER);
@@ -109,6 +106,55 @@ async fn default_start(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
         ctx.present(Screen::Menu).await
     } else {
         forms::start_onboarding(ctx).await
+    }
+}
+
+/// Имя кандидата на привязку: имя Telegram и `@username`, если он есть.
+fn candidate_name(sender: &crate::telegram::update::Sender) -> String {
+    let mut name = sender.display_name.trim().to_owned();
+    if let Some(username) = sender
+        .username
+        .as_deref()
+        .map(str::trim)
+        .filter(|username| !username.is_empty())
+    {
+        if !name.is_empty() {
+            name.push(' ');
+        }
+        name.push('@');
+        name.push_str(username.trim_start_matches('@'));
+    }
+    name
+}
+
+/// `/start adm_…`: записать отправителя кандидатом на привязку.
+///
+/// Код гасится и кандидат записывается одной транзакцией. Недействительный,
+/// истёкший и уже погашенный код ведут себя как `/start` без аргумента, не
+/// меняя прежнего кандидата. Привязка вступает в силу только после
+/// подтверждения в консоли, поэтому членство и первый контакт не меняются.
+async fn link_start(ctx: &mut Ctx<'_>, code: &str) -> Result<(), Fail> {
+    let sender_id = ctx.sender.id;
+    let name = candidate_name(&ctx.sender);
+    let now = ctx.now;
+    let mut savepoint = ctx.conn.begin().await?;
+    let result = async {
+        codes::use_code(&mut savepoint, Purpose::TelegramLink, code, now).await?;
+        admin_accounts::set_pending_telegram(&mut savepoint, sender_id, &name).await
+    }
+    .await;
+
+    match result {
+        Ok(()) => {
+            savepoint.commit().await?;
+            ctx.banner("Запрос на привязку отправлен. Подтвердите его в консоли администратора.");
+            default_start(ctx).await
+        }
+        Err(DomainError::NotFound) => {
+            savepoint.rollback().await?;
+            default_start(ctx).await
+        }
+        Err(error) => Err(error.into()),
     }
 }
 

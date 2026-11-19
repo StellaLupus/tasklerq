@@ -39,6 +39,10 @@
 -- Оба поля NULL или оба заданы; подтверждение переносит кандидата в
 -- `telegram_user_id`.
 --
+-- `telegram_name` — имя подтверждённого аккаунта, снимок на момент привязки:
+-- консоль показывает его рядом с кнопкой «Отвязать». Задан ровно тогда, когда
+-- задан `telegram_user_id`; отвязка очищает оба поля.
+--
 -- `console_origin` — origin консоли, на который уходит ссылка восстановления
 -- (design, решение 6); обновляется при каждом успешном входе. NULL — адрес
 -- ещё не известен, и подсказка ведёт к CLI.
@@ -61,9 +65,13 @@ ALTER TABLE admin_accounts
     ADD COLUMN telegram_user_id bigint,
     ADD COLUMN pending_telegram_user_id bigint,
     ADD COLUMN pending_telegram_name text,
+    ADD COLUMN telegram_name text,
     ADD COLUMN console_origin text,
     ADD CONSTRAINT admin_accounts_pending_telegram CHECK (
         (pending_telegram_user_id IS NULL) = (pending_telegram_name IS NULL)
+    ),
+    ADD CONSTRAINT admin_accounts_telegram_name CHECK (
+        (telegram_user_id IS NULL) = (telegram_name IS NULL)
     );
 
 CREATE UNIQUE INDEX admin_accounts_telegram_user_id_idx

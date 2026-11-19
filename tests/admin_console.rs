@@ -8561,6 +8561,38 @@ async fn claim_is_active(pool: &PgPool, code: &str) -> bool {
         .is_some()
 }
 
+/// Код из ссылки `https://t.me/<бот>?start=adm_<код>`.
+fn telegram_link_code_from(html: &str) -> String {
+    let marker = "?start=adm_";
+    let start = html
+        .find(marker)
+        .unwrap_or_else(|| panic!("no telegram link in:\n{html}"))
+        + marker.len();
+    html[start..].chars().take(22).collect()
+}
+
+/// Действует ли открытое значение `telegram_link`.
+async fn telegram_link_is_active(pool: &PgPool, code: &str) -> bool {
+    let mut conn = pool.acquire().await.expect("connection");
+    codes::find_active(&mut conn, Purpose::TelegramLink, code, Utc::now())
+        .await
+        .expect("find the telegram link")
+        .is_some()
+}
+
+/// Сообщения (`kind = 'message'`) чата в порядке постановки.
+async fn outbox_messages(pool: &PgPool, chat: i64) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT payload->>'html' FROM outbox
+         WHERE chat_id = $1 AND kind = 'message'
+         ORDER BY seq",
+    )
+    .bind(chat)
+    .fetch_all(pool)
+    .await
+    .expect("outbox messages")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_owner_claim_link_is_issued_with_an_inline_qr_and_works_in_telegram() {
     let db = support::isolated_db().await;
@@ -8984,6 +9016,500 @@ async fn an_unknown_or_missing_household_target_is_rejected() {
         assert!(!html.contains("?start=own_"), "{html}");
     }
     assert_eq!(active_claim_count(&db.pool, None).await, 0);
+}
+
+/// Выпустить ссылку привязки Telegram и вернуть открытый код.
+async fn issue_telegram_link(app: &Router, cookie: &str) -> String {
+    let (status, _, body) = send_form_from(
+        app,
+        "/admin/telegram-link",
+        test_peer(),
+        headers_with(&[("cookie", cookie)]),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let html = String::from_utf8_lossy(&body);
+    assert!(
+        html.contains("?start=adm_"),
+        "the response shows the link:\n{html}"
+    );
+    telegram_link_code_from(&html)
+}
+
+/// Подтвердить или отклонить кандидата в консоли.
+async fn send_candidate(app: &Router, cookie: &str, action: &str, candidate: i64) {
+    let path = format!("/admin/telegram-link/{action}");
+    let candidate = candidate.to_string();
+    let (status, _, body) = send_form_from(
+        app,
+        &path,
+        test_peer(),
+        headers_with(&[("cookie", cookie)]),
+        &[("candidate", candidate.as_str())],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+}
+
+/// Кандидат и подтверждённая привязка учётной записи.
+async fn telegram_binding(pool: &PgPool) -> (Option<i64>, Option<String>, Option<i64>) {
+    sqlx::query_as(
+        "SELECT telegram_user_id, telegram_name, pending_telegram_user_id
+         FROM admin_accounts",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("telegram binding")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_telegram_link_is_issued_with_a_fifteen_minute_code_and_reissue_resets_the_candidate() {
+    let db = support::isolated_db().await;
+    let config = telegram_config(&db.pool, None, &[]).await;
+    let cipher = SecretCipher::from_config(&config);
+    seed_bot(
+        &db.pool,
+        &cipher,
+        "polling",
+        "123:SECRET-telegram-link",
+        "telegram-link-secret",
+        902_001,
+        "tasklerq_link_bot",
+    )
+    .await;
+    let (app, cookie) = owner_console_with_login(&db.pool, &config, TenancyMode::Single).await;
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let home = String::from_utf8_lossy(&body);
+    assert!(home.contains("Telegram администратора"), "{home}");
+    assert!(home.contains("Создать ссылку привязки"), "{home}");
+
+    let first = issue_telegram_link(&app, &cookie).await;
+    let (purpose, lifetime): (String, Option<f64>) = sqlx::query_as(
+        "SELECT purpose, EXTRACT(EPOCH FROM (expires_at - created_at))::float8
+         FROM admin_one_time_codes WHERE code_hash = $1",
+    )
+    .bind(hash_token(&first))
+    .fetch_one(&db.pool)
+    .await
+    .expect("the issued telegram link");
+    assert_eq!(purpose, "telegram_link");
+    let lifetime = lifetime.expect("a telegram link always has an expiry");
+    assert!(
+        (lifetime - 900.0).abs() < 1.0,
+        "the telegram link lives fifteen minutes: {lifetime}"
+    );
+
+    let second = issue_telegram_link(&app, &cookie).await;
+    assert_ne!(first, second);
+    assert!(
+        !telegram_link_is_active(&db.pool, &first).await,
+        "reissuing cancels the previous link"
+    );
+    assert!(telegram_link_is_active(&db.pool, &second).await);
+
+    let mut bot = owner_claim_harness(&db.pool, support::next_telegram_id(), TenancyMode::Single);
+    bot.text(&format!("/start adm_{second}")).await;
+    let (_, _, pending) = telegram_binding(&db.pool).await;
+    assert_eq!(pending, Some(bot.chat), "the bot records the candidate");
+
+    let third = issue_telegram_link(&app, &cookie).await;
+    assert!(telegram_link_is_active(&db.pool, &third).await);
+    let (_, _, pending) = telegram_binding(&db.pool).await;
+    assert_eq!(
+        pending, None,
+        "a new link starts a new attempt and drops the candidate"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_telegram_link_post_requires_the_same_origin() {
+    let db = support::isolated_db().await;
+    let config = telegram_config(&db.pool, None, &[]).await;
+    let cipher = SecretCipher::from_config(&config);
+    seed_bot(
+        &db.pool,
+        &cipher,
+        "polling",
+        "123:SECRET-link-origin",
+        "link-origin-secret",
+        902_002,
+        "tasklerq_link_origin_bot",
+    )
+    .await;
+    let (app, cookie) = owner_console_with_login(&db.pool, &config, TenancyMode::Single).await;
+
+    let attempts = [
+        headers_with(&[("cookie", cookie.as_str())]),
+        headers_with(&[
+            ("cookie", cookie.as_str()),
+            ("host", "nas:18081"),
+            ("origin", "http://evil.example"),
+        ]),
+    ];
+    for headers in attempts {
+        let (status, _, _) =
+            send_form_raw(&app, "/admin/telegram-link", test_peer(), headers, &[]).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    let links: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM admin_one_time_codes WHERE purpose = 'telegram_link'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("telegram links");
+    assert_eq!(links, 0, "a rejected POST issues no code");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_telegram_link_without_a_bot_shows_the_hint_and_issues_no_code() {
+    let db = support::isolated_db().await;
+    let config = telegram_config(&db.pool, None, &[]).await;
+    let (app, cookie) = owner_console_with_login(&db.pool, &config, TenancyMode::Single).await;
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let home = String::from_utf8_lossy(&body);
+    assert!(home.contains("Сначала подключите бота"), "{home}");
+    assert!(!home.contains("Создать ссылку привязки"), "{home}");
+
+    let (status, _, body) = send_form_from(
+        &app,
+        "/admin/telegram-link",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let html = String::from_utf8_lossy(&body);
+    assert!(html.contains("Сначала подключите бота"), "{html}");
+    assert!(!html.contains("?start=adm_"), "{html}");
+    let links: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM admin_one_time_codes WHERE purpose = 'telegram_link'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("telegram links");
+    assert_eq!(links, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_telegram_link_binds_only_after_confirmation_and_notifies_the_account() {
+    let db = support::isolated_db().await;
+    let config = telegram_config(&db.pool, None, &[]).await;
+    let cipher = SecretCipher::from_config(&config);
+    seed_bot(
+        &db.pool,
+        &cipher,
+        "polling",
+        "123:SECRET-link-bind",
+        "link-bind-secret",
+        902_003,
+        "tasklerq_bind_bot",
+    )
+    .await;
+    let (app, cookie) = owner_console_with_login(&db.pool, &config, TenancyMode::Single).await;
+
+    let code = issue_telegram_link(&app, &cookie).await;
+    let mut bot = owner_claim_harness(&db.pool, support::next_telegram_id(), TenancyMode::Single);
+    let bot_id = bot.chat;
+    bot.text(&format!("/start adm_{code}")).await;
+    bot.assert_screen_contains("Запрос на привязку отправлен");
+    bot.assert_screen_contains("Подтвердите его в консоли администратора");
+
+    let (bound, name, pending) = telegram_binding(&db.pool).await;
+    assert_eq!(
+        bound, None,
+        "the candidate is not bound before confirmation"
+    );
+    assert_eq!(pending, Some(bot_id));
+    assert_eq!(name, None);
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let home = String::from_utf8_lossy(&body);
+    assert!(home.contains("Alice"), "the candidate is shown:\n{home}");
+    assert!(home.contains("Подтвердить"), "{home}");
+
+    send_candidate(&app, &cookie, "confirm", bot_id).await;
+
+    let (bound, name, pending) = telegram_binding(&db.pool).await;
+    assert_eq!(bound, Some(bot_id));
+    assert_eq!(name.as_deref(), Some("Alice"));
+    assert_eq!(pending, None);
+    assert_eq!(
+        audit_payloads(&db.pool, "admin_telegram_linked")
+            .await
+            .len(),
+        1
+    );
+    let messages = outbox_messages(&db.pool, bot_id).await;
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("консоли администратора")),
+        "the account receives the confirmation message: {messages:?}"
+    );
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let home = String::from_utf8_lossy(&body);
+    assert!(home.contains("Alice"), "{home}");
+    assert!(home.contains("Отвязать"), "{home}");
+
+    bot.text("/start").await;
+    bot.assert_screen_contains("Обратитесь к администратору");
+    assert!(
+        !bot.screen().contains("Добавить"),
+        "the binding must not grant the household menu:\n{}",
+        bot.screen()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stranger_who_opened_the_link_can_be_rejected_and_stays_unbound() {
+    let db = support::isolated_db().await;
+    let config = telegram_config(&db.pool, None, &[]).await;
+    let cipher = SecretCipher::from_config(&config);
+    seed_bot(
+        &db.pool,
+        &cipher,
+        "polling",
+        "123:SECRET-link-reject",
+        "link-reject-secret",
+        902_004,
+        "tasklerq_reject_bot",
+    )
+    .await;
+    let (app, cookie) = owner_console_with_login(&db.pool, &config, TenancyMode::Single).await;
+
+    let code = issue_telegram_link(&app, &cookie).await;
+    let mut bot = owner_claim_harness(&db.pool, support::next_telegram_id(), TenancyMode::Single);
+    let stranger = bot.chat;
+    bot.text(&format!("/start adm_{code}")).await;
+
+    send_candidate(&app, &cookie, "reject", stranger).await;
+
+    let (bound, name, pending) = telegram_binding(&db.pool).await;
+    assert_eq!(bound, None, "the rejected account is not bound");
+    assert_eq!(name, None);
+    assert_eq!(pending, None);
+    assert!(
+        outbox_messages(&db.pool, stranger)
+            .await
+            .iter()
+            .all(|message| !message.contains("консоли администратора")),
+        "a rejected account gets no confirmation message"
+    );
+
+    bot.text("/nosuchcommand").await;
+    let unknown = bot.latest().1;
+    bot.text("/admin").await;
+    let admin = bot.latest().1;
+    assert_eq!(
+        admin, unknown,
+        "`/admin` from an unbound account must behave like an unknown command"
+    );
+    assert!(admin.contains("Не знаю такой команды"), "{admin}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unconfirmed_telegram_link_does_not_bind_and_admin_is_unknown() {
+    let db = support::isolated_db().await;
+    let config = telegram_config(&db.pool, None, &[]).await;
+    let cipher = SecretCipher::from_config(&config);
+    seed_bot(
+        &db.pool,
+        &cipher,
+        "polling",
+        "123:SECRET-link-unconfirmed",
+        "link-unconfirmed-secret",
+        902_005,
+        "tasklerq_unconfirmed_bot",
+    )
+    .await;
+    let (app, cookie) = owner_console_with_login(&db.pool, &config, TenancyMode::Single).await;
+
+    let code = issue_telegram_link(&app, &cookie).await;
+    let mut bot = owner_claim_harness(&db.pool, support::next_telegram_id(), TenancyMode::Single);
+    bot.text(&format!("/start adm_{code}")).await;
+
+    let (bound, name, _) = telegram_binding(&db.pool).await;
+    assert_eq!(bound, None);
+    assert_eq!(name, None);
+
+    bot.text("/admin").await;
+    assert!(
+        bot.latest().1.contains("Не знаю такой команды"),
+        "`/admin` stays unknown without confirmation:\n{}",
+        bot.latest().1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reopening_the_same_link_keeps_the_first_candidate() {
+    let db = support::isolated_db().await;
+    let config = telegram_config(&db.pool, None, &[]).await;
+    let cipher = SecretCipher::from_config(&config);
+    seed_bot(
+        &db.pool,
+        &cipher,
+        "polling",
+        "123:SECRET-link-reopen",
+        "link-reopen-secret",
+        902_006,
+        "tasklerq_reopen_bot",
+    )
+    .await;
+    let (app, cookie) = owner_console_with_login(&db.pool, &config, TenancyMode::Single).await;
+
+    let code = issue_telegram_link(&app, &cookie).await;
+    let mut first = owner_claim_harness(&db.pool, support::next_telegram_id(), TenancyMode::Single);
+    let first_id = first.chat;
+    first.text(&format!("/start adm_{code}")).await;
+
+    let mut second =
+        owner_claim_harness(&db.pool, support::next_telegram_id(), TenancyMode::Single);
+    second.text(&format!("/start adm_{code}")).await;
+    assert!(
+        !second.screen().contains("Запрос на привязку отправлен"),
+        "a spent link behaves like `/start` without an argument:\n{}",
+        second.screen()
+    );
+
+    let (_, _, pending) = telegram_binding(&db.pool).await;
+    assert_eq!(pending, Some(first_id), "the first candidate is kept");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_candidate_confirmation_applies_nothing() {
+    let db = support::isolated_db().await;
+    let config = telegram_config(&db.pool, None, &[]).await;
+    let cipher = SecretCipher::from_config(&config);
+    seed_bot(
+        &db.pool,
+        &cipher,
+        "polling",
+        "123:SECRET-link-stale",
+        "link-stale-secret",
+        902_007,
+        "tasklerq_stale_bot",
+    )
+    .await;
+    let (app, cookie) = owner_console_with_login(&db.pool, &config, TenancyMode::Single).await;
+
+    let first_code = issue_telegram_link(&app, &cookie).await;
+    let mut first = owner_claim_harness(&db.pool, support::next_telegram_id(), TenancyMode::Single);
+    let first_id = first.chat;
+    first.text(&format!("/start adm_{first_code}")).await;
+
+    let second_code = issue_telegram_link(&app, &cookie).await;
+    let mut second =
+        owner_claim_harness(&db.pool, support::next_telegram_id(), TenancyMode::Single);
+    let second_id = second.chat;
+    second.text(&format!("/start adm_{second_code}")).await;
+
+    let candidate = first_id.to_string();
+    let (status, _, body) = send_form_from(
+        &app,
+        "/admin/telegram-link/confirm",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("candidate", candidate.as_str())],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let html = String::from_utf8_lossy(&body);
+    assert!(
+        html.contains("Кандидат"),
+        "the stale form is explained:\n{html}"
+    );
+
+    let (bound, name, pending) = telegram_binding(&db.pool).await;
+    assert_eq!(bound, None, "a stale candidate is not applied");
+    assert_eq!(name, None);
+    assert_eq!(pending, Some(second_id), "the current candidate stays");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unlinking_the_telegram_account_clears_it_and_writes_audit() {
+    let db = support::isolated_db().await;
+    let config = telegram_config(&db.pool, None, &[]).await;
+    let cipher = SecretCipher::from_config(&config);
+    seed_bot(
+        &db.pool,
+        &cipher,
+        "polling",
+        "123:SECRET-link-unlink",
+        "link-unlink-secret",
+        902_008,
+        "tasklerq_unlink_bot",
+    )
+    .await;
+    let (app, cookie) = owner_console_with_login(&db.pool, &config, TenancyMode::Single).await;
+
+    let code = issue_telegram_link(&app, &cookie).await;
+    let mut bot = owner_claim_harness(&db.pool, support::next_telegram_id(), TenancyMode::Single);
+    let bot_id = bot.chat;
+    bot.text(&format!("/start adm_{code}")).await;
+    send_candidate(&app, &cookie, "confirm", bot_id).await;
+
+    let (status, _, body) = send_form_from(
+        &app,
+        "/admin/telegram-link/unlink",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+    let (bound, name, pending) = telegram_binding(&db.pool).await;
+    assert_eq!(bound, None, "unlinking clears the telegram id");
+    assert_eq!(name, None, "unlinking clears the stored name");
+    assert_eq!(pending, None);
+    assert_eq!(
+        audit_payloads(&db.pool, "admin_telegram_unlinked")
+            .await
+            .len(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_login_records_the_request_origin_including_a_trusted_proxy() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console(
+        &db.pool,
+        vec![IpNet::parse("127.0.0.1").expect("a loopback network")],
+    );
+
+    let fields = [("username", "admin"), ("password", TEST_PASSWORD)];
+    let (status, _, _) = send_form(&app, "/admin/login", &fields).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let origin: Option<String> = sqlx::query_scalar("SELECT console_origin FROM admin_accounts")
+        .fetch_one(&db.pool)
+        .await
+        .expect("console origin");
+    assert_eq!(origin.as_deref(), Some("http://nas:18081"));
+
+    let forwarded = headers_with(&[
+        ("x-forwarded-host", "console.example"),
+        ("x-forwarded-proto", "https"),
+        ("origin", "https://console.example"),
+    ]);
+    let (status, _, _) =
+        send_form_from(&app, "/admin/login", test_peer(), forwarded, &fields).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let origin: Option<String> = sqlx::query_scalar("SELECT console_origin FROM admin_accounts")
+        .fetch_one(&db.pool)
+        .await
+        .expect("console origin after the proxy");
+    assert_eq!(origin.as_deref(), Some("https://console.example"));
 }
 
 /// Первое сохранение группы webhook и его события `admin_setting_changed`.

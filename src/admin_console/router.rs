@@ -279,6 +279,19 @@ pub fn build_router(state: AdminState) -> Router {
             post(pages::telegram_reissue_secret),
         )
         .route(pages::OWNER_PATH, post(pages::owner_submit))
+        .route(pages::TELEGRAM_LINK_PATH, post(pages::telegram_link_issue))
+        .route(
+            pages::TELEGRAM_LINK_CONFIRM_PATH,
+            post(pages::telegram_link_confirm),
+        )
+        .route(
+            pages::TELEGRAM_LINK_REJECT_PATH,
+            post(pages::telegram_link_reject),
+        )
+        .route(
+            pages::TELEGRAM_LINK_UNLINK_PATH,
+            post(pages::telegram_link_unlink),
+        )
         .route(pages::LLM_CHECK_PATH, get(pages::llm_check_page))
         .route(
             pages::LLM_CHECK_FRAGMENT_PATH,

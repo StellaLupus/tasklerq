@@ -176,7 +176,9 @@ pub(crate) async fn issue(
 }
 
 /// Готовность Telegram и имя бота без `@`.
-async fn telegram_bot(state: &AdminState) -> Result<(bool, Option<String>), DomainError> {
+pub(crate) async fn telegram_bot(
+    state: &AdminState,
+) -> Result<(bool, Option<String>), DomainError> {
     let Some(config) = state.telegram_config() else {
         return Ok((false, None));
     };

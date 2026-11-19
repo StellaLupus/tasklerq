@@ -39,7 +39,7 @@ use serde_json::Value;
 use super::assets;
 use super::change::{self, ChangeError, ChangeOutcome};
 use super::checks::{CheckOutcome, CheckSlot, CheckSnapshot};
-use super::codes::OWNER_CLAIM_TTL_HOURS;
+use super::codes::{OWNER_CLAIM_TTL_HOURS, TELEGRAM_LINK_TTL_MINUTES};
 use super::login::{self, LoginError, LoginOutcome};
 use super::owner::{self, OwnerIssueOutcome, OwnerLinkForm};
 use super::password::{self, Password};
@@ -48,6 +48,7 @@ use super::router::AdminState;
 use super::session::{self, AdminSession, LOGIN_PATH};
 use super::setup::{self, SetupError, SetupOutcome};
 use super::telegram::{self, BotChange, TelegramForm, TelegramSubmitOutcome, TelegramView};
+use super::telegram_link::{self, BindingOutcome, IssueOutcome};
 use super::wizard::{self, WizardStep};
 use crate::VERSION;
 use crate::admin;
@@ -81,6 +82,14 @@ pub(crate) const TELEGRAM_PATH: &str = telegram::TELEGRAM_PATH;
 pub(crate) const TELEGRAM_SECRET_PATH: &str = telegram::TELEGRAM_SECRET_PATH;
 /// Путь выпуска ссылки-claim владельца.
 pub(crate) const OWNER_PATH: &str = owner::OWNER_PATH;
+/// Путь выпуска ссылки привязки Telegram.
+pub(crate) const TELEGRAM_LINK_PATH: &str = telegram_link::TELEGRAM_LINK_PATH;
+/// Путь подтверждения кандидата.
+pub(crate) const TELEGRAM_LINK_CONFIRM_PATH: &str = telegram_link::TELEGRAM_LINK_CONFIRM_PATH;
+/// Путь отклонения кандидата.
+pub(crate) const TELEGRAM_LINK_REJECT_PATH: &str = telegram_link::TELEGRAM_LINK_REJECT_PATH;
+/// Путь отвязки подтверждённого аккаунта.
+pub(crate) const TELEGRAM_LINK_UNLINK_PATH: &str = telegram_link::TELEGRAM_LINK_UNLINK_PATH;
 /// Путь страницы хода проверки слота.
 pub(crate) const LLM_CHECK_PATH: &str = "/admin/llm/check";
 /// Путь фрагмента хода для htmx; без JavaScript страница обновляется ссылкой.
@@ -109,6 +118,7 @@ const WIZARD_TOKEN_NO_HOUSEHOLD_ERROR: &str = "В инсталляции нет 
 const WIZARD_TOKEN_CHANGED_ERROR: &str =
     "Не удалось выпустить токен: состояние инсталляции изменилось. Повторите попытку.";
 const INVALID_LINK_TITLE: &str = "Ссылка недействительна";
+const STALE_CANDIDATE_ERROR: &str = "Кандидат уже изменился. Показываю актуальное состояние.";
 
 /// Поля формы setup.
 #[derive(Deserialize)]
@@ -128,6 +138,13 @@ pub(crate) struct LoginForm {
     username: String,
     /// Пароль; `Debug` не печатает значение.
     password: Password,
+}
+
+/// Поля формы кандидата на привязку Telegram.
+#[derive(Deserialize)]
+pub(crate) struct CandidateForm {
+    /// Telegram id кандидата, показанный при отрисовке формы.
+    candidate: String,
 }
 
 /// Поля формы восстановления.
@@ -338,6 +355,96 @@ pub(crate) async fn owner_submit(
     }
 }
 
+/// Выпустить ссылку привязки Telegram.
+///
+/// Открытый код показывается только в этом ответе: в базе хранится хеш.
+pub(crate) async fn telegram_link_issue(
+    State(state): State<AdminState>,
+    _session: AdminSession,
+) -> Response {
+    let now = Utc::now();
+    match telegram_link::issue(&state, now).await {
+        Ok(IssueOutcome::Issued(link)) => {
+            let view = TelegramLinkView {
+                link: link.link,
+                expires_at: link.expires_at.to_rfc3339(),
+                ttl_minutes: TELEGRAM_LINK_TTL_MINUTES,
+            };
+            render(ConsolePage::new(Page::TelegramLinkIssued(Box::new(view))))
+        }
+        Ok(IssueOutcome::Rejected(message)) => {
+            home_response(&state, now, Some((&message, StatusCode::BAD_REQUEST))).await
+        }
+        Err(error) => internal(error),
+    }
+}
+
+/// Подтвердить кандидата на привязку Telegram.
+pub(crate) async fn telegram_link_confirm(
+    State(state): State<AdminState>,
+    _session: AdminSession,
+    Form(form): Form<CandidateForm>,
+) -> Response {
+    telegram_link_candidate_action(&state, &form.candidate, true).await
+}
+
+/// Отклонить кандидата на привязку Telegram.
+pub(crate) async fn telegram_link_reject(
+    State(state): State<AdminState>,
+    _session: AdminSession,
+    Form(form): Form<CandidateForm>,
+) -> Response {
+    telegram_link_candidate_action(&state, &form.candidate, false).await
+}
+
+/// Подтвердить или отклонить кандидата; форма несёт его id.
+async fn telegram_link_candidate_action(
+    state: &AdminState,
+    candidate: &str,
+    confirm: bool,
+) -> Response {
+    let now = Utc::now();
+    let Some(candidate) = candidate.trim().parse::<i64>().ok() else {
+        return home_response(
+            state,
+            now,
+            Some((STALE_CANDIDATE_ERROR, StatusCode::BAD_REQUEST)),
+        )
+        .await;
+    };
+
+    let outcome = if confirm {
+        telegram_link::confirm(state, candidate, now).await
+    } else {
+        telegram_link::reject(state, candidate).await
+    };
+    match outcome {
+        Ok(BindingOutcome::Applied) => home_response(state, now, None).await,
+        Ok(BindingOutcome::Stale) => {
+            home_response(
+                state,
+                now,
+                Some((STALE_CANDIDATE_ERROR, StatusCode::BAD_REQUEST)),
+            )
+            .await
+        }
+        Ok(BindingOutcome::NotLinked) => home_response(state, now, None).await,
+        Err(error) => internal(error),
+    }
+}
+
+/// Снять подтверждённую привязку Telegram.
+pub(crate) async fn telegram_link_unlink(
+    State(state): State<AdminState>,
+    _session: AdminSession,
+) -> Response {
+    let now = Utc::now();
+    match telegram_link::unlink(&state, now).await {
+        Ok(_) => home_response(&state, now, None).await,
+        Err(error) => internal(error),
+    }
+}
+
 /// Данные главной страницы.
 struct HomeView {
     /// Версия сервиса.
@@ -362,8 +469,28 @@ struct HomeView {
     owner_targets: Vec<owner::OwnerTarget>,
     /// Бот включён и его имя известно: можно выпускать ссылку.
     owner_telegram_ready: bool,
+    /// Привязка Telegram к учётной записи администратора.
+    telegram: HomeTelegram,
     /// Статусы основного и резервного слотов.
     slots: Vec<HomeSlot>,
+}
+
+/// Состояние блока «Telegram администратора» на главной.
+struct HomeTelegram {
+    /// Бот включён и его имя известно: можно выпускать ссылку.
+    ready: bool,
+    /// Имя подтверждённого аккаунта.
+    linked: Option<String>,
+    /// Кандидат, открывший ссылку привязки.
+    candidate: Option<HomeTelegramCandidate>,
+}
+
+/// Кандидат на привязку Telegram.
+struct HomeTelegramCandidate {
+    /// Telegram id кандидата для сверки формы.
+    id: i64,
+    /// Имя из Telegram.
+    name: String,
 }
 
 /// Предупреждение readiness на главной.
@@ -384,6 +511,16 @@ struct OwnerLinkView {
     ttl_hours: i64,
     /// SVG QR-кода, сгенерированный сервером.
     svg: String,
+}
+
+/// Выпущенная ссылка привязки Telegram: открытый код показывается один раз.
+struct TelegramLinkView {
+    /// Ссылка `https://t.me/<бот>?start=adm_<код>`.
+    link: String,
+    /// Срок действия в RFC 3339.
+    expires_at: String,
+    /// Срок в минутах для подписи.
+    ttl_minutes: i64,
 }
 
 /// Статус одного слота LLM на главной.
@@ -432,10 +569,23 @@ async fn home_view(state: &AdminState, now: DateTime<Utc>) -> Result<HomeView, D
 
     let mut conn = state.pool.acquire().await?;
     let active_households = households::count_active(&mut conn).await?;
+    let account = admin_accounts::get(&mut conn).await?;
     drop(conn);
 
     let owner_targets = owner::targets(state).await?;
     let owner_telegram_ready = owner_targets.telegram_ready;
+    let telegram = HomeTelegram {
+        ready: owner_telegram_ready,
+        linked: account
+            .as_ref()
+            .and_then(|account| account.telegram_name.clone()),
+        candidate: account.as_ref().and_then(|account| {
+            Some(HomeTelegramCandidate {
+                id: account.pending_telegram_user_id?,
+                name: account.pending_telegram_name.clone()?,
+            })
+        }),
+    };
 
     let slots = home_slots(state, now).await;
 
@@ -454,6 +604,7 @@ async fn home_view(state: &AdminState, now: DateTime<Utc>) -> Result<HomeView, D
         telegram_enabled: snapshot.telegram_enabled,
         owner_targets: owner_targets.targets,
         owner_telegram_ready,
+        telegram,
         slots,
     })
 }
@@ -2229,6 +2380,8 @@ enum Page {
     Telegram(Box<TelegramView>),
     /// Выпущенная ссылка-claim владельца.
     OwnerLinkIssued(Box<OwnerLinkView>),
+    /// Выпущенная ссылка привязки Telegram.
+    TelegramLinkIssued(Box<TelegramLinkView>),
     /// Ход проверки слота.
     Check(Option<CheckSnapshot>),
 }
@@ -2266,6 +2419,7 @@ impl Page {
             Self::Llm(_) => "Разбор записей",
             Self::Telegram(_) => "Telegram",
             Self::OwnerLinkIssued(_) => "Ссылка-claim владельца",
+            Self::TelegramLinkIssued(_) => "Ссылка привязки Telegram",
             Self::Check(_) => "Проверка слота",
         }
     }
@@ -2284,6 +2438,7 @@ impl Page {
                 | Self::Llm(_)
                 | Self::Telegram(_)
                 | Self::OwnerLinkIssued(_)
+                | Self::TelegramLinkIssued(_)
                 | Self::Check(_)
         )
     }
@@ -2387,6 +2542,7 @@ impl Page {
                 .render()
             }
             Self::OwnerLinkIssued(view) => OwnerLinkBody { view }.render(),
+            Self::TelegramLinkIssued(view) => TelegramLinkBody { view }.render(),
             Self::Check(snapshot) => {
                 let view = check_view(snapshot.as_ref());
                 let check = CheckBody { view: &view }.render()?;
@@ -2535,6 +2691,38 @@ struct Layout<'a> {
 </section>
 {% endif %}
 <section>
+<h2>Telegram администратора</h2>
+{% match view.telegram.linked %}
+{% when Some with (name) %}
+<p>Привязанный аккаунт: <strong>{{ name }}</strong></p>
+<form method="post" action="/admin/telegram-link/unlink">
+<button type="submit">Отвязать</button>
+</form>
+{% when None %}
+{% match view.telegram.candidate %}
+{% when Some with (candidate) %}
+<p>Кандидат на привязку: <strong>{{ candidate.name }}</strong></p>
+<form method="post" action="/admin/telegram-link/confirm">
+<input type="hidden" name="candidate" value="{{ candidate.id }}">
+<button type="submit">Подтвердить</button>
+</form>
+<form method="post" action="/admin/telegram-link/reject">
+<input type="hidden" name="candidate" value="{{ candidate.id }}">
+<button type="submit">Отклонить</button>
+</form>
+{% when None %}
+{% if view.telegram.ready %}
+<p>Выпустите одноразовую ссылку и откройте её в Telegram.</p>
+<form method="post" action="/admin/telegram-link">
+<button type="submit">Создать ссылку привязки</button>
+</form>
+{% else %}
+<p class="console-notice">Сначала подключите бота на странице <a href="/admin/telegram">Telegram</a>.</p>
+{% endif %}
+{% endmatch %}
+{% endmatch %}
+</section>
+<section>
 <h2>Слоты LLM</h2>
 <ul class="console-slots">
 {% for slot in view.slots %}
@@ -2566,6 +2754,23 @@ struct HomeBody<'a> {
 struct OwnerLinkBody<'a> {
     /// Ссылка, срок и SVG QR-кода.
     view: &'a OwnerLinkView,
+}
+
+/// Содержимое выпущенной ссылки привязки Telegram.
+#[derive(Template)]
+#[template(
+    source = r#"<h1>Ссылка привязки Telegram</h1>
+<p>Откройте ссылку в Telegram с того аккаунта, который привязываете, и подтвердите его на главной странице.</p>
+<p><a href="{{ view.link }}" rel="noreferrer">{{ view.link }}</a></p>
+<p>Срок действия: {{ view.ttl_minutes }} мин, до {{ view.expires_at }}.</p>
+<p class="console-notice">Код сохранён только хешем: при повторном открытии страницы ссылка недоступна. Ссылку можно выпустить заново.</p>
+<p><a href="/admin">На главную</a></p>
+"#,
+    ext = "html"
+)]
+struct TelegramLinkBody<'a> {
+    /// Ссылка и срок.
+    view: &'a TelegramLinkView,
 }
 
 /// Содержимое первого входа.
@@ -3054,8 +3259,8 @@ struct CheckBody<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConsolePage, HomeSlot, HomeView, HomeWarning, HouseholdForm, LlmCheck, LlmChecks,
-        LlmSlotView, LlmTextField, LlmToggle, LlmTokenView, LlmView, Page, WizardForm,
+        ConsolePage, HomeSlot, HomeTelegram, HomeView, HomeWarning, HouseholdForm, LlmCheck,
+        LlmChecks, LlmSlotView, LlmTextField, LlmToggle, LlmTokenView, LlmView, Page, WizardForm,
         household_form_error, phrase_word, target_or_home, warning_label,
     };
     use crate::admin_console::checks::{CheckOutcome, CheckSlot, CheckSnapshot};
@@ -3079,6 +3284,11 @@ mod tests {
             telegram_enabled: false,
             owner_targets: Vec::new(),
             owner_telegram_ready: false,
+            telegram: HomeTelegram {
+                ready: false,
+                linked: None,
+                candidate: None,
+            },
             slots: vec![HomeSlot {
                 label: "Основной слот",
                 status: "не проверен".to_owned(),
