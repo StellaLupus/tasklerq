@@ -4194,7 +4194,10 @@ async fn the_home_page_shows_the_installation_state_and_readiness() {
         "{text}"
     );
     assert!(text.contains("<dt>Household</dt><dd>2</dd>"), "{text}");
-    assert!(text.contains("Telegram</dt><dd>выключен"), "{text}");
+    assert!(
+        text.contains("<dt>Telegram</dt><dd><span class=\"status\">выключен</span></dd>"),
+        "{text}"
+    );
     assert!(text.contains("multiple_households"), "{text}");
     assert!(
         text.contains("в режиме single больше одного household"),
@@ -4345,7 +4348,10 @@ async fn the_home_page_never_shows_secrets_or_user_content() {
     assert_no_external_urls(&body, "GET /admin with secrets");
     let text = String::from_utf8_lossy(&body);
 
-    assert!(text.contains("Telegram</dt><dd>включён"), "{text}");
+    assert!(
+        text.contains("<dt>Telegram</dt><dd><span class=\"status status-ok\">включён</span></dd>"),
+        "{text}"
+    );
     assert!(
         text.contains("<dt>Режим размещения</dt><dd>multi</dd>"),
         "{text}"

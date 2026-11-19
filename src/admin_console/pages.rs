@@ -2443,6 +2443,17 @@ impl Page {
         )
     }
 
+    /// Раздел навигации, который подсвечивается на странице; пусто — ни один.
+    fn section(&self) -> &'static str {
+        match self {
+            Self::Home(_) | Self::OwnerLinkIssued(_) | Self::TelegramLinkIssued(_) => "home",
+            Self::Llm(_) | Self::Check(_) => "llm",
+            Self::Telegram(view) if !view.wizard => "telegram",
+            Self::Password { .. } => "password",
+            _ => "",
+        }
+    }
+
     /// Отрисовать содержимое страницы без макета.
     fn render_body(&self) -> Result<String, askama::Error> {
         match self {
@@ -2527,7 +2538,9 @@ impl Page {
                     );
                 }
                 if !view.checks.any() {
-                    checks.push_str("<p>Настройте слот, чтобы проверить его.</p>");
+                    checks.push_str(
+                        "<div class=\"panel-body\"><p class=\"muted\">Настройте слот, чтобы проверить его.</p></div>",
+                    );
                 }
                 LlmBody {
                     saved: view.saved,
@@ -2579,6 +2592,7 @@ impl<'a> ConsolePage<'a> {
             htmx: assets::htmx_path(),
             title: self.page.title(),
             nav: self.page.nav(),
+            section: self.page.section(),
             error: self.error,
             content: self.page.render_body()?,
         }
@@ -2587,6 +2601,9 @@ impl<'a> ConsolePage<'a> {
 }
 
 /// Общий макет консоли.
+///
+/// Страницы за сессией — шапка с навигацией и колонка содержимого; страницы
+/// входа и восстановления — одна панель по центру без навигации.
 #[derive(Template)]
 #[template(
     source = r#"<!doctype html>
@@ -2594,24 +2611,28 @@ impl<'a> ConsolePage<'a> {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
 <title>{{ title }}</title>
 <link rel="stylesheet" href="{{ css }}">
 <script src="{{ htmx }}" defer></script>
 </head>
-<body>
-<header class="console-header">
-<span class="console-brand">Tasklerq</span>
 {% if nav %}
-<nav class="console-nav">
-<a href="/admin">Главная</a>
-<a href="/admin/llm">Разбор</a>
-<a href="/admin/telegram">Telegram</a>
-<a href="/admin/password">Сменить пароль</a>
-<form method="post" action="/admin/logout">
-<button type="submit">Выйти</button>
-</form>
+<body class="console-app">
+<header class="console-header">
+<div class="console-header-inner">
+<a class="console-brand" href="/admin"><span class="console-mark" aria-hidden="true">T</span>Tasklerq</a>
+<nav class="console-nav" aria-label="Разделы">
+<a href="/admin"{% if section == "home" %} aria-current="page"{% endif %}>Главная</a>
+<a href="/admin/llm"{% if section == "llm" %} aria-current="page"{% endif %}>Разбор</a>
+<a href="/admin/telegram"{% if section == "telegram" %} aria-current="page"{% endif %}>Telegram</a>
 </nav>
-{% endif %}
+<div class="console-account">
+<a href="/admin/password"{% if section == "password" %} aria-current="page"{% endif %}>Сменить пароль</a>
+<form method="post" action="/admin/logout">
+<button type="submit" class="btn-ghost">Выйти</button>
+</form>
+</div>
+</div>
 </header>
 <main class="console-main">
 {% match error %}
@@ -2622,6 +2643,21 @@ impl<'a> ConsolePage<'a> {
 {{ content|safe }}
 </main>
 </body>
+{% else %}
+<body class="console-auth">
+<main class="console-auth-main">
+<div class="console-auth-brand"><span class="console-brand"><span class="console-mark" aria-hidden="true">T</span>Tasklerq</span></div>
+{% match error %}
+{% when Some with (message) %}
+<p role="alert" class="console-alert">{{ message }}</p>
+{% when None %}
+{% endmatch %}
+<div class="auth-panel">
+{{ content|safe }}
+</div>
+</main>
+</body>
+{% endif %}
 </html>
 "#,
     ext = "html"
@@ -2635,6 +2671,8 @@ struct Layout<'a> {
     title: &'static str,
     /// Навигация вошедшего администратора.
     nav: bool,
+    /// Раздел навигации, к которому относится страница; пусто — ни к какому.
+    section: &'static str,
     /// Сообщение формы или причина отказа.
     error: Option<&'a str>,
     /// Уже отрисованный askama фрагмент страницы; экранирован шаблоном
@@ -2645,25 +2683,27 @@ struct Layout<'a> {
 /// Содержимое главной.
 #[derive(Template)]
 #[template(
-    source = r#"<h1>Tasklerq</h1>
-<p>Консоль администратора.</p>
+    source = r#"<header class="page-head">
+<h1>Tasklerq</h1>
+<p class="page-desc">Консоль администратора.</p>
+</header>
 {% if view.setup_incomplete %}
-<p class="console-notice">Настройка ещё не завершена. <a href="/admin/wizard">Продолжить настройку</a></p>
+<div class="console-notice" role="status"><span>Настройка ещё не завершена.</span> <a class="btn btn-primary" href="/admin/wizard">Продолжить настройку</a></div>
 {% endif %}
-<section>
-<h2>Состояние инсталляции</h2>
+<section class="panel">
+<header class="panel-head"><h2>Состояние инсталляции</h2></header>
 <dl class="console-state">
-<dt>Версия</dt><dd>{{ view.version }}</dd>
-<dt>Готовность</dt><dd>{% if view.ready %}готов{% else %}не готов{% endif %}{% match view.readiness_problem %}{% when Some with (reason) %} — {{ reason }}{% when None %}{% endmatch %}</dd>
+<dt>Версия</dt><dd class="mono">{{ view.version }}</dd>
+<dt>Готовность</dt><dd>{% if view.ready %}<span class="status status-ok">готов</span>{% else %}<span class="status status-bad">не готов</span>{% endif %}{% match view.readiness_problem %}{% when Some with (reason) %} <span class="muted">— {{ reason }}</span>{% when None %}{% endmatch %}</dd>
 <dt>Режим размещения</dt><dd>{{ view.tenancy }}</dd>
 <dt>Household</dt><dd>{{ view.households }}</dd>
-<dt>Telegram</dt><dd>{% if view.telegram_enabled %}включён{% else %}выключен{% endif %}</dd>
+<dt>Telegram</dt><dd>{% if view.telegram_enabled %}<span class="status status-ok">включён</span>{% else %}<span class="status">выключен</span>{% endif %}</dd>
 </dl>
 </section>
 {% if view.has_warnings %}
-<section>
-<h2>Предупреждения readiness</h2>
-<ul class="console-warnings">
+<section class="panel">
+<header class="panel-head"><h2>Предупреждения readiness</h2></header>
+<ul class="list list-warnings">
 {% for warning in view.warnings %}
 <li><code>{{ warning.code }}</code> — {{ warning.label }}</li>
 {% endfor %}
@@ -2671,13 +2711,15 @@ struct Layout<'a> {
 </section>
 {% endif %}
 {% if !view.owner_targets.is_empty() %}
-<section>
+<section class="panel">
+<header class="panel-head">
 <h2>Владелец</h2>
+{% if view.owner_telegram_ready %}<p>Выпустите одноразовую ссылку для того, кто станет владельцем.</p>{% endif %}
+</header>
 {% if view.owner_telegram_ready %}
-<p>Выпустите одноразовую ссылку для того, кто станет владельцем.</p>
-<ul class="console-owner-targets">
+<ul class="list">
 {% for target in view.owner_targets %}
-<li>{{ target.label }}
+<li><span class="row-label">{{ target.label }}</span>
 <form method="post" action="/admin/owner">
 <input type="hidden" name="target" value="{{ target.value }}">
 <button type="submit">Выпустить ссылку</button>
@@ -2686,50 +2728,71 @@ struct Layout<'a> {
 {% endfor %}
 </ul>
 {% else %}
-<p class="console-notice">Сначала подключите бота на странице <a href="/admin/telegram">Telegram</a>.</p>
+<div class="panel-body"><p class="console-notice">Сначала подключите бота на странице <a href="/admin/telegram">Telegram</a>.</p></div>
 {% endif %}
 </section>
 {% endif %}
-<section>
-<h2>Telegram администратора</h2>
+<section class="panel">
+<header class="panel-head"><h2>Telegram администратора</h2></header>
 {% match view.telegram.linked %}
 {% when Some with (name) %}
-<p>Привязанный аккаунт: <strong>{{ name }}</strong></p>
-<form method="post" action="/admin/telegram-link/unlink">
-<button type="submit">Отвязать</button>
-</form>
+<div class="row">
+<div class="row-text"><p class="row-desc">Привязанный аккаунт: <strong>{{ name }}</strong></p></div>
+</div>
 {% when None %}
 {% match view.telegram.candidate %}
 {% when Some with (candidate) %}
-<p>Кандидат на привязку: <strong>{{ candidate.name }}</strong></p>
-<form method="post" action="/admin/telegram-link/confirm">
-<input type="hidden" name="candidate" value="{{ candidate.id }}">
-<button type="submit">Подтвердить</button>
-</form>
+<div class="row">
+<div class="row-text"><p class="row-desc">Кандидат на привязку: <strong>{{ candidate.name }}</strong></p></div>
+<div class="row-actions">
 <form method="post" action="/admin/telegram-link/reject">
 <input type="hidden" name="candidate" value="{{ candidate.id }}">
-<button type="submit">Отклонить</button>
+<button type="submit" class="btn-ghost">Отклонить</button>
 </form>
+<form method="post" action="/admin/telegram-link/confirm">
+<input type="hidden" name="candidate" value="{{ candidate.id }}">
+<button type="submit" class="btn-primary">Подтвердить</button>
+</form>
+</div>
+</div>
 {% when None %}
 {% if view.telegram.ready %}
-<p>Выпустите одноразовую ссылку и откройте её в Telegram.</p>
+<div class="row">
+<div class="row-text"><p class="row-desc">Выпустите одноразовую ссылку и откройте её в Telegram.</p></div>
 <form method="post" action="/admin/telegram-link">
 <button type="submit">Создать ссылку привязки</button>
 </form>
+</div>
 {% else %}
-<p class="console-notice">Сначала подключите бота на странице <a href="/admin/telegram">Telegram</a>.</p>
+<div class="panel-body"><p class="console-notice">Сначала подключите бота на странице <a href="/admin/telegram">Telegram</a>.</p></div>
 {% endif %}
 {% endmatch %}
 {% endmatch %}
 </section>
-<section>
-<h2>Слоты LLM</h2>
-<ul class="console-slots">
+<section class="panel">
+<header class="panel-head"><h2>Слоты LLM</h2></header>
+<ul class="list">
 {% for slot in view.slots %}
-<li>{{ slot.label }}: {{ slot.status }}{% if slot.check_link %} — <a href="/admin/llm">Проверить</a>{% endif %}</li>
+<li><span>{{ slot.label }}: {{ slot.status }}{% if slot.check_link %} — <a href="/admin/llm">Проверить</a>{% endif %}</span></li>
 {% endfor %}
 </ul>
 </section>
+{% match view.telegram.linked %}
+{% when Some with (name) %}
+<section class="panel danger-zone">
+<header class="panel-head"><h2>Опасная зона</h2></header>
+<div class="row">
+<div class="row-text">
+<span class="row-label">Telegram администратора</span>
+<span class="row-desc">{{ name }}</span>
+</div>
+<form method="post" action="/admin/telegram-link/unlink">
+<button type="submit" class="btn-danger">Отвязать</button>
+</form>
+</div>
+</section>
+{% when None %}
+{% endmatch %}
 "#,
     ext = "html"
 )]
@@ -2741,13 +2804,19 @@ struct HomeBody<'a> {
 /// Содержимое выпущенной ссылки-claim.
 #[derive(Template)]
 #[template(
-    source = r#"<h1>Ссылка-claim владельца</h1>
-<p>Передайте ссылку или QR-код тому, кто станет владельцем.</p>
-<p><a href="{{ view.link }}" rel="noreferrer">{{ view.link }}</a></p>
-<p>Срок действия: {{ view.ttl_hours }} ч, до {{ view.expires_at }}.</p>
+    source = r#"<header class="page-head">
+<h1>Ссылка-claim владельца</h1>
+<p class="page-desc">Передайте ссылку или QR-код тому, кто станет владельцем.</p>
+</header>
+<section class="panel">
+<div class="panel-body">
+<a class="link-box" href="{{ view.link }}" rel="noreferrer">{{ view.link }}</a>
+<p class="field-hint num">Срок действия: {{ view.ttl_hours }} ч, до {{ view.expires_at }}.</p>
 <div class="console-qr">{{ view.svg|safe }}</div>
+</div>
+</section>
 <p class="console-notice">Код сохранён только хешем: при повторном открытии страницы ссылка недоступна. Ссылку можно выпустить заново.</p>
-<p><a href="/admin">На главную</a></p>
+<div class="actions"><a class="btn" href="/admin">На главную</a></div>
 "#,
     ext = "html"
 )]
@@ -2759,12 +2828,18 @@ struct OwnerLinkBody<'a> {
 /// Содержимое выпущенной ссылки привязки Telegram.
 #[derive(Template)]
 #[template(
-    source = r#"<h1>Ссылка привязки Telegram</h1>
-<p>Откройте ссылку в Telegram с того аккаунта, который привязываете, и подтвердите его на главной странице.</p>
-<p><a href="{{ view.link }}" rel="noreferrer">{{ view.link }}</a></p>
-<p>Срок действия: {{ view.ttl_minutes }} мин, до {{ view.expires_at }}.</p>
+    source = r#"<header class="page-head">
+<h1>Ссылка привязки Telegram</h1>
+<p class="page-desc">Откройте ссылку в Telegram с того аккаунта, который привязываете, и подтвердите его на главной странице.</p>
+</header>
+<section class="panel">
+<div class="panel-body">
+<a class="link-box" href="{{ view.link }}" rel="noreferrer">{{ view.link }}</a>
+<p class="field-hint num">Срок действия: {{ view.ttl_minutes }} мин, до {{ view.expires_at }}.</p>
+</div>
+</section>
 <p class="console-notice">Код сохранён только хешем: при повторном открытии страницы ссылка недоступна. Ссылку можно выпустить заново.</p>
-<p><a href="/admin">На главную</a></p>
+<div class="actions"><a class="btn" href="/admin">На главную</a></div>
 "#,
     ext = "html"
 )]
@@ -2778,13 +2853,13 @@ struct TelegramLinkBody<'a> {
 #[template(
     source = r#"<h1>Первый вход</h1>
 <form method="post" action="/admin/setup">
-<p><label for="setup-code">Код</label>
-<input id="setup-code" name="code" type="text" autocomplete="one-time-code" required></p>
-<p><label for="setup-username">Имя</label>
-<input id="setup-username" name="username" type="text" autocomplete="username" required></p>
-<p><label for="setup-password">Пароль</label>
-<input id="setup-password" name="password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></p>
-<p><button type="submit">Создать учётную запись</button></p>
+<div class="field"><label for="setup-code">Код</label>
+<input id="setup-code" class="mono" name="code" type="text" autocomplete="one-time-code" required></div>
+<div class="field"><label for="setup-username">Имя</label>
+<input id="setup-username" name="username" type="text" autocomplete="username" required></div>
+<div class="field"><label for="setup-password">Пароль</label>
+<input id="setup-password" name="password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></div>
+<button type="submit" class="btn-primary btn-block">Создать учётную запись</button>
 </form>
 "#,
     ext = "html"
@@ -2796,11 +2871,11 @@ struct SetupBody;
 #[template(
     source = r#"<h1>Вход</h1>
 <form method="post" action="/admin/login">
-<p><label for="login-username">Имя</label>
-<input id="login-username" name="username" type="text" autocomplete="username" required></p>
-<p><label for="login-password">Пароль</label>
-<input id="login-password" name="password" type="password" autocomplete="current-password" required></p>
-<p><button type="submit">Войти</button></p>
+<div class="field"><label for="login-username">Имя</label>
+<input id="login-username" name="username" type="text" autocomplete="username" required></div>
+<div class="field"><label for="login-password">Пароль</label>
+<input id="login-password" name="password" type="password" autocomplete="current-password" required></div>
+<button type="submit" class="btn-primary btn-block">Войти</button>
 </form>
 "#,
     ext = "html"
@@ -2812,9 +2887,9 @@ struct LoginBody;
 #[template(
     source = r#"<h1>Восстановление доступа</h1>
 <form method="post" action="/admin/recover/{{ code }}">
-<p><label for="recovery-password">Новый пароль</label>
-<input id="recovery-password" name="password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></p>
-<p><button type="submit">Сохранить пароль</button></p>
+<div class="field"><label for="recovery-password">Новый пароль</label>
+<input id="recovery-password" name="password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></div>
+<button type="submit" class="btn-primary btn-block">Сохранить пароль</button>
 </form>
 "#,
     ext = "html"
@@ -2827,16 +2902,20 @@ struct RecoveryBody<'a> {
 /// Содержимое смены пароля.
 #[derive(Template)]
 #[template(
-    source = r#"<h1>Смена пароля</h1>
+    source = r#"<header class="page-head"><h1>Смена пароля</h1></header>
 {% if changed %}
 <p role="status" class="console-notice">Пароль изменён.</p>
 {% endif %}
 <form method="post" action="/admin/password">
-<p><label for="current-password">Текущий пароль</label>
-<input id="current-password" name="current_password" type="password" autocomplete="current-password" required></p>
-<p><label for="new-password">Новый пароль</label>
-<input id="new-password" name="new_password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></p>
-<p><button type="submit">Сменить пароль</button></p>
+<section class="panel">
+<div class="panel-body">
+<div class="field"><label for="current-password">Текущий пароль</label>
+<input id="current-password" name="current_password" type="password" autocomplete="current-password" required></div>
+<div class="field"><label for="new-password">Новый пароль</label>
+<input id="new-password" name="new_password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></div>
+</div>
+<div class="panel-foot"><button type="submit" class="btn-primary">Сменить пароль</button></div>
+</section>
 </form>
 "#,
     ext = "html"
@@ -2851,7 +2930,7 @@ struct PasswordBody {
 #[template(
     source = r#"<h1>Ссылка недействительна</h1>
 <p>Ссылка восстановления недействительна или истекла. Выпустите новую командой <code>tasklerq admin reset-password</code>.</p>
-<p><a href="/admin/login">Перейти ко входу</a></p>
+<a class="btn btn-block" href="/admin/login">Перейти ко входу</a>
 "#,
     ext = "html"
 )]
@@ -2864,10 +2943,10 @@ struct InvalidLinkBody;
 {% when Some with (step) %}
 <form method="post" action="/admin/wizard/skip">
 <input type="hidden" name="step" value="{{ step }}">
-<button type="submit">Пропустить</button>
+<button type="submit" class="btn-ghost">Пропустить</button>
 </form>
 {% when None %}
-<p>Этот шаг нельзя пропустить: Telegram выключен, поэтому household и владельца нужно создать командой администратора.</p>
+<p class="field-hint">Этот шаг нельзя пропустить: Telegram выключен, поэтому household и владельца нужно создать командой администратора.</p>
 {% endmatch %}
 "#,
     ext = "html"
@@ -2880,10 +2959,14 @@ struct SkipBody {
 /// Содержимое шага мастера без формы (LLM).
 #[derive(Template)]
 #[template(
-    source = r#"<h1>{{ title }}</h1>
-<p>{{ description }}</p>
-<p><a href="/admin/llm">Настроить разбор</a></p>
+    source = r#"<header class="page-head">
+<h1>{{ title }}</h1>
+<p class="page-desc">{{ description }}</p>
+</header>
+<div class="actions">
+<a class="btn btn-primary" href="/admin/llm">Настроить разбор</a>
 {{ skip|safe }}
+</div>
 "#,
     ext = "html"
 )]
@@ -2899,16 +2982,22 @@ struct WizardBody {
 /// Содержимое шага household.
 #[derive(Template)]
 #[template(
-    source = r#"<h1>{{ title }}</h1>
-<p>{{ description }}</p>
+    source = r#"<header class="page-head">
+<h1>{{ title }}</h1>
+<p class="page-desc">{{ description }}</p>
+</header>
 <form method="post" action="/admin/wizard/household">
-<p><label for="household-name">Название</label>
-<input id="household-name" name="name" type="text" value="{{ name }}" maxlength="100" required></p>
-<p><label for="household-timezone">Часовой пояс</label>
-<input id="household-timezone" name="timezone" type="text" value="{{ timezone }}" maxlength="64" required></p>
-<p><button type="submit">Создать дом</button></p>
+<section class="panel">
+<div class="panel-body grid-2">
+<div class="field"><label for="household-name">Название</label>
+<input id="household-name" name="name" type="text" value="{{ name }}" maxlength="100" required></div>
+<div class="field"><label for="household-timezone">Часовой пояс</label>
+<input id="household-timezone" class="mono" name="timezone" type="text" value="{{ timezone }}" maxlength="64" required></div>
+</div>
+<div class="panel-foot"><button type="submit" class="btn-primary">Создать дом</button></div>
+</section>
 </form>
-{{ skip|safe }}
+<div class="actions">{{ skip|safe }}</div>
 "#,
     ext = "html"
 )]
@@ -2928,14 +3017,20 @@ struct HouseholdBody<'a> {
 /// Содержимое шага токена Home Assistant.
 #[derive(Template)]
 #[template(
-    source = r#"<h1>{{ title }}</h1>
-<p>{{ description }}</p>
+    source = r#"<header class="page-head">
+<h1>{{ title }}</h1>
+<p class="page-desc">{{ description }}</p>
+</header>
 <form method="post" action="/admin/wizard/token">
-<p><label for="token-name">Название токена</label>
-<input id="token-name" name="name" type="text" value="{{ name }}" maxlength="64"></p>
-<p><button type="submit">Выпустить токен</button></p>
+<section class="panel">
+<div class="panel-body">
+<div class="field"><label for="token-name">Название токена</label>
+<input id="token-name" name="name" type="text" value="{{ name }}" maxlength="64"></div>
+</div>
+<div class="panel-foot"><button type="submit" class="btn-primary">Выпустить токен</button></div>
+</section>
 </form>
-{{ skip|safe }}
+<div class="actions">{{ skip|safe }}</div>
 "#,
     ext = "html"
 )]
@@ -2953,10 +3048,14 @@ struct TokenBody<'a> {
 /// Страница с токеном, который показывается один раз.
 #[derive(Template)]
 #[template(
-    source = r#"<h1>Токен Home Assistant</h1>
-<p>Скопируйте токен и вставьте его в настройки Home Assistant. Токен показывается один раз: после перехода он больше не будет доступен.</p>
-<p><input id="issued-token" name="token" type="text" value="{{ token }}" readonly></p>
-<p><a href="/admin/wizard">Продолжить</a></p>
+    source = r#"<header class="page-head"><h1>Токен Home Assistant</h1></header>
+<div class="console-warn" role="status"><p>Скопируйте токен и вставьте его в настройки Home Assistant. Токен показывается один раз: после перехода он больше не будет доступен.</p></div>
+<section class="panel">
+<div class="panel-body">
+<input id="issued-token" class="token-value" name="token" type="text" value="{{ token }}" readonly aria-label="Токен Home Assistant">
+</div>
+<div class="panel-foot"><a class="btn btn-primary" href="/admin/wizard">Продолжить</a></div>
+</section>
 "#,
     ext = "html"
 )]
@@ -2968,29 +3067,41 @@ struct TokenIssuedBody<'a> {
 /// Содержимое одного слота формы LLM.
 #[derive(Template)]
 #[template(
-    source = r#"<fieldset>
-<legend>{{ legend }}</legend>
-<p><label for="llm-{{ prefix }}-url">Адрес</label>
-<input id="llm-{{ prefix }}-url" name="{{ prefix }}_url" type="text" value="{{ slot.url.value }}"{% if slot.url.readonly %} readonly{% endif %}>
-<span class="console-source">источник: {{ slot.url.source }}</span></p>
-<p><label for="llm-{{ prefix }}-model">Модель</label>
-<input id="llm-{{ prefix }}-model" name="{{ prefix }}_model" type="text" value="{{ slot.model.value }}"{% if slot.model.readonly %} readonly{% endif %}>
-<span class="console-source">источник: {{ slot.model.source }}</span></p>
-<p>Токен: <strong>{{ slot.token.label }}</strong>
-<span class="console-source">источник: {{ slot.token.source }}</span></p>
+    source = r#"<section class="panel">
+<header class="panel-head"><h2>{{ legend }}</h2></header>
+<div class="panel-body">
+<div class="field">
+<div class="field-head"><label for="llm-{{ prefix }}-url">Адрес</label><span class="console-source">источник: {{ slot.url.source }}</span></div>
+<input id="llm-{{ prefix }}-url" class="mono" name="{{ prefix }}_url" type="text" value="{{ slot.url.value }}"{% if slot.url.readonly %} readonly{% endif %}>
+</div>
+<div class="grid-2">
+<div class="field">
+<div class="field-head"><label for="llm-{{ prefix }}-model">Модель</label><span class="console-source">источник: {{ slot.model.source }}</span></div>
+<input id="llm-{{ prefix }}-model" class="mono" name="{{ prefix }}_model" type="text" value="{{ slot.model.value }}"{% if slot.model.readonly %} readonly{% endif %}>
+</div>
+<div class="field">
+<div class="field-head"><label for="llm-{{ prefix }}-timeout">Таймаут запроса, мс</label><span class="console-source">источник: {{ slot.timeout.source }}</span></div>
+<input id="llm-{{ prefix }}-timeout" name="{{ prefix }}_timeout_ms" type="text" inputmode="numeric" value="{{ slot.timeout.value }}"{% if slot.timeout.readonly %} readonly{% endif %}>
+</div>
+</div>
+<div class="field">
+<div class="field-head"><label for="llm-{{ prefix }}-extra">Дополнительные параметры JSON</label><span class="console-source">источник: {{ slot.extra_json.source }}</span></div>
+<input id="llm-{{ prefix }}-extra" class="mono" name="{{ prefix }}_extra_json" type="text" value="{{ slot.extra_json.value }}"{% if slot.extra_json.readonly %} readonly{% endif %}>
+</div>
+</div>
+<div class="row">
+<div class="row-text"><span class="row-label">Токен: <strong>{{ slot.token.label }}</strong></span></div>
+<span class="console-source">источник: {{ slot.token.source }}</span>
+</div>
 {% if slot.token.readonly %}
 {% else %}
-<p><label for="llm-{{ prefix }}-token">Заменить токен (пустое поле — не менять)</label>
-<input id="llm-{{ prefix }}-token" name="{{ prefix }}_token" type="password" autocomplete="new-password"></p>
-<p><label><input name="{{ prefix }}_token_delete" type="checkbox" value="1"> Удалить токен</label></p>
+<div class="panel-body panel-body-tight">
+<div class="field"><label for="llm-{{ prefix }}-token">Заменить токен (пустое поле — не менять)</label>
+<input id="llm-{{ prefix }}-token" name="{{ prefix }}_token" type="password" autocomplete="new-password"></div>
+<label class="check check-danger"><input name="{{ prefix }}_token_delete" type="checkbox" value="1"> Удалить токен</label>
+</div>
 {% endif %}
-<p><label for="llm-{{ prefix }}-timeout">Таймаут запроса, мс</label>
-<input id="llm-{{ prefix }}-timeout" name="{{ prefix }}_timeout_ms" type="text" inputmode="numeric" value="{{ slot.timeout.value }}"{% if slot.timeout.readonly %} readonly{% endif %}>
-<span class="console-source">источник: {{ slot.timeout.source }}</span></p>
-<p><label for="llm-{{ prefix }}-extra">Дополнительные параметры JSON</label>
-<input id="llm-{{ prefix }}-extra" name="{{ prefix }}_extra_json" type="text" value="{{ slot.extra_json.value }}"{% if slot.extra_json.readonly %} readonly{% endif %}>
-<span class="console-source">источник: {{ slot.extra_json.source }}</span></p>
-</fieldset>
+</section>
 "#,
     ext = "html"
 )]
@@ -3006,7 +3117,7 @@ struct SlotBody<'a> {
 /// Содержимое страницы настроек LLM.
 #[derive(Template)]
 #[template(
-    source = r#"<h1>Разбор записей</h1>
+    source = r#"<header class="page-head"><h1>Разбор записей</h1></header>
 {% if saved %}
 <p role="status" class="console-notice">Настройки LLM сохранены.</p>
 {% endif %}
@@ -3015,28 +3126,37 @@ struct SlotBody<'a> {
 {% endif %}
 <form method="post" action="/admin/llm">
 <input type="hidden" name="enabled_present" value="1">
-<fieldset>
-<legend>Разбор</legend>
-<p><label><input id="llm-enabled" name="enabled" type="checkbox" value="1"{% if enabled.checked %} checked{% endif %}{% if enabled.readonly %} disabled{% endif %}> Включить разбор</label>
-<span class="console-source">источник: {{ enabled.source }}</span></p>
-</fieldset>
+<section class="panel">
+<header class="panel-head"><h2>Разбор</h2></header>
+<div class="row">
+<div class="row-text">
+<label for="llm-enabled" class="row-label">Включить разбор</label>
+<span><span class="console-source">источник: {{ enabled.source }}</span></span>
+</div>
+<input id="llm-enabled" class="switch" name="enabled" type="checkbox" value="1"{% if enabled.checked %} checked{% endif %}{% if enabled.readonly %} disabled{% endif %}>
+</div>
+</section>
 {{ primary|safe }}
 {{ fallback|safe }}
-<fieldset>
-<legend>Общие</legend>
-<p><label for="llm-connect-timeout">Таймаут соединения, мс</label>
+<section class="panel">
+<header class="panel-head"><h2>Общие</h2></header>
+<div class="panel-body grid-2">
+<div class="field">
+<div class="field-head"><label for="llm-connect-timeout">Таймаут соединения, мс</label><span class="console-source">источник: {{ connect_timeout.source }}</span></div>
 <input id="llm-connect-timeout" name="connect_timeout_ms" type="text" inputmode="numeric" value="{{ connect_timeout.value }}"{% if connect_timeout.readonly %} readonly{% endif %}>
-<span class="console-source">источник: {{ connect_timeout.source }}</span></p>
-<p><label for="llm-daily-quota">Суточная квота</label>
+</div>
+<div class="field">
+<div class="field-head"><label for="llm-daily-quota">Суточная квота</label><span class="console-source">источник: {{ daily_quota.source }}</span></div>
 <input id="llm-daily-quota" name="daily_quota" type="text" inputmode="numeric" value="{{ daily_quota.value }}"{% if daily_quota.readonly %} readonly{% endif %}>
-<span class="console-source">источник: {{ daily_quota.source }}</span></p>
-</fieldset>
-<p><button type="submit">Сохранить</button></p>
+</div>
+</div>
+</section>
+<div class="form-actions"><button type="submit" class="btn-primary">Сохранить</button></div>
 </form>
-<fieldset>
-<legend>Проверка слотов</legend>
+<section class="panel">
+<header class="panel-head"><h2>Проверка слотов</h2></header>
 {{ checks|safe }}
-</fieldset>
+</section>
 "#,
     ext = "html"
 )]
@@ -3062,106 +3182,133 @@ struct LlmBody<'a> {
 /// Содержимое страницы Telegram.
 #[derive(Template)]
 #[template(
-    source = r#"<h1>Telegram</h1>
+    source = r#"<header class="page-head"><h1>Telegram</h1></header>
 {% if view.saved %}
 <p role="status" class="console-notice">Настройки Telegram сохранены.</p>
 {% endif %}
-<section>
-<h2>Состояние</h2>
+<section class="panel">
+<header class="panel-head"><h2>Состояние</h2></header>
 <dl class="console-state">
-<dt>Бот</dt><dd>{% if view.bot_name.is_empty() %}не подключён{% else %}{{ view.bot_name }}{% endif %}{% match view.bot_id %}{% when Some with (id) %} ({{ id }}){% when None %}{% endmatch %}</dd>
+<dt>Бот</dt><dd>{% if view.bot_name.is_empty() %}<span class="muted">не подключён</span>{% else %}{{ view.bot_name }}{% endif %}{% match view.bot_id %}{% when Some with (id) %} <span class="muted num">({{ id }})</span>{% when None %}{% endmatch %}</dd>
 <dt>Источник группы</dt><dd>{{ view.source }}</dd>
 <dt>Режим</dt><dd>{{ view.mode }}</dd>
-<dt>Адрес webhook</dt><dd>{% if view.webhook_address.is_empty() %}не задан{% else %}{{ view.webhook_address }}{% endif %}</dd>
+<dt>Адрес webhook</dt><dd>{% if view.webhook_address.is_empty() %}<span class="muted">не задан</span>{% else %}<span class="mono">{{ view.webhook_address }}</span>{% endif %}</dd>
 <dt>Токен</dt><dd>{{ view.token_label }} <span class="console-source">источник: {{ view.token_source }}</span></dd>
-<dt>Секрет webhook</dt><dd>{% if view.webhook_secret_set %}задан{% else %}не задан{% endif %}</dd>
+<dt>Секрет webhook</dt><dd>{% if view.webhook_secret_set %}задан{% else %}<span class="muted">не задан</span>{% endif %}</dd>
 {% if view.webhook_info_failed %}
-<dt>Состояние webhook</dt><dd>не удалось получить</dd>
+<dt>Состояние webhook</dt><dd><span class="status status-bad">не удалось получить</span></dd>
 {% else %}
 <dt>Ожидают обработки</dt><dd>{% match view.pending_update_count %}{% when Some with (count) %}{{ count }}{% when None %}{% endmatch %}</dd>
 {% match view.webhook_error_message %}
 {% when Some with (message) %}
-<dt>Последняя ошибка</dt><dd>{{ message }}{% match view.webhook_error_date %}{% when Some with (date) %} ({{ date }}){% when None %}{% endmatch %}</dd>
+<dt>Последняя ошибка</dt><dd><span class="text-danger">{{ message }}</span>{% match view.webhook_error_date %}{% when Some with (date) %} <span class="muted num">({{ date }})</span>{% when None %}{% endmatch %}</dd>
 {% when None %}
 {% endmatch %}
 {% endif %}
 </dl>
 </section>
 {% if view.readonly %}
-<p>Токен задан окружением TELEGRAM_BOT_TOKEN: страница доступна только для чтения.</p>
+<p class="console-notice">Токен задан окружением TELEGRAM_BOT_TOKEN: страница доступна только для чтения.</p>
 {% else %}
 {% match view.bot_change %}
 {% when Some with (change) %}
-<section>
-<h2>Подтвердить смену бота</h2>
-<p role="alert">Сейчас подключён бот {{ change.previous_name }}, вводится бот {{ change.new_name }}.</p>
-<p role="alert">Участников в инсталляции: {{ change.participants }}. Новый бот не сможет писать участникам, пока они не отправят ему /start.</p>
+<div class="console-warn" role="alert">
+<p><strong>Подтвердить смену бота</strong></p>
+<p>Сейчас подключён бот {{ change.previous_name }}, вводится бот {{ change.new_name }}.</p>
+<p>Участников в инсталляции: {{ change.participants }}. Новый бот не сможет писать участникам, пока они не отправят ему /start.</p>
+</div>
 <form method="post" action="/admin/telegram">
 {% if view.wizard %}<input type="hidden" name="next" value="wizard">{% endif %}
 <input type="hidden" name="confirm_bot_change" value="1">
 <input type="hidden" name="confirm_bot_id" value="{{ change.new_id }}">
-<fieldset>
-<legend>Режим</legend>
-<p><label><input name="mode" type="radio" value="webhook"{% if view.webhook_selected %} checked{% endif %}> webhook</label></p>
+<section class="panel">
+<div class="row">
+<div class="row-text"><span class="row-label" id="telegram-confirm-mode">Режим</span></div>
+<div class="segmented" role="radiogroup" aria-labelledby="telegram-confirm-mode">
+<label><input name="mode" type="radio" value="webhook"{% if view.webhook_selected %} checked{% endif %}><span>webhook</span></label>
 {% if view.polling_allowed %}
-<p><label><input name="mode" type="radio" value="polling"{% if view.polling_selected %} checked{% endif %}> polling</label></p>
+<label><input name="mode" type="radio" value="polling"{% if view.polling_selected %} checked{% endif %}><span>polling</span></label>
 {% endif %}
-<p><label><input name="mode" type="radio" value="disabled"{% if view.disabled_selected %} checked{% endif %}> выключен</label></p>
-</fieldset>
-<fieldset>
-<legend>Токен</legend>
-<p>Введите токен нового бота ещё раз: страница не сохраняет его в форме.</p>
-<p><label for="telegram-confirm-token">Токен нового бота</label>
-<input id="telegram-confirm-token" name="token" type="password" autocomplete="new-password"></p>
-</fieldset>
-<fieldset>
-<legend>Адрес</legend>
-<p><label for="telegram-confirm-public-base-url">Публичный адрес</label>
-<input id="telegram-confirm-public-base-url" name="public_base_url" type="text" value="{{ view.public_base_url.value }}"{% if view.public_base_url.readonly %} readonly{% endif %}>
-<span class="console-source">источник: {{ view.public_base_url.source }}</span></p>
-<p><label for="telegram-confirm-webhook-override">Переопределение адреса webhook (пусто — публичный адрес)</label>
-<input id="telegram-confirm-webhook-override" name="webhook_url_override" type="text" value="{{ view.webhook_url_override.value }}"{% if view.webhook_url_override.readonly %} readonly{% endif %}>
-<span class="console-source">источник: {{ view.webhook_url_override.source }}</span></p>
-</fieldset>
-<p><button type="submit">Подтвердить смену бота</button></p>
-</form>
+<label><input name="mode" type="radio" value="disabled"{% if view.disabled_selected %} checked{% endif %}><span>выключен</span></label>
+</div>
+</div>
 </section>
+<section class="panel">
+<header class="panel-head"><h2>Токен</h2><p>Введите токен нового бота ещё раз: страница не сохраняет его в форме.</p></header>
+<div class="panel-body">
+<div class="field"><label for="telegram-confirm-token">Токен нового бота</label>
+<input id="telegram-confirm-token" class="mono" name="token" type="password" autocomplete="new-password"></div>
+</div>
+</section>
+<section class="panel">
+<header class="panel-head"><h2>Адрес</h2></header>
+<div class="panel-body">
+<div class="field">
+<div class="field-head"><label for="telegram-confirm-public-base-url">Публичный адрес</label><span class="console-source">источник: {{ view.public_base_url.source }}</span></div>
+<input id="telegram-confirm-public-base-url" class="mono" name="public_base_url" type="text" value="{{ view.public_base_url.value }}"{% if view.public_base_url.readonly %} readonly{% endif %}>
+</div>
+<div class="field">
+<div class="field-head"><label for="telegram-confirm-webhook-override">Переопределение адреса webhook (пусто — публичный адрес)</label><span class="console-source">источник: {{ view.webhook_url_override.source }}</span></div>
+<input id="telegram-confirm-webhook-override" class="mono" name="webhook_url_override" type="text" value="{{ view.webhook_url_override.value }}"{% if view.webhook_url_override.readonly %} readonly{% endif %}>
+</div>
+</div>
+</section>
+<div class="form-actions"><button type="submit" class="btn-primary">Подтвердить смену бота</button></div>
+</form>
 {% when None %}
 <form method="post" action="/admin/telegram">
 {% if view.wizard %}<input type="hidden" name="next" value="wizard">{% endif %}
-<fieldset>
-<legend>Режим</legend>
-<p><label><input name="mode" type="radio" value="webhook"{% if view.webhook_selected %} checked{% endif %}> webhook</label></p>
+<section class="panel">
+<div class="row">
+<div class="row-text"><span class="row-label" id="telegram-mode">Режим</span></div>
+<div class="segmented" role="radiogroup" aria-labelledby="telegram-mode">
+<label><input name="mode" type="radio" value="webhook"{% if view.webhook_selected %} checked{% endif %}><span>webhook</span></label>
 {% if view.polling_allowed %}
-<p><label><input name="mode" type="radio" value="polling"{% if view.polling_selected %} checked{% endif %}> polling</label></p>
+<label><input name="mode" type="radio" value="polling"{% if view.polling_selected %} checked{% endif %}><span>polling</span></label>
 {% endif %}
-<p><label><input name="mode" type="radio" value="disabled"{% if view.disabled_selected %} checked{% endif %}> выключен</label></p>
-</fieldset>
-<fieldset>
-<legend>Токен</legend>
-<p>Токен: <strong>{{ view.token_label }}</strong></p>
-<p><label for="telegram-token">Новый токен (пустое поле — не менять)</label>
-<input id="telegram-token" name="token" type="password" autocomplete="new-password"></p>
-</fieldset>
-<fieldset>
-<legend>Адрес</legend>
-<p><label for="telegram-public-base-url">Публичный адрес</label>
-<input id="telegram-public-base-url" name="public_base_url" type="text" value="{{ view.public_base_url.value }}"{% if view.public_base_url.readonly %} readonly{% endif %}>
-<span class="console-source">источник: {{ view.public_base_url.source }}</span></p>
-<p><label for="telegram-webhook-override">Переопределение адреса webhook (пусто — публичный адрес)</label>
-<input id="telegram-webhook-override" name="webhook_url_override" type="text" value="{{ view.webhook_url_override.value }}"{% if view.webhook_url_override.readonly %} readonly{% endif %}>
-<span class="console-source">источник: {{ view.webhook_url_override.source }}</span></p>
-</fieldset>
-<p><button type="submit">Сохранить</button></p>
+<label><input name="mode" type="radio" value="disabled"{% if view.disabled_selected %} checked{% endif %}><span>выключен</span></label>
+</div>
+</div>
+</section>
+<section class="panel">
+<header class="panel-head"><h2>Токен</h2></header>
+<div class="row">
+<div class="row-text"><span class="row-label">Токен: <strong>{{ view.token_label }}</strong></span></div>
+</div>
+<div class="panel-body panel-body-tight">
+<div class="field"><label for="telegram-token">Новый токен (пустое поле — не менять)</label>
+<input id="telegram-token" class="mono" name="token" type="password" autocomplete="new-password"></div>
+</div>
+</section>
+<section class="panel">
+<header class="panel-head"><h2>Адрес</h2></header>
+<div class="panel-body">
+<div class="field">
+<div class="field-head"><label for="telegram-public-base-url">Публичный адрес</label><span class="console-source">источник: {{ view.public_base_url.source }}</span></div>
+<input id="telegram-public-base-url" class="mono" name="public_base_url" type="text" value="{{ view.public_base_url.value }}"{% if view.public_base_url.readonly %} readonly{% endif %}>
+</div>
+<div class="field">
+<div class="field-head"><label for="telegram-webhook-override">Переопределение адреса webhook (пусто — публичный адрес)</label><span class="console-source">источник: {{ view.webhook_url_override.source }}</span></div>
+<input id="telegram-webhook-override" class="mono" name="webhook_url_override" type="text" value="{{ view.webhook_url_override.value }}"{% if view.webhook_url_override.readonly %} readonly{% endif %}>
+</div>
+</div>
+</section>
+<div class="form-actions"><button type="submit" class="btn-primary">Сохранить</button></div>
 </form>
 {% if view.reissue_allowed %}
+<section class="panel danger-zone">
+<header class="panel-head"><h2>Опасная зона</h2></header>
+<div class="row">
+<div class="row-text"><span class="row-label">Секрет webhook</span></div>
 <form method="post" action="/admin/telegram/secret">
-<p><button type="submit">Перевыпустить секрет webhook</button></p>
+<button type="submit" class="btn-danger">Перевыпустить секрет webhook</button>
 </form>
+</div>
+</section>
 {% endif %}
 {% endmatch %}
 {% endif %}
-{{ skip|safe }}
+{% if !skip.is_empty() %}<div class="actions">{{ skip|safe }}</div>{% endif %}
 "#,
     ext = "html"
 )]
@@ -3175,15 +3322,15 @@ struct TelegramBody<'a> {
 /// Форма проверки одного слота.
 #[derive(Template)]
 #[template(
-    source = r#"<div class="console-check">
-<p><strong>{{ legend }}</strong></p>
-<form method="post" action="/admin/llm/check/{{ slot }}">
-<p><label for="llm-check-{{ slot }}-titles">Стандарт названий</label>
+    source = r#"<div class="row console-check">
+<div class="row-text"><span class="row-label">{{ legend }}</span></div>
+<form method="post" action="/admin/llm/check/{{ slot }}" class="row-actions">
+<label for="llm-check-{{ slot }}-titles" class="field-hint">Стандарт названий</label>
 <select id="llm-check-{{ slot }}-titles" name="titles">
 <option value="strict"{% if strict %} selected{% endif %}>strict</option>
 <option value="normalized"{% if normalized %} selected{% endif %}>normalized</option>
 </select>
-<button type="submit">Проверить — {{ phrases }} {{ phrase_word }}</button></p>
+<button type="submit">Проверить — {{ phrases }} {{ phrase_word }}</button>
 </form>
 </div>
 "#,
@@ -3211,7 +3358,7 @@ struct CheckButtonBody {
 /// перезагружал бы страницу у браузера с JavaScript параллельно с опросом.
 #[derive(Template)]
 #[template(
-    source = r#"<h1>Проверка слота</h1>
+    source = r#"<header class="page-head"><h1>Проверка слота</h1></header>
 {{ check|safe }}
 "#,
     ext = "html"
@@ -3226,26 +3373,35 @@ struct CheckPageBody {
 #[template(
     source = r#"{% match view.phase %}
 {% when CheckPhase::Idle %}
-<div id="llm-check">
-<p>Проверка ещё не запускалась.</p>
-<p><a href="/admin/llm">Вернуться к настройкам</a></p>
+<div id="llm-check" class="panel">
+<div class="panel-body">
+<p class="muted">Проверка ещё не запускалась.</p>
+<div class="actions"><a class="btn" href="/admin/llm">Вернуться к настройкам</a></div>
+</div>
 </div>
 {% when CheckPhase::Running %}
-<div id="llm-check" hx-get="/admin/llm/check-fragment" hx-trigger="every 2s" hx-swap="outerHTML">
-<p role="status">Проверка слота {{ view.slot }} идёт: пройдено {{ view.done }} из {{ view.total }} фраз.</p>
+<div id="llm-check" class="panel" hx-get="/admin/llm/check-fragment" hx-trigger="every 2s" hx-swap="outerHTML">
+<div class="panel-body">
+<p role="status" class="num">Проверка слота {{ view.slot }} идёт: пройдено {{ view.done }} из {{ view.total }} фраз.</p>
+<progress value="{{ view.done }}" max="{{ view.total }}"></progress>
 <noscript><p><a href="/admin/llm/check">Обновить</a></p></noscript>
 </div>
+</div>
 {% when CheckPhase::Report %}
-<div id="llm-check">
-<p role="status" class="console-notice">Проверка слота {{ view.slot }} завершена: пройдено {{ view.passed }} из {{ view.total }}.</p>
-{% if !view.saved %}<p role="alert">Результат проверки не сохранён.</p>{% endif %}
+<div id="llm-check" class="panel">
+<div class="panel-body">
+<p role="status" class="console-notice num">Проверка слота {{ view.slot }} завершена: пройдено {{ view.passed }} из {{ view.total }}.</p>
+{% if !view.saved %}<p role="alert" class="console-alert">Результат проверки не сохранён.</p>{% endif %}
 <pre>{{ view.report }}</pre>
-<p><a href="/admin/llm">Вернуться к настройкам</a> · <a href="/admin/llm/check">Обновить</a></p>
+</div>
+<div class="panel-foot"><a class="btn btn-ghost" href="/admin/llm/check">Обновить</a><a class="btn" href="/admin/llm">Вернуться к настройкам</a></div>
 </div>
 {% when CheckPhase::Failed %}
-<div id="llm-check">
-<p role="alert">{{ view.error }}</p>
-<p><a href="/admin/llm">Вернуться к настройкам</a></p>
+<div id="llm-check" class="panel">
+<div class="panel-body">
+<p role="alert" class="console-alert">{{ view.error }}</p>
+<div class="actions"><a class="btn" href="/admin/llm">Вернуться к настройкам</a></div>
+</div>
 </div>
 {% endmatch %}
 "#,
