@@ -401,6 +401,7 @@ impl UpdateWorker {
             html: ru::INTERNAL_ERROR.to_owned(),
             rich: false,
             delete_after: None,
+            disable_preview: false,
         };
         let dedupe_key = format!("dead-update:{chat_id}:{update_id}");
         match outbox::enqueue(conn, chat_id, &outgoing, Some(&dedupe_key), now).await {

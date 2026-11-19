@@ -62,6 +62,8 @@ pub const ADMIN_SETUP_CODE_LIMIT: &str = "admin_setup_code_per_15_minutes";
 pub const ADMIN_CURRENT_PASSWORD_LIMIT: &str = "admin_current_password_per_15_minutes";
 /// Имя лимита восстановления доступа в консоли.
 pub const ADMIN_RECOVERY_LIMIT: &str = "admin_recovery_per_15_minutes";
+/// Имя лимита запросов `/admin` из бота.
+pub const ADMIN_TELEGRAM_RECOVERY_LIMIT: &str = "admin_telegram_recovery_per_hour";
 
 /// Относится ли лимит к консоли оператора.
 fn is_admin_limit(limit: &str) -> bool {
@@ -69,6 +71,7 @@ fn is_admin_limit(limit: &str) -> bool {
         || limit == ADMIN_SETUP_CODE_LIMIT
         || limit == ADMIN_CURRENT_PASSWORD_LIMIT
         || limit == ADMIN_RECOVERY_LIMIT
+        || limit == ADMIN_TELEGRAM_RECOVERY_LIMIT
 }
 
 /// Тип события для подавления повторов.

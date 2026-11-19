@@ -8104,6 +8104,7 @@ async fn rotating_the_token_of_the_same_bot_switches_every_bot_api_call() {
             html: marker.to_owned(),
             rich: false,
             delete_after: None,
+            disable_preview: false,
         },
         None,
         Utc::now(),
@@ -8276,6 +8277,7 @@ async fn an_outbox_message_queued_before_rotation_is_delivered_by_the_new_token(
             html: marker.to_owned(),
             rich: false,
             delete_after: None,
+            disable_preview: false,
         },
         None,
         now,
@@ -9240,12 +9242,15 @@ async fn a_telegram_link_binds_only_after_confirmation_and_notifies_the_account(
     assert_eq!(bound, Some(bot_id));
     assert_eq!(name.as_deref(), Some("Alice"));
     assert_eq!(pending, None);
+    let payloads = audit_payloads(&db.pool, "admin_telegram_linked").await;
+    assert_eq!(payloads.len(), 1);
+    // Payload фиксирует только аккаунт: ни кода привязки, ни токенов.
     assert_eq!(
-        audit_payloads(&db.pool, "admin_telegram_linked")
-            .await
-            .len(),
-        1
+        payloads[0],
+        json!({ "telegram_user_id": bot_id }),
+        "the audit must carry no secrets"
     );
+    assert!(!payloads[0].to_string().contains(&code));
     let messages = outbox_messages(&db.pool, bot_id).await;
     assert!(
         messages
@@ -9253,6 +9258,32 @@ async fn a_telegram_link_binds_only_after_confirmation_and_notifies_the_account(
             .any(|message| message.contains("консоли администратора")),
         "the account receives the confirmation message: {messages:?}"
     );
+
+    // Привязанная учётная запись новую ссылку привязки не получает: скрытого
+    // кандидата нельзя было бы подтвердить.
+    let (status, _, body) = send_form_from(
+        &app,
+        "/admin/telegram-link",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let html = String::from_utf8_lossy(&body);
+    assert!(
+        html.contains("уже привязан"),
+        "the console explains the linked account:\n{html}"
+    );
+    assert!(!html.contains("?start=adm_"), "{html}");
+    let links: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM admin_one_time_codes
+         WHERE purpose = 'telegram_link' AND used_at IS NULL",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("telegram links");
+    assert_eq!(links, 0, "no new link is issued for a linked account");
 
     let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin", &cookie).await;
     assert_eq!(status, StatusCode::OK);
@@ -9674,4 +9705,102 @@ async fn a_failed_old_webhook_removal_does_not_hide_the_new_webhook_failure() {
     );
 
     stop_application(application, shutdown_tx).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_valid_telegram_link_does_not_make_a_candidate_for_a_linked_account() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let bound = support::next_telegram_id();
+    sqlx::query("UPDATE admin_accounts SET telegram_user_id = $1, telegram_name = 'Alice'")
+        .bind(bound)
+        .execute(&db.pool)
+        .await
+        .expect("linked account");
+
+    // Код выпущен в обход консоли: путь `/start adm_` не должен записывать
+    // кандидата, которого нельзя подтвердить.
+    let code = codes::issue(&db.pool, Purpose::TelegramLink, None, Utc::now())
+        .await
+        .expect("a telegram link code");
+
+    let mut bot = owner_claim_harness(&db.pool, support::next_telegram_id(), TenancyMode::Single);
+    bot.text(&format!("/start adm_{}", code.code)).await;
+
+    let (bound_id, name, pending) = telegram_binding(&db.pool).await;
+    assert_eq!(bound_id, Some(bound), "the binding is unchanged");
+    assert_eq!(name.as_deref(), Some("Alice"));
+    assert_eq!(pending, None, "a linked account gets no hidden candidate");
+    assert!(
+        telegram_link_is_active(&db.pool, &code.code).await,
+        "the rejected attempt behaves like an invalid code and does not consume it"
+    );
+    assert!(
+        !bot.screen().contains("Запрос на привязку отправлен"),
+        "the screen is `/start` without a link:\n{}",
+        bot.screen()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_candidate_name_keeps_the_surname_and_the_username() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let code = codes::issue(&db.pool, Purpose::TelegramLink, None, Utc::now())
+        .await
+        .expect("a telegram link code");
+
+    let mut bot = owner_claim_harness(&db.pool, support::next_telegram_id(), TenancyMode::Single);
+    let telegram_id = bot.chat;
+    let update = json!({
+        "update_id": 9_000_001,
+        "message": {
+            "message_id": 9_000_001,
+            "date": 1_700_000_000,
+            "chat": {"id": telegram_id, "type": "private", "first_name": "Иван"},
+            "from": {
+                "id": telegram_id,
+                "is_bot": false,
+                "first_name": "Иван",
+                "last_name": "Петров",
+                "username": "ivan"
+            },
+            "text": format!("/start adm_{}", code.code)
+        }
+    });
+    bot.enqueue(update).await;
+    bot.pump().await;
+
+    let (_, _, pending) = telegram_binding(&db.pool).await;
+    assert_eq!(pending, Some(telegram_id));
+    let pending_name: Option<String> =
+        sqlx::query_scalar("SELECT pending_telegram_name FROM admin_accounts")
+            .fetch_one(&db.pool)
+            .await
+            .expect("the candidate name");
+    assert_eq!(pending_name.as_deref(), Some("Иван Петров @ivan"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_request_origin_does_not_change_the_console_origin() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    sqlx::query("UPDATE admin_accounts SET console_origin = 'http://nas:18081'")
+        .execute(&db.pool)
+        .await
+        .expect("known origin");
+
+    let state = console_state(&db.pool, Vec::new());
+    // Без `Host` origin запроса неизвестен: вход не должен затирать адрес.
+    let client = state.client(test_peer(), &HeaderMap::new());
+    assert!(client.host.is_none());
+    tasklerq::admin_console::session::start(&state, &client, Utc::now())
+        .await
+        .expect("a session without an origin");
+
+    let origin: Option<String> = sqlx::query_scalar("SELECT console_origin FROM admin_accounts")
+        .fetch_one(&db.pool)
+        .await
+        .expect("console origin");
+    assert_eq!(origin.as_deref(), Some("http://nas:18081"));
 }

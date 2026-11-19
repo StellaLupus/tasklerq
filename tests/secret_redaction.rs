@@ -241,7 +241,10 @@ fn telegram_network_error_and_log_hide_the_bot_token() {
         runtime.block_on(async {
             let api = HttpTelegramApi::new(SecretString::new(BOT_TOKEN), "http://127.0.0.1:1")
                 .expect("client");
-            let error = api.send_message(1, "x").await.expect_err("network error");
+            let error = api
+                .send_message(1, "x", false)
+                .await
+                .expect_err("network error");
             tracing::error!(%error, "telegram request failed");
             error
         })

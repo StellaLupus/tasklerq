@@ -110,19 +110,24 @@ async fn default_start(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
 }
 
 /// Имя кандидата на привязку: имя Telegram и `@username`, если он есть.
+///
+/// `@username` не дублируется, когда имени нет и `display_name` уже равен
+/// username: без этого кандидат показывался бы как `ivan @ivan`.
 fn candidate_name(sender: &crate::telegram::update::Sender) -> String {
     let mut name = sender.display_name.trim().to_owned();
     if let Some(username) = sender
         .username
         .as_deref()
         .map(str::trim)
+        .map(|username| username.trim_start_matches('@'))
         .filter(|username| !username.is_empty())
     {
-        if !name.is_empty() {
-            name.push(' ');
+        if name.is_empty() {
+            name.push_str(username);
+        } else if !name.eq_ignore_ascii_case(username) {
+            name.push_str(" @");
+            name.push_str(username);
         }
-        name.push('@');
-        name.push_str(username.trim_start_matches('@'));
     }
     name
 }
@@ -695,5 +700,33 @@ mod tests {
 
         let with = first_contact(&FirstContactScreen::AdminCommandWithHint(42));
         assert!(has_text(&with, ru::ADMIN_LINK_HINT));
+    }
+
+    fn sender(display_name: &str, username: Option<&str>) -> crate::telegram::update::Sender {
+        crate::telegram::update::Sender {
+            id: 42,
+            display_name: display_name.to_owned(),
+            username: username.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn candidate_name_adds_the_surname_and_username() {
+        assert_eq!(
+            candidate_name(&sender("Иван Петров", Some("ivan"))),
+            "Иван Петров @ivan"
+        );
+    }
+
+    #[test]
+    fn candidate_name_does_not_repeat_a_username_used_as_the_name() {
+        assert_eq!(candidate_name(&sender("ivan", Some("ivan"))), "ivan");
+        assert_eq!(candidate_name(&sender("ivan", Some("@ivan"))), "ivan");
+        assert_eq!(candidate_name(&sender("Ivan", Some("ivan"))), "Ivan");
+        assert_eq!(
+            candidate_name(&sender("", Some("ivan"))),
+            "ivan",
+            "an empty name is already the username: derived names are not stored here"
+        );
     }
 }

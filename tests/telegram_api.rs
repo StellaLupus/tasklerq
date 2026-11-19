@@ -84,10 +84,41 @@ async fn edit_rich_and_plain_messages_use_matching_methods() {
     api.edit_rich_message(42, 7, &rich("<p>x</p>"))
         .await
         .expect("edited");
-    assert_eq!(api.send_message(42, "a &amp; b").await.expect("sent"), 8);
+    assert_eq!(
+        api.send_message(42, "a &amp; b", false)
+            .await
+            .expect("sent"),
+        8
+    );
     api.edit_message_text(42, 8, "новый текст")
         .await
         .expect("edited text");
+}
+
+#[tokio::test]
+async fn send_message_disables_the_link_preview_when_asked() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/bot{TOKEN}/sendMessage")))
+        .and(body_json(json!({
+            "chat_id": 42,
+            "text": "https://nas:18081/admin/recover/code",
+            "parse_mode": "HTML",
+            "link_preview_options": {"is_disabled": true}
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true, "result": {"message_id": 9}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let id = client(&server)
+        .send_message(42, "https://nas:18081/admin/recover/code", true)
+        .await
+        .expect("sent");
+
+    assert_eq!(id, 9);
 }
 
 #[tokio::test]
@@ -283,7 +314,7 @@ async fn forbidden_bad_request_and_server_errors_are_distinguished() {
 
     let api = client(&server);
     assert!(matches!(
-        api.send_message(1, "x").await,
+        api.send_message(1, "x", false).await,
         Err(TelegramError::Forbidden(_))
     ));
     let gateway = api.send_rich_message(1, &rich("x")).await.unwrap_err();
@@ -298,7 +329,7 @@ async fn forbidden_bad_request_and_server_errors_are_distinguished() {
 async fn unreachable_server_never_leaks_the_bot_token() {
     let api = HttpTelegramApi::new(SecretString::new(TOKEN), "http://127.0.0.1:9").expect("client");
 
-    let error = api.send_message(1, "x").await.unwrap_err();
+    let error = api.send_message(1, "x", false).await.unwrap_err();
 
     let rendered = format!("{error} {error:?}");
     assert!(matches!(error, TelegramError::Transient(_)));

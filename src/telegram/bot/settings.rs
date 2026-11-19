@@ -890,6 +890,7 @@ async fn enqueue_secret_message(
             html,
             rich: true,
             delete_after: Some(SECRET_MESSAGE_TTL),
+            disable_preview: false,
         },
         None,
         ctx.now,

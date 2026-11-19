@@ -443,6 +443,7 @@ pub(crate) async fn enqueue_message(
         html,
         rich,
         delete_after: None,
+        disable_preview: false,
     };
     match outbox::enqueue(conn, chat_id, &outgoing, Some(dedupe_key), now).await? {
         Some(seq) => Ok(seq),

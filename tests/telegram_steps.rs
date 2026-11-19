@@ -5,9 +5,11 @@ mod support;
 use chrono::{Duration, Utc};
 use serde_json::json;
 use sqlx::PgConnection;
+use std::sync::Arc;
 use support::telegram::Harness;
 use support::{create_household, db, next_telegram_id};
 use tasklerq::config::{TenancyConfig, TenancyMode};
+use tasklerq::rate_limit::RateLimiter;
 use tasklerq::storage::repositories::{households, users};
 use tasklerq::telegram::bot::{Ctx, Fail};
 use tasklerq::telegram::outbox::{self, Outgoing, Placement};
@@ -37,6 +39,7 @@ fn ctx(conn: &mut PgConnection, chat: i64) -> Ctx<'_> {
             bootstrap_owner: None,
         },
         audit: None,
+        recovery_limit: Arc::new(RateLimiter::new(3)),
     }
 }
 
@@ -59,6 +62,7 @@ async fn write_effects(ctx: &mut Ctx<'_>) {
             html: "<p>эффект</p>".into(),
             rich: false,
             delete_after: None,
+            disable_preview: false,
         },
         None,
         ctx.now,

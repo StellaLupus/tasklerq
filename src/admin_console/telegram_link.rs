@@ -54,8 +54,9 @@ pub(crate) enum IssueOutcome {
 /// Выпустить ссылку привязки для единственной учётной записи.
 ///
 /// Прежний код назначения гасится, ожидающий кандидат сбрасывается: новая
-/// ссылка — новая попытка. Подходящего события аудита для выпуска нет, поэтому
-/// журнал не пишется.
+/// ссылка — новая попытка. Уже привязанная учётная запись ссылку не получает:
+/// кандидата нельзя было бы подтвердить, и он остался бы скрытым. Подходящего
+/// события аудита для выпуска нет, поэтому журнал не пишется.
 pub(crate) async fn issue(
     state: &AdminState,
     now: DateTime<Utc>,
@@ -68,6 +69,15 @@ pub(crate) async fn issue(
     }
 
     let mut tx = state.pool.begin().await?;
+    let linked = admin_accounts::get(&mut tx)
+        .await?
+        .and_then(|account| account.telegram_user_id);
+    if linked.is_some() {
+        tx.rollback().await?;
+        return Ok(IssueOutcome::Rejected(
+            "Аккаунт уже привязан, сначала отвяжите его.".to_owned(),
+        ));
+    }
     let issued = codes::issue_locked(&mut tx, Purpose::TelegramLink, None, now).await?;
     admin_accounts::reset_pending_telegram(&mut tx).await?;
     tx.commit().await?;
@@ -127,6 +137,7 @@ pub(crate) async fn confirm(
             html: rich::escape(LINKED_MESSAGE),
             rich: false,
             delete_after: None,
+            disable_preview: false,
         },
         None,
         now,

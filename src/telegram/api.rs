@@ -130,7 +130,15 @@ pub trait TelegramApi: Send + Sync {
     ) -> Result<(), TelegramError>;
 
     /// Отправить обычное HTML-сообщение; возвращает `message_id`.
-    async fn send_message(&self, chat_id: i64, html: &str) -> Result<i64, TelegramError>;
+    ///
+    /// `disable_preview` отключает предпросмотр ссылок: так уходит одноразовая
+    /// ссылка восстановления, которую не нужно показывать в развёрнутом виде.
+    async fn send_message(
+        &self,
+        chat_id: i64,
+        html: &str,
+        disable_preview: bool,
+    ) -> Result<i64, TelegramError>;
 
     /// Заменить текст обычного сообщения.
     async fn edit_message_text(
@@ -337,14 +345,18 @@ impl TelegramApi for HttpTelegramApi {
         .map(|_| ())
     }
 
-    async fn send_message(&self, chat_id: i64, html: &str) -> Result<i64, TelegramError> {
-        let sent: SentMessage = self
-            .call(
-                "sendMessage",
-                &json!({"chat_id": chat_id, "text": html, "parse_mode": "HTML"}),
-                None,
-            )
-            .await?;
+    async fn send_message(
+        &self,
+        chat_id: i64,
+        html: &str,
+        disable_preview: bool,
+    ) -> Result<i64, TelegramError> {
+        let mut body = json!({"chat_id": chat_id, "text": html, "parse_mode": "HTML"});
+        if disable_preview {
+            // Одноразовая ссылка не должна раскрываться предпросмотром.
+            body["link_preview_options"] = json!({"is_disabled": true});
+        }
+        let sent: SentMessage = self.call("sendMessage", &body, None).await?;
         Ok(sent.message_id)
     }
 

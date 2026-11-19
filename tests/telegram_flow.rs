@@ -7,7 +7,9 @@ use std::sync::Arc;
 use chrono::{Datelike, Duration, NaiveDate, TimeZone, Utc};
 use chrono_tz::Tz;
 use support::telegram::{Call, FakeTelegram, Harness, buttons};
-use support::{TestHousehold, create_item, db, new_item, next_telegram_id, recurrence};
+use support::{
+    TestHousehold, create_item, db, isolated_db, new_item, next_telegram_id, recurrence,
+};
 use tasklerq::domain::models::{
     Actor, ActorType, Field, ItemPatch, ListKind, RecurrenceFreq, UserRole,
 };
@@ -167,6 +169,7 @@ async fn deliver_message(bot: &mut Harness, html: &str) {
             html: html.to_owned(),
             rich: true,
             delete_after: None,
+            disable_preview: false,
         },
         None,
         bot.now,
@@ -3595,5 +3598,268 @@ async fn event_editor_confirmed_end_does_not_block_a_later_start() {
         (due_at, end_at),
         (Some(at(16)), Some(at(17))),
         "the end follows the moved start and keeps the one-hour duration"
+    );
+}
+
+// ---- `/admin`: восстановление доступа через бота -------------------------
+
+/// Учётная запись администратора с привязкой и (необязательным) origin.
+async fn admin_account(
+    pool: &sqlx::PgPool,
+    telegram_user_id: Option<i64>,
+    console_origin: Option<&str>,
+) {
+    sqlx::query(
+        "INSERT INTO admin_accounts
+             (id, username, password_hash, telegram_user_id, telegram_name, console_origin)
+         VALUES ($1, 'admin', 'test-hash', $2, $3, $4)",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(telegram_user_id)
+    .bind(telegram_user_id.map(|_| "Alice"))
+    .bind(console_origin)
+    .execute(pool)
+    .await
+    .expect("administrator account");
+}
+
+/// Живое сообщение со ссылкой восстановления.
+fn recovery_message(bot: &Harness) -> (i64, String) {
+    bot.fake
+        .messages(bot.chat)
+        .into_iter()
+        .rev()
+        .find(|(_, html)| html.contains("/admin/recover/"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no recovery link in the chat: {:?}",
+                bot.fake.messages(bot.chat)
+            )
+        })
+}
+
+/// Код из ссылки `<origin>/admin/recover/<код>`.
+fn recovery_code(html: &str) -> String {
+    let marker = "/admin/recover/";
+    let start = html
+        .find(marker)
+        .unwrap_or_else(|| panic!("no recovery link in:\n{html}"))
+        + marker.len();
+    html[start..].chars().take(22).collect()
+}
+
+async fn active_recovery(pool: &sqlx::PgPool, code: &str, now: chrono::DateTime<Utc>) -> bool {
+    let mut conn = pool.acquire().await.expect("connection");
+    tasklerq::admin_console::codes::find_active(
+        &mut conn,
+        tasklerq::admin_console::codes::Purpose::Recovery,
+        code,
+        now,
+    )
+    .await
+    .expect("find the recovery code")
+    .is_some()
+}
+
+async fn recovery_code_count(pool: &sqlx::PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM admin_one_time_codes WHERE purpose = 'recovery'")
+        .fetch_one(pool)
+        .await
+        .expect("recovery codes")
+}
+
+async fn recovery_audit(pool: &sqlx::PgPool) -> Vec<serde_json::Value> {
+    sqlx::query_scalar(
+        "SELECT payload FROM audit_events WHERE event_type::text = 'admin_recovery_issued'",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("recovery audit")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_sends_a_hidden_expiring_recovery_link_to_the_linked_account() {
+    let db = isolated_db().await;
+    let mut bot = Harness::new(&db.pool, next_telegram_id());
+    admin_account(&db.pool, Some(bot.chat), Some("http://nas:18081")).await;
+
+    // Прежний код recovery должен погаснуть при выпуске нового.
+    let previous = tasklerq::admin_console::codes::issue(
+        &db.pool,
+        tasklerq::admin_console::codes::Purpose::Recovery,
+        None,
+        bot.now,
+    )
+    .await
+    .expect("a previous recovery code");
+
+    bot.text("/admin").await;
+
+    let (message_id, html) = recovery_message(&bot);
+    assert!(
+        html.contains("http://nas:18081/admin/recover/"),
+        "the link points at the console origin:\n{html}"
+    );
+
+    // Предпросмотр отключён в самом запросе Bot API.
+    let send = bot
+        .fake
+        .calls()
+        .into_iter()
+        .find_map(|call| match call {
+            Call::Send {
+                id,
+                disable_preview,
+                ..
+            } if id == message_id => Some(disable_preview),
+            _ => None,
+        })
+        .expect("the link is sent as a plain message");
+    assert!(send, "the link preview must be disabled");
+
+    // Новый код действует, срок — как у recovery из 0013; прежний погашен.
+    let code = recovery_code(&html);
+    assert!(active_recovery(&db.pool, &code, bot.now).await);
+    assert!(
+        !active_recovery(&db.pool, &previous.code, bot.now).await,
+        "issuing a new link must consume the previous code"
+    );
+    let lifetime: f64 = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM (expires_at - created_at))::float8
+         FROM admin_one_time_codes WHERE purpose = 'recovery' AND used_at IS NULL",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("the active recovery code");
+    assert!(
+        (lifetime - 900.0).abs() < 1.0,
+        "the recovery code lives fifteen minutes: {lifetime}"
+    );
+
+    // Аудит: один выпуск, без кода и ссылки.
+    let audit = recovery_audit(&db.pool).await;
+    assert_eq!(audit.len(), 1);
+    assert!(
+        !audit[0].to_string().contains(&code),
+        "the audit must not contain the code: {:?}",
+        audit[0]
+    );
+
+    // Сообщение удаляется через 15 минут после доставки.
+    let (sent_at, delete_at): (chrono::DateTime<Utc>, chrono::DateTime<Utc>) = sqlx::query_as(
+        "SELECT m.sent_at, d.next_attempt_at
+           FROM outbox m
+           JOIN outbox d ON d.chat_id = m.chat_id AND d.kind = 'delete'
+                        AND (d.payload->>'message_id')::bigint = m.message_id
+          WHERE m.chat_id = $1 AND m.kind = 'message' AND m.message_id = $2",
+    )
+    .bind(bot.chat)
+    .bind(message_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("the scheduled delete");
+    assert!(
+        (delete_at - sent_at - Duration::seconds(900))
+            .num_milliseconds()
+            .abs()
+            < 1_000,
+        "the message must be deleted fifteen minutes after delivery"
+    );
+
+    bot.advance(Duration::minutes(15));
+    bot.deliver().await;
+    assert!(
+        !is_alive(&bot, message_id),
+        "the message with the link must be deleted by its timer"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_without_a_console_origin_hints_at_the_cli_and_issues_nothing() {
+    let db = isolated_db().await;
+    let mut bot = Harness::new(&db.pool, next_telegram_id());
+    admin_account(&db.pool, Some(bot.chat), None).await;
+
+    bot.text("/admin").await;
+    bot.assert_latest_contains("tasklerq admin reset-password");
+    assert_eq!(recovery_code_count(&db.pool).await, 0);
+    assert!(recovery_audit(&db.pool).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_from_a_stranger_is_the_unknown_command() {
+    let db = isolated_db().await;
+    let admin_id = next_telegram_id();
+    admin_account(&db.pool, Some(admin_id), Some("http://nas:18081")).await;
+
+    // Не участник household.
+    let mut stranger = Harness::new(&db.pool, next_telegram_id());
+    stranger.text("/nosuchcommand").await;
+    let unknown = stranger.latest().1;
+    stranger.text("/admin").await;
+    assert_eq!(
+        stranger.latest().1,
+        unknown,
+        "`/admin` from an unlinked account must answer byte for byte like an unknown command"
+    );
+
+    // Участник household.
+    let mut member = onboarded(&db.pool).await;
+    member.text("/admin").await;
+    member.assert_latest_contains("Не знаю такой команды");
+
+    assert_eq!(recovery_code_count(&db.pool).await, 0);
+    assert!(recovery_audit(&db.pool).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_from_a_pending_candidate_is_the_unknown_command() {
+    let db = isolated_db().await;
+    let bot_id = next_telegram_id();
+    admin_account(&db.pool, None, Some("http://nas:18081")).await;
+    sqlx::query(
+        "UPDATE admin_accounts SET pending_telegram_user_id = $1, pending_telegram_name = 'Alice'",
+    )
+    .bind(bot_id)
+    .execute(&db.pool)
+    .await
+    .expect("candidate");
+
+    let mut bot = Harness::new(&db.pool, bot_id);
+    bot.text("/admin").await;
+    bot.assert_latest_contains("Не знаю такой команды");
+    assert_eq!(recovery_code_count(&db.pool).await, 0);
+    assert!(recovery_audit(&db.pool).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_fourth_admin_request_within_an_hour_is_refused() {
+    let db = isolated_db().await;
+    let mut bot = Harness::new(&db.pool, next_telegram_id());
+    admin_account(&db.pool, Some(bot.chat), Some("http://nas:18081")).await;
+
+    for _ in 0..3 {
+        bot.text("/admin").await;
+        assert!(recovery_message(&bot).1.contains("/admin/recover/"));
+    }
+    assert_eq!(recovery_code_count(&db.pool).await, 3);
+
+    bot.text("/admin").await;
+    bot.assert_latest_contains("Слишком часто");
+    assert_eq!(
+        recovery_code_count(&db.pool).await,
+        3,
+        "the refused request must not issue a fourth code"
+    );
+    let limited: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT payload FROM audit_events WHERE event_type::text = 'rate_limited'",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("rate limit audit");
+    assert_eq!(limited.len(), 1);
+    assert_eq!(
+        limited[0]["limit"],
+        serde_json::json!("admin_telegram_recovery_per_hour")
     );
 }

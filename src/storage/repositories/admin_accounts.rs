@@ -75,6 +75,23 @@ pub async fn get(conn: &mut PgConnection) -> Result<Option<AdminAccount>, Domain
     Ok(account)
 }
 
+/// Найти учётную запись по подтверждённой привязке Telegram.
+///
+/// `None` — аккаунт не привязан ни к одной учётной записи.
+pub async fn find_by_telegram(
+    conn: &mut PgConnection,
+    telegram_user_id: i64,
+) -> Result<Option<AdminAccount>, DomainError> {
+    let account = sqlx::query_as::<_, AdminAccount>(&format!(
+        "SELECT {COLUMNS} FROM admin_accounts WHERE telegram_user_id = $1 LIMIT 1"
+    ))
+    .bind(telegram_user_id)
+    .fetch_optional(conn)
+    .await?;
+
+    Ok(account)
+}
+
 /// Есть ли учётная запись администратора.
 ///
 /// Дешевле [`get`]: не читает хеш пароля и остальные поля, когда нужен только
@@ -178,7 +195,9 @@ pub async fn set_console_origin(conn: &mut PgConnection, origin: &str) -> Result
 
 /// Записать кандидата, открывшего ссылку привязки.
 ///
-/// Заменяет прежнего кандидата. `NotFound` — учётной записи ещё нет.
+/// Заменяет прежнего кандидата. Привязанная учётная запись кандидата не
+/// принимает: сначала нужно отвязать аккаунт, иначе подтвердить кандидата было
+/// бы нельзя. `NotFound` — учётной записи нет или аккаунт уже привязан.
 pub async fn set_pending_telegram(
     conn: &mut PgConnection,
     telegram_user_id: i64,
@@ -186,7 +205,8 @@ pub async fn set_pending_telegram(
 ) -> Result<(), DomainError> {
     let result = sqlx::query(
         "UPDATE admin_accounts
-            SET pending_telegram_user_id = $1, pending_telegram_name = $2",
+            SET pending_telegram_user_id = $1, pending_telegram_name = $2
+          WHERE telegram_user_id IS NULL",
     )
     .bind(telegram_user_id)
     .bind(name)
