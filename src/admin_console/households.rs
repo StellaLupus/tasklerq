@@ -35,7 +35,8 @@ use super::owner;
 use super::pages::{
     self, HOME_ASSISTANT_SCOPES, HouseholdForm, internal, render_household_delete,
     render_household_delete_error, render_household_detail, render_household_detail_error,
-    render_household_list, render_household_token_issued,
+    render_household_list, render_household_token_issued, render_household_token_revoke,
+    render_household_token_revoke_error,
 };
 use super::router::AdminState;
 use super::session::AdminSession;
@@ -62,6 +63,9 @@ const DEFAULT_MEMBER_ROLE: &str = "member";
 const OWNER_EXISTS_HINT: &str = "Владение передаётся в боте.";
 /// Отказ формы токена при нечисловом сроке.
 const INVALID_TOKEN_EXPIRY: &str = "Срок действия должен быть числом дней.";
+/// Отказ отзыва без подтверждения.
+const REVOKE_WITHOUT_CONFIRMATION: &str =
+    "Подтвердите отзыв токена: интеграции с ним перестанут работать.";
 
 /// Telegram ID для показа: только последние четыре цифры.
 ///
@@ -123,6 +127,8 @@ fn scope_options(selected: impl Fn(&str) -> bool) -> Vec<ScopeOption> {
 
 /// Строка секции API-токенов: без хеша и открытого значения.
 struct TokenRow {
+    /// Идентификатор для ссылки отзыва.
+    id: Uuid,
     /// Название.
     name: String,
     /// Видимый префикс.
@@ -135,19 +141,23 @@ struct TokenRow {
     state: &'static str,
     /// Срок действия в поясе household, если задан.
     expires_at: Option<String>,
+    /// Токен активен: его можно отозвать.
+    revocable: bool,
 }
 
 impl TokenRow {
     /// Собрать строку из записи `admin`; состояние — на момент `now`.
     fn new(token: ApiToken, timezone: Tz, now: DateTime<Utc>) -> Self {
+        let expired = token.expires_at.is_some_and(|expires_at| expires_at <= now);
         let state = if token.revoked_at.is_some() {
             "отозван"
-        } else if token.expires_at.is_some_and(|expires_at| expires_at <= now) {
+        } else if expired {
             "истёк"
         } else {
             "активен"
         };
         Self {
+            id: token.id,
             name: token.name,
             prefix: token.prefix,
             scopes: token.scopes.join(", "),
@@ -157,6 +167,7 @@ impl TokenRow {
             ),
             state,
             expires_at: token.expires_at.map(|at| format_at(at, timezone)),
+            revocable: token.revoked_at.is_none() && !expired,
         }
     }
 }
@@ -474,6 +485,43 @@ pub(crate) struct HouseholdDeleteForm {
     /// Название household; отсутствие поля и пустое значение — отказ.
     #[serde(default)]
     confirm_name: Option<String>,
+}
+
+/// Страница подтверждения отзыва токена household: имя и префикс без значения.
+pub(crate) struct HouseholdTokenRevokeView {
+    /// Идентификатор household для адреса формы и ссылки назад.
+    household_id: Uuid,
+    /// Идентификатор токена для адреса формы.
+    token_id: Uuid,
+    /// Название токена.
+    name: String,
+    /// Видимый префикс.
+    prefix: String,
+}
+
+impl HouseholdTokenRevokeView {
+    /// Собрать страницу из токена, уже сверенного с household.
+    fn new(household_id: Uuid, token: ApiToken) -> Self {
+        Self {
+            household_id,
+            token_id: token.id,
+            name: token.name,
+            prefix: token.prefix,
+        }
+    }
+
+    /// Отрисовать содержимое страницы без макета.
+    pub(crate) fn render_body(&self) -> Result<String, askama::Error> {
+        TokenRevokeBody { view: self }.render()
+    }
+}
+
+/// Поля формы отзыва токена.
+#[derive(Deserialize)]
+pub(crate) struct TokenRevokeForm {
+    /// `yes` из формы подтверждения; отсутствие или другое значение — отказ.
+    #[serde(default)]
+    confirm: Option<String>,
 }
 
 /// Поля формы добавления участника.
@@ -815,6 +863,94 @@ async fn token_refusal(
     render_household_detail_error(view, message, None, status)
 }
 
+/// Токен household из пути; чужой, удалённый household и неизвестный токен —
+/// `404`.
+///
+/// Отдельного SQL консоль не пишет: [`admin::list_tokens`] проверяет household и
+/// отдаёт только его токены.
+async fn household_token(
+    state: &AdminState,
+    household_id: Uuid,
+    token_id: Uuid,
+) -> Result<ApiToken, Box<Response>> {
+    let tokens =
+        match admin::list_tokens(&state.pool, state.wizard().tenancy, Some(household_id)).await {
+            Ok(tokens) => tokens,
+            Err(DomainError::NotFound) => return Err(Box::new(not_found())),
+            Err(error) => return Err(Box::new(internal(error))),
+        };
+    tokens
+        .into_iter()
+        .find(|token| token.id == token_id)
+        .ok_or_else(|| Box::new(not_found()))
+}
+
+/// `GET /admin/households/{id}/tokens/{token_id}/revoke`: подтверждение отзыва.
+///
+/// Страница только показывает имя и префикс; принадлежность токена household
+/// проверяет [`household_token`], поэтому чужой токен и неверный UUID дают
+/// `404`.
+pub(crate) async fn revoke_token_page(
+    State(state): State<AdminState>,
+    Path((raw_id, raw_token_id)): Path<(String, String)>,
+    _session: AdminSession,
+) -> Response {
+    let (Ok(household_id), Ok(token_id)) =
+        (Uuid::parse_str(&raw_id), Uuid::parse_str(&raw_token_id))
+    else {
+        return not_found();
+    };
+    match household_token(&state, household_id, token_id).await {
+        Ok(token) => {
+            render_household_token_revoke(HouseholdTokenRevokeView::new(household_id, token))
+        }
+        Err(response) => *response,
+    }
+}
+
+/// `POST /admin/households/{id}/tokens/{token_id}/revoke`: отозвать с
+/// подтверждением.
+///
+/// Без `confirm=yes` данные не меняются: страница возвращается с отказом. Чужой
+/// токен — `404` до всякого отзыва. Сам отзыв выполняет
+/// [`admin::revoke_household_token`], поэтому аудит и системный актор те же, что
+/// у CLI.
+pub(crate) async fn revoke_token(
+    State(state): State<AdminState>,
+    Path((raw_id, raw_token_id)): Path<(String, String)>,
+    _session: AdminSession,
+    Form(form): Form<TokenRevokeForm>,
+) -> Response {
+    let (Ok(household_id), Ok(token_id)) =
+        (Uuid::parse_str(&raw_id), Uuid::parse_str(&raw_token_id))
+    else {
+        return not_found();
+    };
+    let token = match household_token(&state, household_id, token_id).await {
+        Ok(token) => token,
+        Err(response) => return *response,
+    };
+
+    if form.confirm.as_deref() != Some("yes") {
+        return render_household_token_revoke_error(
+            HouseholdTokenRevokeView::new(household_id, token),
+            REVOKE_WITHOUT_CONFIRMATION,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        );
+    }
+
+    match admin::revoke_household_token(&state.pool, household_id, token_id, Utc::now()).await {
+        Ok(_) => Redirect::to(&format!("/admin/households/{household_id}")).into_response(),
+        Err(DomainError::NotFound) => not_found(),
+        Err(DomainError::Database(error)) => internal(error),
+        Err(error) => render_household_token_revoke_error(
+            HouseholdTokenRevokeView::new(household_id, token),
+            &admin::describe(&error),
+            error_status(&error),
+        ),
+    }
+}
+
 /// `GET /admin/households/{id}/delete`: подтверждение вводом названия.
 ///
 /// Страница только читает название; активность household проверяет
@@ -1029,6 +1165,9 @@ struct ListBody<'a> {
 <span class="row-label">{{ token.name }}</span>
 <span class="row-desc">{{ token.prefix }} · scopes: {{ token.scopes }} · {{ token.state }} · последнее использование: {{ token.last_used }}{% match token.expires_at %}{% when Some with (expires_at) %} · срок до {{ expires_at }}{% when None %}{% endmatch %}</span>
 </div>
+{% if token.revocable %}
+<a class="btn btn-danger" href="/admin/households/{{ view.id }}/tokens/{{ token.id }}/revoke">Отозвать</a>
+{% endif %}
 </li>
 {% endfor %}
 </ul>
@@ -1036,6 +1175,7 @@ struct ListBody<'a> {
 <div class="panel-body">
 <form method="post" action="/admin/households/{{ view.id }}/tokens">
 <div class="field"><label for="token-name">Название</label>
+{# Лимит совпадает с normalize_text(name, 64, ...) в `auth::tokens::issue`: поле формы не даёт превысить доменный предел. #}
 <input id="token-name" name="name" type="text" value="{{ view.token_name }}" maxlength="64" required></div>
 <div class="field"><span class="field-head"><span>Scopes</span></span>
 {% for option in view.token_scope_options %}
@@ -1090,6 +1230,31 @@ struct DetailBody<'a> {
 struct DeleteBody<'a> {
     /// Данные подтверждения.
     view: &'a HouseholdDeleteView,
+}
+
+/// Содержимое страницы подтверждения отзыва токена.
+#[derive(Template)]
+#[template(
+    source = r#"<header class="page-head">
+<h1>Отзыв API-токена</h1>
+<p class="page-desc">Подтвердите отзыв токена.</p>
+</header>
+<section class="panel danger-zone">
+<header class="panel-head"><h2>Отозвать токен</h2></header>
+<div class="panel-body">
+<p>Токен «{{ view.name }}» ({{ view.prefix }}) будет отозван. Интеграции с этим токеном перестанут работать. Отменить действие нельзя.</p>
+<form method="post" action="/admin/households/{{ view.household_id }}/tokens/{{ view.token_id }}/revoke">
+<input type="hidden" name="confirm" value="yes">
+<div class="actions"><button type="submit" class="btn-danger">Отозвать токен</button></div>
+</form>
+</div>
+</section>
+"#,
+    ext = "html"
+)]
+struct TokenRevokeBody<'a> {
+    /// Данные подтверждения.
+    view: &'a HouseholdTokenRevokeView,
 }
 
 /// Страница выпущенного токена household: значение показывается один раз.

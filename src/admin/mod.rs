@@ -130,6 +130,30 @@ pub async fn revoke_token(
     Ok(result)
 }
 
+/// Отозвать токен household, сверив принадлежность в одной транзакции.
+///
+/// [`revoke_token`] household не проверяет, поэтому консоль перед отзывом
+/// сверяет, что токен принадлежит household из пути: иначе на странице одного
+/// дома можно было бы отозвать токен другого. Несуществующий или чужой токен —
+/// `NotFound`; дальше отзыв идёт тем же путём, что у CLI (системный актор и
+/// аудит `token_revoked`).
+pub async fn revoke_household_token(
+    pool: &PgPool,
+    household_id: Uuid,
+    token_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<(ApiToken, bool), DomainError> {
+    let mut tx = pool.begin().await?;
+    let token = crate::storage::repositories::tokens::find_by_id(&mut tx, token_id)
+        .await?
+        .filter(|token| token.household_id == household_id)
+        .ok_or(DomainError::NotFound)?;
+    let result = tokens::revoke(&mut tx, token.id, &admin_actor(), now).await?;
+    tx.commit().await?;
+
+    Ok(result)
+}
+
 /// Токены household без секретов.
 pub async fn list_tokens(
     pool: &PgPool,

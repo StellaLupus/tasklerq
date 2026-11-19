@@ -1980,6 +1980,25 @@ pub(crate) fn render_household_token_issued(
     render(ConsolePage::new(Page::HouseholdTokenIssued(Box::new(view))))
 }
 
+/// Отрисовать страницу подтверждения отзыва токена household.
+pub(crate) fn render_household_token_revoke(
+    view: super::households::HouseholdTokenRevokeView,
+) -> Response {
+    render(ConsolePage::new(Page::HouseholdTokenRevoke(Box::new(view))))
+}
+
+/// Отрисовать подтверждение отзыва токена с сообщением отказа формы.
+pub(crate) fn render_household_token_revoke_error(
+    view: super::households::HouseholdTokenRevokeView,
+    message: &str,
+    status: StatusCode,
+) -> Response {
+    render_with_status(
+        ConsolePage::new(Page::HouseholdTokenRevoke(Box::new(view))).error(message),
+        status,
+    )
+}
+
 /// Отрисовать страницу подтверждения удаления household.
 pub(crate) fn render_household_delete(view: super::households::HouseholdDeleteView) -> Response {
     render(ConsolePage::new(Page::HouseholdDelete(Box::new(view))))
@@ -2452,6 +2471,8 @@ enum Page {
     Household(Box<super::households::HouseholdView>),
     /// Токен household только что выпущен: значение показывается один раз.
     HouseholdTokenIssued(Box<super::households::HouseholdTokenIssuedView>),
+    /// Подтверждение отзыва токена household.
+    HouseholdTokenRevoke(Box<super::households::HouseholdTokenRevokeView>),
     /// Подтверждение удаления household.
     HouseholdDelete(Box<super::households::HouseholdDeleteView>),
 }
@@ -2493,6 +2514,7 @@ impl Page {
             Self::Check(_) => "Проверка слота",
             Self::Households(_) | Self::Household(_) => "Household",
             Self::HouseholdTokenIssued(_) => "API-токен",
+            Self::HouseholdTokenRevoke(_) => "Отзыв токена",
             Self::HouseholdDelete(_) => "Удаление household",
         }
     }
@@ -2516,6 +2538,7 @@ impl Page {
                 | Self::Households(_)
                 | Self::Household(_)
                 | Self::HouseholdTokenIssued(_)
+                | Self::HouseholdTokenRevoke(_)
                 | Self::HouseholdDelete(_)
         )
     }
@@ -2527,6 +2550,7 @@ impl Page {
             Self::Households(_)
             | Self::Household(_)
             | Self::HouseholdTokenIssued(_)
+            | Self::HouseholdTokenRevoke(_)
             | Self::HouseholdDelete(_) => "household",
             Self::Llm(_) | Self::Check(_) => "llm",
             Self::Telegram(view) if !view.wizard => "telegram",
@@ -2645,6 +2669,7 @@ impl Page {
             Self::Households(view) => super::households::render_list_body(view),
             Self::Household(view) => view.render_body(),
             Self::HouseholdTokenIssued(view) => view.render_body(),
+            Self::HouseholdTokenRevoke(view) => view.render_body(),
             Self::HouseholdDelete(view) => view.render_body(),
         }
     }

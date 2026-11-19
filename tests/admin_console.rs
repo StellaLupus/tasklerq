@@ -205,17 +205,43 @@ fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
 
 /// Тег `<input>` с заданным `name`.
 fn input_with_name<'a>(html: &'a str, name: &str) -> &'a str {
-    let needle = format!("name=\"{name}\"");
+    input_with_attribute(html, "name", name)
+}
+
+/// Тег `<input>` с заданным `id`.
+fn input_with_id<'a>(html: &'a str, id: &str) -> &'a str {
+    input_with_attribute(html, "id", id)
+}
+
+/// Тег `<input>`, у которого атрибут `attribute` равен `value`.
+fn input_with_attribute<'a>(html: &'a str, attribute: &str, value: &str) -> &'a str {
+    let needle = format!("{attribute}=\"{value}\"");
     let position = html
         .find(&needle)
-        .unwrap_or_else(|| panic!("no input named {name}: {html}"));
+        .unwrap_or_else(|| panic!("no input with {attribute}={value}: {html}"));
     let start = html[..position]
         .rfind("<input")
-        .unwrap_or_else(|| panic!("no input tag around {name}: {html}"));
+        .unwrap_or_else(|| panic!("no input tag around {attribute}={value}: {html}"));
     let end = html[position..]
         .find('>')
         .map(|offset| position + offset)
-        .unwrap_or_else(|| panic!("unclosed input named {name}: {html}"));
+        .unwrap_or_else(|| panic!("unclosed input with {attribute}={value}: {html}"));
+    &html[start..=end]
+}
+
+/// Тег `<input type="checkbox">` с заданным `value`.
+fn checkbox_with_value<'a>(html: &'a str, value: &str) -> &'a str {
+    let needle = format!("value=\"{value}\"");
+    let position = html
+        .find(&needle)
+        .unwrap_or_else(|| panic!("no checkbox with value {value}: {html}"));
+    let start = html[..position]
+        .rfind("<input")
+        .unwrap_or_else(|| panic!("no input tag around {value}: {html}"));
+    let end = html[position..]
+        .find('>')
+        .map(|offset| position + offset)
+        .unwrap_or_else(|| panic!("unclosed input with value {value}: {html}"));
     &html[start..=end]
 }
 
@@ -4406,6 +4432,15 @@ async fn token_count(pool: &PgPool) -> i64 {
         .fetch_one(pool)
         .await
         .expect("token count")
+}
+
+/// Время отзыва токена по открытому значению.
+async fn token_revoked_at(pool: &PgPool, token: &str) -> Option<DateTime<Utc>> {
+    sqlx::query_scalar("SELECT revoked_at FROM api_tokens WHERE token_hash = $1")
+        .bind(hash_token(token))
+        .fetch_one(pool)
+        .await
+        .expect("the token row")
 }
 
 /// Открытый токен со страницы выпуска: единственное поле `issued-token`.
@@ -11736,15 +11771,13 @@ async fn households_card_marks_revoked_and_expired_tokens() {
     )
     .await
     .expect("the active token");
-    sqlx::query("UPDATE api_tokens SET revoked_at = $2 WHERE token_hash = $3")
-        .bind(household.id)
+    sqlx::query("UPDATE api_tokens SET revoked_at = $1 WHERE token_hash = $2")
         .bind(now)
         .bind(hash_token(&revoked.token))
         .execute(&db.pool)
         .await
         .expect("the revoked token");
-    sqlx::query("UPDATE api_tokens SET expires_at = $2 WHERE token_hash = $3")
-        .bind(household.id)
+    sqlx::query("UPDATE api_tokens SET expires_at = $1 WHERE token_hash = $2")
         .bind(now - ChronoDuration::days(1))
         .bind(hash_token(&expired.token))
         .execute(&db.pool)
@@ -11777,4 +11810,363 @@ async fn households_card_marks_revoked_and_expired_tokens() {
             "the card must not show the open value:\n{text}"
         );
     }
+}
+
+/// Отказ формы токена сохраняет введённые значения, а карточка по умолчанию
+/// отмечает ровно scopes Home Assistant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_token_form_keeps_the_input_after_a_refusal() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
+    let household = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Дом",
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("the household");
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    let path = format!("/admin/households/{}/tokens", household.id);
+
+    let (status, _, body) = send_form_from(
+        &app,
+        &path,
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("name", "Сохранённый"),
+            ("scope", "ha:read"),
+            ("expires_in_days", "3651"),
+        ],
+    )
+    .await;
+    assert!(
+        status.is_client_error(),
+        "3651 days is a form error, not {status}"
+    );
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        input_with_id(&text, "token-name").contains("value=\"Сохранённый\""),
+        "the entered name is kept:\n{text}"
+    );
+    assert!(
+        input_with_id(&text, "token-expires").contains("value=\"3651\""),
+        "the entered expiry is kept:\n{text}"
+    );
+    assert!(
+        checkbox_with_value(&text, "ha:read").contains("checked"),
+        "the marked scope stays checked:\n{text}"
+    );
+    assert!(
+        !checkbox_with_value(&text, "ha:write").contains("checked"),
+        "an unmarked scope stays unchecked:\n{text}"
+    );
+    assert_eq!(household_token_count(&db.pool, household.id).await, 0);
+
+    let card_path = format!("/admin/households/{}", household.id);
+    let (status, _, body) = send_with_cookie(&app, Method::GET, &card_path, &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let card = String::from_utf8_lossy(&body);
+    for scope in ["ha:read", "ha:write", "capture:write"] {
+        assert!(
+            checkbox_with_value(&card, scope).contains("checked"),
+            "the card marks {scope} by default:\n{card}"
+        );
+    }
+    assert!(
+        !checkbox_with_value(&card, "metrics:read").contains("checked"),
+        "the card leaves the non-Home-Assistant scope unchecked:\n{card}"
+    );
+}
+
+/// Отзыв токена: подтверждение обязательно, после отзыва токен даёт `401`, а
+/// событие аудита пишется без значения токена.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_token_revoke_requires_confirmation_and_blocks_the_token() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
+    let now = Utc::now();
+    let household = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Дом",
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("the household");
+    let issued = tasklerq::admin::create_token(
+        &db.pool,
+        TenancyMode::Multi,
+        Some(household.id),
+        "Home Assistant",
+        &["ha:read".to_owned()],
+        None,
+        now,
+    )
+    .await
+    .expect("the token to revoke");
+    let token_id: Uuid = sqlx::query_scalar("SELECT id FROM api_tokens WHERE token_hash = $1")
+        .bind(hash_token(&issued.token))
+        .fetch_one(&db.pool)
+        .await
+        .expect("the token row");
+    let prefix: String = issued.token.chars().take(12).collect();
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    let public = support::app(&db.pool);
+
+    let (status, _) = support::request(
+        &public,
+        Method::GET,
+        "/api/v1/household",
+        Some(&issued.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the token works before the revoke");
+
+    let path = format!(
+        "/admin/households/{}/tokens/{token_id}/revoke",
+        household.id
+    );
+    let card_path = format!("/admin/households/{}", household.id);
+    let (status, headers, body) = send_with_cookie(&app, Method::GET, &path, &cookie).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the confirmation page opens: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_security_headers(&headers, "GET the token revoke page");
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("Home Assistant"), "{text}");
+    assert!(text.contains(&prefix), "the prefix is shown:\n{text}");
+    assert!(
+        text.contains("name=\"confirm\" value=\"yes\""),
+        "the form carries the confirmation field:\n{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "action=\"/admin/households/{}/tokens/{token_id}/revoke\"",
+            household.id
+        )),
+        "the form posts to the revoke path:\n{text}"
+    );
+    assert!(
+        token_revoked_at(&db.pool, &issued.token).await.is_none(),
+        "GET must not revoke the token"
+    );
+    assert!(
+        audit_payloads(&db.pool, "token_revoked").await.is_empty(),
+        "GET must not write an audit event"
+    );
+
+    for fields in [Vec::new(), vec![("confirm", "no")]] {
+        let (status, _, body) = send_form_from(
+            &app,
+            &path,
+            test_peer(),
+            headers_with(&[("cookie", &cookie)]),
+            &fields,
+        )
+        .await;
+        assert!(
+            status.is_client_error(),
+            "a revoke without `confirm=yes` is refused, not {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            token_revoked_at(&db.pool, &issued.token).await.is_none(),
+            "the token stays active without `confirm=yes`"
+        );
+    }
+    let (status, _) = support::request(
+        &public,
+        Method::GET,
+        "/api/v1/household",
+        Some(&issued.token),
+        None,
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the token still works after refused revokes"
+    );
+
+    let (status, headers, body) = send_form_from(
+        &app,
+        &path,
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("confirm", "yes")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "a confirmed revoke redirects: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        location(&headers),
+        Some(card_path.as_str()),
+        "the redirect goes back to the household card"
+    );
+    assert!(
+        token_revoked_at(&db.pool, &issued.token).await.is_some(),
+        "the token is revoked"
+    );
+
+    let (status, _) = support::request(
+        &public,
+        Method::GET,
+        "/api/v1/household",
+        Some(&issued.token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a revoked token is refused by the API"
+    );
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, &card_path, &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let card = String::from_utf8_lossy(&body);
+    let row = token_row(&card, "Home Assistant");
+    assert!(row.contains("отозван"), "the card marks the token:\n{row}");
+    assert!(
+        !row.contains("/revoke"),
+        "a revoked token has no revoke link:\n{row}"
+    );
+    assert!(
+        !card.contains(&issued.token),
+        "the card must not show the open value:\n{card}"
+    );
+
+    let payloads = audit_payloads(&db.pool, "token_revoked").await;
+    assert_eq!(payloads.len(), 1, "the revoke is audited once");
+    assert_eq!(payloads[0]["token_id"], json!(token_id));
+    assert!(
+        !payloads[0].to_string().contains(&issued.token),
+        "the audit payload must not contain the open token: {payloads:?}"
+    );
+    assert_eq!(
+        audit_actor(&db.pool, "token_revoked").await,
+        vec![("system".to_owned(), Some(household.id))]
+    );
+
+    let (status, headers, _) = send_form_from(
+        &app,
+        &path,
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("confirm", "yes")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "a repeated revoke is still a redirect"
+    );
+    assert_eq!(
+        location(&headers),
+        Some(card_path.as_str()),
+        "the repeated revoke goes back to the card"
+    );
+    assert_eq!(
+        audit_payloads(&db.pool, "token_revoked").await.len(),
+        1,
+        "a repeated revoke writes no second event"
+    );
+}
+
+/// Чужой токен по пути household — `404` и на странице подтверждения, и на
+/// POST; токен остаётся активным.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_token_revoke_of_another_household_is_not_found() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
+    let now = Utc::now();
+    let flat = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Квартира",
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("the flat");
+    let dacha = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Дача",
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("the dacha");
+    let issued = tasklerq::admin::create_token(
+        &db.pool,
+        TenancyMode::Multi,
+        Some(flat.id),
+        "Home Assistant",
+        &["ha:read".to_owned()],
+        None,
+        now,
+    )
+    .await
+    .expect("the token of the flat");
+    let token_id: Uuid = sqlx::query_scalar("SELECT id FROM api_tokens WHERE token_hash = $1")
+        .bind(hash_token(&issued.token))
+        .fetch_one(&db.pool)
+        .await
+        .expect("the token row");
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let path = format!("/admin/households/{}/tokens/{token_id}/revoke", dacha.id);
+    let (status, headers, _) = send_with_cookie(&app, Method::GET, &path, &cookie).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the confirmation page of another household's token"
+    );
+    assert_security_headers(&headers, "GET a foreign token revoke page");
+    assert!(
+        token_revoked_at(&db.pool, &issued.token).await.is_none(),
+        "GET must not revoke the token"
+    );
+
+    let (status, _, _) = send_form_from(
+        &app,
+        &path,
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("confirm", "yes")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a revoke through another household's path"
+    );
+    assert!(
+        token_revoked_at(&db.pool, &issued.token).await.is_none(),
+        "the token of the other household stays active"
+    );
+    assert!(
+        audit_payloads(&db.pool, "token_revoked").await.is_empty(),
+        "no revoke event is written"
+    );
+
+    let bad_path = format!("/admin/households/{}/tokens/not-a-uuid/revoke", flat.id);
+    let (status, _, _) = send_with_cookie(&app, Method::GET, &bad_path, &cookie).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "an invalid token id");
 }

@@ -273,6 +273,10 @@ pub fn build_router(state: AdminState) -> Router {
         )
         .route("/admin/households/{id}/tokens", post(households::add_token))
         .route(
+            "/admin/households/{id}/tokens/{token_id}/revoke",
+            get(households::revoke_token_page).post(households::revoke_token),
+        )
+        .route(
             "/admin/households/{id}/delete",
             get(households::delete_page).post(households::delete),
         )
