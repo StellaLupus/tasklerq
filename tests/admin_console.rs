@@ -53,6 +53,7 @@ use tasklerq::storage::repositories::admin_accounts;
 use tasklerq::storage::repositories::households;
 use tasklerq::storage::repositories::llm_slot_checks::{self, NewCheck};
 use tasklerq::telegram::bot::Bot;
+use tasklerq::telegram::outbox::{self, Outgoing};
 use tokio::sync::watch;
 use tower::ServiceExt;
 use url::form_urlencoded;
@@ -7898,6 +7899,515 @@ async fn disabling_a_webhook_bot_removes_the_old_webhook_even_on_failure() {
         StatusCode::NOT_FOUND,
         "the disabled bot must not accept webhook updates"
     );
+
+    stop_application(application, shutdown_tx).await;
+}
+
+/// Дождаться заданного числа вызовов метода поддельного Bot API с токеном.
+async fn wait_for_token_requests(
+    server: &MockServer,
+    method_name: &str,
+    token: &str,
+    count: usize,
+) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let calls = bot_requests(server, method_name)
+                .await
+                .iter()
+                .filter(|request| request_bot_token(request).as_deref() == Some(token))
+                .count();
+            if calls >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("{method_name} was not called {count} time(s) with the expected token")
+    });
+}
+
+/// Дождаться статуса строки outbox: запись в базе отстаёт от запроса к Bot API.
+async fn wait_for_outbox_status(pool: &PgPool, seq: i64, expected: &str) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let status: String =
+                sqlx::query_scalar("SELECT status::text FROM outbox WHERE seq = $1")
+                    .bind(seq)
+                    .fetch_one(pool)
+                    .await
+                    .expect("outbox status");
+            if status == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the outbox row did not reach `{expected}`"));
+}
+
+/// `getUpdates` заданного бота отвечает пусто, но достаточно медленно, чтобы
+/// переключение поколения успело отменить запрос.
+async fn mount_empty_updates_for(server: &MockServer, token: &str) {
+    Mock::given(method("POST"))
+        .and(path_regex(format!(r"^/bot{token}/getUpdates$")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(200))
+                .set_body_json(json!({"ok": true, "result": []})),
+        )
+        .mount(server)
+        .await;
+}
+
+/// Ротация токена того же бота: новое поколение, webhook и все вызовы Bot API
+/// переходят на новый токен, а webhook прежнего поколения не снимается.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rotating_the_token_of_the_same_bot_switches_every_bot_api_call() {
+    let db = support::isolated_db().await;
+    let server = MockServer::start().await;
+    mount_bot_base(&server).await;
+    mount_get_me_for(&server, BOT_B_TOKEN, 42, "tasklerq_rotation_bot").await;
+    mount_webhook_info(&server, 0, None).await;
+    Mock::given(method("POST"))
+        .and(path_regex(format!(r"^/bot{BOT_B_TOKEN}/getWebhookInfo$")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "result": {
+                "url": "https://tasklerq.example.com/webhooks/telegram",
+                "pending_update_count": 13
+            }
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    let config = telegram_config(&db.pool, Some(&server), &[]).await;
+    let (application, app, cookie, shutdown_tx) = telegram_app(&config, &db.pool).await;
+    let cipher = SecretCipher::from_config(&config);
+    seed_bot(
+        &db.pool,
+        &cipher,
+        "webhook",
+        BOT_A_TOKEN,
+        BOT_A_SECRET,
+        42,
+        "tasklerq_rotation_bot",
+    )
+    .await;
+    assert!(
+        application
+            .telegram_supervisor
+            .reload()
+            .await
+            .expect("bot A reload")
+    );
+    wait_for_token_requests(&server, "setWebhook", BOT_A_TOKEN, 1).await;
+    let old_secret = bot_requests(&server, "setWebhook")
+        .await
+        .into_iter()
+        .find(|request| request_bot_token(request).as_deref() == Some(BOT_A_TOKEN))
+        .map(|request| submitted_secret(&request))
+        .expect("the old webhook must be registered");
+
+    let (status, headers, body) = send_form_from(
+        &app,
+        "/admin/telegram",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("mode", "webhook"),
+            ("token", BOT_B_TOKEN),
+            ("public_base_url", "https://tasklerq.example.com"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "the same bot must be rotated without a confirmation form: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(location(&headers), Some("/admin/telegram?saved=1"));
+    // Всё, что записано после ответа на форму, принадлежит новому поколению.
+    let boundary = server.received_requests().await.expect("requests").len();
+
+    let (value, secret): (Option<Value>, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT value, secret FROM settings
+         WHERE scope = 'installation' AND household_id IS NULL AND key = 'telegram.bot_token'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("the token row");
+    assert!(value.is_none(), "the token must be stored as a secret");
+    let secret = secret.expect("the token ciphertext");
+    assert!(
+        !String::from_utf8_lossy(&secret).contains(BOT_B_TOKEN),
+        "the stored token must be encrypted"
+    );
+    assert_eq!(stored_bot_token(&db.pool, &config).await, BOT_B_TOKEN);
+
+    let webhooks = bot_requests(&server, "setWebhook").await;
+    let new_webhook = webhooks
+        .iter()
+        .find(|request| request_bot_token(request).as_deref() == Some(BOT_B_TOKEN))
+        .expect("the new token must register the webhook");
+    assert_eq!(
+        submitted_secret(new_webhook),
+        old_secret,
+        "a token rotation must reuse the webhook secret"
+    );
+    assert_eq!(
+        submitted_webhook_url(new_webhook),
+        "https://tasklerq.example.com/webhooks/telegram"
+    );
+    assert!(
+        bot_requests(&server, "deleteWebhook").await.is_empty(),
+        "a token rotation must not remove the webhook of the same bot"
+    );
+
+    let payloads = audit_payloads(&db.pool, "admin_setting_changed").await;
+    let rotation = payloads
+        .iter()
+        .find(|payload| payload["key"] == json!("telegram.bot_token"))
+        .expect("the rotation must be audited");
+    assert_eq!(rotation["value"], json!("set"));
+    let audit = serde_json::to_string(&payloads).expect("audit payloads");
+    assert!(
+        !audit.contains(BOT_A_TOKEN) && !audit.contains(BOT_B_TOKEN),
+        "the audit must not store either token: {audit}"
+    );
+
+    let marker = "rotation-message-marker";
+    let mut conn = db.pool.acquire().await.expect("connection");
+    outbox::enqueue(
+        &mut conn,
+        777_010,
+        &Outgoing::Message {
+            html: marker.to_owned(),
+            rich: false,
+            delete_after: None,
+        },
+        None,
+        Utc::now(),
+    )
+    .await
+    .expect("outbox row");
+    drop(conn);
+    wait_for_token_requests(&server, "sendMessage", BOT_B_TOKEN, 1).await;
+    let sends: Vec<_> = bot_requests(&server, "sendMessage")
+        .await
+        .into_iter()
+        .filter(|request| String::from_utf8_lossy(&request.body).contains(marker))
+        .collect();
+    assert_eq!(sends.len(), 1, "the message must be sent exactly once");
+    assert_eq!(
+        request_bot_token(&sends[0]).as_deref(),
+        Some(BOT_B_TOKEN),
+        "the outbox must deliver with the new token"
+    );
+
+    let (status, _, page) = send_with_cookie(&app, Method::GET, "/admin/telegram", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let html = String::from_utf8_lossy(&page);
+    assert!(
+        html.contains("Ожидают обработки</dt><dd>13"),
+        "the page must show getWebhookInfo obtained with the new token: {html}"
+    );
+    assert!(
+        !html.contains(BOT_A_TOKEN) && !html.contains(BOT_B_TOKEN),
+        "the page must not render either token: {html}"
+    );
+
+    let requests = server.received_requests().await.expect("requests");
+    let after_switch = &requests[boundary..];
+    assert!(
+        !after_switch.is_empty(),
+        "the new generation must call the Bot API"
+    );
+    assert!(
+        after_switch
+            .iter()
+            .all(|request| request_bot_token(request).as_deref() != Some(BOT_A_TOKEN)),
+        "the old token must not be used after the switch"
+    );
+    assert!(
+        after_switch
+            .iter()
+            .filter(|request| request.url.path().ends_with("/getWebhookInfo"))
+            .all(|request| request_bot_token(request).as_deref() == Some(BOT_B_TOKEN)),
+        "getWebhookInfo after the switch must use the new token"
+    );
+
+    stop_application(application, shutdown_tx).await;
+}
+
+/// Ротация токена в polling: обновления запрашиваются только новым токеном.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rotating_the_token_in_polling_mode_polls_with_the_new_token() {
+    let db = support::isolated_db().await;
+    let server = MockServer::start().await;
+    mount_bot_base(&server).await;
+    mount_get_me_for(&server, BOT_B_TOKEN, 42, "tasklerq_polling_rotation_bot").await;
+    mount_empty_updates_for(&server, BOT_A_TOKEN).await;
+    mount_empty_updates_for(&server, BOT_B_TOKEN).await;
+
+    let config = telegram_config(&db.pool, Some(&server), &[]).await;
+    let (application, app, cookie, shutdown_tx) = telegram_app(&config, &db.pool).await;
+    let cipher = SecretCipher::from_config(&config);
+    seed_bot(
+        &db.pool,
+        &cipher,
+        "polling",
+        BOT_A_TOKEN,
+        BOT_A_SECRET,
+        42,
+        "tasklerq_polling_rotation_bot",
+    )
+    .await;
+    assert!(
+        application
+            .telegram_supervisor
+            .reload()
+            .await
+            .expect("bot A reload")
+    );
+    wait_for_token_requests(&server, "getUpdates", BOT_A_TOKEN, 1).await;
+
+    let (status, headers, body) = send_form_from(
+        &app,
+        "/admin/telegram",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("mode", "polling"),
+            ("token", BOT_B_TOKEN),
+            ("public_base_url", "https://tasklerq.example.com"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(location(&headers), Some("/admin/telegram?saved=1"));
+    let boundary = server.received_requests().await.expect("requests").len();
+
+    wait_for_token_requests(&server, "getUpdates", BOT_B_TOKEN, 1).await;
+    let requests = server.received_requests().await.expect("requests");
+    let after_switch: Vec<_> = requests[boundary..]
+        .iter()
+        .filter(|request| request.url.path().ends_with("/getUpdates"))
+        .collect();
+    assert!(
+        !after_switch.is_empty(),
+        "polling must continue with the new token"
+    );
+    assert!(
+        after_switch
+            .iter()
+            .all(|request| request_bot_token(request).as_deref() == Some(BOT_B_TOKEN)),
+        "no getUpdates call may use the old token after the switch"
+    );
+
+    stop_application(application, shutdown_tx).await;
+}
+
+/// Сообщение, поставленное в outbox до ротации, доставляется после неё один
+/// раз и новым токеном.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_outbox_message_queued_before_rotation_is_delivered_by_the_new_token() {
+    let db = support::isolated_db().await;
+    let server = MockServer::start().await;
+    mount_bot_base(&server).await;
+    mount_get_me_for(&server, BOT_B_TOKEN, 42, "tasklerq_outbox_rotation_bot").await;
+    mount_webhook_info(&server, 0, None).await;
+
+    let config = telegram_config(&db.pool, Some(&server), &[]).await;
+    let (application, app, cookie, shutdown_tx) = telegram_app(&config, &db.pool).await;
+    let cipher = SecretCipher::from_config(&config);
+    seed_bot(
+        &db.pool,
+        &cipher,
+        "webhook",
+        BOT_A_TOKEN,
+        BOT_A_SECRET,
+        42,
+        "tasklerq_outbox_rotation_bot",
+    )
+    .await;
+    assert!(
+        application
+            .telegram_supervisor
+            .reload()
+            .await
+            .expect("bot A reload")
+    );
+    wait_for_token_requests(&server, "setWebhook", BOT_A_TOKEN, 1).await;
+
+    // Строка поставлена до ротации, но не готова к доставке: иначе её могло бы
+    // забрать прежнее поколение. После ротации тест делает её готовой.
+    let marker = "pre-rotation-outbox-marker";
+    let now = Utc::now();
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let seq = outbox::enqueue_at(
+        &mut conn,
+        777_011,
+        &Outgoing::Message {
+            html: marker.to_owned(),
+            rich: false,
+            delete_after: None,
+        },
+        None,
+        now,
+        now + ChronoDuration::hours(1),
+    )
+    .await
+    .expect("outbox row")
+    .expect("a new outbox row");
+    drop(conn);
+
+    let (status, headers, body) = send_form_from(
+        &app,
+        "/admin/telegram",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("mode", "webhook"),
+            ("token", BOT_B_TOKEN),
+            ("public_base_url", "https://tasklerq.example.com"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(location(&headers), Some("/admin/telegram?saved=1"));
+
+    sqlx::query("UPDATE outbox SET next_attempt_at = now() WHERE seq = $1")
+        .bind(seq)
+        .execute(&db.pool)
+        .await
+        .expect("make the queued message due");
+    wait_for_token_requests(&server, "sendMessage", BOT_B_TOKEN, 1).await;
+
+    let sends: Vec<_> = bot_requests(&server, "sendMessage")
+        .await
+        .into_iter()
+        .filter(|request| String::from_utf8_lossy(&request.body).contains(marker))
+        .collect();
+    assert_eq!(
+        sends.len(),
+        1,
+        "the queued message must be sent exactly once"
+    );
+    assert!(
+        sends
+            .iter()
+            .all(|request| request_bot_token(request).as_deref() == Some(BOT_B_TOKEN)),
+        "the queued message must be delivered with the new token"
+    );
+    assert!(
+        bot_requests(&server, "sendMessage")
+            .await
+            .iter()
+            .all(|request| request_bot_token(request).as_deref() != Some(BOT_A_TOKEN)),
+        "the old token must not deliver anything after the rotation"
+    );
+
+    wait_for_outbox_status(&db.pool, seq, "sent").await;
+    let (status, message_id): (String, Option<i64>) =
+        sqlx::query_as("SELECT status::text, message_id FROM outbox WHERE seq = $1")
+            .bind(seq)
+            .fetch_one(&db.pool)
+            .await
+            .expect("outbox row");
+    assert_eq!(status, "sent");
+    assert_eq!(message_id, Some(1));
+
+    stop_application(application, shutdown_tx).await;
+}
+
+/// Ротация не выводит ни прежний, ни новый токен в HTML и журнал.
+#[tokio::test]
+async fn token_rotation_keeps_both_tokens_out_of_the_page_and_the_log() {
+    let db = support::isolated_db().await;
+    let server = MockServer::start().await;
+    mount_bot_base(&server).await;
+    mount_get_me_for(&server, BOT_B_TOKEN, 42, "tasklerq_secret_rotation_bot").await;
+    mount_webhook_info(&server, 0, None).await;
+
+    let config = telegram_config(&db.pool, Some(&server), &[]).await;
+    let logs = support::logs::LogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(logs.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let (application, app, cookie, shutdown_tx) = telegram_app(&config, &db.pool).await;
+    let cipher = SecretCipher::from_config(&config);
+    seed_bot(
+        &db.pool,
+        &cipher,
+        "webhook",
+        BOT_A_TOKEN,
+        BOT_A_SECRET,
+        42,
+        "tasklerq_secret_rotation_bot",
+    )
+    .await;
+    assert!(
+        application
+            .telegram_supervisor
+            .reload()
+            .await
+            .expect("bot A reload")
+    );
+    wait_for_token_requests(&server, "setWebhook", BOT_A_TOKEN, 1).await;
+
+    let (status, _, body) = send_form_from(
+        &app,
+        "/admin/telegram",
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("mode", "webhook"),
+            ("token", BOT_B_TOKEN),
+            ("public_base_url", "https://tasklerq.example.com"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let (status, _, page) = send_with_cookie(&app, Method::GET, "/admin/telegram", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let html = String::from_utf8_lossy(&page);
+    let logged = logs.contents();
+    for token in [BOT_A_TOKEN, BOT_B_TOKEN] {
+        assert!(
+            !html.contains(token),
+            "the page leaked a telegram token:\n{html}"
+        );
+        assert!(
+            !logged.contains(token),
+            "the log leaked a telegram token:\n{logged}"
+        );
+    }
 
     stop_application(application, shutdown_tx).await;
 }
