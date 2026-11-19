@@ -283,6 +283,23 @@ pub async fn count_active(conn: &mut PgConnection, household_id: Uuid) -> Result
     Ok(count)
 }
 
+/// Число активных участников во всех household инсталляции.
+///
+/// Бот один на инсталляцию, поэтому смена бота затрагивает участников любого
+/// household. Удалённые household не считаются: их участники тоже мягко
+/// удалены.
+pub async fn count_active_installation(conn: &mut PgConnection) -> Result<i64, DomainError> {
+    let count = sqlx::query_scalar(
+        "SELECT count(*) FROM users u
+         JOIN households h ON h.id = u.household_id
+         WHERE u.deleted_at IS NULL AND h.deleted_at IS NULL",
+    )
+    .fetch_one(conn)
+    .await?;
+
+    Ok(count)
+}
+
 /// Изменить роль активного участника.
 pub(crate) async fn set_role(
     conn: &mut PgConnection,

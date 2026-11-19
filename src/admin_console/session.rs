@@ -25,8 +25,10 @@ use crate::auth::secrets::random_base64url;
 use crate::auth::tokens::hash_token;
 use crate::domain::error::DomainError;
 use crate::http::client::{Client, Scheme};
+use crate::storage::repositories::admin_accounts;
 use crate::storage::repositories::admin_sessions;
 
+use super::origin;
 use super::router::AdminState;
 
 /// Имя cookie сессии.
@@ -138,6 +140,11 @@ pub async fn start(
     let token = random_base64url(TOKEN_BYTES);
     let mut conn = state.pool.acquire().await?;
     let record = admin_sessions::create(&mut conn, &hash_token(&token), now).await?;
+    // Origin запроса запоминается для ссылки восстановления. Неизвестный
+    // origin (нет или испорчен `Host`) поле не меняет.
+    if let Some(origin) = origin::request_origin(client) {
+        admin_accounts::set_console_origin(&mut conn, &origin.to_string()).await?;
+    }
 
     Ok((
         AdminSession { id: record.id },

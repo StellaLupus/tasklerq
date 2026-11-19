@@ -11,7 +11,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tasklerq::storage::repositories::{households, users};
-use tasklerq::telegram::api::{RichMessage, TelegramApi, TelegramError, WebhookInfo};
+use tasklerq::telegram::api::{BotMe, RichMessage, TelegramApi, TelegramError, WebhookInfo};
 use tasklerq::telegram::bot::model::{Action, Screen, Ui};
 use tasklerq::telegram::bot::{Bot, Ctx, display_timezone};
 use tasklerq::telegram::outbox::{OutboxWorker, Placement};
@@ -24,11 +24,31 @@ use tokio::sync::Notify;
 /// Вызов Bot API, записанный подделкой.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Call {
-    SendRich { chat: i64, id: i64, html: String },
-    EditRich { chat: i64, id: i64, html: String },
-    Send { chat: i64, id: i64, html: String },
-    EditText { chat: i64, id: i64, html: String },
-    Delete { chat: i64, id: i64 },
+    SendRich {
+        chat: i64,
+        id: i64,
+        html: String,
+    },
+    EditRich {
+        chat: i64,
+        id: i64,
+        html: String,
+    },
+    Send {
+        chat: i64,
+        id: i64,
+        html: String,
+        disable_preview: bool,
+    },
+    EditText {
+        chat: i64,
+        id: i64,
+        html: String,
+    },
+    Delete {
+        chat: i64,
+        id: i64,
+    },
 }
 
 #[derive(Default)]
@@ -158,7 +178,12 @@ impl TelegramApi for FakeTelegram {
         Ok(())
     }
 
-    async fn send_message(&self, chat_id: i64, html: &str) -> Result<i64, TelegramError> {
+    async fn send_message(
+        &self,
+        chat_id: i64,
+        html: &str,
+        disable_preview: bool,
+    ) -> Result<i64, TelegramError> {
         let mut state = self.state.lock().expect("lock");
         if let Some(error) = Self::take_failure(&mut state) {
             return Err(error);
@@ -170,6 +195,7 @@ impl TelegramApi for FakeTelegram {
             chat: chat_id,
             id,
             html: html.to_owned(),
+            disable_preview,
         });
         Ok(id)
     }
@@ -227,6 +253,17 @@ impl TelegramApi for FakeTelegram {
 
     async fn set_webhook(&self, _url: &str, _secret_token: &str) -> Result<(), TelegramError> {
         Ok(())
+    }
+
+    async fn delete_webhook(&self) -> Result<(), TelegramError> {
+        Ok(())
+    }
+
+    async fn get_me(&self) -> Result<BotMe, TelegramError> {
+        Ok(BotMe {
+            id: 4242,
+            username: Some("tasklerqbot".to_owned()),
+        })
     }
 
     async fn get_webhook_info(&self) -> Result<WebhookInfo, TelegramError> {
@@ -347,6 +384,7 @@ pub async fn present_with_banner(
             bootstrap_owner: None,
         },
         audit: None,
+        recovery_limit: Arc::new(tasklerq::rate_limit::RateLimiter::new(3)),
     };
     ctx.banner_with(text, buttons);
     ctx.show(screen, ui).await.expect("show with banner");

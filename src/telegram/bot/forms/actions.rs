@@ -25,7 +25,7 @@ use super::editor;
 /// Обработать текст при активной форме.
 pub async fn on_text(ctx: &mut Ctx<'_>, form: Form, text: &str) -> Result<(), Fail> {
     match form {
-        Form::Onboarding { name } => onboarding::on_text(ctx, name, text).await,
+        Form::Onboarding { name, claim_id } => onboarding::on_text(ctx, name, claim_id, text).await,
         Form::Editor(editor_form) => editor::on_text(ctx, editor_form, text).await,
         Form::LegacyEdit => legacy_expired(ctx).await,
         Form::DueText {

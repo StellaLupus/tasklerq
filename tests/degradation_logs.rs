@@ -14,6 +14,7 @@ use support::logs::LogBuffer;
 use tasklerq::app::build_application;
 use tasklerq::config::Config;
 use tokio::sync::watch;
+use uuid::Uuid;
 
 const BOT_TOKEN: &str = "123456:SECRET-bot-token";
 const WEBHOOK_SECRET: &str = "SECRET-webhook-secret";
@@ -174,5 +175,34 @@ fn enabled_telegram_without_bootstrap_owner_warns_through_build_application() {
     assert!(
         !logs.contains(WEBHOOK_SECRET),
         "the warning leaked the webhook secret"
+    );
+}
+
+#[test]
+fn enabled_telegram_with_an_admin_account_does_not_warn() {
+    let (logs, ()) = capture(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let db = support::isolated_db().await;
+            sqlx::query(
+                "INSERT INTO admin_accounts (id, username, password_hash)
+                 VALUES ($1, 'admin', 'hash')",
+            )
+            .bind(Uuid::now_v7())
+            .execute(&db.pool)
+            .await
+            .expect("admin account");
+            let database_url = support::database_url().await;
+            let config = config(&database_url, "single", "webhook");
+            build_and_stop(&config, &db.pool).await;
+        })
+    });
+
+    assert!(
+        !logs.contains("BOOTSTRAP_OWNER_TELEGRAM_ID"),
+        "an admin account should suppress the first-writer warning:\n{logs}"
     );
 }

@@ -112,6 +112,10 @@ pub enum Outgoing {
         ///
         /// `None` — без автоудаления; так читаются старые строки без поля.
         delete_after: Option<u32>,
+        /// Не показывать предпросмотр ссылки в клиенте Telegram.
+        ///
+        /// `false` — обычное поведение; так читаются старые строки без поля.
+        disable_preview: bool,
     },
     /// Редактирование конкретного сообщения (например, уведомления).
     Edit {
@@ -146,10 +150,14 @@ impl Outgoing {
                 html,
                 rich,
                 delete_after,
+                disable_preview,
             } => {
                 let mut payload = json!({"html": html, "rich": rich});
                 if let Some(seconds) = delete_after {
                     payload["delete_after"] = json!(seconds);
+                }
+                if *disable_preview {
+                    payload["disable_preview"] = json!(true);
                 }
                 payload
             }
@@ -175,6 +183,13 @@ impl Outgoing {
                 // умолчанием: строка уходит в `invalid_payload`, иначе
                 // сообщение с секретом осталось бы в чате без таймера.
                 delete_after: delete_after_from_payload(payload)?,
+                // Отсутствующее поле — «предпросмотр включён»: старые строки и
+                // все обычные сообщения. Неверный тип не скрывает ссылку, но и
+                // не делает строку мёртвой: это не секрет.
+                disable_preview: payload
+                    .get("disable_preview")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             }),
             "edit" => Some(Self::Edit {
                 message_id: payload.get("message_id")?.as_i64()?,
@@ -480,6 +495,21 @@ impl OutboxWorker {
         now: DateTime<Utc>,
         clock: Instant,
     ) -> Result<usize, sqlx::Error> {
+        self.run_batch(now, clock, None).await
+    }
+
+    /// Проход с проверкой остановки между сообщениями пакета.
+    ///
+    /// Начатый `deliver_one` не прерывается: вызов Bot API, запись
+    /// `message_id` и commit идут до конца. Сигнал проверяется перед следующим
+    /// сообщением, иначе медленный API не давал бы поколению остановиться
+    /// между пакетами.
+    async fn run_batch(
+        &mut self,
+        now: DateTime<Utc>,
+        clock: Instant,
+        shutdown: Option<&watch::Receiver<bool>>,
+    ) -> Result<usize, sqlx::Error> {
         // Головы очередей по чатам: следующее сообщение чата не обгоняет
         // предыдущее, даже если оно ждёт повтора после ошибки. Сообщение,
         // изначально запланированное на будущее (отложенное напоминание),
@@ -504,6 +534,9 @@ impl OutboxWorker {
 
         let mut sent = 0;
         for seq in candidates {
+            if shutdown.is_some_and(|shutdown| *shutdown.borrow()) {
+                break;
+            }
             match self.deliver_one(seq, now, clock).await? {
                 Delivery::Sent => sent += 1,
                 Delivery::Skipped | Delivery::Deferred | Delivery::Dead | Delivery::Idle => {}
@@ -675,20 +708,21 @@ impl OutboxWorker {
                 return;
             }
             // Паника не должна молча останавливать доставку.
-            let delivered = match AssertUnwindSafe(self.run_once(Utc::now(), Instant::now()))
-                .catch_unwind()
-                .await
-            {
-                Ok(Ok(delivered)) => delivered,
-                Ok(Err(error)) => {
-                    tracing::error!(%error, "outbox pass failed");
-                    0
-                }
-                Err(_) => {
-                    tracing::error!("outbox pass panicked");
-                    0
-                }
-            };
+            let delivered =
+                match AssertUnwindSafe(self.run_batch(Utc::now(), Instant::now(), Some(&shutdown)))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(Ok(delivered)) => delivered,
+                    Ok(Err(error)) => {
+                        tracing::error!(%error, "outbox pass failed");
+                        0
+                    }
+                    Err(_) => {
+                        tracing::error!("outbox pass panicked");
+                        0
+                    }
+                };
             if delivered > 0 {
                 continue;
             }
@@ -780,12 +814,17 @@ async fn deliver(
                 .map_err(db)?;
             Ok(message_id)
         }
-        Outgoing::Message { html, rich, .. } => {
+        Outgoing::Message {
+            html,
+            rich,
+            disable_preview,
+            ..
+        } => {
             if *rich {
                 api.send_rich_message(row.chat_id, &RichMessage { html: html.clone() })
                     .await
             } else {
-                api.send_message(row.chat_id, html).await
+                api.send_message(row.chat_id, html, *disable_preview).await
             }
         }
         Outgoing::Edit { message_id, html } => {
@@ -917,11 +956,19 @@ mod tests {
                 html: "b".into(),
                 rich: true,
                 delete_after: None,
+                disable_preview: false,
             },
             Outgoing::Message {
                 html: "b".into(),
                 rich: false,
                 delete_after: Some(3_600),
+                disable_preview: false,
+            },
+            Outgoing::Message {
+                html: "b".into(),
+                rich: false,
+                delete_after: Some(900),
+                disable_preview: true,
             },
             Outgoing::Edit {
                 message_id: 7,
@@ -984,6 +1031,7 @@ mod tests {
                 html: "a".into(),
                 rich: true,
                 delete_after: None,
+                disable_preview: false,
             })
         );
     }
@@ -1013,6 +1061,7 @@ mod tests {
             html: "a".into(),
             rich: false,
             delete_after: None,
+            disable_preview: false,
         };
         assert_eq!(plain.payload(), json!({"html": "a", "rich": false}));
 
@@ -1020,10 +1069,44 @@ mod tests {
             html: "a".into(),
             rich: false,
             delete_after: Some(3_600),
+            disable_preview: false,
         };
         assert_eq!(
             expiring.payload(),
             json!({"html": "a", "rich": false, "delete_after": 3_600})
+        );
+    }
+
+    #[test]
+    fn message_payload_disables_the_preview_only_when_set() {
+        let hidden = Outgoing::Message {
+            html: "a".into(),
+            rich: false,
+            delete_after: Some(900),
+            disable_preview: true,
+        };
+        assert_eq!(
+            hidden.payload(),
+            json!({"html": "a", "rich": false, "delete_after": 900, "disable_preview": true})
+        );
+        assert_eq!(
+            Outgoing::from_row("message", &json!({"html": "a", "disable_preview": true})),
+            Some(Outgoing::Message {
+                html: "a".into(),
+                rich: false,
+                delete_after: None,
+                disable_preview: true,
+            })
+        );
+        assert_eq!(
+            Outgoing::from_row("message", &json!({"html": "a", "disable_preview": "yes"})),
+            Some(Outgoing::Message {
+                html: "a".into(),
+                rich: false,
+                delete_after: None,
+                disable_preview: false,
+            }),
+            "a broken flag must not hide the link nor kill the row"
         );
     }
 }

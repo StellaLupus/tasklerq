@@ -100,16 +100,42 @@ impl TelegramMode {
     }
 
     fn parse(raw: &str) -> Result<Self, ConfigError> {
-        match raw {
-            "webhook" => Ok(Self::Webhook),
-            "polling" => Ok(Self::Polling),
-            "disabled" => Ok(Self::Disabled),
-            _ => Err(ConfigError::invalid(
-                "TELEGRAM_MODE",
-                "expected `webhook`, `polling` or `disabled`",
-            )),
-        }
+        parse_telegram_mode(raw).map_err(|reason| ConfigError::invalid("TELEGRAM_MODE", reason))
     }
+}
+
+/// Разобрать режим Telegram: то же правило для окружения и для значения
+/// настройки консоли. Причина ошибки не повторяет значение.
+pub fn parse_telegram_mode(raw: &str) -> Result<TelegramMode, String> {
+    match raw.trim() {
+        "webhook" => Ok(TelegramMode::Webhook),
+        "polling" => Ok(TelegramMode::Polling),
+        "disabled" => Ok(TelegramMode::Disabled),
+        _ => Err("expected `webhook`, `polling` or `disabled`".to_owned()),
+    }
+}
+
+/// Разобрать идентификатор бота: положительное целое.
+pub fn parse_bot_id(raw: &str) -> Result<i64, String> {
+    raw.trim()
+        .parse::<i64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "expected a positive integer".to_owned())
+}
+
+/// Разобрать имя бота: `@` в начале допускается, дальше — латинские буквы,
+/// цифры и `_`. Это то же правило, что у `TELEGRAM_BOT_USERNAME`.
+pub fn parse_bot_username(raw: &str) -> Result<String, String> {
+    let username = raw.trim().trim_start_matches('@');
+    if username.is_empty()
+        || !username
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return Err("expected a Telegram username like tasklerqbot".to_owned());
+    }
+    Ok(username.to_owned())
 }
 
 /// Режим размещения инсталляции.
@@ -326,7 +352,15 @@ impl DatabaseConfig {
     }
 }
 
-/// Параметры Telegram.
+/// Имя бота по умолчанию для ссылок-приглашений.
+pub const DEFAULT_BOT_USERNAME: &str = "tasklerqbot";
+
+/// Параметры Telegram из окружения: группа целиком.
+///
+/// Группа существует, только если задан `TELEGRAM_BOT_TOKEN`; иначе настройки
+/// берутся из консоли оператора. Служебный адрес Bot API сюда не входит: он не
+/// описывает бота и применяется при любом источнике группы
+/// ([`Config::telegram_api_base_url`]).
 #[derive(Clone, Debug)]
 pub struct TelegramConfig {
     /// Режим работы.
@@ -337,8 +371,6 @@ pub struct TelegramConfig {
     pub webhook_secret: Option<SecretString>,
     /// Публичный URL webhook; обязателен в режиме `webhook`.
     pub webhook_url: Option<Url>,
-    /// Базовый адрес Bot API; в тестах подменяется на mock-сервер.
-    pub api_base_url: Option<Url>,
     /// Имя бота без `@` для ссылок-приглашений.
     pub bot_username: String,
 }
@@ -543,8 +575,15 @@ pub struct Config {
     pub secret_key_old: Option<SecretKey>,
     /// PostgreSQL.
     pub database: DatabaseConfig,
-    /// Telegram.
-    pub telegram: TelegramConfig,
+    /// Telegram из окружения; `None` — окружение не задаёт группу (нет
+    /// `TELEGRAM_BOT_TOKEN`), значения берутся из консоли оператора.
+    pub telegram: Option<TelegramConfig>,
+    /// Служебный адрес Bot API; в тестах подменяется на mock-сервер. Не
+    /// описывает бота, поэтому применяется при любом источнике группы.
+    pub telegram_api_base_url: Option<Url>,
+    /// Переменные `TELEGRAM_*`, заданные без токена: они игнорируются, значения
+    /// не разбирались. Печатаются предупреждением в стартовом логе.
+    pub telegram_ignored_env: Vec<&'static str>,
     /// Режим размещения.
     pub tenancy: TenancyConfig,
     /// Внешний capture.
@@ -614,8 +653,11 @@ impl Config {
         let secret_key = keys.current;
         let secret_key_old = keys.old;
 
-        let telegram_mode = TelegramMode::parse(source.get("TELEGRAM_MODE").unwrap_or("webhook"))?;
-        let telegram = Self::telegram_config(source, telegram_mode, environment)?;
+        let telegram_mode = source.get("TELEGRAM_MODE");
+        let (telegram, telegram_ignored_env) =
+            Self::telegram_config(source, telegram_mode, environment)?;
+        let telegram_api_base_url =
+            source.url("TELEGRAM_API_BASE_URL", environment.is_production())?;
 
         let tenancy = Self::tenancy_config(source)?;
 
@@ -658,6 +700,8 @@ impl Config {
             secret_key_old,
             database,
             telegram,
+            telegram_api_base_url,
+            telegram_ignored_env,
             tenancy,
             capture,
             llm,
@@ -668,22 +712,46 @@ impl Config {
         })
     }
 
+    /// Разобрать группу Telegram из окружения.
+    ///
+    /// Группа берётся из окружения целиком, только если задан
+    /// `TELEGRAM_BOT_TOKEN`: без токена окружение не описывает бота, а
+    /// смешивать источники нельзя. `TELEGRAM_MODE=disabled` без токена —
+    /// значение прежнего `.env.example` — игнорируется с предупреждением, чтобы
+    /// не запирать консоль; `webhook` и `polling` без токена остаются ошибкой
+    /// запуска. Одиночные `TELEGRAM_*` без токена тоже игнорируются: их
+    /// значения не разбираются, чтобы невалидная переменная не роняла запуск.
     fn telegram_config(
         source: &EnvSource,
-        mode: TelegramMode,
+        mode_raw: Option<&str>,
         environment: Environment,
-    ) -> Result<TelegramConfig, ConfigError> {
+    ) -> Result<(Option<TelegramConfig>, Vec<&'static str>), ConfigError> {
         let bot_token = source.secret("TELEGRAM_BOT_TOKEN");
+
+        if bot_token.is_none() {
+            let ignored = telegram_ignored_env(source);
+            if let Some(raw) = mode_raw {
+                match TelegramMode::parse(raw)? {
+                    TelegramMode::Disabled => return Ok((None, ignored)),
+                    TelegramMode::Webhook | TelegramMode::Polling => {
+                        return Err(ConfigError::Missing {
+                            name: "TELEGRAM_BOT_TOKEN",
+                        });
+                    }
+                }
+            }
+            return Ok((None, ignored));
+        }
+
+        let mode = match mode_raw {
+            Some(raw) => TelegramMode::parse(raw)?,
+            None => TelegramMode::Webhook,
+        };
         let webhook_secret = source.secret("TELEGRAM_WEBHOOK_SECRET");
         let webhook_url = source.url("TELEGRAM_WEBHOOK_URL", environment.is_production())?;
 
         match mode {
             TelegramMode::Webhook => {
-                if bot_token.is_none() {
-                    return Err(ConfigError::Missing {
-                        name: "TELEGRAM_BOT_TOKEN",
-                    });
-                }
                 if webhook_secret.is_none() {
                     return Err(ConfigError::Missing {
                         name: "TELEGRAM_WEBHOOK_SECRET",
@@ -702,45 +770,31 @@ impl Config {
                         "polling is not allowed when ENV=production; use webhook",
                     ));
                 }
-                if bot_token.is_none() {
-                    return Err(ConfigError::Missing {
-                        name: "TELEGRAM_BOT_TOKEN",
-                    });
-                }
             }
             TelegramMode::Disabled => {
                 // Бот не нужен; остальные параметры могут отсутствовать.
             }
         }
 
-        let bot_username = source
-            .get("TELEGRAM_BOT_USERNAME")
-            .unwrap_or("tasklerqbot")
-            .trim_start_matches('@')
-            .to_owned();
-        if bot_username.is_empty()
-            || !bot_username
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-        {
-            return Err(ConfigError::invalid(
-                "TELEGRAM_BOT_USERNAME",
-                "expected a Telegram username like tasklerqbot",
-            ));
-        }
+        let bot_username = named(
+            "TELEGRAM_BOT_USERNAME",
+            parse_bot_username(
+                source
+                    .get("TELEGRAM_BOT_USERNAME")
+                    .unwrap_or(DEFAULT_BOT_USERNAME),
+            ),
+        )?;
 
-        // Служебный адрес Bot API: вне development разрешён только HTTPS,
-        // чтобы токен бота не уходил по открытому каналу.
-        let api_base_url = source.url("TELEGRAM_API_BASE_URL", environment.is_production())?;
-
-        Ok(TelegramConfig {
-            mode,
-            bot_token,
-            webhook_secret,
-            webhook_url,
-            api_base_url,
-            bot_username,
-        })
+        Ok((
+            Some(TelegramConfig {
+                mode,
+                bot_token,
+                webhook_secret,
+                webhook_url,
+                bot_username,
+            }),
+            Vec::new(),
+        ))
     }
 
     fn tenancy_config(source: &EnvSource) -> Result<TenancyConfig, ConfigError> {
@@ -832,6 +886,12 @@ impl Config {
                 "LLM slot environment variable is ignored: the slot URL and model are not set"
             );
         }
+        for name in &self.telegram_ignored_env {
+            tracing::warn!(
+                variable = *name,
+                "Telegram environment variable is ignored: TELEGRAM_BOT_TOKEN is not set"
+            );
+        }
         tracing::info!(
             version = VERSION,
             config = ?self,
@@ -885,6 +945,14 @@ const DAILY_QUOTA_MAX: u32 = 100_000;
 
 /// Переменные Home Assistant, которые больше не читаются.
 const LEGACY_ENV: [&str; 3] = ["HA_BASE_URL", "HA_TOKEN", "HA_AI_TASK_ENTITY_ID"];
+
+/// Переменные Telegram, которые без `TELEGRAM_BOT_TOKEN` не описывают бота.
+const TELEGRAM_ENV: [&str; 4] = [
+    "TELEGRAM_MODE",
+    "TELEGRAM_BOT_USERNAME",
+    "TELEGRAM_WEBHOOK_URL",
+    "TELEGRAM_WEBHOOK_SECRET",
+];
 
 /// Прочитать слот: адрес и модель задаются только вместе.
 ///
@@ -993,6 +1061,14 @@ fn bounded_u32(raw: &str, min: u32, max: u32) -> Result<u32, String> {
 /// Список заданных переменных, которые сервис больше не читает.
 fn deprecated_env(source: &EnvSource) -> Vec<&'static str> {
     LEGACY_ENV
+        .into_iter()
+        .filter(|name| source.get(name).is_some())
+        .collect()
+}
+
+/// Переменные Telegram, заданные без токена: их значения не читаются.
+fn telegram_ignored_env(source: &EnvSource) -> Vec<&'static str> {
+    TELEGRAM_ENV
         .into_iter()
         .filter(|name| source.get(name).is_some())
         .collect()

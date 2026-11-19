@@ -125,14 +125,18 @@ fn config_debug_display_and_startup_log_hide_every_secret() {
     assert!(debug.contains("<redacted>"));
     assert_eq!(config.database.url.to_string(), "<redacted>");
     assert_eq!(
-        config.telegram.bot_token.as_ref().map(ToString::to_string),
+        config
+            .telegram
+            .as_ref()
+            .and_then(|telegram| telegram.bot_token.as_ref())
+            .map(ToString::to_string),
         Some("<redacted>".to_owned())
     );
     assert_eq!(
         config
             .telegram
-            .webhook_secret
             .as_ref()
+            .and_then(|telegram| telegram.webhook_secret.as_ref())
             .map(ToString::to_string),
         Some("<redacted>".to_owned())
     );
@@ -237,7 +241,10 @@ fn telegram_network_error_and_log_hide_the_bot_token() {
         runtime.block_on(async {
             let api = HttpTelegramApi::new(SecretString::new(BOT_TOKEN), "http://127.0.0.1:1")
                 .expect("client");
-            let error = api.send_message(1, "x").await.expect_err("network error");
+            let error = api
+                .send_message(1, "x", false)
+                .await
+                .expect_err("network error");
             tracing::error!(%error, "telegram request failed");
             error
         })

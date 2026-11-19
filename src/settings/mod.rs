@@ -4,14 +4,21 @@
 //! Перечень ключей фиксирован в коде: неизвестные строки таблицы игнорируются,
 //! чтобы откат на старый образ не ломал чтение. Обычные значения лежат в
 //! `value` (jsonb), секреты — в `secret` (шифротекст [`crypto`]); для сборки
-//! действующей конфигурации LLM есть [`effective_llm`].
+//! действующей конфигурации LLM есть [`effective_llm`], для Telegram —
+//! [`effective_telegram`].
 //!
-//! Приоритет окружения над базой действует и для отдельного поля, и для слота
-//! целиком: если слот задан окружением, значения базы для него не используются.
-//! Нерасшифрованный секрет делает весь слот ненастроенным, а не «слотом без
-//! токена».
+//! Приоритет окружения над базой действует и для отдельного поля, и для группы
+//! целиком: если группа задана окружением, значения базы для неё не
+//! используются. Нерасшифрованный секрет делает всю группу ненастроенной, а не
+//! «группой без токена».
 
 pub mod crypto;
+mod telegram;
+
+pub use telegram::{
+    EffectiveTelegram, TelegramProblem, effective_telegram, read_effective_telegram,
+    webhook_address,
+};
 
 use std::fmt;
 use std::time::Duration;
@@ -22,8 +29,9 @@ use thiserror::Error;
 
 use crate::config::{
     DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_DAILY_QUOTA, DEFAULT_SLOT_TIMEOUT_MS, LlmConfig,
-    SecretString, SlotConfig, loggable_url, parse_connect_timeout_ms, parse_daily_quota,
-    parse_extra_json, parse_slot_timeout_ms, parse_slot_url,
+    SecretString, SlotConfig, loggable_url, parse_bot_id, parse_bot_username,
+    parse_connect_timeout_ms, parse_daily_quota, parse_extra_json, parse_slot_timeout_ms,
+    parse_slot_url, parse_telegram_mode,
 };
 use crate::settings::crypto::{SecretCipher, SecretContext, SecretError, SettingScope, key_id};
 use crate::storage::repositories::settings::{self as repository, StoredSecret, StoredSetting};
@@ -76,6 +84,12 @@ pub enum ValueKind {
     ExtraJson,
     /// Целое число — суточная квота.
     Quota,
+    /// Режим Telegram: `webhook`, `polling` или `disabled`.
+    TelegramMode,
+    /// Положительный идентификатор бота.
+    BotId,
+    /// Имя бота без `@`: латинские буквы, цифры и `_`.
+    BotUsername,
 }
 
 /// Описание известного ключа настройки.
@@ -100,9 +114,9 @@ impl SettingKey {
 
 /// Перечень ключей настроек, которые знает эта версия.
 ///
-/// Ключи уровня household появятся вместе с Telegram-настройками; пока все
-/// перечисленные — уровня инсталляции. `wizard.*_skipped` читаются только из
-/// базы: окружение их не задаёт.
+/// Все перечисленные ключи — уровня инсталляции: LLM, Telegram и шаги мастера.
+/// `wizard.*_skipped` и `telegram.*` читаются только из базы: окружение задаёт
+/// их своими переменными, а не ключами настроек.
 pub const SETTING_KEYS: &[SettingKey] = &[
     SettingKey {
         name: "llm.enabled",
@@ -189,6 +203,12 @@ pub const SETTING_KEYS: &[SettingKey] = &[
         value_kind: ValueKind::Bool,
     },
     SettingKey {
+        name: "wizard.telegram_skipped",
+        scope: SettingScope::Installation,
+        kind: SettingKind::Plain,
+        value_kind: ValueKind::Bool,
+    },
+    SettingKey {
         name: "wizard.household_skipped",
         scope: SettingScope::Installation,
         kind: SettingKind::Plain,
@@ -199,6 +219,48 @@ pub const SETTING_KEYS: &[SettingKey] = &[
         scope: SettingScope::Installation,
         kind: SettingKind::Plain,
         value_kind: ValueKind::Bool,
+    },
+    SettingKey {
+        name: "telegram.mode",
+        scope: SettingScope::Installation,
+        kind: SettingKind::Plain,
+        value_kind: ValueKind::TelegramMode,
+    },
+    SettingKey {
+        name: "telegram.bot_token",
+        scope: SettingScope::Installation,
+        kind: SettingKind::Secret,
+        value_kind: ValueKind::Text,
+    },
+    SettingKey {
+        name: "telegram.bot_id",
+        scope: SettingScope::Installation,
+        kind: SettingKind::Plain,
+        value_kind: ValueKind::BotId,
+    },
+    SettingKey {
+        name: "telegram.bot_username",
+        scope: SettingScope::Installation,
+        kind: SettingKind::Plain,
+        value_kind: ValueKind::BotUsername,
+    },
+    SettingKey {
+        name: "telegram.public_base_url",
+        scope: SettingScope::Installation,
+        kind: SettingKind::Plain,
+        value_kind: ValueKind::Url,
+    },
+    SettingKey {
+        name: "telegram.webhook_url_override",
+        scope: SettingScope::Installation,
+        kind: SettingKind::Plain,
+        value_kind: ValueKind::Url,
+    },
+    SettingKey {
+        name: "telegram.webhook_secret",
+        scope: SettingScope::Installation,
+        kind: SettingKind::Secret,
+        value_kind: ValueKind::Text,
     },
 ];
 
@@ -831,6 +893,18 @@ fn validate_value(key: &SettingKey, value: &Value) -> Result<(), SettingError> {
             Some(raw) => parse_daily_quota(&raw).err(),
             None => Some("expected an integer".to_owned()),
         },
+        ValueKind::TelegramMode => match value {
+            Value::String(raw) => parse_telegram_mode(raw).err(),
+            _ => Some("expected `webhook`, `polling` or `disabled`".to_owned()),
+        },
+        ValueKind::BotId => match value_text(value) {
+            Some(raw) => parse_bot_id(&raw).err(),
+            None => Some("expected a positive integer".to_owned()),
+        },
+        ValueKind::BotUsername => match value {
+            Value::String(raw) => parse_bot_username(raw).err(),
+            _ => Some("expected a Telegram username like tasklerqbot".to_owned()),
+        },
     };
 
     match reason {
@@ -1135,9 +1209,10 @@ fn settings_from(stored: &[StoredSetting], resolved: &ResolvedLlm) -> Vec<Resolv
                     value: Some(Value::from(resolved.daily_quota)),
                     secret: None,
                 },
-                "wizard.llm_skipped" | "wizard.household_skipped" | "wizard.token_skipped" => {
-                    plain_from_db_or_default(key, stored)
-                }
+                "wizard.llm_skipped"
+                | "wizard.telegram_skipped"
+                | "wizard.household_skipped"
+                | "wizard.token_skipped" => plain_from_db_or_default(key, stored),
                 _ => default_setting(key),
             }
         })

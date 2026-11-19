@@ -19,12 +19,13 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 use crate::capture::slot_status::LlmSlotHealth;
-use crate::config::IpNet;
+use crate::config::{Config, IpNet};
 use crate::domain::models::{Actor, ActorType};
 use crate::http::client::{Client, TrustedProxies};
 use crate::llm::LlmSettings;
 use crate::rate_limit::{RateDecision, RateLimiter};
 use crate::security_audit::{Audit, LimitKey, RateLimitEvent};
+use crate::telegram::runtime::TelegramSupervisor;
 
 use super::checks::CheckState;
 use super::wizard::{WIZARD_PATH, WIZARD_SKIP_PATH, WizardSettings};
@@ -66,8 +67,13 @@ pub struct AdminState {
     /// Допустимый возраст необработанного обновления Telegram для предупреждений
     /// readiness на главной; `None` — очередь не проверяется.
     queue_lag_limit: Option<chrono::Duration>,
+    /// Окружение и служебный адрес Bot API для страницы Telegram. Живое
+    /// состояние поколения берётся у супервизора, а не из отдельной копии.
+    telegram_config: Option<Config>,
     /// Ход проверки слота; одна проверка на процесс.
     checks: CheckState,
+    /// Супервизор поколений Telegram: переключение настроек без перезапуска.
+    telegram_supervisor: Option<Arc<TelegramSupervisor>>,
 }
 
 impl AdminState {
@@ -95,8 +101,46 @@ impl AdminState {
             llm_settings,
             llm_slots,
             queue_lag_limit: None,
+            telegram_config: None,
             checks: CheckState::new(),
+            telegram_supervisor: None,
         }
+    }
+
+    /// Задать супервизор поколений Telegram.
+    ///
+    /// Консоль переключает бота без перезапуска тем же супервизором, что
+    /// запустил текущее поколение. Живое состояние поколения читается у него
+    /// же: отдельной копии слота в консоли нет.
+    pub fn with_telegram_supervisor(mut self, supervisor: Arc<TelegramSupervisor>) -> Self {
+        self.telegram_supervisor = Some(supervisor);
+        self
+    }
+
+    /// Задать окружение для страницы Telegram.
+    ///
+    /// Нужны `TELEGRAM_API_BASE_URL`, `PUBLIC_BASE_URL`, `ENV` и признак группы
+    /// из окружения; настройки читаются из того же пула и ключа, что у LLM.
+    pub fn with_telegram_config(mut self, config: Config) -> Self {
+        self.telegram_config = Some(config);
+        self
+    }
+
+    /// Окружение страницы Telegram, если консоль собрана рантаймом.
+    pub fn telegram_config(&self) -> Option<&Config> {
+        self.telegram_config.as_ref()
+    }
+
+    /// Супервизор поколений Telegram, если консоль собрана рантаймом.
+    pub fn telegram_supervisor(&self) -> Option<&Arc<TelegramSupervisor>> {
+        self.telegram_supervisor.as_ref()
+    }
+
+    /// Есть живое поколение Telegram; у консоли без рантайма — нет.
+    pub fn telegram_active(&self) -> bool {
+        self.telegram_supervisor
+            .as_ref()
+            .is_some_and(|supervisor| supervisor.ingress().is_active())
     }
 
     /// Задать тот же экземпляр проверки слотов, что у readiness.
@@ -225,6 +269,28 @@ pub fn build_router(state: AdminState) -> Router {
         .route(
             pages::LLM_PATH,
             get(pages::llm_page).post(pages::llm_submit),
+        )
+        .route(
+            pages::TELEGRAM_PATH,
+            get(pages::telegram_page).post(pages::telegram_submit),
+        )
+        .route(
+            pages::TELEGRAM_SECRET_PATH,
+            post(pages::telegram_reissue_secret),
+        )
+        .route(pages::OWNER_PATH, post(pages::owner_submit))
+        .route(pages::TELEGRAM_LINK_PATH, post(pages::telegram_link_issue))
+        .route(
+            pages::TELEGRAM_LINK_CONFIRM_PATH,
+            post(pages::telegram_link_confirm),
+        )
+        .route(
+            pages::TELEGRAM_LINK_REJECT_PATH,
+            post(pages::telegram_link_reject),
+        )
+        .route(
+            pages::TELEGRAM_LINK_UNLINK_PATH,
+            post(pages::telegram_link_unlink),
         )
         .route(pages::LLM_CHECK_PATH, get(pages::llm_check_page))
         .route(

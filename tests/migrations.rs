@@ -816,6 +816,27 @@ fn error_code<T>(result: &Result<T, sqlx::Error>) -> Option<String> {
     }
 }
 
+fn error_constraint<T>(result: &Result<T, sqlx::Error>) -> Option<String> {
+    match result {
+        Err(sqlx::Error::Database(database)) => database.constraint().map(str::to_owned),
+        _ => None,
+    }
+}
+
+/// Отказ именно ожидаемым CHECK, а не любым другим ограничением таблицы.
+fn assert_check_violation<T>(result: &Result<T, sqlx::Error>, constraint: &str) {
+    assert_eq!(
+        error_code(result).as_deref(),
+        Some("23514"),
+        "the insert must violate a CHECK: {constraint}"
+    );
+    assert_eq!(
+        error_constraint(result).as_deref(),
+        Some(constraint),
+        "the violated CHECK must be {constraint}"
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn insert_setting(
     pool: &sqlx::PgPool,
@@ -1457,8 +1478,14 @@ async fn admin_console_migration_creates_tables_and_audit_values() {
             ("password_hash", "text", "NO"),
             ("created_at", "timestamp with time zone", "NO"),
             ("password_changed_at", "timestamp with time zone", "NO"),
+            ("telegram_user_id", "bigint", "YES"),
+            ("pending_telegram_user_id", "bigint", "YES"),
+            ("pending_telegram_name", "text", "YES"),
+            ("telegram_name", "text", "YES"),
+            ("console_origin", "text", "YES"),
         ],
-        "admin_accounts must keep the design fields and always have a password"
+        "admin_accounts must keep the design fields, always have a password, \
+         and carry the optional Telegram binding"
     );
 
     let sessions = table_shape(&db.pool, "admin_sessions").await;
@@ -1572,12 +1599,9 @@ async fn admin_one_time_codes_migration_enforces_purpose_expiry_and_household() 
     .await
     .expect("a recovery code lives 15 minutes");
 
-    let unknown = insert_one_time_code(&db.pool, "magic", None, &code_hash('c'), None).await;
-    assert_eq!(
-        error_code(&unknown).as_deref(),
-        Some("23514"),
-        "0013 knows only setup and recovery"
-    );
+    let unknown =
+        insert_one_time_code(&db.pool, "magic", None, &code_hash('c'), Some("15 minutes")).await;
+    assert_check_violation(&unknown, "admin_one_time_codes_purpose");
 
     let household_id = Uuid::now_v7();
     sqlx::query("INSERT INTO households (id, name, timezone) VALUES ($1, 'Дом', 'Europe/Moscow')")
@@ -1588,19 +1612,14 @@ async fn admin_one_time_codes_migration_enforces_purpose_expiry_and_household() 
 
     let setup_with_household =
         insert_one_time_code(&db.pool, "setup", Some(household_id), &code_hash('d'), None).await;
-    assert_eq!(
-        error_code(&setup_with_household).as_deref(),
-        Some("23514"),
-        "in 0013 every purpose is installation-wide"
+    assert_check_violation(
+        &setup_with_household,
+        "admin_one_time_codes_purpose_household",
     );
 
     let recovery_without_expiry =
         insert_one_time_code(&db.pool, "recovery", None, &code_hash('e'), None).await;
-    assert_eq!(
-        error_code(&recovery_without_expiry).as_deref(),
-        Some("23514"),
-        "only a setup code may live without an expiry"
-    );
+    assert_check_violation(&recovery_without_expiry, "admin_one_time_codes_expiry");
 
     let duplicate = insert_one_time_code(
         &db.pool,
@@ -1617,11 +1636,7 @@ async fn admin_one_time_codes_migration_enforces_purpose_expiry_and_household() 
     );
 
     let raw_code = insert_one_time_code(&db.pool, "setup", None, "A3f-_code", None).await;
-    assert_eq!(
-        error_code(&raw_code).as_deref(),
-        Some("23514"),
-        "only a 64 hex character SHA-256 may be stored instead of the code"
-    );
+    assert_check_violation(&raw_code, "admin_one_time_codes_code_hash_check");
 
     // В 0013 строку с household вставить нельзя, поэтому проверяем определение
     // внешнего ключа по каталогу: 0014 будет выпускать коды household, и они
@@ -1659,11 +1674,7 @@ async fn admin_one_time_codes_migration_requires_expiry_after_creation() {
         .bind(code_hash(fill))
         .execute(&db.pool)
         .await;
-        assert_eq!(
-            error_code(&expired).as_deref(),
-            Some("23514"),
-            "expires_at must be strictly later than created_at: {offset}"
-        );
+        assert_check_violation(&expired, "admin_one_time_codes_expiry_after_creation");
     }
 
     let valid = sqlx::query(
@@ -1751,6 +1762,8 @@ async fn admin_console_migration_round_trips_new_audit_events() {
         AuditEventType::AdminPasswordChanged,
         AuditEventType::AdminRecoveryIssued,
         AuditEventType::AdminSettingChanged,
+        AuditEventType::AdminTelegramLinked,
+        AuditEventType::AdminTelegramUnlinked,
     ];
     for event_type in expected {
         sqlx::query(
@@ -1790,4 +1803,313 @@ async fn admin_console_migration_round_trips_new_audit_events() {
     stored.sort_unstable();
     expected.sort_unstable();
     assert_eq!(stored, expected);
+}
+
+/// 0014: `owner_claim` — единственное назначение с household.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_telegram_migration_binds_codes_to_purposes_and_households() {
+    let db = support::empty_db().await;
+    migrations::run(&db.pool)
+        .await
+        .expect("migrations should apply on a clean database");
+
+    let household_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO households (id, name, timezone) VALUES ($1, 'Дом', 'Europe/Moscow')")
+        .bind(household_id)
+        .execute(&db.pool)
+        .await
+        .expect("household");
+
+    insert_one_time_code(
+        &db.pool,
+        "owner_claim",
+        Some(household_id),
+        &code_hash('1'),
+        Some("24 hours"),
+    )
+    .await
+    .expect("a claim code may point at a household without an owner");
+
+    insert_one_time_code(
+        &db.pool,
+        "owner_claim",
+        None,
+        &code_hash('2'),
+        Some("24 hours"),
+    )
+    .await
+    .expect("a claim code of an empty single installation has no household");
+
+    insert_one_time_code(
+        &db.pool,
+        "telegram_link",
+        None,
+        &code_hash('3'),
+        Some("15 minutes"),
+    )
+    .await
+    .expect("a telegram link code is installation-wide");
+
+    insert_one_time_code(&db.pool, "setup", None, &code_hash('4'), None)
+        .await
+        .expect("setup still lives without an expiry and a household");
+
+    // У `owner_claim` household — дом или NULL; у остальных назначений его нет.
+    for (fill, purpose) in [('5', "telegram_link"), ('6', "setup"), ('7', "recovery")] {
+        let with_household = insert_one_time_code(
+            &db.pool,
+            purpose,
+            Some(household_id),
+            &code_hash(fill),
+            Some("15 minutes"),
+        )
+        .await;
+        assert_check_violation(&with_household, "admin_one_time_codes_purpose_household");
+    }
+
+    let unknown =
+        insert_one_time_code(&db.pool, "magic", None, &code_hash('8'), Some("15 minutes")).await;
+    assert_check_violation(&unknown, "admin_one_time_codes_purpose");
+
+    for (fill, purpose) in [('9', "telegram_link"), ('a', "owner_claim")] {
+        let without_expiry =
+            insert_one_time_code(&db.pool, purpose, None, &code_hash(fill), None).await;
+        assert_check_violation(&without_expiry, "admin_one_time_codes_expiry");
+    }
+}
+
+/// 0014: привязка Telegram и кандидат на привязку у единственной учётки.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_telegram_migration_enforces_the_telegram_binding() {
+    let db = support::empty_db().await;
+    migrations::run(&db.pool)
+        .await
+        .expect("migrations should apply on a clean database");
+
+    insert_admin_account(&db.pool, "admin")
+        .await
+        .expect("the account is created before the binding");
+
+    sqlx::query(
+        "UPDATE admin_accounts
+         SET telegram_user_id = 7000000001, telegram_name = 'Администратор'",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("a confirmed telegram id is stored with its name");
+    sqlx::query("UPDATE admin_accounts SET telegram_user_id = NULL, telegram_name = NULL")
+        .execute(&db.pool)
+        .await
+        .expect("NULL stays the unbound state");
+
+    // Подтверждённый id и его имя тоже задаются только вместе.
+    let only_bound_id = sqlx::query("UPDATE admin_accounts SET telegram_user_id = 7000000003")
+        .execute(&db.pool)
+        .await;
+    assert_check_violation(&only_bound_id, "admin_accounts_telegram_name");
+
+    let only_bound_name = sqlx::query("UPDATE admin_accounts SET telegram_name = 'Без id'")
+        .execute(&db.pool)
+        .await;
+    assert_check_violation(&only_bound_name, "admin_accounts_telegram_name");
+
+    sqlx::query(
+        "UPDATE admin_accounts
+         SET telegram_user_id = 7000000003, telegram_name = 'Администратор'",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("a confirmed telegram id and name are stored together");
+
+    // Кандидат и его имя задаются только вместе.
+    let only_id = sqlx::query("UPDATE admin_accounts SET pending_telegram_user_id = 7000000002")
+        .execute(&db.pool)
+        .await;
+    assert_check_violation(&only_id, "admin_accounts_pending_telegram");
+
+    let only_name = sqlx::query("UPDATE admin_accounts SET pending_telegram_name = 'Кандидат'")
+        .execute(&db.pool)
+        .await;
+    assert_check_violation(&only_name, "admin_accounts_pending_telegram");
+
+    sqlx::query(
+        "UPDATE admin_accounts
+         SET pending_telegram_user_id = 7000000002, pending_telegram_name = 'Кандидат'",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("the pending candidate is stored with its name");
+
+    sqlx::query(
+        "UPDATE admin_accounts
+         SET pending_telegram_user_id = NULL, pending_telegram_name = NULL,
+             console_origin = 'http://192.168.1.10:8080'",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("both pending fields may be cleared and the console origin stored");
+
+    // Учётка одна на инсталляцию, поэтому второй строки для проверки
+    // уникальности telegram_user_id нет. Проверяем сам уникальный индекс по
+    // каталогу, а затем внутри транзакции временно снимаем индекс-одиночку:
+    // повторная привязка того же id должна упереться именно в уникальность
+    // telegram_user_id. Откат возвращает схему и единственную строку.
+    let index_definition: Option<String> = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes
+         WHERE schemaname = 'public' AND tablename = 'admin_accounts'
+           AND indexname = 'admin_accounts_telegram_user_id_idx'",
+    )
+    .fetch_optional(&db.pool)
+    .await
+    .expect("telegram index lookup");
+    let index_definition =
+        index_definition.expect("0014 must create a unique index on telegram_user_id");
+    assert!(
+        index_definition.starts_with("CREATE UNIQUE INDEX")
+            && index_definition.contains("(telegram_user_id)"),
+        "telegram_user_id must be unique: {index_definition}"
+    );
+
+    sqlx::query("UPDATE admin_accounts SET telegram_user_id = 7000000001")
+        .execute(&db.pool)
+        .await
+        .expect("a confirmed telegram id before the duplicate attempt");
+
+    let mut tx = db.pool.begin().await.expect("transaction");
+    sqlx::query("DROP INDEX admin_accounts_singleton_idx")
+        .execute(&mut *tx)
+        .await
+        .expect("the singleton index is dropped inside the transaction");
+    let duplicate = sqlx::query(
+        "INSERT INTO admin_accounts
+             (id, username, password_hash, telegram_user_id, telegram_name)
+         VALUES ($1, 'second', '$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA',
+                 7000000001, 'Второй')",
+    )
+    .bind(Uuid::now_v7())
+    .execute(&mut *tx)
+    .await;
+    assert_eq!(
+        error_code(&duplicate).as_deref(),
+        Some("23505"),
+        "two accounts must not share one telegram id"
+    );
+    tx.rollback().await.expect("rollback");
+
+    let accounts: Vec<(String, Option<i64>)> =
+        sqlx::query_as("SELECT username, telegram_user_id FROM admin_accounts ORDER BY username")
+            .fetch_all(&db.pool)
+            .await
+            .expect("accounts after the rollback");
+    assert_eq!(
+        accounts,
+        vec![("admin".to_owned(), Some(7000000001))],
+        "the rollback must keep the single account and its binding"
+    );
+}
+
+/// 0014: значения аудита привязки Telegram.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_telegram_migration_adds_audit_values() {
+    let db = support::empty_db().await;
+    migrations::run(&db.pool)
+        .await
+        .expect("migrations should apply on a clean database");
+
+    let values: Vec<String> =
+        sqlx::query_scalar("SELECT unnest(enum_range(NULL::audit_event_type))::text")
+            .fetch_all(&db.pool)
+            .await
+            .expect("audit_event_type values");
+    for expected in ["admin_telegram_linked", "admin_telegram_unlinked"] {
+        assert!(
+            values.iter().any(|value| value == expected),
+            "audit_event_type must contain {expected}: {values:?}"
+        );
+    }
+}
+
+/// 0014 применяется поверх базы 0021 и не теряет учётку и действующие коды.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_telegram_migration_keeps_existing_admin_rows() {
+    let db = support::empty_db().await;
+    let dir = std::env::temp_dir().join(format!(
+        "tasklerq-migrations-0021-{}",
+        Uuid::now_v7().simple()
+    ));
+    std::fs::create_dir_all(&dir).expect("temporary migration directory");
+    copy_migrations_through(21, &dir);
+
+    let before = Migrator::new(dir.as_path())
+        .await
+        .expect("a migrator through 0021 should resolve");
+    before
+        .run(&db.pool)
+        .await
+        .context("migrations through 0021 should apply")
+        .expect("migrations through 0021");
+
+    insert_admin_account(&db.pool, "admin")
+        .await
+        .expect("the account exists before 0014");
+    let recovery_hash = code_hash('f');
+    insert_one_time_code(
+        &db.pool,
+        "recovery",
+        None,
+        &recovery_hash,
+        Some("15 minutes"),
+    )
+    .await
+    .expect("an active recovery code exists before 0014");
+
+    MIGRATOR
+        .run(&db.pool)
+        .await
+        .expect("0014 must apply over existing admin rows");
+
+    let account: (
+        String,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT username, telegram_user_id, pending_telegram_user_id,
+                pending_telegram_name, console_origin
+         FROM admin_accounts",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("the account after 0014");
+    assert_eq!(
+        account,
+        ("admin".to_owned(), None, None, None, None),
+        "the existing account stays and the new fields start empty"
+    );
+
+    let code: (String, Option<Uuid>) = sqlx::query_as(
+        "SELECT purpose, household_id FROM admin_one_time_codes WHERE code_hash = $1",
+    )
+    .bind(&recovery_hash)
+    .fetch_one(&db.pool)
+    .await
+    .expect("the recovery code after 0014");
+    assert_eq!(
+        (code.0.as_str(), code.1),
+        ("recovery", None),
+        "the existing recovery code keeps its purpose and household"
+    );
+
+    insert_one_time_code(
+        &db.pool,
+        "owner_claim",
+        None,
+        &code_hash('e'),
+        Some("24 hours"),
+    )
+    .await
+    .expect("the new purposes are accepted after the migration");
+
+    std::fs::remove_dir_all(&dir).ok();
 }

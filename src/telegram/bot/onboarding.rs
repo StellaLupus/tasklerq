@@ -1,13 +1,21 @@
 //! Первое знакомство: создание household и присоединение по приглашению.
 
+use serde_json::json;
 use sqlx::Acquire;
+use uuid::Uuid;
 
+use crate::admin_console::codes::{self, Purpose};
+use crate::config::TenancyMode;
 use crate::domain::error::DomainError;
-use crate::domain::first_contact::{FirstContact, classify};
-use crate::domain::identity::NewMember;
+use crate::domain::first_contact::{ClaimTarget, FirstContact, Installation, classify};
+use crate::domain::identity::{AuditEventType, NewMember};
+use crate::domain::models::{Actor, UserRole};
 use crate::domain::settings::validate_timezone;
+use crate::storage::repositories::admin_accounts;
+use crate::storage::repositories::audit;
 use crate::storage::repositories::households::{self, NewOwner};
 use crate::storage::repositories::invites;
+use crate::storage::repositories::users;
 use crate::telegram::rich::{Span, button};
 use crate::telegram::ru;
 
@@ -15,6 +23,12 @@ use super::model::{Action, FirstContactScreen, FormAct, Screen, Ui};
 use super::{Ctx, Fail, display_timezone, forms};
 
 const MAX_NAME: usize = 100;
+
+/// Длина кода в ссылке `own_…` / `adm_…`: `random_base64url(16)`.
+const CLAIM_CODE_LENGTH: usize = 22;
+
+/// Ответ участнику, открывшему ссылку с кодом.
+const MEMBER_BANNER: &str = "Вы уже состоите в пространстве, приглашение не нужно.";
 
 fn new_member(ctx: &Ctx<'_>) -> NewMember {
     NewMember {
@@ -25,22 +39,354 @@ fn new_member(ctx: &Ctx<'_>) -> NewMember {
     }
 }
 
-/// Команда `/start` с необязательным кодом приглашения.
+/// Аргумент `/start`, разобранный до ветки «уже участник».
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartArgument<'a> {
+    /// Аргумента нет: `/start` или `/start` с нераспознанным префиксом.
+    None,
+    /// Код приглашения household (16 символов без префикса).
+    Invite(&'a str),
+    /// Ссылка-claim владельца.
+    OwnerClaim(&'a str),
+    /// Ссылка привязки администратора.
+    AdminLink(&'a str),
+    /// Префикс есть, но длина или алфавит кода неверны.
+    Invalid,
+}
+
+fn parse_start_argument(argument: &str) -> StartArgument<'_> {
+    if argument.is_empty() {
+        return StartArgument::None;
+    }
+    if let Some(code) = argument.strip_prefix("own_") {
+        return if is_claim_code(code) {
+            StartArgument::OwnerClaim(code)
+        } else {
+            StartArgument::Invalid
+        };
+    }
+    if let Some(code) = argument.strip_prefix("adm_") {
+        return if is_claim_code(code) {
+            StartArgument::AdminLink(code)
+        } else {
+            StartArgument::Invalid
+        };
+    }
+    StartArgument::Invite(argument)
+}
+
+fn is_claim_code(code: &str) -> bool {
+    code.len() == CLAIM_CODE_LENGTH
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+/// Команда `/start` с необязательным кодом приглашения, claim или привязки.
 pub async fn on_start(ctx: &mut Ctx<'_>, argument: &str) -> Result<(), Fail> {
     crate::telegram::views::clear_conversation(&mut *ctx.conn, ctx.chat_id).await?;
 
-    if argument.is_empty() {
-        return if ctx.user.is_some() {
-            ctx.present(Screen::Menu).await
-        } else {
-            forms::start_onboarding(ctx).await
-        };
+    match parse_start_argument(argument) {
+        StartArgument::None | StartArgument::Invalid => default_start(ctx).await,
+        StartArgument::OwnerClaim(code) => claim_start(ctx, code).await,
+        StartArgument::AdminLink(code) => link_start(ctx, code).await,
+        StartArgument::Invite(code) => {
+            if ctx.user.is_some() {
+                ctx.banner(MEMBER_BANNER);
+                return ctx.present(Screen::Menu).await;
+            }
+            accept_invite(ctx, code).await
+        }
     }
+}
+
+/// Поведение `/start` без ссылки.
+async fn default_start(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
     if ctx.user.is_some() {
-        ctx.banner("Вы уже состоите в пространстве, приглашение не нужно.");
-        return ctx.present(Screen::Menu).await;
+        ctx.present(Screen::Menu).await
+    } else {
+        forms::start_onboarding(ctx).await
     }
-    accept_invite(ctx, argument).await
+}
+
+/// Имя кандидата на привязку: имя Telegram и `@username`, если он есть.
+///
+/// `@username` не дублируется, когда имени нет и `display_name` уже равен
+/// username: без этого кандидат показывался бы как `ivan @ivan`.
+fn candidate_name(sender: &crate::telegram::update::Sender) -> String {
+    let mut name = sender.display_name.trim().to_owned();
+    if let Some(username) = sender
+        .username
+        .as_deref()
+        .map(str::trim)
+        .map(|username| username.trim_start_matches('@'))
+        .filter(|username| !username.is_empty())
+    {
+        if name.is_empty() {
+            name.push_str(username);
+        } else if !name.eq_ignore_ascii_case(username) {
+            name.push_str(" @");
+            name.push_str(username);
+        }
+    }
+    name
+}
+
+/// `/start adm_…`: записать отправителя кандидатом на привязку.
+///
+/// Код гасится и кандидат записывается одной транзакцией. Недействительный,
+/// истёкший и уже погашенный код ведут себя как `/start` без аргумента, не
+/// меняя прежнего кандидата. Привязка вступает в силу только после
+/// подтверждения в консоли, поэтому членство и первый контакт не меняются.
+async fn link_start(ctx: &mut Ctx<'_>, code: &str) -> Result<(), Fail> {
+    let sender_id = ctx.sender.id;
+    let name = candidate_name(&ctx.sender);
+    let now = ctx.now;
+    let mut savepoint = ctx.conn.begin().await?;
+    let result = async {
+        codes::use_code(&mut savepoint, Purpose::TelegramLink, code, now).await?;
+        admin_accounts::set_pending_telegram(&mut savepoint, sender_id, &name).await
+    }
+    .await;
+
+    match result {
+        Ok(()) => {
+            savepoint.commit().await?;
+            ctx.banner("Запрос на привязку отправлен. Подтвердите его в консоли администратора.");
+            default_start(ctx).await
+        }
+        Err(DomainError::NotFound) => {
+            savepoint.rollback().await?;
+            default_start(ctx).await
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// `/start own_…`: назначить владельца или открыть онбординг пустой
+/// инсталляции.
+///
+/// Ссылка проверяется до ветки участника: недействительный код ведёт себя как
+/// `/start` без аргумента и не показывает баннер «вы уже состоите». Участник
+/// целевого household без владельца становится владельцем; участник другого
+/// household получает баннер, а код не расходуется.
+async fn claim_start(ctx: &mut Ctx<'_>, code: &str) -> Result<(), Fail> {
+    let Some(record) =
+        codes::find_active(&mut *ctx.conn, Purpose::OwnerClaim, code, ctx.now).await?
+    else {
+        return default_start(ctx).await;
+    };
+
+    let Some(household_id) = record.household_id else {
+        return claim_empty_installation(ctx, record.id).await;
+    };
+
+    if let Some(user) = ctx.user.as_ref() {
+        if user.household_id != household_id {
+            ctx.banner(MEMBER_BANNER);
+            return ctx.present(Screen::Menu).await;
+        }
+        // Участник самого household: по контракту ссылки первый открывший
+        // становится владельцем, новое членство не создаётся.
+        if !household_claimable(ctx, household_id).await?
+            || !claim_member_owner(ctx, household_id, code).await?
+        {
+            return default_start(ctx).await;
+        }
+        return Ok(());
+    }
+
+    // Код мог остаться активным после появления владельца: тогда это обычный
+    // `/start` без ссылки.
+    if !household_claimable(ctx, household_id).await? {
+        return default_start(ctx).await;
+    }
+
+    let installation = households::installation(&mut *ctx.conn).await?;
+    let admin_exists = admin_accounts::exists(&mut *ctx.conn).await?;
+    let contact = classify(
+        ctx.tenancy.mode,
+        ctx.tenancy.bootstrap_owner,
+        ctx.sender.id,
+        installation,
+        Some(ClaimTarget::Household(household_id)),
+        admin_exists,
+    );
+    if contact != FirstContact::ClaimOwner(household_id) {
+        return default_start(ctx).await;
+    }
+
+    if !claim_existing_owner(ctx, household_id, Some(code)).await? {
+        return default_start(ctx).await;
+    }
+    Ok(())
+}
+
+/// `/start own_…` на пустой инсталляции: код запоминается в форме и гасится
+/// только при создании household.
+async fn claim_empty_installation(ctx: &mut Ctx<'_>, claim_id: Uuid) -> Result<(), Fail> {
+    if ctx.tenancy.mode != TenancyMode::Single {
+        return default_start(ctx).await;
+    }
+
+    let installation = households::installation(&mut *ctx.conn).await?;
+    if installation != Installation::Empty {
+        return default_start(ctx).await;
+    }
+    let admin_exists = admin_accounts::exists(&mut *ctx.conn).await?;
+    let contact = classify(
+        ctx.tenancy.mode,
+        ctx.tenancy.bootstrap_owner,
+        ctx.sender.id,
+        installation,
+        Some(ClaimTarget::EmptyInstallation),
+        admin_exists,
+    );
+    if contact != FirstContact::Onboard {
+        return default_start(ctx).await;
+    }
+
+    forms::open_onboarding(ctx, Some(claim_id)).await
+}
+
+async fn household_claimable(ctx: &mut Ctx<'_>, household_id: Uuid) -> Result<bool, Fail> {
+    match households::get(&mut *ctx.conn, household_id).await {
+        Ok(_) => Ok(users::owners(&mut *ctx.conn, household_id)
+            .await?
+            .is_empty()),
+        Err(DomainError::NotFound) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Назначить отправителя владельцем существующего household.
+///
+/// Вызывать только для отправителя, который ещё не состоит в household:
+/// участника целевого household повышает `claim_member_owner`, участнику
+/// другого household код не расходуется. С кодом (`Some`) гашение кода и
+/// вставка владельца идут одной транзакцией: одновременный claim даёт ровно
+/// одного владельца, а проигравший не расходует код. Без кода этот путь
+/// использует `BOOTSTRAP_OWNER_TELEGRAM_ID`.
+///
+/// `Ok(false)` — состояние изменилось (код уже погашен, владелец появился или
+/// отправитель стал участником); вызывающий переклассифицирует состояние.
+pub(super) async fn claim_existing_owner(
+    ctx: &mut Ctx<'_>,
+    household_id: Uuid,
+    code: Option<&str>,
+) -> Result<bool, Fail> {
+    let member = new_member(ctx);
+    let now = ctx.now;
+    let mut savepoint = ctx.conn.begin().await?;
+    let result = async {
+        if let Some(code) = code {
+            let record = codes::use_code(&mut savepoint, Purpose::OwnerClaim, code, now).await?;
+            if record.household_id != Some(household_id) {
+                return Err(DomainError::NotFound);
+            }
+        }
+        households::claim_owner(
+            &mut savepoint,
+            household_id,
+            member,
+            code.map(|_| "claim"),
+            now,
+        )
+        .await
+    }
+    .await;
+
+    match result {
+        Ok((household, user)) => {
+            savepoint.commit().await?;
+            let text = format!("Вы стали владельцем пространства «{}».", household.name);
+            ctx.tz = display_timezone(Some(&user), Some(&household));
+            ctx.user = Some(user);
+            ctx.household = Some(household);
+            ctx.banner(text);
+            ctx.present(Screen::Menu).await?;
+            Ok(true)
+        }
+        Err(DomainError::NotFound) | Err(DomainError::Conflict { .. }) => {
+            savepoint.rollback().await?;
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Сделать участника целевого household владельцем по ссылке-claim.
+///
+/// Код гасится и роль меняется одной транзакцией: повторное открытие ссылки
+/// или одновременный claim другим участником получает `NotFound` и не
+/// расходует код. Новое членство не создаётся, событие аудита совпадает с
+/// `claim_existing_owner` (`member_joined`, `source = claim`).
+///
+/// `Ok(false)` — код или состояние изменились; вызывающий показывает `/start`
+/// без ссылки.
+async fn claim_member_owner(
+    ctx: &mut Ctx<'_>,
+    household_id: Uuid,
+    code: &str,
+) -> Result<bool, Fail> {
+    let Some(user_id) = ctx.user.as_ref().map(|user| user.id) else {
+        return Ok(false);
+    };
+    let now = ctx.now;
+    let mut savepoint = ctx.conn.begin().await?;
+    let result = async {
+        let record = codes::use_code(&mut savepoint, Purpose::OwnerClaim, code, now).await?;
+        if record.household_id != Some(household_id) {
+            return Err(DomainError::NotFound);
+        }
+        users::lock_household(&mut savepoint, household_id).await?;
+        if !users::owners(&mut savepoint, household_id)
+            .await?
+            .is_empty()
+        {
+            return Err(DomainError::conflict_with(
+                "household already has an owner",
+                json!({"reason": "owner_exists"}),
+            ));
+        }
+        users::set_role(&mut savepoint, household_id, user_id, UserRole::Owner, now).await?;
+        let user = users::get(&mut savepoint, household_id, user_id).await?;
+        let household = households::get(&mut savepoint, household_id).await?;
+        audit::record(
+            &mut savepoint,
+            Some(household_id),
+            &Actor::user(user.id, user.role),
+            AuditEventType::MemberJoined,
+            json!({
+                "user_id": user.id,
+                "display_name": user.display_name,
+                "role": user.role,
+                "source": "claim",
+            }),
+            now,
+        )
+        .await?;
+        Ok((household, user))
+    }
+    .await;
+
+    match result {
+        Ok((household, user)) => {
+            savepoint.commit().await?;
+            let text = format!("Вы стали владельцем пространства «{}».", household.name);
+            ctx.tz = display_timezone(Some(&user), Some(&household));
+            ctx.user = Some(user);
+            ctx.household = Some(household);
+            ctx.banner(text);
+            ctx.present(Screen::Menu).await?;
+            Ok(true)
+        }
+        Err(DomainError::NotFound) | Err(DomainError::Conflict { .. }) => {
+            savepoint.rollback().await?;
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn accept_invite(ctx: &mut Ctx<'_>, code: &str) -> Result<(), Fail> {
@@ -121,6 +467,12 @@ pub fn first_contact(contact: &FirstContactScreen) -> Ui {
             .text(ru::ADMIN_COMMAND_INTRO)
             .spans(vec![Span::Code(ru::owner_command(*telegram_id))])
             .text(ru::OWNER_NOT_ASSIGNED),
+        FirstContactScreen::AdminCommandWithHint(telegram_id) => Ui::new()
+            .heading(ru::NOT_CONFIGURED_TITLE)
+            .text(ru::ADMIN_COMMAND_INTRO)
+            .spans(vec![Span::Code(ru::owner_command(*telegram_id))])
+            .text(ru::OWNER_NOT_ASSIGNED)
+            .text(ru::ADMIN_LINK_HINT),
         FirstContactScreen::NotConfigured => Ui::new()
             .heading(ru::NOT_CONFIGURED_TITLE)
             .text(ru::NOT_CONFIGURED),
@@ -140,7 +492,12 @@ fn zone(label: &str, zone: &str) -> crate::telegram::rich::Button<Action> {
 }
 
 /// Текст при активном онбординге.
-pub async fn on_text(ctx: &mut Ctx<'_>, name: Option<String>, text: &str) -> Result<(), Fail> {
+pub async fn on_text(
+    ctx: &mut Ctx<'_>,
+    name: Option<String>,
+    claim_id: Option<Uuid>,
+    text: &str,
+) -> Result<(), Fail> {
     if ctx.user.is_some() {
         return forms::start_onboarding(ctx).await;
     }
@@ -151,11 +508,11 @@ pub async fn on_text(ctx: &mut Ctx<'_>, name: Option<String>, text: &str) -> Res
                 ctx.banner("Название — от 1 до 100 символов.");
                 return ctx.present(Screen::Form).await;
             }
-            forms::put_onboarding(ctx, Some(trimmed.to_owned())).await?;
+            forms::put_onboarding(ctx, Some(trimmed.to_owned()), claim_id).await?;
             ctx.present(Screen::Form).await
         }
         Some(name) => match validate_timezone(text) {
-            Ok(zone) => create(ctx, &name, &zone).await,
+            Ok(zone) => create(ctx, &name, &zone, claim_id).await,
             Err(_) => {
                 ctx.banner("Не знаю такой часовой пояс. Пример: Europe/Moscow.");
                 ctx.present(Screen::Form).await
@@ -169,37 +526,61 @@ pub async fn choose_zone(ctx: &mut Ctx<'_>, zone: &str) -> Result<(), Fail> {
     if ctx.user.is_some() {
         return forms::start_onboarding(ctx).await;
     }
-    let name =
+    let (name, claim_id) =
         match crate::telegram::views::conversation(&mut *ctx.conn, ctx.chat_id, ctx.now).await? {
             crate::telegram::views::Lookup::Active(conversation) => {
                 match serde_json::from_value::<super::model::Form>(conversation.data) {
-                    Ok(super::model::Form::Onboarding { name: Some(name) }) => name,
+                    Ok(super::model::Form::Onboarding {
+                        name: Some(name),
+                        claim_id,
+                    }) => (name, claim_id),
                     _ => return forms::start_onboarding(ctx).await,
                 }
             }
             _ => return forms::start_onboarding(ctx).await,
         };
     let zone = validate_timezone(zone)?;
-    create(ctx, &name, &zone).await
+    create(ctx, &name, &zone, claim_id).await
 }
 
-async fn create(ctx: &mut Ctx<'_>, name: &str, zone: &str) -> Result<(), Fail> {
+async fn create(
+    ctx: &mut Ctx<'_>,
+    name: &str,
+    zone: &str,
+    claim_id: Option<Uuid>,
+) -> Result<(), Fail> {
     // Пока форма была открыта, отправителя могли добавить в household.
     // Онбординг больше не нужен: форма закрывается, показывается меню.
     if ctx.user.is_some() {
         return forms::start_onboarding(ctx).await;
     }
 
+    // Код claim мог истечь или быть израсходован, пока форма была открыта.
+    // Тогда household не создаётся: экран соответствует текущему состоянию.
+    let claim = match claim_id {
+        Some(id) => {
+            match codes::find_active_by_id(&mut *ctx.conn, Purpose::OwnerClaim, id, ctx.now).await?
+            {
+                Some(record) if record.household_id.is_none() => Some(id),
+                _ => return forms::start_onboarding(ctx).await,
+            }
+        }
+        None => None,
+    };
+
     // Форма могла быть открыта до того, как администратор задал
     // `BOOTSTRAP_OWNER_TELEGRAM_ID` или появился household. Перед вставкой
     // классификатор перепроверяется целиком: не-`Onboard` закрывает форму и
     // показывает экран нового состояния, household не создаётся.
     let installation = households::installation(&mut *ctx.conn).await?;
+    let admin_exists = admin_accounts::exists(&mut *ctx.conn).await?;
     let contact = classify(
         ctx.tenancy.mode,
         ctx.tenancy.bootstrap_owner,
         ctx.sender.id,
         installation,
+        claim.map(|_| ClaimTarget::EmptyInstallation),
+        admin_exists,
     );
     if contact != FirstContact::Onboard {
         // Тот же путь, что при `household_exists`: `start_onboarding` закроет
@@ -208,10 +589,30 @@ async fn create(ctx: &mut Ctx<'_>, name: &str, zone: &str) -> Result<(), Fail> {
     }
 
     let member = new_member(ctx);
+    let now = ctx.now;
     // Последний шаг может проиграть гонку: household успели создать извне.
     // Вложенный savepoint (как в `accept_invite`) гасит конфликт, не трогая
     // savepoint шага `Ctx::in_step`. Состояние перечитывается классификатором.
     let mut savepoint = ctx.conn.begin().await?;
+    if let Some(id) = claim {
+        if users::find_active_by_telegram(&mut savepoint, member.telegram_user_id)
+            .await?
+            .is_some()
+        {
+            savepoint.rollback().await?;
+            return forms::start_onboarding(ctx).await;
+        }
+        // Код гасится в той же транзакции, что и создание household.
+        match codes::use_code_by_id(&mut savepoint, Purpose::OwnerClaim, id, now).await {
+            Ok(record) if record.household_id.is_none() => {}
+            Ok(_) | Err(DomainError::NotFound) => {
+                savepoint.rollback().await?;
+                return forms::start_onboarding(ctx).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
     let result = households::onboard(
         &mut savepoint,
         ctx.tenancy.mode,
@@ -221,11 +622,37 @@ async fn create(ctx: &mut Ctx<'_>, name: &str, zone: &str) -> Result<(), Fail> {
             member,
             timezone: Some(zone.to_owned()),
         },
-        ctx.now,
+        now,
     )
     .await;
     let onboarded = match result {
+        Ok(onboarded) if !onboarded.created => {
+            // Отправитель успел стать участником: код возвращается откатом,
+            // показывается меню.
+            savepoint.rollback().await?;
+            ctx.tz = display_timezone(Some(&onboarded.user), Some(&onboarded.household));
+            ctx.user = Some(onboarded.user);
+            ctx.household = Some(onboarded.household);
+            return ctx.present(Screen::Menu).await;
+        }
         Ok(onboarded) => {
+            if claim.is_some() {
+                let actor = Actor::user(onboarded.user.id, onboarded.user.role);
+                audit::record(
+                    &mut savepoint,
+                    Some(onboarded.household.id),
+                    &actor,
+                    AuditEventType::MemberJoined,
+                    json!({
+                        "user_id": onboarded.user.id,
+                        "display_name": onboarded.user.display_name,
+                        "role": onboarded.user.role,
+                        "source": "claim",
+                    }),
+                    now,
+                )
+                .await?;
+            }
             savepoint.commit().await?;
             onboarded
         }
@@ -249,4 +676,57 @@ async fn create(ctx: &mut Ctx<'_>, name: &str, zone: &str) -> Result<(), Fail> {
     ctx.user = Some(onboarded.user);
     ctx.household = Some(onboarded.household);
     ctx.present(Screen::Welcome).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::telegram::rich::Block;
+
+    fn has_text(ui: &Ui, text: &str) -> bool {
+        ui.blocks.iter().any(|block| {
+            matches!(
+                block,
+                Block::Paragraph(spans)
+                    if spans.iter().any(|span| span == &Span::Text(text.to_owned()))
+            )
+        })
+    }
+
+    #[test]
+    fn admin_command_screen_shows_the_link_hint_only_with_an_account() {
+        let without = first_contact(&FirstContactScreen::AdminCommand(42));
+        assert!(!has_text(&without, ru::ADMIN_LINK_HINT));
+
+        let with = first_contact(&FirstContactScreen::AdminCommandWithHint(42));
+        assert!(has_text(&with, ru::ADMIN_LINK_HINT));
+    }
+
+    fn sender(display_name: &str, username: Option<&str>) -> crate::telegram::update::Sender {
+        crate::telegram::update::Sender {
+            id: 42,
+            display_name: display_name.to_owned(),
+            username: username.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn candidate_name_adds_the_surname_and_username() {
+        assert_eq!(
+            candidate_name(&sender("Иван Петров", Some("ivan"))),
+            "Иван Петров @ivan"
+        );
+    }
+
+    #[test]
+    fn candidate_name_does_not_repeat_a_username_used_as_the_name() {
+        assert_eq!(candidate_name(&sender("ivan", Some("ivan"))), "ivan");
+        assert_eq!(candidate_name(&sender("ivan", Some("@ivan"))), "ivan");
+        assert_eq!(candidate_name(&sender("Ivan", Some("ivan"))), "Ivan");
+        assert_eq!(
+            candidate_name(&sender("", Some("ivan"))),
+            "ivan",
+            "an empty name is already the username: derived names are not stored here"
+        );
+    }
 }

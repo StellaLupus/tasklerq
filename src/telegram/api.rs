@@ -46,6 +46,9 @@ pub enum TelegramError {
     /// Бот заблокирован пользователем или чат недоступен.
     #[error("forbidden: {0}")]
     Forbidden(String),
+    /// `409 Conflict`: другой экземпляр или поколение держит long polling.
+    #[error("conflict: another consumer is polling")]
+    Conflict,
     /// Запрос отклонён Telegram; повтор бессмысленен.
     #[error("bad request: {0}")]
     BadRequest(String),
@@ -68,10 +71,21 @@ impl TelegramError {
             Self::MessageGone => "message_gone",
             Self::MessageUndeletable => "message_undeletable",
             Self::Forbidden(_) => "forbidden",
+            Self::Conflict => "conflict",
             Self::BadRequest(_) => "bad_request",
             Self::Transient(_) => "transient",
         }
     }
+}
+
+/// Описание бота по данным `getMe`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct BotMe {
+    /// Идентификатор бота.
+    pub id: i64,
+    /// Имя бота без `@`; у бота оно обычно есть.
+    #[serde(default)]
+    pub username: Option<String>,
 }
 
 /// Состояние webhook по данным `getWebhookInfo`.
@@ -116,7 +130,15 @@ pub trait TelegramApi: Send + Sync {
     ) -> Result<(), TelegramError>;
 
     /// Отправить обычное HTML-сообщение; возвращает `message_id`.
-    async fn send_message(&self, chat_id: i64, html: &str) -> Result<i64, TelegramError>;
+    ///
+    /// `disable_preview` отключает предпросмотр ссылок: так уходит одноразовая
+    /// ссылка восстановления, которую не нужно показывать в развёрнутом виде.
+    async fn send_message(
+        &self,
+        chat_id: i64,
+        html: &str,
+        disable_preview: bool,
+    ) -> Result<i64, TelegramError>;
 
     /// Заменить текст обычного сообщения.
     async fn edit_message_text(
@@ -139,6 +161,12 @@ pub trait TelegramApi: Send + Sync {
 
     /// Зарегистрировать webhook с секретом.
     async fn set_webhook(&self, url: &str, secret_token: &str) -> Result<(), TelegramError>;
+
+    /// Снять webhook перед long polling.
+    async fn delete_webhook(&self) -> Result<(), TelegramError>;
+
+    /// Прочитать описание бота: id и имя.
+    async fn get_me(&self) -> Result<BotMe, TelegramError>;
 
     /// Прочитать состояние webhook.
     async fn get_webhook_info(&self) -> Result<WebhookInfo, TelegramError>;
@@ -226,6 +254,7 @@ struct EnvelopeParameters {
 pub fn parse_response<T: DeserializeOwned>(status: u16, body: &str) -> Result<T, TelegramError> {
     let envelope: Envelope<T> = match serde_json::from_str(body) {
         Ok(envelope) => envelope,
+        Err(_) if status == 409 => return Err(TelegramError::Conflict),
         Err(_) if status >= 500 => {
             return Err(TelegramError::Transient(format!("http {status}")));
         }
@@ -247,6 +276,9 @@ pub fn parse_response<T: DeserializeOwned>(status: u16, body: &str) -> Result<T,
             .and_then(|parameters| parameters.retry_after)
             .unwrap_or(1);
         return Err(TelegramError::RetryAfter(retry_after));
+    }
+    if code == 409 {
+        return Err(TelegramError::Conflict);
     }
     if lowered.contains("message is not modified") {
         return Err(TelegramError::NotModified);
@@ -313,14 +345,18 @@ impl TelegramApi for HttpTelegramApi {
         .map(|_| ())
     }
 
-    async fn send_message(&self, chat_id: i64, html: &str) -> Result<i64, TelegramError> {
-        let sent: SentMessage = self
-            .call(
-                "sendMessage",
-                &json!({"chat_id": chat_id, "text": html, "parse_mode": "HTML"}),
-                None,
-            )
-            .await?;
+    async fn send_message(
+        &self,
+        chat_id: i64,
+        html: &str,
+        disable_preview: bool,
+    ) -> Result<i64, TelegramError> {
+        let mut body = json!({"chat_id": chat_id, "text": html, "parse_mode": "HTML"});
+        if disable_preview {
+            // Одноразовая ссылка не должна раскрываться предпросмотром.
+            body["link_preview_options"] = json!({"is_disabled": true});
+        }
+        let sent: SentMessage = self.call("sendMessage", &body, None).await?;
         Ok(sent.message_id)
     }
 
@@ -387,6 +423,20 @@ impl TelegramApi for HttpTelegramApi {
         )
         .await
         .map(|_| ())
+    }
+
+    async fn delete_webhook(&self) -> Result<(), TelegramError> {
+        self.call::<Value>(
+            "deleteWebhook",
+            &json!({"drop_pending_updates": false}),
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn get_me(&self) -> Result<BotMe, TelegramError> {
+        self.call("getMe", &json!({}), None).await
     }
 
     async fn get_webhook_info(&self) -> Result<WebhookInfo, TelegramError> {

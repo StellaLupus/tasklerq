@@ -444,7 +444,14 @@ mod tests {
             (Screen::Journal { page: 0 }, None, None),
             (Screen::Form, None, None),
             (Screen::Form, Some(Form::Search), None),
-            (Screen::Form, Some(Form::Onboarding { name: None }), None),
+            (
+                Screen::Form,
+                Some(Form::Onboarding {
+                    name: None,
+                    claim_id: None,
+                }),
+                None,
+            ),
             (Screen::Form, Some(Form::Editor(editor(None))), None),
             (Screen::Processing { job_id: None }, None, None),
             (

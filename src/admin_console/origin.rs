@@ -17,6 +17,8 @@
 //! соседние порты, поэтому проверяются **все** не-GET-запросы, включая вход,
 //! setup и восстановление.
 
+use std::fmt;
+
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use url::Url;
@@ -38,6 +40,20 @@ impl Origin {
         self.scheme == other.scheme
             && self.port == other.port
             && self.host.eq_ignore_ascii_case(&other.host)
+    }
+}
+
+/// Строка origin в виде `схема://хост[:порт]`.
+///
+/// Порт по умолчанию для схемы не пишется: так же браузер сериализует
+/// заголовок `Origin`.
+impl fmt::Display for Origin {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}://{}", self.scheme.as_str(), self.host)?;
+        if self.port != default_port(self.scheme) {
+            write!(formatter, ":{}", self.port)?;
+        }
+        Ok(())
     }
 }
 

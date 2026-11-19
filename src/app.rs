@@ -3,6 +3,8 @@
 //! Эту функцию вызывают и `serve()` в `main.rs`, и интеграционные тесты, чтобы
 //! тест проверял production-путь, а не отдельную ручную сборку.
 
+use std::sync::Arc;
+
 use axum::Router;
 use sqlx::PgPool;
 use tokio::sync::watch;
@@ -20,8 +22,8 @@ use crate::llm::{LlmHandle, LlmSettings, LlmSnapshot};
 use crate::security_audit::Audit;
 use crate::settings;
 use crate::settings::crypto::SecretCipher;
-use crate::storage::repositories::households;
-use crate::telegram::runtime::{self, StartError};
+use crate::storage::repositories::{admin_accounts, households};
+use crate::telegram::runtime::{self, StartError, TelegramSupervisor};
 
 /// Собранное приложение и его фоновые задачи.
 pub struct Application {
@@ -29,19 +31,27 @@ pub struct Application {
     pub router: Router,
     /// Роутер консоли; `None`, если `ADMIN_BIND_ADDR=disabled`.
     pub admin_router: Option<Router>,
-    /// Фоновые задачи: Telegram (в режиме `disabled` их нет), retention и
-    /// доменный тикер.
+    /// Фоновые задачи: супервизор Telegram, retention и доменный тикер.
+    /// Супервизор живёт всегда и ждёт текущее поколение, даже если бот включён
+    /// переключением после старта.
     pub workers: Vec<JoinHandle<()>>,
     /// Применение сохранённых настроек LLM к снимку без перезапуска: вход
     /// будущей консоли администратора и тестов.
     pub llm_settings: LlmSettings,
+    /// Действующий режим Telegram на момент старта: из окружения, базы или
+    /// `disabled`.
+    pub telegram_mode: TelegramMode,
+    /// Источник группы Telegram на момент старта; `None` — группа не настроена.
+    pub telegram_source: Option<settings::SettingSource>,
+    /// Супервизор поколений Telegram: консоль будет менять бота через него.
+    pub telegram_supervisor: Arc<TelegramSupervisor>,
 }
 
 /// Собрать состояние и роутер так же, как это делает `serve()`.
 ///
-/// В режиме `TELEGRAM_MODE=disabled` без токена [`runtime::start`] ничего не
-/// запускает: ingress и воркеры Telegram отсутствуют, а HTTP API и capture
-/// работают. Retention и доменный тикер запускаются всегда и попадают в
+/// В режиме `TELEGRAM_MODE=disabled` без токена супервизор ничего не запускает:
+/// ingress и воркеры Telegram отсутствуют, а HTTP API и capture работают.
+/// Retention и доменный тикер запускаются всегда и попадают в
 /// [`Application::workers`].
 pub async fn build_application(
     config: &Config,
@@ -62,11 +72,15 @@ pub async fn build_application_with_update_limit(
     shutdown: watch::Receiver<bool>,
     update_limit: Option<u32>,
 ) -> Result<Application, StartError> {
-    warn_if_bootstrap_owner_missing(config);
-    warn_if_multiple_households(config, &pool).await;
-
     let secret_cipher = SecretCipher::from_config(config);
     warn_if_stored_secrets_unreadable(&pool, &secret_cipher).await;
+
+    // Действующая конфигурация Telegram: окружение целиком при токене, иначе
+    // база. Сбой чтения базы не роняет сервис — действует окружение.
+    let telegram = build_effective_telegram(&pool, config, &secret_cipher).await;
+    let admin_account_exists = read_admin_account_exists(&pool).await;
+    warn_if_bootstrap_owner_missing(config, &telegram, admin_account_exists);
+    warn_if_multiple_households(config, &pool).await;
 
     let llm = build_llm_handle(&pool, config, &secret_cipher).await;
     let llm_settings = LlmSettings::new(
@@ -81,30 +95,32 @@ pub async fn build_application_with_update_limit(
     // Один журнал событий на процесс: вебхук, воркеры, бот и capture-воркер
     // делят состояние подавления и счётчики отказов.
     let audit = Audit::new(pool.clone());
-    let telegram = runtime::start_with_update_limit(
-        config,
-        &pool,
+    let telegram_mode = telegram.mode();
+    let telegram_source = telegram.source();
+    let supervisor = runtime::TelegramSupervisor::new(
+        pool.clone(),
         shutdown.clone(),
         llm.clone(),
         audit.clone(),
+        config.tenancy,
+        config.queue.max_attempts,
         update_limit,
-    )
-    .await?;
+        config.clone(),
+        secret_cipher.clone(),
+    );
+    supervisor.start(&telegram).await?;
 
     let mut state = AppState::new(pool.clone(), audit.clone())
         .with_tenancy_mode(config.tenancy.mode)
         .with_secret_cipher(secret_cipher.clone())
-        .with_llm_slots(llm_slots.clone());
-    let mut workers = Vec::new();
-    let mut queue_lag_seconds = None;
-    if let Some(runtime) = telegram {
-        if let Some(ingress) = runtime.ingress {
-            state = state.with_telegram(ingress);
-        }
-        state = state.with_queue_lag_limit(config.queue.ready_lag_seconds);
-        queue_lag_seconds = Some(config.queue.ready_lag_seconds);
-        workers = runtime.tasks;
-    }
+        .with_llm_slots(llm_slots.clone())
+        .with_telegram_slot(supervisor.ingress())
+        // Порог задаётся всегда; readiness применяет его, только пока живо
+        // поколение Telegram, и видит включение и выключение из консоли.
+        .with_queue_lag_limit(config.queue.ready_lag_seconds);
+    // Супервизор запускается всегда: поколение, включённое из консоли после
+    // старта, тоже должно дождаться graceful shutdown процесса.
+    let mut workers = vec![tokio::spawn(Arc::clone(&supervisor).run())];
     if config.capture.enabled {
         state = state.with_capture(CaptureState::new(config.capture, llm));
     }
@@ -112,18 +128,18 @@ pub async fn build_application_with_update_limit(
     // Консоль получает собственный роутер и listener. `disabled` не создаёт
     // ни того, ни другого.
     let admin_router = config.admin_bind_addr.map(|_| {
-        let wizard = WizardSettings::new(config.tenancy.mode, config.telegram.mode.is_enabled());
-        let mut admin = AdminState::new(
+        let wizard = WizardSettings::new(config.tenancy.mode, telegram.is_enabled());
+        let admin = AdminState::new(
             pool.clone(),
             config.admin_trusted_proxies.clone(),
             audit,
             llm_settings.clone(),
         )
         .with_wizard(wizard)
-        .with_llm_slots(llm_slots);
-        if let Some(seconds) = queue_lag_seconds {
-            admin = admin.with_queue_lag_limit(seconds);
-        }
+        .with_llm_slots(llm_slots)
+        .with_telegram_config(config.clone())
+        .with_telegram_supervisor(Arc::clone(&supervisor))
+        .with_queue_lag_limit(config.queue.ready_lag_seconds);
         build_admin_router(admin)
     });
 
@@ -139,7 +155,55 @@ pub async fn build_application_with_update_limit(
         admin_router,
         workers,
         llm_settings,
+        telegram_mode,
+        telegram_source,
+        telegram_supervisor: supervisor,
     })
+}
+
+/// Собрать действующую конфигурацию Telegram из базы и окружения.
+///
+/// Бот, настроенный только в консоли, подхватывается переключением поколения
+/// (в том числе при следующем старте). Сбой чтения базы не роняет сервис:
+/// действует конфигурация из окружения
+/// (без строк настройки Telegram выключен), а в журнал уходит предупреждение без
+/// значений настроек.
+async fn build_effective_telegram(
+    pool: &PgPool,
+    config: &Config,
+    cipher: &SecretCipher,
+) -> settings::EffectiveTelegram {
+    let effective = match settings::read_effective_telegram(pool, config, cipher).await {
+        Ok(effective) => effective,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "could not read telegram settings at startup; using environment only"
+            );
+            settings::effective_telegram(config, &[], cipher)
+        }
+    };
+    warn_if_telegram_unavailable(&effective);
+    effective
+}
+
+/// Предупредить, что сохранённая группа Telegram не настроена.
+///
+/// В строке только код причины и имя ключа: значение могло не разобраться, а
+/// секрет нельзя показывать. `not_set` — обычное состояние «бота нет», о нём
+/// не предупреждаем.
+fn warn_if_telegram_unavailable(telegram: &settings::EffectiveTelegram) {
+    let Some(problem) = telegram.problem() else {
+        return;
+    };
+    if problem == settings::TelegramProblem::NotSet {
+        return;
+    }
+    tracing::warn!(
+        code = problem.code(),
+        setting = problem.field(),
+        "telegram bot is not configured: the bot stays disabled"
+    );
 }
 
 /// Собрать снимок LLM из окружения, базы и умолчаний.
@@ -162,15 +226,67 @@ async fn build_llm_handle(pool: &PgPool, config: &Config, cipher: &SecretCipher)
     LlmHandle::new(LlmSnapshot::from_effective(effective))
 }
 
+/// Прочитать, есть ли учётная запись администратора консоли.
+///
+/// `None` — прочитать не удалось. Сбой базы не роняет старт: вызывающий
+/// трактует неизвестность консервативно, как отсутствие учётки.
+async fn read_admin_account_exists(pool: &PgPool) -> Option<bool> {
+    let mut conn = match pool.acquire().await {
+        Ok(conn) => conn,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "could not check the admin account at startup"
+            );
+            return None;
+        }
+    };
+    match admin_accounts::exists(&mut conn).await {
+        Ok(exists) => Some(exists),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "could not check the admin account at startup"
+            );
+            None
+        }
+    }
+}
+
 /// Предупредить, что без явного первого владельца им станет первый написавший
-/// боту. Текст не содержит секретов: в нём только имя переменной.
-fn warn_if_bootstrap_owner_missing(config: &Config) {
-    if config.telegram.mode != TelegramMode::Disabled && config.tenancy.bootstrap_owner.is_none() {
+/// боту.
+///
+/// С созданной учёткой администратора владелец назначается из консоли, поэтому
+/// предупреждения нет. Если учётку проверить не удалось (`None`), предупреждение
+/// выводится: подтвердить безопасное состояние нельзя. Текст не содержит
+/// секретов: в нём только имя переменной.
+fn warn_if_bootstrap_owner_missing(
+    config: &Config,
+    telegram: &settings::EffectiveTelegram,
+    admin_account_exists: Option<bool>,
+) {
+    if should_warn_about_the_first_writer(
+        telegram.is_enabled(),
+        config.tenancy.bootstrap_owner.is_some(),
+        admin_account_exists,
+    ) {
         tracing::warn!(
             "BOOTSTRAP_OWNER_TELEGRAM_ID is not set: the first person to write to the bot \
              will become the owner; set BOOTSTRAP_OWNER_TELEGRAM_ID to choose the owner explicitly"
         );
     }
+}
+
+/// Решение о стартовом предупреждении по трём флагам.
+///
+/// `admin_account_exists = None` — учётку прочитать не удалось; это не
+/// подтверждённое отсутствие владельца, поэтому предупреждение выводится.
+fn should_warn_about_the_first_writer(
+    telegram_enabled: bool,
+    bootstrap_owner_set: bool,
+    admin_account_exists: Option<bool>,
+) -> bool {
+    telegram_enabled && !bootstrap_owner_set && admin_account_exists != Some(true)
 }
 
 /// Сообщить о деградации: в режиме `single` активных household больше одного.
@@ -362,14 +478,16 @@ mod tests {
         Config::from_map(vars).expect("test config should be valid")
     }
 
-    fn captured_warning(config: &Config) -> String {
+    fn captured_warning(config: &Config, admin_account_exists: Option<bool>) -> String {
         let buffer = LogBuffer::default();
         let subscriber = tracing_subscriber::fmt()
             .json()
             .with_writer(buffer.clone())
             .finish();
+        let cipher = SecretCipher::from_config(config);
+        let telegram = settings::effective_telegram(config, &[], &cipher);
         tracing::subscriber::with_default(subscriber, || {
-            warn_if_bootstrap_owner_missing(config);
+            warn_if_bootstrap_owner_missing(config, &telegram, admin_account_exists);
         });
         buffer.contents()
     }
@@ -377,7 +495,7 @@ mod tests {
     #[test]
     fn warns_when_telegram_is_enabled_without_bootstrap_owner() {
         for mode in ["webhook", "polling"] {
-            let logs = captured_warning(&config(mode, None));
+            let logs = captured_warning(&config(mode, None), Some(false));
 
             assert!(
                 logs.contains("BOOTSTRAP_OWNER_TELEGRAM_ID"),
@@ -399,9 +517,35 @@ mod tests {
     }
 
     #[test]
+    fn no_warning_when_an_admin_account_exists() {
+        for mode in ["webhook", "polling"] {
+            let logs = captured_warning(&config(mode, None), Some(true));
+            assert!(
+                !logs.contains("BOOTSTRAP_OWNER_TELEGRAM_ID"),
+                "{mode}: an admin account should suppress the warning:\n{logs}"
+            );
+        }
+    }
+
+    #[test]
+    fn warns_when_the_admin_account_cannot_be_read() {
+        for mode in ["webhook", "polling"] {
+            let logs = captured_warning(&config(mode, None), None);
+            assert!(
+                logs.contains("BOOTSTRAP_OWNER_TELEGRAM_ID"),
+                "{mode}: an unreadable admin account should warn conservatively:\n{logs}"
+            );
+            assert!(
+                logs.contains("first person"),
+                "{mode}: warning should explain who becomes the owner:\n{logs}"
+            );
+        }
+    }
+
+    #[test]
     fn no_warning_when_bootstrap_owner_is_set() {
         for mode in ["webhook", "polling"] {
-            let logs = captured_warning(&config(mode, Some("111")));
+            let logs = captured_warning(&config(mode, Some("111")), Some(false));
             assert!(
                 !logs.contains("BOOTSTRAP_OWNER_TELEGRAM_ID"),
                 "{mode}: explicit owner should suppress the warning:\n{logs}"
@@ -411,7 +555,7 @@ mod tests {
 
     #[test]
     fn no_warning_when_telegram_is_disabled() {
-        let logs = captured_warning(&config("disabled", None));
+        let logs = captured_warning(&config("disabled", None), Some(false));
         assert!(
             !logs.contains("BOOTSTRAP_OWNER_TELEGRAM_ID"),
             "disabled Telegram should not warn:\n{logs}"

@@ -7,6 +7,7 @@
 //! отправляется после коммита.
 
 pub(crate) mod additions;
+mod admin;
 mod agenda;
 pub(crate) mod capture;
 mod card;
@@ -19,6 +20,8 @@ mod screens;
 mod settings;
 mod shopping;
 
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use futures_util::future::BoxFuture;
@@ -30,6 +33,7 @@ use crate::domain::identity::{MembershipChange, MembershipNotice, NoticeKind};
 use crate::domain::models::{Actor, Household, User};
 use crate::domain::recurrence::parse_timezone;
 use crate::llm::LlmHandle;
+use crate::rate_limit::RateLimiter;
 use crate::security_audit::Audit;
 use crate::storage::repositories::{households, users};
 
@@ -87,6 +91,8 @@ pub struct Bot {
     pub tenancy: TenancyConfig,
     /// Журнал событий безопасности, которые откатываются вместе с шагом.
     audit: Option<Audit>,
+    /// Лимит запросов восстановления доступа через `/admin`.
+    recovery_limit: Arc<RateLimiter<i64>>,
 }
 
 /// Сбой обработки: инфраструктурный (повторить) или объяснимый пользователю.
@@ -213,6 +219,8 @@ pub struct Ctx<'a> {
     pub tenancy: TenancyConfig,
     /// Журнал событий безопасности; `None` в тестах без пула.
     pub audit: Option<&'a Audit>,
+    /// Лимит запросов `/admin` на аккаунт администратора.
+    pub recovery_limit: Arc<RateLimiter<i64>>,
 }
 
 impl Ctx<'_> {
@@ -331,6 +339,7 @@ impl Ctx<'_> {
                 html: rich::escape(text),
                 rich: false,
                 delete_after: None,
+                disable_preview: false,
             },
             None,
             self.now,
@@ -394,6 +403,7 @@ impl Ctx<'_> {
                     html: rich::escape(&text),
                     rich: false,
                     delete_after: None,
+                    disable_preview: false,
                 },
                 None,
                 self.now,
@@ -447,6 +457,10 @@ impl Bot {
                 bootstrap_owner: None,
             },
             audit: None,
+            recovery_limit: Arc::new(RateLimiter::with_window(
+                admin::RECOVERY_REQUESTS_PER_HOUR,
+                admin::RECOVERY_WINDOW_SECONDS,
+            )),
         }
     }
 
@@ -534,6 +548,7 @@ impl Bot {
             llm_capture: self.llm_capture(),
             tenancy: self.tenancy,
             audit: self.audit.as_ref(),
+            recovery_limit: Arc::clone(&self.recovery_limit),
         }
     }
 
@@ -635,6 +650,7 @@ impl Bot {
             llm_capture: self.llm_capture(),
             tenancy: self.tenancy,
             audit: self.audit.as_ref(),
+            recovery_limit: Arc::clone(&self.recovery_limit),
         };
 
         let query_id = match &incoming {
@@ -899,12 +915,21 @@ async fn on_command(ctx: &mut Ctx<'_>, command: &str, argument: &str) -> Result<
             ctx.say(HELP).await?;
             Ok(())
         }
-        _ => {
-            ctx.banner("Не знаю такой команды. Отправьте /help, чтобы увидеть список.");
-            ctx.refresh().await
-        }
+        "admin" => admin::on_admin(ctx).await,
+        _ => unknown_command(ctx).await,
     }
 }
+
+/// Ответ на неизвестную команду: баннер и актуальный экран.
+///
+/// `/admin` от непривязанного аккаунта обязан отвечать ровно так же, поэтому
+/// эта ветка и скрытая команда идут через одну функцию.
+pub(super) async fn unknown_command(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
+    ctx.banner(UNKNOWN_COMMAND);
+    ctx.refresh().await
+}
+
+const UNKNOWN_COMMAND: &str = "Не знаю такой команды. Отправьте /help, чтобы увидеть список.";
 
 const HELP: &str = "Я помогаю вести задачи и покупки всей семьёй.\n\n\
 Напишите, что нужно сделать: с включённым разбором я разделю текст на задачи и покупки и покажу черновик, а без разбора или когда разбор не удался открою редактор с этим текстом в названии.\n\n\

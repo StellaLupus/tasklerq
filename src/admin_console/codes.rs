@@ -20,6 +20,12 @@ use crate::storage::repositories::admin_one_time_codes::{
 /// Срок жизни `recovery`-кода, минуты.
 pub const RECOVERY_TTL_MINUTES: i64 = 15;
 
+/// Срок жизни ссылки-claim владельца, часы.
+pub const OWNER_CLAIM_TTL_HOURS: i64 = 24;
+
+/// Срок жизни ссылки привязки Telegram, минуты.
+pub const TELEGRAM_LINK_TTL_MINUTES: i64 = 15;
+
 /// Назначение одноразового кода.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Purpose {
@@ -27,6 +33,10 @@ pub enum Purpose {
     Setup,
     /// Восстановление доступа.
     Recovery,
+    /// Ссылка-claim владельца.
+    OwnerClaim,
+    /// Привязка Telegram к учётной записи администратора.
+    TelegramLink,
 }
 
 impl Purpose {
@@ -35,6 +45,8 @@ impl Purpose {
         match self {
             Self::Setup => repository::PURPOSE_SETUP,
             Self::Recovery => repository::PURPOSE_RECOVERY,
+            Self::OwnerClaim => repository::PURPOSE_OWNER_CLAIM,
+            Self::TelegramLink => repository::PURPOSE_TELEGRAM_LINK,
         }
     }
 
@@ -43,6 +55,8 @@ impl Purpose {
         match self {
             Self::Setup => None,
             Self::Recovery => Some(Duration::minutes(RECOVERY_TTL_MINUTES)),
+            Self::OwnerClaim => Some(Duration::hours(OWNER_CLAIM_TTL_HOURS)),
+            Self::TelegramLink => Some(Duration::minutes(TELEGRAM_LINK_TTL_MINUTES)),
         }
     }
 }
@@ -62,14 +76,28 @@ pub async fn issue(
     household_id: Option<Uuid>,
     now: DateTime<Utc>,
 ) -> Result<IssuedCode, DomainError> {
-    let expires_at = purpose.ttl().and_then(|ttl| now.checked_add_signed(ttl));
-
     let mut tx = pool.begin().await?;
-    let issued =
-        repository::issue(&mut tx, purpose.as_str(), household_id, expires_at, now).await?;
+    let issued = issue_locked(&mut tx, purpose, household_id, now).await?;
     tx.commit().await?;
 
     Ok(issued)
+}
+
+/// Выпустить код в транзакции вызывающего.
+///
+/// Нужен путям, которые проверяют цель и выпускают код одной транзакцией:
+/// ссылка-claim держит блокировку household, пока не увидит отсутствие
+/// владельца и не вставит новый код. Политика срока остаётся здесь же, поэтому
+/// [`issue`] и [`issue_locked`] не расходятся.
+pub async fn issue_locked(
+    conn: &mut PgConnection,
+    purpose: Purpose,
+    household_id: Option<Uuid>,
+    now: DateTime<Utc>,
+) -> Result<IssuedCode, DomainError> {
+    let expires_at = purpose.ttl().and_then(|ttl| now.checked_add_signed(ttl));
+    lock_purpose(conn, purpose, household_id).await?;
+    repository::issue(conn, purpose.as_str(), household_id, expires_at, now).await
 }
 
 /// Взять блокировку выпуска кодов назначения в транзакции вызывающего.
@@ -103,6 +131,44 @@ pub async fn use_code(
     now: DateTime<Utc>,
 ) -> Result<OneTimeCode, DomainError> {
     repository::use_code(conn, purpose.as_str(), code, now).await
+}
+
+/// Найти действующий код по открытому значению, не гася его.
+pub async fn find_active(
+    conn: &mut PgConnection,
+    purpose: Purpose,
+    code: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<OneTimeCode>, DomainError> {
+    repository::find_active(conn, purpose.as_str(), code, now).await
+}
+
+/// Найти действующий код по идентификатору, не гася его.
+///
+/// Онбординг по ссылке-claim хранит в состоянии диалога только id кода:
+/// открытое значение в базе не сохраняется. Проверка нужна перед показом
+/// подтверждения и повторно перед созданием household.
+pub async fn find_active_by_id(
+    conn: &mut PgConnection,
+    purpose: Purpose,
+    id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<Option<OneTimeCode>, DomainError> {
+    repository::find_active_by_id(conn, purpose.as_str(), id, now).await
+}
+
+/// Погасить код по идентификатору атомарным `UPDATE … RETURNING`.
+///
+/// Работает в транзакции вызывающего: создание household по ссылке-claim
+/// гасит код и вставляет household одной транзакцией. Недействительный код
+/// даёт [`DomainError::NotFound`].
+pub async fn use_code_by_id(
+    conn: &mut PgConnection,
+    purpose: Purpose,
+    id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<OneTimeCode, DomainError> {
+    repository::use_code_by_id(conn, purpose.as_str(), id, now).await
 }
 
 /// Выпустить setup-код, если учётной записи администратора ещё нет.

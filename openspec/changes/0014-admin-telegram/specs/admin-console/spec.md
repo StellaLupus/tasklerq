@@ -1,5 +1,50 @@
 # Spec Delta
 
+## MODIFIED Requirements
+
+### Requirement: Мастер первого запуска
+
+После создания учётной записи консоль SHALL проводить администратора по шагам:
+household (только в `single`, если его нет); LLM; токен для Home Assistant.
+Шаги LLM и токена MUST допускать пропуск; шаг household MUST допускать пропуск,
+только если Telegram включён. Мастер MUST продолжаться с первого незавершённого
+шага после повторного входа и MUST NOT повторять завершённые шаги.
+
+#### Scenario: Установка только с Home Assistant
+
+- **WHEN** на пустой инсталляции в режиме `single` без Telegram администратор
+  создаёт household, пропускает LLM и выпускает токен
+- **THEN** household создан без владельца
+- **AND** токен со scopes `ha:read`, `ha:write`, `capture:write` показан один
+  раз
+- **AND** в базе хранится только хеш токена
+
+#### Scenario: Household создаст владелец в боте
+
+- **WHEN** Telegram включён и администратор пропускает шаг household
+- **THEN** household не создаётся
+- **AND** онбординг в боте проходит пользователь, открывший действующую
+  ссылку-claim консоли, или пользователь с Telegram ID из
+  `BOOTSTRAP_OWNER_TELEGRAM_ID`
+- **AND** без ссылки-claim и без совпадения с
+  `BOOTSTRAP_OWNER_TELEGRAM_ID` бот сообщает, что пространство ещё не настроено
+
+#### Scenario: Household уже есть
+
+- **WHEN** администратор впервые входит на инсталляцию, где household уже
+  создан через бота
+- **THEN** шаг household пропускается
+
+#### Scenario: Возврат в мастер
+
+- **WHEN** администратор закрыл консоль после шага household и вошёл снова
+- **THEN** мастер открывается на шаге LLM
+
+#### Scenario: Режим multi
+
+- **WHEN** инсталляция работает в режиме `multi`
+- **THEN** мастер не показывает шаги household и токена
+
 ## ADDED Requirements
 
 ### Requirement: Подключение Telegram в консоли

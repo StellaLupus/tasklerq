@@ -42,6 +42,9 @@ pub enum FirstContactScreen {
     AskInvite,
     /// Нужно назначить владельца командой CLI с этим Telegram ID.
     AdminCommand(i64),
+    /// То же, но учётка администратора уже создана: добавить подсказку
+    /// попросить ссылку-claim.
+    AdminCommandWithHint(i64),
     /// Инсталляция ещё не настроена, подробностей нет.
     NotConfigured,
     /// В `single` больше одного household: вмешательство администратора.
@@ -50,11 +53,23 @@ pub enum FirstContactScreen {
 
 impl FirstContactScreen {
     /// Экран для исхода классификатора; `None` — это онбординг.
+    ///
+    /// [`FirstContact::ClaimOwner`] обрабатывается вызывающим до сборки экрана:
+    /// назначение владельца — действие, а не информационный экран. Fail-closed
+    /// ответ здесь страхует от случайного вызова с этим исходом.
     pub fn from_contact(contact: FirstContact) -> Option<Self> {
         match contact {
             FirstContact::Onboard => None,
             FirstContact::AskInvite => Some(Self::AskInvite),
-            FirstContact::AdminCommand(telegram_id) => Some(Self::AdminCommand(telegram_id)),
+            FirstContact::AdminCommand {
+                telegram_id,
+                admin_exists: false,
+            } => Some(Self::AdminCommand(telegram_id)),
+            FirstContact::AdminCommand {
+                telegram_id,
+                admin_exists: true,
+            } => Some(Self::AdminCommandWithHint(telegram_id)),
+            FirstContact::ClaimOwner(_) => Some(Self::NotConfigured),
             FirstContact::NotConfigured => Some(Self::NotConfigured),
             FirstContact::NeedsAdmin => Some(Self::NeedsAdmin),
         }
@@ -1579,6 +1594,11 @@ pub enum Form {
     Onboarding {
         /// Название household после первого шага.
         name: Option<String>,
+        /// Идентификатор действующего кода `owner_claim`, по которому открыт
+        /// онбординг на пустой инсталляции. Старый JSON без поля читается как
+        /// онбординг без ссылки.
+        #[serde(default)]
+        claim_id: Option<Uuid>,
     },
     /// Единый редактор существующего элемента или пункта черновика.
     Editor(Editor),
@@ -2126,6 +2146,55 @@ mod tests {
             serde_json::from_value::<Screen>(json!({"t": "first_contact", "kind": "ask_invite"}))
                 .expect("ask invite screen"),
             Screen::FirstContact(FirstContactScreen::AskInvite)
+        );
+    }
+
+    #[test]
+    fn old_admin_command_screen_json_is_still_read() {
+        assert_eq!(
+            serde_json::from_value::<Screen>(json!({
+                "t": "first_contact",
+                "kind": "admin_command",
+                "value": 123,
+            }))
+            .expect("the old admin command screen"),
+            Screen::FirstContact(FirstContactScreen::AdminCommand(123))
+        );
+    }
+
+    #[test]
+    fn admin_command_hint_has_its_own_screen() {
+        assert_eq!(
+            FirstContactScreen::from_contact(FirstContact::AdminCommand {
+                telegram_id: 123,
+                admin_exists: false,
+            }),
+            Some(FirstContactScreen::AdminCommand(123))
+        );
+        assert_eq!(
+            FirstContactScreen::from_contact(FirstContact::AdminCommand {
+                telegram_id: 123,
+                admin_exists: true,
+            }),
+            Some(FirstContactScreen::AdminCommandWithHint(123))
+        );
+        assert_eq!(
+            FirstContactScreen::from_contact(FirstContact::ClaimOwner(Uuid::nil())),
+            Some(FirstContactScreen::NotConfigured),
+            "claim ownership is handled by the onboarding flow, not by a screen"
+        );
+    }
+
+    #[test]
+    fn onboarding_form_without_a_claim_id_is_read() {
+        let form: Form =
+            serde_json::from_value(json!({"form": "onboarding", "name": "Семья"})).expect("form");
+        assert_eq!(
+            form,
+            Form::Onboarding {
+                name: Some("Семья".to_owned()),
+                claim_id: None,
+            }
         );
     }
 

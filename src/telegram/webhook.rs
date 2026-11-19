@@ -6,7 +6,9 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use arc_swap::ArcSwapOption;
 use axum::body::{Body, to_bytes};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -32,6 +34,10 @@ pub const SECRET_HEADER: &str = "x-telegram-bot-api-secret-token";
 
 /// Максимальный размер тела обновления.
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// Сколько секунд Telegram должен подождать перед повтором, пока идёт смена
+/// поколения.
+pub const SWITCH_RETRY_AFTER: u64 = 5;
 
 /// Не больше 120 webhook-запросов в секунду с одного IP.
 pub const WEBHOOKS_PER_SECOND: u32 = 120;
@@ -77,6 +83,97 @@ impl Ingress {
     }
 }
 
+/// Общий слот приёма webhook: текущее поколение и признак его смены.
+///
+/// Супервизор Telegram кладёт сюда приём поколения и снимает его на время
+/// переключения. Слот разделяется между супервизором и [`crate::http::router::AppState`],
+/// поэтому обработчик видит смену поколения без пересборки роутера.
+#[derive(Clone, Default)]
+pub struct IngressSlot {
+    ingress: Arc<ArcSwapOption<Ingress>>,
+    switching: Arc<AtomicBool>,
+    /// Есть живое поколение Telegram; приём webhook есть только у webhook-режима,
+    /// поэтому для polling и readiness состояние хранится отдельно.
+    active: Arc<AtomicBool>,
+}
+
+impl IngressSlot {
+    /// Поставить приём текущего поколения; `None` — режим без webhook.
+    pub fn store(&self, ingress: Option<Ingress>) {
+        self.ingress.store(ingress.map(Arc::new));
+    }
+
+    /// Текущий приём; `None` — webhook выключен или идёт переключение.
+    pub fn load(&self) -> Option<Arc<Ingress>> {
+        self.ingress.load_full()
+    }
+
+    /// Отметить наличие живого поколения.
+    ///
+    /// Признак нужен readiness: лаг очереди проверяется, только пока есть кому
+    /// её разбирать. Значение ставит супервизор при запуске и остановке
+    /// поколения, а не при чтении настроек.
+    pub fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::SeqCst);
+    }
+
+    /// Есть живое поколение Telegram.
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::SeqCst)
+    }
+
+    /// Начать смену поколения: приём снимается, webhook отвечает `503`.
+    pub fn begin_switch(&self) {
+        self.switching.store(true, Ordering::SeqCst);
+        self.active.store(false, Ordering::SeqCst);
+        self.ingress.store(None);
+    }
+
+    /// Смена поколения закончена: приём уже в слоте (или его нет по режиму).
+    pub fn end_switch(&self) {
+        self.switching.store(false, Ordering::SeqCst);
+    }
+
+    /// Идёт смена поколения.
+    pub fn is_switching(&self) -> bool {
+        self.switching.load(Ordering::SeqCst)
+    }
+}
+
+/// Что делать с запросом по состоянию слота приёма.
+#[derive(Debug, PartialEq, Eq)]
+enum IngressGate<T> {
+    /// Обработать запрос текущим приёмом.
+    Handle(T),
+    /// Идёт смена поколения: ответить `503`.
+    Switching,
+    /// Приёма нет и переключения нет: ответить `404`.
+    NotFound,
+}
+
+/// Выбрать приём по первому чтению слота, признаку переключения и повторному
+/// чтению.
+///
+/// Повтор нужен из-за гонки: `load()` мог вернуть `None` прямо перед тем, как
+/// супервизор закончил `store(Some)` и снял признак переключения. Тогда
+/// живущее поколение не должно получить `404`; слот перечитывается один раз.
+fn select_ingress<T>(
+    first: Option<T>,
+    switching: bool,
+    reload: impl FnOnce() -> Option<T>,
+) -> IngressGate<T> {
+    if let Some(ingress) = first {
+        return IngressGate::Handle(ingress);
+    }
+    if switching {
+        return IngressGate::Switching;
+    }
+    match reload() {
+        Some(ingress) => IngressGate::Handle(ingress),
+        None => IngressGate::NotFound,
+    }
+}
+
 /// `POST /webhooks/telegram`.
 pub async fn receive(
     State(state): State<AppState>,
@@ -84,8 +181,20 @@ pub async fn receive(
     headers: HeaderMap,
     body: Body,
 ) -> Result<StatusCode, ApiError> {
-    let Some(ingress) = &state.telegram else {
-        return Err(ApiError::not_found("Route not found"));
+    // `load` и `is_switching` — два независимых чтения. Если первое вернуло
+    // `None`, а супервизор успел закончить переключение, признак уже снят:
+    // слот перечитывается один раз, чтобы не ответить `404` живому поколению.
+    let ingress = match select_ingress(state.telegram.load(), state.telegram.is_switching(), || {
+        state.telegram.load()
+    }) {
+        IngressGate::Handle(ingress) => ingress,
+        // Поколение меняется: Telegram повторит доставку, а отказ не считается
+        // ни ошибкой секрета, ни выключенным режимом.
+        IngressGate::Switching => {
+            return Err(ApiError::service_unavailable("Telegram is switching")
+                .with_retry_after(SWITCH_RETRY_AFTER));
+        }
+        IngressGate::NotFound => return Err(ApiError::not_found("Route not found")),
     };
 
     // Проверка лимита — до разбора тела и секрета: всплеск запросов с одного
@@ -188,4 +297,43 @@ pub async fn receive(
     }
 
     Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IngressGate, select_ingress};
+
+    #[test]
+    fn an_empty_slot_is_reread_once_before_a_404() {
+        assert_eq!(
+            select_ingress(None, false, || Some(7)),
+            IngressGate::Handle(7),
+            "a generation that started between the reads must serve the request"
+        );
+        assert_eq!(
+            select_ingress(None::<u8>, false, || None),
+            IngressGate::NotFound
+        );
+    }
+
+    #[test]
+    fn a_switch_is_not_mistaken_for_a_disabled_bot() {
+        let mut reread = false;
+        assert_eq!(
+            select_ingress(None::<u8>, true, || {
+                reread = true;
+                Some(1)
+            }),
+            IngressGate::Switching
+        );
+        assert!(!reread, "a switch is reported without a second read");
+    }
+
+    #[test]
+    fn a_loaded_ingress_is_used_as_is() {
+        assert_eq!(
+            select_ingress(Some(3), true, || panic!("the slot must not be reread")),
+            IngressGate::Handle(3)
+        );
+    }
 }
