@@ -1611,14 +1611,10 @@ async fn export_records_one_household_exported_audit_event_without_content() {
         Some(household.household_id),
         "the event names the exported household"
     );
-    let payload = events[0].2.to_string();
-    assert!(
-        !payload.contains(TASK_TITLE),
-        "the audit payload leaked the task text: {payload}"
-    );
-    assert!(
-        events[0].2.get("household_name").is_none(),
-        "the audit payload has no household content: {payload}"
+    assert_eq!(
+        events[0].2,
+        serde_json::json!({}),
+        "the export event has an empty payload"
     );
 }
 

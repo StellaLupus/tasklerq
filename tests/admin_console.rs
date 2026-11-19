@@ -12382,6 +12382,88 @@ async fn households_export_downloads_the_cli_json_and_records_one_audit_event() 
     );
 }
 
+/// Сбой записи события выгрузки не отдаёт файл: консоль отвечает `5xx` без
+/// данных household.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_export_fails_without_data_when_the_audit_event_is_rejected() {
+    use tasklerq::domain::models::ListKind;
+
+    const HOUSEHOLD_NAME: &str = "Квартира без аудита";
+    const TASK_TITLE: &str = "СЕКРЕТНАЯ ЗАДАЧА БЕЗ АУДИТА";
+    const LIST_NAME: &str = "СЕКРЕТНЫЙ СПИСОК БЕЗ АУДИТА";
+
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
+    let now = Utc::now();
+    let household = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        HOUSEHOLD_NAME,
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("the household");
+    insert_open_task(&db.pool, household.id, TASK_TITLE).await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+    tasklerq::storage::repositories::lists::create(
+        &mut conn,
+        household.id,
+        ListKind::Checklist,
+        LIST_NAME,
+        now,
+    )
+    .await
+    .expect("the secret list");
+    drop(conn);
+
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    // Триггер только в базе этого теста: выгрузка без события не должна уйти.
+    sqlx::query(
+        "CREATE FUNCTION reject_household_exported_fn() RETURNS trigger AS $$
+         BEGIN
+             IF NEW.event_type::text = 'household_exported' THEN
+                 RAISE EXCEPTION 'audit storage is unavailable';
+             END IF;
+             RETURN NEW;
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("the trigger function");
+    sqlx::query(
+        "CREATE TRIGGER reject_household_exported
+         BEFORE INSERT ON audit_events
+         FOR EACH ROW EXECUTE FUNCTION reject_household_exported_fn()",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("the audit trigger");
+
+    let path = format!("/admin/households/{}/export", household.id);
+    let (status, _, body) = send_with_cookie(&app, Method::POST, &path, &cookie).await;
+    assert!(
+        status.is_server_error(),
+        "the export must fail without an audit event: {status}"
+    );
+    let text = String::from_utf8_lossy(&body);
+    for content in [HOUSEHOLD_NAME, TASK_TITLE, LIST_NAME] {
+        assert!(
+            !text.contains(content),
+            "the failed export leaked `{content}`:\n{text}"
+        );
+    }
+    assert!(
+        audit_payloads(&db.pool, "household_exported")
+            .await
+            .is_empty(),
+        "the rejected event left no audit row"
+    );
+}
+
 /// Выгрузка несуществующего, удалённого или нечислового household — `404`, и
 /// события выгрузки не появляется.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
