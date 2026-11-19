@@ -10128,6 +10128,60 @@ fn household_row<'a>(html: &'a str, name: &str) -> &'a str {
     &html[start..end]
 }
 
+/// Активное приглашение household, вставленное напрямую как после `invite create`.
+async fn insert_active_invite(pool: &PgPool, household_id: Uuid, created_by: Uuid) -> Uuid {
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO invites (id, household_id, code_hash, role, created_by_user_id,
+                              expires_at, created_at)
+         VALUES ($1, $2, $3, 'member', $4, now() + interval '1 hour', now())",
+    )
+    .bind(id)
+    .bind(household_id)
+    .bind(hash_token(&format!("invite-{id}")))
+    .bind(created_by)
+    .execute(pool)
+    .await
+    .expect("the active invite");
+    id
+}
+
+/// Household с владельцем, участником, активным токеном и приглашением.
+async fn household_ready_for_deletion(pool: &PgPool, name: &str) -> (Uuid, Uuid) {
+    use tasklerq::domain::models::UserRole;
+
+    let now = Utc::now();
+    let household =
+        tasklerq::admin::create_household(pool, TenancyMode::Multi, name, "Europe/Moscow", now)
+            .await
+            .expect("the household to delete");
+    let (_, owner) = tasklerq::admin::add_user(
+        pool,
+        TenancyMode::Multi,
+        Some(household.id),
+        UserRole::Owner,
+        7_100_000_001,
+        Some("Алексей"),
+        now,
+    )
+    .await
+    .expect("the household owner");
+    tasklerq::admin::add_user(
+        pool,
+        TenancyMode::Multi,
+        Some(household.id),
+        UserRole::Member,
+        7_100_000_002,
+        Some("Мария"),
+        now,
+    )
+    .await
+    .expect("the household member");
+    support::issue_token(pool, household.id, &["ha:read"]).await;
+    let invite = insert_active_invite(pool, household.id, owner.id).await;
+    (household.id, invite)
+}
+
 /// В `single` второй household отклоняется текстом `admin::describe`, форма
 /// сохраняет ввод, а данные не меняются.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10342,6 +10396,336 @@ async fn single_mode_with_several_households_shows_the_list() {
             text.contains(&format!("href=\"/admin/households/{id}\"")),
             "the list links to {name}:\n{text}"
         );
-        assert!(household_row(&text, name).contains(name), "{text}");
     }
+    assert!(
+        !text.contains("action=\"/admin/households\""),
+        "single mode with several households must not offer the creation form:\n{text}"
+    );
+}
+
+/// Страница подтверждения показывает название и последствия, но ничего не
+/// меняет.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_delete_confirmation_page_changes_nothing() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
+    let (household_id, invite_id) = household_ready_for_deletion(&db.pool, "Дом").await;
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let path = format!("/admin/households/{household_id}/delete");
+    let (status, headers, body) = send_with_cookie(&app, Method::GET, &path, &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_security_headers(&headers, "GET the household delete page");
+    let text = String::from_utf8_lossy(&body);
+    for expected in [
+        "Дом",
+        "name=\"confirm_name\"",
+        "Household «Дом» и все участники будут помечены удалёнными",
+        "API-токены и приглашения будут отозваны",
+    ] {
+        assert!(
+            text.contains(expected),
+            "missing `{expected}` on the confirmation page:\n{text}"
+        );
+    }
+    assert!(
+        text.contains(&format!(
+            "action=\"/admin/households/{household_id}/delete\""
+        )),
+        "the form posts to the household delete route:\n{text}"
+    );
+
+    let deleted_at: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT deleted_at FROM households WHERE id = $1")
+            .bind(household_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("the household");
+    assert!(deleted_at.is_none(), "GET must not delete the household");
+    assert_eq!(member_count(&db.pool, household_id).await, 2);
+    assert_eq!(token_count(&db.pool).await, 1);
+    let invite_revoked: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT revoked_at FROM invites WHERE id = $1")
+            .bind(invite_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("the invite");
+    assert!(invite_revoked.is_none(), "GET must not revoke the invite");
+    assert!(
+        audit_actor(&db.pool, "household_deleted").await.is_empty(),
+        "GET must not write the deletion event"
+    );
+}
+
+/// Неверное название — отказ без изменений и без удаления.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_delete_with_a_wrong_name_changes_nothing() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
+    let (household_id, invite_id) = household_ready_for_deletion(&db.pool, "Квартира").await;
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let path = format!("/admin/households/{household_id}/delete");
+    let (status, _, body) = send_form_from(
+        &app,
+        &path,
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("confirm_name", "Дача")],
+    )
+    .await;
+    assert!(
+        status.is_client_error(),
+        "a wrong name is a form refusal, not {status}"
+    );
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("не совпадает"),
+        "the page explains the mismatch:\n{text}"
+    );
+    assert_eq!(household_count(&db.pool).await, 1, "the household stays");
+    assert_eq!(member_count(&db.pool, household_id).await, 2);
+    assert_eq!(token_count(&db.pool).await, 1);
+    let invite_revoked: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT revoked_at FROM invites WHERE id = $1")
+            .bind(invite_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("the invite");
+    assert!(invite_revoked.is_none(), "the invite stays active");
+    assert!(
+        audit_actor(&db.pool, "household_deleted").await.is_empty(),
+        "nothing was deleted"
+    );
+}
+
+/// POST без поля подтверждения и с пустым полем ничего не меняет.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_delete_without_confirmation_changes_nothing() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
+    let (household_id, _) = household_ready_for_deletion(&db.pool, "Квартира").await;
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let path = format!("/admin/households/{household_id}/delete");
+    for fields in [
+        Vec::new(),
+        vec![("confirm_name", "")],
+        vec![("confirm_name", "   ")],
+    ] {
+        let (status, _, body) = send_form_from(
+            &app,
+            &path,
+            test_peer(),
+            headers_with(&[("cookie", &cookie)]),
+            &fields,
+        )
+        .await;
+        assert!(
+            status.is_client_error(),
+            "a request without confirmation is refused, not {status}"
+        );
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("Введите название"),
+            "the page asks for the household name:\n{text}"
+        );
+        assert_eq!(household_count(&db.pool).await, 1, "the household stays");
+        assert_eq!(member_count(&db.pool, household_id).await, 2);
+        assert_eq!(token_count(&db.pool).await, 1);
+    }
+    assert!(
+        audit_actor(&db.pool, "household_deleted").await.is_empty(),
+        "nothing was deleted"
+    );
+}
+
+/// Название с крайними пробелами проходит: сравниваются значения после `trim`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_delete_trims_surrounding_spaces_in_the_name() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
+    let (household_id, _) = household_ready_for_deletion(&db.pool, "Дача").await;
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let path = format!("/admin/households/{household_id}/delete");
+    let (status, headers, _) = send_form_from(
+        &app,
+        &path,
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("confirm_name", "  Дача  ")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/households"));
+    assert_eq!(household_count(&db.pool).await, 0);
+}
+
+/// Верное название мягко удаляет household, участников и отзывает доступы;
+/// событие удаления пишется от системного актора.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_delete_with_the_name_soft_deletes_and_revokes() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
+    let (household_id, invite_id) = household_ready_for_deletion(&db.pool, "Квартира").await;
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let path = format!("/admin/households/{household_id}/delete");
+    let (status, headers, body) = send_form_from(
+        &app,
+        &path,
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("confirm_name", "Квартира")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "an accepted deletion redirects: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(location(&headers), Some("/admin/households"));
+
+    let deleted_at: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT deleted_at FROM households WHERE id = $1")
+            .bind(household_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("the household");
+    assert!(deleted_at.is_some(), "the household is soft-deleted");
+    assert_eq!(member_count(&db.pool, household_id).await, 0);
+    let deleted_members: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM users WHERE household_id = $1 AND deleted_at IS NOT NULL",
+    )
+    .bind(household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("the soft-deleted members");
+    assert_eq!(deleted_members, 2);
+
+    let active_tokens: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM api_tokens WHERE household_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(household_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("the active tokens");
+    assert_eq!(active_tokens, 0, "the tokens are revoked");
+    let invite_revoked: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT revoked_at FROM invites WHERE id = $1")
+            .bind(invite_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("the invite");
+    assert!(invite_revoked.is_some(), "the invite is revoked");
+
+    let events = audit_actor(&db.pool, "household_deleted").await;
+    assert_eq!(
+        events,
+        vec![("system".to_owned(), Some(household_id))],
+        "the deletion is recorded for the household by the system actor"
+    );
+    let payloads = audit_payloads(&db.pool, "household_deleted").await;
+    assert_eq!(payloads.len(), 1);
+    assert_eq!(payloads[0]["household_name"], "Квартира");
+    assert_eq!(payloads[0]["revoked_tokens"], 1);
+    assert_eq!(payloads[0]["revoked_invites"], 1);
+
+    let card = format!("/admin/households/{household_id}");
+    let (status, _, _) = send_with_cookie(&app, Method::GET, &card, &cookie).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the card of a deleted household"
+    );
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin/households", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        !text.contains(&format!("href=\"/admin/households/{household_id}\"")),
+        "the deleted household disappears from the list:\n{text}"
+    );
+    assert!(!text.contains("Квартира"), "{text}");
+}
+
+/// Несуществующий, удалённый и нечисловой id на обеих страницах удаления — `404`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_delete_pages_are_not_found_for_missing_households() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let now = Utc::now();
+    let deleted = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Удалённый",
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("the household");
+    tasklerq::admin::delete_household(&db.pool, deleted.id, now)
+        .await
+        .expect("the household is deleted");
+    let app = console(&db.pool, Vec::new());
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    for id in [
+        Uuid::now_v7().to_string(),
+        deleted.id.to_string(),
+        "not-a-uuid".to_owned(),
+    ] {
+        let path = format!("/admin/households/{id}/delete");
+        let (status, headers, _) = send_with_cookie(&app, Method::GET, &path, &cookie).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "GET {path}");
+        assert_security_headers(&headers, "GET a missing household delete page");
+
+        let (status, _, _) = send_form_from(
+            &app,
+            &path,
+            test_peer(),
+            headers_with(&[("cookie", &cookie)]),
+            &[("confirm_name", "Удалённый")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "POST {path}");
+    }
+}
+
+/// Без владельца и без готового Telegram карточка объясняет, как подключить
+/// бота, и не показывает форму выпуска ссылки-claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_card_without_owner_explains_missing_telegram() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
+    let household = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Дача",
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("the household");
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let path = format!("/admin/households/{}", household.id);
+    let (status, _, body) = send_with_cookie(&app, Method::GET, &path, &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("Сначала подключите бота"),
+        "the card explains that the bot is not ready:\n{text}"
+    );
+    assert!(
+        !text.contains("action=\"/admin/owner\""),
+        "without a ready bot the claim form is hidden:\n{text}"
+    );
 }

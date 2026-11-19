@@ -1957,6 +1957,23 @@ pub(crate) fn render_household_detail(view: super::households::HouseholdView) ->
     render(ConsolePage::new(Page::Household(Box::new(view))))
 }
 
+/// Отрисовать страницу подтверждения удаления household.
+pub(crate) fn render_household_delete(view: super::households::HouseholdDeleteView) -> Response {
+    render(ConsolePage::new(Page::HouseholdDelete(Box::new(view))))
+}
+
+/// Отрисовать подтверждение удаления с сообщением отказа формы.
+pub(crate) fn render_household_delete_error(
+    view: super::households::HouseholdDeleteView,
+    message: &str,
+    status: StatusCode,
+) -> Response {
+    render_with_status(
+        ConsolePage::new(Page::HouseholdDelete(Box::new(view))).error(message),
+        status,
+    )
+}
+
 /// Отрисовать список household с сообщением отказа формы.
 pub(crate) fn render_household_list_error(
     view: super::households::HouseholdList,
@@ -2410,6 +2427,8 @@ enum Page {
     Households(Box<super::households::HouseholdList>),
     /// Карточка household.
     Household(Box<super::households::HouseholdView>),
+    /// Подтверждение удаления household.
+    HouseholdDelete(Box<super::households::HouseholdDeleteView>),
 }
 
 /// Поля шага мастера, которые возвращаются в форму после отказа.
@@ -2448,6 +2467,7 @@ impl Page {
             Self::TelegramLinkIssued(_) => "Ссылка привязки Telegram",
             Self::Check(_) => "Проверка слота",
             Self::Households(_) | Self::Household(_) => "Household",
+            Self::HouseholdDelete(_) => "Удаление household",
         }
     }
 
@@ -2469,6 +2489,7 @@ impl Page {
                 | Self::Check(_)
                 | Self::Households(_)
                 | Self::Household(_)
+                | Self::HouseholdDelete(_)
         )
     }
 
@@ -2476,7 +2497,7 @@ impl Page {
     fn section(&self) -> &'static str {
         match self {
             Self::Home(_) | Self::OwnerLinkIssued(_) | Self::TelegramLinkIssued(_) => "home",
-            Self::Households(_) | Self::Household(_) => "household",
+            Self::Households(_) | Self::Household(_) | Self::HouseholdDelete(_) => "household",
             Self::Llm(_) | Self::Check(_) => "llm",
             Self::Telegram(view) if !view.wizard => "telegram",
             Self::Password { .. } => "password",
@@ -2593,6 +2614,7 @@ impl Page {
             }
             Self::Households(view) => super::households::render_list_body(view),
             Self::Household(view) => view.render_body(),
+            Self::HouseholdDelete(view) => view.render_body(),
         }
     }
 }

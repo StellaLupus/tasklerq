@@ -267,6 +267,10 @@ pub fn build_router(state: AdminState) -> Router {
             get(households::list).post(households::create),
         )
         .route("/admin/households/{id}", get(households::detail))
+        .route(
+            "/admin/households/{id}/delete",
+            get(households::delete_page).post(households::delete),
+        )
         .route(WIZARD_PATH, get(pages::wizard_page))
         .route(WIZARD_SKIP_PATH, post(pages::wizard_skip))
         .route("/admin/wizard/household", post(pages::wizard_household))
