@@ -68,7 +68,7 @@
 
 ## 4. Claim владельца и первый контакт
 
-- [ ] 4.1 Миграция: назначения `owner_claim` и `telegram_link` с CHECK
+- [x] 4.1 Миграция: назначения `owner_claim` и `telegram_link` с CHECK
   (`household_id` NULL только для `owner_claim`),
   `admin_accounts.telegram_user_id` (уникальный),
   `pending_telegram_user_id` с именем, `console_origin`, значения

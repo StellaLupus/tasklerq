@@ -56,6 +56,10 @@ pub enum AuditEventType {
     AdminRecoveryIssued,
     /// Настройка изменена в консоли.
     AdminSettingChanged,
+    /// Telegram привязан к учётной записи администратора.
+    AdminTelegramLinked,
+    /// Привязка Telegram к учётной записи администратора снята.
+    AdminTelegramUnlinked,
 }
 
 impl AuditEventType {
@@ -84,6 +88,8 @@ impl AuditEventType {
             Self::AdminPasswordChanged => "admin_password_changed",
             Self::AdminRecoveryIssued => "admin_recovery_issued",
             Self::AdminSettingChanged => "admin_setting_changed",
+            Self::AdminTelegramLinked => "admin_telegram_linked",
+            Self::AdminTelegramUnlinked => "admin_telegram_unlinked",
         }
     }
 
@@ -259,6 +265,11 @@ mod tests {
             ),
             (AuditEventType::AdminRecoveryIssued, "admin_recovery_issued"),
             (AuditEventType::AdminSettingChanged, "admin_setting_changed"),
+            (AuditEventType::AdminTelegramLinked, "admin_telegram_linked"),
+            (
+                AuditEventType::AdminTelegramUnlinked,
+                "admin_telegram_unlinked",
+            ),
         ];
 
         for (event_type, name) in expected {

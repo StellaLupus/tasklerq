@@ -593,7 +593,9 @@ pub fn journal_line(event: &AuditEvent, tz: chrono_tz::Tz) -> String {
         | AuditEventType::AdminAccountCreated
         | AuditEventType::AdminPasswordChanged
         | AuditEventType::AdminRecoveryIssued
-        | AuditEventType::AdminSettingChanged => "Служебное событие".to_owned(),
+        | AuditEventType::AdminSettingChanged
+        | AuditEventType::AdminTelegramLinked
+        | AuditEventType::AdminTelegramUnlinked => "Служебное событие".to_owned(),
     };
     match source_label(event.actor_type) {
         Some(source) => format!("{stamp} · {what} · источник: {source}"),

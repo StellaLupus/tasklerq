@@ -10,9 +10,11 @@
 //! нужно; если в этом слое появится сравнение секретов в памяти, его следует
 //! делать через `subtle`, а не `==`.
 //!
-//! `expires_at` задаёт вызывающая сторона: `setup` живёт без срока, `recovery` —
-//! 15 минут. Ограничения назначений, срока и household держит схема
-//! (`migrations/0021_admin_console.sql`).
+//! `expires_at` задаёт вызывающая сторона: `setup` живёт без срока, `recovery`
+//! и `telegram_link` — 15 минут, `owner_claim` — 24 часа. Ограничения
+//! назначений, срока и household держит схема
+//! (`migrations/0021_admin_console.sql`, заменено в
+//! `migrations/0022_admin_telegram.sql`).
 
 use std::fmt;
 
@@ -29,6 +31,10 @@ use crate::redaction::REDACTED;
 pub const PURPOSE_SETUP: &str = "setup";
 /// Назначение `recovery`: восстановление доступа.
 pub const PURPOSE_RECOVERY: &str = "recovery";
+/// Назначение `owner_claim`: ссылка-claim владельца.
+pub const PURPOSE_OWNER_CLAIM: &str = "owner_claim";
+/// Назначение `telegram_link`: привязка Telegram к учётной записи.
+pub const PURPOSE_TELEGRAM_LINK: &str = "telegram_link";
 /// Длина случайной части кода в байтах: 256 бит, не меньше требуемых 128.
 pub const CODE_BYTES: usize = 32;
 
@@ -41,7 +47,7 @@ pub struct OneTimeCode {
     pub id: Uuid,
     /// Назначение.
     pub purpose: String,
-    /// Household для кодов уровня household; в 0013 всегда `None`.
+    /// Household для кодов уровня household: задан только у `owner_claim`.
     pub household_id: Option<Uuid>,
     /// Срок действия; `None` только у `setup`.
     pub expires_at: Option<DateTime<Utc>>,

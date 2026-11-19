@@ -20,6 +20,12 @@ use crate::storage::repositories::admin_one_time_codes::{
 /// Срок жизни `recovery`-кода, минуты.
 pub const RECOVERY_TTL_MINUTES: i64 = 15;
 
+/// Срок жизни ссылки-claim владельца, часы.
+pub const OWNER_CLAIM_TTL_HOURS: i64 = 24;
+
+/// Срок жизни ссылки привязки Telegram, минуты.
+pub const TELEGRAM_LINK_TTL_MINUTES: i64 = 15;
+
 /// Назначение одноразового кода.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Purpose {
@@ -27,6 +33,10 @@ pub enum Purpose {
     Setup,
     /// Восстановление доступа.
     Recovery,
+    /// Ссылка-claim владельца.
+    OwnerClaim,
+    /// Привязка Telegram к учётной записи администратора.
+    TelegramLink,
 }
 
 impl Purpose {
@@ -35,6 +45,8 @@ impl Purpose {
         match self {
             Self::Setup => repository::PURPOSE_SETUP,
             Self::Recovery => repository::PURPOSE_RECOVERY,
+            Self::OwnerClaim => repository::PURPOSE_OWNER_CLAIM,
+            Self::TelegramLink => repository::PURPOSE_TELEGRAM_LINK,
         }
     }
 
@@ -43,6 +55,8 @@ impl Purpose {
         match self {
             Self::Setup => None,
             Self::Recovery => Some(Duration::minutes(RECOVERY_TTL_MINUTES)),
+            Self::OwnerClaim => Some(Duration::hours(OWNER_CLAIM_TTL_HOURS)),
+            Self::TelegramLink => Some(Duration::minutes(TELEGRAM_LINK_TTL_MINUTES)),
         }
     }
 }
