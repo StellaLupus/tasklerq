@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::domain::first_contact::classify;
 use crate::domain::models::{List, ListKind};
 use crate::domain::validation::{MAX_TITLE, sanitize};
-use crate::storage::repositories::{households, items, lists};
+use crate::storage::repositories::{admin_accounts, households, items, lists};
 use crate::telegram::views::{self, Lookup};
 
 use super::model::{
@@ -366,13 +366,16 @@ pub async fn start_onboarding(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
     }
 
     let installation = households::installation(&mut *ctx.conn).await?;
+    let admin_exists = admin_accounts::exists(&mut *ctx.conn).await?;
     let contact = classify(
         ctx.tenancy.mode,
         ctx.tenancy.bootstrap_owner,
         ctx.sender.id,
         installation,
+        None,
+        admin_exists,
     );
-    let Some(screen) = FirstContactScreen::from_contact(contact) else {
+    let Some(screen) = FirstContactScreen::from_contact(contact, ctx.sender.id) else {
         return open(ctx, Form::Onboarding { name: None }).await;
     };
     if matches!(load(ctx).await?, Some(Form::Onboarding { .. })) {

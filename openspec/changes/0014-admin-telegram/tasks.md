@@ -75,7 +75,7 @@
   `audit_event_type` `admin_telegram_linked` и `admin_telegram_unlinked`.
   Проверить в `tests/migrations.rs`: ограничения назначений и уникальность
   привязки (design, решения 4, 6).
-- [ ] 4.2 `first_contact::classify` с входами `claim` и `admin_exists` по
+- [x] 4.2 `first_contact::classify` с входами `claim` и `admin_exists` по
   таблице design, решение 5; исход `ClaimOwner`. Проверить табличным
   юнит-тестом все строки таблицы; существующие тесты `tests/first_contact.rs`
   проходят.

@@ -58,6 +58,18 @@ pub async fn get(conn: &mut PgConnection) -> Result<Option<AdminAccount>, Domain
     Ok(account)
 }
 
+/// Есть ли учётная запись администратора.
+///
+/// Дешевле [`get`]: не читает хеш пароля и остальные поля, когда нужен только
+/// факт существования (первый контакт).
+pub async fn exists(conn: &mut PgConnection) -> Result<bool, DomainError> {
+    let exists = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM admin_accounts)")
+        .fetch_one(conn)
+        .await?;
+
+    Ok(exists)
+}
+
 /// Создать учётную запись по готовому хешу пароля.
 ///
 /// Вызывать внутри транзакции вместе с [`crate::admin_console::codes::use_code`]:

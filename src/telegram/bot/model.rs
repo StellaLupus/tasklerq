@@ -42,6 +42,9 @@ pub enum FirstContactScreen {
     AskInvite,
     /// Нужно назначить владельца командой CLI с этим Telegram ID.
     AdminCommand(i64),
+    /// То же, но учётка администратора уже создана: добавить подсказку
+    /// попросить ссылку-claim.
+    AdminCommandWithHint(i64),
     /// Инсталляция ещё не настроена, подробностей нет.
     NotConfigured,
     /// В `single` больше одного household: вмешательство администратора.
@@ -50,11 +53,25 @@ pub enum FirstContactScreen {
 
 impl FirstContactScreen {
     /// Экран для исхода классификатора; `None` — это онбординг.
-    pub fn from_contact(contact: FirstContact) -> Option<Self> {
+    ///
+    /// [`FirstContact::ClaimOwner`] до пункта 4.3 показывается как
+    /// [`FirstContactScreen::AdminCommand`]: назначение владельца ещё не
+    /// реализовано, а открывать онбординг на уже существующем household нельзя
+    /// — форма зациклилась бы на повторной проверке классификатора. Для
+    /// claim-перехода 4.3 обработает исход до вызова этого метода.
+    pub fn from_contact(contact: FirstContact, sender_id: i64) -> Option<Self> {
         match contact {
             FirstContact::Onboard => None,
             FirstContact::AskInvite => Some(Self::AskInvite),
-            FirstContact::AdminCommand(telegram_id) => Some(Self::AdminCommand(telegram_id)),
+            FirstContact::AdminCommand {
+                telegram_id,
+                admin_exists: false,
+            } => Some(Self::AdminCommand(telegram_id)),
+            FirstContact::AdminCommand {
+                telegram_id,
+                admin_exists: true,
+            } => Some(Self::AdminCommandWithHint(telegram_id)),
+            FirstContact::ClaimOwner(_) => Some(Self::AdminCommand(sender_id)),
             FirstContact::NotConfigured => Some(Self::NotConfigured),
             FirstContact::NeedsAdmin => Some(Self::NeedsAdmin),
         }
@@ -2126,6 +2143,53 @@ mod tests {
             serde_json::from_value::<Screen>(json!({"t": "first_contact", "kind": "ask_invite"}))
                 .expect("ask invite screen"),
             Screen::FirstContact(FirstContactScreen::AskInvite)
+        );
+    }
+
+    #[test]
+    fn old_admin_command_screen_json_is_still_read() {
+        assert_eq!(
+            serde_json::from_value::<Screen>(json!({
+                "t": "first_contact",
+                "kind": "admin_command",
+                "value": 123,
+            }))
+            .expect("the old admin command screen"),
+            Screen::FirstContact(FirstContactScreen::AdminCommand(123))
+        );
+    }
+
+    #[test]
+    fn admin_command_hint_has_its_own_screen() {
+        assert_eq!(
+            FirstContactScreen::from_contact(
+                FirstContact::AdminCommand {
+                    telegram_id: 123,
+                    admin_exists: false,
+                },
+                123,
+            ),
+            Some(FirstContactScreen::AdminCommand(123))
+        );
+        assert_eq!(
+            FirstContactScreen::from_contact(
+                FirstContact::AdminCommand {
+                    telegram_id: 123,
+                    admin_exists: true,
+                },
+                123,
+            ),
+            Some(FirstContactScreen::AdminCommandWithHint(123))
+        );
+        assert_eq!(
+            FirstContactScreen::from_contact(FirstContact::ClaimOwner(None), 123),
+            Some(FirstContactScreen::AdminCommand(123)),
+            "claim ownership is not a screen yet; the sender must not get onboarding"
+        );
+        assert_eq!(
+            FirstContactScreen::from_contact(FirstContact::ClaimOwner(Some(Uuid::nil())), 123),
+            Some(FirstContactScreen::AdminCommand(123)),
+            "an unexpected claim target must fail closed instead of opening onboarding"
         );
     }
 

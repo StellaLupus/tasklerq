@@ -816,6 +816,27 @@ fn error_code<T>(result: &Result<T, sqlx::Error>) -> Option<String> {
     }
 }
 
+fn error_constraint<T>(result: &Result<T, sqlx::Error>) -> Option<String> {
+    match result {
+        Err(sqlx::Error::Database(database)) => database.constraint().map(str::to_owned),
+        _ => None,
+    }
+}
+
+/// Отказ именно ожидаемым CHECK, а не любым другим ограничением таблицы.
+fn assert_check_violation<T>(result: &Result<T, sqlx::Error>, constraint: &str) {
+    assert_eq!(
+        error_code(result).as_deref(),
+        Some("23514"),
+        "the insert must violate a CHECK: {constraint}"
+    );
+    assert_eq!(
+        error_constraint(result).as_deref(),
+        Some(constraint),
+        "the violated CHECK must be {constraint}"
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn insert_setting(
     pool: &sqlx::PgPool,
@@ -1577,12 +1598,9 @@ async fn admin_one_time_codes_migration_enforces_purpose_expiry_and_household() 
     .await
     .expect("a recovery code lives 15 minutes");
 
-    let unknown = insert_one_time_code(&db.pool, "magic", None, &code_hash('c'), None).await;
-    assert_eq!(
-        error_code(&unknown).as_deref(),
-        Some("23514"),
-        "only the known purposes are accepted"
-    );
+    let unknown =
+        insert_one_time_code(&db.pool, "magic", None, &code_hash('c'), Some("15 minutes")).await;
+    assert_check_violation(&unknown, "admin_one_time_codes_purpose");
 
     let household_id = Uuid::now_v7();
     sqlx::query("INSERT INTO households (id, name, timezone) VALUES ($1, 'Дом', 'Europe/Moscow')")
@@ -1593,19 +1611,14 @@ async fn admin_one_time_codes_migration_enforces_purpose_expiry_and_household() 
 
     let setup_with_household =
         insert_one_time_code(&db.pool, "setup", Some(household_id), &code_hash('d'), None).await;
-    assert_eq!(
-        error_code(&setup_with_household).as_deref(),
-        Some("23514"),
-        "in 0013 every purpose is installation-wide"
+    assert_check_violation(
+        &setup_with_household,
+        "admin_one_time_codes_purpose_household",
     );
 
     let recovery_without_expiry =
         insert_one_time_code(&db.pool, "recovery", None, &code_hash('e'), None).await;
-    assert_eq!(
-        error_code(&recovery_without_expiry).as_deref(),
-        Some("23514"),
-        "only a setup code may live without an expiry"
-    );
+    assert_check_violation(&recovery_without_expiry, "admin_one_time_codes_expiry");
 
     let duplicate = insert_one_time_code(
         &db.pool,
@@ -1622,11 +1635,7 @@ async fn admin_one_time_codes_migration_enforces_purpose_expiry_and_household() 
     );
 
     let raw_code = insert_one_time_code(&db.pool, "setup", None, "A3f-_code", None).await;
-    assert_eq!(
-        error_code(&raw_code).as_deref(),
-        Some("23514"),
-        "only a 64 hex character SHA-256 may be stored instead of the code"
-    );
+    assert_check_violation(&raw_code, "admin_one_time_codes_code_hash_check");
 
     // В 0013 строку с household вставить нельзя, поэтому проверяем определение
     // внешнего ключа по каталогу: 0014 будет выпускать коды household, и они
@@ -1664,11 +1673,7 @@ async fn admin_one_time_codes_migration_requires_expiry_after_creation() {
         .bind(code_hash(fill))
         .execute(&db.pool)
         .await;
-        assert_eq!(
-            error_code(&expired).as_deref(),
-            Some("23514"),
-            "expires_at must be strictly later than created_at: {offset}"
-        );
+        assert_check_violation(&expired, "admin_one_time_codes_expiry_after_creation");
     }
 
     let valid = sqlx::query(
@@ -1858,29 +1863,17 @@ async fn admin_telegram_migration_binds_codes_to_purposes_and_households() {
             Some("15 minutes"),
         )
         .await;
-        assert_eq!(
-            error_code(&with_household).as_deref(),
-            Some("23514"),
-            "{purpose} must not reference a household"
-        );
+        assert_check_violation(&with_household, "admin_one_time_codes_purpose_household");
     }
 
     let unknown =
         insert_one_time_code(&db.pool, "magic", None, &code_hash('8'), Some("15 minutes")).await;
-    assert_eq!(
-        error_code(&unknown).as_deref(),
-        Some("23514"),
-        "only the four known purposes are accepted"
-    );
+    assert_check_violation(&unknown, "admin_one_time_codes_purpose");
 
     for (fill, purpose) in [('9', "telegram_link"), ('a', "owner_claim")] {
         let without_expiry =
             insert_one_time_code(&db.pool, purpose, None, &code_hash(fill), None).await;
-        assert_eq!(
-            error_code(&without_expiry).as_deref(),
-            Some("23514"),
-            "{purpose} must carry an expiry; only setup lives without one"
-        );
+        assert_check_violation(&without_expiry, "admin_one_time_codes_expiry");
     }
 }
 
@@ -1909,20 +1902,12 @@ async fn admin_telegram_migration_enforces_the_telegram_binding() {
     let only_id = sqlx::query("UPDATE admin_accounts SET pending_telegram_user_id = 7000000002")
         .execute(&db.pool)
         .await;
-    assert_eq!(
-        error_code(&only_id).as_deref(),
-        Some("23514"),
-        "a pending telegram id without a name is rejected"
-    );
+    assert_check_violation(&only_id, "admin_accounts_pending_telegram");
 
     let only_name = sqlx::query("UPDATE admin_accounts SET pending_telegram_name = 'Кандидат'")
         .execute(&db.pool)
         .await;
-    assert_eq!(
-        error_code(&only_name).as_deref(),
-        Some("23514"),
-        "a pending name without a telegram id is rejected"
-    );
+    assert_check_violation(&only_name, "admin_accounts_pending_telegram");
 
     sqlx::query(
         "UPDATE admin_accounts

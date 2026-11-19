@@ -6,6 +6,7 @@ use crate::domain::error::DomainError;
 use crate::domain::first_contact::{FirstContact, classify};
 use crate::domain::identity::NewMember;
 use crate::domain::settings::validate_timezone;
+use crate::storage::repositories::admin_accounts;
 use crate::storage::repositories::households::{self, NewOwner};
 use crate::storage::repositories::invites;
 use crate::telegram::rich::{Span, button};
@@ -121,6 +122,12 @@ pub fn first_contact(contact: &FirstContactScreen) -> Ui {
             .text(ru::ADMIN_COMMAND_INTRO)
             .spans(vec![Span::Code(ru::owner_command(*telegram_id))])
             .text(ru::OWNER_NOT_ASSIGNED),
+        FirstContactScreen::AdminCommandWithHint(telegram_id) => Ui::new()
+            .heading(ru::NOT_CONFIGURED_TITLE)
+            .text(ru::ADMIN_COMMAND_INTRO)
+            .spans(vec![Span::Code(ru::owner_command(*telegram_id))])
+            .text(ru::OWNER_NOT_ASSIGNED)
+            .text(ru::ADMIN_LINK_HINT),
         FirstContactScreen::NotConfigured => Ui::new()
             .heading(ru::NOT_CONFIGURED_TITLE)
             .text(ru::NOT_CONFIGURED),
@@ -195,11 +202,14 @@ async fn create(ctx: &mut Ctx<'_>, name: &str, zone: &str) -> Result<(), Fail> {
     // классификатор перепроверяется целиком: не-`Onboard` закрывает форму и
     // показывает экран нового состояния, household не создаётся.
     let installation = households::installation(&mut *ctx.conn).await?;
+    let admin_exists = admin_accounts::exists(&mut *ctx.conn).await?;
     let contact = classify(
         ctx.tenancy.mode,
         ctx.tenancy.bootstrap_owner,
         ctx.sender.id,
         installation,
+        None,
+        admin_exists,
     );
     if contact != FirstContact::Onboard {
         // Тот же путь, что при `household_exists`: `start_onboarding` закроет
@@ -249,4 +259,29 @@ async fn create(ctx: &mut Ctx<'_>, name: &str, zone: &str) -> Result<(), Fail> {
     ctx.user = Some(onboarded.user);
     ctx.household = Some(onboarded.household);
     ctx.present(Screen::Welcome).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::telegram::rich::Block;
+
+    fn has_text(ui: &Ui, text: &str) -> bool {
+        ui.blocks.iter().any(|block| {
+            matches!(
+                block,
+                Block::Paragraph(spans)
+                    if spans.iter().any(|span| span == &Span::Text(text.to_owned()))
+            )
+        })
+    }
+
+    #[test]
+    fn admin_command_screen_shows_the_link_hint_only_with_an_account() {
+        let without = first_contact(&FirstContactScreen::AdminCommand(42));
+        assert!(!has_text(&without, ru::ADMIN_LINK_HINT));
+
+        let with = first_contact(&FirstContactScreen::AdminCommandWithHint(42));
+        assert!(has_text(&with, ru::ADMIN_LINK_HINT));
+    }
 }

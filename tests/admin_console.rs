@@ -4431,11 +4431,11 @@ fn capture_router(pool: &PgPool, ai: Arc<support::llm::BackendDouble>) -> Router
 }
 
 /// Бот в режиме `single` на базе теста.
-fn single_bot(pool: &PgPool, telegram_id: i64) -> Harness {
+fn single_bot(pool: &PgPool, telegram_id: i64, bootstrap_owner: Option<i64>) -> Harness {
     let bot = Bot::new("tasklerqbot")
         .with_tenancy_config(TenancyConfig {
             mode: TenancyMode::Single,
-            bootstrap_owner: None,
+            bootstrap_owner,
         })
         .with_audit(Audit::new(pool.clone()));
     Harness::with_handler(pool, telegram_id, Arc::new(bot), FakeTelegram::new())
@@ -4710,9 +4710,10 @@ async fn the_household_step_validates_and_creates_only_one_household() {
     );
 }
 
-/// Telegram включён и household пропущен: бот создаёт household и владельца.
+/// Telegram включён и household пропущен: после создания учётки дом создаёт
+/// только `BOOTSTRAP_OWNER_TELEGRAM_ID`, а не первый написавший.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_household_skip_leaves_the_first_bot_user_to_onboard() {
+async fn a_household_skip_needs_the_bootstrap_owner_after_the_account_exists() {
     let db = support::isolated_db().await;
     insert_account(&db.pool, "admin").await;
     let app = console_with(&db.pool, TenancyMode::Single, true, LlmConfig::empty());
@@ -4734,8 +4735,21 @@ async fn a_household_skip_leaves_the_first_bot_user_to_onboard() {
         "the skip leaves the household to the bot"
     );
 
+    // Без bootstrap-владельца учётка закрывает правило первого написавшего.
+    let stranger = support::next_telegram_id();
+    let mut first = single_bot(&db.pool, stranger, None);
+    first.text("/start").await;
+    first.assert_screen_contains("Обратитесь к администратору");
+    assert!(
+        !first.screen().contains("Как назовём ваше пространство"),
+        "the first sender must not onboard after the account exists:\n{}",
+        first.screen()
+    );
+    assert_eq!(household_count(&db.pool).await, 0);
+
+    // Явный bootstrap-владелец проходит онбординг, как и раньше.
     let telegram_id = support::next_telegram_id();
-    let mut bot = single_bot(&db.pool, telegram_id);
+    let mut bot = single_bot(&db.pool, telegram_id, Some(telegram_id));
     bot.text("/start").await;
     bot.assert_screen_contains("Как назовём ваше пространство");
     bot.text("Семья").await;

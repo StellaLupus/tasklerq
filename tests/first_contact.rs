@@ -103,6 +103,17 @@ fn single_harness(pool: &PgPool, telegram_id: i64, bootstrap_owner: Option<i64>)
     Harness::with_handler(pool, telegram_id, Arc::new(bot), FakeTelegram::new())
 }
 
+/// Бот в режиме `multi` на отдельной базе.
+fn multi_harness(pool: &PgPool, telegram_id: i64) -> Harness {
+    let bot = Bot::new("tasklerqbot")
+        .with_tenancy_config(TenancyConfig {
+            mode: TenancyMode::Multi,
+            bootstrap_owner: None,
+        })
+        .with_audit(Audit::new(pool.clone()));
+    Harness::with_handler(pool, telegram_id, Arc::new(bot), FakeTelegram::new())
+}
+
 async fn form_count(pool: &PgPool, chat: i64) -> i64 {
     sqlx::query_scalar("SELECT count(*) FROM conversation_states WHERE chat_id = $1")
         .bind(chat)
@@ -116,6 +127,17 @@ async fn household_count(pool: &PgPool) -> i64 {
         .fetch_one(pool)
         .await
         .expect("household count")
+}
+
+async fn create_admin_account(pool: &PgPool) {
+    sqlx::query(
+        "INSERT INTO admin_accounts (id, username, password_hash)
+         VALUES ($1, 'admin', 'hash')",
+    )
+    .bind(Uuid::now_v7())
+    .execute(pool)
+    .await
+    .expect("admin account");
 }
 
 async fn assert_joined(
@@ -193,6 +215,57 @@ async fn start_on_empty_database_opens_onboarding() {
     bot.assert_screen_contains("Как назовём ваше пространство");
     assert_eq!(form_count(&db.pool, sender).await, 1);
     assert_eq!(household_count(&db.pool).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_installation_with_an_admin_account_is_not_configured() {
+    let db = isolated_db().await;
+    create_admin_account(&db.pool).await;
+    let sender = next_telegram_id();
+    let mut bot = single_harness(&db.pool, sender, None);
+
+    bot.text("/start").await;
+
+    bot.assert_screen_contains("Обратитесь к администратору");
+    assert!(
+        !bot.screen().contains("Как назовём ваше пространство"),
+        "the first sender must not get onboarding with an account:\n{}",
+        bot.screen()
+    );
+    assert_eq!(form_count(&db.pool, sender).await, 0);
+    assert_eq!(household_count(&db.pool).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_with_an_admin_account_still_opens_onboarding() {
+    let db = isolated_db().await;
+    create_admin_account(&db.pool).await;
+    let sender = next_telegram_id();
+    let mut bot = multi_harness(&db.pool, sender);
+
+    bot.text("/start").await;
+
+    bot.assert_screen_contains("Как назовём ваше пространство");
+    assert_eq!(form_count(&db.pool, sender).await, 1);
+    assert_eq!(household_count(&db.pool).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_without_owner_and_an_admin_account_offers_the_claim_link() {
+    let db = isolated_db().await;
+    let household = create_household(&db.pool).await;
+    soft_delete_owner(&db.pool, household.owner_id).await;
+    create_admin_account(&db.pool).await;
+
+    let sender = next_telegram_id();
+    let mut bot = single_harness(&db.pool, sender, None);
+    bot.text("/start").await;
+
+    let command = format!("tasklerq admin user add --telegram-id {sender} --role owner");
+    bot.assert_screen_contains(&command);
+    bot.assert_screen_contains("попросите у администратора ссылку");
+    assert_eq!(form_count(&db.pool, sender).await, 0);
+    assert_eq!(household_count(&db.pool).await, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -303,6 +376,27 @@ async fn foreign_bootstrap_owner_with_household_without_owner_is_not_configured(
     assert_eq!(form_count(&db.pool, sender).await, 0);
 
     assert_joined(&db.pool, &code, household.household_id, Some(foreign)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_owner_matching_sender_with_household_without_owner_shows_the_admin_command() {
+    let db = isolated_db().await;
+    let household = create_household(&db.pool).await;
+    soft_delete_owner(&db.pool, household.owner_id).await;
+
+    let sender = next_telegram_id();
+    let mut bot = single_harness(&db.pool, sender, Some(sender));
+    bot.text("/start").await;
+
+    let command = format!("tasklerq admin user add --telegram-id {sender} --role owner");
+    bot.assert_screen_contains(&command);
+    assert!(
+        !bot.screen().contains("Как назовём ваше пространство"),
+        "the sender must not get the onboarding form for an existing household:\n{}",
+        bot.screen()
+    );
+    assert_eq!(form_count(&db.pool, sender).await, 0);
+    assert_eq!(household_count(&db.pool).await, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
