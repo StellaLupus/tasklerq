@@ -131,7 +131,7 @@
 
 ## 6. Итог
 
-- [ ] 6.1 Итоговая проверка: `cargo fmt --check`,
+- [x] 6.1 Итоговая проверка: `cargo fmt --check`,
   `cargo clippy --all-targets -- -D warnings`, `cargo test`,
   `openspec validate 0014-admin-telegram --strict`; ручной прогон в
   `docker compose` с polling: бот подключён из консоли без перезапуска,
