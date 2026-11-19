@@ -102,8 +102,9 @@ const LLM_SECRET_REJECTED_PATH: &str = "/admin/llm?saved=1&secret=key_missing";
 const LLM_SECRET_ONLY_REJECTED_PATH: &str = "/admin/llm?secret=key_missing";
 /// Имя токена Home Assistant по умолчанию.
 const DEFAULT_TOKEN_NAME: &str = "Home Assistant";
-/// Scopes токена, который выпускает мастер.
-const HOME_ASSISTANT_SCOPES: [&str; 3] = ["ha:read", "ha:write", "capture:write"];
+/// Scopes токена, который выпускает мастер; те же отмечены по умолчанию в
+/// форме токена household.
+pub(crate) const HOME_ASSISTANT_SCOPES: [&str; 3] = ["ha:read", "ha:write", "capture:write"];
 
 const SETUP_FORM_ERROR: &str = "Код недействителен.";
 const LOGIN_FORM_ERROR: &str = "Неверное имя или пароль.";
@@ -1972,6 +1973,13 @@ pub(crate) fn render_household_detail_error(
     )
 }
 
+/// Отрисовать страницу выпущенного токена household: значение видно один раз.
+pub(crate) fn render_household_token_issued(
+    view: super::households::HouseholdTokenIssuedView,
+) -> Response {
+    render(ConsolePage::new(Page::HouseholdTokenIssued(Box::new(view))))
+}
+
 /// Отрисовать страницу подтверждения удаления household.
 pub(crate) fn render_household_delete(view: super::households::HouseholdDeleteView) -> Response {
     render(ConsolePage::new(Page::HouseholdDelete(Box::new(view))))
@@ -2442,6 +2450,8 @@ enum Page {
     Households(Box<super::households::HouseholdList>),
     /// Карточка household.
     Household(Box<super::households::HouseholdView>),
+    /// Токен household только что выпущен: значение показывается один раз.
+    HouseholdTokenIssued(Box<super::households::HouseholdTokenIssuedView>),
     /// Подтверждение удаления household.
     HouseholdDelete(Box<super::households::HouseholdDeleteView>),
 }
@@ -2482,6 +2492,7 @@ impl Page {
             Self::TelegramLinkIssued(_) => "Ссылка привязки Telegram",
             Self::Check(_) => "Проверка слота",
             Self::Households(_) | Self::Household(_) => "Household",
+            Self::HouseholdTokenIssued(_) => "API-токен",
             Self::HouseholdDelete(_) => "Удаление household",
         }
     }
@@ -2504,6 +2515,7 @@ impl Page {
                 | Self::Check(_)
                 | Self::Households(_)
                 | Self::Household(_)
+                | Self::HouseholdTokenIssued(_)
                 | Self::HouseholdDelete(_)
         )
     }
@@ -2512,7 +2524,10 @@ impl Page {
     fn section(&self) -> &'static str {
         match self {
             Self::Home(_) | Self::OwnerLinkIssued(_) | Self::TelegramLinkIssued(_) => "home",
-            Self::Households(_) | Self::Household(_) | Self::HouseholdDelete(_) => "household",
+            Self::Households(_)
+            | Self::Household(_)
+            | Self::HouseholdTokenIssued(_)
+            | Self::HouseholdDelete(_) => "household",
             Self::Llm(_) | Self::Check(_) => "llm",
             Self::Telegram(view) if !view.wizard => "telegram",
             Self::Password { .. } => "password",
@@ -2629,6 +2644,7 @@ impl Page {
             }
             Self::Households(view) => super::households::render_list_body(view),
             Self::Household(view) => view.render_body(),
+            Self::HouseholdTokenIssued(view) => view.render_body(),
             Self::HouseholdDelete(view) => view.render_body(),
         }
     }
@@ -2738,11 +2754,6 @@ impl<'a> ConsolePage<'a> {
 {% match error %}
 {% when Some with (message) %}
 <p role="alert" class="console-alert">{{ message }}</p>
-{% when None %}
-{% endmatch %}
-{% match hint %}
-{% when Some with (hint) %}
-<p class="muted">{{ hint }}</p>
 {% when None %}
 {% endmatch %}
 <div class="auth-panel">

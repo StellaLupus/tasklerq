@@ -17,9 +17,13 @@
 //! Удаление — двухшаговое: `GET /admin/households/{id}/delete` спрашивает
 //! название, а POST сверяет его с [`admin::household_name`] и вызывает
 //! [`admin::delete_household`]. Своего SQL для удаления консоль не пишет.
+//!
+//! API-токены карточки — тонкая обёртка над [`admin::list_tokens`] и
+//! [`admin::create_token`]: список показывает только префикс и метаданные, а
+//! открытое значение выпущенного токена живёт только в теле ответа.
 
 use askama::Template;
-use axum::extract::{Form, Path, State};
+use axum::extract::{Form, Path, RawForm, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use chrono::{DateTime, NaiveDate, Utc};
@@ -29,19 +33,22 @@ use uuid::Uuid;
 
 use super::owner;
 use super::pages::{
-    self, HouseholdForm, internal, render_household_delete, render_household_delete_error,
-    render_household_detail, render_household_detail_error, render_household_list,
+    self, HOME_ASSISTANT_SCOPES, HouseholdForm, internal, render_household_delete,
+    render_household_delete_error, render_household_detail, render_household_detail_error,
+    render_household_list, render_household_token_issued,
 };
 use super::router::AdminState;
 use super::session::AdminSession;
 use crate::admin::{self, HouseholdSummary};
+use crate::auth::tokens::{IssuedToken, SCOPES};
 use crate::config::TenancyMode;
 use crate::domain::error::DomainError;
 use crate::domain::identity::confirmation_matches;
 use crate::domain::models::{User, UserRole};
 use crate::domain::recurrence::parse_timezone;
-use crate::domain::settings::{DEFAULT_TIMEZONE, validate_timezone};
+use crate::domain::settings::{DEFAULT_TIMEZONE, MAX_DISPLAY_NAME, validate_timezone};
 use crate::domain::validation::normalize_text;
+use crate::storage::repositories::tokens::ApiToken;
 
 /// Отказ без подтверждения: пустое поле или его отсутствие.
 const DELETE_EMPTY_CONFIRMATION: &str = "Введите название household, чтобы подтвердить удаление.";
@@ -53,6 +60,8 @@ const INVALID_TELEGRAM_ID: &str = "telegram id must be a positive integer";
 const DEFAULT_MEMBER_ROLE: &str = "member";
 /// Подсказка при попытке добавить второго владельца.
 const OWNER_EXISTS_HINT: &str = "Владение передаётся в боте.";
+/// Отказ формы токена при нечисловом сроке.
+const INVALID_TOKEN_EXPIRY: &str = "Срок действия должен быть числом дней.";
 
 /// Telegram ID для показа: только последние четыре цифры.
 ///
@@ -91,6 +100,116 @@ impl MemberView {
             telegram_id: mask_telegram_id(user.telegram_user_id),
         }
     }
+}
+
+/// Опция scopes формы токена: известные scopes с отметкой выбранных.
+struct ScopeOption {
+    /// Имя scope из [`SCOPES`].
+    scope: &'static str,
+    /// Флажок отмечен.
+    checked: bool,
+}
+
+/// Построить options в порядке [`SCOPES`], отмечая выбранные.
+fn scope_options(selected: impl Fn(&str) -> bool) -> Vec<ScopeOption> {
+    SCOPES
+        .iter()
+        .map(|scope| ScopeOption {
+            scope,
+            checked: selected(scope),
+        })
+        .collect()
+}
+
+/// Строка секции API-токенов: без хеша и открытого значения.
+struct TokenRow {
+    /// Название.
+    name: String,
+    /// Видимый префикс.
+    prefix: String,
+    /// Scopes через запятую.
+    scopes: String,
+    /// Время последнего использования или «не использовался».
+    last_used: String,
+    /// Состояние на момент запроса.
+    state: &'static str,
+    /// Срок действия в поясе household, если задан.
+    expires_at: Option<String>,
+}
+
+impl TokenRow {
+    /// Собрать строку из записи `admin`; состояние — на момент `now`.
+    fn new(token: ApiToken, timezone: Tz, now: DateTime<Utc>) -> Self {
+        let state = if token.revoked_at.is_some() {
+            "отозван"
+        } else if token.expires_at.is_some_and(|expires_at| expires_at <= now) {
+            "истёк"
+        } else {
+            "активен"
+        };
+        Self {
+            name: token.name,
+            prefix: token.prefix,
+            scopes: token.scopes.join(", "),
+            last_used: token.last_used_at.map_or_else(
+                || "не использовался".to_owned(),
+                |at| format_at(at, timezone),
+            ),
+            state,
+            expires_at: token.expires_at.map(|at| format_at(at, timezone)),
+        }
+    }
+}
+
+/// Дата и время карточки в поясе household.
+fn format_at(at: DateTime<Utc>, timezone: Tz) -> String {
+    at.with_timezone(&timezone)
+        .format("%Y-%m-%d %H:%M")
+        .to_string()
+}
+
+/// Поля формы токена из сырого `application/x-www-form-urlencoded`.
+///
+/// Scopes приходят повторяющимися полями `scope`, поэтому `Form<T>` с
+/// `serde_urlencoded` их не разберёт; новых зависимостей разбор не требует.
+struct TokenFormInput {
+    /// Название токена.
+    name: String,
+    /// Отмеченные scopes.
+    scopes: Vec<String>,
+    /// Срок в днях как введён: пусто — без срока.
+    expires_in_days: String,
+}
+
+impl TokenFormInput {
+    /// Разобрать тело формы; неизвестные поля игнорируются.
+    fn parse(body: &[u8]) -> Self {
+        let mut name = String::new();
+        let mut scopes = Vec::new();
+        let mut expires_in_days = String::new();
+        for (key, value) in url::form_urlencoded::parse(body) {
+            match key.as_ref() {
+                "name" => name = value.into_owned(),
+                "scope" => scopes.push(value.into_owned()),
+                "expires_in_days" => expires_in_days = value.into_owned(),
+                _ => {}
+            }
+        }
+        Self {
+            name,
+            scopes,
+            expires_in_days,
+        }
+    }
+}
+
+/// Срок из формы: пусто — без срока, нечисловое — отказ формы.
+fn parse_expiry_days(raw: &str) -> Result<Option<i64>, &'static str> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    raw.parse().map(Some).map_err(|_| INVALID_TOKEN_EXPIRY)
 }
 
 /// Строка списка household: без участников, готовности Telegram и формы.
@@ -152,6 +271,16 @@ pub(crate) struct HouseholdView {
     member_role: String,
     /// Введённое имя формы участника: сохраняется при отказе.
     member_name: String,
+    /// Лимит длины имени участника из домена.
+    member_name_max: usize,
+    /// Строки API-токенов household.
+    token_rows: Vec<TokenRow>,
+    /// Введённое имя формы токена: сохраняется при отказе.
+    token_name: String,
+    /// Введённый срок формы токена: сохраняется при отказе.
+    token_expires_in_days: String,
+    /// Scopes формы токена с отметками.
+    token_scope_options: Vec<ScopeOption>,
 }
 
 impl HouseholdView {
@@ -170,7 +299,21 @@ impl HouseholdView {
             member_telegram_id: String::new(),
             member_role: DEFAULT_MEMBER_ROLE.to_owned(),
             member_name: String::new(),
+            member_name_max: MAX_DISPLAY_NAME,
+            token_rows: Vec::new(),
+            token_name: String::new(),
+            token_expires_in_days: String::new(),
+            token_scope_options: scope_options(|scope| HOME_ASSISTANT_SCOPES.contains(&scope)),
         }
+    }
+
+    /// Часовой пояс household для дат карточки.
+    ///
+    /// Пояс валидируется при создании household ([`validate_timezone`]), поэтому
+    /// ветка `Tz::UTC` недостижима; она оставлена, чтобы карточка не падала на
+    /// повреждённых данных.
+    fn timezone(&self) -> Tz {
+        parse_timezone(&self.timezone).unwrap_or(Tz::UTC)
     }
 
     /// Выставить готовность Telegram для предложения ссылки-claim.
@@ -181,10 +324,20 @@ impl HouseholdView {
 
     /// Заполнить секцию участников; дата вступления — в поясе household.
     fn with_members(mut self, members: Vec<User>) -> Self {
-        let timezone = parse_timezone(&self.timezone).unwrap_or(Tz::UTC);
+        let timezone = self.timezone();
         self.member_rows = members
             .into_iter()
             .map(|user| MemberView::new(user, timezone))
+            .collect();
+        self
+    }
+
+    /// Заполнить секцию API-токенов; состояние — на момент `now`.
+    fn with_tokens(mut self, tokens: Vec<ApiToken>, now: DateTime<Utc>) -> Self {
+        let timezone = self.timezone();
+        self.token_rows = tokens
+            .into_iter()
+            .map(|token| TokenRow::new(token, timezone, now))
             .collect();
         self
     }
@@ -197,6 +350,15 @@ impl HouseholdView {
             .clone()
             .unwrap_or_else(|| DEFAULT_MEMBER_ROLE.to_owned());
         self.member_name = form.name.clone().unwrap_or_default();
+        self
+    }
+
+    /// Показать введённые значения формы токена после отказа.
+    fn with_token_form(mut self, form: &TokenFormInput) -> Self {
+        self.token_name = form.name.clone();
+        self.token_expires_in_days = form.expires_in_days.clone();
+        self.token_scope_options =
+            scope_options(|scope| form.scopes.iter().any(|chosen| chosen.as_str() == scope));
         self
     }
 
@@ -273,6 +435,36 @@ impl HouseholdDeleteView {
     /// Отрисовать содержимое страницы без макета.
     pub(crate) fn render_body(&self) -> Result<String, askama::Error> {
         DeleteBody { view: self }.render()
+    }
+}
+
+/// Страница выпущенного токена household: открытое значение показывается один
+/// раз, в базу и журнал не попадает.
+pub(crate) struct HouseholdTokenIssuedView {
+    /// Идентификатор household для ссылки назад.
+    household_id: Uuid,
+    /// Название токена.
+    name: String,
+    /// Открытое значение; только в теле ответа.
+    token: String,
+    /// Scopes через запятую.
+    scopes: String,
+}
+
+impl HouseholdTokenIssuedView {
+    /// Собрать страницу из результата [`admin::create_token`].
+    pub(crate) fn new(household_id: Uuid, issued: IssuedToken) -> Self {
+        Self {
+            household_id,
+            name: issued.record.name,
+            token: issued.token,
+            scopes: issued.record.scopes.join(", "),
+        }
+    }
+
+    /// Отрисовать содержимое страницы без макета.
+    pub(crate) fn render_body(&self) -> Result<String, askama::Error> {
+        TokenIssuedBody { view: self }.render()
     }
 }
 
@@ -465,6 +657,12 @@ async fn load_card(
         Err(DomainError::NotFound) => return Err(Box::new(not_found())),
         Err(error) => return Err(Box::new(internal(error))),
     };
+    let tokens =
+        match admin::list_tokens(&state.pool, state.wizard().tenancy, Some(household_id)).await {
+            Ok(tokens) => tokens,
+            Err(DomainError::NotFound) => return Err(Box::new(not_found())),
+            Err(error) => return Err(Box::new(internal(error))),
+        };
 
     // Готовность Telegram нужна только предложению ссылки-claim.
     let telegram_ready = if household.owner_telegram_id.is_some() {
@@ -478,6 +676,7 @@ async fn load_card(
 
     Ok(HouseholdView::new(household)
         .with_members(members)
+        .with_tokens(tokens, now)
         .with_telegram_ready(telegram_ready))
 }
 
@@ -543,6 +742,77 @@ async fn member_refusal(
 /// Отказ «владелец уже есть»: подсказка ведёт к передаче владения в боте.
 fn owner_exists(error: &DomainError) -> bool {
     matches!(error, DomainError::Conflict { details, .. } if details["reason"] == "owner_exists")
+}
+
+/// `POST /admin/households/{id}/tokens`: выпустить токен и показать значение
+/// один раз.
+///
+/// Правила scopes и срока остаются в [`admin::create_token`]: консоль только
+/// разбирает форму и передаёт отказ текстом [`admin::describe`]. Открытое
+/// значение попадает только в тело ответа; в базу и аудит идут хеш и
+/// метаданные. `Cache-Control: no-store` ставит слой заголовков консоли.
+pub(crate) async fn add_token(
+    State(state): State<AdminState>,
+    Path(raw_id): Path<String>,
+    _session: AdminSession,
+    RawForm(body): RawForm,
+) -> Response {
+    let Ok(household_id) = Uuid::parse_str(&raw_id) else {
+        return not_found();
+    };
+    let now = Utc::now();
+    let form = TokenFormInput::parse(&body);
+    let expires_in_days = match parse_expiry_days(&form.expires_in_days) {
+        Ok(days) => days,
+        Err(message) => {
+            return token_refusal(
+                &state,
+                household_id,
+                &form,
+                message,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            )
+            .await;
+        }
+    };
+
+    match admin::create_token(
+        &state.pool,
+        state.wizard().tenancy,
+        Some(household_id),
+        &form.name,
+        &form.scopes,
+        expires_in_days,
+        now,
+    )
+    .await
+    {
+        Ok(issued) => {
+            render_household_token_issued(HouseholdTokenIssuedView::new(household_id, issued))
+        }
+        Err(DomainError::Database(error)) => internal(error),
+        Err(DomainError::NotFound) => not_found(),
+        Err(error) => {
+            let message = admin::describe(&error);
+            let status = error_status(&error);
+            token_refusal(&state, household_id, &form, &message, status).await
+        }
+    }
+}
+
+/// Карточка с формой токена и текстом отказа; удалённый household — `404`.
+async fn token_refusal(
+    state: &AdminState,
+    household_id: Uuid,
+    form: &TokenFormInput,
+    message: &str,
+    status: StatusCode,
+) -> Response {
+    let view = match load_card(state, household_id, Utc::now()).await {
+        Ok(view) => view.with_token_form(form),
+        Err(response) => return *response,
+    };
+    render_household_detail_error(view, message, None, status)
 }
 
 /// `GET /admin/households/{id}/delete`: подтверждение вводом названия.
@@ -726,7 +996,7 @@ struct ListBody<'a> {
 <option value="owner"{% if view.member_role == "owner" %} selected{% endif %}>владелец</option>
 </select></div>
 <div class="field"><label for="member-name">Имя (необязательно)</label>
-<input id="member-name" name="name" type="text" value="{{ view.member_name }}" maxlength="64"></div>
+<input id="member-name" name="name" type="text" value="{{ view.member_name }}" maxlength="{{ view.member_name_max }}"></div>
 <div class="actions"><button type="submit" class="btn-primary">Добавить участника</button></div>
 </form>
 </div>
@@ -747,6 +1017,37 @@ struct ListBody<'a> {
 {% endif %}
 </section>
 {% endif %}
+<section class="panel">
+<header class="panel-head"><h2>API-токены</h2></header>
+{% if view.token_rows.is_empty() %}
+<div class="panel-body"><p class="muted">Токенов пока нет.</p></div>
+{% else %}
+<ul class="list">
+{% for token in view.token_rows %}
+<li>
+<div class="row-text">
+<span class="row-label">{{ token.name }}</span>
+<span class="row-desc">{{ token.prefix }} · scopes: {{ token.scopes }} · {{ token.state }} · последнее использование: {{ token.last_used }}{% match token.expires_at %}{% when Some with (expires_at) %} · срок до {{ expires_at }}{% when None %}{% endmatch %}</span>
+</div>
+</li>
+{% endfor %}
+</ul>
+{% endif %}
+<div class="panel-body">
+<form method="post" action="/admin/households/{{ view.id }}/tokens">
+<div class="field"><label for="token-name">Название</label>
+<input id="token-name" name="name" type="text" value="{{ view.token_name }}" maxlength="64" required></div>
+<div class="field"><span class="field-head"><span>Scopes</span></span>
+{% for option in view.token_scope_options %}
+<label class="check"><input type="checkbox" name="scope" value="{{ option.scope }}"{% if option.checked %} checked{% endif %}> {{ option.scope }}</label>
+{% endfor %}
+</div>
+<div class="field"><label for="token-expires">Срок действия, дней (необязательно)</label>
+<input id="token-expires" name="expires_in_days" type="text" inputmode="numeric" value="{{ view.token_expires_in_days }}"></div>
+<div class="actions"><button type="submit" class="btn-primary">Выпустить токен</button></div>
+</form>
+</div>
+</section>
 <section class="panel danger-zone">
 <header class="panel-head"><h2>Опасная зона</h2></header>
 <div class="row">
@@ -789,6 +1090,30 @@ struct DetailBody<'a> {
 struct DeleteBody<'a> {
     /// Данные подтверждения.
     view: &'a HouseholdDeleteView,
+}
+
+/// Страница выпущенного токена household: значение показывается один раз.
+#[derive(Template)]
+#[template(
+    source = r#"<header class="page-head">
+<h1>API-токен выпущен</h1>
+<p class="page-desc">Скопируйте значение сейчас: после перехода оно больше не будет доступно.</p>
+</header>
+<div class="console-warn" role="status"><p>Вставьте токен в настройки Home Assistant. В списке токенов останется только префикс.</p></div>
+<section class="panel">
+<header class="panel-head"><h2>{{ view.name }}</h2></header>
+<div class="panel-body">
+<p class="muted">Scopes: {{ view.scopes }}</p>
+<input id="issued-token" class="token-value" name="token" type="text" value="{{ view.token }}" readonly aria-label="API-токен">
+</div>
+<div class="panel-foot"><a class="btn btn-primary" href="/admin/households/{{ view.household_id }}">К household</a></div>
+</section>
+"#,
+    ext = "html"
+)]
+struct TokenIssuedBody<'a> {
+    /// Данные выпущенного токена.
+    view: &'a HouseholdTokenIssuedView,
 }
 
 #[cfg(test)]

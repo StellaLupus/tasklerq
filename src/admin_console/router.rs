@@ -271,6 +271,7 @@ pub fn build_router(state: AdminState) -> Router {
             "/admin/households/{id}/members",
             post(households::add_member),
         )
+        .route("/admin/households/{id}/tokens", post(households::add_token))
         .route(
             "/admin/households/{id}/delete",
             get(households::delete_page).post(households::delete),

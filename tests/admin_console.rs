@@ -4391,6 +4391,15 @@ async fn member_count(pool: &PgPool, household_id: Uuid) -> i64 {
         .expect("member count")
 }
 
+/// Число токенов household независимо от состояния.
+async fn household_token_count(pool: &PgPool, household_id: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM api_tokens WHERE household_id = $1")
+        .bind(household_id)
+        .fetch_one(pool)
+        .await
+        .expect("household token count")
+}
+
 /// Число неотозванных токенов household.
 async fn token_count(pool: &PgPool) -> i64 {
     sqlx::query_scalar("SELECT count(*) FROM api_tokens WHERE revoked_at IS NULL")
@@ -10079,6 +10088,13 @@ async fn households_card_lists_members_with_masked_telegram_ids() {
         !text.contains("2026-01-01"),
         "the joining date uses the household timezone, not UTC:\n{text}"
     );
+    assert!(
+        input_with_name(&text, "name").contains(&format!(
+            "maxlength=\"{}\"",
+            tasklerq::domain::settings::MAX_DISPLAY_NAME
+        )),
+        "the member name input uses the domain limit:\n{text}"
+    );
     for hidden in [
         "123456789",
         "987654321",
@@ -10331,6 +10347,10 @@ async fn households_member_form_refuses_a_telegram_id_from_another_household() {
         text.contains(&expected),
         "the page shows `{expected}`:\n{text}"
     );
+    assert!(
+        !text.contains("Владение передаётся в боте."),
+        "a busy Telegram id is not the second-owner case:\n{text}"
+    );
     assert_eq!(
         member_count(&db.pool, second.id).await,
         0,
@@ -10388,6 +10408,80 @@ async fn households_member_form_rejects_invalid_telegram_ids() {
     assert!(
         audit_actor(&db.pool, "member_joined").await.is_empty(),
         "nothing was written"
+    );
+}
+
+/// Неизвестная роль — ошибка формы; имя из одних пробелов заменяется
+/// `DEFAULT_MEMBER_NAME`, как в CLI.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_member_form_rejects_an_unknown_role_and_defaults_a_blank_name() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
+    let household = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Дом",
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("the household");
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    let path = format!("/admin/households/{}/members", household.id);
+
+    let (status, _, body) = send_form_from(
+        &app,
+        &path,
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("telegram_id", "7300000020"),
+            ("role", "admin"),
+            ("name", "Борис"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "an unknown role is a form error: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        String::from_utf8_lossy(&body).contains("role must be owner or member"),
+        "the page explains the role rule:\n{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(member_count(&db.pool, household.id).await, 0);
+    assert!(audit_actor(&db.pool, "member_joined").await.is_empty());
+
+    let (status, _, body) = send_form_from(
+        &app,
+        &path,
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("telegram_id", "7300000021"),
+            ("role", "member"),
+            ("name", "   "),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "a blank name is accepted with the default: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let card_path = format!("/admin/households/{}", household.id);
+    let (status, _, body) = send_with_cookie(&app, Method::GET, &card_path, &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    let row = member_row(&text, tasklerq::admin::DEFAULT_MEMBER_NAME);
+    assert!(
+        row.contains("…0021"),
+        "the default-named member is listed with the mask:\n{row}"
     );
 }
 
@@ -10637,6 +10731,17 @@ async fn unknown_deleted_and_malformed_households_are_not_found() {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "POST {members}");
+
+        let tokens = format!("{path}/tokens");
+        let (status, _, _) = send_form_from(
+            &app,
+            &tokens,
+            test_peer(),
+            headers_with(&[("cookie", &cookie)]),
+            &[("name", "bad"), ("scope", "ha:read")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "POST {tokens}");
     }
 }
 
@@ -10687,6 +10792,23 @@ fn member_row<'a>(html: &'a str, name: &str) -> &'a str {
             .find("</li>")
             .map(|offset| offset + "</li>".len())
             .unwrap_or_else(|| panic!("no member row end for {name} in:\n{html}"));
+    &html[start..end]
+}
+
+/// Строка токена карточки с указанным названием целиком: от `<li>` до `</li>`.
+fn token_row<'a>(html: &'a str, name: &str) -> &'a str {
+    let marker = format!(">{name}</span>");
+    let name_position = html
+        .find(&marker)
+        .unwrap_or_else(|| panic!("no token row for {name} in:\n{html}"));
+    let start = html[..name_position]
+        .rfind("<li>")
+        .unwrap_or_else(|| panic!("no token row start for {name} in:\n{html}"));
+    let end = name_position
+        + html[name_position..]
+            .find("</li>")
+            .map(|offset| offset + "</li>".len())
+            .unwrap_or_else(|| panic!("no token row end for {name} in:\n{html}"));
     &html[start..end]
 }
 
@@ -11297,4 +11419,362 @@ async fn households_card_without_owner_explains_missing_telegram() {
         !text.contains("action=\"/admin/owner\""),
         "without a ready bot the claim form is hidden:\n{text}"
     );
+}
+
+/// Выпуск токена household: значение показано один раз, в списке остаётся
+/// только префикс, событие аудита пишется без значения.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_token_form_issues_a_token_once_and_lists_only_the_prefix() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
+    let household = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Дом",
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("the household");
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let path = format!("/admin/households/{}/tokens", household.id);
+    let (status, headers, body) = send_form_from(
+        &app,
+        &path,
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("name", "Home Assistant"),
+            ("scope", "ha:read"),
+            ("scope", "ha:write"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the issued token page is shown without a redirect: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_security_headers(&headers, "POST /admin/households/{id}/tokens");
+    let text = String::from_utf8_lossy(&body);
+    let token = issued_token(&body);
+    assert!(
+        token.starts_with("tlq_"),
+        "the page shows the open token: {token}"
+    );
+    for expected in ["Home Assistant", "ha:read", "ha:write"] {
+        assert!(
+            text.contains(expected),
+            "missing `{expected}` on the issued page:\n{text}"
+        );
+    }
+    assert!(
+        text.contains(&format!("href=\"/admin/households/{}\"", household.id)),
+        "the issued page links back to the household:\n{text}"
+    );
+
+    let (stored_name, stored_scopes): (String, Vec<String>) = sqlx::query_as(
+        "SELECT name, scopes FROM api_tokens WHERE household_id = $1 AND token_hash = $2",
+    )
+    .bind(household.id)
+    .bind(hash_token(&token))
+    .fetch_one(&db.pool)
+    .await
+    .expect("the issued token row");
+    assert_eq!(stored_name, "Home Assistant");
+    assert_eq!(
+        stored_scopes,
+        vec!["ha:read".to_owned(), "ha:write".to_owned()]
+    );
+
+    let payloads = audit_payloads(&db.pool, "token_created").await;
+    assert_eq!(payloads.len(), 1, "the issue is audited once");
+    assert!(
+        !serde_json::to_string(&payloads)
+            .expect("the audit payloads serialize")
+            .contains(&token),
+        "the audit payload must not contain the open token: {payloads:?}"
+    );
+    assert_eq!(
+        audit_actor(&db.pool, "token_created").await,
+        vec![("system".to_owned(), Some(household.id))]
+    );
+
+    let card_path = format!("/admin/households/{}", household.id);
+    let (status, _, body) = send_with_cookie(&app, Method::GET, &card_path, &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let card = String::from_utf8_lossy(&body);
+    let prefix: String = token.chars().take(12).collect();
+    let row = token_row(&card, "Home Assistant");
+    assert!(
+        row.contains(&prefix),
+        "the card shows the visible prefix:\n{row}"
+    );
+    assert!(
+        !row.contains(&token),
+        "the card hides the open value:\n{row}"
+    );
+    assert!(
+        !card.contains(&token),
+        "the card hides the open value:\n{card}"
+    );
+}
+
+/// Правила срока и scopes остаются в домене: отказ приходит текстом
+/// `admin::describe` и ничего не создаёт; срок 30 дней даёт `expires_at`
+/// примерно now + 30 дней.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_token_form_enforces_the_domain_expiry_and_scope_rules() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
+    let household = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Дом",
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("the household");
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    let path = format!("/admin/households/{}/tokens", household.id);
+
+    let expected_zero = tasklerq::admin::describe(
+        &tasklerq::admin::create_token(
+            &db.pool,
+            TenancyMode::Multi,
+            Some(household.id),
+            "bad",
+            &["ha:read".to_owned()],
+            Some(0),
+            Utc::now(),
+        )
+        .await
+        .expect_err("zero days is out of range"),
+    );
+    let expected_long = tasklerq::admin::describe(
+        &tasklerq::admin::create_token(
+            &db.pool,
+            TenancyMode::Multi,
+            Some(household.id),
+            "bad",
+            &["ha:read".to_owned()],
+            Some(3_651),
+            Utc::now(),
+        )
+        .await
+        .expect_err("3651 days is out of range"),
+    );
+    for (days, expected) in [
+        ("0", expected_zero.as_str()),
+        ("3651", expected_long.as_str()),
+    ] {
+        let (status, _, body) = send_form_from(
+            &app,
+            &path,
+            test_peer(),
+            headers_with(&[("cookie", &cookie)]),
+            &[
+                ("name", "bad"),
+                ("scope", "ha:read"),
+                ("expires_in_days", days),
+            ],
+        )
+        .await;
+        assert!(
+            status.is_client_error(),
+            "`{days}` days is a form error, not {status}"
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains(expected),
+            "the page explains `{days}` days with `{expected}`:\n{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            household_token_count(&db.pool, household.id).await,
+            0,
+            "`{days}` days must not issue a token"
+        );
+    }
+
+    let no_scopes: Vec<String> = Vec::new();
+    let expected_no_scopes = tasklerq::admin::describe(
+        &tasklerq::admin::create_token(
+            &db.pool,
+            TenancyMode::Multi,
+            Some(household.id),
+            "bad",
+            &no_scopes,
+            None,
+            Utc::now(),
+        )
+        .await
+        .expect_err("at least one scope is required"),
+    );
+    let (status, _, body) = send_form_from(
+        &app,
+        &path,
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[("name", "bad"), ("expires_in_days", "30")],
+    )
+    .await;
+    assert!(
+        status.is_client_error(),
+        "a token without scopes is a form error, not {status}"
+    );
+    assert!(
+        String::from_utf8_lossy(&body).contains(&expected_no_scopes),
+        "the page explains the missing scopes with `{expected_no_scopes}`:\n{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(household_token_count(&db.pool, household.id).await, 0);
+
+    let (status, _, _) = send_form_from(
+        &app,
+        &path,
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("name", "bad"),
+            ("scope", "ha:read"),
+            ("expires_in_days", "soon"),
+        ],
+    )
+    .await;
+    assert!(
+        status.is_client_error(),
+        "a non-numeric expiry is a form error, not {status}"
+    );
+    assert_eq!(household_token_count(&db.pool, household.id).await, 0);
+
+    let before = Utc::now();
+    let (status, _, body) = send_form_from(
+        &app,
+        &path,
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("name", "Срок"),
+            ("scope", "ha:read"),
+            ("expires_in_days", "30"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a valid expiry is accepted: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let token = issued_token(&body);
+    let expires_at: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT expires_at FROM api_tokens WHERE token_hash = $1")
+            .bind(hash_token(&token))
+            .fetch_one(&db.pool)
+            .await
+            .expect("the issued token");
+    let expires_at = expires_at.expect("a token with an expiry");
+    let expected = before + ChronoDuration::days(30);
+    assert!(
+        (expires_at - expected).num_seconds().abs() <= 60,
+        "expires_at {expires_at} is not close to {expected}"
+    );
+}
+
+/// Отозванный и истёкший токены показаны своим состоянием; значение не
+/// выводится.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_card_marks_revoked_and_expired_tokens() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
+    let now = Utc::now();
+    let household = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Дом",
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("the household");
+    let revoked = tasklerq::admin::create_token(
+        &db.pool,
+        TenancyMode::Multi,
+        Some(household.id),
+        "Отозванный",
+        &["ha:read".to_owned()],
+        None,
+        now,
+    )
+    .await
+    .expect("the token to revoke");
+    let expired = tasklerq::admin::create_token(
+        &db.pool,
+        TenancyMode::Multi,
+        Some(household.id),
+        "Истёкший",
+        &["ha:write".to_owned()],
+        Some(30),
+        now,
+    )
+    .await
+    .expect("the token to expire");
+    let active = tasklerq::admin::create_token(
+        &db.pool,
+        TenancyMode::Multi,
+        Some(household.id),
+        "Активный",
+        &["capture:write".to_owned()],
+        None,
+        now,
+    )
+    .await
+    .expect("the active token");
+    sqlx::query("UPDATE api_tokens SET revoked_at = $2 WHERE token_hash = $3")
+        .bind(household.id)
+        .bind(now)
+        .bind(hash_token(&revoked.token))
+        .execute(&db.pool)
+        .await
+        .expect("the revoked token");
+    sqlx::query("UPDATE api_tokens SET expires_at = $2 WHERE token_hash = $3")
+        .bind(household.id)
+        .bind(now - ChronoDuration::days(1))
+        .bind(hash_token(&expired.token))
+        .execute(&db.pool)
+        .await
+        .expect("the expired token");
+
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    let path = format!("/admin/households/{}", household.id);
+    let (status, _, body) = send_with_cookie(&app, Method::GET, &path, &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    for (name, state) in [
+        ("Отозванный", "отозван"),
+        ("Истёкший", "истёк"),
+        ("Активный", "активен"),
+    ] {
+        let row = token_row(&text, name);
+        assert!(
+            row.contains(state),
+            "the {name} row shows `{state}`:\n{row}"
+        );
+    }
+    assert!(
+        token_row(&text, "Активный").contains("не использовался"),
+        "an unused token says so:\n{text}"
+    );
+    for issued in [&revoked, &expired, &active] {
+        assert!(
+            !text.contains(&issued.token),
+            "the card must not show the open value:\n{text}"
+        );
+    }
 }
