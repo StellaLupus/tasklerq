@@ -8192,9 +8192,6 @@ async fn rotating_the_token_in_polling_mode_polls_with_the_new_token() {
     );
     wait_for_token_requests(&server, "getUpdates", BOT_A_TOKEN, 1).await;
 
-    // Граница — до POST: запрос новым токеном может уйти раньше, чем
-    // `wait_for_token_requests` его увидит, и не должен оказаться до границы.
-    let boundary = server.received_requests().await.expect("requests").len();
     let (status, headers, body) = send_form_from(
         &app,
         "/admin/telegram",
@@ -8216,8 +8213,20 @@ async fn rotating_the_token_in_polling_mode_polls_with_the_new_token() {
     assert_eq!(location(&headers), Some("/admin/telegram?saved=1"));
 
     wait_for_token_requests(&server, "getUpdates", BOT_B_TOKEN, 1).await;
+    // Ещё несколько циклов: если старый поллер возобновится, это станет
+    // заметно до проверки.
+    wait_for_token_requests(&server, "getUpdates", BOT_B_TOKEN, 3).await;
     let requests = server.received_requests().await.expect("requests");
-    let after_switch: Vec<_> = requests[boundary..]
+    // Граница — первый опрос новым токеном. Всё, что пришло раньше, может
+    // принадлежать старому поллеру, который ещё не успел отмениться.
+    let first_new = requests
+        .iter()
+        .position(|request| {
+            request.url.path().ends_with("/getUpdates")
+                && request_bot_token(request).as_deref() == Some(BOT_B_TOKEN)
+        })
+        .expect("polling must continue with the new token");
+    let after_switch: Vec<_> = requests[first_new..]
         .iter()
         .filter(|request| request.url.path().ends_with("/getUpdates"))
         .collect();
