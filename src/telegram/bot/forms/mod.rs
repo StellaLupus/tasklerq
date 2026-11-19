@@ -386,7 +386,7 @@ pub async fn start_onboarding(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
             }
             continue;
         }
-        let Some(screen) = FirstContactScreen::from_contact(contact, ctx.sender.id) else {
+        let Some(screen) = FirstContactScreen::from_contact(contact) else {
             return open_onboarding(ctx, None).await;
         };
         if matches!(load(ctx).await?, Some(Form::Onboarding { .. })) {

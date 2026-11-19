@@ -57,7 +57,7 @@ impl FirstContactScreen {
     /// [`FirstContact::ClaimOwner`] обрабатывается вызывающим до сборки экрана:
     /// назначение владельца — действие, а не информационный экран. Fail-closed
     /// ответ здесь страхует от случайного вызова с этим исходом.
-    pub fn from_contact(contact: FirstContact, _sender_id: i64) -> Option<Self> {
+    pub fn from_contact(contact: FirstContact) -> Option<Self> {
         match contact {
             FirstContact::Onboard => None,
             FirstContact::AskInvite => Some(Self::AskInvite),
@@ -2165,27 +2165,21 @@ mod tests {
     #[test]
     fn admin_command_hint_has_its_own_screen() {
         assert_eq!(
-            FirstContactScreen::from_contact(
-                FirstContact::AdminCommand {
-                    telegram_id: 123,
-                    admin_exists: false,
-                },
-                123,
-            ),
+            FirstContactScreen::from_contact(FirstContact::AdminCommand {
+                telegram_id: 123,
+                admin_exists: false,
+            }),
             Some(FirstContactScreen::AdminCommand(123))
         );
         assert_eq!(
-            FirstContactScreen::from_contact(
-                FirstContact::AdminCommand {
-                    telegram_id: 123,
-                    admin_exists: true,
-                },
-                123,
-            ),
+            FirstContactScreen::from_contact(FirstContact::AdminCommand {
+                telegram_id: 123,
+                admin_exists: true,
+            }),
             Some(FirstContactScreen::AdminCommandWithHint(123))
         );
         assert_eq!(
-            FirstContactScreen::from_contact(FirstContact::ClaimOwner(Uuid::nil()), 123),
+            FirstContactScreen::from_contact(FirstContact::ClaimOwner(Uuid::nil())),
             Some(FirstContactScreen::NotConfigured),
             "claim ownership is handled by the onboarding flow, not by a screen"
         );

@@ -22,7 +22,7 @@ use crate::llm::{LlmHandle, LlmSettings, LlmSnapshot};
 use crate::security_audit::Audit;
 use crate::settings;
 use crate::settings::crypto::SecretCipher;
-use crate::storage::repositories::households;
+use crate::storage::repositories::{admin_accounts, households};
 use crate::telegram::runtime::{self, StartError, TelegramSupervisor};
 
 /// Собранное приложение и его фоновые задачи.
@@ -78,7 +78,8 @@ pub async fn build_application_with_update_limit(
     // Действующая конфигурация Telegram: окружение целиком при токене, иначе
     // база. Сбой чтения базы не роняет сервис — действует окружение.
     let telegram = build_effective_telegram(&pool, config, &secret_cipher).await;
-    warn_if_bootstrap_owner_missing(config, &telegram);
+    let admin_account_exists = read_admin_account_exists(&pool).await;
+    warn_if_bootstrap_owner_missing(config, &telegram, admin_account_exists);
     warn_if_multiple_households(config, &pool).await;
 
     let llm = build_llm_handle(&pool, config, &secret_cipher).await;
@@ -225,15 +226,67 @@ async fn build_llm_handle(pool: &PgPool, config: &Config, cipher: &SecretCipher)
     LlmHandle::new(LlmSnapshot::from_effective(effective))
 }
 
+/// Прочитать, есть ли учётная запись администратора консоли.
+///
+/// `None` — прочитать не удалось. Сбой базы не роняет старт: вызывающий
+/// трактует неизвестность консервативно, как отсутствие учётки.
+async fn read_admin_account_exists(pool: &PgPool) -> Option<bool> {
+    let mut conn = match pool.acquire().await {
+        Ok(conn) => conn,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "could not check the admin account at startup"
+            );
+            return None;
+        }
+    };
+    match admin_accounts::exists(&mut conn).await {
+        Ok(exists) => Some(exists),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "could not check the admin account at startup"
+            );
+            None
+        }
+    }
+}
+
 /// Предупредить, что без явного первого владельца им станет первый написавший
-/// боту. Текст не содержит секретов: в нём только имя переменной.
-fn warn_if_bootstrap_owner_missing(config: &Config, telegram: &settings::EffectiveTelegram) {
-    if telegram.is_enabled() && config.tenancy.bootstrap_owner.is_none() {
+/// боту.
+///
+/// С созданной учёткой администратора владелец назначается из консоли, поэтому
+/// предупреждения нет. Если учётку проверить не удалось (`None`), предупреждение
+/// выводится: подтвердить безопасное состояние нельзя. Текст не содержит
+/// секретов: в нём только имя переменной.
+fn warn_if_bootstrap_owner_missing(
+    config: &Config,
+    telegram: &settings::EffectiveTelegram,
+    admin_account_exists: Option<bool>,
+) {
+    if should_warn_about_the_first_writer(
+        telegram.is_enabled(),
+        config.tenancy.bootstrap_owner.is_some(),
+        admin_account_exists,
+    ) {
         tracing::warn!(
             "BOOTSTRAP_OWNER_TELEGRAM_ID is not set: the first person to write to the bot \
              will become the owner; set BOOTSTRAP_OWNER_TELEGRAM_ID to choose the owner explicitly"
         );
     }
+}
+
+/// Решение о стартовом предупреждении по трём флагам.
+///
+/// `admin_account_exists = None` — учётку прочитать не удалось; это не
+/// подтверждённое отсутствие владельца, поэтому предупреждение выводится.
+fn should_warn_about_the_first_writer(
+    telegram_enabled: bool,
+    bootstrap_owner_set: bool,
+    admin_account_exists: Option<bool>,
+) -> bool {
+    telegram_enabled && !bootstrap_owner_set && admin_account_exists != Some(true)
 }
 
 /// Сообщить о деградации: в режиме `single` активных household больше одного.
@@ -425,7 +478,7 @@ mod tests {
         Config::from_map(vars).expect("test config should be valid")
     }
 
-    fn captured_warning(config: &Config) -> String {
+    fn captured_warning(config: &Config, admin_account_exists: Option<bool>) -> String {
         let buffer = LogBuffer::default();
         let subscriber = tracing_subscriber::fmt()
             .json()
@@ -434,7 +487,7 @@ mod tests {
         let cipher = SecretCipher::from_config(config);
         let telegram = settings::effective_telegram(config, &[], &cipher);
         tracing::subscriber::with_default(subscriber, || {
-            warn_if_bootstrap_owner_missing(config, &telegram);
+            warn_if_bootstrap_owner_missing(config, &telegram, admin_account_exists);
         });
         buffer.contents()
     }
@@ -442,7 +495,7 @@ mod tests {
     #[test]
     fn warns_when_telegram_is_enabled_without_bootstrap_owner() {
         for mode in ["webhook", "polling"] {
-            let logs = captured_warning(&config(mode, None));
+            let logs = captured_warning(&config(mode, None), Some(false));
 
             assert!(
                 logs.contains("BOOTSTRAP_OWNER_TELEGRAM_ID"),
@@ -464,9 +517,35 @@ mod tests {
     }
 
     #[test]
+    fn no_warning_when_an_admin_account_exists() {
+        for mode in ["webhook", "polling"] {
+            let logs = captured_warning(&config(mode, None), Some(true));
+            assert!(
+                !logs.contains("BOOTSTRAP_OWNER_TELEGRAM_ID"),
+                "{mode}: an admin account should suppress the warning:\n{logs}"
+            );
+        }
+    }
+
+    #[test]
+    fn warns_when_the_admin_account_cannot_be_read() {
+        for mode in ["webhook", "polling"] {
+            let logs = captured_warning(&config(mode, None), None);
+            assert!(
+                logs.contains("BOOTSTRAP_OWNER_TELEGRAM_ID"),
+                "{mode}: an unreadable admin account should warn conservatively:\n{logs}"
+            );
+            assert!(
+                logs.contains("first person"),
+                "{mode}: warning should explain who becomes the owner:\n{logs}"
+            );
+        }
+    }
+
+    #[test]
     fn no_warning_when_bootstrap_owner_is_set() {
         for mode in ["webhook", "polling"] {
-            let logs = captured_warning(&config(mode, Some("111")));
+            let logs = captured_warning(&config(mode, Some("111")), Some(false));
             assert!(
                 !logs.contains("BOOTSTRAP_OWNER_TELEGRAM_ID"),
                 "{mode}: explicit owner should suppress the warning:\n{logs}"
@@ -476,7 +555,7 @@ mod tests {
 
     #[test]
     fn no_warning_when_telegram_is_disabled() {
-        let logs = captured_warning(&config("disabled", None));
+        let logs = captured_warning(&config("disabled", None), Some(false));
         assert!(
             !logs.contains("BOOTSTRAP_OWNER_TELEGRAM_ID"),
             "disabled Telegram should not warn:\n{logs}"

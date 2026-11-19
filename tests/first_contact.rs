@@ -130,6 +130,15 @@ async fn household_count(pool: &PgPool) -> i64 {
         .expect("household count")
 }
 
+/// Telegram ID участника созданного household.
+async fn member_telegram_id(pool: &PgPool, member_id: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT telegram_user_id FROM users WHERE id = $1")
+        .bind(member_id)
+        .fetch_one(pool)
+        .await
+        .expect("member telegram id")
+}
+
 async fn create_admin_account(pool: &PgPool) {
     sqlx::query(
         "INSERT INTO admin_accounts (id, username, password_hash)
@@ -815,6 +824,86 @@ async fn a_used_claim_link_shows_the_plain_start_screen() {
     assert_eq!(joined, None, "the link must not create a second owner");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_member_with_an_invalid_claim_link_gets_the_plain_menu() {
+    let db = isolated_db().await;
+    let household = create_household(&db.pool).await;
+    let telegram_id = member_telegram_id(&db.pool, household.member_id).await;
+    let (code, code_id) = issue_claim(&db.pool, Some(household.household_id)).await;
+    sqlx::query(
+        "UPDATE admin_one_time_codes
+         SET created_at = now() - interval '2 days',
+             expires_at = now() - interval '1 day'
+         WHERE id = $1",
+    )
+    .bind(code_id)
+    .execute(&db.pool)
+    .await
+    .expect("expire code");
+    let unknown = "A".repeat(22);
+
+    let mut bot = multi_harness(&db.pool, telegram_id);
+    for argument in [format!("own_{code}"), format!("own_{unknown}")] {
+        bot.text(&format!("/start {argument}")).await;
+
+        bot.assert_screen_contains("Добавить");
+        assert!(
+            !bot.screen().contains("Вы уже состоите в пространстве"),
+            "`{argument}` must behave like a plain start for a member:\n{}",
+            bot.screen()
+        );
+        assert!(
+            !bot.screen().contains("Приглашение не найдено"),
+            "`{argument}` must behave like a plain start:\n{}",
+            bot.screen()
+        );
+    }
+    assert!(code_used_at(&db.pool, code_id).await.is_none());
+    assert_eq!(active_owners(&db.pool, household.household_id).await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_member_claiming_their_own_household_link_becomes_the_owner() {
+    let db = isolated_db().await;
+    let household = create_household(&db.pool).await;
+    let telegram_id = member_telegram_id(&db.pool, household.member_id).await;
+    soft_delete_owner(&db.pool, household.owner_id).await;
+    let (code, code_id) = issue_claim(&db.pool, Some(household.household_id)).await;
+
+    let mut bot = multi_harness(&db.pool, telegram_id);
+    bot.text(&format!("/start own_{code}")).await;
+
+    bot.assert_screen_contains("Вы стали владельцем");
+    assert_eq!(active_owners(&db.pool, household.household_id).await, 1);
+    assert!(code_used_at(&db.pool, code_id).await.is_some());
+
+    let role: String = sqlx::query_scalar(
+        "SELECT role::text FROM users WHERE telegram_user_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(telegram_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("member");
+    assert_eq!(role, "owner");
+
+    let memberships: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM users
+         WHERE household_id = $1 AND telegram_user_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(household.household_id)
+    .bind(telegram_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("membership count");
+    assert_eq!(memberships, 1, "the member must not get a second row");
+    assert_eq!(
+        claim_audit_source(&db.pool, household.household_id)
+            .await
+            .as_deref(),
+        Some("claim")
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_claim_leaves_exactly_one_owner() {
     let db = isolated_db().await;
@@ -841,6 +930,28 @@ async fn concurrent_claim_leaves_exactly_one_owner() {
     assert_eq!(owners.len(), 1);
     assert!(owners[0] == first_id || owners[0] == second_id);
     assert!(code_used_at(&db.pool, code_id).await.is_some());
+
+    let (loser_id, loser) = if owners[0] == first_id {
+        (second_id, &second)
+    } else {
+        (first_id, &first)
+    };
+    let loser_row: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM users WHERE telegram_user_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(loser_id)
+    .fetch_optional(&db.pool)
+    .await
+    .expect("loser user");
+    assert_eq!(loser_row, None, "the losing claim must not create a member");
+
+    let mut plain = single_harness(&db.pool, next_telegram_id(), None);
+    plain.text("/start").await;
+    assert_eq!(
+        loser.screen(),
+        plain.screen(),
+        "the losing claim must show the same screen as a plain start"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

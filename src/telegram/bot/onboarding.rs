@@ -9,7 +9,7 @@ use crate::config::TenancyMode;
 use crate::domain::error::DomainError;
 use crate::domain::first_contact::{ClaimTarget, FirstContact, Installation, classify};
 use crate::domain::identity::{AuditEventType, NewMember};
-use crate::domain::models::Actor;
+use crate::domain::models::{Actor, UserRole};
 use crate::domain::settings::validate_timezone;
 use crate::storage::repositories::admin_accounts;
 use crate::storage::repositories::audit;
@@ -113,13 +113,13 @@ async fn default_start(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
 }
 
 /// `/start own_…`: назначить владельца или открыть онбординг пустой
-/// инсталляции. Недействительный код ведёт себя как `/start` без аргумента.
+/// инсталляции.
+///
+/// Ссылка проверяется до ветки участника: недействительный код ведёт себя как
+/// `/start` без аргумента и не показывает баннер «вы уже состоите». Участник
+/// целевого household без владельца становится владельцем; участник другого
+/// household получает баннер, а код не расходуется.
 async fn claim_start(ctx: &mut Ctx<'_>, code: &str) -> Result<(), Fail> {
-    if ctx.user.is_some() {
-        ctx.banner(MEMBER_BANNER);
-        return ctx.present(Screen::Menu).await;
-    }
-
     let Some(record) =
         codes::find_active(&mut *ctx.conn, Purpose::OwnerClaim, code, ctx.now).await?
     else {
@@ -129,6 +129,21 @@ async fn claim_start(ctx: &mut Ctx<'_>, code: &str) -> Result<(), Fail> {
     let Some(household_id) = record.household_id else {
         return claim_empty_installation(ctx, record.id).await;
     };
+
+    if let Some(user) = ctx.user.as_ref() {
+        if user.household_id != household_id {
+            ctx.banner(MEMBER_BANNER);
+            return ctx.present(Screen::Menu).await;
+        }
+        // Участник самого household: по контракту ссылки первый открывший
+        // становится владельцем, новое членство не создаётся.
+        if !household_claimable(ctx, household_id).await?
+            || !claim_member_owner(ctx, household_id, code).await?
+        {
+            return default_start(ctx).await;
+        }
+        return Ok(());
+    }
 
     // Код мог остаться активным после появления владельца: тогда это обычный
     // `/start` без ссылки.
@@ -195,9 +210,12 @@ async fn household_claimable(ctx: &mut Ctx<'_>, household_id: Uuid) -> Result<bo
 
 /// Назначить отправителя владельцем существующего household.
 ///
-/// С кодом (`Some`) гашение кода и вставка владельца идут одной транзакцией:
-/// одновременный claim даёт ровно одного владельца, а проигравший не расходует
-/// код. Без кода этот путь использует `BOOTSTRAP_OWNER_TELEGRAM_ID`.
+/// Вызывать только для отправителя, который ещё не состоит в household:
+/// участника целевого household повышает `claim_member_owner`, участнику
+/// другого household код не расходуется. С кодом (`Some`) гашение кода и
+/// вставка владельца идут одной транзакцией: одновременный claim даёт ровно
+/// одного владельца, а проигравший не расходует код. Без кода этот путь
+/// использует `BOOTSTRAP_OWNER_TELEGRAM_ID`.
 ///
 /// `Ok(false)` — состояние изменилось (код уже погашен, владелец появился или
 /// отправитель стал участником); вызывающий переклассифицирует состояние.
@@ -206,12 +224,6 @@ pub(super) async fn claim_existing_owner(
     household_id: Uuid,
     code: Option<&str>,
 ) -> Result<bool, Fail> {
-    if ctx.user.is_some() {
-        ctx.banner(MEMBER_BANNER);
-        ctx.present(Screen::Menu).await?;
-        return Ok(true);
-    }
-
     let member = new_member(ctx);
     let now = ctx.now;
     let mut savepoint = ctx.conn.begin().await?;
@@ -230,6 +242,80 @@ pub(super) async fn claim_existing_owner(
             now,
         )
         .await
+    }
+    .await;
+
+    match result {
+        Ok((household, user)) => {
+            savepoint.commit().await?;
+            let text = format!("Вы стали владельцем пространства «{}».", household.name);
+            ctx.tz = display_timezone(Some(&user), Some(&household));
+            ctx.user = Some(user);
+            ctx.household = Some(household);
+            ctx.banner(text);
+            ctx.present(Screen::Menu).await?;
+            Ok(true)
+        }
+        Err(DomainError::NotFound) | Err(DomainError::Conflict { .. }) => {
+            savepoint.rollback().await?;
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Сделать участника целевого household владельцем по ссылке-claim.
+///
+/// Код гасится и роль меняется одной транзакцией: повторное открытие ссылки
+/// или одновременный claim другим участником получает `NotFound` и не
+/// расходует код. Новое членство не создаётся, событие аудита совпадает с
+/// `claim_existing_owner` (`member_joined`, `source = claim`).
+///
+/// `Ok(false)` — код или состояние изменились; вызывающий показывает `/start`
+/// без ссылки.
+async fn claim_member_owner(
+    ctx: &mut Ctx<'_>,
+    household_id: Uuid,
+    code: &str,
+) -> Result<bool, Fail> {
+    let Some(user_id) = ctx.user.as_ref().map(|user| user.id) else {
+        return Ok(false);
+    };
+    let now = ctx.now;
+    let mut savepoint = ctx.conn.begin().await?;
+    let result = async {
+        let record = codes::use_code(&mut savepoint, Purpose::OwnerClaim, code, now).await?;
+        if record.household_id != Some(household_id) {
+            return Err(DomainError::NotFound);
+        }
+        users::lock_household(&mut savepoint, household_id).await?;
+        if !users::owners(&mut savepoint, household_id)
+            .await?
+            .is_empty()
+        {
+            return Err(DomainError::conflict_with(
+                "household already has an owner",
+                json!({"reason": "owner_exists"}),
+            ));
+        }
+        users::set_role(&mut savepoint, household_id, user_id, UserRole::Owner, now).await?;
+        let user = users::get(&mut savepoint, household_id, user_id).await?;
+        let household = households::get(&mut savepoint, household_id).await?;
+        audit::record(
+            &mut savepoint,
+            Some(household_id),
+            &Actor::user(user.id, user.role),
+            AuditEventType::MemberJoined,
+            json!({
+                "user_id": user.id,
+                "display_name": user.display_name,
+                "role": user.role,
+                "source": "claim",
+            }),
+            now,
+        )
+        .await?;
+        Ok((household, user))
     }
     .await;
 
