@@ -1957,6 +1957,21 @@ pub(crate) fn render_household_detail(view: super::households::HouseholdView) ->
     render(ConsolePage::new(Page::Household(Box::new(view))))
 }
 
+/// Отрисовать карточку с сообщением отказа формы участника.
+pub(crate) fn render_household_detail_error(
+    view: super::households::HouseholdView,
+    message: &str,
+    hint: Option<&str>,
+    status: StatusCode,
+) -> Response {
+    render_with_status(
+        ConsolePage::new(Page::Household(Box::new(view)))
+            .error(message)
+            .hint(hint),
+        status,
+    )
+}
+
 /// Отрисовать страницу подтверждения удаления household.
 pub(crate) fn render_household_delete(view: super::households::HouseholdDeleteView) -> Response {
     render(ConsolePage::new(Page::HouseholdDelete(Box::new(view))))
@@ -2625,17 +2640,29 @@ struct ConsolePage<'a> {
     page: Page,
     /// Сообщение формы или причина отказа.
     error: Option<&'a str>,
+    /// Короткая подсказка под сообщением отказа.
+    hint: Option<&'a str>,
 }
 
 impl<'a> ConsolePage<'a> {
     /// Страница с общим макетом и подключёнными ресурсами.
     fn new(page: Page) -> Self {
-        Self { page, error: None }
+        Self {
+            page,
+            error: None,
+            hint: None,
+        }
     }
 
     /// Показать сообщение формы.
     fn error(mut self, message: &'a str) -> Self {
         self.error = Some(message);
+        self
+    }
+
+    /// Показать подсказку под сообщением формы.
+    fn hint(mut self, hint: Option<&'a str>) -> Self {
+        self.hint = hint;
         self
     }
 
@@ -2648,6 +2675,7 @@ impl<'a> ConsolePage<'a> {
             nav: self.page.nav(),
             section: self.page.section(),
             error: self.error,
+            hint: self.hint,
             content: self.page.render_body()?,
         }
         .render()
@@ -2695,6 +2723,11 @@ impl<'a> ConsolePage<'a> {
 <p role="alert" class="console-alert">{{ message }}</p>
 {% when None %}
 {% endmatch %}
+{% match hint %}
+{% when Some with (hint) %}
+<p class="muted">{{ hint }}</p>
+{% when None %}
+{% endmatch %}
 {{ content|safe }}
 </main>
 </body>
@@ -2705,6 +2738,11 @@ impl<'a> ConsolePage<'a> {
 {% match error %}
 {% when Some with (message) %}
 <p role="alert" class="console-alert">{{ message }}</p>
+{% when None %}
+{% endmatch %}
+{% match hint %}
+{% when Some with (hint) %}
+<p class="muted">{{ hint }}</p>
 {% when None %}
 {% endmatch %}
 <div class="auth-panel">
@@ -2730,6 +2768,8 @@ struct Layout<'a> {
     section: &'static str,
     /// Сообщение формы или причина отказа.
     error: Option<&'a str>,
+    /// Короткая подсказка под сообщением отказа.
+    hint: Option<&'a str>,
     /// Уже отрисованный askama фрагмент страницы; экранирован шаблоном
     /// страницы, поэтому в макет вставляется без повторного экранирования.
     content: String,

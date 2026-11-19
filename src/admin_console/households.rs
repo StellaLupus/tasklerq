@@ -23,13 +23,14 @@ use axum::extract::{Form, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use chrono::{DateTime, NaiveDate, Utc};
+use chrono_tz::Tz;
 use serde::Deserialize;
 use uuid::Uuid;
 
 use super::owner;
 use super::pages::{
     self, HouseholdForm, internal, render_household_delete, render_household_delete_error,
-    render_household_detail, render_household_list,
+    render_household_detail, render_household_detail_error, render_household_list,
 };
 use super::router::AdminState;
 use super::session::AdminSession;
@@ -38,6 +39,7 @@ use crate::config::TenancyMode;
 use crate::domain::error::DomainError;
 use crate::domain::identity::confirmation_matches;
 use crate::domain::models::{User, UserRole};
+use crate::domain::recurrence::parse_timezone;
 use crate::domain::settings::{DEFAULT_TIMEZONE, validate_timezone};
 use crate::domain::validation::normalize_text;
 
@@ -45,6 +47,12 @@ use crate::domain::validation::normalize_text;
 const DELETE_EMPTY_CONFIRMATION: &str = "Введите название household, чтобы подтвердить удаление.";
 /// Отказ при несовпадении названия.
 const DELETE_NAME_MISMATCH: &str = "Название не совпадает с названием household.";
+/// Отказ формы участника на пустой, нечисловой или неположительный Telegram ID.
+const INVALID_TELEGRAM_ID: &str = "telegram id must be a positive integer";
+/// Роль по умолчанию в форме участника.
+const DEFAULT_MEMBER_ROLE: &str = "member";
+/// Подсказка при попытке добавить второго владельца.
+const OWNER_EXISTS_HINT: &str = "Владение передаётся в боте.";
 
 /// Telegram ID для показа: только последние четыре цифры.
 ///
@@ -72,23 +80,55 @@ struct MemberView {
 
 impl MemberView {
     /// Оставить только поля, которые можно показывать на карточке.
-    fn new(user: User) -> Self {
+    fn new(user: User, timezone: Tz) -> Self {
         Self {
             name: user.display_name,
             role: match user.role {
                 UserRole::Owner => "владелец",
                 UserRole::Member => "участник",
             },
-            joined_at: user.created_at.date_naive(),
+            joined_at: user.created_at.with_timezone(&timezone).date_naive(),
             telegram_id: mask_telegram_id(user.telegram_user_id),
         }
     }
 }
 
-/// Данные household для строки списка и карточки; без Telegram ID владельца и
-/// содержимого задач.
+/// Строка списка household: без участников, готовности Telegram и формы.
+pub(crate) struct HouseholdRow {
+    /// Идентификатор для ссылки на карточку.
+    id: Uuid,
+    /// Название.
+    name: String,
+    /// Часовой пояс IANA.
+    timezone: String,
+    /// Есть ли активный владелец.
+    has_owner: bool,
+    /// Число активных участников.
+    members: i64,
+    /// Число открытых задач.
+    open_tasks: i64,
+    /// Число активных токенов.
+    active_tokens: i64,
+}
+
+impl HouseholdRow {
+    /// Собрать строку из сводки `admin`.
+    fn new(household: HouseholdSummary) -> Self {
+        Self {
+            id: household.id,
+            name: household.name,
+            timezone: household.timezone,
+            has_owner: household.owner_telegram_id.is_some(),
+            members: household.members,
+            open_tasks: household.open_tasks,
+            active_tokens: household.active_tokens,
+        }
+    }
+}
+
+/// Данные карточки household; без Telegram ID владельца и содержимого задач.
 pub(crate) struct HouseholdView {
-    /// Идентификатор для ссылки на карточку и формы выпуска ссылки-claim.
+    /// Идентификатор для ссылки на карточку и форм.
     id: Uuid,
     /// Название.
     name: String,
@@ -104,13 +144,18 @@ pub(crate) struct HouseholdView {
     active_tokens: i64,
     /// Бот включён и его имя известно: ссылку-claim можно выпускать.
     telegram_ready: bool,
-    /// Участники для секции карточки; пусто в строке списка.
+    /// Участники секции карточки.
     member_rows: Vec<MemberView>,
+    /// Введённый Telegram ID формы участника: сохраняется при отказе.
+    member_telegram_id: String,
+    /// Выбранная роль формы участника.
+    member_role: String,
+    /// Введённое имя формы участника: сохраняется при отказе.
+    member_name: String,
 }
 
 impl HouseholdView {
-    /// Собрать данные из сводки `admin`; готовность Telegram не нужна строке
-    /// списка и по умолчанию выключена.
+    /// Собрать карточку из сводки `admin`.
     fn new(household: HouseholdSummary) -> Self {
         Self {
             id: household.id,
@@ -122,18 +167,36 @@ impl HouseholdView {
             active_tokens: household.active_tokens,
             telegram_ready: false,
             member_rows: Vec::new(),
+            member_telegram_id: String::new(),
+            member_role: DEFAULT_MEMBER_ROLE.to_owned(),
+            member_name: String::new(),
         }
     }
 
-    /// Выставить готовность Telegram: её использует только карточка.
+    /// Выставить готовность Telegram для предложения ссылки-claim.
     fn with_telegram_ready(mut self, telegram_ready: bool) -> Self {
         self.telegram_ready = telegram_ready;
         self
     }
 
-    /// Заполнить секцию участников карточки.
+    /// Заполнить секцию участников; дата вступления — в поясе household.
     fn with_members(mut self, members: Vec<User>) -> Self {
-        self.member_rows = members.into_iter().map(MemberView::new).collect();
+        let timezone = parse_timezone(&self.timezone).unwrap_or(Tz::UTC);
+        self.member_rows = members
+            .into_iter()
+            .map(|user| MemberView::new(user, timezone))
+            .collect();
+        self
+    }
+
+    /// Показать введённые значения формы участника после отказа.
+    fn with_member_form(mut self, form: &MemberForm) -> Self {
+        self.member_telegram_id = form.telegram_id.clone().unwrap_or_default();
+        self.member_role = form
+            .role
+            .clone()
+            .unwrap_or_else(|| DEFAULT_MEMBER_ROLE.to_owned());
+        self.member_name = form.name.clone().unwrap_or_default();
         self
     }
 
@@ -146,7 +209,7 @@ impl HouseholdView {
 /// Данные списка household и формы создания.
 pub(crate) struct HouseholdList {
     /// Строки в порядке `list_households`.
-    rows: Vec<HouseholdView>,
+    rows: Vec<HouseholdRow>,
     /// Активных household нет: показать пояснение вместо пустого списка.
     empty: bool,
     /// Показывать форму создания.
@@ -160,7 +223,7 @@ pub(crate) struct HouseholdList {
 impl HouseholdList {
     /// Собрать список из сводок `admin`.
     fn new(households: Vec<HouseholdSummary>, show_form: bool) -> Self {
-        let rows: Vec<HouseholdView> = households.into_iter().map(HouseholdView::new).collect();
+        let rows: Vec<HouseholdRow> = households.into_iter().map(HouseholdRow::new).collect();
         let empty = rows.is_empty();
         Self {
             rows,
@@ -219,6 +282,62 @@ pub(crate) struct HouseholdDeleteForm {
     /// Название household; отсутствие поля и пустое значение — отказ.
     #[serde(default)]
     confirm_name: Option<String>,
+}
+
+/// Поля формы добавления участника.
+#[derive(Deserialize)]
+pub(crate) struct MemberForm {
+    /// Telegram ID: полный, только при добавлении.
+    #[serde(default)]
+    telegram_id: Option<String>,
+    /// Роль: `member` по умолчанию или `owner`.
+    #[serde(default)]
+    role: Option<String>,
+    /// Необязательное имя.
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Разобранная форма участника для [`admin::add_user`].
+struct MemberSubmission {
+    /// Роль нового участника.
+    role: UserRole,
+    /// Положительный Telegram ID.
+    telegram_id: i64,
+    /// Имя, если администратор его указал.
+    name: Option<String>,
+}
+
+/// Разобрать форму участника: поля ввода проверяются здесь, правила членства —
+/// в `src/admin`.
+fn parse_member_submission(form: &MemberForm) -> Result<MemberSubmission, DomainError> {
+    let raw = form.telegram_id.as_deref().unwrap_or_default().trim();
+    let telegram_id: i64 = raw
+        .parse()
+        .map_err(|_| DomainError::Validation(INVALID_TELEGRAM_ID.into()))?;
+    if telegram_id <= 0 {
+        return Err(DomainError::Validation(INVALID_TELEGRAM_ID.into()));
+    }
+    let role = match form.role.as_deref().unwrap_or(DEFAULT_MEMBER_ROLE) {
+        "owner" => UserRole::Owner,
+        DEFAULT_MEMBER_ROLE => UserRole::Member,
+        _ => {
+            return Err(DomainError::Validation(
+                "role must be owner or member".into(),
+            ));
+        }
+    };
+    let name = form
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned);
+    Ok(MemberSubmission {
+        role,
+        telegram_id,
+        name,
+    })
 }
 
 /// Отрисовать содержимое списка без макета.
@@ -321,32 +440,109 @@ pub(crate) async fn detail(
     let Ok(household_id) = Uuid::parse_str(&raw_id) else {
         return not_found();
     };
-    let household = match admin::household_summary(&state.pool, household_id, Utc::now()).await {
+    match load_card(&state, household_id, Utc::now()).await {
+        Ok(view) => render_household_detail(view),
+        Err(response) => *response,
+    }
+}
+
+/// Загрузить карточку household или вернуть готовый ответ (`404`/`500`).
+///
+/// Ответ в `Err` упакован: он больше самой карточки, а `Result` с большим
+/// `Err` не проходит clippy.
+async fn load_card(
+    state: &AdminState,
+    household_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<HouseholdView, Box<Response>> {
+    let household = match admin::household_summary(&state.pool, household_id, now).await {
         Ok(Some(household)) => household,
-        Ok(None) => return not_found(),
-        Err(error) => return internal(error),
+        Ok(None) => return Err(Box::new(not_found())),
+        Err(error) => return Err(Box::new(internal(error))),
     };
     let members = match admin::list_members(&state.pool, household_id).await {
         Ok(members) => members,
-        Err(DomainError::NotFound) => return not_found(),
-        Err(error) => return internal(error),
+        Err(DomainError::NotFound) => return Err(Box::new(not_found())),
+        Err(error) => return Err(Box::new(internal(error))),
     };
 
     // Готовность Telegram нужна только предложению ссылки-claim.
     let telegram_ready = if household.owner_telegram_id.is_some() {
         false
     } else {
-        match owner::telegram_bot(&state).await {
+        match owner::telegram_bot(state).await {
             Ok((ready, _)) => ready,
-            Err(error) => return internal(error),
+            Err(error) => return Err(Box::new(internal(error))),
         }
     };
 
-    render_household_detail(
-        HouseholdView::new(household)
-            .with_members(members)
-            .with_telegram_ready(telegram_ready),
+    Ok(HouseholdView::new(household)
+        .with_members(members)
+        .with_telegram_ready(telegram_ready))
+}
+
+/// `POST /admin/households/{id}/members`: добавить участника через домен.
+///
+/// Поля формы разбираются здесь, правила членства (второй владелец, Telegram ID
+/// из другого household, `member_joined`) проверяет [`admin::add_user`]. Отказ
+/// возвращает карточку с формой и введёнными значениями, ничего не меняя.
+pub(crate) async fn add_member(
+    State(state): State<AdminState>,
+    Path(raw_id): Path<String>,
+    _session: AdminSession,
+    Form(form): Form<MemberForm>,
+) -> Response {
+    let Ok(household_id) = Uuid::parse_str(&raw_id) else {
+        return not_found();
+    };
+    let now = Utc::now();
+    let submission = match parse_member_submission(&form) {
+        Ok(submission) => submission,
+        Err(error) => {
+            return member_refusal(&state, household_id, &form, &error, now, None).await;
+        }
+    };
+
+    match admin::add_user(
+        &state.pool,
+        state.wizard().tenancy,
+        Some(household_id),
+        submission.role,
+        submission.telegram_id,
+        submission.name.as_deref(),
+        now,
     )
+    .await
+    {
+        Ok(_) => Redirect::to(&format!("/admin/households/{household_id}")).into_response(),
+        Err(DomainError::Database(error)) => internal(error),
+        Err(error) => {
+            let hint = owner_exists(&error).then_some(OWNER_EXISTS_HINT);
+            member_refusal(&state, household_id, &form, &error, now, hint).await
+        }
+    }
+}
+
+/// Карточка с формой участника и текстом отказа; удалённый household — `404`.
+async fn member_refusal(
+    state: &AdminState,
+    household_id: Uuid,
+    form: &MemberForm,
+    error: &DomainError,
+    now: DateTime<Utc>,
+    hint: Option<&str>,
+) -> Response {
+    let view = match load_card(state, household_id, now).await {
+        Ok(view) => view.with_member_form(form),
+        Err(response) => return *response,
+    };
+    let message = admin::describe(error);
+    render_household_detail_error(view, &message, hint, error_status(error))
+}
+
+/// Отказ «владелец уже есть»: подсказка ведёт к передаче владения в боте.
+fn owner_exists(error: &DomainError) -> bool {
+    matches!(error, DomainError::Conflict { details, .. } if details["reason"] == "owner_exists")
 }
 
 /// `GET /admin/households/{id}/delete`: подтверждение вводом названия.
@@ -520,6 +716,20 @@ struct ListBody<'a> {
 {% endfor %}
 </ul>
 {% endif %}
+<div class="panel-body">
+<form method="post" action="/admin/households/{{ view.id }}/members">
+<div class="field"><label for="member-telegram-id">Telegram ID</label>
+<input id="member-telegram-id" name="telegram_id" type="text" inputmode="numeric" value="{{ view.member_telegram_id }}" required></div>
+<div class="field"><label for="member-role">Роль</label>
+<select id="member-role" name="role">
+<option value="member"{% if view.member_role == "member" %} selected{% endif %}>участник</option>
+<option value="owner"{% if view.member_role == "owner" %} selected{% endif %}>владелец</option>
+</select></div>
+<div class="field"><label for="member-name">Имя (необязательно)</label>
+<input id="member-name" name="name" type="text" value="{{ view.member_name }}" maxlength="64"></div>
+<div class="actions"><button type="submit" class="btn-primary">Добавить участника</button></div>
+</form>
+</div>
 </section>
 {% if !view.has_owner %}
 <section class="panel">
@@ -588,6 +798,7 @@ mod tests {
     #[test]
     fn telegram_ids_show_only_the_last_four_digits_or_nothing_short() {
         assert_eq!(mask_telegram_id(123_456_789), "…6789");
+        assert_eq!(mask_telegram_id(12_345), "…2345");
         assert_eq!(mask_telegram_id(1_234), "…");
         assert_eq!(mask_telegram_id(12), "…");
     }

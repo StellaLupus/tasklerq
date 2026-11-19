@@ -26,7 +26,7 @@
   `src/admin` поверх репозитория `members`), Telegram ID маскируется до
   `…NNNN`. Проверить: в HTML нет полного Telegram ID участника (spec
   admin-console «Участники в консоли», design, решение 6).
-- [ ] 2.2 Добавление участника через `admin::add_user`; для household без
+- [x] 2.2 Добавление участника через `admin::add_user`; для household без
   владельца — блок ссылки-claim из 0014. Проверить: `member_joined` с
   системным актором; второй владелец и Telegram ID из другого household
   отклонены без изменений (spec admin-console «Участники в консоли»).

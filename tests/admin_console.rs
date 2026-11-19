@@ -9994,7 +9994,11 @@ async fn households_card_lists_members_with_masked_telegram_ids() {
     let db = support::isolated_db().await;
     insert_account(&db.pool, "admin").await;
     let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
-    let now = Utc::now();
+    // 22:30 UTC — уже следующие сутки в Europe/Moscow: дата вступления должна
+    // браться в часовом поясе household, а не по UTC.
+    let now = DateTime::parse_from_rfc3339("2026-01-01T22:30:00Z")
+        .expect("a fixed moment")
+        .with_timezone(&Utc);
     let household = tasklerq::admin::create_household(
         &db.pool,
         TenancyMode::Multi,
@@ -10047,16 +10051,33 @@ async fn households_card_lists_members_with_masked_telegram_ids() {
     let (status, _, body) = send_with_cookie(&app, Method::GET, &path, &cookie).await;
     assert_eq!(status, StatusCode::OK);
     let text = String::from_utf8_lossy(&body);
-    for expected in ["Алексей", "Мария", "владелец", "участник", "…6789", "…4321"]
-    {
+
+    let owner_row = member_row(&text, "Алексей");
+    for expected in ["владелец", "…6789", "2026-01-02"] {
         assert!(
-            text.contains(expected),
-            "missing `{expected}` on the card:\n{text}"
+            owner_row.contains(expected),
+            "missing `{expected}` in the owner row:\n{owner_row}"
         );
     }
     assert!(
-        text.contains(&now.date_naive().to_string()),
-        "the joining date is shown without the time:\n{text}"
+        !owner_row.contains("…4321"),
+        "the owner row must not show another member's mask:\n{owner_row}"
+    );
+
+    let member_row = member_row(&text, "Мария");
+    for expected in ["участник", "…4321", "2026-01-02"] {
+        assert!(
+            member_row.contains(expected),
+            "missing `{expected}` in the member row:\n{member_row}"
+        );
+    }
+    assert!(
+        !member_row.contains("…6789"),
+        "the member row must not show another member's mask:\n{member_row}"
+    );
+    assert!(
+        !text.contains("2026-01-01"),
+        "the joining date uses the household timezone, not UTC:\n{text}"
     );
     for hidden in [
         "123456789",
@@ -10070,6 +10091,428 @@ async fn households_card_lists_members_with_masked_telegram_ids() {
             "the card must not show `{hidden}`:\n{text}"
         );
     }
+}
+
+/// Форма участника добавляет его через домен: `303`, маска в списке и событие
+/// `member_joined` от системного актора.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_member_form_adds_a_member_with_the_domain_event() {
+    const TELEGRAM_ID: i64 = 123_456_789;
+
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
+    let household = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Дом",
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("the household");
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    let path = format!("/admin/households/{}/members", household.id);
+    let (status, headers, body) = send_form_from(
+        &app,
+        &path,
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("telegram_id", "123456789"),
+            ("role", "member"),
+            ("name", "Мария"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "an added member redirects: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let card_path = format!("/admin/households/{}", household.id);
+    assert_eq!(location(&headers), Some(card_path.as_str()));
+    assert_eq!(member_count(&db.pool, household.id).await, 1);
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, &card_path, &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    let row = member_row(&text, "Мария");
+    assert!(
+        row.contains("…6789"),
+        "the member row shows the mask:\n{row}"
+    );
+    assert!(
+        row.contains("участник"),
+        "the member row shows the role:\n{row}"
+    );
+    assert!(
+        !text.contains(&TELEGRAM_ID.to_string()),
+        "the card must not show the full Telegram id:\n{text}"
+    );
+
+    assert_eq!(
+        audit_actor(&db.pool, "member_joined").await,
+        vec![("system".to_owned(), Some(household.id))],
+        "the domain writes member_joined from the system actor"
+    );
+}
+
+/// Второй владелец отклоняется текстом `admin::describe` с подсказкой про
+/// передачу владения в боте; участники и журнал не меняются.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_member_form_refuses_a_second_owner_and_points_to_the_bot() {
+    use tasklerq::domain::models::UserRole;
+
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
+    let now = Utc::now();
+    let household = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Дом",
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("the household");
+    tasklerq::admin::add_user(
+        &db.pool,
+        TenancyMode::Multi,
+        Some(household.id),
+        UserRole::Owner,
+        7_200_000_001,
+        Some("Алексей"),
+        now,
+    )
+    .await
+    .expect("the owner");
+    let members_before = member_count(&db.pool, household.id).await;
+    let events_before = audit_actor(&db.pool, "member_joined").await.len();
+
+    let refused = tasklerq::admin::add_user(
+        &db.pool,
+        TenancyMode::Multi,
+        Some(household.id),
+        UserRole::Owner,
+        7_200_000_002,
+        Some("Борис"),
+        now,
+    )
+    .await;
+    let expected = tasklerq::admin::describe(&refused.expect_err("a second owner"));
+
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    let path = format!("/admin/households/{}/members", household.id);
+    let (status, _, body) = send_form_from(
+        &app,
+        &path,
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("telegram_id", "7200000002"),
+            ("role", "owner"),
+            ("name", "Борис"),
+        ],
+    )
+    .await;
+    assert!(
+        status.is_client_error(),
+        "a second owner is a form refusal, not {status}"
+    );
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains(&expected),
+        "the page shows `{expected}`:\n{text}"
+    );
+    assert!(
+        text.contains("Владение передаётся в боте."),
+        "the page points to the bot for ownership transfer:\n{text}"
+    );
+    assert!(
+        input_with_name(&text, "telegram_id").contains("value=\"7200000002\""),
+        "the failed form keeps the entered Telegram id in the input:\n{text}"
+    );
+    let owner_row = member_row(&text, "Алексей");
+    assert!(
+        !owner_row.contains("7200000002"),
+        "the member list must not show the entered full Telegram id:\n{owner_row}"
+    );
+    assert_eq!(
+        member_count(&db.pool, household.id).await,
+        members_before,
+        "the refused owner changes nothing"
+    );
+    assert_eq!(
+        audit_actor(&db.pool, "member_joined").await.len(),
+        events_before,
+        "the refused owner writes no member_joined event"
+    );
+}
+
+/// Telegram ID из другого household отклоняется текстом `admin::describe` и
+/// ничего не меняет.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_member_form_refuses_a_telegram_id_from_another_household() {
+    use tasklerq::domain::models::UserRole;
+
+    const TELEGRAM_ID: i64 = 7_300_000_001;
+
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
+    let now = Utc::now();
+    let first = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Квартира",
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("the first household");
+    let second = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Дача",
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("the second household");
+    tasklerq::admin::add_user(
+        &db.pool,
+        TenancyMode::Multi,
+        Some(first.id),
+        UserRole::Member,
+        TELEGRAM_ID,
+        Some("Мария"),
+        now,
+    )
+    .await
+    .expect("the member of another household");
+    let events_before = audit_actor(&db.pool, "member_joined").await.len();
+
+    let refused = tasklerq::admin::add_user(
+        &db.pool,
+        TenancyMode::Multi,
+        Some(second.id),
+        UserRole::Member,
+        TELEGRAM_ID,
+        Some("Мария"),
+        now,
+    )
+    .await;
+    let expected = tasklerq::admin::describe(&refused.expect_err("a busy Telegram id"));
+
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    let path = format!("/admin/households/{}/members", second.id);
+    let (status, _, body) = send_form_from(
+        &app,
+        &path,
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("telegram_id", "7300000001"),
+            ("role", "member"),
+            ("name", "Мария"),
+        ],
+    )
+    .await;
+    assert!(
+        status.is_client_error(),
+        "a busy Telegram id is a form refusal, not {status}"
+    );
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains(&expected),
+        "the page shows `{expected}`:\n{text}"
+    );
+    assert_eq!(
+        member_count(&db.pool, second.id).await,
+        0,
+        "the refused member is not added"
+    );
+    assert_eq!(
+        audit_actor(&db.pool, "member_joined").await.len(),
+        events_before,
+        "the refused member writes no member_joined event"
+    );
+}
+
+/// Пустой, нечисловой и неположительный Telegram ID — ошибка формы без записи.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_member_form_rejects_invalid_telegram_ids() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
+    let household = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Дом",
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("the household");
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    let path = format!("/admin/households/{}/members", household.id);
+
+    for telegram_id in ["", "not-a-number", "0", "-5"] {
+        let (status, _, body) = send_form_from(
+            &app,
+            &path,
+            test_peer(),
+            headers_with(&[("cookie", &cookie)]),
+            &[("telegram_id", telegram_id), ("role", "member")],
+        )
+        .await;
+        assert!(
+            status.is_client_error(),
+            "`{telegram_id}` is a form error, not {status}"
+        );
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("telegram id"),
+            "the page explains the invalid Telegram id `{telegram_id}`:\n{text}"
+        );
+        assert_eq!(
+            member_count(&db.pool, household.id).await,
+            0,
+            "`{telegram_id}` must not add a member"
+        );
+    }
+    assert!(
+        audit_actor(&db.pool, "member_joined").await.is_empty(),
+        "nothing was written"
+    );
+}
+
+/// Слишком длинное имя отклоняется правилом домена и не записывает участника.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_member_form_rejects_a_too_long_name() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
+    let household = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Дом",
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("the household");
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    let path = format!("/admin/households/{}/members", household.id);
+    let too_long = "я".repeat(65);
+
+    let (status, _, body) = send_form_from(
+        &app,
+        &path,
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("telegram_id", "7300000009"),
+            ("role", "member"),
+            ("name", too_long.as_str()),
+        ],
+    )
+    .await;
+    assert!(
+        status.is_client_error(),
+        "a too long name is a form error, not {status}"
+    );
+    assert!(
+        String::from_utf8_lossy(&body).contains("display name"),
+        "the page explains the name limit:\n{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        member_count(&db.pool, household.id).await,
+        0,
+        "a rejected name must not add a member"
+    );
+    assert!(
+        audit_actor(&db.pool, "member_joined").await.is_empty(),
+        "nothing was written"
+    );
+}
+
+/// После добавления владельца через форму блок ссылки-claim пропадает.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_member_form_removes_the_claim_block_once_an_owner_is_added() {
+    let db = support::isolated_db().await;
+    let config = telegram_config(&db.pool, None, &[]).await;
+    let cipher = SecretCipher::from_config(&config);
+    seed_bot(
+        &db.pool,
+        &cipher,
+        "polling",
+        "123:SECRET-owner-form",
+        "owner-form-secret",
+        902_002,
+        "tasklerq_owner_form_bot",
+    )
+    .await;
+    let (app, cookie) = owner_console_with_login(&db.pool, &config, TenancyMode::Multi).await;
+    let household = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Дача",
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("the household");
+    let path = format!("/admin/households/{}", household.id);
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, &path, &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(&body).contains("action=\"/admin/owner\""),
+        "a household without an owner offers the claim link"
+    );
+
+    let members = format!("/admin/households/{}/members", household.id);
+    let (status, _, body) = send_form_from(
+        &app,
+        &members,
+        test_peer(),
+        headers_with(&[("cookie", &cookie)]),
+        &[
+            ("telegram_id", "123456789"),
+            ("role", "owner"),
+            ("name", "Алексей"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "an added owner redirects: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, _, body) = send_with_cookie(&app, Method::GET, &path, &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        !text.contains("action=\"/admin/owner\""),
+        "a household with an owner has no claim block:\n{text}"
+    );
+    assert!(
+        text.contains("<dt>Владелец</dt><dd>есть</dd>"),
+        "the card shows the owner:\n{text}"
+    );
+    let row = member_row(&text, "Алексей");
+    assert!(
+        row.contains("владелец") && row.contains("…6789"),
+        "the owner row shows the role and the mask:\n{row}"
+    );
 }
 
 /// В `single` список сразу ведёт на единственный household; пункт меню
@@ -10183,6 +10626,17 @@ async fn unknown_deleted_and_malformed_households_are_not_found() {
             !String::from_utf8_lossy(&body).contains("Удалённый"),
             "a missing household must not be revealed: {path}"
         );
+
+        let members = format!("{path}/members");
+        let (status, _, _) = send_form_from(
+            &app,
+            &members,
+            test_peer(),
+            headers_with(&[("cookie", &cookie)]),
+            &[("telegram_id", "7300000010"), ("role", "member")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "POST {members}");
     }
 }
 
@@ -10216,6 +10670,23 @@ fn household_row<'a>(html: &'a str, name: &str) -> &'a str {
             .find("</li>")
             .map(|offset| offset + "</li>".len())
             .unwrap_or_else(|| panic!("no row end for {name} in:\n{html}"));
+    &html[start..end]
+}
+
+/// Строка участника карточки с указанным именем целиком: от `<li>` до `</li>`.
+fn member_row<'a>(html: &'a str, name: &str) -> &'a str {
+    let marker = format!(">{name}</span>");
+    let name_position = html
+        .find(&marker)
+        .unwrap_or_else(|| panic!("no member row for {name} in:\n{html}"));
+    let start = html[..name_position]
+        .rfind("<li>")
+        .unwrap_or_else(|| panic!("no member row start for {name} in:\n{html}"));
+    let end = name_position
+        + html[name_position..]
+            .find("</li>")
+            .map(|offset| offset + "</li>".len())
+            .unwrap_or_else(|| panic!("no member row end for {name} in:\n{html}"));
     &html[start..end]
 }
 
