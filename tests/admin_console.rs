@@ -8192,6 +8192,9 @@ async fn rotating_the_token_in_polling_mode_polls_with_the_new_token() {
     );
     wait_for_token_requests(&server, "getUpdates", BOT_A_TOKEN, 1).await;
 
+    // Граница — до POST: запрос новым токеном может уйти раньше, чем
+    // `wait_for_token_requests` его увидит, и не должен оказаться до границы.
+    let boundary = server.received_requests().await.expect("requests").len();
     let (status, headers, body) = send_form_from(
         &app,
         "/admin/telegram",
@@ -8211,7 +8214,6 @@ async fn rotating_the_token_in_polling_mode_polls_with_the_new_token() {
         String::from_utf8_lossy(&body)
     );
     assert_eq!(location(&headers), Some("/admin/telegram?saved=1"));
-    let boundary = server.received_requests().await.expect("requests").len();
 
     wait_for_token_requests(&server, "getUpdates", BOT_B_TOKEN, 1).await;
     let requests = server.received_requests().await.expect("requests");

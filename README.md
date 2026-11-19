@@ -154,7 +154,9 @@ make migrate
 TELEGRAM_MODE=polling make dev
 
 # 5. Открыть @tasklerq_example_bot в Telegram и отправить /start
-#    Владелец — BOOTSTRAP_OWNER_TELEGRAM_ID, иначе первый написавший боту
+#    Владельца назначают BOOTSTRAP_OWNER_TELEGRAM_ID или ссылка-claim из
+#    консоли; первый написавший становится владельцем, только если учётной
+#    записи администратора ещё нет
 
 # 6. Создать токен для внешнего capture
 tasklerq admin token create --name "Dev capture" --scopes capture:write
