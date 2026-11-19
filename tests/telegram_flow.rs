@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use chrono::{Datelike, Duration, NaiveDate, TimeZone, Utc};
 use chrono_tz::Tz;
+use serde_json::json;
 use support::telegram::{Call, FakeTelegram, Harness, buttons};
 use support::{
     TestHousehold, create_item, db, isolated_db, new_item, next_telegram_id, recurrence,
@@ -3638,6 +3639,21 @@ fn recovery_message(bot: &Harness) -> (i64, String) {
         })
 }
 
+/// HTML без значений callback-токенов: каждый рендер выдаёт новые, а текст и
+/// кнопки ответа должны совпадать.
+fn without_callback_tokens(html: &str) -> String {
+    let marker = "data=\"t:";
+    let mut result = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(start) = rest.find(marker) {
+        let (before, after) = rest.split_at(start + marker.len());
+        result.push_str(before);
+        rest = &after[16.min(after.len())..];
+    }
+    result.push_str(rest);
+    result
+}
+
 /// Код из ссылки `<origin>/admin/recover/<код>`.
 fn recovery_code(html: &str) -> String {
     let marker = "/admin/recover/";
@@ -3736,9 +3752,14 @@ async fn admin_sends_a_hidden_expiring_recovery_link_to_the_linked_account() {
         "the recovery code lives fifteen minutes: {lifetime}"
     );
 
-    // Аудит: один выпуск, без кода и ссылки.
+    // Аудит: один выпуск, без кода и ссылки; форма payload как у CLI.
     let audit = recovery_audit(&db.pool).await;
     assert_eq!(audit.len(), 1);
+    assert_eq!(
+        audit[0],
+        json!({ "suppressed": 0 }),
+        "the bot must write the same payload as `tasklerq admin reset-password`"
+    );
     assert!(
         !audit[0].to_string().contains(&code),
         "the audit must not contain the code: {:?}",
@@ -3787,6 +3808,35 @@ async fn admin_without_a_console_origin_hints_at_the_cli_and_issues_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_requests_without_a_console_origin_do_not_spend_the_limit() {
+    let db = isolated_db().await;
+    let mut bot = Harness::new(&db.pool, next_telegram_id());
+    admin_account(&db.pool, Some(bot.chat), None).await;
+
+    for _ in 0..3 {
+        bot.text("/admin").await;
+        bot.assert_latest_contains("tasklerq admin reset-password");
+    }
+    assert_eq!(recovery_code_count(&db.pool).await, 0);
+    assert!(recovery_audit(&db.pool).await.is_empty());
+
+    // Адрес консоли появился после входа администратора: лимит не израсходован.
+    sqlx::query("UPDATE admin_accounts SET console_origin = 'http://nas:18081'")
+        .execute(&db.pool)
+        .await
+        .expect("console origin");
+
+    bot.text("/admin").await;
+    assert!(
+        recovery_message(&bot)
+            .1
+            .contains("http://nas:18081/admin/recover/"),
+        "the first request after the origin is known must pass"
+    );
+    assert_eq!(recovery_code_count(&db.pool).await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_from_a_stranger_is_the_unknown_command() {
     let db = isolated_db().await;
     let admin_id = next_telegram_id();
@@ -3803,10 +3853,16 @@ async fn admin_from_a_stranger_is_the_unknown_command() {
         "`/admin` from an unlinked account must answer byte for byte like an unknown command"
     );
 
-    // Участник household.
+    // Участник household, не привязанный к администратору.
     let mut member = onboarded(&db.pool).await;
+    member.text("/nosuchcommand").await;
+    let unknown = without_callback_tokens(&member.latest().1);
     member.text("/admin").await;
-    member.assert_latest_contains("Не знаю такой команды");
+    assert_eq!(
+        without_callback_tokens(&member.latest().1),
+        unknown,
+        "a household member without a Telegram link must see the unknown command"
+    );
 
     assert_eq!(recovery_code_count(&db.pool).await, 0);
     assert!(recovery_audit(&db.pool).await.is_empty());
@@ -3861,5 +3917,18 @@ async fn the_fourth_admin_request_within_an_hour_is_refused() {
     assert_eq!(
         limited[0]["limit"],
         serde_json::json!("admin_telegram_recovery_per_hour")
+    );
+
+    // Час прошёл: окно лимита освободилось.
+    bot.advance(Duration::hours(1));
+    bot.text("/admin").await;
+    assert!(
+        recovery_message(&bot).1.contains("/admin/recover/"),
+        "the limit must reset after an hour"
+    );
+    assert_eq!(
+        recovery_code_count(&db.pool).await,
+        4,
+        "the request after the window issues a new code"
     );
 }

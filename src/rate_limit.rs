@@ -93,7 +93,17 @@ impl<K: Eq + Hash + Clone> RateGuard<K> {
     /// Ввод не удался: слот превращается в отметку неудачи.
     pub fn failed(mut self) {
         self.armed = false;
-        self.limiter.record_failure(&self.key, self.now);
+        self.limiter.record_hit(&self.key, self.now);
+    }
+
+    /// Операция состоялась и должна считаться в окне.
+    ///
+    /// Нужен лимитам, которые ограничивают успешные операции (например, выпуск
+    /// ссылок восстановления), а не неудачные попытки ввода: в отличие от
+    /// [`RateGuard::succeeded`], отметка попадает в окно.
+    pub fn recorded(mut self) {
+        self.armed = false;
+        self.limiter.record_hit(&self.key, self.now);
     }
 }
 
@@ -235,8 +245,8 @@ impl<K: Eq + Hash + Clone> RateLimiter<K> {
         release_slot(&mut state.in_flight, key);
     }
 
-    /// Освободить занятый слот и записать неудачу.
-    fn record_failure(&self, key: &K, now: DateTime<Utc>) {
+    /// Освободить занятый слот и записать отметку в окно.
+    fn record_hit(&self, key: &K, now: DateTime<Utc>) {
         let cutoff = now - self.window;
         let mut state = self
             .state
