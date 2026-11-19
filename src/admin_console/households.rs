@@ -22,7 +22,7 @@ use askama::Template;
 use axum::extract::{Form, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -36,6 +36,8 @@ use super::session::AdminSession;
 use crate::admin::{self, HouseholdSummary};
 use crate::config::TenancyMode;
 use crate::domain::error::DomainError;
+use crate::domain::identity::confirmation_matches;
+use crate::domain::models::{User, UserRole};
 use crate::domain::settings::{DEFAULT_TIMEZONE, validate_timezone};
 use crate::domain::validation::normalize_text;
 
@@ -43,6 +45,45 @@ use crate::domain::validation::normalize_text;
 const DELETE_EMPTY_CONFIRMATION: &str = "Введите название household, чтобы подтвердить удаление.";
 /// Отказ при несовпадении названия.
 const DELETE_NAME_MISMATCH: &str = "Название не совпадает с названием household.";
+
+/// Telegram ID для показа: только последние четыре цифры.
+///
+/// Для ID короче пяти цифр остаётся одно многоточие: раскрывать короткий ID
+/// целиком нельзя.
+fn mask_telegram_id(telegram_user_id: i64) -> String {
+    let digits = telegram_user_id.unsigned_abs().to_string();
+    match digits.len().checked_sub(4) {
+        Some(start) if start > 0 => format!("…{}", &digits[start..]),
+        _ => "…".to_owned(),
+    }
+}
+
+/// Участник в секции карточки: без полного Telegram ID, chat id и username.
+struct MemberView {
+    /// Отображаемое имя.
+    name: String,
+    /// Роль по-русски.
+    role: &'static str,
+    /// Дата вступления без времени.
+    joined_at: NaiveDate,
+    /// Последние четыре цифры Telegram ID.
+    telegram_id: String,
+}
+
+impl MemberView {
+    /// Оставить только поля, которые можно показывать на карточке.
+    fn new(user: User) -> Self {
+        Self {
+            name: user.display_name,
+            role: match user.role {
+                UserRole::Owner => "владелец",
+                UserRole::Member => "участник",
+            },
+            joined_at: user.created_at.date_naive(),
+            telegram_id: mask_telegram_id(user.telegram_user_id),
+        }
+    }
+}
 
 /// Данные household для строки списка и карточки; без Telegram ID владельца и
 /// содержимого задач.
@@ -63,6 +104,8 @@ pub(crate) struct HouseholdView {
     active_tokens: i64,
     /// Бот включён и его имя известно: ссылку-claim можно выпускать.
     telegram_ready: bool,
+    /// Участники для секции карточки; пусто в строке списка.
+    member_rows: Vec<MemberView>,
 }
 
 impl HouseholdView {
@@ -78,12 +121,19 @@ impl HouseholdView {
             open_tasks: household.open_tasks,
             active_tokens: household.active_tokens,
             telegram_ready: false,
+            member_rows: Vec::new(),
         }
     }
 
     /// Выставить готовность Telegram: её использует только карточка.
     fn with_telegram_ready(mut self, telegram_ready: bool) -> Self {
         self.telegram_ready = telegram_ready;
+        self
+    }
+
+    /// Заполнить секцию участников карточки.
+    fn with_members(mut self, members: Vec<User>) -> Self {
+        self.member_rows = members.into_iter().map(MemberView::new).collect();
         self
     }
 
@@ -276,6 +326,11 @@ pub(crate) async fn detail(
         Ok(None) => return not_found(),
         Err(error) => return internal(error),
     };
+    let members = match admin::list_members(&state.pool, household_id).await {
+        Ok(members) => members,
+        Err(DomainError::NotFound) => return not_found(),
+        Err(error) => return internal(error),
+    };
 
     // Готовность Telegram нужна только предложению ссылки-claim.
     let telegram_ready = if household.owner_telegram_id.is_some() {
@@ -287,7 +342,11 @@ pub(crate) async fn detail(
         }
     };
 
-    render_household_detail(HouseholdView::new(household).with_telegram_ready(telegram_ready))
+    render_household_detail(
+        HouseholdView::new(household)
+            .with_members(members)
+            .with_telegram_ready(telegram_ready),
+    )
 }
 
 /// `GET /admin/households/{id}/delete`: подтверждение вводом названия.
@@ -311,9 +370,10 @@ pub(crate) async fn delete_page(
 
 /// `POST /admin/households/{id}/delete`: сверить название и мягко удалить.
 ///
-/// Сравнение с текущим названием идёт здесь: [`admin::delete_household`] не
-/// принимает подтверждение. Крайние пробелы срезаются с обеих сторон, регистр
-/// учитывается. При отказе форма возвращается с сообщением, данные не меняются.
+/// Сравнение с текущим названием идёт здесь через [`confirmation_matches`] —
+/// то же правило, что у CLI и бота: [`admin::delete_household`] не принимает
+/// подтверждение. Пробелы по краям ввода не учитываются, регистр важен. При
+/// отказе форма возвращается с сообщением, данные не меняются.
 pub(crate) async fn delete(
     State(state): State<AdminState>,
     Path(raw_id): Path<String>,
@@ -329,22 +389,20 @@ pub(crate) async fn delete(
         Err(error) => return internal(error),
     };
 
-    let confirmation = form.confirm_name.as_deref().unwrap_or_default().trim();
-    if confirmation.is_empty() {
+    let confirmation = form.confirm_name.as_deref().unwrap_or_default();
+    let refusal = if confirmation.trim().is_empty() {
+        Some(DELETE_EMPTY_CONFIRMATION)
+    } else if !confirmation_matches(&name, confirmation) {
+        Some(DELETE_NAME_MISMATCH)
+    } else {
+        None
+    };
+    if let Some(message) = refusal {
         return delete_refusal(
             household_id,
             name,
             form.confirm_name.as_deref(),
-            DELETE_EMPTY_CONFIRMATION,
-            StatusCode::UNPROCESSABLE_ENTITY,
-        );
-    }
-    if confirmation != name.trim() {
-        return delete_refusal(
-            household_id,
-            name,
-            form.confirm_name.as_deref(),
-            DELETE_NAME_MISMATCH,
+            message,
             StatusCode::UNPROCESSABLE_ENTITY,
         );
     }
@@ -446,6 +504,23 @@ struct ListBody<'a> {
 <dt>Активные токены</dt><dd>{{ view.active_tokens }}</dd>
 </dl>
 </section>
+<section class="panel">
+<header class="panel-head"><h2>Участники</h2></header>
+{% if view.member_rows.is_empty() %}
+<div class="panel-body"><p class="muted">В household пока нет участников.</p></div>
+{% else %}
+<ul class="list">
+{% for member in view.member_rows %}
+<li>
+<div class="row-text">
+<span class="row-label">{{ member.name }}</span>
+<span class="row-desc">{{ member.role }} · вступил(а) {{ member.joined_at }} · Telegram ID {{ member.telegram_id }}</span>
+</div>
+</li>
+{% endfor %}
+</ul>
+{% endif %}
+</section>
 {% if !view.has_owner %}
 <section class="panel">
 <header class="panel-head"><h2>Владелец</h2></header>
@@ -504,4 +579,16 @@ struct DetailBody<'a> {
 struct DeleteBody<'a> {
     /// Данные подтверждения.
     view: &'a HouseholdDeleteView,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mask_telegram_id;
+
+    #[test]
+    fn telegram_ids_show_only_the_last_four_digits_or_nothing_short() {
+        assert_eq!(mask_telegram_id(123_456_789), "…6789");
+        assert_eq!(mask_telegram_id(1_234), "…");
+        assert_eq!(mask_telegram_id(12), "…");
+    }
 }

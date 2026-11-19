@@ -9985,6 +9985,93 @@ async fn households_list_shows_counts_without_task_content_or_full_telegram_ids(
     }
 }
 
+/// Карточка показывает активных участников с ролью, датой вступления и только
+/// последними четырьмя цифрами Telegram ID; удалённый участник скрыт.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_card_lists_members_with_masked_telegram_ids() {
+    use tasklerq::domain::models::UserRole;
+
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
+    let now = Utc::now();
+    let household = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Квартира",
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("the household");
+
+    for (role, telegram_id, name) in [
+        (UserRole::Owner, 123_456_789_i64, "Алексей"),
+        (UserRole::Member, 987_654_321_i64, "Мария"),
+        (UserRole::Member, 555_555_555_i64, "Удалённый"),
+    ] {
+        tasklerq::admin::add_user(
+            &db.pool,
+            TenancyMode::Multi,
+            Some(household.id),
+            role,
+            telegram_id,
+            Some(name),
+            now,
+        )
+        .await
+        .expect("the household member");
+    }
+    sqlx::query(
+        "UPDATE users SET username = 'hidden_username'
+         WHERE household_id = $1 AND telegram_user_id = $2",
+    )
+    .bind(household.id)
+    .bind(987_654_321_i64)
+    .execute(&db.pool)
+    .await
+    .expect("the member username");
+    sqlx::query(
+        "UPDATE users SET deleted_at = $2
+         WHERE household_id = $1 AND telegram_user_id = $3",
+    )
+    .bind(household.id)
+    .bind(now)
+    .bind(555_555_555_i64)
+    .execute(&db.pool)
+    .await
+    .expect("the deleted member");
+
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    let path = format!("/admin/households/{}", household.id);
+    let (status, _, body) = send_with_cookie(&app, Method::GET, &path, &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    for expected in ["Алексей", "Мария", "владелец", "участник", "…6789", "…4321"]
+    {
+        assert!(
+            text.contains(expected),
+            "missing `{expected}` on the card:\n{text}"
+        );
+    }
+    assert!(
+        text.contains(&now.date_naive().to_string()),
+        "the joining date is shown without the time:\n{text}"
+    );
+    for hidden in [
+        "123456789",
+        "987654321",
+        "555555555",
+        "Удалённый",
+        "hidden_username",
+    ] {
+        assert!(
+            !text.contains(hidden),
+            "the card must not show `{hidden}`:\n{text}"
+        );
+    }
+}
+
 /// В `single` список сразу ведёт на единственный household; пункт меню
 /// «Household» есть в шапке и подсвечивается на карточке.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10053,6 +10140,10 @@ async fn single_mode_households_redirects_to_the_only_household_and_nav_links_to
     ] {
         assert!(text.contains(expected), "missing `{expected}` in:\n{text}");
     }
+    assert!(
+        text.contains("нет участников"),
+        "an empty member list explains itself:\n{text}"
+    );
     assert!(
         text.contains("href=\"/admin/households\" aria-current=\"page\""),
         "the household section must be highlighted:\n{text}"
@@ -10468,26 +10559,33 @@ async fn households_delete_with_a_wrong_name_changes_nothing() {
     let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
 
     let path = format!("/admin/households/{household_id}/delete");
-    let (status, _, body) = send_form_from(
-        &app,
-        &path,
-        test_peer(),
-        headers_with(&[("cookie", &cookie)]),
-        &[("confirm_name", "Дача")],
-    )
-    .await;
-    assert!(
-        status.is_client_error(),
-        "a wrong name is a form refusal, not {status}"
-    );
-    let text = String::from_utf8_lossy(&body);
-    assert!(
-        text.contains("не совпадает"),
-        "the page explains the mismatch:\n{text}"
-    );
-    assert_eq!(household_count(&db.pool).await, 1, "the household stays");
-    assert_eq!(member_count(&db.pool, household_id).await, 2);
-    assert_eq!(token_count(&db.pool).await, 1);
+    // Другое название и то же название в другом регистре одинаково отклоняются.
+    for confirmation in ["Дача", "квартира"] {
+        let (status, _, body) = send_form_from(
+            &app,
+            &path,
+            test_peer(),
+            headers_with(&[("cookie", &cookie)]),
+            &[("confirm_name", confirmation)],
+        )
+        .await;
+        assert!(
+            status.is_client_error(),
+            "`{confirmation}` is a form refusal, not {status}"
+        );
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("не совпадает"),
+            "the page explains the mismatch for `{confirmation}`:\n{text}"
+        );
+        assert_eq!(
+            household_count(&db.pool).await,
+            1,
+            "`{confirmation}` leaves the household"
+        );
+        assert_eq!(member_count(&db.pool, household_id).await, 2);
+        assert_eq!(token_count(&db.pool).await, 1);
+    }
     let invite_revoked: Option<DateTime<Utc>> =
         sqlx::query_scalar("SELECT revoked_at FROM invites WHERE id = $1")
             .bind(invite_id)

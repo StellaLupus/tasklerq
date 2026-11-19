@@ -204,6 +204,17 @@ pub async fn household_name(pool: &PgPool, household_id: Uuid) -> Result<String,
     Ok(households::get(&mut conn, household_id).await?.name)
 }
 
+/// Активные участники активного household.
+///
+/// Удалённый или несуществующий household — `NotFound`, как у
+/// [`household_name`]: консоль не показывает участников дома, которого нет.
+/// Состав читает репозиторий [`users::list_active`], своего SQL здесь нет.
+pub async fn list_members(pool: &PgPool, household_id: Uuid) -> Result<Vec<User>, DomainError> {
+    let mut conn = pool.acquire().await?;
+    households::get(&mut conn, household_id).await?;
+    users::list_active(&mut conn, household_id).await
+}
+
 /// Мягко удалить household от системного актора.
 ///
 /// Уведомления участникам не отправляются: у CLI нет контекста бота, а при
