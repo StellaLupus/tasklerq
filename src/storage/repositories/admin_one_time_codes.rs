@@ -1,8 +1,9 @@
 //! Одноразовые коды консоли администратора.
 //!
-//! Код — 32 случайных байта (256 бит) в base64url. В базе хранится только
-//! SHA-256 хеш в нижнем hexadecimal (`auth::tokens::hash_token`), а открытое
-//! значение возвращается один раз при выпуске и больше нигде не читается.
+//! Код — 16 случайных байт (128 бит) в base64url (22 символа). В базе
+//! хранится только SHA-256 хеш в нижнем hexadecimal
+//! (`auth::tokens::hash_token`), а открытое значение возвращается один раз при
+//! выпуске и больше нигде не читается.
 //!
 //! Проверка кода не сравнивает открытый текст в памяти: сервер хеширует ввод и
 //! ищет строку по `code_hash` (уникальный индекс), поэтому сравнение выполняет
@@ -35,8 +36,9 @@ pub const PURPOSE_RECOVERY: &str = "recovery";
 pub const PURPOSE_OWNER_CLAIM: &str = "owner_claim";
 /// Назначение `telegram_link`: привязка Telegram к учётной записи.
 pub const PURPOSE_TELEGRAM_LINK: &str = "telegram_link";
-/// Длина случайной части кода в байтах: 256 бит, не меньше требуемых 128.
-pub const CODE_BYTES: usize = 32;
+/// Длина случайной части кода в байтах: 128 бит, не меньше требуемых 128;
+/// в base64url без паддинга — 22 символа.
+pub const CODE_BYTES: usize = 16;
 
 const COLUMNS: &str = "id, purpose, household_id, expires_at, used_at, created_at";
 
@@ -171,6 +173,58 @@ pub async fn find_active(
     .await?;
 
     Ok(record)
+}
+
+/// Найти действующий код по идентификатору, не гася его.
+///
+/// Нужно онбордингу по ссылке-claim: в состоянии диалога хранится только id,
+/// а открытое значение кода в базе не сохраняется. Условия те же, что у
+/// [`use_code_by_id`].
+pub async fn find_active_by_id(
+    conn: &mut PgConnection,
+    purpose: &str,
+    id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<Option<OneTimeCode>, DomainError> {
+    let record = sqlx::query_as::<_, OneTimeCode>(&format!(
+        "SELECT {COLUMNS} FROM admin_one_time_codes
+         WHERE id = $1 AND purpose = $2 AND used_at IS NULL
+           AND (expires_at IS NULL OR expires_at > $3)"
+    ))
+    .bind(id)
+    .bind(purpose)
+    .bind(now)
+    .fetch_optional(&mut *conn)
+    .await?;
+
+    Ok(record)
+}
+
+/// Погасить код по идентификатору атомарно и вернуть его строку.
+///
+/// Пара к [`find_active_by_id`] для онбординга по ссылке-claim: открытое
+/// значение кода известно только пользователю, а состояние диалога хранит id.
+/// Повторный, истёкший, уже погашенный и код другого назначения неотличимы:
+/// запрос не возвращает строку и функция отвечает [`DomainError::NotFound`].
+/// Вызывать внутри транзакции вместе с созданием household.
+pub async fn use_code_by_id(
+    conn: &mut PgConnection,
+    purpose: &str,
+    id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<OneTimeCode, DomainError> {
+    sqlx::query_as::<_, OneTimeCode>(&format!(
+        "UPDATE admin_one_time_codes SET used_at = $3
+         WHERE id = $1 AND purpose = $2 AND used_at IS NULL
+           AND (expires_at IS NULL OR expires_at > $3)
+         RETURNING {COLUMNS}"
+    ))
+    .bind(id)
+    .bind(purpose)
+    .bind(now)
+    .fetch_optional(&mut *conn)
+    .await?
+    .ok_or(DomainError::NotFound)
 }
 
 /// Погасить код атомарно и вернуть его строку.

@@ -54,12 +54,10 @@ pub enum FirstContactScreen {
 impl FirstContactScreen {
     /// Экран для исхода классификатора; `None` — это онбординг.
     ///
-    /// [`FirstContact::ClaimOwner`] до пункта 4.3 показывается как
-    /// [`FirstContactScreen::AdminCommand`]: назначение владельца ещё не
-    /// реализовано, а открывать онбординг на уже существующем household нельзя
-    /// — форма зациклилась бы на повторной проверке классификатора. Для
-    /// claim-перехода 4.3 обработает исход до вызова этого метода.
-    pub fn from_contact(contact: FirstContact, sender_id: i64) -> Option<Self> {
+    /// [`FirstContact::ClaimOwner`] обрабатывается вызывающим до сборки экрана:
+    /// назначение владельца — действие, а не информационный экран. Fail-closed
+    /// ответ здесь страхует от случайного вызова с этим исходом.
+    pub fn from_contact(contact: FirstContact, _sender_id: i64) -> Option<Self> {
         match contact {
             FirstContact::Onboard => None,
             FirstContact::AskInvite => Some(Self::AskInvite),
@@ -71,7 +69,7 @@ impl FirstContactScreen {
                 telegram_id,
                 admin_exists: true,
             } => Some(Self::AdminCommandWithHint(telegram_id)),
-            FirstContact::ClaimOwner(_) => Some(Self::AdminCommand(sender_id)),
+            FirstContact::ClaimOwner(_) => Some(Self::NotConfigured),
             FirstContact::NotConfigured => Some(Self::NotConfigured),
             FirstContact::NeedsAdmin => Some(Self::NeedsAdmin),
         }
@@ -1596,6 +1594,11 @@ pub enum Form {
     Onboarding {
         /// Название household после первого шага.
         name: Option<String>,
+        /// Идентификатор действующего кода `owner_claim`, по которому открыт
+        /// онбординг на пустой инсталляции. Старый JSON без поля читается как
+        /// онбординг без ссылки.
+        #[serde(default)]
+        claim_id: Option<Uuid>,
     },
     /// Единый редактор существующего элемента или пункта черновика.
     Editor(Editor),
@@ -2182,14 +2185,22 @@ mod tests {
             Some(FirstContactScreen::AdminCommandWithHint(123))
         );
         assert_eq!(
-            FirstContactScreen::from_contact(FirstContact::ClaimOwner(None), 123),
-            Some(FirstContactScreen::AdminCommand(123)),
-            "claim ownership is not a screen yet; the sender must not get onboarding"
+            FirstContactScreen::from_contact(FirstContact::ClaimOwner(Uuid::nil()), 123),
+            Some(FirstContactScreen::NotConfigured),
+            "claim ownership is handled by the onboarding flow, not by a screen"
         );
+    }
+
+    #[test]
+    fn onboarding_form_without_a_claim_id_is_read() {
+        let form: Form =
+            serde_json::from_value(json!({"form": "onboarding", "name": "Семья"})).expect("form");
         assert_eq!(
-            FirstContactScreen::from_contact(FirstContact::ClaimOwner(Some(Uuid::nil())), 123),
-            Some(FirstContactScreen::AdminCommand(123)),
-            "an unexpected claim target must fail closed instead of opening onboarding"
+            form,
+            Form::Onboarding {
+                name: Some("Семья".to_owned()),
+                claim_id: None,
+            }
         );
     }
 

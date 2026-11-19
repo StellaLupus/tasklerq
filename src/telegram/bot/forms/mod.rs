@@ -7,7 +7,7 @@
 
 use uuid::Uuid;
 
-use crate::domain::first_contact::classify;
+use crate::domain::first_contact::{FirstContact, classify};
 use crate::domain::models::{List, ListKind};
 use crate::domain::validation::{MAX_TITLE, sanitize};
 use crate::storage::repositories::{admin_accounts, households, items, lists};
@@ -357,6 +357,10 @@ pub async fn start_draft_due(ctx: &mut Ctx<'_>, draft_id: Uuid, index: usize) ->
 /// Если отправитель уже стал участником, пока форма была открыта
 /// (`admin user add` или `admin household create --owner-telegram-id`), форма
 /// закрывается, а вместо неё показывается меню.
+///
+/// [`FirstContact::ClaimOwner`] — не экран, а назначение владельца: так
+/// `BOOTSTRAP_OWNER_TELEGRAM_ID` получает household без владельца. Если
+/// состояние изменилось между классификацией и записью, проход повторяется.
 pub async fn start_onboarding(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
     if ctx.user.is_some() {
         if matches!(load(ctx).await?, Some(Form::Onboarding { .. })) {
@@ -365,28 +369,60 @@ pub async fn start_onboarding(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
         return ctx.present(Screen::Menu).await;
     }
 
-    let installation = households::installation(&mut *ctx.conn).await?;
-    let admin_exists = admin_accounts::exists(&mut *ctx.conn).await?;
-    let contact = classify(
-        ctx.tenancy.mode,
-        ctx.tenancy.bootstrap_owner,
-        ctx.sender.id,
-        installation,
-        None,
-        admin_exists,
-    );
-    let Some(screen) = FirstContactScreen::from_contact(contact, ctx.sender.id) else {
-        return open(ctx, Form::Onboarding { name: None }).await;
-    };
+    for _ in 0..2 {
+        let installation = households::installation(&mut *ctx.conn).await?;
+        let admin_exists = admin_accounts::exists(&mut *ctx.conn).await?;
+        let contact = classify(
+            ctx.tenancy.mode,
+            ctx.tenancy.bootstrap_owner,
+            ctx.sender.id,
+            installation,
+            None,
+            admin_exists,
+        );
+        if let FirstContact::ClaimOwner(household_id) = contact {
+            if super::onboarding::claim_existing_owner(ctx, household_id, None).await? {
+                return Ok(());
+            }
+            continue;
+        }
+        let Some(screen) = FirstContactScreen::from_contact(contact, ctx.sender.id) else {
+            return open_onboarding(ctx, None).await;
+        };
+        if matches!(load(ctx).await?, Some(Form::Onboarding { .. })) {
+            clear(ctx).await?;
+        }
+        return ctx.present(Screen::FirstContact(screen)).await;
+    }
+
+    // Состояние продолжает меняться под нами: показать безопасный экран без
+    // онбординга на существующем household.
     if matches!(load(ctx).await?, Some(Form::Onboarding { .. })) {
         clear(ctx).await?;
     }
-    ctx.present(Screen::FirstContact(screen)).await
+    ctx.present(Screen::FirstContact(FirstContactScreen::NotConfigured))
+        .await
+}
+
+/// Открыть форму онбординга, сохранив код claim, если он есть.
+pub async fn open_onboarding(ctx: &mut Ctx<'_>, claim_id: Option<Uuid>) -> Result<(), Fail> {
+    open(
+        ctx,
+        Form::Onboarding {
+            name: None,
+            claim_id,
+        },
+    )
+    .await
 }
 
 /// Сохранить состояние онбординга.
-pub async fn put_onboarding(ctx: &mut Ctx<'_>, name: Option<String>) -> Result<(), Fail> {
-    put(ctx, &Form::Onboarding { name }).await
+pub async fn put_onboarding(
+    ctx: &mut Ctx<'_>,
+    name: Option<String>,
+    claim_id: Option<Uuid>,
+) -> Result<(), Fail> {
+    put(ctx, &Form::Onboarding { name, claim_id }).await
 }
 
 /// Завершить форму.

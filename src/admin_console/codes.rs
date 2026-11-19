@@ -119,6 +119,44 @@ pub async fn use_code(
     repository::use_code(conn, purpose.as_str(), code, now).await
 }
 
+/// Найти действующий код по открытому значению, не гася его.
+pub async fn find_active(
+    conn: &mut PgConnection,
+    purpose: Purpose,
+    code: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<OneTimeCode>, DomainError> {
+    repository::find_active(conn, purpose.as_str(), code, now).await
+}
+
+/// Найти действующий код по идентификатору, не гася его.
+///
+/// Онбординг по ссылке-claim хранит в состоянии диалога только id кода:
+/// открытое значение в базе не сохраняется. Проверка нужна перед показом
+/// подтверждения и повторно перед созданием household.
+pub async fn find_active_by_id(
+    conn: &mut PgConnection,
+    purpose: Purpose,
+    id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<Option<OneTimeCode>, DomainError> {
+    repository::find_active_by_id(conn, purpose.as_str(), id, now).await
+}
+
+/// Погасить код по идентификатору атомарным `UPDATE … RETURNING`.
+///
+/// Работает в транзакции вызывающего: создание household по ссылке-claim
+/// гасит код и вставляет household одной транзакцией. Недействительный код
+/// даёт [`DomainError::NotFound`].
+pub async fn use_code_by_id(
+    conn: &mut PgConnection,
+    purpose: Purpose,
+    id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<OneTimeCode, DomainError> {
+    repository::use_code_by_id(conn, purpose.as_str(), id, now).await
+}
+
 /// Выпустить setup-код, если учётной записи администратора ещё нет.
 ///
 /// `Ok(None)` — учётка уже создана, код не выпускается. Проверка и выпуск идут

@@ -123,6 +123,65 @@ pub async fn create_with_owner(
     Ok((household, user))
 }
 
+/// Назначить владельца уже существующему household без владельца.
+///
+/// Общий путь ссылки-claim и `BOOTSTRAP_OWNER_TELEGRAM_ID`: вызывающий в той же
+/// транзакции гасит код claim (если он есть) и вызывает эту функцию. Порядок
+/// блокировок тот же, что у [`create_with_owner`]: Telegram ID, затем household.
+/// Занятый Telegram ID и появившийся владелец отклоняются понятным `Conflict`,
+/// поэтому одновременный claim даёт ровно одного владельца.
+///
+/// Событие аудита — [`AuditEventType::MemberJoined`]; `source` отличает
+/// назначение по ссылке (`claim`) от других путей.
+pub async fn claim_owner(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    member: NewMember,
+    source: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<(Household, User), DomainError> {
+    users::lock_telegram_user(conn, member.telegram_user_id).await?;
+    users::lock_household(conn, household_id).await?;
+
+    if users::find_active_by_telegram(conn, member.telegram_user_id)
+        .await?
+        .is_some()
+    {
+        return Err(DomainError::conflict_with(
+            "user already belongs to a household",
+            json!({"reason": "already_member"}),
+        ));
+    }
+    if !users::owners(conn, household_id).await?.is_empty() {
+        return Err(DomainError::conflict_with(
+            "household already has an owner",
+            json!({"reason": "owner_exists"}),
+        ));
+    }
+
+    let user = users::insert(conn, household_id, UserRole::Owner, &member, None, now).await?;
+    let mut payload = json!({
+        "user_id": user.id,
+        "display_name": user.display_name,
+        "role": user.role,
+    });
+    if let Some(source) = source {
+        payload["source"] = json!(source);
+    }
+    audit::record(
+        conn,
+        Some(household_id),
+        &Actor::user(user.id, user.role),
+        AuditEventType::MemberJoined,
+        payload,
+        now,
+    )
+    .await?;
+
+    let household = get(conn, household_id).await?;
+    Ok((household, user))
+}
+
 /// Создать household без владельца.
 ///
 /// Путь администратора: владельца добавляют отдельной командой. Проверка
@@ -303,17 +362,18 @@ pub async fn count_active(conn: &mut PgConnection) -> Result<i64, DomainError> {
     )
 }
 
-/// Состояние инсталляции одним запросом: число активных household и наличие
-/// активного владельца, если household один.
+/// Состояние инсталляции одним запросом: число активных household, наличие
+/// активного владельца и id единственного household.
 pub async fn installation(conn: &mut PgConnection) -> Result<Installation, DomainError> {
-    let (active, has_owner): (i64, bool) = sqlx::query_as(
+    let (active, has_owner, household_id): (i64, bool, Option<Uuid>) = sqlx::query_as(
         "SELECT count(*)::bigint,
                 coalesce(bool_or(EXISTS (
                     SELECT 1 FROM users u
                     WHERE u.household_id = h.id
                       AND u.role = 'owner'
                       AND u.deleted_at IS NULL
-                )), false)
+                )), false),
+                (array_agg(h.id))[1]
          FROM households h
          WHERE h.deleted_at IS NULL",
     )
@@ -322,7 +382,12 @@ pub async fn installation(conn: &mut PgConnection) -> Result<Installation, Domai
 
     Ok(match active {
         0 => Installation::Empty,
-        1 => Installation::Single { has_owner },
+        1 => Installation::Single {
+            household_id: household_id.ok_or_else(|| {
+                DomainError::Validation("single installation without a household".into())
+            })?,
+            has_owner,
+        },
         _ => Installation::Multiple,
     })
 }

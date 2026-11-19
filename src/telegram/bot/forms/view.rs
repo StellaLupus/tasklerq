@@ -67,7 +67,7 @@ pub async fn view(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
     };
 
     match form {
-        Form::Onboarding { name } => Ok(onboarding::view(name.as_deref())),
+        Form::Onboarding { name, .. } => Ok(onboarding::view(name.as_deref())),
         Form::Editor(editor_form) => editor::view(ctx, editor_form).await,
         Form::LegacyEdit => Ok(Ui::new()
             .heading("Правка устарела")

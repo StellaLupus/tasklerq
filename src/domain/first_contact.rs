@@ -20,8 +20,11 @@ use crate::config::TenancyMode;
 pub enum Installation {
     /// Активных household нет.
     Empty,
-    /// Ровно один активный household; `has_owner` — есть ли у него владелец.
+    /// Ровно один активный household.
     Single {
+        /// Идентификатор единственного household: по нему назначается
+        /// владелец из `BOOTSTRAP_OWNER_TELEGRAM_ID`.
+        household_id: Uuid,
         /// Есть ли активный владелец.
         has_owner: bool,
     },
@@ -56,13 +59,11 @@ pub enum FirstContact {
         /// Учётка администратора уже создана: можно попросить ссылку-claim.
         admin_exists: bool,
     },
-    /// Отправитель становится владельцем.
+    /// Отправитель становится владельцем указанного household.
     ///
-    /// `Some(id)` — household, на который указывает ссылка-claim. `None` —
-    /// единственный household без владельца, выбранный
-    /// `BOOTSTRAP_OWNER_TELEGRAM_ID`: [`Installation::Single`] не несёт его id,
-    /// поэтому конкретный household находит вызывающий (пункт 4.3).
-    ClaimOwner(Option<Uuid>),
+    /// Исход несёт цель: id из ссылки-claim или id единственного household,
+    /// выбранного `BOOTSTRAP_OWNER_TELEGRAM_ID`.
+    ClaimOwner(Uuid),
     /// Инсталляция ещё не настроена, подробностей нет.
     NotConfigured,
     /// В `single` больше одного household: вмешательство администратора.
@@ -80,7 +81,12 @@ fn effective_claim(installation: Installation, claim: Option<ClaimTarget>) -> Op
     match (installation, claim) {
         (Installation::Empty, Some(ClaimTarget::EmptyInstallation)) => claim,
         (Installation::Empty, _) => None,
-        (Installation::Single { has_owner: true }, Some(ClaimTarget::Household(_))) => None,
+        (
+            Installation::Single {
+                has_owner: true, ..
+            },
+            Some(ClaimTarget::Household(_)),
+        ) => None,
         (_, Some(ClaimTarget::Household(_))) => claim,
         (_, Some(ClaimTarget::EmptyInstallation)) => None,
         (_, None) => None,
@@ -106,9 +112,7 @@ pub fn classify(
 
     if mode == TenancyMode::Multi {
         return match claim {
-            Some(ClaimTarget::Household(household_id)) => {
-                FirstContact::ClaimOwner(Some(household_id))
-            }
+            Some(ClaimTarget::Household(household_id)) => FirstContact::ClaimOwner(household_id),
             _ => FirstContact::Onboard,
         };
     }
@@ -123,14 +127,17 @@ pub fn classify(
                 None => FirstContact::Onboard,
             },
         },
-        Installation::Single { has_owner: true } => FirstContact::AskInvite,
-        Installation::Single { has_owner: false } => match claim {
-            Some(ClaimTarget::Household(household_id)) => {
-                FirstContact::ClaimOwner(Some(household_id))
-            }
+        Installation::Single {
+            has_owner: true, ..
+        } => FirstContact::AskInvite,
+        Installation::Single {
+            household_id,
+            has_owner: false,
+        } => match claim {
+            Some(ClaimTarget::Household(claimed)) => FirstContact::ClaimOwner(claimed),
             _ => match bootstrap_owner {
                 Some(owner) if owner != sender_id => FirstContact::NotConfigured,
-                Some(_) => FirstContact::ClaimOwner(None),
+                Some(_) => FirstContact::ClaimOwner(household_id),
                 None => FirstContact::AdminCommand {
                     telegram_id: sender_id,
                     admin_exists,
@@ -150,7 +157,10 @@ mod tests {
     const HOUSEHOLD: Uuid = Uuid::from_u128(7);
 
     fn single(has_owner: bool) -> Installation {
-        Installation::Single { has_owner }
+        Installation::Single {
+            household_id: HOUSEHOLD,
+            has_owner,
+        }
     }
 
     fn admin_command(admin_exists: bool) -> FirstContact {
@@ -201,7 +211,7 @@ mod tests {
                         Some(ClaimTarget::Household(HOUSEHOLD)),
                         bootstrap,
                         admin_exists,
-                        FirstContact::ClaimOwner(Some(HOUSEHOLD)),
+                        FirstContact::ClaimOwner(HOUSEHOLD),
                     );
                 }
             }
@@ -327,15 +337,15 @@ mod tests {
                     Some(ClaimTarget::Household(HOUSEHOLD)),
                     bootstrap,
                     admin_exists,
-                    FirstContact::ClaimOwner(Some(HOUSEHOLD)),
+                    FirstContact::ClaimOwner(HOUSEHOLD),
                 );
             }
         }
 
         // single без владельца + claim на пустую инсталляцию — как без claim.
         for (bootstrap, admin_exists, expected) in [
-            (Some(SENDER), false, FirstContact::ClaimOwner(None)),
-            (Some(SENDER), true, FirstContact::ClaimOwner(None)),
+            (Some(SENDER), false, FirstContact::ClaimOwner(HOUSEHOLD)),
+            (Some(SENDER), true, FirstContact::ClaimOwner(HOUSEHOLD)),
             (Some(OTHER), false, FirstContact::NotConfigured),
             (Some(OTHER), true, FirstContact::NotConfigured),
             (None, false, admin_command(false)),
@@ -359,7 +369,7 @@ mod tests {
                 None,
                 Some(SENDER),
                 admin_exists,
-                FirstContact::ClaimOwner(None),
+                FirstContact::ClaimOwner(HOUSEHOLD),
             );
             check(
                 TenancyMode::Single,
