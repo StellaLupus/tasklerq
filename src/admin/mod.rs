@@ -285,6 +285,27 @@ pub async fn list_households(
     pool: &PgPool,
     now: DateTime<Utc>,
 ) -> Result<Vec<HouseholdSummary>, DomainError> {
+    household_summaries(pool, now, None).await
+}
+
+/// Сводка одного активного household; удалённый или неизвестный — `None`.
+pub async fn household_summary(
+    pool: &PgPool,
+    household_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<Option<HouseholdSummary>, DomainError> {
+    Ok(household_summaries(pool, now, Some(household_id))
+        .await?
+        .into_iter()
+        .next())
+}
+
+/// Общий запрос сводок: без `household_id` — все активные household.
+async fn household_summaries(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    household_id: Option<Uuid>,
+) -> Result<Vec<HouseholdSummary>, DomainError> {
     let rows = sqlx::query_as::<_, HouseholdSummaryRow>(
         "SELECT h.id, h.name, h.timezone, o.telegram_user_id AS owner_telegram_id,
                 h.created_at,
@@ -308,9 +329,11 @@ pub async fn list_households(
                AND o.role = 'owner'
                AND o.deleted_at IS NULL
          WHERE h.deleted_at IS NULL
+           AND ($2::uuid IS NULL OR h.id = $2)
          ORDER BY h.created_at, h.id",
     )
     .bind(now)
+    .bind(household_id)
     .fetch_all(pool)
     .await?;
 
@@ -327,6 +350,19 @@ pub async fn list_households(
             created_at: row.created_at,
         })
         .collect())
+}
+
+/// Активный household, выбранный правилом [`select_household`].
+///
+/// `None` — правило не выбрало один household (ноль, несколько или `multi`):
+/// консоль показывает список, а не ошибку.
+pub async fn selected_household(
+    pool: &PgPool,
+    mode: TenancyMode,
+) -> Result<Option<Household>, DomainError> {
+    let mut conn = pool.acquire().await?;
+    let active = households::list_active(&mut conn).await?;
+    Ok(select_household(mode, active).ok())
 }
 
 #[derive(sqlx::FromRow)]

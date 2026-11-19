@@ -9821,3 +9821,253 @@ async fn an_unknown_request_origin_does_not_change_the_console_origin() {
         .expect("console origin");
     assert_eq!(origin.as_deref(), Some("http://nas:18081"));
 }
+
+/// Вставить открытую задачу в список `tasks` household.
+async fn insert_open_task(pool: &PgPool, household_id: Uuid, title: &str) {
+    let list_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM lists
+         WHERE household_id = $1 AND kind = 'tasks' AND deleted_at IS NULL",
+    )
+    .bind(household_id)
+    .fetch_one(pool)
+    .await
+    .expect("the tasks list");
+    let now = Utc::now();
+    sqlx::query(
+        "INSERT INTO items (id, household_id, list_id, title, status, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'open', $5, $5)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(household_id)
+    .bind(list_id)
+    .bind(title)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("the open task");
+}
+
+/// В `multi` список household показывает счётчики и не раскрывает содержимое
+/// задач и полные Telegram ID.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_list_shows_counts_without_task_content_or_full_telegram_ids() {
+    const OWNER_TELEGRAM_ID: i64 = 7_000_000_001;
+    const MEMBER_TELEGRAM_ID: i64 = 7_000_000_002;
+    const TASK_TITLE: &str = "СЕКРЕТНАЯ ЗАДАЧА В HOUSEHOLD";
+
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let now = Utc::now();
+    let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
+
+    let flat = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Квартира",
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("the first household");
+    for (role, telegram_id, name) in [
+        (
+            tasklerq::domain::models::UserRole::Owner,
+            OWNER_TELEGRAM_ID,
+            "Алексей",
+        ),
+        (
+            tasklerq::domain::models::UserRole::Member,
+            MEMBER_TELEGRAM_ID,
+            "Мария",
+        ),
+    ] {
+        tasklerq::admin::add_user(
+            &db.pool,
+            TenancyMode::Multi,
+            Some(flat.id),
+            role,
+            telegram_id,
+            Some(name),
+            now,
+        )
+        .await
+        .expect("the household member");
+    }
+    insert_open_task(&db.pool, flat.id, TASK_TITLE).await;
+    support::issue_token(&db.pool, flat.id, &["ha:read"]).await;
+
+    let dacha = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Дача",
+        "Asia/Yekaterinburg",
+        now,
+    )
+    .await
+    .expect("the second household");
+    tasklerq::admin::add_user(
+        &db.pool,
+        TenancyMode::Multi,
+        Some(dacha.id),
+        tasklerq::domain::models::UserRole::Member,
+        7_000_000_003,
+        Some("Пётр"),
+        now,
+    )
+    .await
+    .expect("the second household member");
+
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    let (status, headers, body) =
+        send_with_cookie(&app, Method::GET, "/admin/households", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_security_headers(&headers, "GET /admin/households");
+    let text = String::from_utf8_lossy(&body);
+
+    for expected in [
+        "Квартира",
+        "Дача",
+        "Europe/Moscow",
+        "Asia/Yekaterinburg",
+        "участники: 2",
+        "участники: 1",
+        "владелец: есть",
+        "владелец: нет",
+        "открытых задач: 1",
+        "открытых задач: 0",
+        "активных токенов: 1",
+        "активных токенов: 0",
+    ] {
+        assert!(text.contains(expected), "missing `{expected}` in:\n{text}");
+    }
+    for id in [flat.id, dacha.id] {
+        assert!(
+            text.contains(&format!("href=\"/admin/households/{id}\"")),
+            "no link to {id} in:\n{text}"
+        );
+    }
+    assert!(
+        !text.contains(TASK_TITLE),
+        "the list must not show task content:\n{text}"
+    );
+    for telegram_id in [OWNER_TELEGRAM_ID, MEMBER_TELEGRAM_ID, 7_000_000_003] {
+        assert!(
+            !text.contains(&telegram_id.to_string()),
+            "the list must not show the full Telegram id {telegram_id}:\n{text}"
+        );
+    }
+}
+
+/// В `single` список сразу ведёт на единственный household; пункт меню
+/// «Household» есть в шапке и подсвечивается на карточке.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn single_mode_households_redirects_to_the_only_household_and_nav_links_to_it() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Single, false, LlmConfig::empty());
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    // Пока household нет, ошибки нет: пустой список с пояснением.
+    let (status, _, body) = send_with_cookie(&app, Method::GET, "/admin/households", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(&body).contains("Активных household нет"),
+        "an empty installation explains the empty list:\n{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let household = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Дом",
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("the household");
+
+    let (status, headers, _) =
+        send_with_cookie(&app, Method::GET, "/admin/households", &cookie).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let expected_location = format!("/admin/households/{}", household.id);
+    assert_eq!(location(&headers), Some(expected_location.as_str()));
+
+    let (_, _, home) = send_with_cookie(&app, Method::GET, "/admin", &cookie).await;
+    let home = String::from_utf8_lossy(&home);
+    assert!(
+        home.contains("href=\"/admin/households\""),
+        "the header must link to the household section:\n{home}"
+    );
+
+    let path = format!("/admin/households/{}", household.id);
+    let (status, headers, body) = send_with_cookie(&app, Method::GET, &path, &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_security_headers(&headers, "GET /admin/households/{id}");
+    let text = String::from_utf8_lossy(&body);
+    for expected in [
+        "Дом",
+        "<dt>Часовой пояс</dt><dd>Europe/Moscow</dd>",
+        "<dt>Владелец</dt><dd>нет</dd>",
+        "<dt>Участники</dt><dd>0</dd>",
+        "<dt>Открытые задачи</dt><dd>0</dd>",
+        "<dt>Активные токены</dt><dd>0</dd>",
+    ] {
+        assert!(text.contains(expected), "missing `{expected}` in:\n{text}");
+    }
+    assert!(
+        text.contains("href=\"/admin/households\" aria-current=\"page\""),
+        "the household section must be highlighted:\n{text}"
+    );
+}
+
+/// Несуществующий, удалённый и нечисловой id одинаково отвечают `404`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_deleted_and_malformed_households_are_not_found() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let now = Utc::now();
+    let deleted = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Удалённый",
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("the household");
+    tasklerq::admin::delete_household(&db.pool, deleted.id, now)
+        .await
+        .expect("the household is deleted");
+    let app = console(&db.pool, Vec::new());
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    for path in [
+        format!("/admin/households/{}", Uuid::now_v7()),
+        format!("/admin/households/{}", deleted.id),
+        "/admin/households/not-a-uuid".to_owned(),
+    ] {
+        let (status, headers, body) = send_with_cookie(&app, Method::GET, &path, &cookie).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+        assert_security_headers(&headers, "GET a missing household");
+        assert!(
+            !String::from_utf8_lossy(&body).contains("Удалённый"),
+            "a missing household must not be revealed: {path}"
+        );
+    }
+}
+
+/// Без сессии обе страницы ведут на вход, как остальные страницы консоли.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_pages_require_a_session_like_the_rest_of_the_console() {
+    let db = support::isolated_db().await;
+    let app = console(&db.pool, Vec::new());
+
+    for path in [
+        "/admin/households".to_owned(),
+        format!("/admin/households/{}", Uuid::now_v7()),
+    ] {
+        let (status, headers, _) = send(&app, Method::GET, &path).await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "{path}");
+        assert_eq!(location(&headers), Some("/admin/login"), "{path}");
+    }
+}

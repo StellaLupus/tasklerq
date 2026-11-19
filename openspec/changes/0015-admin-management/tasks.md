@@ -2,7 +2,7 @@
 
 ## 1. Household
 
-- [ ] 1.1 Маршруты `/admin/households` и `/admin/households/{id}`: список из
+- [x] 1.1 Маршруты `/admin/households` и `/admin/households/{id}`: список из
   `admin::list_households`, в `single` переход сразу на единственный household,
   удалённый или несуществующий id → `404`. Проверить в
   `tests/admin_console.rs`: список показывает число участников, открытых задач

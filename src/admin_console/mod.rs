@@ -5,6 +5,7 @@ pub mod attempt;
 pub mod change;
 pub mod checks;
 pub mod codes;
+pub mod households;
 pub mod login;
 pub mod origin;
 pub mod owner;

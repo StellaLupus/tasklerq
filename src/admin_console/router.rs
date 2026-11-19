@@ -29,7 +29,7 @@ use crate::telegram::runtime::TelegramSupervisor;
 
 use super::checks::CheckState;
 use super::wizard::{WIZARD_PATH, WIZARD_SKIP_PATH, WizardSettings};
-use super::{assets, origin, pages};
+use super::{assets, households, origin, pages};
 
 /// Сколько неудач допускается в окне лимита консоли.
 pub const FAILURE_LIMIT: u32 = 5;
@@ -262,6 +262,8 @@ fn failure_limiter() -> Arc<RateLimiter<IpAddr>> {
 pub fn build_router(state: AdminState) -> Router {
     Router::new()
         .route("/admin", get(pages::index))
+        .route("/admin/households", get(households::list))
+        .route("/admin/households/{id}", get(households::detail))
         .route(WIZARD_PATH, get(pages::wizard_page))
         .route(WIZARD_SKIP_PATH, post(pages::wizard_skip))
         .route("/admin/wizard/household", post(pages::wizard_household))

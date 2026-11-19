@@ -1,5 +1,5 @@
 //! Страницы консоли: setup, вход, восстановление, смена пароля, мастер,
-//! настройки LLM и главная.
+//! настройки LLM и главная. Страницы household — в [`super::households`].
 //!
 //! Макет (`Layout`) общий: шапка, навигация вошедшего администратора, сообщение
 //! и место для содержимого. Содержимое рисует небольшой askama-шаблон своей
@@ -1929,7 +1929,7 @@ fn redirect_with_cookie(path: &str, cookie: String) -> Response {
 }
 
 /// `500` без подробностей: причина уходит в журнал вызывающей стороны.
-fn internal(error: impl std::fmt::Display) -> Response {
+pub(crate) fn internal(error: impl std::fmt::Display) -> Response {
     tracing::error!(error = %error, "admin console request failed");
     (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
 }
@@ -1945,6 +1945,16 @@ fn render_with_status(page: ConsolePage<'_>, status: StatusCode) -> Response {
         Ok(body) => (status, Html(body)).into_response(),
         Err(error) => internal(error),
     }
+}
+
+/// Отрисовать список household в общем макете.
+pub(crate) fn render_household_list(view: super::households::HouseholdList) -> Response {
+    render(ConsolePage::new(Page::Households(Box::new(view))))
+}
+
+/// Отрисовать карточку household в общем макете.
+pub(crate) fn render_household_detail(view: super::households::HouseholdDetail) -> Response {
+    render(ConsolePage::new(Page::Household(Box::new(view))))
 }
 
 /// Вид страницы настроек LLM.
@@ -2384,6 +2394,10 @@ enum Page {
     TelegramLinkIssued(Box<TelegramLinkView>),
     /// Ход проверки слота.
     Check(Option<CheckSnapshot>),
+    /// Список household.
+    Households(Box<super::households::HouseholdList>),
+    /// Карточка household.
+    Household(Box<super::households::HouseholdDetail>),
 }
 
 /// Поля шага мастера, которые возвращаются в форму после отказа.
@@ -2421,6 +2435,7 @@ impl Page {
             Self::OwnerLinkIssued(_) => "Ссылка-claim владельца",
             Self::TelegramLinkIssued(_) => "Ссылка привязки Telegram",
             Self::Check(_) => "Проверка слота",
+            Self::Households(_) | Self::Household(_) => "Household",
         }
     }
 
@@ -2440,6 +2455,8 @@ impl Page {
                 | Self::OwnerLinkIssued(_)
                 | Self::TelegramLinkIssued(_)
                 | Self::Check(_)
+                | Self::Households(_)
+                | Self::Household(_)
         )
     }
 
@@ -2447,6 +2464,7 @@ impl Page {
     fn section(&self) -> &'static str {
         match self {
             Self::Home(_) | Self::OwnerLinkIssued(_) | Self::TelegramLinkIssued(_) => "home",
+            Self::Households(_) | Self::Household(_) => "household",
             Self::Llm(_) | Self::Check(_) => "llm",
             Self::Telegram(view) if !view.wizard => "telegram",
             Self::Password { .. } => "password",
@@ -2561,6 +2579,8 @@ impl Page {
                 let check = CheckBody { view: &view }.render()?;
                 CheckPageBody { check }.render()
             }
+            Self::Households(view) => super::households::render_list_body(view),
+            Self::Household(view) => view.render_body(),
         }
     }
 }
@@ -2623,6 +2643,7 @@ impl<'a> ConsolePage<'a> {
 <a class="console-brand" href="/admin"><span class="console-mark" aria-hidden="true">T</span>Tasklerq</a>
 <nav class="console-nav" aria-label="Разделы">
 <a href="/admin"{% if section == "home" %} aria-current="page"{% endif %}>Главная</a>
+<a href="/admin/households"{% if section == "household" %} aria-current="page"{% endif %}>Household</a>
 <a href="/admin/llm"{% if section == "llm" %} aria-current="page"{% endif %}>Разбор</a>
 <a href="/admin/telegram"{% if section == "telegram" %} aria-current="page"{% endif %}>Telegram</a>
 </nav>
