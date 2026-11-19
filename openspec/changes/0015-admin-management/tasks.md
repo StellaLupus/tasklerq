@@ -66,7 +66,7 @@
   «команда CLI → страница консоли», предупреждение о личных данных в выгрузке.
   Проверить: каждая команда `tasklerq admin --help`, кроме `setup-code`,
   `reset-password` и `secret-key`, имеет строку в таблице.
-- [ ] 5.2 Итоговая проверка: `cargo fmt --check`,
+- [x] 5.2 Итоговая проверка: `cargo fmt --check`,
   `cargo clippy --all-targets -- -D warnings`, `cargo test`,
   `openspec validate 0015-admin-management --strict`; ручной прогон в
   `docker compose` в `multi`: создать household, выпустить claim и токен,
