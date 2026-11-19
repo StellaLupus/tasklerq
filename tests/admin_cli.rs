@@ -1575,6 +1575,53 @@ async fn export_uses_the_only_household_when_not_specified() {
     );
 }
 
+/// `admin export` пишет одно событие `household_exported` без содержимого.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn export_records_one_household_exported_audit_event_without_content() {
+    const TASK_TITLE: &str = "СЕКРЕТНАЯ ЗАДАЧА ЭКСПОРТА CLI";
+
+    let db = cli_database().await;
+    let household = support::create_household(&db.pool).await;
+    support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        support::new_item(household.tasks_list_id, TASK_TITLE),
+    )
+    .await;
+
+    let household_id = household.household_id.to_string();
+    let output = run(&db.url, &["admin", "export", "--household", &household_id]).await;
+    assert!(output.status.success(), "{output:?}");
+
+    let events: Vec<(String, Option<Uuid>, Value)> = sqlx::query_as(
+        "SELECT actor_type::text, household_id, payload
+         FROM audit_events
+         WHERE event_type::text = 'household_exported'
+         ORDER BY created_at, id",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("the export audit events");
+    assert_eq!(events.len(), 1, "one export event: {events:?}");
+    assert_eq!(events[0].0, "system", "the system actor writes the event");
+    assert_eq!(
+        events[0].1,
+        Some(household.household_id),
+        "the event names the exported household"
+    );
+    let payload = events[0].2.to_string();
+    assert!(
+        !payload.contains(TASK_TITLE),
+        "the audit payload leaked the task text: {payload}"
+    );
+    assert!(
+        events[0].2.get("household_name").is_none(),
+        "the audit payload has no household content: {payload}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multi_token_create_requires_household_even_when_unique() {
     let db = cli_database().await;

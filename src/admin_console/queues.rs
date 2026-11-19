@@ -64,11 +64,9 @@ impl QueuesView {
     fn new(stats: QueueStats, limit: Option<Duration>) -> Self {
         let age = stats
             .oldest_ready
-            .map(|oldest| stats.now.signed_duration_since(oldest).num_seconds().max(0));
+            .map(|oldest| stats.now.signed_duration_since(oldest));
         let oldest_violation = match (age, limit) {
-            (Some(age), Some(limit)) if age > limit.num_seconds() => {
-                Some(format_age(limit.num_seconds()))
-            }
+            (Some(age), Some(limit)) if age > limit => Some(format_age(limit.num_seconds())),
             _ => None,
         };
 
@@ -79,7 +77,10 @@ impl QueuesView {
                 QueueRow::new("разборы", &stats.capture_jobs),
                 QueueRow::new("доставки уведомлений", &stats.notification_deliveries),
             ],
-            oldest_age: age.map_or_else(|| "нет".to_owned(), format_age),
+            oldest_age: age.map_or_else(
+                || "нет".to_owned(),
+                |age| format_age(age.num_seconds().max(0)),
+            ),
             oldest_violation,
         }
     }

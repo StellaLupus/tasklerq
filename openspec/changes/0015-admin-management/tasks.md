@@ -51,7 +51,7 @@
   `QUEUE_READY_LAG_SECONDS`. Проверить: фрагмент содержит числа по статусам и
   не содержит текста обновлений; при старом обновлении возраст выделен (spec
   admin-console «Очереди в консоли», design, решение 5).
-- [ ] 4.2 Миграция со значением `audit_event_type` `household_exported`;
+- [x] 4.2 Миграция со значением `audit_event_type` `household_exported`;
   запись события в `admin::export`; выгрузка из консоли с
   `Content-Disposition` и `Cache-Control: no-store`. Проверить: выгрузка
   консоли совпадает с выгрузкой CLI без поля времени; нет хешей токенов и

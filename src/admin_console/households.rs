@@ -21,10 +21,14 @@
 //! API-токены карточки — тонкая обёртка над [`admin::list_tokens`] и
 //! [`admin::create_token`]: список показывает только префикс и метаданные, а
 //! открытое значение выпущенного токена живёт только в теле ответа.
+//!
+//! Выгрузка карточки — `POST /admin/households/{id}/export`: POST, потому что
+//! [`admin::export`] пишет событие аудита. Тело — тот же JSON, что у CLI, с
+//! запретом кеширования и именем файла из household и даты.
 
 use askama::Template;
 use axum::extract::{Form, Path, RawForm, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use chrono::{DateTime, NaiveDate, Utc};
 use chrono_tz::Tz;
@@ -145,19 +149,24 @@ struct TokenRow {
     revocable: bool,
 }
 
+/// Токен истёк: срок задан и наступил на момент `now`.
+fn expired(token: &ApiToken, now: DateTime<Utc>) -> bool {
+    token.expires_at.is_some_and(|expires_at| expires_at <= now)
+}
+
 /// Токен можно отозвать: он не отозван и не истёк на момент `now`.
 fn revocable(token: &ApiToken, now: DateTime<Utc>) -> bool {
-    token.revoked_at.is_none() && !token.expires_at.is_some_and(|expires_at| expires_at <= now)
+    token.revoked_at.is_none() && !expired(token, now)
 }
 
 impl TokenRow {
     /// Собрать строку из записи `admin`; состояние — на момент `now`.
     fn new(token: ApiToken, timezone: Tz, now: DateTime<Utc>) -> Self {
-        let expired = token.expires_at.is_some_and(|expires_at| expires_at <= now);
+        let is_expired = expired(&token, now);
         let is_revocable = revocable(&token, now);
         let state = if token.revoked_at.is_some() {
             "отозван"
-        } else if expired {
+        } else if is_expired {
             "истёк"
         } else {
             "активен"
@@ -963,6 +972,57 @@ pub(crate) async fn revoke_token(
     }
 }
 
+/// `POST /admin/households/{id}/export`: выгрузка household файлом JSON.
+///
+/// POST, потому что [`admin::export`] пишет событие аудита. Формат совпадает с
+/// CLI: функция общая, различается только поле времени. Неизвестный, удалённый
+/// household и неверный UUID отвечают `404` до чтения, поэтому события нет.
+/// `Cache-Control: no-store` и имя файла с идентификатором и датой не дают
+/// браузеру и прокси сохранить личные данные.
+pub(crate) async fn export(
+    State(state): State<AdminState>,
+    Path(raw_id): Path<String>,
+    _session: AdminSession,
+) -> Response {
+    let Ok(household_id) = Uuid::parse_str(&raw_id) else {
+        return not_found();
+    };
+    let export = match admin::export(
+        &state.pool,
+        state.wizard().tenancy,
+        Some(household_id),
+        Utc::now(),
+    )
+    .await
+    {
+        Ok(export) => export,
+        Err(DomainError::NotFound) => return not_found(),
+        Err(error) => return internal(error),
+    };
+
+    let body = match serde_json::to_string_pretty(&export) {
+        Ok(body) => body,
+        Err(error) => return internal(error),
+    };
+    let filename = format!(
+        "tasklerq-{household_id}-{}.json",
+        export.exported_at.format("%Y-%m-%d")
+    );
+    let disposition = match HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
+        Ok(value) => value,
+        Err(error) => return internal(error),
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    headers.insert(header::CONTENT_DISPOSITION, disposition);
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+
+    (StatusCode::OK, headers, body).into_response()
+}
+
 /// `GET /admin/households/{id}/delete`: подтверждение вводом названия.
 ///
 /// Страница только читает название; активность household проверяет
@@ -1202,6 +1262,15 @@ struct ListBody<'a> {
 <div class="field"><label for="token-expires">Срок действия, дней (необязательно)</label>
 <input id="token-expires" name="expires_in_days" type="text" inputmode="numeric" value="{{ view.token_expires_in_days }}"></div>
 <div class="actions"><button type="submit" class="btn-primary">Выпустить токен</button></div>
+</form>
+</div>
+</section>
+<section class="panel">
+<header class="panel-head"><h2>Выгрузка</h2></header>
+<div class="panel-body">
+<p class="console-notice">Файл содержит личные данные household: участников, списки и задачи.</p>
+<form method="post" action="/admin/households/{{ view.id }}/export">
+<button type="submit" class="btn-primary">Скачать выгрузку</button>
 </form>
 </div>
 </section>

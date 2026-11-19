@@ -12188,6 +12188,256 @@ async fn households_token_revoke_of_another_household_is_not_found() {
     assert_eq!(status, StatusCode::NOT_FOUND, "an invalid token id");
 }
 
+/// Выгрузка из консоли: карточка предлагает скачать файл, скачивание отдаёт
+/// тот же JSON, что CLI, без хешей и секретов, и пишет одно событие аудита без
+/// содержимого.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_export_downloads_the_cli_json_and_records_one_audit_event() {
+    use tasklerq::domain::models::{ListKind, UserRole};
+
+    const TASK_TITLE: &str = "СЕКРЕТНАЯ ЗАДАЧА ВЫГРУЗКИ";
+    const LIST_NAME: &str = "СЕКРЕТНЫЙ СПИСОК ВЫГРУЗКИ";
+
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    // Мастер-ключ известен тесту: он не должен попасть в скачанный файл.
+    let master_key = BASE64.encode([0x42_u8; 32]);
+    let (app, _settings) = console_with_llm_and_mode(
+        &db.pool,
+        TenancyMode::Multi,
+        false,
+        LlmConfig::empty(),
+        cipher_with_key(0x42),
+    );
+    let now = Utc::now();
+    let household = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Квартира",
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("the household");
+    for (role, telegram_id, name) in [
+        (UserRole::Owner, 7_100_000_001_i64, "Алексей"),
+        (UserRole::Member, 7_100_000_002_i64, "Мария"),
+    ] {
+        tasklerq::admin::add_user(
+            &db.pool,
+            TenancyMode::Multi,
+            Some(household.id),
+            role,
+            telegram_id,
+            Some(name),
+            now,
+        )
+        .await
+        .expect("the household member");
+    }
+    insert_open_task(&db.pool, household.id, TASK_TITLE).await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+    tasklerq::storage::repositories::lists::create(
+        &mut conn,
+        household.id,
+        ListKind::Checklist,
+        LIST_NAME,
+        now,
+    )
+    .await
+    .expect("the secret list");
+    drop(conn);
+    let token = support::issue_token(&db.pool, household.id, &["ha:read"]).await;
+    let token_hash = hash_token(&token);
+    let admin_hash: String = sqlx::query_scalar("SELECT password_hash FROM admin_accounts")
+        .fetch_one(&db.pool)
+        .await
+        .expect("the administrator hash");
+
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+
+    // Карточка предлагает скачивание и предупреждает о личных данных.
+    let card_path = format!("/admin/households/{}", household.id);
+    let (status, _, body) = send_with_cookie(&app, Method::GET, &card_path, &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let card = String::from_utf8_lossy(&body);
+    assert!(
+        card.contains(&format!(
+            "action=\"/admin/households/{}/export\"",
+            household.id
+        )),
+        "the card must offer the export form:\n{card}"
+    );
+    assert!(
+        card.contains("Скачать выгрузку"),
+        "the export form has a download button:\n{card}"
+    );
+    assert!(
+        card.contains("личные данные"),
+        "the card warns about personal data:\n{card}"
+    );
+    assert_eq!(
+        audit_payloads(&db.pool, "household_exported").await.len(),
+        0,
+        "showing the card records nothing"
+    );
+
+    let path = format!("/admin/households/{}/export", household.id);
+    let (status, headers, body) = send_with_cookie(&app, Method::POST, &path, &cookie).await;
+    assert_eq!(status, StatusCode::OK, "the export downloads");
+    assert_security_headers(&headers, "POST /admin/households/{id}/export");
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json"),
+        "the download is JSON"
+    );
+    assert_eq!(
+        headers
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store"),
+        "the download forbids caching"
+    );
+
+    // Событие пишется сразу при скачивании: одно, от системного актора.
+    let actors = audit_actor(&db.pool, "household_exported").await;
+    assert_eq!(
+        actors,
+        vec![("system".to_owned(), Some(household.id))],
+        "the export records one system event for the household"
+    );
+
+    let text = String::from_utf8(body).expect("the export body is utf8");
+    let downloaded: Value = serde_json::from_str(&text).expect("the export is JSON");
+    assert_eq!(downloaded["household"]["id"], household.id.to_string());
+    assert!(
+        downloaded["items"]
+            .as_array()
+            .expect("items array")
+            .iter()
+            .any(|item| item["title"] == TASK_TITLE),
+        "the export contains the household task:\n{text}"
+    );
+    let exported_at = downloaded["exported_at"]
+        .as_str()
+        .expect("exported_at is a timestamp");
+    let date = exported_at
+        .get(..10)
+        .expect("exported_at starts with the UTC date");
+    let expected_disposition = format!(
+        "attachment; filename=\"tasklerq-{}-{date}.json\"",
+        household.id
+    );
+    assert_eq!(
+        headers
+            .get(header::CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok()),
+        Some(expected_disposition.as_str()),
+        "the download filename carries the household id and date"
+    );
+
+    for forbidden in [
+        token.as_str(),
+        token_hash.as_str(),
+        admin_hash.as_str(),
+        master_key.as_str(),
+        "token_hash",
+        "password_hash",
+    ] {
+        assert!(
+            !text.contains(forbidden),
+            "the export leaked `{forbidden}`:\n{text}"
+        );
+    }
+
+    // Payload события не содержит ни названия списка, ни текста задачи.
+    let payloads = audit_payloads(&db.pool, "household_exported").await;
+    assert_eq!(payloads.len(), 1, "one export event");
+    let payload_text = payloads[0].to_string();
+    for content in [TASK_TITLE, LIST_NAME, "household_name"] {
+        assert!(
+            !payload_text.contains(content),
+            "the audit payload leaked `{content}`: {payload_text}"
+        );
+    }
+
+    // Формат совпадает с выгрузкой CLI без поля времени.
+    let cli_export =
+        tasklerq::admin::export(&db.pool, TenancyMode::Multi, Some(household.id), Utc::now())
+            .await
+            .expect("the CLI export");
+    let mut expected = serde_json::to_value(&cli_export).expect("the export serializes");
+    let mut actual = downloaded;
+    for export in [&mut expected, &mut actual] {
+        export
+            .as_object_mut()
+            .expect("the export is an object")
+            .remove("exported_at");
+    }
+    assert_eq!(
+        actual, expected,
+        "the console export matches the CLI export"
+    );
+}
+
+/// Выгрузка несуществующего, удалённого или нечислового household — `404`, и
+/// события выгрузки не появляется.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_export_of_an_unknown_or_deleted_household_is_not_found() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Multi, false, LlmConfig::empty());
+    let now = Utc::now();
+    let deleted = tasklerq::admin::create_household(
+        &db.pool,
+        TenancyMode::Multi,
+        "Удалённый",
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("the deleted household");
+    tasklerq::admin::delete_household(&db.pool, deleted.id, now)
+        .await
+        .expect("the household is deleted");
+
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    for path in [
+        format!("/admin/households/{}/export", deleted.id),
+        format!("/admin/households/{}/export", Uuid::now_v7()),
+        "/admin/households/not-a-uuid/export".to_owned(),
+    ] {
+        let (status, _, _) = send_with_cookie(&app, Method::POST, &path, &cookie).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+    }
+    assert!(
+        audit_payloads(&db.pool, "household_exported")
+            .await
+            .is_empty(),
+        "a refused export records nothing"
+    );
+}
+
+/// Выгрузка за сессией, как остальные POST консоли: без сессии — вход.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn households_export_without_a_session_redirects_to_login() {
+    let db = support::isolated_db().await;
+    let app = console(&db.pool, Vec::new());
+    let path = format!("/admin/households/{}/export", Uuid::now_v7());
+
+    let (status, headers, _) = send_form(&app, &path, &[]).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), Some("/admin/login"));
+    assert!(
+        audit_payloads(&db.pool, "household_exported")
+            .await
+            .is_empty(),
+        "an anonymous export records nothing"
+    );
+}
+
 /// Консоль с тем же порогом задержки очереди, что выставляет readiness.
 fn console_with_queue_limit(pool: &PgPool, seconds: u32) -> Router {
     build_admin_router(console_state(pool, Vec::new()).with_queue_lag_limit(seconds))
@@ -12382,6 +12632,60 @@ async fn queues_highlight_only_the_age_over_the_readiness_limit() {
     assert!(
         fresh.contains("1 мин"),
         "the fresh age is still shown:\n{fresh}"
+    );
+
+    // Граница: полсекунды сверх порога уже превышение, хотя целых секунд
+    // ровно столько же, сколько у порога.
+    sqlx::query(
+        "UPDATE telegram_updates
+         SET available_at = now() - interval '300.5 seconds',
+             received_at = now() - interval '300.5 seconds'
+         WHERE update_id = $1",
+    )
+    .bind(update_id)
+    .execute(&db.pool)
+    .await
+    .expect("the update half a second over the limit");
+
+    let (status, _, body) =
+        send_with_cookie(&app, Method::GET, "/admin/queues/fragment", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let boundary = String::from_utf8_lossy(&body);
+    assert!(
+        boundary.contains("status-bad"),
+        "half a second over the threshold is highlighted:\n{boundary}"
+    );
+}
+
+/// Без порога (`queue_lag_limit = None`) старое готовое обновление показывается,
+/// но не выделяется.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queues_without_a_limit_do_not_highlight_an_old_update() {
+    let db = support::isolated_db().await;
+    insert_account(&db.pool, "admin").await;
+    let app = console_with(&db.pool, TenancyMode::Single, false, LlmConfig::empty());
+    sqlx::query(
+        "INSERT INTO telegram_updates (update_id, payload, available_at, received_at)
+         VALUES ($1, '{}'::jsonb, now() - interval '7 minutes',
+                 now() - interval '7 minutes')",
+    )
+    .bind(90_201_i64)
+    .execute(&db.pool)
+    .await
+    .expect("the stale update");
+
+    let cookie = login_cookie(&app, "admin", TEST_PASSWORD).await;
+    let (status, _, body) =
+        send_with_cookie(&app, Method::GET, "/admin/queues/fragment", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let fragment = String::from_utf8_lossy(&body);
+    assert!(
+        !fragment.contains("status-bad"),
+        "without a limit the old age is not highlighted:\n{fragment}"
+    );
+    assert!(
+        fragment.contains("7 мин"),
+        "the old age is still shown:\n{fragment}"
     );
 }
 

@@ -14,11 +14,11 @@ use uuid::Uuid;
 use crate::auth::tokens::{self, IssuedToken};
 use crate::config::TenancyMode;
 use crate::domain::error::DomainError;
-use crate::domain::identity::NewMember;
+use crate::domain::identity::{AuditEventType, NewMember};
 use crate::domain::models::{Actor, ActorType, Household, Item, ListKind, User, UserRole};
 use crate::storage::repositories::items;
 use crate::storage::repositories::tokens::ApiToken;
-use crate::storage::repositories::{households, lists, members, users};
+use crate::storage::repositories::{audit, households, lists, members, users};
 use crate::telegram::queue;
 
 /// Имя участника, если администратор его не указал.
@@ -582,6 +582,9 @@ struct ReminderRow {
 /// выгрузки невозможна.
 ///
 /// Мягко удалённые участники, списки и задачи не включаются.
+///
+/// После чтения пишется событие `household_exported` от системного актора:
+/// его получают и CLI, и консоль, потому что функция общая.
 pub async fn export(
     pool: &PgPool,
     mode: TenancyMode,
@@ -598,6 +601,20 @@ pub async fn export(
     let items = items::all_for_export(&mut tx, household.id).await?;
     let reminders = reminders_for(&mut tx, household.id).await?;
     tx.commit().await?;
+
+    // Событие — отдельная короткая запись после снимка. Payload пуст: ни
+    // участников, ни списков, ни задач в журнале нет, только household.
+    // Сбой записи возвращает ошибку: выгрузка без аудита не отдаётся.
+    let mut conn = pool.acquire().await?;
+    audit::record(
+        &mut conn,
+        Some(household.id),
+        &admin_actor(),
+        AuditEventType::HouseholdExported,
+        serde_json::json!({}),
+        now,
+    )
+    .await?;
 
     let mut by_item: HashMap<Uuid, Vec<Reminder>> = HashMap::new();
     for row in reminders {
