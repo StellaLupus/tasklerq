@@ -837,8 +837,9 @@ household, настройки LLM и токен для Home Assistant без п�
    ссылкой-claim из консоли (раздел 9.1). Пока вы не нажали `/start`, бот не
    сможет написать вам первым.
 
-   Для headless-режима (`TELEGRAM_MODE=disabled`) или bootstrap без бота
-   создайте household и владельца одной командой:
+   Для headless-режима (бот выключен: токен не задан и бот не подключён в
+   консоли либо `TELEGRAM_MODE=disabled` задан при токене в окружении) или
+   bootstrap без бота создайте household и владельца одной командой:
 
    ```bash
    tasklerq admin household create \
@@ -856,8 +857,9 @@ household, настройки LLM и токен для Home Assistant без п�
    скопируйте его в HA и нажмите **Я сохранил**; если кнопку не нажимали,
    сообщение удалится само через час.
 
-   Для headless-режима (`TELEGRAM_MODE=disabled`) и автоматизации токен
-   выпускается через CLI:
+   Для headless-режима (бот выключен: токен не задан и бот не подключён в
+   консоли либо `TELEGRAM_MODE=disabled` задан при токене в окружении) и
+   автоматизации токен выпускается через CLI:
 
    ```bash
    sudo /usr/local/bin/docker compose exec tasklerq \
@@ -2386,8 +2388,7 @@ cat > .env <<EOF
 ENV=development
 BIND_ADDR=0.0.0.0:8080
 DATABASE_URL=postgres://tasklerq:tasklerq@127.0.0.1:15433/tasklerq?sslmode=disable
-# Без ключа токен бота из консоли не сохранится.
-# Сгенерируйте: openssl rand -base64 32
+# Ключ генерируется командой ниже; без него токен бота из консоли не сохранится.
 TASKLERQ_SECRET_KEY=$(openssl rand -base64 32)
 LLM_CAPTURE_ENABLED=false
 RUST_LOG=debug
@@ -2397,11 +2398,17 @@ EOF
 cargo run --locked -- serve
 ```
 
+Не пересоздавайте `.env` этим блоком при непустой dev-базе: новый ключ сделает
+сохранённые секреты нерасшифровываемыми, и токен бота придётся ввести в консоли
+заново (раздел 16.13).
+
 Без `TELEGRAM_BOT_TOKEN` и настроек в консоли бот выключен, а API и capture
-продолжают работать. `TELEGRAM_MODE=disabled` теперь игнорируется с
-предупреждением в логе: режимом управляет наличие токена и консоль. Для
-`TELEGRAM_MODE=polling` нужен реальный токен тестового бота. Для подключения
-бота из консоли нужен `TASKLERQ_SECRET_KEY`: без него токен не сохранится.
+продолжают работать. `TELEGRAM_MODE=disabled` без токена теперь игнорируется с
+предупреждением в логе: без токена режимом управляет консоль. При заданном в
+окружении `TELEGRAM_BOT_TOKEN` действует `TELEGRAM_MODE`, и `disabled` выключает
+бота. Для `TELEGRAM_MODE=polling` нужен реальный токен тестового бота. Для
+подключения бота из консоли нужен `TASKLERQ_SECRET_KEY`: без него токен не
+сохранится.
 
 Для webhook локально:
 
