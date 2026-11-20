@@ -2029,6 +2029,25 @@ async fn admin_telegram_migration_adds_audit_values() {
     }
 }
 
+/// 0023: значение аудита выгрузки household.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_export_migration_adds_audit_value() {
+    let db = support::empty_db().await;
+    migrations::run(&db.pool)
+        .await
+        .expect("migrations should apply on a clean database");
+
+    let values: Vec<String> =
+        sqlx::query_scalar("SELECT unnest(enum_range(NULL::audit_event_type))::text")
+            .fetch_all(&db.pool)
+            .await
+            .expect("audit_event_type values");
+    assert!(
+        values.iter().any(|value| value == "household_exported"),
+        "audit_event_type must contain household_exported: {values:?}"
+    );
+}
+
 /// 0014 применяется поверх базы 0021 и не теряет учётку и действующие коды.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_telegram_migration_keeps_existing_admin_rows() {

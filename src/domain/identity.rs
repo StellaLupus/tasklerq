@@ -42,6 +42,8 @@ pub enum AuditEventType {
     AuthFailureThresholdExceeded,
     /// Household удалён.
     HouseholdDeleted,
+    /// Household выгружен в файл.
+    HouseholdExported,
     /// Вход администратора в консоль.
     AdminLogin,
     /// Неудачная попытка входа в консоль.
@@ -81,6 +83,7 @@ impl AuditEventType {
             Self::LlmValidationFailed => "llm_validation_failed",
             Self::AuthFailureThresholdExceeded => "auth_failure_threshold_exceeded",
             Self::HouseholdDeleted => "household_deleted",
+            Self::HouseholdExported => "household_exported",
             Self::AdminLogin => "admin_login",
             Self::AdminLoginFailed => "admin_login_failed",
             Self::AdminSetupCodeFailed => "admin_setup_code_failed",
@@ -252,6 +255,7 @@ mod tests {
     #[test]
     fn admin_audit_event_names_match_the_database_enum() {
         let expected = [
+            (AuditEventType::HouseholdExported, "household_exported"),
             (AuditEventType::AdminLogin, "admin_login"),
             (AuditEventType::AdminLoginFailed, "admin_login_failed"),
             (

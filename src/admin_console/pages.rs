@@ -1,5 +1,6 @@
 //! Страницы консоли: setup, вход, восстановление, смена пароля, мастер,
-//! настройки LLM и главная.
+//! настройки LLM и главная. Страницы household — в [`super::households`],
+//! очередей — в [`super::queues`].
 //!
 //! Макет (`Layout`) общий: шапка, навигация вошедшего администратора, сообщение
 //! и место для содержимого. Содержимое рисует небольшой askama-шаблон своей
@@ -102,8 +103,9 @@ const LLM_SECRET_REJECTED_PATH: &str = "/admin/llm?saved=1&secret=key_missing";
 const LLM_SECRET_ONLY_REJECTED_PATH: &str = "/admin/llm?secret=key_missing";
 /// Имя токена Home Assistant по умолчанию.
 const DEFAULT_TOKEN_NAME: &str = "Home Assistant";
-/// Scopes токена, который выпускает мастер.
-const HOME_ASSISTANT_SCOPES: [&str; 3] = ["ha:read", "ha:write", "capture:write"];
+/// Scopes токена, который выпускает мастер; те же отмечены по умолчанию в
+/// форме токена household.
+pub(crate) const HOME_ASSISTANT_SCOPES: [&str; 3] = ["ha:read", "ha:write", "capture:write"];
 
 const SETUP_FORM_ERROR: &str = "Код недействителен.";
 const LOGIN_FORM_ERROR: &str = "Неверное имя или пароль.";
@@ -181,9 +183,9 @@ pub(crate) struct SkipForm {
 #[derive(Deserialize)]
 pub(crate) struct HouseholdForm {
     /// Название household.
-    name: String,
+    pub(crate) name: String,
     /// Часовой пояс IANA.
-    timezone: String,
+    pub(crate) timezone: String,
 }
 
 /// Поля формы токена Home Assistant: имя по желанию.
@@ -1929,7 +1931,7 @@ fn redirect_with_cookie(path: &str, cookie: String) -> Response {
 }
 
 /// `500` без подробностей: причина уходит в журнал вызывающей стороны.
-fn internal(error: impl std::fmt::Display) -> Response {
+pub(crate) fn internal(error: impl std::fmt::Display) -> Response {
     tracing::error!(error = %error, "admin console request failed");
     (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
 }
@@ -1945,6 +1947,91 @@ fn render_with_status(page: ConsolePage<'_>, status: StatusCode) -> Response {
         Ok(body) => (status, Html(body)).into_response(),
         Err(error) => internal(error),
     }
+}
+
+/// Отрисовать страницу очередей в общем макете.
+pub(crate) fn render_queues(view: super::queues::QueuesView) -> Response {
+    render(ConsolePage::new(Page::Queues(Box::new(view))))
+}
+
+/// Отрисовать список household в общем макете.
+pub(crate) fn render_household_list(view: super::households::HouseholdList) -> Response {
+    render(ConsolePage::new(Page::Households(Box::new(view))))
+}
+
+/// Отрисовать карточку household в общем макете.
+pub(crate) fn render_household_detail(view: super::households::HouseholdView) -> Response {
+    render(ConsolePage::new(Page::Household(Box::new(view))))
+}
+
+/// Отрисовать карточку с сообщением отказа формы участника.
+pub(crate) fn render_household_detail_error(
+    view: super::households::HouseholdView,
+    message: &str,
+    hint: Option<&str>,
+    status: StatusCode,
+) -> Response {
+    render_with_status(
+        ConsolePage::new(Page::Household(Box::new(view)))
+            .error(message)
+            .hint(hint),
+        status,
+    )
+}
+
+/// Отрисовать страницу выпущенного токена household: значение видно один раз.
+pub(crate) fn render_household_token_issued(
+    view: super::households::HouseholdTokenIssuedView,
+) -> Response {
+    render(ConsolePage::new(Page::HouseholdTokenIssued(Box::new(view))))
+}
+
+/// Отрисовать страницу подтверждения отзыва токена household.
+pub(crate) fn render_household_token_revoke(
+    view: super::households::HouseholdTokenRevokeView,
+) -> Response {
+    render(ConsolePage::new(Page::HouseholdTokenRevoke(Box::new(view))))
+}
+
+/// Отрисовать подтверждение отзыва токена с сообщением отказа формы.
+pub(crate) fn render_household_token_revoke_error(
+    view: super::households::HouseholdTokenRevokeView,
+    message: &str,
+    status: StatusCode,
+) -> Response {
+    render_with_status(
+        ConsolePage::new(Page::HouseholdTokenRevoke(Box::new(view))).error(message),
+        status,
+    )
+}
+
+/// Отрисовать страницу подтверждения удаления household.
+pub(crate) fn render_household_delete(view: super::households::HouseholdDeleteView) -> Response {
+    render(ConsolePage::new(Page::HouseholdDelete(Box::new(view))))
+}
+
+/// Отрисовать подтверждение удаления с сообщением отказа формы.
+pub(crate) fn render_household_delete_error(
+    view: super::households::HouseholdDeleteView,
+    message: &str,
+    status: StatusCode,
+) -> Response {
+    render_with_status(
+        ConsolePage::new(Page::HouseholdDelete(Box::new(view))).error(message),
+        status,
+    )
+}
+
+/// Отрисовать список household с сообщением отказа формы.
+pub(crate) fn render_household_list_error(
+    view: super::households::HouseholdList,
+    message: &str,
+    status: StatusCode,
+) -> Response {
+    render_with_status(
+        ConsolePage::new(Page::Households(Box::new(view))).error(message),
+        status,
+    )
 }
 
 /// Вид страницы настроек LLM.
@@ -2384,6 +2471,18 @@ enum Page {
     TelegramLinkIssued(Box<TelegramLinkView>),
     /// Ход проверки слота.
     Check(Option<CheckSnapshot>),
+    /// Очереди инсталляции.
+    Queues(Box<super::queues::QueuesView>),
+    /// Список household.
+    Households(Box<super::households::HouseholdList>),
+    /// Карточка household.
+    Household(Box<super::households::HouseholdView>),
+    /// Токен household только что выпущен: значение показывается один раз.
+    HouseholdTokenIssued(Box<super::households::HouseholdTokenIssuedView>),
+    /// Подтверждение отзыва токена household.
+    HouseholdTokenRevoke(Box<super::households::HouseholdTokenRevokeView>),
+    /// Подтверждение удаления household.
+    HouseholdDelete(Box<super::households::HouseholdDeleteView>),
 }
 
 /// Поля шага мастера, которые возвращаются в форму после отказа.
@@ -2421,6 +2520,11 @@ impl Page {
             Self::OwnerLinkIssued(_) => "Ссылка-claim владельца",
             Self::TelegramLinkIssued(_) => "Ссылка привязки Telegram",
             Self::Check(_) => "Проверка слота",
+            Self::Queues(_) => "Очереди",
+            Self::Households(_) | Self::Household(_) => "Household",
+            Self::HouseholdTokenIssued(_) => "API-токен",
+            Self::HouseholdTokenRevoke(_) => "Отзыв токена",
+            Self::HouseholdDelete(_) => "Удаление household",
         }
     }
 
@@ -2440,6 +2544,12 @@ impl Page {
                 | Self::OwnerLinkIssued(_)
                 | Self::TelegramLinkIssued(_)
                 | Self::Check(_)
+                | Self::Queues(_)
+                | Self::Households(_)
+                | Self::Household(_)
+                | Self::HouseholdTokenIssued(_)
+                | Self::HouseholdTokenRevoke(_)
+                | Self::HouseholdDelete(_)
         )
     }
 
@@ -2447,7 +2557,13 @@ impl Page {
     fn section(&self) -> &'static str {
         match self {
             Self::Home(_) | Self::OwnerLinkIssued(_) | Self::TelegramLinkIssued(_) => "home",
+            Self::Households(_)
+            | Self::Household(_)
+            | Self::HouseholdTokenIssued(_)
+            | Self::HouseholdTokenRevoke(_)
+            | Self::HouseholdDelete(_) => "household",
             Self::Llm(_) | Self::Check(_) => "llm",
+            Self::Queues(_) => "queues",
             Self::Telegram(view) if !view.wizard => "telegram",
             Self::Password { .. } => "password",
             _ => "",
@@ -2561,6 +2677,12 @@ impl Page {
                 let check = CheckBody { view: &view }.render()?;
                 CheckPageBody { check }.render()
             }
+            Self::Queues(view) => super::queues::render_page_body(view),
+            Self::Households(view) => super::households::render_list_body(view),
+            Self::Household(view) => view.render_body(),
+            Self::HouseholdTokenIssued(view) => view.render_body(),
+            Self::HouseholdTokenRevoke(view) => view.render_body(),
+            Self::HouseholdDelete(view) => view.render_body(),
         }
     }
 }
@@ -2571,17 +2693,29 @@ struct ConsolePage<'a> {
     page: Page,
     /// Сообщение формы или причина отказа.
     error: Option<&'a str>,
+    /// Короткая подсказка под сообщением отказа.
+    hint: Option<&'a str>,
 }
 
 impl<'a> ConsolePage<'a> {
     /// Страница с общим макетом и подключёнными ресурсами.
     fn new(page: Page) -> Self {
-        Self { page, error: None }
+        Self {
+            page,
+            error: None,
+            hint: None,
+        }
     }
 
     /// Показать сообщение формы.
     fn error(mut self, message: &'a str) -> Self {
         self.error = Some(message);
+        self
+    }
+
+    /// Показать подсказку под сообщением формы.
+    fn hint(mut self, hint: Option<&'a str>) -> Self {
+        self.hint = hint;
         self
     }
 
@@ -2594,6 +2728,7 @@ impl<'a> ConsolePage<'a> {
             nav: self.page.nav(),
             section: self.page.section(),
             error: self.error,
+            hint: self.hint,
             content: self.page.render_body()?,
         }
         .render()
@@ -2623,6 +2758,8 @@ impl<'a> ConsolePage<'a> {
 <a class="console-brand" href="/admin"><span class="console-mark" aria-hidden="true">T</span>Tasklerq</a>
 <nav class="console-nav" aria-label="Разделы">
 <a href="/admin"{% if section == "home" %} aria-current="page"{% endif %}>Главная</a>
+<a href="/admin/households"{% if section == "household" %} aria-current="page"{% endif %}>Household</a>
+<a href="/admin/queues"{% if section == "queues" %} aria-current="page"{% endif %}>Очереди</a>
 <a href="/admin/llm"{% if section == "llm" %} aria-current="page"{% endif %}>Разбор</a>
 <a href="/admin/telegram"{% if section == "telegram" %} aria-current="page"{% endif %}>Telegram</a>
 </nav>
@@ -2638,6 +2775,11 @@ impl<'a> ConsolePage<'a> {
 {% match error %}
 {% when Some with (message) %}
 <p role="alert" class="console-alert">{{ message }}</p>
+{% when None %}
+{% endmatch %}
+{% match hint %}
+{% when Some with (hint) %}
+<p class="muted">{{ hint }}</p>
 {% when None %}
 {% endmatch %}
 {{ content|safe }}
@@ -2675,6 +2817,8 @@ struct Layout<'a> {
     section: &'static str,
     /// Сообщение формы или причина отказа.
     error: Option<&'a str>,
+    /// Короткая подсказка под сообщением отказа.
+    hint: Option<&'a str>,
     /// Уже отрисованный askama фрагмент страницы; экранирован шаблоном
     /// страницы, поэтому в макет вставляется без повторного экранирования.
     content: String,

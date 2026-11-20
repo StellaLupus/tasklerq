@@ -14,15 +14,29 @@ use uuid::Uuid;
 use crate::auth::tokens::{self, IssuedToken};
 use crate::config::TenancyMode;
 use crate::domain::error::DomainError;
-use crate::domain::identity::NewMember;
+use crate::domain::identity::{AuditEventType, NewMember};
 use crate::domain::models::{Actor, ActorType, Household, Item, ListKind, User, UserRole};
 use crate::storage::repositories::items;
 use crate::storage::repositories::tokens::ApiToken;
-use crate::storage::repositories::{households, lists, members, users};
+use crate::storage::repositories::{audit, households, lists, members, users};
 use crate::telegram::queue;
 
 /// Имя участника, если администратор его не указал.
 pub const DEFAULT_MEMBER_NAME: &str = "Участник";
+
+/// Отказ домена: Telegram ID пользователя всегда положителен.
+///
+/// Тот же текст показывает форма консоли для пустого и нечислового ввода,
+/// чтобы отказ не зависел от того, где ID не разобрался.
+pub const INVALID_TELEGRAM_ID: &str = "telegram id must be a positive integer";
+
+/// Проверить Telegram ID до записи: `0` и отрицательные значения — ошибка ввода.
+fn require_positive_telegram_id(telegram_user_id: i64) -> Result<(), DomainError> {
+    if telegram_user_id <= 0 {
+        return Err(DomainError::Validation(INVALID_TELEGRAM_ID.into()));
+    }
+    Ok(())
+}
 
 /// Максимальный срок токена, дней: десять лет.
 pub const MAX_TOKEN_EXPIRY_DAYS: i64 = 3650;
@@ -130,6 +144,30 @@ pub async fn revoke_token(
     Ok(result)
 }
 
+/// Отозвать токен household, сверив принадлежность в одной транзакции.
+///
+/// [`revoke_token`] household не проверяет, поэтому консоль перед отзывом
+/// сверяет, что токен принадлежит household из пути: иначе на странице одного
+/// дома можно было бы отозвать токен другого. Несуществующий или чужой токен —
+/// `NotFound`; дальше отзыв идёт тем же путём, что у CLI (системный актор и
+/// аудит `token_revoked`).
+pub async fn revoke_household_token(
+    pool: &PgPool,
+    household_id: Uuid,
+    token_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<(ApiToken, bool), DomainError> {
+    let mut tx = pool.begin().await?;
+    let token = crate::storage::repositories::tokens::find_by_id(&mut tx, token_id)
+        .await?
+        .filter(|token| token.household_id == household_id)
+        .ok_or(DomainError::NotFound)?;
+    let result = tokens::revoke(&mut tx, token.id, &admin_actor(), now).await?;
+    tx.commit().await?;
+
+    Ok(result)
+}
+
 /// Токены household без секретов.
 pub async fn list_tokens(
     pool: &PgPool,
@@ -170,6 +208,8 @@ pub async fn create_household_with_owner(
     display_name: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<(Household, User), DomainError> {
+    require_positive_telegram_id(telegram_user_id)?;
+
     let owner = households::NewOwner {
         member: NewMember {
             telegram_user_id,
@@ -204,6 +244,17 @@ pub async fn household_name(pool: &PgPool, household_id: Uuid) -> Result<String,
     Ok(households::get(&mut conn, household_id).await?.name)
 }
 
+/// Активные участники активного household.
+///
+/// Удалённый или несуществующий household — `NotFound`, как у
+/// [`household_name`]: консоль не показывает участников дома, которого нет.
+/// Состав читает репозиторий [`users::list_active`], своего SQL здесь нет.
+pub async fn list_members(pool: &PgPool, household_id: Uuid) -> Result<Vec<User>, DomainError> {
+    let mut conn = pool.acquire().await?;
+    households::get(&mut conn, household_id).await?;
+    users::list_active(&mut conn, household_id).await
+}
+
 /// Мягко удалить household от системного актора.
 ///
 /// Уведомления участникам не отправляются: у CLI нет контекста бота, а при
@@ -232,6 +283,8 @@ pub async fn add_user(
     display_name: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<(Household, User), DomainError> {
+    require_positive_telegram_id(telegram_user_id)?;
+
     let mut tx = pool.begin().await?;
     let household = resolve_household(&mut tx, mode, household_id).await?;
 
@@ -285,6 +338,27 @@ pub async fn list_households(
     pool: &PgPool,
     now: DateTime<Utc>,
 ) -> Result<Vec<HouseholdSummary>, DomainError> {
+    household_summaries(pool, now, None).await
+}
+
+/// Сводка одного активного household; удалённый или неизвестный — `None`.
+pub async fn household_summary(
+    pool: &PgPool,
+    household_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<Option<HouseholdSummary>, DomainError> {
+    Ok(household_summaries(pool, now, Some(household_id))
+        .await?
+        .into_iter()
+        .next())
+}
+
+/// Общий запрос сводок: без `household_id` — все активные household.
+async fn household_summaries(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    household_id: Option<Uuid>,
+) -> Result<Vec<HouseholdSummary>, DomainError> {
     let rows = sqlx::query_as::<_, HouseholdSummaryRow>(
         "SELECT h.id, h.name, h.timezone, o.telegram_user_id AS owner_telegram_id,
                 h.created_at,
@@ -308,9 +382,11 @@ pub async fn list_households(
                AND o.role = 'owner'
                AND o.deleted_at IS NULL
          WHERE h.deleted_at IS NULL
+           AND ($2::uuid IS NULL OR h.id = $2)
          ORDER BY h.created_at, h.id",
     )
     .bind(now)
+    .bind(household_id)
     .fetch_all(pool)
     .await?;
 
@@ -327,6 +403,19 @@ pub async fn list_households(
             created_at: row.created_at,
         })
         .collect())
+}
+
+/// Активный household, выбранный правилом [`select_household`].
+///
+/// `None` — правило не выбрало один household (ноль, несколько или `multi`):
+/// консоль показывает список, а не ошибку.
+pub async fn selected_household(
+    pool: &PgPool,
+    mode: TenancyMode,
+) -> Result<Option<Household>, DomainError> {
+    let mut conn = pool.acquire().await?;
+    let active = households::list_active(&mut conn).await?;
+    Ok(select_household(mode, active).ok())
 }
 
 #[derive(sqlx::FromRow)]
@@ -511,6 +600,9 @@ struct ReminderRow {
 /// выгрузки невозможна.
 ///
 /// Мягко удалённые участники, списки и задачи не включаются.
+///
+/// После чтения пишется событие `household_exported` от системного актора:
+/// его получают и CLI, и консоль, потому что функция общая.
 pub async fn export(
     pool: &PgPool,
     mode: TenancyMode,
@@ -527,6 +619,20 @@ pub async fn export(
     let items = items::all_for_export(&mut tx, household.id).await?;
     let reminders = reminders_for(&mut tx, household.id).await?;
     tx.commit().await?;
+
+    // Событие — отдельная короткая запись после снимка. Payload пуст: ни
+    // участников, ни списков, ни задач в журнале нет, только household.
+    // Сбой записи возвращает ошибку: выгрузка без аудита не отдаётся.
+    let mut conn = pool.acquire().await?;
+    audit::record(
+        &mut conn,
+        Some(household.id),
+        &admin_actor(),
+        AuditEventType::HouseholdExported,
+        serde_json::json!({}),
+        now,
+    )
+    .await?;
 
     let mut by_item: HashMap<Uuid, Vec<Reminder>> = HashMap::new();
     for row in reminders {

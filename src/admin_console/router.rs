@@ -29,7 +29,7 @@ use crate::telegram::runtime::TelegramSupervisor;
 
 use super::checks::CheckState;
 use super::wizard::{WIZARD_PATH, WIZARD_SKIP_PATH, WizardSettings};
-use super::{assets, origin, pages};
+use super::{assets, households, origin, pages, queues};
 
 /// Сколько неудач допускается в окне лимита консоли.
 pub const FAILURE_LIMIT: u32 = 5;
@@ -262,6 +262,27 @@ fn failure_limiter() -> Arc<RateLimiter<IpAddr>> {
 pub fn build_router(state: AdminState) -> Router {
     Router::new()
         .route("/admin", get(pages::index))
+        .route(
+            "/admin/households",
+            get(households::list).post(households::create),
+        )
+        .route(queues::QUEUES_PATH, get(queues::page))
+        .route(queues::QUEUES_FRAGMENT_PATH, get(queues::fragment))
+        .route("/admin/households/{id}", get(households::detail))
+        .route(
+            "/admin/households/{id}/members",
+            post(households::add_member),
+        )
+        .route("/admin/households/{id}/tokens", post(households::add_token))
+        .route("/admin/households/{id}/export", post(households::export))
+        .route(
+            "/admin/households/{id}/tokens/{token_id}/revoke",
+            get(households::revoke_token_page).post(households::revoke_token),
+        )
+        .route(
+            "/admin/households/{id}/delete",
+            get(households::delete_page).post(households::delete),
+        )
         .route(WIZARD_PATH, get(pages::wizard_page))
         .route(WIZARD_SKIP_PATH, post(pages::wizard_skip))
         .route("/admin/wizard/household", post(pages::wizard_household))

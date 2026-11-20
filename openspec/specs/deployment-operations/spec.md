@@ -13,9 +13,13 @@ Docker, Telegram webhook, health, фоновые задания, обновле�
 запуск с понятной ошибкой, если отсутствует обязательный параметр или он
 невалиден. Обязательные параметры MUST включать `DATABASE_URL`; `ENV` MUST
 быть необязательным со значением по умолчанию `production`; при
-`TELEGRAM_MODE=webhook` — `TELEGRAM_BOT_TOKEN` и `TELEGRAM_WEBHOOK_SECRET`; при
-явно заданном в окружении `LLM_CAPTURE_ENABLED=true` — адрес и модель основного
-слота (`LLM_PRIMARY_URL`, `LLM_PRIMARY_MODEL`). `PUBLIC_BASE_URL` MUST быть
+`TELEGRAM_MODE=webhook` или `polling` в окружении — `TELEGRAM_BOT_TOKEN`, а для
+webhook также `TELEGRAM_WEBHOOK_SECRET` и адрес webhook; при явно заданном в
+окружении `LLM_CAPTURE_ENABLED=true` — адрес и модель основного слота
+(`LLM_PRIMARY_URL`, `LLM_PRIMARY_MODEL`). Настройки Telegram MUST браться из
+окружения целиком, только если задан `TELEGRAM_BOT_TOKEN`; иначе — из консоли
+оператора, а без них Telegram MUST быть выключен; прочие переменные `TELEGRAM_*`
+без токена MUST игнорироваться с предупреждением. `PUBLIC_BASE_URL` MUST быть
 необязательным; если он задан, в production он MUST быть HTTPS-URL. Параметры
 LLM, не заданные окружением, MAY браться из настроек консоли оператора; значение
 из окружения MUST иметь приоритет. Слот MUST считаться заданным окружением,
@@ -49,6 +53,25 @@ MUST приводить к ошибке запуска. Переменные `HA
 - **THEN** сервис стартует в окружении `production`
 - **AND** консоль оператора доступна на адресе по умолчанию
 - **AND** настройки LLM в консоли можно изменять
+
+#### Scenario: Запуск только с DATABASE_URL
+
+- **WHEN** сервис запускается только с `DATABASE_URL`, а в консоли Telegram не
+  настроен
+- **THEN** сервис стартует с выключенным Telegram
+- **AND** HTTP API и консоль работают
+
+#### Scenario: Режим Telegram без токена
+
+- **WHEN** в окружении задан `TELEGRAM_MODE=disabled` без `TELEGRAM_BOT_TOKEN`
+- **THEN** сервис стартует, а настройки Telegram берутся из консоли
+- **AND** лог содержит предупреждение, что `TELEGRAM_MODE` без токена
+  игнорируется
+
+#### Scenario: Webhook без токена
+
+- **WHEN** в окружении задан `TELEGRAM_MODE=webhook` без `TELEGRAM_BOT_TOKEN`
+- **THEN** сервис отказывается запускаться и называет `TELEGRAM_BOT_TOKEN`
 
 #### Scenario: LLM включён без основного слота
 
@@ -127,8 +150,9 @@ MUST приводить к ошибке запуска. Переменные `HA
 
 Режим размещения MUST задаваться `TENANCY_MODE` со значениями `single` (по
 умолчанию) и `multi`. Необязательный `BOOTSTRAP_OWNER_TELEGRAM_ID` MUST быть
-положительным целым; если он не задан и Telegram включён, при старте MUST
-выводиться предупреждение, что первым владельцем станет первый написавший боту.
+положительным целым; если он не задан, Telegram включён и учётки администратора
+консоли нет, при старте MUST выводиться предупреждение, что первым владельцем
+станет первый написавший боту.
 
 #### Scenario: Режим размещения по умолчанию
 
@@ -149,10 +173,17 @@ MUST приводить к ошибке запуска. Переменные `HA
 
 #### Scenario: Первый владелец не ограничен
 
-- **WHEN** Telegram включён, а `BOOTSTRAP_OWNER_TELEGRAM_ID` не задан
+- **WHEN** Telegram включён, `BOOTSTRAP_OWNER_TELEGRAM_ID` не задан и учётки
+  администратора нет
 - **THEN** сервис стартует
 - **AND** лог содержит предупреждение о том, что первым владельцем станет первый
   написавший боту
+
+#### Scenario: Учётка администратора есть
+
+- **WHEN** Telegram включён, `BOOTSTRAP_OWNER_TELEGRAM_ID` не задан, а учётка
+  администратора создана
+- **THEN** предупреждение о первом написавшем не выводится
 
 ### Requirement: PostgreSQL
 
@@ -214,12 +245,13 @@ secrets.
 
 ### Requirement: Telegram webhook и TLS
 
-Система SHALL принимать webhook по HTTPS-адресу `PUBLIC_BASE_URL` и пути
-`/webhooks/telegram`. Запрос MUST проверять заголовок
+Система SHALL принимать webhook по HTTPS-адресу и пути `/webhooks/telegram`.
+Адрес webhook MUST браться из `TELEGRAM_WEBHOOK_URL` или из настройки консоли, а
+без них — из публичного адреса с этим путём. Запрос MUST проверять заголовок
 `X-Telegram-Bot-Api-Secret-Token` сравнением с секретом за постоянное время;
 несовпадение MUST возвращать `401` без деталей. Размер тела MUST быть ограничен
-1 МБ. Система MUST регистрировать webhook при старте, если задан
-`TELEGRAM_WEBHOOK_URL`, и MUST логировать результат без токена.
+1 МБ. Система MUST регистрировать webhook при старте и при сохранении настроек
+Telegram в консоли и MUST логировать результат без токена.
 
 #### Scenario: Регистрация webhook
 
@@ -232,6 +264,14 @@ secrets.
 - **WHEN** запрос приходит без корректного секрета
 - **THEN** сервис возвращает `401`
 - **AND** обновление не сохраняется
+
+#### Scenario: Регистрация из консоли
+
+- **WHEN** администратор сохраняет в консоли публичный адрес
+  `https://tasklerq.example.com` без переопределения адреса webhook
+- **THEN** `setWebhook` вызывается с адресом
+  `https://tasklerq.example.com/webhooks/telegram`
+- **AND** перезапуск процесса не нужен
 
 ### Requirement: Polling только вне production
 

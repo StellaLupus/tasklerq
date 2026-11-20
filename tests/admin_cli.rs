@@ -527,6 +527,90 @@ async fn household_create_without_owner_prints_the_add_user_hint() {
     );
 }
 
+/// Telegram ID пользователя всегда положителен: `admin user add` отклоняет
+/// `0` и отрицательный ID ошибкой валидации и ничего не записывает.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_add_rejects_a_non_positive_telegram_id() {
+    let db = cli_database().await;
+    let household = support::create_household(&db.pool).await;
+    let household_id = household.household_id.to_string();
+
+    for telegram_id in ["0", "-5"] {
+        let id_arg = format!("--telegram-id={telegram_id}");
+        let output = run(
+            &db.url,
+            &[
+                "admin",
+                "user",
+                "add",
+                "--household",
+                &household_id,
+                &id_arg,
+                "--role",
+                "member",
+            ],
+        )
+        .await;
+        assert!(
+            !output.status.success(),
+            "`{telegram_id}` is not a Telegram id: {output:?}"
+        );
+        let combined = format!("{}{}", stdout(&output), stderr(&output));
+        assert!(
+            combined.contains("422"),
+            "`{telegram_id}` is a validation error:\n{combined}"
+        );
+        assert!(
+            combined.contains("telegram id"),
+            "the refusal names the Telegram id:\n{combined}"
+        );
+
+        let created: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM users WHERE telegram_user_id = $1")
+                .bind(telegram_id.parse::<i64>().expect("id"))
+                .fetch_one(&db.pool)
+                .await
+                .expect("user count");
+        assert_eq!(created, 0, "`{telegram_id}` must not create a member");
+    }
+}
+
+/// Домен отклоняет владельца с неположительным Telegram ID до записи:
+/// household и участник не создаются, даже если CLI обошел бы проверку clap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_create_with_owner_rejects_a_non_positive_telegram_id_in_the_domain() {
+    let db = cli_database().await;
+
+    let refused = tasklerq::admin::create_household_with_owner(
+        &db.pool,
+        tasklerq::config::TenancyMode::Multi,
+        "Нулевой ID",
+        "Europe/Moscow",
+        0,
+        Some("Владелец"),
+        Utc::now(),
+    )
+    .await;
+    assert!(
+        matches!(
+            refused,
+            Err(tasklerq::domain::error::DomainError::Validation(_))
+        ),
+        "a non-positive owner id is a validation error: {refused:?}"
+    );
+
+    let households: i64 = sqlx::query_scalar("SELECT count(*) FROM households")
+        .fetch_one(&db.pool)
+        .await
+        .expect("households");
+    assert_eq!(households, 0, "the refused household is not created");
+    let users: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
+        .fetch_one(&db.pool)
+        .await
+        .expect("users");
+    assert_eq!(users, 0, "the refused owner is not created");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn household_delete_revokes_access_and_records_a_system_audit() {
     let db = cli_database().await;
@@ -1572,6 +1656,49 @@ async fn export_uses_the_only_household_when_not_specified() {
         export["household"]["id"],
         household.household_id.to_string(),
         "the single household is used without --household"
+    );
+}
+
+/// `admin export` пишет одно событие `household_exported` без содержимого.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn export_records_one_household_exported_audit_event_without_content() {
+    const TASK_TITLE: &str = "СЕКРЕТНАЯ ЗАДАЧА ЭКСПОРТА CLI";
+
+    let db = cli_database().await;
+    let household = support::create_household(&db.pool).await;
+    support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        support::new_item(household.tasks_list_id, TASK_TITLE),
+    )
+    .await;
+
+    let household_id = household.household_id.to_string();
+    let output = run(&db.url, &["admin", "export", "--household", &household_id]).await;
+    assert!(output.status.success(), "{output:?}");
+
+    let events: Vec<(String, Option<Uuid>, Value)> = sqlx::query_as(
+        "SELECT actor_type::text, household_id, payload
+         FROM audit_events
+         WHERE event_type::text = 'household_exported'
+         ORDER BY created_at, id",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("the export audit events");
+    assert_eq!(events.len(), 1, "one export event: {events:?}");
+    assert_eq!(events[0].0, "system", "the system actor writes the event");
+    assert_eq!(
+        events[0].1,
+        Some(household.household_id),
+        "the event names the exported household"
+    );
+    assert_eq!(
+        events[0].2,
+        serde_json::json!({}),
+        "the export event has an empty payload"
     );
 }
 
