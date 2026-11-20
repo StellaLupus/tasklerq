@@ -527,6 +527,90 @@ async fn household_create_without_owner_prints_the_add_user_hint() {
     );
 }
 
+/// Telegram ID пользователя всегда положителен: `admin user add` отклоняет
+/// `0` и отрицательный ID ошибкой валидации и ничего не записывает.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_add_rejects_a_non_positive_telegram_id() {
+    let db = cli_database().await;
+    let household = support::create_household(&db.pool).await;
+    let household_id = household.household_id.to_string();
+
+    for telegram_id in ["0", "-5"] {
+        let id_arg = format!("--telegram-id={telegram_id}");
+        let output = run(
+            &db.url,
+            &[
+                "admin",
+                "user",
+                "add",
+                "--household",
+                &household_id,
+                &id_arg,
+                "--role",
+                "member",
+            ],
+        )
+        .await;
+        assert!(
+            !output.status.success(),
+            "`{telegram_id}` is not a Telegram id: {output:?}"
+        );
+        let combined = format!("{}{}", stdout(&output), stderr(&output));
+        assert!(
+            combined.contains("422"),
+            "`{telegram_id}` is a validation error:\n{combined}"
+        );
+        assert!(
+            combined.contains("telegram id"),
+            "the refusal names the Telegram id:\n{combined}"
+        );
+
+        let created: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM users WHERE telegram_user_id = $1")
+                .bind(telegram_id.parse::<i64>().expect("id"))
+                .fetch_one(&db.pool)
+                .await
+                .expect("user count");
+        assert_eq!(created, 0, "`{telegram_id}` must not create a member");
+    }
+}
+
+/// Домен отклоняет владельца с неположительным Telegram ID до записи:
+/// household и участник не создаются, даже если CLI обошел бы проверку clap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_create_with_owner_rejects_a_non_positive_telegram_id_in_the_domain() {
+    let db = cli_database().await;
+
+    let refused = tasklerq::admin::create_household_with_owner(
+        &db.pool,
+        tasklerq::config::TenancyMode::Multi,
+        "Нулевой ID",
+        "Europe/Moscow",
+        0,
+        Some("Владелец"),
+        Utc::now(),
+    )
+    .await;
+    assert!(
+        matches!(
+            refused,
+            Err(tasklerq::domain::error::DomainError::Validation(_))
+        ),
+        "a non-positive owner id is a validation error: {refused:?}"
+    );
+
+    let households: i64 = sqlx::query_scalar("SELECT count(*) FROM households")
+        .fetch_one(&db.pool)
+        .await
+        .expect("households");
+    assert_eq!(households, 0, "the refused household is not created");
+    let users: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
+        .fetch_one(&db.pool)
+        .await
+        .expect("users");
+    assert_eq!(users, 0, "the refused owner is not created");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn household_delete_revokes_access_and_records_a_system_audit() {
     let db = cli_database().await;

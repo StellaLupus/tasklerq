@@ -24,6 +24,20 @@ use crate::telegram::queue;
 /// Имя участника, если администратор его не указал.
 pub const DEFAULT_MEMBER_NAME: &str = "Участник";
 
+/// Отказ домена: Telegram ID пользователя всегда положителен.
+///
+/// Тот же текст показывает форма консоли для пустого и нечислового ввода,
+/// чтобы отказ не зависел от того, где ID не разобрался.
+pub const INVALID_TELEGRAM_ID: &str = "telegram id must be a positive integer";
+
+/// Проверить Telegram ID до записи: `0` и отрицательные значения — ошибка ввода.
+fn require_positive_telegram_id(telegram_user_id: i64) -> Result<(), DomainError> {
+    if telegram_user_id <= 0 {
+        return Err(DomainError::Validation(INVALID_TELEGRAM_ID.into()));
+    }
+    Ok(())
+}
+
 /// Максимальный срок токена, дней: десять лет.
 pub const MAX_TOKEN_EXPIRY_DAYS: i64 = 3650;
 
@@ -194,6 +208,8 @@ pub async fn create_household_with_owner(
     display_name: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<(Household, User), DomainError> {
+    require_positive_telegram_id(telegram_user_id)?;
+
     let owner = households::NewOwner {
         member: NewMember {
             telegram_user_id,
@@ -267,6 +283,8 @@ pub async fn add_user(
     display_name: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<(Household, User), DomainError> {
+    require_positive_telegram_id(telegram_user_id)?;
+
     let mut tx = pool.begin().await?;
     let household = resolve_household(&mut tx, mode, household_id).await?;
 

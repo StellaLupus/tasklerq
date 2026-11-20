@@ -10398,7 +10398,8 @@ async fn households_member_form_refuses_a_telegram_id_from_another_household() {
     );
 }
 
-/// Пустой, нечисловой и неположительный Telegram ID — ошибка формы без записи.
+/// Пустой и нечисловой Telegram ID разбирает форма, неположительный отклоняет
+/// домен: в обоих случаях `422` и ни одной записи.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn households_member_form_rejects_invalid_telegram_ids() {
     let db = support::isolated_db().await;
@@ -10425,8 +10426,9 @@ async fn households_member_form_rejects_invalid_telegram_ids() {
             &[("telegram_id", telegram_id), ("role", "member")],
         )
         .await;
-        assert!(
-            status.is_client_error(),
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
             "`{telegram_id}` is a form error, not {status}"
         );
         let text = String::from_utf8_lossy(&body);

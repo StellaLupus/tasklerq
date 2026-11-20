@@ -59,8 +59,9 @@ use crate::storage::repositories::tokens::ApiToken;
 const DELETE_EMPTY_CONFIRMATION: &str = "Введите название household, чтобы подтвердить удаление.";
 /// Отказ при несовпадении названия.
 const DELETE_NAME_MISMATCH: &str = "Название не совпадает с названием household.";
-/// Отказ формы участника на пустой, нечисловой или неположительный Telegram ID.
-const INVALID_TELEGRAM_ID: &str = "telegram id must be a positive integer";
+/// Отказ формы участника на пустой или нечисловой Telegram ID; неположительный
+/// отклоняет домен тем же текстом.
+const INVALID_TELEGRAM_ID: &str = admin::INVALID_TELEGRAM_ID;
 /// Роль по умолчанию в форме участника.
 const DEFAULT_MEMBER_ROLE: &str = "member";
 /// Подсказка при попытке добавить второго владельца.
@@ -557,7 +558,7 @@ pub(crate) struct MemberForm {
 struct MemberSubmission {
     /// Роль нового участника.
     role: UserRole,
-    /// Положительный Telegram ID.
+    /// Telegram ID; положительность проверяет [`admin::add_user`].
     telegram_id: i64,
     /// Имя, если администратор его указал.
     name: Option<String>,
@@ -570,9 +571,6 @@ fn parse_member_submission(form: &MemberForm) -> Result<MemberSubmission, Domain
     let telegram_id: i64 = raw
         .parse()
         .map_err(|_| DomainError::Validation(INVALID_TELEGRAM_ID.into()))?;
-    if telegram_id <= 0 {
-        return Err(DomainError::Validation(INVALID_TELEGRAM_ID.into()));
-    }
     let role = match form.role.as_deref().unwrap_or(DEFAULT_MEMBER_ROLE) {
         "owner" => UserRole::Owner,
         DEFAULT_MEMBER_ROLE => UserRole::Member,
