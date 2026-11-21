@@ -122,6 +122,74 @@ async fn send_message_disables_the_link_preview_when_asked() {
 }
 
 #[tokio::test]
+async fn send_keyboard_message_posts_a_persistent_reply_keyboard() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/bot{TOKEN}/sendMessage")))
+        .and(body_json(json!({
+            "chat_id": 42,
+            "text": "<p>Меню всегда под рукой</p>",
+            "parse_mode": "HTML",
+            "reply_markup": {
+                "keyboard": [[{"text": "🏠 Меню"}]],
+                "is_persistent": true,
+                "resize_keyboard": true
+            }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true, "result": {"message_id": 9}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let id = client(&server)
+        .send_keyboard_message(
+            42,
+            "<p>Меню всегда под рукой</p>",
+            &[vec!["🏠 Меню".to_owned()]],
+        )
+        .await
+        .expect("sent");
+
+    assert_eq!(id, 9);
+}
+
+#[tokio::test]
+async fn send_keyboard_message_preserves_the_row_layout() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/bot{TOKEN}/sendMessage")))
+        .and(body_json(json!({
+            "chat_id": 42,
+            "text": "раскладка",
+            "parse_mode": "HTML",
+            "reply_markup": {
+                "keyboard": [[{"text": "A"}, {"text": "B"}], [{"text": "C"}]],
+                "is_persistent": true,
+                "resize_keyboard": true
+            }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true, "result": {"message_id": 10}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let id = client(&server)
+        .send_keyboard_message(
+            42,
+            "раскладка",
+            &[vec!["A".to_owned(), "B".to_owned()], vec!["C".to_owned()]],
+        )
+        .await
+        .expect("sent");
+
+    assert_eq!(id, 10);
+}
+
+#[tokio::test]
 async fn answer_callback_and_delete_send_expected_payloads() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

@@ -40,6 +40,12 @@ pub enum Call {
         html: String,
         disable_preview: bool,
     },
+    SendKeyboard {
+        chat: i64,
+        id: i64,
+        html: String,
+        rows: Vec<Vec<String>>,
+    },
     EditText {
         chat: i64,
         id: i64,
@@ -196,6 +202,28 @@ impl TelegramApi for FakeTelegram {
             id,
             html: html.to_owned(),
             disable_preview,
+        });
+        Ok(id)
+    }
+
+    async fn send_keyboard_message(
+        &self,
+        chat_id: i64,
+        html: &str,
+        rows: &[Vec<String>],
+    ) -> Result<i64, TelegramError> {
+        let mut state = self.state.lock().expect("lock");
+        if let Some(error) = Self::take_failure(&mut state) {
+            return Err(error);
+        }
+        state.next_id += 1;
+        let id = state.next_id;
+        state.messages.insert((chat_id, id), html.to_owned());
+        state.calls.push(Call::SendKeyboard {
+            chat: chat_id,
+            id,
+            html: html.to_owned(),
+            rows: rows.to_vec(),
         });
         Ok(id)
     }

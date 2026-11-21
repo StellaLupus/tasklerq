@@ -20,7 +20,7 @@
   `telegram_views.keyboard_message_id` и значение `keyboard` в `outbox_kind`, с
   шапкой-комментарием в стиле прежних миграций. Проверить: `tests/migrations.rs`
   проходит, колонка и значение enum есть после миграции (design, решение 2).
-- [ ] 2.2 `TelegramApi::send_keyboard_message(chat_id, html, rows)` в
+- [x] 2.2 `TelegramApi::send_keyboard_message(chat_id, html, rows)` в
   `src/telegram/api.rs` и в фейке: `sendMessage` с раскладкой `rows` в
   `reply_markup.keyboard` (здесь `[[{text: "🏠 Меню"}]]`),
   `is_persistent: true`, `resize_keyboard: true`. Проверить тестом в
