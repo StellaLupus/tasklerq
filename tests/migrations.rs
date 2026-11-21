@@ -2132,3 +2132,99 @@ async fn admin_telegram_migration_keeps_existing_admin_rows() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// 0024: колонка носителя клавиатуры и вид outbox `keyboard`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn telegram_keyboard_migration_adds_column_and_kind() {
+    let db = support::empty_db().await;
+    migrations::run(&db.pool)
+        .await
+        .expect("migrations should apply on a clean database");
+
+    let views = table_shape(&db.pool, "telegram_views").await;
+    let views: Vec<(&str, &str, &str)> = views
+        .iter()
+        .map(|(name, data_type, nullable)| (name.as_str(), data_type.as_str(), nullable.as_str()))
+        .collect();
+    assert_eq!(
+        views,
+        vec![
+            ("chat_id", "bigint", "NO"),
+            ("message_id", "bigint", "YES"),
+            ("view_key", "text", "NO"),
+            ("state", "jsonb", "NO"),
+            ("updated_at", "timestamp with time zone", "NO"),
+            ("buried", "boolean", "NO"),
+            ("keyboard_message_id", "bigint", "YES"),
+        ],
+        "telegram_views must keep the old columns and carry the nullable \
+         keyboard carrier id without a default"
+    );
+
+    let values: Vec<String> = sqlx::query_scalar(
+        "SELECT e.enumlabel
+         FROM pg_enum e
+         JOIN pg_type t ON t.oid = e.enumtypid
+         WHERE t.typname = 'outbox_kind'
+         ORDER BY e.enumsortorder",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("outbox_kind values");
+    assert_eq!(
+        values,
+        vec!["screen", "message", "edit", "delete", "keyboard"],
+        "outbox_kind must keep the old kinds and gain keyboard"
+    );
+}
+
+/// 0024 применяется поверх базы с данными до 0023: вид чата сохраняется,
+/// носителя клавиатуры у него ещё нет.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn telegram_keyboard_migration_applies_over_existing_rows() {
+    let db = support::empty_db().await;
+    let dir = std::env::temp_dir().join(format!(
+        "tasklerq-migrations-0023-{}",
+        Uuid::now_v7().simple()
+    ));
+    std::fs::create_dir_all(&dir).expect("temporary migration directory");
+    copy_migrations_through(23, &dir);
+
+    let before = Migrator::new(dir.as_path())
+        .await
+        .expect("a migrator through 0023 should resolve");
+    before
+        .run(&db.pool)
+        .await
+        .context("migrations through 0023 should apply")
+        .expect("migrations through 0023");
+
+    sqlx::query(
+        "INSERT INTO telegram_views (chat_id, message_id, view_key, state)
+         VALUES (201, 9, 'menu', $1)",
+    )
+    .bind(json!({"tab": "tasks"}))
+    .execute(&db.pool)
+    .await
+    .expect("existing view before 0024");
+
+    MIGRATOR
+        .run(&db.pool)
+        .await
+        .expect("0024 must apply over existing data");
+
+    let view: (i64, Option<i64>, String, Option<i64>, bool) = sqlx::query_as(
+        "SELECT chat_id, message_id, view_key, keyboard_message_id, buried
+         FROM telegram_views",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("the view after 0024");
+    assert_eq!(
+        view,
+        (201, Some(9), "menu".to_owned(), None, false),
+        "the existing view stays and has no keyboard carrier yet"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

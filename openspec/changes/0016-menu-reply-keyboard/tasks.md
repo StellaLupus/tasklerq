@@ -16,7 +16,7 @@
 
 ## 2. Отправка и хранение носителя
 
-- [ ] 2.1 Миграция `0024_telegram_keyboard.sql`: nullable-колонка
+- [x] 2.1 Миграция `0024_telegram_keyboard.sql`: nullable-колонка
   `telegram_views.keyboard_message_id` и значение `keyboard` в `outbox_kind`, с
   шапкой-комментарием в стиле прежних миграций. Проверить: `tests/migrations.rs`
   проходит, колонка и значение enum есть после миграции (design, решение 2).
