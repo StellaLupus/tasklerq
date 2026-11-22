@@ -281,8 +281,8 @@ async fn text_is_queued_and_the_card_replaces_the_waiting_screen() {
     stand.bot.assert_has_button("Изменить 1");
     stand.bot.assert_has_button("Удалить 2");
     stand.bot.assert_has_button("Отмена");
-    // Ожидание заменено карточкой в том же сообщении.
-    assert_eq!(stand.bot.fake.messages(stand.bot.chat).len(), 1);
+    // Ожидание заменено карточкой в том же сообщении; в чате ещё носитель.
+    assert_eq!(stand.bot.fake.messages(stand.bot.chat).len(), 2);
     assert_eq!(
         stand.household_items().await,
         0,

@@ -2235,7 +2235,8 @@ async fn stale_replayed_foreign_and_expired_buttons_are_handled() {
             .iter()
             .any(|(_, text, _)| text.as_deref() == Some("Это действие уже выполнено."))
     );
-    assert_eq!(bot.fake.messages(bot.chat).len(), 1);
+    // В чате носитель клавиатуры и активный экран.
+    assert_eq!(bot.fake.messages(bot.chat).len(), 2);
 
     // Чужой токен: отказ без выполнения.
     let foreign = support::telegram::buttons(&bot.screen())[0].1.clone();
@@ -2254,8 +2255,8 @@ async fn stale_replayed_foreign_and_expired_buttons_are_handled() {
     assert_ne!(old_id, new_id);
     assert_eq!(
         bot.fake.messages(bot.chat).len(),
-        1,
-        "old message must be deleted"
+        2,
+        "old message must be deleted; the carrier stays"
     );
     bot.fake.clear_calls();
     bot.press_data(&old_buttons[0].1, old_id).await;

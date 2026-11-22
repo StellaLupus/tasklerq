@@ -9,19 +9,23 @@ use chrono_tz::Tz;
 use serde_json::json;
 use support::telegram::{Call, FakeTelegram, Harness, buttons};
 use support::{
-    TestHousehold, create_item, db, isolated_db, new_item, next_telegram_id, recurrence,
+    TestHousehold, create_household, create_item, db, isolated_db, new_item, next_telegram_id,
+    recurrence,
 };
+use tasklerq::config::{TenancyConfig, TenancyMode};
 use tasklerq::domain::models::{
-    Actor, ActorType, Field, ItemPatch, ListKind, RecurrenceFreq, UserRole,
+    Actor, ActorType, Field, Household, ItemPatch, ListKind, RecurrenceFreq, User, UserRole,
 };
-use tasklerq::storage::repositories::{items, users};
+use tasklerq::rate_limit::RateLimiter;
+use tasklerq::storage::repositories::{households, items, users};
 use tasklerq::telegram::api::TelegramError;
-use tasklerq::telegram::bot::model::{Action, FormAct, Screen, Ui};
-use tasklerq::telegram::bot::{Bot, issue_and_render};
+use tasklerq::telegram::bot::model::{Action, FirstContactScreen, FormAct, Screen, Ui};
+use tasklerq::telegram::bot::{Bot, Ctx, display_timezone, issue_and_render};
 use tasklerq::telegram::callbacks::{self, NewToken, Scope};
-use tasklerq::telegram::outbox::{self, Outgoing};
+use tasklerq::telegram::outbox::{self, Outgoing, Placement};
 use tasklerq::telegram::rich::{button, escape};
 use tasklerq::telegram::ru;
+use tasklerq::telegram::update::Sender;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn onboarding_creates_household_once() {
@@ -286,7 +290,8 @@ async fn navigation_edits_the_single_active_message() {
 
     // Ни одного нового сообщения: только правки активного.
     assert!(bot.fake.sent().is_empty(), "{:?}", bot.fake.sent());
-    assert_eq!(bot.fake.messages(bot.chat).len(), 1);
+    // В чате носитель клавиатуры и активный экран.
+    assert_eq!(bot.fake.messages(bot.chat).len(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2683,7 +2688,8 @@ async fn button_on_buried_screen_edits_it_in_place() {
         "the anchor must be edited in place: {calls:?}"
     );
     assert_eq!(bot.active().0, anchor);
-    assert_eq!(bot.fake.messages(bot.chat).len(), 2);
+    // В чате носитель клавиатуры, якорь и уведомление.
+    assert_eq!(bot.fake.messages(bot.chat).len(), 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2916,6 +2922,377 @@ async fn menu_without_a_household_shows_onboarding_without_the_carrier() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_sends_the_keyboard_carrier_before_the_menu() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let (anchor, _) = bot.active();
+    bot.fake.clear_calls();
+
+    let (message_id, rows) = send_text(&mut bot, "/start").await;
+
+    // В outbox носитель стоит после удаления входящего и раньше экрана меню.
+    let deleted = delete_seq(&rows, message_id);
+    let carrier = rows
+        .iter()
+        .find(|(_, kind, _)| kind == "keyboard")
+        .unwrap_or_else(|| panic!("no keyboard row after /start: {rows:?}"))
+        .0;
+    let screen = rows
+        .iter()
+        .find(|(_, kind, _)| kind == "screen")
+        .unwrap_or_else(|| panic!("no screen row after /start: {rows:?}"))
+        .0;
+    assert!(
+        deleted < carrier && carrier < screen,
+        "the carrier must be queued before the menu: {rows:?}"
+    );
+
+    // Носитель доставлен с текстом спеки и раскладкой из одной кнопки меню.
+    let calls = bot.fake.calls();
+    let keyboards: Vec<_> = calls
+        .iter()
+        .filter_map(|call| match call {
+            Call::SendKeyboard { html, rows, .. } => Some((html, rows)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(keyboards.len(), 1, "exactly one carrier: {calls:?}");
+    assert_eq!(keyboards[0].0, &escape(ru::KEYBOARD_CARRIER_TEXT));
+    assert_eq!(keyboards[0].1, &vec![vec![ru::MENU_BUTTON.to_owned()]]);
+
+    // Вызовы фейка: сначала носитель, затем меню.
+    let carrier_at = calls
+        .iter()
+        .position(|call| matches!(call, Call::SendKeyboard { .. }))
+        .expect("SendKeyboard");
+    let menu_at = calls
+        .iter()
+        .position(|call| matches!(call, Call::SendRich { .. }))
+        .expect("SendRich");
+    assert!(
+        carrier_at < menu_at,
+        "the carrier must be sent before the menu: {calls:?}"
+    );
+
+    // В чате меню приходит новым сообщением ниже носителя; якорь удалён.
+    let (carrier_id, _) = bot
+        .fake
+        .messages(bot.chat)
+        .into_iter()
+        .find(|(_, html)| html == &escape(ru::KEYBOARD_CARRIER_TEXT))
+        .expect("the carrier must stay in the chat");
+    let (menu_id, _) = bot.active();
+    assert!(
+        menu_id > carrier_id,
+        "the menu must arrive below the carrier"
+    );
+    assert!(is_alive(&bot, carrier_id));
+    assert!(!is_alive(&bot, anchor));
+    bot.assert_screen_contains("📋 Задачи · 0");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_without_a_household_shows_onboarding_without_the_carrier() {
+    let db = db().await;
+    let mut bot = Harness::new(&db.pool, next_telegram_id());
+    bot.fake.clear_calls();
+
+    let (_, rows) = send_text(&mut bot, "/start").await;
+
+    assert!(
+        !rows.iter().any(|(_, kind, _)| kind == "keyboard"),
+        "onboarding must not get a carrier: {rows:?}"
+    );
+    assert!(
+        !bot.fake
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::SendKeyboard { .. })),
+        "no SendKeyboard without a household"
+    );
+    bot.assert_screen_contains("Как назовём ваше пространство");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_creation_by_zone_text_sends_the_carrier_before_a_fresh_welcome() {
+    let db = db().await;
+    let mut bot = Harness::new(&db.pool, next_telegram_id());
+    bot.text("/start").await;
+    bot.text("Семья Ивановых").await;
+    assert!(
+        !bot.fake
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::SendKeyboard { .. })),
+        "onboarding screens must not get a carrier: {:?}",
+        bot.fake.calls()
+    );
+    let (form_anchor, _) = bot.active();
+    bot.fake.clear_calls();
+
+    let (_, rows) = send_text(&mut bot, "Europe/Moscow").await;
+
+    // В outbox носитель стоит раньше приветствия.
+    let carrier = rows
+        .iter()
+        .find(|(_, kind, _)| kind == "keyboard")
+        .unwrap_or_else(|| panic!("no keyboard row after household creation: {rows:?}"))
+        .0;
+    let screen = rows
+        .iter()
+        .find(|(_, kind, _)| kind == "screen")
+        .unwrap_or_else(|| panic!("no screen row after household creation: {rows:?}"))
+        .0;
+    assert!(
+        carrier < screen,
+        "the carrier must be queued before the welcome: {rows:?}"
+    );
+
+    let calls = bot.fake.calls();
+    let keyboards: Vec<_> = calls
+        .iter()
+        .filter_map(|call| match call {
+            Call::SendKeyboard { html, rows, .. } => Some((html, rows)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(keyboards.len(), 1, "exactly one carrier: {calls:?}");
+    assert_eq!(keyboards[0].0, &escape(ru::KEYBOARD_CARRIER_TEXT));
+    assert_eq!(keyboards[0].1, &vec![vec![ru::MENU_BUTTON.to_owned()]]);
+
+    // Приветствие — новое сообщение после носителя, не правка якоря формы.
+    let carrier_at = calls
+        .iter()
+        .position(|call| matches!(call, Call::SendKeyboard { .. }))
+        .expect("SendKeyboard");
+    let welcome_at = calls
+        .iter()
+        .position(|call| {
+            matches!(call, Call::SendRich { html, .. } if html.contains("Пространство создано"))
+        })
+        .unwrap_or_else(|| panic!("the welcome must be sent as a new message: {calls:?}"));
+    assert!(
+        carrier_at < welcome_at,
+        "the carrier must be sent before the welcome: {calls:?}"
+    );
+    assert!(
+        !calls.iter().any(|call| matches!(
+            call,
+            Call::EditRich { id, .. } | Call::EditText { id, .. } if *id == form_anchor
+        )),
+        "the welcome must not edit the form anchor: {calls:?}"
+    );
+    let (carrier_id, _) = bot
+        .fake
+        .messages(bot.chat)
+        .into_iter()
+        .find(|(_, html)| html == &escape(ru::KEYBOARD_CARRIER_TEXT))
+        .expect("the carrier must stay in the chat");
+    let (welcome_id, _) = bot.active();
+    assert_ne!(
+        welcome_id, form_anchor,
+        "the welcome must not reuse the anchor"
+    );
+    assert!(
+        welcome_id > carrier_id,
+        "the welcome must arrive below the carrier"
+    );
+    assert!(is_alive(&bot, carrier_id));
+    bot.assert_screen_contains("Пространство создано");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn household_creation_by_zone_button_sends_the_carrier_once_before_a_fresh_welcome() {
+    let db = db().await;
+    let mut bot = Harness::new(&db.pool, next_telegram_id());
+    bot.text("/start").await;
+    bot.text("Семья Ивановых").await;
+    assert!(
+        !bot.fake
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::SendKeyboard { .. })),
+        "onboarding screens must not get a carrier: {:?}",
+        bot.fake.calls()
+    );
+    let (form_anchor, _) = bot.active();
+    bot.fake.clear_calls();
+
+    // Кнопка часового пояса — callback на якоре с `InPlace`: приветствие всё
+    // равно должно прийти новым сообщением ниже носителя.
+    bot.press("Москва").await;
+
+    let calls = bot.fake.calls();
+    let keyboards: Vec<_> = calls
+        .iter()
+        .filter_map(|call| match call {
+            Call::SendKeyboard { html, rows, .. } => Some((html, rows)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        keyboards.len(),
+        1,
+        "the carrier must arrive once: {calls:?}"
+    );
+    assert_eq!(keyboards[0].0, &escape(ru::KEYBOARD_CARRIER_TEXT));
+    assert_eq!(keyboards[0].1, &vec![vec![ru::MENU_BUTTON.to_owned()]]);
+    assert!(
+        !calls.iter().any(|call| matches!(
+            call,
+            Call::EditRich { id, .. } | Call::EditText { id, .. } if *id == form_anchor
+        )),
+        "the welcome must not edit the form anchor: {calls:?}"
+    );
+    let carrier_at = calls
+        .iter()
+        .position(|call| matches!(call, Call::SendKeyboard { .. }))
+        .expect("SendKeyboard");
+    let welcome_at = calls
+        .iter()
+        .position(|call| {
+            matches!(call, Call::SendRich { html, .. } if html.contains("Пространство создано"))
+        })
+        .unwrap_or_else(|| panic!("the welcome must be sent as a new message: {calls:?}"));
+    assert!(
+        carrier_at < welcome_at,
+        "the carrier must be sent before the welcome: {calls:?}"
+    );
+    let (carrier_id, _) = bot
+        .fake
+        .messages(bot.chat)
+        .into_iter()
+        .find(|(_, html)| html == &escape(ru::KEYBOARD_CARRIER_TEXT))
+        .expect("the carrier must stay in the chat");
+    let (welcome_id, _) = bot.active();
+    assert_ne!(
+        welcome_id, form_anchor,
+        "the welcome must not reuse the anchor"
+    );
+    assert!(
+        welcome_id > carrier_id,
+        "the welcome must arrive below the carrier"
+    );
+    assert!(is_alive(&bot, carrier_id));
+    assert!(
+        !is_alive(&bot, form_anchor),
+        "the form anchor must be deleted"
+    );
+    bot.assert_screen_contains("Пространство создано");
+}
+
+/// Контекст для прямых проверок контракта [`Ctx::present`]: флаг носителя
+/// выставлен, размещение — по умолчанию.
+fn present_ctx<'a>(
+    conn: &'a mut sqlx::PgConnection,
+    chat: i64,
+    user: Option<User>,
+    household: Option<Household>,
+) -> Ctx<'a> {
+    let sender = match &user {
+        Some(user) => Sender {
+            id: user.telegram_user_id,
+            display_name: user.display_name.clone(),
+            username: user.username.clone(),
+        },
+        None => Sender {
+            id: chat,
+            display_name: "Ann".into(),
+            username: None,
+        },
+    };
+    let tz = display_timezone(user.as_ref(), household.as_ref());
+    Ctx {
+        conn,
+        now: Utc::now(),
+        bot_username: "tasklerqbot",
+        chat_id: chat,
+        sender,
+        user,
+        household,
+        tz,
+        toast: None,
+        banner: None,
+        placement: Placement::Visible,
+        carrier_pending: true,
+        llm_capture: false,
+        tenancy: TenancyConfig {
+            mode: TenancyMode::Multi,
+            bootstrap_owner: None,
+        },
+        audit: None,
+        recovery_limit: Arc::new(RateLimiter::new(3)),
+    }
+}
+
+/// Контракт `present`: без участника носитель не ставится и флаг не тратится.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn present_keeps_the_carrier_flag_without_a_member() {
+    let db = db().await;
+    let chat = next_telegram_id();
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let mut ctx = present_ctx(&mut conn, chat, None, None);
+
+    ctx.present(Screen::FirstContact(FirstContactScreen::AskInvite))
+        .await
+        .expect("first contact screen");
+
+    assert!(
+        ctx.carrier_pending,
+        "an onboarding screen must not spend the flag"
+    );
+    assert_eq!(
+        ctx.placement,
+        Placement::Visible,
+        "the placement must stay untouched"
+    );
+    let keyboards: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM outbox WHERE chat_id = $1 AND kind = 'keyboard'")
+            .bind(chat)
+            .fetch_one(&db.pool)
+            .await
+            .expect("keyboard rows");
+    assert_eq!(keyboards, 0, "no carrier without a member");
+}
+
+/// Контракт `present`: экраны кроме `Menu`/`Welcome` не тратят флаг.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn present_keeps_the_carrier_flag_on_other_screens() {
+    let db = db().await;
+    let home = create_household(&db.pool).await;
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let user = users::get(&mut conn, home.household_id, home.owner_id)
+        .await
+        .expect("user");
+    let household = households::get(&mut conn, home.household_id)
+        .await
+        .expect("household");
+    let chat = next_telegram_id();
+    let mut ctx = present_ctx(&mut conn, chat, Some(user), Some(household));
+
+    ctx.present(Screen::Settings)
+        .await
+        .expect("settings screen");
+
+    assert!(
+        ctx.carrier_pending,
+        "only Menu and Welcome spend the carrier flag"
+    );
+    assert_eq!(
+        ctx.placement,
+        Placement::Visible,
+        "the placement must stay untouched"
+    );
+    let keyboards: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM outbox WHERE chat_id = $1 AND kind = 'keyboard'")
+            .bind(chat)
+            .fetch_one(&db.pool)
+            .await
+            .expect("keyboard rows");
+    assert_eq!(keyboards, 0, "the carrier belongs to Menu and Welcome only");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn start_sends_a_new_screen_when_edit_would_succeed() {
     let db = db().await;
     let mut bot = onboarded(&db.pool).await;
@@ -3014,7 +3391,8 @@ async fn text_on_visible_screen_edits_it_in_place() {
         "text on the visible screen must edit it: {calls:?}"
     );
     assert_eq!(bot.active().0, anchor);
-    assert_eq!(bot.fake.messages(bot.chat).len(), 1);
+    // В чате носитель клавиатуры и активный экран.
+    assert_eq!(bot.fake.messages(bot.chat).len(), 2);
     bot.assert_screen_contains("Название: купить молоко");
 }
 
@@ -3245,7 +3623,8 @@ async fn back_from_card_returns_to_the_same_list_page_in_the_same_message() {
         "the same screen message must be edited"
     );
     assert!(bot.fake.sent().is_empty(), "{:?}", bot.fake.sent());
-    assert_eq!(bot.fake.messages(bot.chat).len(), 1);
+    // В чате носитель клавиатуры и активный экран.
+    assert_eq!(bot.fake.messages(bot.chat).len(), 2);
 }
 
 // 0009-events 8.4: свободный текст на повестке уходит в общий разбор.

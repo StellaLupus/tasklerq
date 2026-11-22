@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use sqlx::PgPool;
-use support::telegram::{FakeTelegram, Harness};
+use support::telegram::{Call, FakeTelegram, Harness};
 use support::{create_household, isolated_db, next_telegram_id};
 use tasklerq::admin_console::codes::{self, Purpose};
 use tasklerq::config::{TenancyConfig, TenancyMode};
@@ -17,6 +17,8 @@ use tasklerq::security_audit::Audit;
 use tasklerq::storage::repositories::households::{self, Creator, NewOwner};
 use tasklerq::storage::repositories::invites;
 use tasklerq::telegram::bot::Bot;
+use tasklerq::telegram::rich::escape;
+use tasklerq::telegram::ru;
 use uuid::Uuid;
 
 async fn installation(pool: &PgPool) -> Installation {
@@ -1151,4 +1153,165 @@ async fn a_member_opening_a_claim_link_does_not_consume_it() {
             .await
             .expect("member");
     assert_eq!(household_id, member_household.household_id);
+}
+
+/// Носитель клавиатуры доставлен ровно один раз, с текстом и раскладкой спеки,
+/// и стоит перед первым экраном участника (последним новым rich-сообщением).
+fn assert_carrier_before_the_member_screen(bot: &Harness) {
+    let calls = bot.fake.calls();
+    let keyboards: Vec<_> = calls
+        .iter()
+        .filter_map(|call| match call {
+            Call::SendKeyboard { html, rows, .. } => Some((html, rows)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(keyboards.len(), 1, "exactly one carrier: {calls:?}");
+    assert_eq!(keyboards[0].0, &escape(ru::KEYBOARD_CARRIER_TEXT));
+    assert_eq!(keyboards[0].1, &vec![vec![ru::MENU_BUTTON.to_owned()]]);
+
+    let carrier_at = calls
+        .iter()
+        .position(|call| matches!(call, Call::SendKeyboard { .. }))
+        .expect("SendKeyboard");
+    let screen_at = calls
+        .iter()
+        .rposition(|call| matches!(call, Call::SendRich { .. }))
+        .expect("SendRich");
+    assert!(
+        carrier_at < screen_at,
+        "the carrier must be sent before the member screen: {calls:?}"
+    );
+
+    let (carrier_id, _) = bot
+        .fake
+        .messages(bot.chat)
+        .into_iter()
+        .find(|(_, html)| html == &escape(ru::KEYBOARD_CARRIER_TEXT))
+        .expect("the carrier must stay in the chat");
+    let (screen_id, _) = bot.active();
+    assert!(
+        screen_id > carrier_id,
+        "the member screen must arrive below the carrier"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invite_join_sends_the_carrier_before_the_menu() {
+    let db = isolated_db().await;
+    let household = create_household(&db.pool).await;
+    let code = create_invite(&db.pool, household.household_id, household.owner_id).await;
+    let sender = next_telegram_id();
+    let mut bot = single_harness(&db.pool, sender, None);
+
+    bot.text(&format!("/start {code}")).await;
+
+    bot.assert_screen_contains("Добро пожаловать в");
+    bot.assert_screen_contains("Добавить");
+    assert_carrier_before_the_member_screen(&bot);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_claim_sends_the_carrier_before_the_menu() {
+    let db = isolated_db().await;
+    let household = create_household(&db.pool).await;
+    soft_delete_owner(&db.pool, household.owner_id).await;
+    let (code, _) = issue_claim(&db.pool, Some(household.household_id)).await;
+    let sender = next_telegram_id();
+    let mut bot = single_harness(&db.pool, sender, None);
+
+    bot.text(&format!("/start own_{code}")).await;
+
+    bot.assert_screen_contains("Вы стали владельцем");
+    bot.assert_screen_contains("Добавить");
+    assert_carrier_before_the_member_screen(&bot);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn member_claim_sends_the_carrier_before_the_menu() {
+    let db = isolated_db().await;
+    let household = create_household(&db.pool).await;
+    let telegram_id = member_telegram_id(&db.pool, household.member_id).await;
+    soft_delete_owner(&db.pool, household.owner_id).await;
+    let (code, _) = issue_claim(&db.pool, Some(household.household_id)).await;
+    let mut bot = multi_harness(&db.pool, telegram_id);
+
+    bot.text(&format!("/start own_{code}")).await;
+
+    bot.assert_screen_contains("Вы стали владельцем");
+    bot.assert_screen_contains("Добавить");
+    assert_carrier_before_the_member_screen(&bot);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_installation_claim_sends_the_carrier_before_the_welcome() {
+    let db = isolated_db().await;
+    let foreign = next_telegram_id();
+    let (code, _) = issue_claim(&db.pool, None).await;
+    let sender = next_telegram_id();
+    let mut bot = single_harness(&db.pool, sender, Some(foreign));
+
+    bot.text(&format!("/start own_{code}")).await;
+    bot.assert_screen_contains("Как назовём ваше пространство");
+    assert!(
+        !bot.fake
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::SendKeyboard { .. })),
+        "onboarding must not get a carrier: {:?}",
+        bot.fake.calls()
+    );
+
+    bot.text("Семья").await;
+    bot.press("Москва").await;
+
+    bot.assert_screen_contains("Пространство создано");
+    assert_carrier_before_the_member_screen(&bot);
+}
+
+/// Claim ожидаемого владельца срабатывает и вне `/start`: первый контакт из
+/// обычного текста тоже завершает онбординг и получает носитель.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_owner_claim_without_start_sends_the_carrier() {
+    let db = isolated_db().await;
+    let household = create_household(&db.pool).await;
+    soft_delete_owner(&db.pool, household.owner_id).await;
+    let sender = next_telegram_id();
+    let mut bot = single_harness(&db.pool, sender, Some(sender));
+
+    bot.text("привет").await;
+
+    bot.assert_screen_contains("Вы стали владельцем");
+    bot.assert_screen_contains("Добавить");
+    assert_carrier_before_the_member_screen(&bot);
+}
+
+/// Отправитель стал участником, пока форма онбординга была открыта: выбор
+/// часового пояса кнопкой показывает меню с носителем (флаг `/start` пережил
+/// экраны онбординга).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zone_button_after_the_sender_became_a_member_sends_the_carrier() {
+    let db = isolated_db().await;
+    let sender = next_telegram_id();
+    let mut bot = single_harness(&db.pool, sender, None);
+
+    bot.text("/start").await;
+    bot.text("Семья").await;
+
+    tasklerq::admin::create_household_with_owner(
+        &db.pool,
+        TenancyMode::Single,
+        "Семья",
+        "Europe/Moscow",
+        sender,
+        Some("Alice"),
+        Utc::now(),
+    )
+    .await
+    .expect("household with owner");
+
+    bot.press("Москва").await;
+
+    bot.assert_screen_contains("Добавить");
+    assert_carrier_before_the_member_screen(&bot);
 }

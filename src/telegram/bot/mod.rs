@@ -944,6 +944,9 @@ async fn on_command(ctx: &mut Ctx<'_>, command: &str, argument: &str) -> Result<
             // `/start` (включая онбординг и `/start <code>`) возвращает окно
             // даже если якорь удалён у пользователя.
             ctx.placement = Placement::Fresh;
+            // Носитель встаёт перед первым экраном участника; экраны
+            // онбординга флаг не тратят (см. `Ctx::present`).
+            ctx.carrier_pending = true;
             onboarding::on_start(ctx, argument).await
         }
         "menu" => open_menu(ctx, true).await,
