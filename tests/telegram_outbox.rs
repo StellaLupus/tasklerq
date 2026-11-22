@@ -211,8 +211,29 @@ impl Rig {
         outbox::enqueue(
             &mut conn,
             self.chat,
-            &Outgoing::Delete { message_id },
+            &Outgoing::Delete {
+                message_id,
+                cleanup: false,
+            },
             key,
+            self.now,
+        )
+        .await
+        .expect("enqueue")
+        .expect("seq")
+    }
+
+    /// Уборка сообщения бота (0017): отказ удаления не засыпает вид чата.
+    async fn delete_cleanup(&self, message_id: i64) -> i64 {
+        let mut conn = self.pool.acquire().await.expect("conn");
+        outbox::enqueue(
+            &mut conn,
+            self.chat,
+            &Outgoing::Delete {
+                message_id,
+                cleanup: true,
+            },
+            None,
             self.now,
         )
         .await
@@ -1050,6 +1071,116 @@ async fn delete_exhausted_by_retries_is_dead_and_buries_the_view() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undeletable_cleanup_delete_is_skipped_without_burying_the_view() {
+    let _dead = DEAD_METRIC.lock().await;
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    rig.put_view().await;
+    rig.fake
+        .reject_deletes(Some(TelegramError::MessageUndeletable));
+    let before = counter(&tasklerq::metrics::render(), "outbox_dead_total");
+    let seq = rig.delete_cleanup(63).await;
+
+    assert_eq!(rig.pass().await, 0);
+
+    assert_eq!(
+        rig.row(seq).await,
+        (
+            "skipped".into(),
+            0,
+            Some("message_undeletable".into()),
+            None
+        )
+    );
+    assert!(
+        !rig.buried().await,
+        "a cleanup delete removes a bot message, not a user message below the anchor"
+    );
+    let after = counter(&tasklerq::metrics::render(), "outbox_dead_total");
+    assert_eq!(
+        after, before,
+        "an undeletable cleanup delete is skipped, not a dead-letter"
+    );
+    assert_eq!(
+        rig.payload_text(seq).await,
+        r#"{"redacted": true}"#,
+        "the skipped delete payload must be redacted"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn permanently_failed_cleanup_delete_is_dead_without_burying_the_view() {
+    let _dead = DEAD_METRIC.lock().await;
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    rig.put_view().await;
+    rig.fake
+        .reject_deletes(Some(TelegramError::BadRequest("bad".into())));
+    let seq = rig.delete_cleanup(64).await;
+
+    assert_eq!(rig.pass().await, 0);
+
+    assert_eq!(
+        rig.row(seq).await,
+        ("dead".into(), 0, Some("bad_request".into()), None)
+    );
+    assert!(
+        !rig.buried().await,
+        "a dead cleanup delete must not bury the view"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cleanup_delete_exhausted_by_retries_is_dead_without_burying_the_view() {
+    let _dead = DEAD_METRIC.lock().await;
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    rig.put_view().await;
+    rig.fake
+        .reject_deletes(Some(TelegramError::Transient("503".into())));
+    let seq = rig.delete_cleanup(65).await;
+
+    for _ in 0..MAX_ATTEMPTS {
+        rig.pass_after(StdDuration::from_secs(400)).await;
+    }
+
+    assert_eq!(rig.row(seq).await.0, "dead");
+    assert!(
+        !rig.buried().await,
+        "a cleanup delete that exhausted its retries must not bury the view"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_delete_row_without_cleanup_is_delivered_as_regular_delete() {
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    // Старая строка, вставленная SQL-ом без поля `cleanup`.
+    let seq: i64 = sqlx::query_scalar(
+        "INSERT INTO outbox (chat_id, kind, payload, next_attempt_at, created_at)
+         VALUES ($1, 'delete', $2, $3, $3)
+         RETURNING seq",
+    )
+    .bind(rig.chat)
+    .bind(serde_json::json!({"message_id": 66}))
+    .bind(rig.now)
+    .fetch_one(&db.pool)
+    .await
+    .expect("legacy delete");
+
+    assert_eq!(rig.pass().await, 1);
+
+    assert_eq!(rig.row(seq).await.0, "sent");
+    assert_eq!(
+        rig.fake.calls(),
+        vec![Call::Delete {
+            chat: rig.chat,
+            id: 66
+        }]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_rate_limit_defers_without_spending_an_attempt() {
     let db = db().await;
     let mut rig = Rig::new(&db.pool);
@@ -1262,7 +1393,10 @@ async fn existing_expire_row_is_not_duplicated() {
     let existing = outbox::enqueue_at(
         &mut conn,
         rig.chat,
-        &Outgoing::Delete { message_id: 1 },
+        &Outgoing::Delete {
+            message_id: 1,
+            cleanup: false,
+        },
         Some(&key),
         rig.now,
         run_at,

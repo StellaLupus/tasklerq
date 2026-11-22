@@ -6,7 +6,7 @@
   не слит): `notification_deliveries.dismissed_at timestamptz NULL` и
   `replaces_message_id bigint NULL` с шапкой-комментарием. Проверить:
   `tests/migrations.rs` проходит (design, решения 3, 5).
-- [ ] 1.2 `Outgoing::Delete { message_id, cleanup }` (поле в payload,
+- [x] 1.2 `Outgoing::Delete { message_id, cleanup }` (поле в payload,
   отсутствует у старых строк → `false`): удаление уборки при
   `MessageUndeletable` и окончательном отказе не вызывает `mark_buried`.
   Проверить в `tests/telegram_outbox.rs`: `cleanup`-удаление с

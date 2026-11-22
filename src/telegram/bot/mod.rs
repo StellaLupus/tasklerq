@@ -643,6 +643,7 @@ impl Bot {
                 chat_id,
                 &Outgoing::Delete {
                     message_id: *message_id,
+                    cleanup: false,
                 },
                 Some(&delete_dedupe_key(chat_id, *message_id)),
                 now,

@@ -428,7 +428,10 @@ pub async fn close(ctx: &mut Ctx<'_>, message_id: i64) -> Result<(), Fail> {
     outbox::enqueue(
         &mut *ctx.conn,
         ctx.chat_id,
-        &Outgoing::Delete { message_id },
+        &Outgoing::Delete {
+            message_id,
+            cleanup: false,
+        },
         Some(&super::delete_dedupe_key(ctx.chat_id, message_id)),
         ctx.now,
     )

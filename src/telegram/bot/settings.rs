@@ -909,7 +909,10 @@ pub async fn dismiss_secret(ctx: &mut Ctx<'_>, message_id: i64) -> Result<(), Fa
     outbox::enqueue(
         &mut *ctx.conn,
         ctx.chat_id,
-        &Outgoing::Delete { message_id },
+        &Outgoing::Delete {
+            message_id,
+            cleanup: false,
+        },
         Some(&delete_dedupe_key(ctx.chat_id, message_id)),
         ctx.now,
     )
