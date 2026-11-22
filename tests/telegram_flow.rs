@@ -26,6 +26,7 @@ use tasklerq::telegram::outbox::{self, Outgoing, Placement};
 use tasklerq::telegram::rich::{button, escape};
 use tasklerq::telegram::ru;
 use tasklerq::telegram::update::Sender;
+use tasklerq::telegram::views;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn onboarding_creates_household_once() {
@@ -272,6 +273,14 @@ fn delete_seq(rows: &[OutboxRow], message_id: i64) -> i64 {
         .find(|(_, kind, id)| kind == "delete" && *id == Some(message_id))
         .unwrap_or_else(|| panic!("no delete row for incoming message {message_id}: {rows:?}"))
         .0
+}
+
+/// Id носителя, который вид чата помнит в `telegram_views.keyboard_message_id`.
+async fn view_carrier_id(bot: &Harness) -> Option<i64> {
+    let mut conn = bot.pool.acquire().await.expect("conn");
+    views::keyboard_message_id(&mut conn, bot.chat)
+        .await
+        .expect("keyboard_message_id")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3417,6 +3426,177 @@ async fn menu_button_press_after_exclusion_shows_onboarding_without_the_carrier(
         "the old carrier must stay in the chat"
     );
     bot.assert_screen_contains("Как назовём ваше пространство");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn screen_replacement_after_a_notice_keeps_the_keyboard_carrier() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.fake.clear_calls();
+
+    // Носитель и меню; вид чата запоминает id носителя.
+    send_text(&mut bot, "/menu").await;
+    let (carrier_id, _) = bot
+        .fake
+        .messages(bot.chat)
+        .into_iter()
+        .find(|(_, html)| html == &escape(ru::KEYBOARD_CARRIER_TEXT))
+        .expect("the carrier must stay in the chat");
+    let (anchor, _) = bot.active();
+    assert_eq!(view_carrier_id(&bot).await, Some(carrier_id));
+
+    // Уведомление засыпает меню: экран больше не последнее сообщение чата.
+    deliver_message(&mut bot, "<p>напоминание</p>").await;
+    let (notice, _) = bot.latest();
+    assert_ne!(notice, anchor, "the notice must arrive below the menu");
+
+    // Обычный текст показывает экран новым сообщением и удаляет прежний активный.
+    let (message_id, rows) = send_text(&mut bot, "купить молоко").await;
+
+    // В outbox удаление входящего, но не носителя. Прежний экран удаляет сама
+    // доставка Screen (ветка Fresh/Visible+buried в outbox::deliver), а не
+    // строка Delete: факт удаления проверяется ниже по вызову фейка и чату.
+    delete_seq(&rows, message_id);
+    assert!(
+        !rows
+            .iter()
+            .any(|(_, kind, id)| kind == "delete" && *id == Some(carrier_id)),
+        "the carrier must not be deleted: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|(_, kind, _)| kind == "keyboard"),
+        "the replacement must not enqueue a new carrier: {rows:?}"
+    );
+    // Во всём outbox чата нет удаления носителя, в том числе пропущенного.
+    let carrier_deletes: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox
+         WHERE chat_id = $1 AND kind = 'delete'
+           AND coalesce((payload->>'message_id')::bigint, message_id) = $2",
+    )
+    .bind(bot.chat)
+    .bind(carrier_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("carrier deletes");
+    assert_eq!(carrier_deletes, 0, "the outbox must not delete the carrier");
+
+    // Вся цепочка «носитель → уведомление → текст»: ни одного Delete носителя.
+    let calls = bot.fake.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|call| matches!(call, Call::Delete { id, .. } if *id == anchor)),
+        "the old active screen must be deleted: {calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|call| matches!(call, Call::Delete { id, .. } if *id == carrier_id)),
+        "no Delete of the carrier in the whole chain: {calls:?}"
+    );
+    let keyboards = calls
+        .iter()
+        .filter(|call| matches!(call, Call::SendKeyboard { .. }))
+        .count();
+    assert_eq!(keyboards, 1, "exactly one carrier in the chain: {calls:?}");
+
+    let (new_id, _) = bot.active();
+    assert_ne!(new_id, anchor, "a buried screen must be sent anew");
+    assert!(
+        new_id > notice,
+        "the new screen must be below the notification"
+    );
+    assert!(!is_alive(&bot, anchor));
+    assert!(is_alive(&bot, notice), "the notification must stay");
+    assert!(
+        is_alive(&bot, carrier_id),
+        "the carrier must stay in the chat"
+    );
+    assert_eq!(view_carrier_id(&bot).await, Some(carrier_id));
+    bot.assert_screen_contains("Название: купить молоко");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn menu_button_after_a_notice_keeps_the_keyboard_carrier() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.fake.clear_calls();
+
+    // Носитель и меню, затем уведомление засыпает меню.
+    send_text(&mut bot, "/menu").await;
+    let (carrier_id, _) = bot
+        .fake
+        .messages(bot.chat)
+        .into_iter()
+        .find(|(_, html)| html == &escape(ru::KEYBOARD_CARRIER_TEXT))
+        .expect("the carrier must stay in the chat");
+    let (anchor, _) = bot.active();
+    deliver_message(&mut bot, "<p>напоминание</p>").await;
+    let (notice, _) = bot.latest();
+    bot.fake.clear_calls();
+
+    let (message_id, rows) = send_text(&mut bot, ru::MENU_BUTTON).await;
+
+    // Удаление текста кнопки и прежнего меню, но не носителя; нового носителя
+    // нет. Прежнее меню удаляет сама доставка Screen (ветка Fresh/Visible+
+    // buried в outbox::deliver), а не строка Delete outbox.
+    delete_seq(&rows, message_id);
+    assert!(
+        !rows
+            .iter()
+            .any(|(_, kind, id)| kind == "delete" && *id == Some(carrier_id)),
+        "the carrier must not be deleted: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|(_, kind, _)| kind == "keyboard"),
+        "the button press must not enqueue a carrier: {rows:?}"
+    );
+    // Во всём outbox чата нет удаления носителя, в том числе пропущенного.
+    let carrier_deletes: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox
+         WHERE chat_id = $1 AND kind = 'delete'
+           AND coalesce((payload->>'message_id')::bigint, message_id) = $2",
+    )
+    .bind(bot.chat)
+    .bind(carrier_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("carrier deletes");
+    assert_eq!(carrier_deletes, 0, "the outbox must not delete the carrier");
+
+    let calls = bot.fake.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|call| matches!(call, Call::Delete { id, .. } if *id == anchor)),
+        "the old menu must be deleted: {calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|call| matches!(call, Call::Delete { id, .. } if *id == carrier_id)),
+        "no Delete of the carrier: {calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|call| matches!(call, Call::SendKeyboard { .. })),
+        "no SendKeyboard after the button press: {calls:?}"
+    );
+
+    let (menu_id, _) = bot.active();
+    assert_ne!(menu_id, anchor, "the menu must arrive as a new message");
+    assert!(
+        menu_id > notice,
+        "the menu must arrive below the notification"
+    );
+    assert!(!is_alive(&bot, anchor));
+    assert!(
+        is_alive(&bot, carrier_id),
+        "the carrier must stay in the chat"
+    );
+    assert_eq!(view_carrier_id(&bot).await, Some(carrier_id));
+    bot.assert_screen_contains("📋 Задачи · 0");
 }
 
 /// Контекст для прямых проверок контракта [`Ctx::present`]: флаг носителя
