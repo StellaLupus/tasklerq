@@ -7,7 +7,7 @@ use std::sync::Arc;
 use chrono::{Datelike, Duration, NaiveDate, TimeZone, Utc};
 use chrono_tz::Tz;
 use serde_json::json;
-use support::telegram::{Call, FakeTelegram, Harness, buttons};
+use support::telegram::{Call, FakeTelegram, Harness, assert_carrier_sent, buttons, chat_carrier};
 use support::{
     TestHousehold, create_household, create_item, db, isolated_db, new_item, next_telegram_id,
     recurrence,
@@ -18,7 +18,7 @@ use tasklerq::domain::models::{
 };
 use tasklerq::rate_limit::RateLimiter;
 use tasklerq::storage::repositories::{households, items, users};
-use tasklerq::telegram::api::TelegramError;
+use tasklerq::telegram::api::{RichMessage, TelegramApi, TelegramError};
 use tasklerq::telegram::bot::model::{Action, FirstContactScreen, FormAct, Screen, Ui};
 use tasklerq::telegram::bot::{Bot, Ctx, display_timezone, issue_and_render};
 use tasklerq::telegram::callbacks::{self, NewToken, Scope};
@@ -281,6 +281,34 @@ async fn view_carrier_id(bot: &Harness) -> Option<i64> {
     views::keyboard_message_id(&mut conn, bot.chat)
         .await
         .expect("keyboard_message_id")
+}
+
+/// Сколько строк outbox чата удаляют носитель, включая пропущенные защитой.
+///
+/// Отправленные строки ищутся по `message_id`; пропущенный `Delete` текущего
+/// носителя получает `status = 'skipped'`, `last_error = 'keyboard_carrier'`,
+/// скрытый payload и NULL в `message_id`, поэтому поиск по id его не видит —
+/// такие строки ищутся по `last_error`.
+async fn carrier_deletes(bot: &Harness, carrier_id: i64) -> i64 {
+    let by_id: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox
+         WHERE chat_id = $1 AND kind = 'delete'
+           AND coalesce((payload->>'message_id')::bigint, message_id) = $2",
+    )
+    .bind(bot.chat)
+    .bind(carrier_id)
+    .fetch_one(&bot.pool)
+    .await
+    .expect("carrier deletes by message id");
+    let skipped: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox
+         WHERE chat_id = $1 AND kind = 'delete' AND last_error = 'keyboard_carrier'",
+    )
+    .bind(bot.chat)
+    .fetch_one(&bot.pool)
+    .await
+    .expect("skipped carrier deletes");
+    by_id + skipped
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2862,21 +2890,10 @@ async fn menu_sends_the_keyboard_carrier_before_the_menu() {
     );
 
     // Носитель доставлен с текстом спеки и раскладкой из одной кнопки меню.
-    // Payload строки после доставки скрыт, поэтому содержимое проверяется по
-    // вызову фейка: он получает html и rows прямо из строки outbox.
-    let calls = bot.fake.calls();
-    let keyboards: Vec<_> = calls
-        .iter()
-        .filter_map(|call| match call {
-            Call::SendKeyboard { html, rows, .. } => Some((html, rows)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(keyboards.len(), 1, "exactly one carrier: {calls:?}");
-    assert_eq!(keyboards[0].0, &escape(ru::KEYBOARD_CARRIER_TEXT));
-    assert_eq!(keyboards[0].1, &vec![vec![ru::MENU_BUTTON.to_owned()]]);
+    let carrier_id = assert_carrier_sent(&bot);
 
     // Вызовы фейка: сначала носитель, затем меню.
+    let calls = bot.fake.calls();
     let carrier_at = calls
         .iter()
         .position(|call| matches!(call, Call::SendKeyboard { .. }))
@@ -2891,20 +2908,12 @@ async fn menu_sends_the_keyboard_carrier_before_the_menu() {
     );
 
     // В чате меню приходит новым сообщением ниже носителя; якорь удалён.
-    let (carrier_id, carrier_html) = bot
-        .fake
-        .messages(bot.chat)
-        .into_iter()
-        .find(|(_, html)| html == &escape(ru::KEYBOARD_CARRIER_TEXT))
-        .expect("the carrier must stay in the chat");
     let (menu_id, _) = bot.active();
     assert!(
         menu_id > carrier_id,
         "the menu must arrive below the carrier"
     );
-    assert!(is_alive(&bot, carrier_id));
     assert!(!is_alive(&bot, anchor));
-    assert_eq!(carrier_html, escape(ru::KEYBOARD_CARRIER_TEXT));
     bot.assert_screen_contains("📋 Задачи · 0");
 }
 
@@ -2957,19 +2966,10 @@ async fn start_sends_the_keyboard_carrier_before_the_menu() {
     );
 
     // Носитель доставлен с текстом спеки и раскладкой из одной кнопки меню.
-    let calls = bot.fake.calls();
-    let keyboards: Vec<_> = calls
-        .iter()
-        .filter_map(|call| match call {
-            Call::SendKeyboard { html, rows, .. } => Some((html, rows)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(keyboards.len(), 1, "exactly one carrier: {calls:?}");
-    assert_eq!(keyboards[0].0, &escape(ru::KEYBOARD_CARRIER_TEXT));
-    assert_eq!(keyboards[0].1, &vec![vec![ru::MENU_BUTTON.to_owned()]]);
+    let carrier_id = assert_carrier_sent(&bot);
 
     // Вызовы фейка: сначала носитель, затем меню.
+    let calls = bot.fake.calls();
     let carrier_at = calls
         .iter()
         .position(|call| matches!(call, Call::SendKeyboard { .. }))
@@ -2984,18 +2984,11 @@ async fn start_sends_the_keyboard_carrier_before_the_menu() {
     );
 
     // В чате меню приходит новым сообщением ниже носителя; якорь удалён.
-    let (carrier_id, _) = bot
-        .fake
-        .messages(bot.chat)
-        .into_iter()
-        .find(|(_, html)| html == &escape(ru::KEYBOARD_CARRIER_TEXT))
-        .expect("the carrier must stay in the chat");
     let (menu_id, _) = bot.active();
     assert!(
         menu_id > carrier_id,
         "the menu must arrive below the carrier"
     );
-    assert!(is_alive(&bot, carrier_id));
     assert!(!is_alive(&bot, anchor));
     bot.assert_screen_contains("📋 Задачи · 0");
 }
@@ -3057,19 +3050,11 @@ async fn household_creation_by_zone_text_sends_the_carrier_before_a_fresh_welcom
         "the carrier must be queued before the welcome: {rows:?}"
     );
 
-    let calls = bot.fake.calls();
-    let keyboards: Vec<_> = calls
-        .iter()
-        .filter_map(|call| match call {
-            Call::SendKeyboard { html, rows, .. } => Some((html, rows)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(keyboards.len(), 1, "exactly one carrier: {calls:?}");
-    assert_eq!(keyboards[0].0, &escape(ru::KEYBOARD_CARRIER_TEXT));
-    assert_eq!(keyboards[0].1, &vec![vec![ru::MENU_BUTTON.to_owned()]]);
+    // Носитель доставлен с текстом спеки и раскладкой из одной кнопки меню.
+    let carrier_id = assert_carrier_sent(&bot);
 
     // Приветствие — новое сообщение после носителя, не правка якоря формы.
+    let calls = bot.fake.calls();
     let carrier_at = calls
         .iter()
         .position(|call| matches!(call, Call::SendKeyboard { .. }))
@@ -3091,12 +3076,6 @@ async fn household_creation_by_zone_text_sends_the_carrier_before_a_fresh_welcom
         )),
         "the welcome must not edit the form anchor: {calls:?}"
     );
-    let (carrier_id, _) = bot
-        .fake
-        .messages(bot.chat)
-        .into_iter()
-        .find(|(_, html)| html == &escape(ru::KEYBOARD_CARRIER_TEXT))
-        .expect("the carrier must stay in the chat");
     let (welcome_id, _) = bot.active();
     assert_ne!(
         welcome_id, form_anchor,
@@ -3106,7 +3085,6 @@ async fn household_creation_by_zone_text_sends_the_carrier_before_a_fresh_welcom
         welcome_id > carrier_id,
         "the welcome must arrive below the carrier"
     );
-    assert!(is_alive(&bot, carrier_id));
     bot.assert_screen_contains("Пространство создано");
 }
 
@@ -3131,21 +3109,9 @@ async fn household_creation_by_zone_button_sends_the_carrier_once_before_a_fresh
     // равно должно прийти новым сообщением ниже носителя.
     bot.press("Москва").await;
 
+    // Носитель доставлен ровно один раз, с текстом и раскладкой спеки.
+    let carrier_id = assert_carrier_sent(&bot);
     let calls = bot.fake.calls();
-    let keyboards: Vec<_> = calls
-        .iter()
-        .filter_map(|call| match call {
-            Call::SendKeyboard { html, rows, .. } => Some((html, rows)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        keyboards.len(),
-        1,
-        "the carrier must arrive once: {calls:?}"
-    );
-    assert_eq!(keyboards[0].0, &escape(ru::KEYBOARD_CARRIER_TEXT));
-    assert_eq!(keyboards[0].1, &vec![vec![ru::MENU_BUTTON.to_owned()]]);
     assert!(
         !calls.iter().any(|call| matches!(
             call,
@@ -3167,12 +3133,6 @@ async fn household_creation_by_zone_button_sends_the_carrier_once_before_a_fresh
         carrier_at < welcome_at,
         "the carrier must be sent before the welcome: {calls:?}"
     );
-    let (carrier_id, _) = bot
-        .fake
-        .messages(bot.chat)
-        .into_iter()
-        .find(|(_, html)| html == &escape(ru::KEYBOARD_CARRIER_TEXT))
-        .expect("the carrier must stay in the chat");
     let (welcome_id, _) = bot.active();
     assert_ne!(
         welcome_id, form_anchor,
@@ -3182,7 +3142,6 @@ async fn household_creation_by_zone_button_sends_the_carrier_once_before_a_fresh
         welcome_id > carrier_id,
         "the welcome must arrive below the carrier"
     );
-    assert!(is_alive(&bot, carrier_id));
     assert!(
         !is_alive(&bot, form_anchor),
         "the form anchor must be deleted"
@@ -3195,12 +3154,7 @@ async fn menu_button_press_returns_a_buried_menu_to_the_bottom() {
     let db = db().await;
     let mut bot = onboarded(&db.pool).await;
     let (anchor, _) = bot.active();
-    let (carrier_id, _) = bot
-        .fake
-        .messages(bot.chat)
-        .into_iter()
-        .find(|(_, html)| html == &escape(ru::KEYBOARD_CARRIER_TEXT))
-        .expect("the carrier must stay in the chat");
+    let (carrier_id, _) = chat_carrier(&bot);
 
     // Меню уехало вверх: после него три уведомления.
     for number in 1..=3 {
@@ -3392,12 +3346,7 @@ async fn menu_word_without_the_emoji_stays_ordinary_text() {
 async fn menu_button_press_after_exclusion_shows_onboarding_without_the_carrier() {
     let db = db().await;
     let mut bot = onboarded(&db.pool).await;
-    let (carrier_id, _) = bot
-        .fake
-        .messages(bot.chat)
-        .into_iter()
-        .find(|(_, html)| html == &escape(ru::KEYBOARD_CARRIER_TEXT))
-        .expect("the carrier must stay in the chat");
+    let (carrier_id, _) = chat_carrier(&bot);
 
     // Участника исключили из household, клавиатура у него осталась.
     sqlx::query("UPDATE users SET deleted_at = now() WHERE telegram_user_id = $1")
@@ -3436,12 +3385,7 @@ async fn screen_replacement_after_a_notice_keeps_the_keyboard_carrier() {
 
     // Носитель и меню; вид чата запоминает id носителя.
     send_text(&mut bot, "/menu").await;
-    let (carrier_id, _) = bot
-        .fake
-        .messages(bot.chat)
-        .into_iter()
-        .find(|(_, html)| html == &escape(ru::KEYBOARD_CARRIER_TEXT))
-        .expect("the carrier must stay in the chat");
+    let (carrier_id, _) = chat_carrier(&bot);
     let (anchor, _) = bot.active();
     assert_eq!(view_carrier_id(&bot).await, Some(carrier_id));
 
@@ -3467,18 +3411,13 @@ async fn screen_replacement_after_a_notice_keeps_the_keyboard_carrier() {
         !rows.iter().any(|(_, kind, _)| kind == "keyboard"),
         "the replacement must not enqueue a new carrier: {rows:?}"
     );
-    // Во всём outbox чата нет удаления носителя, в том числе пропущенного.
-    let carrier_deletes: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM outbox
-         WHERE chat_id = $1 AND kind = 'delete'
-           AND coalesce((payload->>'message_id')::bigint, message_id) = $2",
-    )
-    .bind(bot.chat)
-    .bind(carrier_id)
-    .fetch_one(&db.pool)
-    .await
-    .expect("carrier deletes");
-    assert_eq!(carrier_deletes, 0, "the outbox must not delete the carrier");
+    // Во всём outbox чата нет удаления носителя, в том числе пропущенного:
+    // пропущенный защитой Delete ищется по last_error, а не по message_id.
+    assert_eq!(
+        carrier_deletes(&bot, carrier_id).await,
+        0,
+        "the outbox must not delete the carrier"
+    );
 
     // Вся цепочка «носитель → уведомление → текст»: ни одного Delete носителя.
     let calls = bot.fake.calls();
@@ -3524,12 +3463,7 @@ async fn menu_button_after_a_notice_keeps_the_keyboard_carrier() {
 
     // Носитель и меню, затем уведомление засыпает меню.
     send_text(&mut bot, "/menu").await;
-    let (carrier_id, _) = bot
-        .fake
-        .messages(bot.chat)
-        .into_iter()
-        .find(|(_, html)| html == &escape(ru::KEYBOARD_CARRIER_TEXT))
-        .expect("the carrier must stay in the chat");
+    let (carrier_id, _) = chat_carrier(&bot);
     let (anchor, _) = bot.active();
     deliver_message(&mut bot, "<p>напоминание</p>").await;
     let (notice, _) = bot.latest();
@@ -3551,18 +3485,13 @@ async fn menu_button_after_a_notice_keeps_the_keyboard_carrier() {
         !rows.iter().any(|(_, kind, _)| kind == "keyboard"),
         "the button press must not enqueue a carrier: {rows:?}"
     );
-    // Во всём outbox чата нет удаления носителя, в том числе пропущенного.
-    let carrier_deletes: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM outbox
-         WHERE chat_id = $1 AND kind = 'delete'
-           AND coalesce((payload->>'message_id')::bigint, message_id) = $2",
-    )
-    .bind(bot.chat)
-    .bind(carrier_id)
-    .fetch_one(&db.pool)
-    .await
-    .expect("carrier deletes");
-    assert_eq!(carrier_deletes, 0, "the outbox must not delete the carrier");
+    // Во всём outbox чата нет удаления носителя, в том числе пропущенного:
+    // пропущенный защитой Delete ищется по last_error, а не по message_id.
+    assert_eq!(
+        carrier_deletes(&bot, carrier_id).await,
+        0,
+        "the outbox must not delete the carrier"
+    );
 
     let calls = bot.fake.calls();
     assert!(
@@ -3597,6 +3526,69 @@ async fn menu_button_after_a_notice_keeps_the_keyboard_carrier() {
     );
     assert_eq!(view_carrier_id(&bot).await, Some(carrier_id));
     bot.assert_screen_contains("📋 Задачи · 0");
+}
+
+/// Трактовка носителя в фейке: id запоминается при отправке, а не ищется по
+/// тексту; `messages` включает носитель в картину чата, `sent` — нет.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fake_tracks_the_carrier_by_id_not_by_text() {
+    let fake = FakeTelegram::new();
+    let rows = vec![vec![ru::MENU_BUTTON.to_owned()]];
+    let text = escape(ru::KEYBOARD_CARRIER_TEXT);
+    let carrier_id = fake
+        .send_keyboard_message(7, &text, &rows)
+        .await
+        .expect("carrier");
+    // Двойник с тем же текстом, отправленный обычным сообщением, — не носитель.
+    let twin_id = fake.send_message(7, &text, false).await.expect("twin");
+    let screen_id = fake
+        .send_rich_message(
+            7,
+            &RichMessage {
+                html: "<p>экран</p>".to_owned(),
+            },
+        )
+        .await
+        .expect("screen");
+
+    assert_eq!(fake.carriers(7), vec![(carrier_id, text.clone())]);
+    assert!(fake.carriers(8).is_empty());
+    // Честная картина чата: носитель, двойник и экран.
+    assert_eq!(fake.messages(7).len(), 3);
+    assert!(
+        !fake
+            .sent()
+            .iter()
+            .any(|call| matches!(call, Call::SendKeyboard { .. })),
+        "sent() must not contain the carrier: {:?}",
+        fake.sent()
+    );
+
+    fake.delete_message(7, carrier_id)
+        .await
+        .expect("delete carrier");
+    assert!(
+        fake.carriers(7).is_empty(),
+        "a deleted carrier must be forgotten"
+    );
+    assert_eq!(fake.messages(7).len(), 2);
+    assert!(fake.messages(7).iter().any(|(id, _)| *id == twin_id));
+    assert!(fake.messages(7).iter().any(|(id, _)| *id == screen_id));
+}
+
+/// Носитель не считается экраном: когда он остался последним живым сообщением
+/// чата, `latest()` не возвращает его вместо экрана.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[should_panic(expected = "chat should have a message")]
+async fn latest_does_not_return_the_carrier_as_a_screen() {
+    let db = db().await;
+    let bot = onboarded(&db.pool).await;
+    let (screen_id, _) = bot.active();
+    bot.fake
+        .delete_message(bot.chat, screen_id)
+        .await
+        .expect("delete the screen");
+    bot.latest();
 }
 
 /// Контекст для прямых проверок контракта [`Ctx::present`]: флаг носителя

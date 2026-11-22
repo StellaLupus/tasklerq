@@ -17,8 +17,6 @@ use tasklerq::security_audit::Audit;
 use tasklerq::storage::repositories::households::{self, Creator, NewOwner};
 use tasklerq::storage::repositories::invites;
 use tasklerq::telegram::bot::Bot;
-use tasklerq::telegram::rich::escape;
-use tasklerq::telegram::ru;
 use uuid::Uuid;
 
 async fn installation(pool: &PgPool) -> Installation {
@@ -1158,18 +1156,8 @@ async fn a_member_opening_a_claim_link_does_not_consume_it() {
 /// Носитель клавиатуры доставлен ровно один раз, с текстом и раскладкой спеки,
 /// и стоит перед первым экраном участника (последним новым rich-сообщением).
 fn assert_carrier_before_the_member_screen(bot: &Harness) {
+    let carrier_id = support::telegram::assert_carrier_sent(bot);
     let calls = bot.fake.calls();
-    let keyboards: Vec<_> = calls
-        .iter()
-        .filter_map(|call| match call {
-            Call::SendKeyboard { html, rows, .. } => Some((html, rows)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(keyboards.len(), 1, "exactly one carrier: {calls:?}");
-    assert_eq!(keyboards[0].0, &escape(ru::KEYBOARD_CARRIER_TEXT));
-    assert_eq!(keyboards[0].1, &vec![vec![ru::MENU_BUTTON.to_owned()]]);
-
     let carrier_at = calls
         .iter()
         .position(|call| matches!(call, Call::SendKeyboard { .. }))
@@ -1183,12 +1171,6 @@ fn assert_carrier_before_the_member_screen(bot: &Harness) {
         "the carrier must be sent before the member screen: {calls:?}"
     );
 
-    let (carrier_id, _) = bot
-        .fake
-        .messages(bot.chat)
-        .into_iter()
-        .find(|(_, html)| html == &escape(ru::KEYBOARD_CARRIER_TEXT))
-        .expect("the carrier must stay in the chat");
     let (screen_id, _) = bot.active();
     assert!(
         screen_id > carrier_id,

@@ -1,8 +1,16 @@
 //! Поддержка тестов Telegram: поддельный Bot API и сценарный стенд.
+//!
+//! Носитель reply-клавиатуры — служебное сообщение бота, не экран. Фейк
+//! запоминает id носителей при отправке (`Call::SendKeyboard`) и забывает при
+//! удалении сообщения. Трактовка в помощниках: `sent()` — только экраны и
+//! уведомления, `messages()` — все живые сообщения чата включая носитель
+//! (честная картина чата, счётчики считают и носитель), `carriers()` — только
+//! носители; `Harness::latest()/active()/screen()` носитель вместо экрана не
+//! возвращают.
 
 #![allow(dead_code)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -16,7 +24,8 @@ use tasklerq::telegram::bot::model::{Action, Screen, Ui};
 use tasklerq::telegram::bot::{Bot, Ctx, display_timezone};
 use tasklerq::telegram::outbox::{OutboxWorker, Placement};
 use tasklerq::telegram::queue;
-use tasklerq::telegram::rich::Button;
+use tasklerq::telegram::rich::{Button, escape};
+use tasklerq::telegram::ru;
 use tasklerq::telegram::update::Sender;
 use tasklerq::telegram::worker::{Pass, UpdateHandler, UpdateWorker};
 use tokio::sync::Notify;
@@ -61,6 +70,9 @@ pub enum Call {
 struct State {
     next_id: i64,
     messages: HashMap<(i64, i64), String>,
+    /// Id носителей клавиатуры `(чат, сообщение)`: запоминаются при отправке
+    /// `send_keyboard_message`, а не по тексту сообщения.
+    carriers: HashSet<(i64, i64)>,
     calls: Vec<Call>,
     failures: VecDeque<TelegramError>,
     edit_error: Option<TelegramError>,
@@ -102,7 +114,9 @@ impl FakeTelegram {
         self.state.lock().expect("lock").calls.clear();
     }
 
-    /// Сообщения, отправленные новыми (не правками).
+    /// Сообщения, отправленные новыми (не правками): экраны и уведомления.
+    /// Носитель клавиатуры сюда не входит — это отдельный вид
+    /// `Call::SendKeyboard`; живые носители чата даёт [`Self::carriers`].
     pub fn sent(&self) -> Vec<Call> {
         self.calls()
             .into_iter()
@@ -110,7 +124,9 @@ impl FakeTelegram {
             .collect()
     }
 
-    /// Живые сообщения чата по возрастанию идентификатора.
+    /// Все живые сообщения чата по возрастанию идентификатора, включая
+    /// носитель клавиатуры: честная картина чата, счётчики сообщений считают
+    /// и носитель. Только носители — [`Self::carriers`].
     pub fn messages(&self, chat: i64) -> Vec<(i64, String)> {
         let state = self.state.lock().expect("lock");
         let mut messages: Vec<(i64, String)> = state
@@ -121,6 +137,21 @@ impl FakeTelegram {
             .collect();
         messages.sort_by_key(|(id, _)| *id);
         messages
+    }
+
+    /// Живые носители клавиатуры чата по возрастанию идентификатора.
+    /// Носитель запоминается по id из `send_keyboard_message` и убирается
+    /// отсюда при удалении сообщения.
+    pub fn carriers(&self, chat: i64) -> Vec<(i64, String)> {
+        let state = self.state.lock().expect("lock");
+        let mut carriers: Vec<(i64, String)> = state
+            .messages
+            .iter()
+            .filter(|((c, id), _)| *c == chat && state.carriers.contains(&(*c, *id)))
+            .map(|((_, id), html)| (*id, html.clone()))
+            .collect();
+        carriers.sort_by_key(|(id, _)| *id);
+        carriers
     }
 
     pub fn answers(&self) -> Vec<(String, Option<String>, bool)> {
@@ -219,6 +250,7 @@ impl TelegramApi for FakeTelegram {
         state.next_id += 1;
         let id = state.next_id;
         state.messages.insert((chat_id, id), html.to_owned());
+        state.carriers.insert((chat_id, id));
         state.calls.push(Call::SendKeyboard {
             chat: chat_id,
             id,
@@ -272,6 +304,7 @@ impl TelegramApi for FakeTelegram {
             return Err(error);
         }
         state.messages.remove(&(chat_id, message_id));
+        state.carriers.remove(&(chat_id, message_id));
         state.calls.push(Call::Delete {
             chat: chat_id,
             id: message_id,
@@ -620,15 +653,21 @@ impl Harness {
         self.pump().await;
     }
 
-    /// Последнее живое сообщение чата (например, уведомление).
+    /// Последнее живое сообщение чата без носителя клавиатуры (например,
+    /// уведомление): носитель не считается экраном и вместо экрана не
+    /// возвращается.
     pub fn latest(&self) -> (i64, String) {
+        let carriers = self.fake.carriers(self.chat);
         self.fake
             .messages(self.chat)
-            .pop()
+            .into_iter()
+            .rfind(|(id, _)| !carriers.iter().any(|(carrier_id, _)| carrier_id == id))
             .expect("chat should have a message")
     }
 
-    /// Активное сообщение экрана навигации.
+    /// Активное сообщение экрана навигации. Id берётся из `telegram_views`,
+    /// где носитель не хранится, поэтому носитель вместо экрана не
+    /// возвращается.
     pub fn active(&self) -> (i64, String) {
         let id = self.screen_id.expect("a screen should have been delivered");
         self.fake
@@ -646,6 +685,7 @@ impl Harness {
         );
     }
 
+    /// HTML активного экрана; носитель клавиатуры экраном не считается.
     pub fn screen(&self) -> String {
         self.active().1
     }
@@ -709,4 +749,41 @@ impl Harness {
             self.screen()
         );
     }
+}
+
+/// Единственный живой носитель клавиатуры в чате: `(id, html)`.
+///
+/// Носитель ищется по id, запомненному фейком при отправке, а не по тексту;
+/// проверяются единственность живого носителя и текст спеки.
+pub fn chat_carrier(bot: &Harness) -> (i64, String) {
+    let carriers = bot.fake.carriers(bot.chat);
+    assert_eq!(
+        carriers.len(),
+        1,
+        "exactly one carrier must stay in the chat: {carriers:?}"
+    );
+    let (id, html) = carriers.into_iter().next().expect("carrier");
+    assert_eq!(html, escape(ru::KEYBOARD_CARRIER_TEXT), "carrier text");
+    (id, html)
+}
+
+/// Носитель клавиатуры доставлен ровно один раз, с текстом и раскладкой спеки
+/// (`ru::KEYBOARD_CARRIER_TEXT`, раскладка `[["🏠 Меню"]]`); возвращает id
+/// живого носителя в чате.
+///
+/// Payload строки outbox после доставки скрыт, поэтому содержимое проверяется
+/// по вызову фейка: он получает html и rows прямо из строки outbox.
+pub fn assert_carrier_sent(bot: &Harness) -> i64 {
+    let calls = bot.fake.calls();
+    let keyboards: Vec<_> = calls
+        .iter()
+        .filter_map(|call| match call {
+            Call::SendKeyboard { html, rows, .. } => Some((html, rows)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(keyboards.len(), 1, "exactly one carrier: {calls:?}");
+    assert_eq!(keyboards[0].0, &escape(ru::KEYBOARD_CARRIER_TEXT));
+    assert_eq!(keyboards[0].1, &vec![vec![ru::MENU_BUTTON.to_owned()]]);
+    chat_carrier(bot).0
 }
