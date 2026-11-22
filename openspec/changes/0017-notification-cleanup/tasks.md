@@ -2,7 +2,7 @@
 
 ## 1. Основа: миграция, удаления уборки, отметка «убрано»
 
-- [ ] 1.1 Миграция `0025_notice_cleanup.sql` (номер сдвигается, если 0016 ещё
+- [x] 1.1 Миграция `0025_notice_cleanup.sql` (номер сдвигается, если 0016 ещё
   не слит): `notification_deliveries.dismissed_at timestamptz NULL` и
   `replaces_message_id bigint NULL` с шапкой-комментарием. Проверить:
   `tests/migrations.rs` проходит (design, решения 3, 5).
