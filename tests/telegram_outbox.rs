@@ -1694,3 +1694,127 @@ async fn keyboard_with_invalid_rows_is_dead_as_invalid_payload() {
         rig.fake.calls()
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_of_current_keyboard_carrier_is_skipped_without_telegram() {
+    let _dead = DEAD_METRIC.lock().await;
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    rig.put_view().await;
+
+    rig.keyboard("<p>носитель</p>").await;
+    assert_eq!(rig.pass().await, 1);
+    let carrier = rig.keyboard_message_id().await.expect("carrier id");
+
+    // Носитель закапывает вид. Сбрасываем признак, чтобы пропуск удаления был
+    // виден: вызови он `mark_buried`, `buried` снова стал бы `true`. Сравниваем
+    // значение до и после `Delete`, а не с `false` само по себе.
+    rig.set_buried(false).await;
+    let buried_before = rig.buried().await;
+    let before = counter(&tasklerq::metrics::render(), "outbox_dead_total");
+
+    let seq = rig.delete(carrier).await;
+    assert_eq!(rig.pass().await, 0);
+
+    assert_eq!(
+        rig.row(seq).await,
+        ("skipped".into(), 0, Some("keyboard_carrier".into()), None)
+    );
+    assert_eq!(
+        rig.payload_text(seq).await,
+        r#"{"redacted": true}"#,
+        "the skipped carrier delete payload must be redacted"
+    );
+    assert!(
+        !rig.fake
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::Delete { id, .. } if *id == carrier)),
+        "Telegram must not be asked to delete the carrier: {:?}",
+        rig.fake.calls()
+    );
+    assert_eq!(
+        rig.fake.messages(rig.chat),
+        vec![(carrier, "<p>носитель</p>".to_owned())],
+        "the carrier must stay in the chat"
+    );
+    assert_eq!(
+        rig.buried().await,
+        buried_before,
+        "skipping the carrier delete must not bury the view"
+    );
+    let after = counter(&tasklerq::metrics::render(), "outbox_dead_total");
+    assert_eq!(
+        after, before,
+        "a protected carrier delete is skipped, not a dead-letter"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_of_replaced_carrier_is_not_blocked_by_protection() {
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+
+    rig.keyboard("<p>носитель 1</p>").await;
+    assert_eq!(rig.pass().await, 1);
+    let first = rig.keyboard_message_id().await.expect("first carrier id");
+
+    rig.keyboard("<p>носитель 2</p>").await;
+    assert_eq!(rig.pass_after(SECOND).await, 1);
+    let second = rig.keyboard_message_id().await.expect("second carrier id");
+    assert_ne!(first, second);
+
+    // К моменту доставки удаления прежнего текущим носителем уже стал второй,
+    // поэтому защита не блокирует замену.
+    assert_eq!(rig.pass().await, 1);
+
+    let deletes = rig.delete_rows().await;
+    assert_eq!(deletes.len(), 1, "{deletes:?}");
+    assert_eq!(rig.row(deletes[0].0).await.0, "sent");
+    assert!(
+        rig.fake
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::Delete { id, .. } if *id == first)),
+        "the old carrier must be deleted: {:?}",
+        rig.fake.calls()
+    );
+    assert_eq!(
+        rig.fake.messages(rig.chat),
+        vec![(second, "<p>носитель 2</p>".to_owned())],
+        "only the second carrier must stay in the chat"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_of_regular_message_in_carrier_chat_is_delivered() {
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+
+    rig.keyboard("<p>носитель</p>").await;
+    assert_eq!(rig.pass().await, 1);
+    let carrier = rig.keyboard_message_id().await.expect("carrier id");
+
+    rig.message("<p>обычное</p>", None).await;
+    assert_eq!(rig.pass_after(SECOND).await, 1);
+    let other = rig.fake.messages(rig.chat).last().expect("message").0;
+    assert_ne!(other, carrier);
+
+    let seq = rig.delete(other).await;
+    assert_eq!(rig.pass_after(SECOND).await, 1);
+
+    assert_eq!(rig.row(seq).await.0, "sent");
+    assert!(
+        rig.fake
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::Delete { id, .. } if *id == other)),
+        "a non-carrier delete must reach Telegram: {:?}",
+        rig.fake.calls()
+    );
+    assert_eq!(
+        rig.fake.messages(rig.chat),
+        vec![(carrier, "<p>носитель</p>".to_owned())],
+        "only the non-carrier message is removed; the carrier stays"
+    );
+}

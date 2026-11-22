@@ -602,6 +602,31 @@ impl OutboxWorker {
             return Ok(Delivery::Dead);
         };
 
+        // Страховка: удаление текущего носителя клавиатуры убирает клавиатуру,
+        // поэтому такой `Delete` пропускается без вызова Telegram и без
+        // `mark_buried`. Прежний носитель под защиту не попадает: к моменту его
+        // доставки текущим уже стал новый id (вариант A).
+        if let Outgoing::Delete { message_id } = &outgoing
+            && views::keyboard_message_id(&mut tx, row.chat_id).await? == Some(*message_id)
+        {
+            sqlx::query(
+                "UPDATE outbox
+                 SET status = 'skipped', last_error = 'keyboard_carrier',
+                     payload = jsonb_build_object('redacted', true)
+                 WHERE seq = $1",
+            )
+            .bind(row.seq)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            tracing::warn!(
+                seq = row.seq,
+                error = "keyboard_carrier",
+                "outbox delete skipped: message is the keyboard carrier"
+            );
+            return Ok(Delivery::Skipped);
+        }
+
         let result = deliver(self.api.as_ref(), &mut tx, &row, &outgoing, now).await;
         let outcome = match result {
             Ok(message_id) => {

@@ -144,6 +144,24 @@ pub async fn set_keyboard_message(
     Ok(old.flatten())
 }
 
+/// Текущий id носителя reply-клавиатуры чата; `None`, если носителя нет.
+///
+/// Читается в транзакции доставки `Delete` как страховка: удаление текущего
+/// носителя убирает клавиатуру, поэтому такой `Delete` пропускается (см.
+/// `outbox::deliver_one`).
+pub async fn keyboard_message_id(
+    conn: &mut PgConnection,
+    chat_id: i64,
+) -> Result<Option<i64>, sqlx::Error> {
+    let row: Option<Option<i64>> =
+        sqlx::query_scalar("SELECT keyboard_message_id FROM telegram_views WHERE chat_id = $1")
+            .bind(chat_id)
+            .fetch_optional(conn)
+            .await?;
+
+    Ok(row.flatten())
+}
+
 /// Форма чата.
 #[derive(Debug, Clone)]
 pub struct Conversation {
