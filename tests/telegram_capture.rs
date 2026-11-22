@@ -13,9 +13,10 @@ use tasklerq::llm::{Chain, LlmError, LlmHandle, LlmSnapshot};
 use tasklerq::security_audit::Audit;
 use tasklerq::telegram::bot::Bot;
 use tasklerq::telegram::capture_worker::{CaptureWorker, MAX_ATTEMPTS, Pass};
+use tasklerq::telegram::ru;
 use tokio::sync::Notify;
 
-use support::telegram::{FakeTelegram, Harness, button_rows};
+use support::telegram::{Call, FakeTelegram, Harness, button_rows};
 use support::{db, next_telegram_id};
 
 /// Двойник слота: отдаёт заготовленные ответы по очереди.
@@ -713,6 +714,49 @@ async fn text_does_not_replace_an_open_editor() {
         "text must not enqueue a capture job while the editor is open"
     );
     assert_eq!(stand.ai.calls(), calls_before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn menu_button_press_does_not_enqueue_a_parse() {
+    let db = db().await;
+    let mut stand = stand(&db.pool, vec![Ok(two_items())]).await;
+    stand.bot.assert_screen_contains("📋 Задачи · 0");
+    let before = stand.last_outbox_seq().await;
+    stand.bot.fake.clear_calls();
+
+    stand.bot.text(ru::MENU_BUTTON).await;
+
+    assert_eq!(stand.jobs().await, 0, "the button text must not be parsed");
+    assert_eq!(stand.ai.calls(), 0, "the LLM must not be called");
+    let rows = stand.outbox_since(before).await;
+    assert!(
+        rows.iter().any(|(kind, _)| kind == "delete"),
+        "the button text must be deleted: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|(kind, _)| kind == "keyboard"),
+        "the button press must not enqueue a carrier: {rows:?}"
+    );
+    assert!(
+        !stand
+            .bot
+            .fake
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::SendKeyboard { .. })),
+        "no SendKeyboard after the button press"
+    );
+    stand.bot.assert_screen_contains("📋 Задачи · 0");
+    assert!(
+        !stand.bot.screen().contains("Разбираю сообщение"),
+        "the button press must not show the parsing screen:\n{}",
+        stand.bot.screen()
+    );
+
+    // Проход воркера ничего не разбирает: черновик не создаётся.
+    assert_eq!(stand.work().await, Pass::Idle);
+    assert_eq!(stand.household_items().await, 0);
+    stand.bot.assert_screen_contains("📋 Задачи · 0");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

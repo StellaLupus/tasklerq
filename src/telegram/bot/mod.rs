@@ -759,6 +759,13 @@ async fn on_text(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
         return Ok(());
     }
 
+    // Нажатие кнопки reply-клавиатуры приходит обычным текстом с её подписью:
+    // это путь `/menu` без нового носителя, а не ввод пользователя. Совпадение
+    // точное, с эмодзи: «Меню» без эмодзи остаётся обычным текстом.
+    if text == ru::MENU_BUTTON {
+        return open_menu(ctx, false).await;
+    }
+
     if let Some((command, argument)) = parse_command(text) {
         return on_command(ctx, &command, argument).await;
     }
