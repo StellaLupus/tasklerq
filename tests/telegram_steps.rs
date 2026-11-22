@@ -33,6 +33,7 @@ fn ctx(conn: &mut PgConnection, chat: i64) -> Ctx<'_> {
         toast: None,
         banner: None,
         placement: Placement::Visible,
+        carrier_pending: false,
         llm_capture: false,
         tenancy: TenancyConfig {
             mode: TenancyMode::Multi,

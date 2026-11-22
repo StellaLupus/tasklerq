@@ -106,6 +106,62 @@ pub async fn mark_buried(conn: &mut PgConnection, chat_id: i64) -> Result<(), sq
     Ok(())
 }
 
+/// Записать id носителя reply-клавиатуры и вернуть прежний id носителя чата.
+///
+/// Прежний id читается в момент доставки нового носителя (под `FOR UPDATE`), а
+/// не при постановке, поэтому два носителя подряд оставляют в чате только
+/// второй. Запись — UPSERT по `chat_id`, как [`set_message`]: если строки вида
+/// нет, она создаётся (`view_key = 'unknown'`, `message_id` NULL, прочие колонки
+/// по умолчанию); если есть — обновляются только `keyboard_message_id` и
+/// `updated_at`. Порядок блокировок прежний: строка `outbox` уже заблокирована
+/// вызывающим, затем берётся строка `telegram_views`.
+pub async fn set_keyboard_message(
+    conn: &mut PgConnection,
+    chat_id: i64,
+    message_id: i64,
+    now: DateTime<Utc>,
+) -> Result<Option<i64>, sqlx::Error> {
+    let old: Option<Option<i64>> = sqlx::query_scalar(
+        "SELECT keyboard_message_id FROM telegram_views WHERE chat_id = $1 FOR UPDATE",
+    )
+    .bind(chat_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO telegram_views (chat_id, keyboard_message_id, view_key, updated_at)
+         VALUES ($1, $2, 'unknown', $3)
+         ON CONFLICT (chat_id)
+         DO UPDATE SET keyboard_message_id = EXCLUDED.keyboard_message_id,
+                       updated_at = EXCLUDED.updated_at",
+    )
+    .bind(chat_id)
+    .bind(message_id)
+    .bind(now)
+    .execute(conn)
+    .await?;
+
+    Ok(old.flatten())
+}
+
+/// Текущий id носителя reply-клавиатуры чата; `None`, если носителя нет.
+///
+/// Читается в транзакции доставки `Delete` как страховка: удаление текущего
+/// носителя убирает клавиатуру, поэтому такой `Delete` пропускается (см.
+/// `outbox::deliver_one`).
+pub async fn keyboard_message_id(
+    conn: &mut PgConnection,
+    chat_id: i64,
+) -> Result<Option<i64>, sqlx::Error> {
+    let row: Option<Option<i64>> =
+        sqlx::query_scalar("SELECT keyboard_message_id FROM telegram_views WHERE chat_id = $1")
+            .bind(chat_id)
+            .fetch_optional(conn)
+            .await?;
+
+    Ok(row.flatten())
+}
+
 /// Форма чата.
 #[derive(Debug, Clone)]
 pub struct Conversation {

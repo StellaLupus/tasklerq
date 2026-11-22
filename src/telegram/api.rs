@@ -140,6 +140,17 @@ pub trait TelegramApi: Send + Sync {
         disable_preview: bool,
     ) -> Result<i64, TelegramError>;
 
+    /// Отправить сообщение с постоянной reply-клавиатурой; возвращает `message_id`.
+    ///
+    /// `rows` — подписи кнопок по строкам: раскладка уходит в
+    /// `reply_markup.keyboard` как есть.
+    async fn send_keyboard_message(
+        &self,
+        chat_id: i64,
+        html: &str,
+        rows: &[Vec<String>],
+    ) -> Result<i64, TelegramError>;
+
     /// Заменить текст обычного сообщения.
     async fn edit_message_text(
         &self,
@@ -356,6 +367,30 @@ impl TelegramApi for HttpTelegramApi {
             // Одноразовая ссылка не должна раскрываться предпросмотром.
             body["link_preview_options"] = json!({"is_disabled": true});
         }
+        let sent: SentMessage = self.call("sendMessage", &body, None).await?;
+        Ok(sent.message_id)
+    }
+
+    async fn send_keyboard_message(
+        &self,
+        chat_id: i64,
+        html: &str,
+        rows: &[Vec<String>],
+    ) -> Result<i64, TelegramError> {
+        let keyboard: Vec<Vec<Value>> = rows
+            .iter()
+            .map(|row| row.iter().map(|label| json!({"text": label})).collect())
+            .collect();
+        let body = json!({
+            "chat_id": chat_id,
+            "text": html,
+            "parse_mode": "HTML",
+            "reply_markup": {
+                "keyboard": keyboard,
+                "is_persistent": true,
+                "resize_keyboard": true
+            }
+        });
         let sent: SentMessage = self.call("sendMessage", &body, None).await?;
         Ok(sent.message_id)
     }

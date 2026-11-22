@@ -129,6 +129,18 @@ pub enum Outgoing {
         /// Сообщение.
         message_id: i64,
     },
+    /// Носитель постоянной reply-клавиатуры (кнопка «🏠 Меню»).
+    ///
+    /// Отдельное сообщение с `reply_markup.keyboard`: клавиатура не может жить
+    /// на экране навигации с inline-кнопками. После доставки id носителя
+    /// запоминается, а прежний носитель чата удаляется (вариант A: сначала
+    /// новый, затем удаление прежнего).
+    Keyboard {
+        /// HTML текста носителя.
+        html: String,
+        /// Раскладка кнопок по строкам: подписи уходят в `reply_markup.keyboard`.
+        rows: Vec<Vec<String>>,
+    },
 }
 
 impl Outgoing {
@@ -138,6 +150,7 @@ impl Outgoing {
             Self::Message { .. } => "message",
             Self::Edit { .. } => "edit",
             Self::Delete { .. } => "delete",
+            Self::Keyboard { .. } => "keyboard",
         }
     }
 
@@ -163,6 +176,7 @@ impl Outgoing {
             }
             Self::Edit { message_id, html } => json!({"html": html, "message_id": message_id}),
             Self::Delete { message_id } => json!({"message_id": message_id}),
+            Self::Keyboard { html, rows } => json!({"html": html, "rows": rows}),
         }
     }
 
@@ -197,6 +211,13 @@ impl Outgoing {
             }),
             "delete" => Some(Self::Delete {
                 message_id: payload.get("message_id")?.as_i64()?,
+            }),
+            "keyboard" => Some(Self::Keyboard {
+                html: payload.get("html")?.as_str()?.to_owned(),
+                // Раскладка — массив массивов строк. Испорченное значение не
+                // подменяется умолчанием: строка уходит в `invalid_payload`,
+                // как испорченный `delete_after`.
+                rows: serde_json::from_value(payload.get("rows")?.clone()).ok()?,
             }),
             _ => None,
         }
@@ -468,6 +489,7 @@ struct Row {
     kind: String,
     payload: Value,
     attempts: i32,
+    dedupe_key: Option<String>,
 }
 
 impl OutboxWorker {
@@ -551,10 +573,15 @@ impl OutboxWorker {
         now: DateTime<Utc>,
         clock: Instant,
     ) -> Result<Delivery, sqlx::Error> {
+        // Префикс ключа дедупликации `Delete` прежнего носителя клавиатуры:
+        // ключ создаётся при доставке `Keyboard` (см. ниже), а по префиксу
+        // доставка отличает такое удаление от остальных.
+        const KEYBOARD_DELETE_PREFIX: &str = "keyboard:";
+
         let mut tx = self.pool.begin().await?;
         // Строка блокируется на время вызова API: второй воркер её пропустит.
         let row: Option<Row> = sqlx::query_as(
-            "SELECT seq, chat_id, kind::text AS kind, payload, attempts
+            "SELECT seq, chat_id, kind::text AS kind, payload, attempts, dedupe_key
              FROM outbox
              WHERE seq = $1 AND status = 'pending' AND next_attempt_at <= $2
              FOR UPDATE SKIP LOCKED",
@@ -581,6 +608,40 @@ impl OutboxWorker {
             return Ok(Delivery::Dead);
         };
 
+        // `Delete`, поставленный заменой носителя, удаляет служебное сообщение
+        // бота, а не сообщение пользователя: его отказ не закапывает активный
+        // экран (design, решение 3). Признак — префикс ключа дедупликации.
+        let carrier_delete = matches!(outgoing, Outgoing::Delete { .. })
+            && row
+                .dedupe_key
+                .as_deref()
+                .is_some_and(|key| key.starts_with(KEYBOARD_DELETE_PREFIX));
+
+        // Страховка: удаление текущего носителя клавиатуры убирает клавиатуру,
+        // поэтому такой `Delete` пропускается без вызова Telegram и без
+        // `mark_buried`. Прежний носитель под защиту не попадает: к моменту его
+        // доставки текущим уже стал новый id (вариант A).
+        if let Outgoing::Delete { message_id } = &outgoing
+            && views::keyboard_message_id(&mut tx, row.chat_id).await? == Some(*message_id)
+        {
+            sqlx::query(
+                "UPDATE outbox
+                 SET status = 'skipped', last_error = 'keyboard_carrier',
+                     payload = jsonb_build_object('redacted', true)
+                 WHERE seq = $1",
+            )
+            .bind(row.seq)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            tracing::warn!(
+                seq = row.seq,
+                error = "keyboard_carrier",
+                "outbox delete skipped: message is the keyboard carrier"
+            );
+            return Ok(Delivery::Skipped);
+        }
+
         let result = deliver(self.api.as_ref(), &mut tx, &row, &outgoing, now).await;
         let outcome = match result {
             Ok(message_id) => {
@@ -597,8 +658,12 @@ impl OutboxWorker {
                 .await?;
                 // Новое самостоятельное сообщение встаёт ниже якоря: править
                 // экран на месте больше нельзя. Правка (`edit`) признак не
-                // меняет: сообщение уже было в чате.
-                if matches!(outgoing, Outgoing::Message { .. }) {
+                // меняет: сообщение уже было в чате. Носитель клавиатуры тоже
+                // приходит новым сообщением ниже якоря.
+                if matches!(
+                    outgoing,
+                    Outgoing::Message { .. } | Outgoing::Keyboard { .. }
+                ) {
                     views::mark_buried(&mut tx, row.chat_id).await?;
                 }
                 // Автоудаление отсчитывается от фактической доставки, поэтому
@@ -618,6 +683,28 @@ impl OutboxWorker {
                         now + Duration::seconds(i64::from(*seconds)),
                     )
                     .await?;
+                }
+                // Вариант A: носитель уже доставлен, теперь в той же транзакции
+                // запоминаем его id и ставим удаление прежнего. Прежний id
+                // читается в момент доставки, поэтому два носителя подряд
+                // оставляют в чате только второй. Запись и постановка — только
+                // после успешной отправки: повтор при временном сбое ничего не
+                // меняет.
+                if matches!(outgoing, Outgoing::Keyboard { .. }) {
+                    let old =
+                        views::set_keyboard_message(&mut tx, row.chat_id, message_id, now).await?;
+                    if let Some(old) = old.filter(|old| *old != message_id) {
+                        let key = format!("{KEYBOARD_DELETE_PREFIX}{}:{old}", row.chat_id);
+                        enqueue_at(
+                            &mut tx,
+                            row.chat_id,
+                            &Outgoing::Delete { message_id: old },
+                            Some(&key),
+                            now,
+                            now,
+                        )
+                        .await?;
+                    }
                 }
                 Delivery::Sent
             }
@@ -650,10 +737,15 @@ impl OutboxWorker {
                 .bind(code)
                 .execute(&mut *tx)
                 .await?;
-                // Сообщение пользователя осталось в чате: следующий экран
-                // должен прийти новым сообщением. Строку вида не создаём —
-                // без активного экрана `buried` не нужен (см. `views`).
-                views::mark_buried(&mut tx, row.chat_id).await?;
+                // Отказ удаления прежнего носителя считается выполненным:
+                // это служебное сообщение бота, активный экран от него не
+                // засыпает (design, решение 3). У остальных удалений сообщение
+                // пользователя осталось в чате: следующий экран должен прийти
+                // новым сообщением. Строку вида не создаём — без активного
+                // экрана `buried` не нужен (см. `views`).
+                if !carrier_delete {
+                    views::mark_buried(&mut tx, row.chat_id).await?;
+                }
                 tracing::warn!(
                     seq = row.seq,
                     error = code,
@@ -664,9 +756,11 @@ impl OutboxWorker {
             Err(error) if error.is_retryable() => {
                 let attempts = row.attempts + 1;
                 if attempts >= MAX_ATTEMPTS {
-                    // Сообщение пользователя осталось в чате: следующий
-                    // экран должен прийти новым сообщением.
-                    if matches!(outgoing, Outgoing::Delete { .. }) {
+                    // Сообщение пользователя осталось в чате: следующий экран
+                    // должен прийти новым сообщением. Прежний носитель —
+                    // исключение: это служебное сообщение бота, экран от него
+                    // не засыпает.
+                    if matches!(outgoing, Outgoing::Delete { .. }) && !carrier_delete {
                         views::mark_buried(&mut tx, row.chat_id).await?;
                     }
                     mark_dead(&mut tx, row.seq, error.code(), now).await?;
@@ -688,8 +782,10 @@ impl OutboxWorker {
             }
             Err(error) => {
                 // Любой окончательный отказ удаления, кроме «сообщения нет»,
-                // оставляет сообщение пользователя в чате.
-                if matches!(outgoing, Outgoing::Delete { .. }) {
+                // оставляет сообщение пользователя в чате. Прежний носитель —
+                // исключение: это служебное сообщение бота, экран от него
+                // не засыпает.
+                if matches!(outgoing, Outgoing::Delete { .. }) && !carrier_delete {
                     views::mark_buried(&mut tx, row.chat_id).await?;
                 }
                 mark_dead(&mut tx, row.seq, error.code(), now).await?;
@@ -845,6 +941,9 @@ async fn deliver(
                 Err(error) => Err(error),
             }
         }
+        Outgoing::Keyboard { html, rows } => {
+            api.send_keyboard_message(row.chat_id, html, rows).await
+        }
     }
 }
 
@@ -975,12 +1074,49 @@ mod tests {
                 html: "c".into(),
             },
             Outgoing::Delete { message_id: 8 },
+            Outgoing::Keyboard {
+                html: "d".into(),
+                rows: vec![vec!["🏠 Меню".into()]],
+            },
         ] {
             assert_eq!(
                 Outgoing::from_row(outgoing.kind(), &outgoing.payload()),
                 Some(outgoing)
             );
         }
+    }
+
+    #[test]
+    fn keyboard_payload_contains_rows() {
+        let outgoing = Outgoing::Keyboard {
+            html: "носитель".into(),
+            rows: vec![vec!["🏠 Меню".into()], vec!["a".into(), "b".into()]],
+        };
+        assert_eq!(
+            outgoing.payload(),
+            json!({"html": "носитель", "rows": [["🏠 Меню"], ["a", "b"]]})
+        );
+    }
+
+    #[test]
+    fn keyboard_row_with_invalid_rows_is_not_parsed() {
+        for rows in [
+            json!("abc"),
+            json!([1, 2]),
+            json!([["a"], "b"]),
+            json!({"a": "b"}),
+        ] {
+            assert_eq!(
+                Outgoing::from_row("keyboard", &json!({"html": "a", "rows": rows})),
+                None,
+                "rows {rows} must become invalid_payload, not a keyboard"
+            );
+        }
+        assert_eq!(
+            Outgoing::from_row("keyboard", &json!({"rows": [["a"]]})),
+            None,
+            "a keyboard without html must become invalid_payload"
+        );
     }
 
     #[test]

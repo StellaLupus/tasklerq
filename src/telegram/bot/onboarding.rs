@@ -304,6 +304,9 @@ pub(super) async fn claim_existing_owner(
             ctx.user = Some(user);
             ctx.household = Some(household);
             ctx.banner(text);
+            // Claim завершает онбординг и вне `/start`: классификатор первого
+            // контакта назначает ожидаемого владельца из `start_onboarding`.
+            ctx.carrier_pending = true;
             ctx.present(Screen::Menu).await?;
             Ok(true)
         }
@@ -633,6 +636,7 @@ async fn create(
             ctx.tz = display_timezone(Some(&onboarded.user), Some(&onboarded.household));
             ctx.user = Some(onboarded.user);
             ctx.household = Some(onboarded.household);
+            ctx.carrier_pending = true;
             return ctx.present(Screen::Menu).await;
         }
         Ok(onboarded) => {
@@ -675,6 +679,10 @@ async fn create(
     ctx.tz = display_timezone(Some(&onboarded.user), Some(&onboarded.household));
     ctx.user = Some(onboarded.user);
     ctx.household = Some(onboarded.household);
+    // Создание household завершает онбординг вне `/start` (название текстом,
+    // пояс — текстом или кнопкой): носитель встаёт перед приветствием, а
+    // принудительный `Fresh` в `present` не даёт править якорь формы на месте.
+    ctx.carrier_pending = true;
     ctx.present(Screen::Welcome).await
 }
 

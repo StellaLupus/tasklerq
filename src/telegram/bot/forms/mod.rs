@@ -365,6 +365,10 @@ pub async fn start_onboarding(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
     if ctx.user.is_some() {
         if matches!(load(ctx).await?, Some(Form::Onboarding { .. })) {
             clear(ctx).await?;
+            // Онбординг завершён: отправитель стал участником, пока форма была
+            // открыта. Первый экран участника получает носитель и вне `/start`
+            // (например, выбор часового пояса кнопкой).
+            ctx.carrier_pending = true;
         }
         return ctx.present(Screen::Menu).await;
     }
