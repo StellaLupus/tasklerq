@@ -49,7 +49,7 @@
 
 ## 3. Бот: носитель и кнопка
 
-- [ ] 3.1 `ru::KEYBOARD_CARRIER_TEXT`, функция раскладки `keyboard_rows()`
+- [x] 3.1 `ru::KEYBOARD_CARRIER_TEXT`, функция раскладки `keyboard_rows()`
   (подпись — `ru::MENU_BUTTON`), флаг `Ctx::carrier_pending` и постановка
   носителя в `Ctx::present` перед первым `Screen::Menu`/`Screen::Welcome`
   участника с принудительным `Placement::Fresh`; ветка `"menu"` из

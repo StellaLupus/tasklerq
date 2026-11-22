@@ -40,6 +40,7 @@ use crate::storage::repositories::{households, users};
 use super::callbacks::{self, Consumed, NewToken, Scope};
 use super::outbox::{self, Outgoing, Placement};
 use super::rich::{self, Block, Button, Span};
+use super::ru;
 use super::update::{Incoming, Sender};
 use super::views::{self, Lookup};
 use model::{Action, Screen, Ui};
@@ -213,6 +214,8 @@ pub struct Ctx<'a> {
     /// Правило видимости для следующего экрана. Обработчик выставляет его до
     /// вызова [`Ctx::present`]/[`Ctx::show`]; по умолчанию — [`Placement::Visible`].
     pub placement: Placement,
+    /// Перед первым экраном участника поставить носитель клавиатуры.
+    pub carrier_pending: bool,
     /// Свободный текст уходит на разбор в LLM.
     pub llm_capture: bool,
     /// Политика размещения инсталляции.
@@ -279,7 +282,31 @@ impl Ctx<'_> {
     }
 
     /// Показать экран: собрать, выпустить токены и поставить в outbox.
+    ///
+    /// Если стоит [`Ctx::carrier_pending`], экран — первый экран участника
+    /// (меню или приветствие), а отправитель — участник, раньше экрана в
+    /// очередь встаёт носитель клавиатуры, а размещение становится
+    /// [`Placement::Fresh`]: экран должен прийти новым сообщением ниже
+    /// носителя. Экраны онбординга флаг не сбрасывают.
     pub async fn present(&mut self, screen: Screen) -> Result<(), Fail> {
+        if self.carrier_pending
+            && self.user.is_some()
+            && matches!(screen, Screen::Menu | Screen::Welcome)
+        {
+            outbox::enqueue(
+                &mut *self.conn,
+                self.chat_id,
+                &Outgoing::Keyboard {
+                    html: rich::escape(ru::KEYBOARD_CARRIER_TEXT),
+                    rows: keyboard_rows(),
+                },
+                None,
+                self.now,
+            )
+            .await?;
+            self.placement = Placement::Fresh;
+            self.carrier_pending = false;
+        }
         let ui = screens::build(self, &screen).await?;
         self.show(&screen, ui).await
     }
@@ -545,6 +572,7 @@ impl Bot {
             toast: None,
             banner,
             placement: Placement::Visible,
+            carrier_pending: false,
             llm_capture: self.llm_capture(),
             tenancy: self.tenancy,
             audit: self.audit.as_ref(),
@@ -647,6 +675,7 @@ impl Bot {
             toast: None,
             banner: None,
             placement: Placement::Visible,
+            carrier_pending: false,
             llm_capture: self.llm_capture(),
             tenancy: self.tenancy,
             audit: self.audit.as_ref(),
@@ -869,6 +898,14 @@ impl<'a> Ctx<'a> {
     }
 }
 
+/// Раскладка постоянной reply-клавиатуры: один ряд с одной кнопкой меню.
+///
+/// Единственное место, где строится раскладка носителя: подписи уходят в
+/// `reply_markup.keyboard`, доставка от слоя бота не зависит.
+fn keyboard_rows() -> Vec<Vec<String>> {
+    vec![vec![ru::MENU_BUTTON.to_owned()]]
+}
+
 /// Ключ удаления входящего сообщения.
 ///
 /// Страховка от двойной постановки: одно сообщение удаляется не больше раза.
@@ -888,6 +925,19 @@ fn parse_command(text: &str) -> Option<(String, &str)> {
     Some((command, argument))
 }
 
+/// Открыть главное меню, а без household — онбординг: общий путь `/menu` и
+/// нажатия кнопки клавиатуры. Форма очищается, экран всегда приходит заново.
+/// `carrier` — ставить ли перед экраном носитель клавиатуры: `/menu` ставит,
+/// нажатие кнопки — нет (носитель уже в чате).
+async fn open_menu(ctx: &mut Ctx<'_>, carrier: bool) -> Result<(), Fail> {
+    ctx.placement = Placement::Fresh;
+    views::clear_conversation(&mut *ctx.conn, ctx.chat_id).await?;
+    if carrier {
+        ctx.carrier_pending = true;
+    }
+    ctx.menu_or_onboarding().await
+}
+
 async fn on_command(ctx: &mut Ctx<'_>, command: &str, argument: &str) -> Result<(), Fail> {
     match command {
         "start" => {
@@ -896,11 +946,7 @@ async fn on_command(ctx: &mut Ctx<'_>, command: &str, argument: &str) -> Result<
             ctx.placement = Placement::Fresh;
             onboarding::on_start(ctx, argument).await
         }
-        "menu" => {
-            ctx.placement = Placement::Fresh;
-            views::clear_conversation(&mut *ctx.conn, ctx.chat_id).await?;
-            ctx.menu_or_onboarding().await
-        }
+        "menu" => open_menu(ctx, true).await,
         "cancel" => {
             views::clear_conversation(&mut *ctx.conn, ctx.chat_id).await?;
             ctx.banner("Действие отменено.");
@@ -1217,6 +1263,11 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
 mod tests {
     use super::*;
     use crate::telegram::rich::button;
+
+    #[test]
+    fn keyboard_rows_are_a_single_row_with_the_menu_button() {
+        assert_eq!(keyboard_rows(), vec![vec![ru::MENU_BUTTON.to_owned()]]);
+    }
 
     #[test]
     fn banner_with_a_button_is_rendered_above_the_screen() {

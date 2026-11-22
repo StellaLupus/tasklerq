@@ -406,6 +406,7 @@ pub async fn present_with_banner(
         toast: None,
         banner: None,
         placement: Placement::Visible,
+        carrier_pending: false,
         llm_capture: false,
         tenancy: tasklerq::config::TenancyConfig {
             mode: tasklerq::config::TenancyMode::Single,

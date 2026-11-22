@@ -20,7 +20,7 @@ use tasklerq::telegram::bot::model::{Action, FormAct, Screen, Ui};
 use tasklerq::telegram::bot::{Bot, issue_and_render};
 use tasklerq::telegram::callbacks::{self, NewToken, Scope};
 use tasklerq::telegram::outbox::{self, Outgoing};
-use tasklerq::telegram::rich::button;
+use tasklerq::telegram::rich::{button, escape};
 use tasklerq::telegram::ru;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2818,6 +2818,101 @@ async fn repeated_start_and_menu_send_a_new_screen() {
         assert!(!is_alive(&bot, anchor));
         bot.assert_screen_contains("📋 Задачи · 0");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn menu_sends_the_keyboard_carrier_before_the_menu() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let (anchor, _) = bot.active();
+    bot.fake.clear_calls();
+
+    let (message_id, rows) = send_text(&mut bot, "/menu").await;
+
+    // В outbox носитель стоит после удаления входящего и раньше экрана меню.
+    let deleted = delete_seq(&rows, message_id);
+    let carrier = rows
+        .iter()
+        .find(|(_, kind, _)| kind == "keyboard")
+        .unwrap_or_else(|| panic!("no keyboard row after /menu: {rows:?}"))
+        .0;
+    let screen = rows
+        .iter()
+        .find(|(_, kind, _)| kind == "screen")
+        .unwrap_or_else(|| panic!("no screen row after /menu: {rows:?}"))
+        .0;
+    assert!(
+        deleted < carrier && carrier < screen,
+        "the carrier must be queued before the menu: {rows:?}"
+    );
+
+    // Носитель доставлен с текстом спеки и раскладкой из одной кнопки меню.
+    // Payload строки после доставки скрыт, поэтому содержимое проверяется по
+    // вызову фейка: он получает html и rows прямо из строки outbox.
+    let calls = bot.fake.calls();
+    let keyboards: Vec<_> = calls
+        .iter()
+        .filter_map(|call| match call {
+            Call::SendKeyboard { html, rows, .. } => Some((html, rows)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(keyboards.len(), 1, "exactly one carrier: {calls:?}");
+    assert_eq!(keyboards[0].0, &escape(ru::KEYBOARD_CARRIER_TEXT));
+    assert_eq!(keyboards[0].1, &vec![vec![ru::MENU_BUTTON.to_owned()]]);
+
+    // Вызовы фейка: сначала носитель, затем меню.
+    let carrier_at = calls
+        .iter()
+        .position(|call| matches!(call, Call::SendKeyboard { .. }))
+        .expect("SendKeyboard");
+    let menu_at = calls
+        .iter()
+        .position(|call| matches!(call, Call::SendRich { .. }))
+        .expect("SendRich");
+    assert!(
+        carrier_at < menu_at,
+        "the carrier must be sent before the menu: {calls:?}"
+    );
+
+    // В чате меню приходит новым сообщением ниже носителя; якорь удалён.
+    let (carrier_id, carrier_html) = bot
+        .fake
+        .messages(bot.chat)
+        .into_iter()
+        .find(|(_, html)| html == &escape(ru::KEYBOARD_CARRIER_TEXT))
+        .expect("the carrier must stay in the chat");
+    let (menu_id, _) = bot.active();
+    assert!(
+        menu_id > carrier_id,
+        "the menu must arrive below the carrier"
+    );
+    assert!(is_alive(&bot, carrier_id));
+    assert!(!is_alive(&bot, anchor));
+    assert_eq!(carrier_html, escape(ru::KEYBOARD_CARRIER_TEXT));
+    bot.assert_screen_contains("📋 Задачи · 0");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn menu_without_a_household_shows_onboarding_without_the_carrier() {
+    let db = db().await;
+    let mut bot = Harness::new(&db.pool, next_telegram_id());
+    bot.fake.clear_calls();
+
+    let (_, rows) = send_text(&mut bot, "/menu").await;
+
+    assert!(
+        !rows.iter().any(|(_, kind, _)| kind == "keyboard"),
+        "onboarding must not get a carrier: {rows:?}"
+    );
+    assert!(
+        !bot.fake
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::SendKeyboard { .. })),
+        "no SendKeyboard without a household"
+    );
+    bot.assert_screen_contains("Как назовём ваше пространство");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
