@@ -26,7 +26,7 @@
   `is_persistent: true`, `resize_keyboard: true`. Проверить тестом в
   `tests/telegram_api.rs`: тело запроса содержит эти поля и `parse_mode: HTML`
   (design, решение 1).
-- [ ] 2.3 `Outgoing::Keyboard { html, rows }` в `src/telegram/outbox.rs`:
+- [x] 2.3 `Outgoing::Keyboard { html, rows }` в `src/telegram/outbox.rs`:
   сериализация (`rows` в payload), доставка через `send_keyboard_message`,
   `mark_buried`, запись id носителя UPSERT-ом по `chat_id`, замена
   прежнего носителя по варианту, выбранному в 1.1 (A — `Delete` прежнего с

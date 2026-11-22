@@ -129,6 +129,18 @@ pub enum Outgoing {
         /// Сообщение.
         message_id: i64,
     },
+    /// Носитель постоянной reply-клавиатуры (кнопка «🏠 Меню»).
+    ///
+    /// Отдельное сообщение с `reply_markup.keyboard`: клавиатура не может жить
+    /// на экране навигации с inline-кнопками. После доставки id носителя
+    /// запоминается, а прежний носитель чата удаляется (вариант A: сначала
+    /// новый, затем удаление прежнего).
+    Keyboard {
+        /// HTML текста носителя.
+        html: String,
+        /// Раскладка кнопок по строкам: подписи уходят в `reply_markup.keyboard`.
+        rows: Vec<Vec<String>>,
+    },
 }
 
 impl Outgoing {
@@ -138,6 +150,7 @@ impl Outgoing {
             Self::Message { .. } => "message",
             Self::Edit { .. } => "edit",
             Self::Delete { .. } => "delete",
+            Self::Keyboard { .. } => "keyboard",
         }
     }
 
@@ -163,6 +176,7 @@ impl Outgoing {
             }
             Self::Edit { message_id, html } => json!({"html": html, "message_id": message_id}),
             Self::Delete { message_id } => json!({"message_id": message_id}),
+            Self::Keyboard { html, rows } => json!({"html": html, "rows": rows}),
         }
     }
 
@@ -197,6 +211,13 @@ impl Outgoing {
             }),
             "delete" => Some(Self::Delete {
                 message_id: payload.get("message_id")?.as_i64()?,
+            }),
+            "keyboard" => Some(Self::Keyboard {
+                html: payload.get("html")?.as_str()?.to_owned(),
+                // Раскладка — массив массивов строк. Испорченное значение не
+                // подменяется умолчанием: строка уходит в `invalid_payload`,
+                // как испорченный `delete_after`.
+                rows: serde_json::from_value(payload.get("rows")?.clone()).ok()?,
             }),
             _ => None,
         }
@@ -597,8 +618,12 @@ impl OutboxWorker {
                 .await?;
                 // Новое самостоятельное сообщение встаёт ниже якоря: править
                 // экран на месте больше нельзя. Правка (`edit`) признак не
-                // меняет: сообщение уже было в чате.
-                if matches!(outgoing, Outgoing::Message { .. }) {
+                // меняет: сообщение уже было в чате. Носитель клавиатуры тоже
+                // приходит новым сообщением ниже якоря.
+                if matches!(
+                    outgoing,
+                    Outgoing::Message { .. } | Outgoing::Keyboard { .. }
+                ) {
                     views::mark_buried(&mut tx, row.chat_id).await?;
                 }
                 // Автоудаление отсчитывается от фактической доставки, поэтому
@@ -618,6 +643,28 @@ impl OutboxWorker {
                         now + Duration::seconds(i64::from(*seconds)),
                     )
                     .await?;
+                }
+                // Вариант A: носитель уже доставлен, теперь в той же транзакции
+                // запоминаем его id и ставим удаление прежнего. Прежний id
+                // читается в момент доставки, поэтому два носителя подряд
+                // оставляют в чате только второй. Запись и постановка — только
+                // после успешной отправки: повтор при временном сбое ничего не
+                // меняет.
+                if matches!(outgoing, Outgoing::Keyboard { .. }) {
+                    let old =
+                        views::set_keyboard_message(&mut tx, row.chat_id, message_id, now).await?;
+                    if let Some(old) = old.filter(|old| *old != message_id) {
+                        let key = format!("keyboard:{}:{old}", row.chat_id);
+                        enqueue_at(
+                            &mut tx,
+                            row.chat_id,
+                            &Outgoing::Delete { message_id: old },
+                            Some(&key),
+                            now,
+                            now,
+                        )
+                        .await?;
+                    }
                 }
                 Delivery::Sent
             }
@@ -845,6 +892,9 @@ async fn deliver(
                 Err(error) => Err(error),
             }
         }
+        Outgoing::Keyboard { html, rows } => {
+            api.send_keyboard_message(row.chat_id, html, rows).await
+        }
     }
 }
 
@@ -975,12 +1025,49 @@ mod tests {
                 html: "c".into(),
             },
             Outgoing::Delete { message_id: 8 },
+            Outgoing::Keyboard {
+                html: "d".into(),
+                rows: vec![vec!["🏠 Меню".into()]],
+            },
         ] {
             assert_eq!(
                 Outgoing::from_row(outgoing.kind(), &outgoing.payload()),
                 Some(outgoing)
             );
         }
+    }
+
+    #[test]
+    fn keyboard_payload_contains_rows() {
+        let outgoing = Outgoing::Keyboard {
+            html: "носитель".into(),
+            rows: vec![vec!["🏠 Меню".into()], vec!["a".into(), "b".into()]],
+        };
+        assert_eq!(
+            outgoing.payload(),
+            json!({"html": "носитель", "rows": [["🏠 Меню"], ["a", "b"]]})
+        );
+    }
+
+    #[test]
+    fn keyboard_row_with_invalid_rows_is_not_parsed() {
+        for rows in [
+            json!("abc"),
+            json!([1, 2]),
+            json!([["a"], "b"]),
+            json!({"a": "b"}),
+        ] {
+            assert_eq!(
+                Outgoing::from_row("keyboard", &json!({"html": "a", "rows": rows})),
+                None,
+                "rows {rows} must become invalid_payload, not a keyboard"
+            );
+        }
+        assert_eq!(
+            Outgoing::from_row("keyboard", &json!({"rows": [["a"]]})),
+            None,
+            "a keyboard without html must become invalid_payload"
+        );
     }
 
     #[test]
