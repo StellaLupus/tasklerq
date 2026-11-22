@@ -1582,21 +1582,55 @@ async fn keyboard_without_a_view_row_creates_it_and_the_next_one_replaces_it() {
     );
 }
 
+/// Замена носителя при видимом экране меню: в очереди носитель, экран `Fresh`,
+/// затем `Delete{old}`, поставленный при доставке носителя (seq больше экрана).
+/// Возвращает id прежнего носителя и seq его удаления.
+///
+/// Ошибку отказа удалений вызывающий ставит заранее: удаление якоря экраном
+/// `Fresh` молча игнорируется и на исход не влияет.
+async fn replaced_carrier_with_visible_menu(rig: &mut Rig) -> (i64, i64) {
+    rig.keyboard("<p>носитель 1</p>").await;
+    assert_eq!(rig.pass().await, 1);
+    let first = rig.keyboard_message_id().await.expect("carrier id");
+
+    // До замены в чате видимый экран меню: вид не засыпан.
+    rig.screen_with("<p>меню</p>", Placement::Fresh).await;
+    assert_eq!(rig.pass_after(SECOND).await, 1);
+    assert!(!rig.buried().await);
+
+    let carrier_seq = rig.keyboard("<p>носитель 2</p>").await;
+    let screen_seq = rig.screen_with("<p>меню 2</p>", Placement::Fresh).await;
+    // Носитель закапывает вид; экран `Fresh` приходит новым сообщением после
+    // носителя и снимает признак.
+    assert_eq!(rig.pass_after(SECOND).await, 1);
+    assert!(rig.buried().await, "a delivered carrier must bury the view");
+    assert_eq!(rig.pass_after(SECOND).await, 1);
+    assert!(
+        !rig.buried().await,
+        "a Fresh screen after the carrier is visible"
+    );
+
+    let deletes = rig.delete_rows().await;
+    assert_eq!(deletes.len(), 1, "{deletes:?}");
+    assert!(
+        carrier_seq < screen_seq && screen_seq < deletes[0].0,
+        "queue order must be carrier, screen, Delete{{old}}: {carrier_seq}, {screen_seq}, {}",
+        deletes[0].0
+    );
+    (first, deletes[0].0)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn undeletable_old_carrier_is_skipped_without_dead_metric() {
     let _dead = DEAD_METRIC.lock().await;
     let db = db().await;
     let mut rig = Rig::new(&db.pool);
-    rig.keyboard("<p>носитель 1</p>").await;
-    assert_eq!(rig.pass().await, 1);
-    let first = rig.keyboard_message_id().await.expect("carrier id");
-
     rig.fake
         .reject_deletes(Some(TelegramError::MessageUndeletable));
-    rig.keyboard("<p>носитель 2</p>").await;
-    assert_eq!(rig.pass_after(SECOND).await, 1);
+    let (first, delete_seq) = replaced_carrier_with_visible_menu(&mut rig).await;
     let second = rig.keyboard_message_id().await.expect("second carrier id");
 
+    // `Delete{old}` доставляется после экрана: прежний носитель старше 48 часов.
     let before = counter(&tasklerq::metrics::render(), "outbox_dead_total");
     assert_eq!(rig.pass().await, 0);
     let after = counter(&tasklerq::metrics::render(), "outbox_dead_total");
@@ -1605,10 +1639,8 @@ async fn undeletable_old_carrier_is_skipped_without_dead_metric() {
         "an undeletable old carrier is skipped, not a dead-letter"
     );
 
-    let deletes = rig.delete_rows().await;
-    assert_eq!(deletes.len(), 1, "{deletes:?}");
     assert_eq!(
-        rig.row(deletes[0].0).await,
+        rig.row(delete_seq).await,
         (
             "skipped".into(),
             0,
@@ -1616,13 +1648,66 @@ async fn undeletable_old_carrier_is_skipped_without_dead_metric() {
             None
         )
     );
+    let deletes = rig.delete_rows().await;
+    assert_eq!(deletes.len(), 1, "{deletes:?}");
     assert_eq!(
         deletes[0].3.as_deref(),
         Some(format!("keyboard:{}:{first}", rig.chat).as_str())
     );
     // Новый носитель работает как обычно, прежний остаётся в истории.
     assert_eq!(rig.keyboard_message_id().await, Some(second));
-    assert_eq!(rig.fake.messages(rig.chat).len(), 2);
+    // Отказ удаления служебного носителя не закапывает только что показанное
+    // меню: следующая навигация правит экран на месте.
+    assert!(
+        !rig.buried().await,
+        "an undeletable old carrier must not bury the shown menu"
+    );
+    assert_eq!(
+        rig.fake.messages(rig.chat).last().expect("menu message").1,
+        "<p>меню 2</p>",
+        "the menu stays the latest message in the chat"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exhausted_carrier_delete_is_dead_without_burying_the_view() {
+    let _dead = DEAD_METRIC.lock().await;
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    rig.fake
+        .reject_deletes(Some(TelegramError::Transient("503".into())));
+    let (_, delete_seq) = replaced_carrier_with_visible_menu(&mut rig).await;
+
+    for _ in 0..MAX_ATTEMPTS {
+        rig.pass_after(StdDuration::from_secs(400)).await;
+    }
+
+    assert_eq!(rig.row(delete_seq).await.0, "dead");
+    assert!(
+        !rig.buried().await,
+        "a dead old-carrier delete must not bury the shown menu"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn permanently_failed_carrier_delete_is_dead_without_burying_the_view() {
+    let _dead = DEAD_METRIC.lock().await;
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    rig.fake
+        .reject_deletes(Some(TelegramError::BadRequest("bad".into())));
+    let (_, delete_seq) = replaced_carrier_with_visible_menu(&mut rig).await;
+
+    assert_eq!(rig.pass().await, 0);
+
+    assert_eq!(
+        rig.row(delete_seq).await,
+        ("dead".into(), 0, Some("bad_request".into()), None)
+    );
+    assert!(
+        !rig.buried().await,
+        "a dead old-carrier delete must not bury the shown menu"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

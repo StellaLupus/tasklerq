@@ -489,6 +489,7 @@ struct Row {
     kind: String,
     payload: Value,
     attempts: i32,
+    dedupe_key: Option<String>,
 }
 
 impl OutboxWorker {
@@ -572,10 +573,15 @@ impl OutboxWorker {
         now: DateTime<Utc>,
         clock: Instant,
     ) -> Result<Delivery, sqlx::Error> {
+        // Префикс ключа дедупликации `Delete` прежнего носителя клавиатуры:
+        // ключ создаётся при доставке `Keyboard` (см. ниже), а по префиксу
+        // доставка отличает такое удаление от остальных.
+        const KEYBOARD_DELETE_PREFIX: &str = "keyboard:";
+
         let mut tx = self.pool.begin().await?;
         // Строка блокируется на время вызова API: второй воркер её пропустит.
         let row: Option<Row> = sqlx::query_as(
-            "SELECT seq, chat_id, kind::text AS kind, payload, attempts
+            "SELECT seq, chat_id, kind::text AS kind, payload, attempts, dedupe_key
              FROM outbox
              WHERE seq = $1 AND status = 'pending' AND next_attempt_at <= $2
              FOR UPDATE SKIP LOCKED",
@@ -601,6 +607,15 @@ impl OutboxWorker {
             tx.commit().await?;
             return Ok(Delivery::Dead);
         };
+
+        // `Delete`, поставленный заменой носителя, удаляет служебное сообщение
+        // бота, а не сообщение пользователя: его отказ не закапывает активный
+        // экран (design, решение 3). Признак — префикс ключа дедупликации.
+        let carrier_delete = matches!(outgoing, Outgoing::Delete { .. })
+            && row
+                .dedupe_key
+                .as_deref()
+                .is_some_and(|key| key.starts_with(KEYBOARD_DELETE_PREFIX));
 
         // Страховка: удаление текущего носителя клавиатуры убирает клавиатуру,
         // поэтому такой `Delete` пропускается без вызова Telegram и без
@@ -679,7 +694,7 @@ impl OutboxWorker {
                     let old =
                         views::set_keyboard_message(&mut tx, row.chat_id, message_id, now).await?;
                     if let Some(old) = old.filter(|old| *old != message_id) {
-                        let key = format!("keyboard:{}:{old}", row.chat_id);
+                        let key = format!("{KEYBOARD_DELETE_PREFIX}{}:{old}", row.chat_id);
                         enqueue_at(
                             &mut tx,
                             row.chat_id,
@@ -722,10 +737,15 @@ impl OutboxWorker {
                 .bind(code)
                 .execute(&mut *tx)
                 .await?;
-                // Сообщение пользователя осталось в чате: следующий экран
-                // должен прийти новым сообщением. Строку вида не создаём —
-                // без активного экрана `buried` не нужен (см. `views`).
-                views::mark_buried(&mut tx, row.chat_id).await?;
+                // Отказ удаления прежнего носителя считается выполненным:
+                // это служебное сообщение бота, активный экран от него не
+                // засыпает (design, решение 3). У остальных удалений сообщение
+                // пользователя осталось в чате: следующий экран должен прийти
+                // новым сообщением. Строку вида не создаём — без активного
+                // экрана `buried` не нужен (см. `views`).
+                if !carrier_delete {
+                    views::mark_buried(&mut tx, row.chat_id).await?;
+                }
                 tracing::warn!(
                     seq = row.seq,
                     error = code,
@@ -736,9 +756,11 @@ impl OutboxWorker {
             Err(error) if error.is_retryable() => {
                 let attempts = row.attempts + 1;
                 if attempts >= MAX_ATTEMPTS {
-                    // Сообщение пользователя осталось в чате: следующий
-                    // экран должен прийти новым сообщением.
-                    if matches!(outgoing, Outgoing::Delete { .. }) {
+                    // Сообщение пользователя осталось в чате: следующий экран
+                    // должен прийти новым сообщением. Прежний носитель —
+                    // исключение: это служебное сообщение бота, экран от него
+                    // не засыпает.
+                    if matches!(outgoing, Outgoing::Delete { .. }) && !carrier_delete {
                         views::mark_buried(&mut tx, row.chat_id).await?;
                     }
                     mark_dead(&mut tx, row.seq, error.code(), now).await?;
@@ -760,8 +782,10 @@ impl OutboxWorker {
             }
             Err(error) => {
                 // Любой окончательный отказ удаления, кроме «сообщения нет»,
-                // оставляет сообщение пользователя в чате.
-                if matches!(outgoing, Outgoing::Delete { .. }) {
+                // оставляет сообщение пользователя в чате. Прежний носитель —
+                // исключение: это служебное сообщение бота, экран от него
+                // не засыпает.
+                if matches!(outgoing, Outgoing::Delete { .. }) && !carrier_delete {
                     views::mark_buried(&mut tx, row.chat_id).await?;
                 }
                 mark_dead(&mut tx, row.seq, error.code(), now).await?;
