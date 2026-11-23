@@ -2,30 +2,30 @@
 
 ## 1. Основа: миграция, удаления уборки, отметка «убрано»
 
-- [ ] 1.1 Миграция `0025_notice_cleanup.sql` (номер сдвигается, если 0016 ещё
+- [x] 1.1 Миграция `0025_notice_cleanup.sql` (номер сдвигается, если 0016 ещё
   не слит): `notification_deliveries.dismissed_at timestamptz NULL` и
   `replaces_message_id bigint NULL` с шапкой-комментарием. Проверить:
   `tests/migrations.rs` проходит (design, решения 3, 5).
-- [ ] 1.2 `Outgoing::Delete { message_id, cleanup }` (поле в payload,
+- [x] 1.2 `Outgoing::Delete { message_id, cleanup }` (поле в payload,
   отсутствует у старых строк → `false`): удаление уборки при
   `MessageUndeletable` и окончательном отказе не вызывает `mark_buried`.
   Проверить в `tests/telegram_outbox.rs`: `cleanup`-удаление с
   `MessageUndeletable` — `skipped`, вид чата не засыпан; обычное удаление
   ведёт себя как раньше; старая строка без поля разбирается (design,
   решение 2).
-- [ ] 1.3 `notifications::mark_dismissed(conn, chat_id, message_id, now)`:
+- [x] 1.3 `notifications::mark_dismissed(conn, chat_id, message_id, now)`:
   `dismissed_at` всем записям доставки, чья строка outbox доставила это
   сообщение, включая записи одного сводного сообщения. Проверить в
   `tests/repositories.rs`: одиночное уведомление и сводное с тремя блоками;
   чужой чат не задет (design, решение 3).
-- [ ] 1.4 `jobs::retention` не удаляет строки outbox моложе 48 часов
+- [x] 1.4 `jobs::retention` не удаляет строки outbox моложе 48 часов
   независимо от `RETENTION_OUTBOX_DAYS`. Проверить в `tests/retention.rs`: при
   `RETENTION_OUTBOX_DAYS=1` строка возрастом 30 часов остаётся, 50 часов —
   удаляется (design, решение 6).
 
 ## 2. Кнопка «🗑 Убрать»
 
-- [ ] 2.1 `ru::DISMISS_BUTTON` и кнопка с `Action::NoticeClose` в
+- [x] 2.1 `ru::DISMISS_BUTTON` и кнопка с `Action::NoticeClose` в
   `reminder_ui` (третья строка), `assignment_ui`, `digest_ui`, `batch_ui` (ряд
   общих действий), экране «😴 Напомню …» и «Задача больше недоступна»; у
   напоминания о событии «Закрыть» → «🗑 Убрать». Проверить юнит-тестами экранов
@@ -33,7 +33,7 @@
   экранах, состав кнопок события — «🗑 Убрать», «📅 Перенести», «Открыть»
   (spec «Убрать уведомление», «Действия из уведомления о событии», design,
   решение 1).
-- [ ] 2.2 `notify::close`: удаление своего сообщения с `cleanup = true` и
+- [x] 2.2 `notify::close`: удаление своего сообщения с `cleanup = true` и
   `mark_dismissed`. Обновить существующие проверки «Закрыть» в
   `tests/notification_actions.rs`. Проверить там же: «🗑 Убрать» в напоминании
   ставит удаление, задача не меняется, доставка отмечена `dismissed_at`; в
@@ -41,23 +41,26 @@
   остаётся `pending`; в сводном сообщении с отложенным блоком — сводное
   удалено, snooze-доставка блока остаётся `pending` (spec «Убрать
   уведомление»).
-- [ ] 2.3 `callbacks::consume` для истёкшего токена отдаёт `action`/`payload`;
+- [x] 2.3 `callbacks::consume` для истёкшего токена отдаёт `action`/`payload`;
   `on_callback` выполняет истёкший `NoticeClose` области `notice` как
   действующий, остальные истёкшие действия — как раньше. Проверить в
   `tests/telegram_callbacks.rs`: «🗑 Убрать» через 30 часов удаляет сообщение;
   истёкшее «✓ Выполнено» — прежний тост, задача не меняется; чужой истёкший
   токен — отказ «другому пользователю» (spec «Убрать уведомление», сценарий
   «Убрать старое уведомление», design, решение 1).
+  Решение при реализации: retention хранит токены «🗑 Убрать»
+  (`notice`/`notice_close`) до отсечки outbox, иначе кнопка перестаёт работать
+  после суточной очистки истёкших токенов.
 
 ## 3. Автоудаление «✅ Выполнено»
 
-- [ ] 3.1 `outbox::cancel_scheduled_deletes(chat_id, message_id)`: будущие
+- [x] 3.1 `outbox::cancel_scheduled_deletes(chat_id, message_id)`: будущие
   `pending`-строки `delete` с ключом
   `notice-expire:{chat_id}:{message_id}:` → `skipped`. Проверить в
   `tests/telegram_outbox.rs`: отменяется только будущая строка этого
   сообщения, удаление другого сообщения и уже наступившее не трогаются
   (design, решение 4).
-- [ ] 3.2 `notify::show_done` (правка в `done_ui` и отложенное `cleanup`-удаление
+- [x] 3.2 `notify::show_done` (правка в `done_ui` и отложенное `cleanup`-удаление
   на `now + UNDO_WINDOW_MINUTES` с ключом `notice-expire:{chat}:{msg}:{now_ms}`)
   вызывается из `complete` и из ветки «уже выполнена» `show_current`;
   `notify::undo` при успехе вызывает `cancel_scheduled_deletes`. Проверить в
@@ -70,19 +73,22 @@
 
 ## 4. Замена: «😴 Напомню …» и прежняя сводка
 
-- [ ] 4.1 `Outgoing::Message { …, replaces }` (в payload, у старых строк
+- [x] 4.1 `Outgoing::Message { …, replaces }` (в payload, у старых строк
   пусто): в транзакции отметки `sent` — `cleanup`-удаление каждого id с ключом
   `replace:{chat}:{id}`. Проверить в `tests/telegram_outbox.rs`: удаление
   ставится только после доставки; новое сообщение в `dead` — удаления нет;
   повторная постановка того же id не дублирует строку (design, решение 5).
-- [ ] 4.2 `replaces_message_id` в `NewDelivery`, `insert_with_flags` (включая
+- [x] 4.2 `replaces_message_id` в `NewDelivery`, `insert_with_flags` (включая
   ветку `DO UPDATE`), `NOTICE_ROW_COLUMNS`, `NoticeRow`; `insert_snooze`
   записывает id сообщения для snooze из отдельного уведомления и оставляет
   пустым для `batched`; затёртый другой id удаляется сразу. Проверить в
   `tests/notification_actions.rs`: «Отложить на час» в напоминании — поле
   равно id сообщения; «На час» в блоке сводного — поле пустое; snooze после
   отмены прежнего по тому же ключу — поле обновлено.
-- [ ] 4.3 Доставка snooze кладёт поле в `replaces` и вызывает
+  Решение пользователя (гейт): повторный snooze на то же время из другого
+  сообщения при ожидающем snooze записывает новое сообщение, прежнее удаляется
+  сразу.
+- [x] 4.3 Доставка snooze кладёт поле в `replaces` и вызывает
   `mark_dismissed`; `mark_cancelled` при непустом поле и известном чате ставит
   удаление сразу тем же ключом и `mark_dismissed` (сигнатура не меняется);
   `BatchCandidate` несёт поле, и `commit_prepared_batch` кладёт id
@@ -92,7 +98,7 @@
   ставит удаление; получатель без чата — удаления нет; snooze из блока
   сводного не удаляет сводное (spec «Сообщение отложенного напоминания
   заменяется»).
-- [ ] 4.4 `digest::replace_previous` в ветке доставки сводки перед
+- [x] 4.4 `digest::replace_previous` в ветке доставки сводки перед
   `enqueue_message`: прежние сводки получателя (`sent`, `dismissed_at IS NULL`,
   `sent_at` не старше 47 часов) → `mark_dismissed` и `replaces` новой.
   Проверить в `tests/notifications.rs`: вчерашняя сводка — удаление после
@@ -104,12 +110,12 @@
 
 ## 5. Документация и проверка
 
-- [ ] 5.1 `docs/telegram-ux.md`: кнопки уведомлений с «🗑 Убрать» (включая
+- [x] 5.1 `docs/telegram-ux.md`: кнопки уведомлений с «🗑 Убрать» (включая
   раздел напоминания о событии, где сейчас «Закрыть»), автоудаление
   «Выполнено», замена «Напомню» и прежней сводки, «Убрать» после истечения
   кнопок, ограничение 48 часов. Проверить: описанные подписи совпадают с
   `ru.rs`.
-- [ ] 5.2 Ручной прогон через `telegram-ui`: напоминание → «Отложить на час»
+- [x] 5.2 Ручной прогон через `telegram-ui`: напоминание → «Отложить на час»
   (короткий интервал в тестовой сборке или ручная правка `scheduled_at`) → в
   чате одно сообщение по задаче; «Выполнено» → сообщение исчезает через 10
   минут; «🗑 Убрать» на сводке. `cargo clippy --all-targets`, `cargo test` и

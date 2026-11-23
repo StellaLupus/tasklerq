@@ -244,11 +244,8 @@ pub fn batch_ui(
             Action::BatchSnoozeAll { batch_id },
         ));
     }
-    if common.is_empty() {
-        ui
-    } else {
-        ui.row(common)
-    }
+    common.push(button(ru::DISMISS_BUTTON, Action::NoticeClose));
+    ui.row(common)
 }
 
 /// Перелистнуть сводное сообщение.
@@ -610,7 +607,8 @@ async fn snooze_batch_item(
 
     let deliver_at = snooze_time(SnoozeUntil::OneHour, ctx.tz, ctx.now)?;
     let origin_key = snooze_origin(item.due_at, item.due_date);
-    insert_snooze(ctx, item_id, &origin_key, deliver_at, batched).await?;
+    // Сводное сообщение snooze не удаляет: заменяемого сообщения нет.
+    insert_snooze(ctx, item_id, &origin_key, deliver_at, batched, None).await?;
     set_batch_snoozed(ctx, batch_id, item_id, deliver_at).await?;
     Ok(true)
 }
@@ -780,5 +778,76 @@ fn batch_entry(row: &BatchDelivery, tz: Tz, now: DateTime<Utc>) -> BatchEntry {
         version: row.item_version.or(row.batch_version).unwrap_or(0),
         state,
         is_event,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::telegram::rich::{Block, Button};
+
+    fn entry(state: BatchEntryState) -> BatchEntry {
+        BatchEntry {
+            item_id: Uuid::now_v7(),
+            kind: NotificationKind::Reminder,
+            title: "Задача".into(),
+            when: "Сегодня · Задачи".into(),
+            version: 1,
+            state,
+            is_event: false,
+        }
+    }
+
+    fn button_rows(ui: &Ui) -> Vec<&[Button<Action>]> {
+        ui.blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Buttons(buttons) => Some(buttons.as_slice()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn row_labels(row: &[Button<Action>]) -> Vec<&str> {
+        row.iter().map(|button| button.label.as_str()).collect()
+    }
+
+    fn batch(entries: &[BatchEntry]) -> Ui {
+        let tz: Tz = "Europe/Moscow".parse().expect("tz");
+        batch_ui(
+            Uuid::now_v7(),
+            0,
+            entries,
+            entries.len(),
+            None,
+            BatchActions::of(entries),
+            tz,
+        )
+    }
+
+    #[test]
+    fn batch_common_row_ends_with_dismiss() {
+        let entries = [entry(BatchEntryState::Open)];
+        let ui = batch(&entries);
+
+        let rows = button_rows(&ui);
+        let common = rows.last().expect("common row");
+        assert_eq!(
+            row_labels(common),
+            ["✓ Выполнить все", "😴 Отложить все на час", "🗑 Убрать"]
+        );
+        assert!(matches!(common[2].action, Action::NoticeClose));
+    }
+
+    #[test]
+    fn batch_without_common_task_actions_still_has_dismiss() {
+        let entries = [entry(BatchEntryState::Done)];
+        assert_eq!(BatchActions::of(&entries), BatchActions::default());
+        let ui = batch(&entries);
+
+        let rows = button_rows(&ui);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(row_labels(rows[0]), ["🗑 Убрать"]);
+        assert!(matches!(rows[0][0].action, Action::NoticeClose));
     }
 }

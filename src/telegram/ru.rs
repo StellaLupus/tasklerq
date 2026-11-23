@@ -330,6 +330,8 @@ pub const DONE_BUTTON: &str = "✓ Выполнено";
 pub const BOUGHT_BUTTON: &str = "✓ Куплено";
 /// Кнопка группового выполнения.
 pub const DONE_ALL_BUTTON: &str = "✓ Выполнить все";
+/// Кнопка уборки уведомления из чата.
+pub const DISMISS_BUTTON: &str = "🗑 Убрать";
 /// Кнопка закрытия выбора нескольких значений.
 pub const APPLY_BUTTON: &str = "Применить";
 /// Всплывающее сообщение после выполнения.

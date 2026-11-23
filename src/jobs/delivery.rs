@@ -16,7 +16,7 @@ use super::{assignment, digest, scheduler};
 use crate::domain::error::DomainError;
 use crate::domain::models::{Item, List};
 use crate::domain::settings::NotificationSettings;
-use crate::storage::repositories::notifications::NotificationKind;
+use crate::storage::repositories::notifications::{self, NotificationKind};
 use crate::storage::repositories::{items, lists};
 use crate::telegram::outbox::{self, Outgoing};
 
@@ -288,7 +288,18 @@ pub(crate) async fn deliver_one_in_conn(
     };
 
     let dedupe_key = delivery_dedupe_key(row.id, row.kind);
-    let seq = enqueue_message(&mut *conn, chat_id, &dedupe_key, html, true, now).await?;
+    // Замена (0017, решения 5, 6): snooze из отдельного уведомления удаляет
+    // сообщение «😴 Напомню …», новая сводка — прежние сводки получателя.
+    // Удаление ставит outbox после фактической доставки нового; отметка уборки
+    // ставится здесь же, в транзакции доставки.
+    let replaces: Vec<i64> = match scope {
+        DeliveryScope::Digest => digest::replace_previous(&mut *conn, &row, chat_id, now).await?,
+        _ => row.replaces_message_id.into_iter().collect(),
+    };
+    let seq = enqueue_message(&mut *conn, chat_id, &dedupe_key, html, true, replaces, now).await?;
+    if let Some(old) = row.replaces_message_id {
+        notifications::mark_dismissed(&mut *conn, chat_id, old, now).await?;
+    }
     mark_sent(&mut *conn, row.id, seq, now).await?;
     Ok(1)
 }
@@ -361,21 +372,48 @@ fn delivery_dedupe_key(id: Uuid, kind: NotificationKind) -> String {
 }
 
 /// Пометить `pending`-доставку отменённой в текущей транзакции.
+///
+/// Отменённый snooze из отдельного уведомления сразу удаляет своё сообщение
+/// «😴 Напомню …» тем же ключом замены, что и доставка (0017, решение 5):
+/// повторная постановка не создаёт вторую строку. Чат получателя читается
+/// подзапросом к `users`, как в [`NOTICE_ROW_FROM`]; выбывший получатель чата
+/// не имеет — удалять нечего. Возвращает число отменённых строк: `0`, если
+/// запись уже не `pending`.
 pub(crate) async fn mark_cancelled(
     conn: &mut PgConnection,
     id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<u64, sqlx::Error> {
-    Ok(sqlx::query(
-        "UPDATE notification_deliveries
+    let row: Option<(Option<i64>, Option<i64>)> = sqlx::query_as(
+        "UPDATE notification_deliveries d
          SET status = 'cancelled', updated_at = $2
-         WHERE id = $1 AND status = 'pending'",
+         WHERE d.id = $1 AND d.status = 'pending'
+         RETURNING d.replaces_message_id,
+                   (SELECT u.telegram_chat_id FROM users u
+                    WHERE u.id = d.user_id AND u.deleted_at IS NULL)",
     )
     .bind(id)
     .bind(now)
-    .execute(&mut *conn)
-    .await?
-    .rows_affected())
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((replaces, chat_id)) = row else {
+        return Ok(0);
+    };
+    if let (Some(message_id), Some(chat_id)) = (replaces, chat_id) {
+        outbox::enqueue(
+            conn,
+            chat_id,
+            &Outgoing::Delete {
+                message_id,
+                cleanup: true,
+            },
+            Some(&outbox::replace_key(chat_id, message_id)),
+            now,
+        )
+        .await?;
+        notifications::mark_dismissed(conn, chat_id, message_id, now).await?;
+    }
+    Ok(1)
 }
 
 /// Пометить доставку переданной в outbox.
@@ -429,14 +467,16 @@ pub(crate) async fn postpone_for_quiet(
 
 /// Поставить сообщение в outbox и вернуть его `seq`.
 ///
-/// Повторная постановка после сбоя использует уже существующую запись по
-/// `dedupe_key`.
+/// `replaces` — id прежних сообщений, которые удалятся после доставки нового
+/// (0017, решение 5); пустой вектор — без замены. Повторная постановка после
+/// сбоя использует уже существующую запись по `dedupe_key`.
 pub(crate) async fn enqueue_message(
     conn: &mut PgConnection,
     chat_id: i64,
     dedupe_key: &str,
     html: String,
     rich: bool,
+    replaces: Vec<i64>,
     now: DateTime<Utc>,
 ) -> Result<i64, sqlx::Error> {
     let outgoing = Outgoing::Message {
@@ -444,6 +484,7 @@ pub(crate) async fn enqueue_message(
         rich,
         delete_after: None,
         disable_preview: false,
+        replaces,
     };
     match outbox::enqueue(conn, chat_id, &outgoing, Some(dedupe_key), now).await? {
         Some(seq) => Ok(seq),

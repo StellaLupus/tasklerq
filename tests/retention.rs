@@ -714,6 +714,187 @@ async fn retention_purges_an_outbox_message_referenced_by_a_delivery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_keeps_outbox_rows_younger_than_48_hours_with_one_day_retention() {
+    let db = support::isolated_db().await;
+    let now = Utc::now();
+    let tag = Uuid::now_v7().to_string();
+    let config = RetentionConfig {
+        outbox_days: 1,
+        ..config()
+    };
+
+    // Окно замены прежней сводки — 47 часов (design 0017, решение 6):
+    // строка outbox моложе 48 часов остаётся даже при сроке в одни сутки.
+    let mut seqs = Vec::new();
+    for age_hours in [30, 50] {
+        let sent_at = now - Duration::hours(age_hours);
+        let seq: i64 = sqlx::query_scalar(
+            "INSERT INTO outbox (
+                 chat_id, kind, payload, status, created_at, sent_at, message_id, dedupe_key
+             )
+             VALUES (1, 'message', '{}'::jsonb, 'sent', $1, $1, $2, $3)
+             RETURNING seq",
+        )
+        .bind(sent_at)
+        .bind(age_hours)
+        .bind(format!("{tag}:{age_hours}"))
+        .fetch_one(&db.pool)
+        .await
+        .expect("outbox message");
+        seqs.push(seq);
+    }
+
+    retention::run(&db.pool, &config, now)
+        .await
+        .expect("retention");
+
+    let recent_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM outbox WHERE seq = $1)")
+            .bind(seqs[0])
+            .fetch_one(&db.pool)
+            .await
+            .expect("recent outbox");
+    assert!(
+        recent_exists,
+        "a sent outbox row 30 hours old must survive the 48-hour floor"
+    );
+    let old_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM outbox WHERE seq = $1)")
+            .bind(seqs[1])
+            .fetch_one(&db.pool)
+            .await
+            .expect("old outbox");
+    assert!(!old_exists, "a sent outbox row 50 hours old must be purged");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_keeps_finished_deliveries_younger_than_48_hours_with_one_day_retention() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let config = RetentionConfig {
+        outbox_days: 1,
+        ..config()
+    };
+
+    // Нижняя граница 48 часов — у общей отсечки outbox, поэтому она действует
+    // и на завершённые доставки: `sent` возрастом 30 часов остаётся,
+    // 50 часов — удаляется.
+    let recent = insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        "recent-sent",
+        "sent",
+        now - Duration::hours(30),
+        false,
+        None,
+    )
+    .await;
+    insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        "old-sent",
+        "sent",
+        now - Duration::hours(50),
+        false,
+        None,
+    )
+    .await;
+
+    let stats = retention::run(&db.pool, &config, now)
+        .await
+        .expect("retention");
+    assert_eq!(stats.purged_notification_deliveries, 1);
+
+    let left: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM notification_deliveries ORDER BY id")
+        .fetch_all(&db.pool)
+        .await
+        .expect("deliveries");
+    assert_eq!(
+        left,
+        vec![recent],
+        "only the 50-hour-old delivery is purged"
+    );
+}
+
+/// Выпустить callback-токен на действие в заданный момент.
+async fn issue_callback_token(
+    pool: &PgPool,
+    scope: tasklerq::telegram::callbacks::Scope,
+    action: &tasklerq::telegram::bot::model::Action,
+    at: DateTime<Utc>,
+) -> String {
+    let mut conn = pool.acquire().await.expect("connection");
+    tasklerq::telegram::callbacks::issue_many(
+        &mut conn,
+        &[tasklerq::telegram::callbacks::NewToken {
+            telegram_user_id: 1,
+            household_id: None,
+            scope,
+            action: action.name(),
+            payload: serde_json::to_value(action).expect("payload"),
+            version: None,
+        }],
+        at,
+    )
+    .await
+    .expect("issue")
+    .remove(0)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_keeps_dismiss_tokens_until_the_outbox_cutoff() {
+    use tasklerq::auth::tokens::hash_token;
+    use tasklerq::telegram::bot::model::Action;
+    use tasklerq::telegram::callbacks::Scope;
+
+    let db = support::isolated_db().await;
+    let now = Utc::now();
+    let config = RetentionConfig {
+        outbox_days: 1,
+        ..config()
+    };
+
+    // «🗑 Убрать» работает, пока жива строка outbox (design 0017, решение 1):
+    // его токен хранится до отсечки outbox (не меньше 48 часов), остальные
+    // истёкшие токены удаляются как раньше.
+    let close = Action::NoticeClose;
+    let recent_dismiss =
+        issue_callback_token(&db.pool, Scope::Notice, &close, now - Duration::hours(30)).await;
+    let old_dismiss =
+        issue_callback_token(&db.pool, Scope::Notice, &close, now - Duration::hours(50)).await;
+    let screen = issue_callback_token(
+        &db.pool,
+        Scope::Screen,
+        &Action::Refresh,
+        now - Duration::hours(30),
+    )
+    .await;
+
+    let stats = retention::run(&db.pool, &config, now)
+        .await
+        .expect("retention");
+    assert_eq!(stats.purged_callback_tokens, 2);
+
+    for (token, remains) in [
+        (&recent_dismiss, true),
+        (&old_dismiss, false),
+        (&screen, false),
+    ] {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM callback_tokens WHERE token_hash = $1)",
+        )
+        .bind(hash_token(token))
+        .fetch_one(&db.pool)
+        .await
+        .expect("token exists");
+        assert_eq!(exists, remains, "token {token} remains={remains}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retention_worker_skips_the_run_when_the_advisory_lock_is_held() {
     let db = support::isolated_db().await;
     let household = support::create_household(&db.pool).await;

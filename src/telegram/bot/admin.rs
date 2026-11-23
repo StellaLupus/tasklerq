@@ -94,6 +94,7 @@ pub(super) async fn on_admin(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
                 rich: false,
                 delete_after: Some(RECOVERY_MESSAGE_TTL_SECONDS),
                 disable_preview: true,
+                replaces: Vec::new(),
             },
             None,
             ctx.now,

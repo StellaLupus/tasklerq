@@ -81,6 +81,9 @@ pub struct NewDelivery<'a> {
     pub occurrence_key: &'a str,
     /// Вхождение срока, из которого отложено snooze; у остальных видов пусто.
     pub origin_key: Option<&'a str>,
+    /// Сообщение «😴 Напомню …», которое заменит эта snooze-доставка;
+    /// у остальных видов пусто.
+    pub replaces_message_id: Option<i64>,
     /// Момент, начиная с которого запись можно доставлять.
     pub scheduled_at: DateTime<Utc>,
 }
@@ -95,55 +98,126 @@ pub async fn insert(
     delivery: &NewDelivery<'_>,
     now: DateTime<Utc>,
 ) -> Result<u64, sqlx::Error> {
-    insert_with_flags(conn, delivery, false, now).await
+    Ok(insert_with_flags(conn, delivery, false, now).await?.0)
 }
 
-/// Вставить групповую snooze-доставку действия «Отложить все на час».
+/// Вставить snooze-доставку; возвращает затёртый id сообщения «😴 Напомню …».
 ///
-/// `batched` означает «собрать в сводное в свой срок», но не «отложено тихими
-/// часами»: ручной выпуск и баннер такую доставку не трогают. Если её срок сам
-/// попадёт в тихие часы, тик выставит `deferred` по общему правилу.
-pub async fn insert_batched(
+/// Повторный snooze на то же время из другого сообщения при ожидающем snooze с
+/// тем же ключом и `origin_key` записывает новое сообщение: `replaces_message_id`
+/// строки обновляется, прежнее непустое значение возвращается как затёртое
+/// (0017, решение 5). Строка блокируется обновлением, поэтому прежнее значение
+/// читается атомарно с записью. Пустое новое значение (snooze из сводного
+/// сообщения) ожидающую строку не трогает.
+///
+/// Если ветка `DO UPDATE` заменила непустой `replaces_message_id` другим
+/// значением (snooze после отмены прежнего или со сменившимся `origin_key`),
+/// прежнее сообщение эта доставка уже не заменит и его нужно удалить сразу.
+/// Равное или пустое прежнее значение не возвращается. `batched` отмечает
+/// групповой snooze («Отложить все на час»): такая доставка собирается в
+/// сводное сообщение в свой срок, но не считается отложенной тихими часами —
+/// ручной выпуск и баннер её не трогают.
+pub async fn insert_snooze(
     conn: &mut PgConnection,
     delivery: &NewDelivery<'_>,
+    batched: bool,
     now: DateTime<Utc>,
-) -> Result<u64, sqlx::Error> {
-    insert_with_flags(conn, delivery, true, now).await
+) -> Result<Option<i64>, sqlx::Error> {
+    if delivery.replaces_message_id.is_some() {
+        let previous: Option<(Option<i64>,)> = sqlx::query_as(
+            "WITH previous AS (
+                 SELECT id, replaces_message_id
+                 FROM notification_deliveries
+                 WHERE user_id = $1 AND item_id IS NOT DISTINCT FROM $2
+                   AND occurrence_key = $3 AND kind = $4
+                   AND origin_key IS NOT DISTINCT FROM $5
+                   AND status = 'pending'
+                   AND replaces_message_id IS DISTINCT FROM $6
+                 FOR UPDATE
+             )
+             UPDATE notification_deliveries d
+             SET replaces_message_id = $6, updated_at = $7
+             FROM previous p
+             WHERE d.id = p.id
+             RETURNING p.replaces_message_id",
+        )
+        .bind(delivery.user_id)
+        .bind(delivery.item_id)
+        .bind(delivery.occurrence_key)
+        .bind(delivery.kind)
+        .bind(delivery.origin_key)
+        .bind(delivery.replaces_message_id)
+        .bind(now)
+        .fetch_optional(&mut *conn)
+        .await?;
+        if let Some((overwritten,)) = previous {
+            return Ok(overwritten);
+        }
+    }
+    Ok(insert_with_flags(conn, delivery, batched, now).await?.1)
 }
 
 /// Вставить доставку; `batched` отмечает групповой snooze. Признак `deferred`
 /// при вставке всегда снят: его выставляет только перенос тихими часами.
+///
+/// Возвращает число затронутых строк и затёртый `replaces_message_id` —
+/// прежнее непустое значение, которое ветка `DO UPDATE` заменила другим.
+/// Повторный snooze по тому же ключу и `origin_key` при ожидающей строке сюда
+/// не доходит: его обрабатывает `insert_snooze` отдельным `UPDATE` с
+/// блокировкой строки, где прежнее значение читается атомарно с записью.
+/// Здесь остаются перезапись отменённой строки и смена `origin_key`. Для них
+/// прежняя строка читается CTE `previous` того же запроса, но при
+/// `READ COMMITTED` чтение и обновление не атомарны: CTE видит снимок на
+/// начало запроса, а `ON CONFLICT DO UPDATE` обновляет актуальную версию
+/// строки. Два одновременных snooze по одному ключу из разных сообщений
+/// могут вернуть устаревший id. Гонка принята: для неё нужны два
+/// одновременных нажатия по одной задаче на одно время.
 async fn insert_with_flags(
     conn: &mut PgConnection,
     delivery: &NewDelivery<'_>,
     batched: bool,
     now: DateTime<Utc>,
-) -> Result<u64, sqlx::Error> {
-    Ok(sqlx::query(
-        "INSERT INTO notification_deliveries (
-             id, household_id, user_id, item_id, occurrence_key, origin_key, kind,
-             status, scheduled_at, deferred, batched, created_at, updated_at
+) -> Result<(u64, Option<i64>), sqlx::Error> {
+    let row: Option<(i64, Option<i64>)> = sqlx::query_as(
+        "WITH previous AS (
+             SELECT replaces_message_id
+             FROM notification_deliveries
+             WHERE user_id = $3 AND item_id IS NOT DISTINCT FROM $4
+               AND occurrence_key = $5 AND kind = $7
+         ),
+         upsert AS (
+             INSERT INTO notification_deliveries (
+                 id, household_id, user_id, item_id, occurrence_key, origin_key, kind,
+                 status, scheduled_at, deferred, batched, replaces_message_id,
+                 created_at, updated_at
+             )
+             SELECT $1, $2, $3, $4, $5, $6, $7, 'pending', $8, false, $9, $10, $11, $11
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM notification_deliveries d
+                 WHERE d.user_id = $3 AND d.item_id IS NOT DISTINCT FROM $4
+                   AND d.occurrence_key = $5 AND d.kind = $7
+                   AND d.origin_key IS NOT DISTINCT FROM $6
+                   AND d.status IN ('pending', 'sent')
+             )
+             ON CONFLICT ON CONSTRAINT notification_deliveries_key_unique
+             DO UPDATE SET
+                 status = 'pending',
+                 origin_key = EXCLUDED.origin_key,
+                 scheduled_at = EXCLUDED.scheduled_at,
+                 deferred = EXCLUDED.deferred,
+                 batched = EXCLUDED.batched,
+                 replaces_message_id = EXCLUDED.replaces_message_id,
+                 outbox_seq = NULL,
+                 updated_at = EXCLUDED.updated_at
+             WHERE notification_deliveries.status = 'cancelled'
+                OR (notification_deliveries.status = 'pending'
+                    AND notification_deliveries.origin_key IS DISTINCT FROM EXCLUDED.origin_key)
+             RETURNING 1
          )
-         SELECT $1, $2, $3, $4, $5, $6, $7, 'pending', $8, false, $9, $10, $10
-         WHERE NOT EXISTS (
-             SELECT 1 FROM notification_deliveries d
-             WHERE d.user_id = $3 AND d.item_id IS NOT DISTINCT FROM $4
-               AND d.occurrence_key = $5 AND d.kind = $7
-               AND d.origin_key IS NOT DISTINCT FROM $6
-               AND d.status IN ('pending', 'sent')
-         )
-         ON CONFLICT ON CONSTRAINT notification_deliveries_key_unique
-         DO UPDATE SET
-             status = 'pending',
-             origin_key = EXCLUDED.origin_key,
-             scheduled_at = EXCLUDED.scheduled_at,
-             deferred = EXCLUDED.deferred,
-             batched = EXCLUDED.batched,
-             outbox_seq = NULL,
-             updated_at = EXCLUDED.updated_at
-         WHERE notification_deliveries.status = 'cancelled'
-            OR (notification_deliveries.status = 'pending'
-                AND notification_deliveries.origin_key IS DISTINCT FROM EXCLUDED.origin_key)",
+         SELECT count(*),
+                max(previous.replaces_message_id)
+                    FILTER (WHERE previous.replaces_message_id IS DISTINCT FROM $10)
+         FROM upsert LEFT JOIN previous ON true",
     )
     .bind(Uuid::now_v7())
     .bind(delivery.household_id)
@@ -154,10 +228,14 @@ async fn insert_with_flags(
     .bind(delivery.kind)
     .bind(delivery.scheduled_at)
     .bind(batched)
+    .bind(delivery.replaces_message_id)
     .bind(now)
-    .execute(conn)
-    .await?
-    .rows_affected())
+    .fetch_optional(conn)
+    .await?;
+    Ok(match row {
+        Some((affected, overwritten)) => (affected as u64, overwritten),
+        None => (0, None),
+    })
 }
 
 /// Сводное сообщение, выпущенное после тихих часов.
@@ -413,9 +491,44 @@ pub async fn notify_assignment(
         kind: NotificationKind::Assignment,
         occurrence_key: &occurrence_key,
         origin_key: None,
+        replaces_message_id: None,
         scheduled_at: now,
     };
     Ok(insert(conn, &delivery, now).await?)
+}
+
+/// Отметить сообщение уведомления окончательно убранным из чата.
+///
+/// `dismissed_at` ставится всем записям доставки, чья строка outbox доставила
+/// это сообщение (`outbox_seq → outbox` с этими `chat_id` и `message_id`);
+/// записи одного сводного сообщения делят `outbox_seq`, поэтому убираются все
+/// его блоки сразу. Отметка нужна тем, кто правит отправленные сообщения позже
+/// (0018, 0019): запись с `dismissed_at` они не трогают. Первая отметка
+/// сохраняется — уже отмеченные записи не перезаписываются. Статус доставки,
+/// `outbox_seq` и прочие поля не меняются; возвращается число отмеченных
+/// записей. Автоудаление «✅ Выполнено» эту функцию не вызывает: оно отменяемо
+/// (design, решение 3).
+pub async fn mark_dismissed(
+    conn: &mut PgConnection,
+    chat_id: i64,
+    message_id: i64,
+    now: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query(
+        "UPDATE notification_deliveries d
+         SET dismissed_at = $3
+         FROM outbox o
+         WHERE o.seq = d.outbox_seq
+           AND o.chat_id = $1
+           AND o.message_id = $2
+           AND d.dismissed_at IS NULL",
+    )
+    .bind(chat_id)
+    .bind(message_id)
+    .bind(now)
+    .execute(conn)
+    .await?
+    .rows_affected())
 }
 
 #[cfg(test)]

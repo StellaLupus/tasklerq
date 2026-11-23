@@ -2228,3 +2228,144 @@ async fn telegram_keyboard_migration_applies_over_existing_rows() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// 0025: колонки уборки уведомлений — нужного типа, nullable, без значения
+/// по умолчанию.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notice_cleanup_migration_adds_nullable_columns() {
+    let db = support::empty_db().await;
+    migrations::run(&db.pool)
+        .await
+        .expect("migrations should apply on a clean database");
+
+    let columns = table_shape(&db.pool, "notification_deliveries").await;
+    for (name, data_type) in [
+        ("dismissed_at", "timestamp with time zone"),
+        ("replaces_message_id", "bigint"),
+    ] {
+        let column = columns
+            .iter()
+            .find(|(column, _, _)| column == name)
+            .unwrap_or_else(|| panic!("{name} must exist on notification_deliveries"));
+        assert_eq!(column.1, data_type, "{name} must have the design type");
+        assert_eq!(column.2, "YES", "{name} must be nullable");
+    }
+
+    let defaults: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT column_name, column_default
+         FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'notification_deliveries'
+           AND column_name IN ('dismissed_at', 'replaces_message_id')
+         ORDER BY column_name",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("column defaults");
+    assert_eq!(
+        defaults,
+        vec![
+            ("dismissed_at".to_owned(), None),
+            ("replaces_message_id".to_owned(), None),
+        ],
+        "the cleanup columns must have no default"
+    );
+}
+
+/// 0025 применяется поверх базы с данными до 0024: уже отправленное
+/// уведомление считается неубранным, прежний snooze остаётся с пустым полем
+/// заменяемого сообщения.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notice_cleanup_migration_keeps_existing_deliveries_undismissed() {
+    let db = support::empty_db().await;
+    let dir = std::env::temp_dir().join(format!(
+        "tasklerq-migrations-0024-{}",
+        Uuid::now_v7().simple()
+    ));
+    std::fs::create_dir_all(&dir).expect("temporary migration directory");
+    copy_migrations_through(24, &dir);
+
+    let before = Migrator::new(dir.as_path())
+        .await
+        .expect("a migrator through 0024 should resolve");
+    before
+        .run(&db.pool)
+        .await
+        .context("migrations through 0024 should apply")
+        .expect("migrations through 0024");
+
+    let (household_id, owner_id, tasks_list_id) = create_household_before_events(&db.pool).await;
+    let item_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO items (
+             id, household_id, list_id, title, status, priority, source, position, version
+         )
+         VALUES ($1, $2, $3, 'Задача с уведомлением', 'open', 'normal', 'api', 0, 1)",
+    )
+    .bind(item_id)
+    .bind(household_id)
+    .bind(tasks_list_id)
+    .execute(&db.pool)
+    .await
+    .expect("item before 0025");
+    let sent_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO notification_deliveries (
+             id, household_id, user_id, item_id, occurrence_key, kind,
+             status, scheduled_at, created_at, updated_at
+         )
+         VALUES ($1, $2, $3, $4, '2026-11-20T09:00:00+00:00', 'reminder',
+                 'sent', now(), now(), now())",
+    )
+    .bind(sent_id)
+    .bind(household_id)
+    .bind(owner_id)
+    .bind(item_id)
+    .execute(&db.pool)
+    .await
+    .expect("sent reminder before the migration");
+    let snooze_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO notification_deliveries (
+             id, household_id, user_id, item_id, occurrence_key, kind,
+             status, scheduled_at, created_at, updated_at
+         )
+         VALUES ($1, $2, $3, $4, 'snooze:1800000000', 'snooze',
+                 'pending', now(), now(), now())",
+    )
+    .bind(snooze_id)
+    .bind(household_id)
+    .bind(owner_id)
+    .bind(item_id)
+    .execute(&db.pool)
+    .await
+    .expect("pending snooze before the migration");
+
+    MIGRATOR
+        .run(&db.pool)
+        .await
+        .expect("0025 must apply over existing deliveries");
+
+    for (id, kind, status) in [
+        (sent_id, "reminder", "sent"),
+        (snooze_id, "snooze", "pending"),
+    ] {
+        let row: (String, String, Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT kind::text, status::text, dismissed_at::text, replaces_message_id
+             FROM notification_deliveries
+             WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("delivery after the migration");
+        assert_eq!(
+            row,
+            (kind.to_owned(), status.to_owned(), None, None),
+            "existing deliveries stay unchanged: a sent notification is not \
+             dismissed and an old snooze has no message to replace"
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}

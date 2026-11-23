@@ -892,6 +892,7 @@ async fn enqueue_secret_message(
             rich: true,
             delete_after: Some(SECRET_MESSAGE_TTL),
             disable_preview: false,
+            replaces: Vec::new(),
         },
         None,
         ctx.now,
@@ -909,7 +910,10 @@ pub async fn dismiss_secret(ctx: &mut Ctx<'_>, message_id: i64) -> Result<(), Fa
     outbox::enqueue(
         &mut *ctx.conn,
         ctx.chat_id,
-        &Outgoing::Delete { message_id },
+        &Outgoing::Delete {
+            message_id,
+            cleanup: false,
+        },
         Some(&delete_dedupe_key(ctx.chat_id, message_id)),
         ctx.now,
     )

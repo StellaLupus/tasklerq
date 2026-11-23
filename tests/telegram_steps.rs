@@ -64,6 +64,7 @@ async fn write_effects(ctx: &mut Ctx<'_>) {
             rich: false,
             delete_after: None,
             disable_preview: false,
+            replaces: Vec::new(),
         },
         None,
         ctx.now,

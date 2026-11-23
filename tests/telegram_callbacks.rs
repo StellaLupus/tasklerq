@@ -2,10 +2,10 @@
 
 mod support;
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde_json::json;
-use support::telegram::Harness;
-use support::{create_household, create_item, db, new_item};
+use support::telegram::{Call, Harness};
+use support::{create_household, create_item, db, isolated_db, new_item, next_telegram_id};
 use tasklerq::auth::tokens::hash_token;
 use tasklerq::domain::models::Item;
 use tasklerq::telegram::bot::model::{Action, QuickDue, Screen};
@@ -117,7 +117,22 @@ async fn expired_and_unknown_tokens_are_refused() {
     )
     .await
     .expect("consume");
-    assert!(matches!(late, Consumed::Expired(Scope::Screen)), "{late:?}");
+    let Consumed::Expired(expired) = late else {
+        panic!("expired expected, got {late:?}")
+    };
+    assert_eq!(expired.scope, Scope::Screen);
+    assert_eq!(expired.action, "go");
+    assert_eq!(expired.payload, json!({"a": "go"}));
+    assert_eq!(expired.version, Some(3));
+
+    // Истёкший токен не помечается потреблённым.
+    let consumed_at: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT consumed_at FROM callback_tokens WHERE token_hash = $1")
+            .bind(hash_token(&tokens[0]))
+            .fetch_one(&db.pool)
+            .await
+            .expect("token state");
+    assert!(consumed_at.is_none());
 
     let unknown = callbacks::consume(&mut conn, "t:AAAAAAAAAAAAAAAA", 20, now)
         .await
@@ -189,7 +204,7 @@ async fn expired_tokens_are_purged() {
         .await
         .expect("issue");
 
-    let purged = callbacks::purge_expired(&mut conn, now)
+    let purged = callbacks::purge_expired(&mut conn, now, now)
         .await
         .expect("purge");
 
@@ -201,6 +216,84 @@ async fn expired_tokens_are_purged() {
             .await
             .expect("count");
     assert_eq!(left, 0);
+}
+
+/// Токен области `notice` с действием `action` и полезной нагрузкой действия.
+fn notice_spec(user: i64, action: &Action) -> NewToken {
+    NewToken {
+        telegram_user_id: user,
+        household_id: None,
+        scope: Scope::Notice,
+        action: action.name(),
+        payload: serde_json::to_value(action).expect("payload"),
+        version: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_dismiss_tokens_are_kept_until_the_outbox_cutoff() {
+    // Отдельная база: общий purge удалил бы истёкшие токены параллельных тестов.
+    let db = isolated_db().await;
+    let now = Utc::now();
+    let mut conn = db.pool.acquire().await.expect("conn");
+    // Отсечка outbox — 48 часов назад (нижняя граница хранения outbox).
+    let outbox_cutoff = now - Duration::hours(48);
+
+    let close = Action::NoticeClose;
+    let complete = Action::NoticeComplete {
+        item_id: uuid::Uuid::now_v7(),
+        version: 1,
+    };
+    // «🗑 Убрать», выпущенный после отсечки outbox (30 часов назад), остаётся;
+    // выпущенный до неё (50 часов назад) — удаляется. Истёкшие токен экрана и
+    // «✓ Выполнено» удаляются как раньше.
+    let recent_dismiss = callbacks::issue_many(
+        &mut conn,
+        &[notice_spec(70, &close)],
+        now - Duration::hours(30),
+    )
+    .await
+    .expect("issue recent dismiss")
+    .remove(0);
+    let old_dismiss = callbacks::issue_many(
+        &mut conn,
+        &[notice_spec(71, &close)],
+        now - Duration::hours(50),
+    )
+    .await
+    .expect("issue old dismiss")
+    .remove(0);
+    let screen = callbacks::issue_many(&mut conn, &[spec(72, None)], now - Duration::hours(30))
+        .await
+        .expect("issue screen")
+        .remove(0);
+    let notice_complete = callbacks::issue_many(
+        &mut conn,
+        &[notice_spec(73, &complete)],
+        now - Duration::hours(30),
+    )
+    .await
+    .expect("issue notice complete")
+    .remove(0);
+
+    callbacks::purge_expired(&mut conn, now, outbox_cutoff)
+        .await
+        .expect("purge");
+
+    for (token, remains) in [
+        (&recent_dismiss, true),
+        (&old_dismiss, false),
+        (&screen, false),
+        (&notice_complete, false),
+    ] {
+        let left: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM callback_tokens WHERE token_hash = $1")
+                .bind(hash_token(token))
+                .fetch_one(&db.pool)
+                .await
+                .expect("count");
+        assert_eq!(left, i64::from(remains), "token {token} remains={remains}");
+    }
 }
 
 // 0009-events 9.2: устаревшие кнопки карточки события отказывают и не меняют
@@ -367,5 +460,183 @@ async fn stale_reopen_callback_on_an_event_is_refused_and_changes_nothing() {
         }),
         "the stale button must be refused with an alert: {:?}",
         bot.fake.answers()
+    );
+}
+
+// 0017-notification-cleanup 2.3: «🗑 Убрать» работает и после истечения токена.
+
+/// Доставленное напоминание о задаче: стенд для кнопок уведомления.
+async fn reminder_stand(pool: &sqlx::PgPool) -> (Harness, Item, i64, String) {
+    let mut bot = support::notifications::onboarded(pool).await;
+    support::notifications::quiet_off(pool, bot.chat).await;
+    let household = support::notifications::household_for(pool, bot.chat).await;
+    let due = bot.now + Duration::hours(3);
+    let item =
+        support::notifications::create_task(pool, &household, "Оплатить интернет", due, None).await;
+    support::notifications::tick_and_deliver(&mut bot, pool, due - Duration::minutes(15)).await;
+    let (message_id, html) = bot.latest();
+    (bot, item, message_id, html)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_dismiss_in_a_reminder_deletes_the_message() {
+    let db = isolated_db().await;
+    let (mut bot, item, message_id, html) = reminder_stand(&db.pool).await;
+    let dismiss = support::notifications::button_of(&html, "🗑 Убрать");
+    let before = support::notifications::item_status(&db.pool, item.id).await;
+    let calls_before = bot.fake.calls().len();
+
+    // Кнопки устарели: токен выпущен 30 часов назад.
+    bot.advance(Duration::hours(30));
+    bot.press_data_pending(&dismiss, message_id).await;
+
+    // Удаление уборки своего сообщения поставлено, payload цел.
+    let payload: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload FROM outbox
+         WHERE chat_id = $1 AND kind = 'delete' AND dedupe_key = $2",
+    )
+    .bind(bot.chat)
+    .bind(format!("delete:{}:{message_id}", bot.chat))
+    .fetch_one(&db.pool)
+    .await
+    .expect("cleanup delete row");
+    assert_eq!(payload["message_id"], json!(message_id), "{payload}");
+    assert_eq!(payload["cleanup"], json!(true), "{payload}");
+
+    // Доставка отмечена убранной, статус прежний.
+    let (status, dismissed_at): (String, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT status::text, dismissed_at FROM notification_deliveries
+         WHERE item_id = $1 AND kind = 'reminder'",
+    )
+    .bind(item.id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("reminder delivery");
+    assert_eq!(status, "sent");
+    assert!(
+        dismissed_at.is_some(),
+        "«🗑 Убрать» must mark the delivery dismissed"
+    );
+
+    // Тоста «устарело» нет.
+    assert!(
+        !bot.fake
+            .answers()
+            .iter()
+            .any(|(_, text, _)| text.as_deref().is_some_and(|t| t.contains("устарело"))),
+        "the expired dismiss must run without the stale toast: {:?}",
+        bot.fake.answers()
+    );
+
+    bot.deliver().await;
+    assert!(
+        !bot.fake
+            .messages(bot.chat)
+            .into_iter()
+            .any(|(id, _)| id == message_id),
+        "the reminder must disappear from the chat"
+    );
+    // Экран навигации не перерисован: после нажатия только удаление.
+    let calls = bot.fake.calls();
+    assert!(
+        calls[calls_before..]
+            .iter()
+            .all(|call| matches!(call, Call::Delete { .. })),
+        "the navigation screen must not be redrawn: {:?}",
+        &calls[calls_before..]
+    );
+    assert_eq!(
+        support::notifications::item_status(&db.pool, item.id).await,
+        before,
+        "«🗑 Убрать» must not change the task"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_complete_in_a_reminder_is_refused_as_before() {
+    let db = isolated_db().await;
+    let (mut bot, item, message_id, html) = reminder_stand(&db.pool).await;
+    let complete = support::notifications::button_of(&html, "Выполнено");
+    let before = support::notifications::item_status(&db.pool, item.id).await;
+    let calls_before = bot.fake.calls().len();
+
+    bot.advance(Duration::hours(30));
+    bot.press_data(&complete, message_id).await;
+
+    assert!(
+        bot.fake.answers().iter().any(|(_, text, _)| {
+            text.as_deref() == Some("Это действие устарело. Открываю актуальный экран.")
+        }),
+        "the expired complete must keep the stale toast: {:?}",
+        bot.fake.answers()
+    );
+    assert_eq!(
+        support::notifications::item_status(&db.pool, item.id).await,
+        before,
+        "the expired complete must not change the task"
+    );
+    // Удаления нет: ни строки outbox, ни вызова Telegram; сообщение живо.
+    let deletes: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox
+         WHERE chat_id = $1 AND kind = 'delete' AND dedupe_key = $2",
+    )
+    .bind(bot.chat)
+    .bind(format!("delete:{}:{message_id}", bot.chat))
+    .fetch_one(&db.pool)
+    .await
+    .expect("delete rows");
+    assert_eq!(deletes, 0);
+    let calls = bot.fake.calls();
+    assert!(
+        calls[calls_before..]
+            .iter()
+            .all(|call| !matches!(call, Call::Delete { .. })),
+        "the expired complete must not delete anything: {:?}",
+        &calls[calls_before..]
+    );
+    assert!(
+        bot.fake
+            .messages(bot.chat)
+            .into_iter()
+            .any(|(id, _)| id == message_id),
+        "the reminder must stay in the chat"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreign_expired_dismiss_is_refused() {
+    let db = isolated_db().await;
+    let (mut bot, _item, message_id, html) = reminder_stand(&db.pool).await;
+    let dismiss = support::notifications::button_of(&html, "🗑 Убрать");
+    let mut other =
+        Harness::sharing(&db.pool, next_telegram_id(), bot.fake.clone()).named("Mallory");
+
+    bot.advance(Duration::hours(30));
+    other.set_now(bot.now);
+    other.press_data(&dismiss, message_id).await;
+
+    assert!(
+        other.fake.answers().iter().any(|(_, text, alert)| {
+            *alert && text.as_deref() == Some("Эта кнопка предназначена другому пользователю.")
+        }),
+        "a foreign expired token must be refused with an alert: {:?}",
+        other.fake.answers()
+    );
+    let deletes: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox
+         WHERE chat_id = $1 AND kind = 'delete' AND dedupe_key = $2",
+    )
+    .bind(bot.chat)
+    .bind(format!("delete:{}:{message_id}", bot.chat))
+    .fetch_one(&db.pool)
+    .await
+    .expect("delete rows");
+    assert_eq!(deletes, 0, "a foreign press must not enqueue a delete");
+    assert!(
+        bot.fake
+            .messages(bot.chat)
+            .into_iter()
+            .any(|(id, _)| id == message_id),
+        "the reminder must stay in the chat"
     );
 }

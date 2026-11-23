@@ -116,6 +116,11 @@ pub enum Outgoing {
         ///
         /// `false` — обычное поведение; так читаются старые строки без поля.
         disable_preview: bool,
+        /// Id прежних сообщений этого чата, которые удаляются после доставки
+        /// нового (0017, решение 5).
+        ///
+        /// Пустой вектор — без замены; так читаются старые строки без поля.
+        replaces: Vec<i64>,
     },
     /// Редактирование конкретного сообщения (например, уведомления).
     Edit {
@@ -128,6 +133,10 @@ pub enum Outgoing {
     Delete {
         /// Сообщение.
         message_id: i64,
+        /// Уборка сообщения бота: отказ удаления не засыпает вид чата.
+        ///
+        /// `false` — обычное удаление; так читаются старые строки без поля.
+        cleanup: bool,
     },
     /// Носитель постоянной reply-клавиатуры (кнопка «🏠 Меню»).
     ///
@@ -164,6 +173,7 @@ impl Outgoing {
                 rich,
                 delete_after,
                 disable_preview,
+                replaces,
             } => {
                 let mut payload = json!({"html": html, "rich": rich});
                 if let Some(seconds) = delete_after {
@@ -172,10 +182,22 @@ impl Outgoing {
                 if *disable_preview {
                     payload["disable_preview"] = json!(true);
                 }
+                if !replaces.is_empty() {
+                    payload["replaces"] = json!(replaces);
+                }
                 payload
             }
             Self::Edit { message_id, html } => json!({"html": html, "message_id": message_id}),
-            Self::Delete { message_id } => json!({"message_id": message_id}),
+            Self::Delete {
+                message_id,
+                cleanup,
+            } => {
+                let mut payload = json!({"message_id": message_id});
+                if *cleanup {
+                    payload["cleanup"] = json!(true);
+                }
+                payload
+            }
             Self::Keyboard { html, rows } => json!({"html": html, "rows": rows}),
         }
     }
@@ -204,6 +226,16 @@ impl Outgoing {
                     .get("disable_preview")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                // Отсутствующее поле — «без замены»: старые строки и все
+                // обычные сообщения. Испорченное значение не подменяется
+                // пустым списком: строка уходит в `invalid_payload`, как
+                // испорченный `delete_after`, — поле велит удалить прежние
+                // сообщения, и молча потерянный список оставил бы их в чате
+                // без сигнала о поломке.
+                replaces: match payload.get("replaces") {
+                    None => Vec::new(),
+                    Some(value) => serde_json::from_value(value.clone()).ok()?,
+                },
             }),
             "edit" => Some(Self::Edit {
                 message_id: payload.get("message_id")?.as_i64()?,
@@ -211,6 +243,12 @@ impl Outgoing {
             }),
             "delete" => Some(Self::Delete {
                 message_id: payload.get("message_id")?.as_i64()?,
+                // Отсутствующее поле — обычное удаление: старые строки.
+                // Неверный тип не делает строку мёртвой, как `disable_preview`.
+                cleanup: payload
+                    .get("cleanup")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             }),
             "keyboard" => Some(Self::Keyboard {
                 html: payload.get("html")?.as_str()?.to_owned(),
@@ -346,6 +384,65 @@ pub async fn enqueue_screen(
     .await?;
     views::set(conn, chat_id, view_key, state, now).await?;
     Ok(seq)
+}
+
+/// Префикс ключа отложенного удаления «✅ Выполнено» без метки времени.
+///
+/// Заканчивается на `:`, поэтому сообщение 12 не задевает ключи сообщения 123.
+/// Общий для [`notice_expire_key`] и [`cancel_scheduled_deletes`].
+fn notice_expire_prefix(chat_id: i64, message_id: i64) -> String {
+    format!("notice-expire:{chat_id}:{message_id}:")
+}
+
+/// Ключ отложенного удаления сообщения «✅ Выполнено» (0017, решение 4).
+///
+/// Метка времени в конце нужна потому, что `dedupe_key` уникален по таблице,
+/// а повторное «Выполнено» после отмены ставит удаление снова.
+pub fn notice_expire_key(chat_id: i64, message_id: i64, now: DateTime<Utc>) -> String {
+    format!(
+        "{}{}",
+        notice_expire_prefix(chat_id, message_id),
+        now.timestamp_millis()
+    )
+}
+
+/// Ключ удаления прежнего сообщения при замене (0017, решение 5).
+///
+/// Детерминированный ключ делает постановку идемпотентной для всех путей
+/// (доставка, отмена, сводное): повторная постановка того же id не создаёт
+/// вторую строку.
+pub fn replace_key(chat_id: i64, message_id: i64) -> String {
+    format!("replace:{chat_id}:{message_id}")
+}
+
+/// Отменить отложенные удаления уборки сообщения (0017, решение 4).
+///
+/// «↩️ Отменить» переводит в `skipped` будущие (`next_attempt_at > now`)
+/// `pending`-строки `delete` этого чата, чей `dedupe_key` начинается с
+/// [`notice_expire_prefix`] этого сообщения. Поиск идёт по ключу: у ожидающей
+/// строки `outbox.message_id` ещё пуст. Наступившие строки и удаления с другими
+/// ключами не трогаются. Возвращает число отменённых строк.
+pub async fn cancel_scheduled_deletes(
+    conn: &mut PgConnection,
+    chat_id: i64,
+    message_id: i64,
+    now: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
+    // Префикс собран из чисел и `:`, символов шаблона LIKE в нём нет.
+    let pattern = format!("{}%", notice_expire_prefix(chat_id, message_id));
+    Ok(sqlx::query(
+        "UPDATE outbox
+         SET status = 'skipped', last_error = 'cancelled',
+             payload = jsonb_build_object('redacted', true)
+         WHERE kind = 'delete' AND status = 'pending' AND chat_id = $1
+           AND next_attempt_at > $2 AND dedupe_key LIKE $3",
+    )
+    .bind(chat_id)
+    .bind(now)
+    .bind(pattern)
+    .execute(conn)
+    .await?
+    .rows_affected())
 }
 
 /// Состояние outbox.
@@ -616,12 +713,16 @@ impl OutboxWorker {
                 .dedupe_key
                 .as_deref()
                 .is_some_and(|key| key.starts_with(KEYBOARD_DELETE_PREFIX));
+        // Уборка сообщения бота (0017, решение 2): удаляемое сообщение не стоит
+        // ниже якоря, поэтому отказ удаления не засыпает вид чата.
+        let cleanup = matches!(outgoing, Outgoing::Delete { cleanup: true, .. });
+        let skip_bury = carrier_delete || cleanup;
 
         // Страховка: удаление текущего носителя клавиатуры убирает клавиатуру,
         // поэтому такой `Delete` пропускается без вызова Telegram и без
         // `mark_buried`. Прежний носитель под защиту не попадает: к моменту его
         // доставки текущим уже стал новый id (вариант A).
-        if let Outgoing::Delete { message_id } = &outgoing
+        if let Outgoing::Delete { message_id, .. } = &outgoing
             && views::keyboard_message_id(&mut tx, row.chat_id).await? == Some(*message_id)
         {
             sqlx::query(
@@ -677,12 +778,41 @@ impl OutboxWorker {
                     enqueue_at(
                         &mut tx,
                         row.chat_id,
-                        &Outgoing::Delete { message_id },
+                        &Outgoing::Delete {
+                            message_id,
+                            cleanup: false,
+                        },
                         Some(&key),
                         now,
                         now + Duration::seconds(i64::from(*seconds)),
                     )
                     .await?;
+                }
+                // Замена (0017, решение 5): прежние сообщения удаляются только
+                // после фактической доставки нового, поэтому строки ставятся
+                // здесь же, в транзакции отметки `sent`. Ушедшее в `dead`
+                // сообщение прежнее не удаляет. Дубликат ключа — не ошибка:
+                // удаление этого id уже поставлено другим путём.
+                if let Outgoing::Message { replaces, .. } = &outgoing {
+                    for id in replaces {
+                        // Новое сообщение не удаляет само себя.
+                        if *id == message_id {
+                            continue;
+                        }
+                        let key = replace_key(row.chat_id, *id);
+                        enqueue_at(
+                            &mut tx,
+                            row.chat_id,
+                            &Outgoing::Delete {
+                                message_id: *id,
+                                cleanup: true,
+                            },
+                            Some(&key),
+                            now,
+                            now,
+                        )
+                        .await?;
+                    }
                 }
                 // Вариант A: носитель уже доставлен, теперь в той же транзакции
                 // запоминаем его id и ставим удаление прежнего. Прежний id
@@ -698,7 +828,10 @@ impl OutboxWorker {
                         enqueue_at(
                             &mut tx,
                             row.chat_id,
-                            &Outgoing::Delete { message_id: old },
+                            &Outgoing::Delete {
+                                message_id: old,
+                                cleanup: false,
+                            },
                             Some(&key),
                             now,
                             now,
@@ -737,13 +870,14 @@ impl OutboxWorker {
                 .bind(code)
                 .execute(&mut *tx)
                 .await?;
-                // Отказ удаления прежнего носителя считается выполненным:
-                // это служебное сообщение бота, активный экран от него не
-                // засыпает (design, решение 3). У остальных удалений сообщение
-                // пользователя осталось в чате: следующий экран должен прийти
-                // новым сообщением. Строку вида не создаём — без активного
-                // экрана `buried` не нужен (см. `views`).
-                if !carrier_delete {
+                // Отказ удаления прежнего носителя или уборки считается
+                // выполненным: это служебное сообщение бота, активный экран от
+                // него не засыпает (design, решение 3; 0017, решение 2). У
+                // остальных удалений сообщение пользователя осталось в чате:
+                // следующий экран должен прийти новым сообщением. Строку вида
+                // не создаём — без активного экрана `buried` не нужен
+                // (см. `views`).
+                if !skip_bury {
                     views::mark_buried(&mut tx, row.chat_id).await?;
                 }
                 tracing::warn!(
@@ -757,10 +891,10 @@ impl OutboxWorker {
                 let attempts = row.attempts + 1;
                 if attempts >= MAX_ATTEMPTS {
                     // Сообщение пользователя осталось в чате: следующий экран
-                    // должен прийти новым сообщением. Прежний носитель —
-                    // исключение: это служебное сообщение бота, экран от него
-                    // не засыпает.
-                    if matches!(outgoing, Outgoing::Delete { .. }) && !carrier_delete {
+                    // должен прийти новым сообщением. Прежний носитель и
+                    // уборка — исключения: это служебные сообщения бота, экран
+                    // от них не засыпает.
+                    if matches!(outgoing, Outgoing::Delete { .. }) && !skip_bury {
                         views::mark_buried(&mut tx, row.chat_id).await?;
                     }
                     mark_dead(&mut tx, row.seq, error.code(), now).await?;
@@ -782,10 +916,10 @@ impl OutboxWorker {
             }
             Err(error) => {
                 // Любой окончательный отказ удаления, кроме «сообщения нет»,
-                // оставляет сообщение пользователя в чате. Прежний носитель —
-                // исключение: это служебное сообщение бота, экран от него
-                // не засыпает.
-                if matches!(outgoing, Outgoing::Delete { .. }) && !carrier_delete {
+                // оставляет сообщение пользователя в чате. Прежний носитель и
+                // уборка — исключения: это служебные сообщения бота, экран от
+                // них не засыпает.
+                if matches!(outgoing, Outgoing::Delete { .. }) && !skip_bury {
                     views::mark_buried(&mut tx, row.chat_id).await?;
                 }
                 mark_dead(&mut tx, row.seq, error.code(), now).await?;
@@ -934,7 +1068,7 @@ async fn deliver(
             }
             Ok(message_id)
         }
-        Outgoing::Delete { message_id } => {
+        Outgoing::Delete { message_id, .. } => {
             match api.delete_message(row.chat_id, *message_id).await {
                 // «Удалять нечего» — тот же результат, что и успешное удаление.
                 Ok(()) | Err(TelegramError::MessageGone) => Ok(*message_id),
@@ -1056,24 +1190,41 @@ mod tests {
                 rich: true,
                 delete_after: None,
                 disable_preview: false,
+                replaces: Vec::new(),
             },
             Outgoing::Message {
                 html: "b".into(),
                 rich: false,
                 delete_after: Some(3_600),
                 disable_preview: false,
+                replaces: Vec::new(),
             },
             Outgoing::Message {
                 html: "b".into(),
                 rich: false,
                 delete_after: Some(900),
                 disable_preview: true,
+                replaces: Vec::new(),
+            },
+            Outgoing::Message {
+                html: "b".into(),
+                rich: true,
+                delete_after: None,
+                disable_preview: false,
+                replaces: vec![5, 6],
             },
             Outgoing::Edit {
                 message_id: 7,
                 html: "c".into(),
             },
-            Outgoing::Delete { message_id: 8 },
+            Outgoing::Delete {
+                message_id: 8,
+                cleanup: false,
+            },
+            Outgoing::Delete {
+                message_id: 9,
+                cleanup: true,
+            },
             Outgoing::Keyboard {
                 html: "d".into(),
                 rows: vec![vec!["🏠 Меню".into()]],
@@ -1168,6 +1319,7 @@ mod tests {
                 rich: true,
                 delete_after: None,
                 disable_preview: false,
+                replaces: Vec::new(),
             })
         );
     }
@@ -1198,6 +1350,7 @@ mod tests {
             rich: false,
             delete_after: None,
             disable_preview: false,
+            replaces: Vec::new(),
         };
         assert_eq!(plain.payload(), json!({"html": "a", "rich": false}));
 
@@ -1206,6 +1359,7 @@ mod tests {
             rich: false,
             delete_after: Some(3_600),
             disable_preview: false,
+            replaces: Vec::new(),
         };
         assert_eq!(
             expiring.payload(),
@@ -1220,6 +1374,7 @@ mod tests {
             rich: false,
             delete_after: Some(900),
             disable_preview: true,
+            replaces: Vec::new(),
         };
         assert_eq!(
             hidden.payload(),
@@ -1232,6 +1387,7 @@ mod tests {
                 rich: false,
                 delete_after: None,
                 disable_preview: true,
+                replaces: Vec::new(),
             })
         );
         assert_eq!(
@@ -1241,8 +1397,123 @@ mod tests {
                 rich: false,
                 delete_after: None,
                 disable_preview: false,
+                replaces: Vec::new(),
             }),
             "a broken flag must not hide the link nor kill the row"
+        );
+    }
+
+    #[test]
+    fn message_row_without_replaces_reads_as_no_replacement() {
+        assert_eq!(
+            Outgoing::from_row("message", &json!({"html": "a", "rich": true})),
+            Some(Outgoing::Message {
+                html: "a".into(),
+                rich: true,
+                delete_after: None,
+                disable_preview: false,
+                replaces: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn message_row_with_invalid_replaces_is_not_parsed() {
+        for replaces in [
+            json!("abc"),
+            json!(5),
+            json!([1, "a"]),
+            json!([1.5]),
+            json!({"a": 1}),
+        ] {
+            assert_eq!(
+                Outgoing::from_row(
+                    "message",
+                    &json!({"html": "a", "rich": true, "replaces": replaces})
+                ),
+                None,
+                "replaces {replaces} must become invalid_payload, not no replacement"
+            );
+        }
+    }
+
+    #[test]
+    fn message_payload_has_replaces_only_when_non_empty() {
+        let plain = Outgoing::Message {
+            html: "a".into(),
+            rich: false,
+            delete_after: None,
+            disable_preview: false,
+            replaces: Vec::new(),
+        };
+        assert_eq!(plain.payload(), json!({"html": "a", "rich": false}));
+
+        let replacing = Outgoing::Message {
+            html: "a".into(),
+            rich: false,
+            delete_after: None,
+            disable_preview: false,
+            replaces: vec![5, 6],
+        };
+        assert_eq!(
+            replacing.payload(),
+            json!({"html": "a", "rich": false, "replaces": [5, 6]})
+        );
+    }
+
+    #[test]
+    fn replace_key_contains_chat_and_message() {
+        assert_eq!(replace_key(-100_123, 42), "replace:-100123:42");
+    }
+
+    #[test]
+    fn delete_payload_has_cleanup_only_when_set() {
+        let plain = Outgoing::Delete {
+            message_id: 8,
+            cleanup: false,
+        };
+        assert_eq!(plain.payload(), json!({"message_id": 8}));
+
+        let cleanup = Outgoing::Delete {
+            message_id: 8,
+            cleanup: true,
+        };
+        assert_eq!(cleanup.payload(), json!({"message_id": 8, "cleanup": true}));
+    }
+
+    #[test]
+    fn notice_expire_key_contains_chat_message_and_millis() {
+        let now = DateTime::from_timestamp_millis(1_700_000_000_123).expect("time");
+        assert_eq!(
+            notice_expire_key(-100_123, 42, now),
+            "notice-expire:-100123:42:1700000000123"
+        );
+    }
+
+    #[test]
+    fn delete_row_without_cleanup_reads_as_regular_delete() {
+        assert_eq!(
+            Outgoing::from_row("delete", &json!({"message_id": 8})),
+            Some(Outgoing::Delete {
+                message_id: 8,
+                cleanup: false,
+            }),
+            "old rows without the field must read as a regular delete"
+        );
+        assert_eq!(
+            Outgoing::from_row("delete", &json!({"message_id": 8, "cleanup": true})),
+            Some(Outgoing::Delete {
+                message_id: 8,
+                cleanup: true,
+            })
+        );
+        assert_eq!(
+            Outgoing::from_row("delete", &json!({"message_id": 8, "cleanup": "yes"})),
+            Some(Outgoing::Delete {
+                message_id: 8,
+                cleanup: false,
+            }),
+            "a broken flag must not kill the row"
         );
     }
 }

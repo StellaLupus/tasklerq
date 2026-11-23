@@ -1,6 +1,6 @@
 //! Утренняя сводка: планирование, содержимое и текст сообщения.
 
-use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, Duration, NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
 use sqlx::{FromRow, PgConnection, PgPool};
 use uuid::Uuid;
@@ -139,6 +139,7 @@ pub async fn plan(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error>
             kind: NotificationKind::Digest,
             occurrence_key: &occurrence_key,
             origin_key: None,
+            replaces_message_id: None,
             scheduled_at,
         };
         match notifications::insert(&mut conn, &delivery, now).await {
@@ -424,6 +425,51 @@ pub(crate) async fn digest_message(
     notify::render_notice(conn, telegram_user_id, row.household_id, &ui, now)
         .await
         .map(Some)
+}
+
+/// Окно поиска прежней сводки для замены: 47 часов.
+///
+/// Telegram даёт удалять сообщения только в течение 48 часов; час запаса
+/// учитывает очередь outbox и расхождение часов, чтобы удаление не уперлось
+/// в лимит уже после доставки новой сводки (design 0017, решение 6). Строки
+/// outbox при этом живут не меньше 48 часов (`jobs::retention`).
+const REPLACE_WINDOW_HOURS: i64 = 47;
+
+/// Отобрать прежние сводки получателя, которые уберёт новая.
+///
+/// Годятся только доставленные (`sent`) и ещё не убранные (`dismissed_at IS
+/// NULL`) сводки этого получателя, чья строка outbox действительно доставила
+/// сообщение в этом чате не раньше [`REPLACE_WINDOW_HOURS`]: более старые
+/// Telegram удалить уже не даст. Каждое отобранное сообщение отмечается
+/// `mark_dismissed`, его id возвращается для `replaces` новой сводки (0017,
+/// решение 6). Функция общая: ежедневная доставка, выпуск отложенной тихими
+/// часами по тику и ручной выпуск сходятся в `deliver_one_in_conn`, другой
+/// путь доставки сводки (0019) сможет вызвать её сам.
+pub(crate) async fn replace_previous(
+    conn: &mut PgConnection,
+    row: &NoticeRow,
+    chat_id: i64,
+    now: DateTime<Utc>,
+) -> Result<Vec<i64>, sqlx::Error> {
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT o.message_id
+         FROM notification_deliveries d
+         JOIN outbox o ON o.seq = d.outbox_seq
+         WHERE d.kind = 'digest' AND d.status = 'sent'
+           AND d.user_id = $1 AND d.id <> $2 AND d.dismissed_at IS NULL
+           AND o.chat_id = $3 AND o.message_id IS NOT NULL
+           AND o.sent_at >= $4",
+    )
+    .bind(row.user_id)
+    .bind(row.id)
+    .bind(chat_id)
+    .bind(now - Duration::hours(REPLACE_WINDOW_HOURS))
+    .fetch_all(&mut *conn)
+    .await?;
+    for id in &ids {
+        notifications::mark_dismissed(conn, chat_id, *id, now).await?;
+    }
+    Ok(ids)
 }
 
 /// Немедленно выпустить отложенные сводки получателя.

@@ -485,6 +485,7 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
         rich: false,
         delete_after: None,
         disable_preview: false,
+        replaces: Vec::new(),
     };
     tasklerq::telegram::outbox::enqueue(&mut conn, dead_chat, &dead_payload, None, now)
         .await
@@ -508,6 +509,7 @@ async fn scrape_reports_queue_llm_capture_and_http_metrics() {
         rich: false,
         delete_after: None,
         disable_preview: false,
+        replaces: Vec::new(),
     };
     tasklerq::telegram::outbox::enqueue(&mut conn, pending_chat, &pending, None, now)
         .await

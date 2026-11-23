@@ -367,6 +367,7 @@ impl Ctx<'_> {
                 rich: false,
                 delete_after: None,
                 disable_preview: false,
+                replaces: Vec::new(),
             },
             None,
             self.now,
@@ -431,6 +432,7 @@ impl Ctx<'_> {
                     rich: false,
                     delete_after: None,
                     disable_preview: false,
+                    replaces: Vec::new(),
                 },
                 None,
                 self.now,
@@ -643,6 +645,7 @@ impl Bot {
                 chat_id,
                 &Outgoing::Delete {
                     message_id: *message_id,
+                    cleanup: false,
                 },
                 Some(&delete_dedupe_key(chat_id, *message_id)),
                 now,
@@ -1015,9 +1018,21 @@ async fn on_callback(ctx: &mut Ctx<'_>, message_id: i64, data: &str) -> Result<(
             ctx.toast("Это действие уже выполнено.");
             return refresh_unless_notice(ctx, scope).await;
         }
-        Consumed::Expired(scope) => {
-            ctx.toast("Это действие устарело. Открываю актуальный экран.");
-            return refresh_unless_notice(ctx, scope).await;
+        Consumed::Expired(token) => {
+            // «🗑 Убрать» выполняется и после истечения токена: удалить своё
+            // сообщение безопасно (design 0017, решение 1). Остальные истёкшие
+            // действия ведут себя как раньше.
+            let dismiss = token.scope == Scope::Notice
+                && matches!(
+                    serde_json::from_value::<Action>(token.payload.clone()),
+                    Ok(Action::NoticeClose)
+                );
+            if dismiss {
+                token
+            } else {
+                ctx.toast("Это действие устарело. Открываю актуальный экран.");
+                return refresh_unless_notice(ctx, token.scope).await;
+            }
         }
         Consumed::Foreign => {
             ctx.alert("Эта кнопка предназначена другому пользователю.");
@@ -1059,7 +1074,9 @@ async fn on_callback(ctx: &mut Ctx<'_>, message_id: i64, data: &str) -> Result<(
         ctx.toast("Это действие уже неактуально.");
         return ctx.refresh().await;
     };
-    // Токен уже потреблён: откат действия его не возвращает.
+    // Действующий токен уже потреблён: откат действия его не возвращает
+    // (истёкший «🗑 Убрать» не потребляется и повторное нажатие безопасно:
+    // удаление идемпотентно по ключу).
     ctx.in_step(|ctx| Box::pin(run_action(ctx, message_id, action)))
         .await
 }

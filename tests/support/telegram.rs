@@ -605,6 +605,13 @@ impl Harness {
 
     /// Обработать очередь обновлений и доставить исходящие.
     pub async fn pump(&mut self) {
+        self.process_updates().await;
+        self.deliver().await;
+    }
+
+    /// Обработать очередь обновлений, не доставляя исходящие: тест смотрит
+    /// payload строк outbox до доставки.
+    pub async fn process_updates(&mut self) {
         self.tick();
         for _ in 0..50 {
             match self.updates.run_once(self.now).await.expect("update pass") {
@@ -612,7 +619,6 @@ impl Harness {
                 Pass::Idle | Pass::Failed(_) => break,
             }
         }
-        self.deliver().await;
     }
 
     /// Доставить исходящие, пока очередь не опустеет.
@@ -732,6 +738,15 @@ impl Harness {
         let update = self.callback_update(&name, data, message_id);
         self.enqueue(update).await;
         self.pump().await;
+    }
+
+    /// Нажать кнопку, обработать обновление, но не доставлять исходящие:
+    /// payload поставленных строк outbox ещё цел.
+    pub async fn press_data_pending(&mut self, data: &str, message_id: i64) {
+        let name = self.name.clone();
+        let update = self.callback_update(&name, data, message_id);
+        self.enqueue(update).await;
+        self.process_updates().await;
     }
 
     pub fn assert_screen_contains(&self, needle: &str) {
