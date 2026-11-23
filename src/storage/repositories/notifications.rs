@@ -103,19 +103,57 @@ pub async fn insert(
 
 /// Вставить snooze-доставку; возвращает затёртый id сообщения «😴 Напомню …».
 ///
+/// Повторный snooze на то же время из другого сообщения при ожидающем snooze с
+/// тем же ключом и `origin_key` записывает новое сообщение: `replaces_message_id`
+/// строки обновляется, прежнее непустое значение возвращается как затёртое
+/// (0017, решение 5). Строка блокируется обновлением, поэтому прежнее значение
+/// читается атомарно с записью. Пустое новое значение (snooze из сводного
+/// сообщения) ожидающую строку не трогает.
+///
 /// Если ветка `DO UPDATE` заменила непустой `replaces_message_id` другим
-/// значением (повторный snooze по тому же ключу из другого сообщения, в том
-/// числе после отмены прежнего), прежнее сообщение эта доставка уже не
-/// заменит и его нужно удалить сразу. Равное или пустое прежнее значение не
-/// возвращается. `batched` отмечает групповой snooze («Отложить все на час»):
-/// такая доставка собирается в сводное сообщение в свой срок, но не считается
-/// отложенной тихими часами — ручной выпуск и баннер её не трогают.
+/// значением (snooze после отмены прежнего или со сменившимся `origin_key`),
+/// прежнее сообщение эта доставка уже не заменит и его нужно удалить сразу.
+/// Равное или пустое прежнее значение не возвращается. `batched` отмечает
+/// групповой snooze («Отложить все на час»): такая доставка собирается в
+/// сводное сообщение в свой срок, но не считается отложенной тихими часами —
+/// ручной выпуск и баннер её не трогают.
 pub async fn insert_snooze(
     conn: &mut PgConnection,
     delivery: &NewDelivery<'_>,
     batched: bool,
     now: DateTime<Utc>,
 ) -> Result<Option<i64>, sqlx::Error> {
+    if delivery.replaces_message_id.is_some() {
+        let previous: Option<(Option<i64>,)> = sqlx::query_as(
+            "WITH previous AS (
+                 SELECT id, replaces_message_id
+                 FROM notification_deliveries
+                 WHERE user_id = $1 AND item_id IS NOT DISTINCT FROM $2
+                   AND occurrence_key = $3 AND kind = $4
+                   AND origin_key IS NOT DISTINCT FROM $5
+                   AND status = 'pending'
+                   AND replaces_message_id IS DISTINCT FROM $6
+                 FOR UPDATE
+             )
+             UPDATE notification_deliveries d
+             SET replaces_message_id = $6, updated_at = $7
+             FROM previous p
+             WHERE d.id = p.id
+             RETURNING p.replaces_message_id",
+        )
+        .bind(delivery.user_id)
+        .bind(delivery.item_id)
+        .bind(delivery.occurrence_key)
+        .bind(delivery.kind)
+        .bind(delivery.origin_key)
+        .bind(delivery.replaces_message_id)
+        .bind(now)
+        .fetch_optional(&mut *conn)
+        .await?;
+        if let Some((overwritten,)) = previous {
+            return Ok(overwritten);
+        }
+    }
     Ok(insert_with_flags(conn, delivery, batched, now).await?.1)
 }
 
@@ -124,7 +162,11 @@ pub async fn insert_snooze(
 ///
 /// Возвращает число затронутых строк и затёртый `replaces_message_id` —
 /// прежнее непустое значение, которое ветка `DO UPDATE` заменила другим.
-/// Прежняя строка читается CTE `previous` того же запроса, но при
+/// Повторный snooze по тому же ключу и `origin_key` при ожидающей строке сюда
+/// не доходит: его обрабатывает `insert_snooze` отдельным `UPDATE` с
+/// блокировкой строки, где прежнее значение читается атомарно с записью.
+/// Здесь остаются перезапись отменённой строки и смена `origin_key`. Для них
+/// прежняя строка читается CTE `previous` того же запроса, но при
 /// `READ COMMITTED` чтение и обновление не атомарны: CTE видит снимок на
 /// начало запроса, а `ON CONFLICT DO UPDATE` обновляет актуальную версию
 /// строки. Два одновременных snooze по одному ключу из разных сообщений
