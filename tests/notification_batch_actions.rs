@@ -1897,3 +1897,60 @@ async fn stale_actions_on_a_deleted_event_block_report_the_event_is_unavailable(
     assert!(batch.contains("Событие удалено"), "{batch}");
     assert!(!batch.contains("Задача удалена"), "{batch}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snooze_from_a_batch_does_not_record_a_replaced_message() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = bot.now.with_timezone(&moscow).date_naive();
+    let morning = local_utc(moscow, day, 8, 0);
+    let due = local_utc(moscow, day, 9, 0);
+    let first = create_task(&db.pool, &household, "Первая", due, None).await;
+    let second = create_task(&db.pool, &household, "Вторая", due, None).await;
+    deferred_reminder(&db.pool, &household, first.id, due, morning).await;
+    deferred_reminder(&db.pool, &household, second.id, due, morning).await;
+
+    tick_and_deliver(&mut bot, &db.pool, morning).await;
+    let (message_id, html) = bot.latest();
+    // «На час» в блоке (не batched) и «Отложить все» (batched): сводное
+    // сообщение snooze не удаляет, поле заменяемого сообщения пусто.
+    bot.press_data(&button_of(&html, "На час"), message_id)
+        .await;
+    let (_, edited) = bot.latest();
+    bot.press_data(&button_of(&edited, "Отложить все на час"), message_id)
+        .await;
+
+    for item_id in [first.id, second.id] {
+        let replaces: Option<i64> = sqlx::query_scalar(
+            "SELECT replaces_message_id FROM notification_deliveries
+             WHERE item_id = $1 AND kind = 'snooze'",
+        )
+        .bind(item_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("snooze replaces");
+        assert_eq!(
+            replaces, None,
+            "a batch snooze must not record the batch message"
+        );
+    }
+    let replace_deletes: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox
+         WHERE chat_id = $1 AND kind = 'delete' AND dedupe_key LIKE 'replace:%'",
+    )
+    .bind(bot.chat)
+    .fetch_one(&db.pool)
+    .await
+    .expect("replace deletes");
+    assert_eq!(replace_deletes, 0, "the batch message must not be deleted");
+    assert!(
+        bot.fake
+            .messages(bot.chat)
+            .into_iter()
+            .any(|(id, _)| id == message_id),
+        "the batch message must stay in the chat"
+    );
+}

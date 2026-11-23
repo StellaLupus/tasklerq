@@ -426,6 +426,7 @@ async fn insert_reminder(
         kind: NotificationKind::Reminder,
         occurrence_key: key,
         origin_key: None,
+        replaces_message_id: None,
         scheduled_at,
     };
     notifications::insert(conn, &delivery, now).await

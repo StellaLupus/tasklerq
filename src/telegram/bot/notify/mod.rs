@@ -529,15 +529,20 @@ pub(super) fn snooze_time(
 /// Поставить snooze-доставку задачи на `deliver_at`.
 ///
 /// `batched` — групповой snooze: несколько таких задач приходят одним сводным
-/// сообщением. Ключ включает время snooze, поэтому повторное нажатие той же
-/// кнопки не создаёт вторую доставку, а планировщик не путает её с вхождением
-/// срока.
+/// сообщением. `replaces_message_id` — сообщение «😴 Напомню …», которое
+/// заменит эта доставка; у snooze из сводного сообщения пусто. Ключ включает
+/// время snooze, поэтому повторное нажатие той же кнопки не создаёт вторую
+/// доставку, а планировщик не путает её с вхождением срока.
+///
+/// Затёртый другим значением прежний id удаляется сразу: эта доставка его
+/// уже не заменит (design 0017, решение 5).
 pub(super) async fn insert_snooze(
     ctx: &mut Ctx<'_>,
     item_id: Uuid,
     origin_key: &str,
     deliver_at: DateTime<Utc>,
     batched: bool,
+    replaces_message_id: Option<i64>,
 ) -> Result<(), Fail> {
     let occurrence_key = notifications::snooze_key(deliver_at);
     let delivery = NewDelivery {
@@ -547,12 +552,24 @@ pub(super) async fn insert_snooze(
         kind: NotificationKind::Snooze,
         occurrence_key: &occurrence_key,
         origin_key: Some(origin_key),
+        replaces_message_id,
         scheduled_at: deliver_at,
     };
-    if batched {
-        notifications::insert_batched(&mut *ctx.conn, &delivery, ctx.now).await?;
-    } else {
-        notifications::insert(&mut *ctx.conn, &delivery, ctx.now).await?;
+    let overwritten =
+        notifications::insert_snooze(&mut *ctx.conn, &delivery, batched, ctx.now).await?;
+    if let Some(old) = overwritten {
+        outbox::enqueue(
+            &mut *ctx.conn,
+            ctx.chat_id,
+            &Outgoing::Delete {
+                message_id: old,
+                cleanup: true,
+            },
+            Some(&outbox::replace_key(ctx.chat_id, old)),
+            ctx.now,
+        )
+        .await?;
+        notifications::mark_dismissed(&mut *ctx.conn, ctx.chat_id, old, ctx.now).await?;
     }
     Ok(())
 }
@@ -588,7 +605,15 @@ pub async fn snooze(
 
     let deliver_at = snooze_time(until, ctx.tz, ctx.now)?;
     let origin_key = snooze_origin(item.due_at, item.due_date);
-    insert_snooze(ctx, item_id, &origin_key, deliver_at, false).await?;
+    insert_snooze(
+        ctx,
+        item_id,
+        &origin_key,
+        deliver_at,
+        false,
+        Some(message_id),
+    )
+    .await?;
 
     let local = deliver_at.with_timezone(&ctx.tz);
     ctx.toast("Отложено");

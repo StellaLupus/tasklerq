@@ -551,6 +551,7 @@ async fn insert_snooze_with_origin(
         kind: NotificationKind::Snooze,
         occurrence_key: key,
         origin_key,
+        replaces_message_id: None,
         scheduled_at,
     };
     notifications::insert(&mut conn, &delivery, scheduled_at).await

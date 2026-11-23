@@ -78,7 +78,7 @@
   `replace:{chat}:{id}`. Проверить в `tests/telegram_outbox.rs`: удаление
   ставится только после доставки; новое сообщение в `dead` — удаления нет;
   повторная постановка того же id не дублирует строку (design, решение 5).
-- [ ] 4.2 `replaces_message_id` в `NewDelivery`, `insert_with_flags` (включая
+- [x] 4.2 `replaces_message_id` в `NewDelivery`, `insert_with_flags` (включая
   ветку `DO UPDATE`), `NOTICE_ROW_COLUMNS`, `NoticeRow`; `insert_snooze`
   записывает id сообщения для snooze из отдельного уведомления и оставляет
   пустым для `batched`; затёртый другой id удаляется сразу. Проверить в

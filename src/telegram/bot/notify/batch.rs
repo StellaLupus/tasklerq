@@ -607,7 +607,8 @@ async fn snooze_batch_item(
 
     let deliver_at = snooze_time(SnoozeUntil::OneHour, ctx.tz, ctx.now)?;
     let origin_key = snooze_origin(item.due_at, item.due_date);
-    insert_snooze(ctx, item_id, &origin_key, deliver_at, batched).await?;
+    // Сводное сообщение snooze не удаляет: заменяемого сообщения нет.
+    insert_snooze(ctx, item_id, &origin_key, deliver_at, batched, None).await?;
     set_batch_snoozed(ctx, batch_id, item_id, deliver_at).await?;
     Ok(true)
 }

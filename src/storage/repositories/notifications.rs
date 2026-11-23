@@ -81,6 +81,9 @@ pub struct NewDelivery<'a> {
     pub occurrence_key: &'a str,
     /// Вхождение срока, из которого отложено snooze; у остальных видов пусто.
     pub origin_key: Option<&'a str>,
+    /// Сообщение «😴 Напомню …», которое заменит эта snooze-доставка;
+    /// у остальных видов пусто.
+    pub replaces_message_id: Option<i64>,
     /// Момент, начиная с которого запись можно доставлять.
     pub scheduled_at: DateTime<Utc>,
 }
@@ -95,7 +98,7 @@ pub async fn insert(
     delivery: &NewDelivery<'_>,
     now: DateTime<Utc>,
 ) -> Result<u64, sqlx::Error> {
-    insert_with_flags(conn, delivery, false, now).await
+    Ok(insert_with_flags(conn, delivery, false, now).await?.0)
 }
 
 /// Вставить групповую snooze-доставку действия «Отложить все на час».
@@ -108,42 +111,78 @@ pub async fn insert_batched(
     delivery: &NewDelivery<'_>,
     now: DateTime<Utc>,
 ) -> Result<u64, sqlx::Error> {
-    insert_with_flags(conn, delivery, true, now).await
+    Ok(insert_with_flags(conn, delivery, true, now).await?.0)
+}
+
+/// Вставить snooze-доставку; возвращает затёртый id сообщения «😴 Напомню …».
+///
+/// Если ветка `DO UPDATE` заменила непустой `replaces_message_id` другим
+/// значением (повторный snooze по тому же ключу из другого сообщения, в том
+/// числе после отмены прежнего), прежнее сообщение эта доставка уже не
+/// заменит и его нужно удалить сразу. Равное или пустое прежнее значение не
+/// возвращается. `batched` — как в [`insert_batched`].
+pub async fn insert_snooze(
+    conn: &mut PgConnection,
+    delivery: &NewDelivery<'_>,
+    batched: bool,
+    now: DateTime<Utc>,
+) -> Result<Option<i64>, sqlx::Error> {
+    Ok(insert_with_flags(conn, delivery, batched, now).await?.1)
 }
 
 /// Вставить доставку; `batched` отмечает групповой snooze. Признак `deferred`
 /// при вставке всегда снят: его выставляет только перенос тихими часами.
+///
+/// Возвращает число затронутых строк и затёртый `replaces_message_id` —
+/// прежнее непустое значение, которое ветка `DO UPDATE` заменила другим.
+/// Прежняя строка читается CTE того же запроса, поэтому чтение и обновление
+/// атомарны; строка выбирается ровно по ключу уникальности.
 async fn insert_with_flags(
     conn: &mut PgConnection,
     delivery: &NewDelivery<'_>,
     batched: bool,
     now: DateTime<Utc>,
-) -> Result<u64, sqlx::Error> {
-    Ok(sqlx::query(
-        "INSERT INTO notification_deliveries (
-             id, household_id, user_id, item_id, occurrence_key, origin_key, kind,
-             status, scheduled_at, deferred, batched, created_at, updated_at
+) -> Result<(u64, Option<i64>), sqlx::Error> {
+    let row: Option<(i64, Option<i64>)> = sqlx::query_as(
+        "WITH previous AS (
+             SELECT replaces_message_id
+             FROM notification_deliveries
+             WHERE user_id = $3 AND item_id IS NOT DISTINCT FROM $4
+               AND occurrence_key = $5 AND kind = $7
+         ),
+         upsert AS (
+             INSERT INTO notification_deliveries (
+                 id, household_id, user_id, item_id, occurrence_key, origin_key, kind,
+                 status, scheduled_at, deferred, batched, replaces_message_id,
+                 created_at, updated_at
+             )
+             SELECT $1, $2, $3, $4, $5, $6, $7, 'pending', $8, false, $9, $10, $11, $11
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM notification_deliveries d
+                 WHERE d.user_id = $3 AND d.item_id IS NOT DISTINCT FROM $4
+                   AND d.occurrence_key = $5 AND d.kind = $7
+                   AND d.origin_key IS NOT DISTINCT FROM $6
+                   AND d.status IN ('pending', 'sent')
+             )
+             ON CONFLICT ON CONSTRAINT notification_deliveries_key_unique
+             DO UPDATE SET
+                 status = 'pending',
+                 origin_key = EXCLUDED.origin_key,
+                 scheduled_at = EXCLUDED.scheduled_at,
+                 deferred = EXCLUDED.deferred,
+                 batched = EXCLUDED.batched,
+                 replaces_message_id = EXCLUDED.replaces_message_id,
+                 outbox_seq = NULL,
+                 updated_at = EXCLUDED.updated_at
+             WHERE notification_deliveries.status = 'cancelled'
+                OR (notification_deliveries.status = 'pending'
+                    AND notification_deliveries.origin_key IS DISTINCT FROM EXCLUDED.origin_key)
+             RETURNING 1
          )
-         SELECT $1, $2, $3, $4, $5, $6, $7, 'pending', $8, false, $9, $10, $10
-         WHERE NOT EXISTS (
-             SELECT 1 FROM notification_deliveries d
-             WHERE d.user_id = $3 AND d.item_id IS NOT DISTINCT FROM $4
-               AND d.occurrence_key = $5 AND d.kind = $7
-               AND d.origin_key IS NOT DISTINCT FROM $6
-               AND d.status IN ('pending', 'sent')
-         )
-         ON CONFLICT ON CONSTRAINT notification_deliveries_key_unique
-         DO UPDATE SET
-             status = 'pending',
-             origin_key = EXCLUDED.origin_key,
-             scheduled_at = EXCLUDED.scheduled_at,
-             deferred = EXCLUDED.deferred,
-             batched = EXCLUDED.batched,
-             outbox_seq = NULL,
-             updated_at = EXCLUDED.updated_at
-         WHERE notification_deliveries.status = 'cancelled'
-            OR (notification_deliveries.status = 'pending'
-                AND notification_deliveries.origin_key IS DISTINCT FROM EXCLUDED.origin_key)",
+         SELECT count(*),
+                max(previous.replaces_message_id)
+                    FILTER (WHERE previous.replaces_message_id IS DISTINCT FROM $10)
+         FROM upsert LEFT JOIN previous ON true",
     )
     .bind(Uuid::now_v7())
     .bind(delivery.household_id)
@@ -154,10 +193,14 @@ async fn insert_with_flags(
     .bind(delivery.kind)
     .bind(delivery.scheduled_at)
     .bind(batched)
+    .bind(delivery.replaces_message_id)
     .bind(now)
-    .execute(conn)
-    .await?
-    .rows_affected())
+    .fetch_optional(conn)
+    .await?;
+    Ok(match row {
+        Some((affected, overwritten)) => (affected as u64, overwritten),
+        None => (0, None),
+    })
 }
 
 /// Сводное сообщение, выпущенное после тихих часов.
@@ -413,6 +456,7 @@ pub async fn notify_assignment(
         kind: NotificationKind::Assignment,
         occurrence_key: &occurrence_key,
         origin_key: None,
+        replaces_message_id: None,
         scheduled_at: now,
     };
     Ok(insert(conn, &delivery, now).await?)

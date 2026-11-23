@@ -19,7 +19,8 @@ use crate::storage::repositories::notifications::NotificationKind;
 
 /// Колонки записи доставки и связанных строк для [`NoticeRow`].
 pub(crate) const NOTICE_ROW_COLUMNS: &str = "d.id, d.household_id, d.user_id, d.kind,
-        d.occurrence_key, d.origin_key, d.scheduled_at, d.deferred, d.created_at,
+        d.occurrence_key, d.origin_key, d.replaces_message_id,
+        d.scheduled_at, d.deferred, d.created_at,
         i.id AS item_id, i.title AS item_title, i.status AS item_status,
         i.deleted_at AS item_deleted_at, i.due_at AS item_due_at,
         i.due_date AS item_due_date, i.end_at AS item_end_at,
@@ -50,6 +51,10 @@ pub(crate) struct NoticeRow {
     pub kind: NotificationKind,
     pub occurrence_key: String,
     pub origin_key: Option<String>,
+    /// Сообщение «😴 Напомню …», которое заменит snooze-доставка.
+    // Читает доставка и отмена snooze (0017, пункт 4.3).
+    #[allow(dead_code)]
+    pub replaces_message_id: Option<i64>,
     pub scheduled_at: DateTime<Utc>,
     pub deferred: bool,
     pub created_at: DateTime<Utc>,
