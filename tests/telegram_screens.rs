@@ -1494,7 +1494,10 @@ async fn search_and_my_tasks() {
 
     bot.press("Назад").await;
     bot.press("Мои задачи").await;
-    bot.assert_screen_contains("Мои задачи · 1");
+    // 0018-shared-tasks 2.1: счётчик считает и общую задачу «Купить молоко
+    // домой» без исполнителя. Состав экрана переключится на `mine_for`
+    // в пункте 2.2, пока показывается только назначенная задача.
+    bot.assert_screen_contains("Мои задачи · 2");
     bot.assert_screen_contains("Моя задача");
     assert!(!bot.screen().contains("Купить молоко домой"));
 }

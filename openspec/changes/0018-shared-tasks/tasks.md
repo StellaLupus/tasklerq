@@ -18,7 +18,7 @@
 
 ## 2. «Мои задачи»
 
-- [ ] 2.1 `SearchFilters::mine_for` и `items::open_mine_tasks` с общим
+- [x] 2.1 `SearchFilters::mine_for` и `items::open_mine_tasks` с общим
   SQL-фрагментом «назначена мне или без исполнителя»; `assignee_user_id` не
   меняется; позиционные привязки `SEARCH_FILTERS` сдвинуты. Проверить в
   `tests/search.rs` и `tests/repositories.rs` (тесты `open_assigned_tasks_*`

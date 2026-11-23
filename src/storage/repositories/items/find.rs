@@ -35,21 +35,21 @@ struct SearchRow {
 
 /// Проекция и ранжирование: общая часть обоих вариантов запроса.
 ///
-/// `$14` — сырой текст запроса; при пустом запросе он биндится как `NULL`, и
+/// `$15` — сырой текст запроса; при пустом запросе он биндится как `NULL`, и
 /// `plainto_tsquery`/бонус за название дают нулевую релевантность.
 const SEARCH_PROJECTION: &str = "
         SELECT id, rank, sort_due, list_name, list_kind
         FROM (
             SELECT i.id AS id,
                    (
-                       COALESCE(ts_rank(i.search_vector, plainto_tsquery('simple', $14)), 0)
-                       + CASE WHEN $14::text IS NOT NULL
-                                   AND strpos(lower(i.title), lower($14)) > 0
+                       COALESCE(ts_rank(i.search_vector, plainto_tsquery('simple', $15)), 0)
+                       + CASE WHEN $15::text IS NOT NULL
+                                   AND strpos(lower(i.title), lower($15)) > 0
                               THEN 1.0 ELSE 0.0 END
                    )::float8 AS rank,
                    COALESCE(
                        i.due_at,
-                       (i.due_date::timestamp AT TIME ZONE $12),
+                       (i.due_date::timestamp AT TIME ZONE $13),
                        '9999-12-31 00:00:00+00'::timestamptz
                    ) AS sort_due,
                    l.name AS list_name,
@@ -58,7 +58,13 @@ const SEARCH_PROJECTION: &str = "
             JOIN lists l ON l.id = i.list_id";
 
 /// Фильтры, общие для обоих вариантов.
-const SEARCH_FILTERS: &str = "
+///
+/// `$6` — `mine_for`: свои и общие задачи только в списках вида `tasks`.
+/// У покупок и событий исполнителя обычно нет, и без условия на вид списка
+/// они заполнили бы лимит страницы «Моих задач» и вытеснили задачи.
+fn search_filters() -> String {
+    format!(
+        "
             WHERE i.household_id = $1
               AND i.deleted_at IS NULL
               AND l.deleted_at IS NULL
@@ -66,22 +72,26 @@ const SEARCH_FILTERS: &str = "
               AND ($2::bool OR i.status = $3)
               AND ($4::uuid IS NULL OR i.list_id = $4)
               AND ($5::uuid IS NULL OR i.assignee_user_id = $5)
-              AND ($6::text IS NULL OR EXISTS (
+              AND ($6::uuid IS NULL OR (l.kind = 'tasks' AND {}))
+              AND ($7::text IS NULL OR EXISTS (
                       SELECT 1 FROM item_tags it
                       JOIN tags t ON t.id = it.tag_id
-                      WHERE it.item_id = i.id AND lower(t.name) = lower($6)
+                      WHERE it.item_id = i.id AND lower(t.name) = lower($7)
                   ))
-              AND ($7::timestamptz IS NULL OR
-                   COALESCE(i.due_at, (i.due_date::timestamp AT TIME ZONE $12)) >= $7)
               AND ($8::timestamptz IS NULL OR
-                   COALESCE(i.due_at, (i.due_date::timestamp AT TIME ZONE $12)) < $8)";
+                   COALESCE(i.due_at, (i.due_date::timestamp AT TIME ZONE $13)) >= $8)
+              AND ($9::timestamptz IS NULL OR
+                   COALESCE(i.due_at, (i.due_date::timestamp AT TIME ZONE $13)) < $9)",
+        super::mine_predicate("$6")
+    )
+}
 
 /// Условие курсора, порядок и размер страницы.
 const SEARCH_TAIL: &str = "
         ) matched
-        WHERE ($9::float8 IS NULL OR rank < $9 OR (rank = $9 AND (sort_due > $10 OR (sort_due = $10 AND id > $11))))
+        WHERE ($10::float8 IS NULL OR rank < $10 OR (rank = $10 AND (sort_due > $11 OR (sort_due = $11 AND id > $12))))
         ORDER BY rank DESC, sort_due ASC, id ASC
-        LIMIT $13";
+        LIMIT $14";
 
 /// CTE кандидатов: строки отбираются по trigram-индексам и `search_vector`,
 /// а не полным проходом по задачам household.
@@ -90,21 +100,21 @@ const SEARCH_CANDIDATES_CTE: &str = "
             SELECT i.id AS id
             FROM items i
             WHERE i.household_id = $1
-              AND (i.title ILIKE $15
-                   OR i.notes ILIKE $15
-                   OR i.search_vector @@ plainto_tsquery('simple', $14))
+              AND (i.title ILIKE $16
+                   OR i.notes ILIKE $16
+                   OR i.search_vector @@ plainto_tsquery('simple', $15))
             UNION
             SELECT s.item_id AS id
             FROM subtasks s
             JOIN items i ON i.id = s.item_id
             WHERE i.household_id = $1
-              AND s.title ILIKE $15
+              AND s.title ILIKE $16
             UNION
             SELECT it.item_id AS id
             FROM tags t
             JOIN item_tags it ON it.tag_id = t.id
             WHERE t.household_id = $1
-              AND t.name ILIKE $15
+              AND t.name ILIKE $16
         )
         ";
 
@@ -149,12 +159,13 @@ pub async fn search(
 
     // Два текста: с CTE кандидатов (запрос непустой) и без него. Общие части
     // собраны в константах, различается только источник строк.
+    let search_filters = search_filters();
     let sql = match query {
         Some(_) => format!(
             "{SEARCH_CANDIDATES_CTE}{SEARCH_PROJECTION}
-            JOIN candidates c ON c.id = i.id{SEARCH_FILTERS}{SEARCH_TAIL}"
+            JOIN candidates c ON c.id = i.id{search_filters}{SEARCH_TAIL}"
         ),
-        None => format!("{SEARCH_PROJECTION}{SEARCH_FILTERS}{SEARCH_TAIL}"),
+        None => format!("{SEARCH_PROJECTION}{search_filters}{SEARCH_TAIL}"),
     };
 
     let mut request = sqlx::query_as::<_, SearchRow>(&sql)
@@ -163,6 +174,7 @@ pub async fn search(
         .bind(filters.status.unwrap_or(ItemStatus::Open))
         .bind(filters.list_id)
         .bind(filters.assignee_user_id)
+        .bind(filters.mine_for)
         .bind(tag)
         .bind(filters.due_from)
         .bind(filters.due_to)
@@ -173,7 +185,7 @@ pub async fn search(
         .bind(filters.limit);
     request = match query {
         Some(query) => request.bind(query).bind(like_pattern(query)),
-        // В SQL без текстового условия `$14` остаётся в ранжировании.
+        // В SQL без текстового условия `$15` остаётся в ранжировании.
         None => request.bind(None::<&str>),
     };
 

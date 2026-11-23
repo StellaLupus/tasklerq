@@ -12,8 +12,8 @@ pub use find::{SearchHit, search};
 pub use lifecycle::{complete, reopen, revert_completion, soft_delete, undo_last};
 pub use read::{all_for_export, calendar_items, get, is_deleted, list_by_list, snapshot};
 pub use stats::{
-    MenuCounts, menu_counts, menu_counts_with_timezone, open_assigned_tasks, open_counts_by_list,
-    open_event_counts_by_list, overdue_tasks,
+    MenuCounts, menu_counts, menu_counts_with_timezone, open_counts_by_list,
+    open_event_counts_by_list, open_mine_tasks, overdue_tasks,
 };
 pub use write::{create, reschedule_occurrence, update};
 
@@ -23,6 +23,15 @@ use serde_json::json;
 use crate::domain::error::DomainError;
 use crate::domain::models::{Item, MonthRule, Recurrence, RecurrenceFreq};
 use crate::domain::recurrence::parse_timezone;
+
+/// Предикат «назначена участнику или без исполнителя» (общая задача).
+///
+/// `param` — номер или имя позиционного параметра с идентификатором
+/// участника. Фрагмент только про исполнителя: условие на вид списка
+/// добавляет вызывающий запрос (поиск «моих задач», счётчик, сводка 0019).
+pub(super) fn mine_predicate(param: &str) -> String {
+    format!("(i.assignee_user_id = {param} OR i.assignee_user_id IS NULL)")
+}
 
 /// Окно отмены последнего действия.
 pub const UNDO_WINDOW_MINUTES: i64 = 10;

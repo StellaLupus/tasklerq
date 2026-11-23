@@ -165,7 +165,7 @@ async fn menu(ctx: &mut Ctx<'_>) -> Result<Ui, Fail> {
         ctx.now,
     )
     .await?;
-    let mine_count = items::open_assigned_tasks(&mut *ctx.conn, household.id, user_id).await?;
+    let mine_count = items::open_mine_tasks(&mut *ctx.conn, household.id, user_id).await?;
     let all_lists = lists::list(&mut *ctx.conn, household.id).await?;
     let visible: Vec<&List> = all_lists.iter().filter(|list| !list.is_archived).collect();
     let open = items::open_counts_by_list(&mut *ctx.conn, household.id).await?;
@@ -650,7 +650,7 @@ async fn mine(ctx: &mut Ctx<'_>, page: u32) -> Result<Ui, Fail> {
     let user_id = ctx.user()?.id;
     // Заголовок считает по тому же счётчику, что и кнопка меню: поиск ниже
     // ограничен MAX_LIMIT и не должен уменьшать число в заголовке.
-    let total = items::open_assigned_tasks(&mut *ctx.conn, household_id, user_id).await?;
+    let total = items::open_mine_tasks(&mut *ctx.conn, household_id, user_id).await?;
     let filters = SearchFilters {
         assignee_user_id: Some(user_id),
         limit: crate::domain::search::MAX_LIMIT,

@@ -77,6 +77,9 @@ pub async fn search(
         all_status,
         list_id: parse_uuid(query.list_id.as_deref(), "list_id")?,
         assignee_user_id: parse_uuid(query.assignee_user_id.as_deref(), "assignee_user_id")?,
+        // HTTP API не выставляет фильтр «мои задачи»: только буквальный
+        // исполнитель (0018-shared-tasks, пункт 2.1).
+        mine_for: None,
         tag: query.tag,
         // Даты разбираются в часовом поясе household, интервал полуоткрытый.
         due_from: parse_due_bound(query.due_from.as_deref(), DueBound::From, timezone)?,
