@@ -332,7 +332,11 @@ pub(super) async fn edit_notice(ctx: &mut Ctx<'_>, message_id: i64, ui: &Ui) -> 
     outbox::enqueue(
         &mut *ctx.conn,
         ctx.chat_id,
-        &Outgoing::Edit { message_id, html },
+        &Outgoing::Edit {
+            message_id,
+            html,
+            resend_if_gone: true,
+        },
         None,
         ctx.now,
     )

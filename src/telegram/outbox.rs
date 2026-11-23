@@ -128,6 +128,14 @@ pub enum Outgoing {
         message_id: i64,
         /// HTML RichMessage.
         html: String,
+        /// Прислать правку новым сообщением, если исходное исчезло
+        /// (`MessageGone`).
+        ///
+        /// `false` — правка без повторной отправки: строка завершается как
+        /// `sent`, ничего не отправляется и не удаляется, вид чата не
+        /// засыпается (0018, решение 3). `true` — прежнее поведение; так
+        /// читаются старые строки без поля.
+        resend_if_gone: bool,
     },
     /// Удаление сообщения (например, входящего текста пользователя).
     Delete {
@@ -187,7 +195,19 @@ impl Outgoing {
                 }
                 payload
             }
-            Self::Edit { message_id, html } => json!({"html": html, "message_id": message_id}),
+            Self::Edit {
+                message_id,
+                html,
+                resend_if_gone,
+            } => {
+                let mut payload = json!({"html": html, "message_id": message_id});
+                // Как `cleanup`: в payload пишется только неумолчательное
+                // значение; отсутствие поля читается как `true`.
+                if !*resend_if_gone {
+                    payload["resend_if_gone"] = json!(false);
+                }
+                payload
+            }
             Self::Delete {
                 message_id,
                 cleanup,
@@ -240,6 +260,13 @@ impl Outgoing {
             "edit" => Some(Self::Edit {
                 message_id: payload.get("message_id")?.as_i64()?,
                 html: payload.get("html")?.as_str()?.to_owned(),
+                // Отсутствующее поле — повторная отправка при исчезновении:
+                // старые строки. Неверный тип не делает строку мёртвой, как
+                // `cleanup`.
+                resend_if_gone: payload
+                    .get("resend_if_gone")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
             }),
             "delete" => Some(Self::Delete {
                 message_id: payload.get("message_id")?.as_i64()?,
@@ -1033,7 +1060,7 @@ async fn deliver(
                     let _ = api.delete_message(row.chat_id, old_id).await;
                     (message_id, true)
                 }
-                None => replace_or_send(api, row.chat_id, target, &rich).await?,
+                None => replace_or_send(api, row.chat_id, target, &rich, true).await?,
             };
 
             // Новое сообщение снимает признак засыпанности; правка на месте
@@ -1057,10 +1084,15 @@ async fn deliver(
                 api.send_message(row.chat_id, html, *disable_preview).await
             }
         }
-        Outgoing::Edit { message_id, html } => {
+        Outgoing::Edit {
+            message_id,
+            html,
+            resend_if_gone,
+        } => {
             let rich = RichMessage { html: html.clone() };
             let (message_id, sent_new) =
-                replace_or_send(api, row.chat_id, Some(*message_id), &rich).await?;
+                replace_or_send(api, row.chat_id, Some(*message_id), &rich, *resend_if_gone)
+                    .await?;
             // Запасной путь отправил новое сообщение ниже якоря: как и при
             // доставке `message`, активный экран больше нельзя править на месте.
             if sent_new {
@@ -1083,11 +1115,16 @@ async fn deliver(
 
 /// Отредактировать сообщение; если это невозможно — удалить старое и отправить
 /// новое. Флаг в результате говорит, что было отправлено новое сообщение.
+///
+/// `resend_if_gone = false` запрещает запасной путь: исчезнувшее сообщение
+/// (`MessageGone`) не удаляется и не заменяется, результат — исходный id без
+/// нового сообщения (0018, решение 3).
 async fn replace_or_send(
     api: &dyn TelegramApi,
     chat_id: i64,
     target: Option<i64>,
     message: &RichMessage,
+    resend_if_gone: bool,
 ) -> Result<(i64, bool), TelegramError> {
     let Some(message_id) = target else {
         return Ok((api.send_rich_message(chat_id, message).await?, true));
@@ -1095,6 +1132,7 @@ async fn replace_or_send(
 
     match api.edit_rich_message(chat_id, message_id, message).await {
         Ok(()) | Err(TelegramError::NotModified) => Ok((message_id, false)),
+        Err(TelegramError::MessageGone) if !resend_if_gone => Ok((message_id, false)),
         Err(TelegramError::MessageGone) => {
             // Старое сообщение уже могло исчезнуть; ошибка удаления не мешает.
             let _ = api.delete_message(chat_id, message_id).await;
@@ -1216,6 +1254,12 @@ mod tests {
             Outgoing::Edit {
                 message_id: 7,
                 html: "c".into(),
+                resend_if_gone: true,
+            },
+            Outgoing::Edit {
+                message_id: 7,
+                html: "c".into(),
+                resend_if_gone: false,
             },
             Outgoing::Delete {
                 message_id: 8,
@@ -1233,6 +1277,51 @@ mod tests {
             assert_eq!(
                 Outgoing::from_row(outgoing.kind(), &outgoing.payload()),
                 Some(outgoing)
+            );
+        }
+    }
+
+    #[test]
+    fn edit_row_without_resend_if_gone_reads_as_true() {
+        assert_eq!(
+            Outgoing::from_row("edit", &json!({"html": "a", "message_id": 7})),
+            Some(Outgoing::Edit {
+                message_id: 7,
+                html: "a".into(),
+                resend_if_gone: true,
+            })
+        );
+    }
+
+    #[test]
+    fn edit_row_with_resend_if_gone_false_reads_as_false() {
+        assert_eq!(
+            Outgoing::from_row(
+                "edit",
+                &json!({"html": "a", "message_id": 7, "resend_if_gone": false})
+            ),
+            Some(Outgoing::Edit {
+                message_id: 7,
+                html: "a".into(),
+                resend_if_gone: false,
+            })
+        );
+    }
+
+    #[test]
+    fn edit_row_with_invalid_resend_if_gone_is_not_dead() {
+        for value in [json!("false"), json!(0), json!(null), json!({})] {
+            assert_eq!(
+                Outgoing::from_row(
+                    "edit",
+                    &json!({"html": "a", "message_id": 7, "resend_if_gone": value})
+                ),
+                Some(Outgoing::Edit {
+                    message_id: 7,
+                    html: "a".into(),
+                    resend_if_gone: true,
+                }),
+                "resend_if_gone {value} must fall back to the default, not kill the row"
             );
         }
     }

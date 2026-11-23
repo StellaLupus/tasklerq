@@ -152,6 +152,7 @@ impl Rig {
             &Outgoing::Edit {
                 message_id,
                 html: html.into(),
+                resend_if_gone: true,
             },
             None,
             self.now,
@@ -159,6 +160,41 @@ impl Rig {
         .await
         .expect("enqueue")
         .expect("seq")
+    }
+
+    /// Правка без повторной отправки (0018, решение 3): `resend_if_gone = false`.
+    async fn edit_no_resend(&self, message_id: i64, html: &str) -> i64 {
+        let mut conn = self.pool.acquire().await.expect("conn");
+        outbox::enqueue(
+            &mut conn,
+            self.chat,
+            &Outgoing::Edit {
+                message_id,
+                html: html.into(),
+                resend_if_gone: false,
+            },
+            None,
+            self.now,
+        )
+        .await
+        .expect("enqueue")
+        .expect("seq")
+    }
+
+    /// Поставить строку `edit` с произвольным payload (для старых строк без
+    /// `resend_if_gone`).
+    async fn raw_edit(&self, payload: serde_json::Value) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO outbox (chat_id, kind, payload, next_attempt_at, created_at)
+             VALUES ($1, 'edit', $2, $3, $3)
+             RETURNING seq",
+        )
+        .bind(self.chat)
+        .bind(payload)
+        .bind(self.now)
+        .fetch_one(&self.pool)
+        .await
+        .expect("raw edit")
     }
 
     async fn message(&self, html: &str, key: Option<&str>) -> Option<i64> {
@@ -520,6 +556,75 @@ async fn edit_fallback_with_a_new_message_buries_the_view() {
     assert!(
         rig.buried().await,
         "a new message sent instead of the edit lands below the anchor"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_without_resend_of_a_gone_message_sends_nothing() {
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    rig.put_view().await;
+    rig.message("<p>уведомление</p>", None)
+        .await
+        .expect("message");
+    rig.pass().await;
+    rig.set_buried(false).await;
+    rig.fake.reject_edits(Some(TelegramError::MessageGone));
+    rig.fake.clear_calls();
+    let message_id = rig.fake.messages(rig.chat).last().expect("notification").0;
+
+    let seq = rig.edit_no_resend(message_id, "<p>правка</p>").await;
+    assert_eq!(rig.pass_after(SECOND).await, 1);
+
+    let (status, _, _, row_message_id) = rig.row(seq).await;
+    assert_eq!(status, "sent");
+    assert_eq!(
+        row_message_id,
+        Some(message_id),
+        "the original message id is kept"
+    );
+    assert!(
+        rig.fake.calls().is_empty(),
+        "nothing must be sent or deleted: {:?}",
+        rig.fake.calls()
+    );
+    assert_eq!(rig.fake.messages(rig.chat).len(), 1);
+    assert!(
+        !rig.buried().await,
+        "a gone message must not bury the view when resend is off"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn old_edit_row_without_resend_if_gone_still_resends_when_gone() {
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    rig.put_view().await;
+    rig.message("<p>уведомление</p>", None)
+        .await
+        .expect("message");
+    rig.pass().await;
+    rig.set_buried(false).await;
+    rig.fake.reject_edits(Some(TelegramError::MessageGone));
+    let message_id = rig.fake.messages(rig.chat).last().expect("notification").0;
+
+    let seq = rig
+        .raw_edit(serde_json::json!({"html": "<p>запасной</p>", "message_id": message_id}))
+        .await;
+    assert_eq!(rig.pass_after(SECOND).await, 1);
+
+    assert_eq!(rig.row(seq).await.0, "sent");
+    let calls = rig.fake.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|call| matches!(call, Call::SendRich { id, .. } if *id != message_id)),
+        "an old row without the field must resend as a new message: {calls:?}"
+    );
+    assert_eq!(rig.fake.messages(rig.chat).len(), 1);
+    assert!(
+        rig.buried().await,
+        "an old row keeps the old behaviour: the new message buries the view"
     );
 }
 

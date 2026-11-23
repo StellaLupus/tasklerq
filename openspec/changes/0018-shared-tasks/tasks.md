@@ -40,7 +40,7 @@
   (`REFERENCES item_events (id) ON DELETE SET NULL`), частичный индекс
   `(updated_at) WHERE status = 'sent'`. Проверить: `tests/migrations.rs`
   проходит (design, решение 4).
-- [ ] 3.2 `Outgoing::Edit { …, resend_if_gone }` (в payload, отсутствует у
+- [x] 3.2 `Outgoing::Edit { …, resend_if_gone }` (в payload, отсутствует у
   старых строк → `true`): при `false` и `MessageGone` — `sent` без отправки и
   без `mark_buried`. Проверить в `tests/telegram_outbox.rs`: правка
   исчезнувшего сообщения с `false` ничего не присылает и не засыпает вид;
