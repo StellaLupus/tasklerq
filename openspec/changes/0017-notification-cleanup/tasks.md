@@ -13,7 +13,7 @@
   `MessageUndeletable` — `skipped`, вид чата не засыпан; обычное удаление
   ведёт себя как раньше; старая строка без поля разбирается (design,
   решение 2).
-- [ ] 1.3 `notifications::mark_dismissed(conn, chat_id, message_id, now)`:
+- [x] 1.3 `notifications::mark_dismissed(conn, chat_id, message_id, now)`:
   `dismissed_at` всем записям доставки, чья строка outbox доставила это
   сообщение, включая записи одного сводного сообщения. Проверить в
   `tests/repositories.rs`: одиночное уведомление и сводное с тремя блоками;

@@ -418,6 +418,40 @@ pub async fn notify_assignment(
     Ok(insert(conn, &delivery, now).await?)
 }
 
+/// Отметить сообщение уведомления окончательно убранным из чата.
+///
+/// `dismissed_at` ставится всем записям доставки, чья строка outbox доставила
+/// это сообщение (`outbox_seq → outbox` с этими `chat_id` и `message_id`);
+/// записи одного сводного сообщения делят `outbox_seq`, поэтому убираются все
+/// его блоки сразу. Отметка нужна тем, кто правит отправленные сообщения позже
+/// (0018, 0019): запись с `dismissed_at` они не трогают. Первая отметка
+/// сохраняется — уже отмеченные записи не перезаписываются. Статус доставки,
+/// `outbox_seq` и прочие поля не меняются; возвращается число отмеченных
+/// записей. Автоудаление «✅ Выполнено» эту функцию не вызывает: оно отменяемо
+/// (design, решение 3).
+pub async fn mark_dismissed(
+    conn: &mut PgConnection,
+    chat_id: i64,
+    message_id: i64,
+    now: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query(
+        "UPDATE notification_deliveries d
+         SET dismissed_at = $3
+         FROM outbox o
+         WHERE o.seq = d.outbox_seq
+           AND o.chat_id = $1
+           AND o.message_id = $2
+           AND d.dismissed_at IS NULL",
+    )
+    .bind(chat_id)
+    .bind(message_id)
+    .bind(now)
+    .execute(conn)
+    .await?
+    .rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

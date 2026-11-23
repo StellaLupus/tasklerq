@@ -2,7 +2,8 @@
 
 mod support;
 
-use chrono::{Duration, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
+use sqlx::PgPool;
 use tasklerq::config::TenancyMode;
 use tasklerq::domain::error::DomainError;
 use tasklerq::domain::identity::NewMember;
@@ -10,7 +11,7 @@ use tasklerq::domain::models::{
     Field, ItemPriority, ItemStatus, ListKind, RecurrenceFreq, SubtaskInput,
 };
 use tasklerq::storage::repositories::households::{self, NewOwner};
-use tasklerq::storage::repositories::{items, lists, tags, users};
+use tasklerq::storage::repositories::{items, lists, notifications, tags, users};
 use uuid::Uuid;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1041,4 +1042,248 @@ async fn open_assigned_tasks_counts_only_open_own_tasks_in_visible_task_lists() 
         count, 1,
         "only the open own task in a visible tasks list counts"
     );
+}
+
+/// Чат пользователя: у owner и member одного household чаты разные.
+async fn chat_of(pool: &PgPool, user_id: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT telegram_chat_id FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .expect("chat id")
+}
+
+/// Строка outbox доставленного сообщения: как после отметки `sent`
+/// (`src/telegram/outbox.rs`), с `message_id` и `sent_at`.
+async fn insert_sent_outbox(pool: &PgPool, chat: i64, message_id: i64, now: DateTime<Utc>) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO outbox (chat_id, kind, payload, status, message_id, sent_at, created_at)
+         VALUES ($1, 'message', '{}'::jsonb, 'sent', $2, $3, $3)
+         RETURNING seq",
+    )
+    .bind(chat)
+    .bind(message_id)
+    .bind(now)
+    .fetch_one(pool)
+    .await
+    .expect("outbox row")
+}
+
+/// Передать доставку в outbox, как это делает доставка уведомления.
+async fn link_delivery(pool: &PgPool, id: Uuid, seq: i64) {
+    sqlx::query(
+        "UPDATE notification_deliveries SET status = 'sent', outbox_seq = $2 WHERE id = $1",
+    )
+    .bind(id)
+    .bind(seq)
+    .execute(pool)
+    .await
+    .expect("link delivery");
+}
+
+/// Отметка уборки, статус и ссылка на outbox записи доставки.
+async fn delivery_dismissal(
+    pool: &PgPool,
+    id: Uuid,
+) -> (Option<DateTime<Utc>>, String, Option<i64>) {
+    sqlx::query_as(
+        "SELECT dismissed_at, status::text, outbox_seq FROM notification_deliveries WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("delivery")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mark_dismissed_marks_the_delivery_of_a_single_notice() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let item = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        support::new_item(household.tasks_list_id, "Позвонить в поликлинику"),
+    )
+    .await;
+    let chat = chat_of(&db.pool, household.owner_id).await;
+    let now = support::utc(2026, 11, 20, 9, 0);
+    let seq = insert_sent_outbox(&db.pool, chat, 101, now).await;
+    let delivery = support::notifications::insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        item.id,
+        "reminder",
+        "2026-11-20T09:00:00Z",
+        now,
+        false,
+    )
+    .await;
+    link_delivery(&db.pool, delivery, seq).await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let marked = notifications::mark_dismissed(&mut conn, chat, 101, now)
+        .await
+        .expect("mark dismissed");
+    assert_eq!(marked, 1);
+    let (dismissed_at, status, outbox_seq) = delivery_dismissal(&db.pool, delivery).await;
+    assert_eq!(dismissed_at, Some(now));
+    assert_eq!(status, "sent", "статус доставки не меняется");
+    assert_eq!(outbox_seq, Some(seq), "ссылка на outbox не меняется");
+
+    // Повторный вызов с другим временем не перезаписывает первую отметку.
+    let later = now + Duration::hours(1);
+    let again = notifications::mark_dismissed(&mut conn, chat, 101, later)
+        .await
+        .expect("repeat mark");
+    assert_eq!(again, 0);
+    let (dismissed_at, ..) = delivery_dismissal(&db.pool, delivery).await;
+    assert_eq!(dismissed_at, Some(now), "первая отметка сохраняется");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mark_dismissed_marks_every_block_of_a_batch_message() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let chat = chat_of(&db.pool, household.owner_id).await;
+    let now = support::utc(2026, 11, 20, 8, 0);
+
+    let mut deliveries = Vec::new();
+    for title in ["Первая", "Вторая", "Третья"] {
+        let item = support::create_item(
+            &db.pool,
+            &household,
+            household.tasks_list_id,
+            &household.owner(),
+            support::new_item(household.tasks_list_id, title),
+        )
+        .await;
+        let id = support::notifications::insert_delivery(
+            &db.pool,
+            household.household_id,
+            household.owner_id,
+            item.id,
+            "reminder",
+            title,
+            now,
+            false,
+        )
+        .await;
+        deliveries.push(id);
+    }
+    // Сводное сообщение: одна строка outbox, все блоки делят её seq.
+    let seq = insert_sent_outbox(&db.pool, chat, 202, now).await;
+    for id in &deliveries {
+        link_delivery(&db.pool, *id, seq).await;
+    }
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let marked = notifications::mark_dismissed(&mut conn, chat, 202, now)
+        .await
+        .expect("mark dismissed");
+    assert_eq!(marked, 3);
+    for id in deliveries {
+        let (dismissed_at, status, outbox_seq) = delivery_dismissal(&db.pool, id).await;
+        assert_eq!(dismissed_at, Some(now));
+        assert_eq!(status, "sent");
+        assert_eq!(outbox_seq, Some(seq));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mark_dismissed_leaves_other_chats_and_messages_untouched() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let owner_chat = chat_of(&db.pool, household.owner_id).await;
+    let member_chat = chat_of(&db.pool, household.member_id).await;
+    let now = support::utc(2026, 11, 20, 9, 0);
+
+    let item = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        support::new_item(household.tasks_list_id, "Своя задача"),
+    )
+    .await;
+    let other_item = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        support::new_item(household.tasks_list_id, "Другая задача"),
+    )
+    .await;
+
+    // Целевое сообщение: чат owner, message_id 303.
+    let seq = insert_sent_outbox(&db.pool, owner_chat, 303, now).await;
+    let target = support::notifications::insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        item.id,
+        "reminder",
+        "target",
+        now,
+        false,
+    )
+    .await;
+    link_delivery(&db.pool, target, seq).await;
+
+    // Чужой чат с тем же message_id.
+    let foreign_seq = insert_sent_outbox(&db.pool, member_chat, 303, now).await;
+    let foreign = support::notifications::insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.member_id,
+        item.id,
+        "reminder",
+        "foreign",
+        now,
+        false,
+    )
+    .await;
+    link_delivery(&db.pool, foreign, foreign_seq).await;
+
+    // Другое сообщение в том же чате.
+    let other_seq = insert_sent_outbox(&db.pool, owner_chat, 304, now).await;
+    let other = support::notifications::insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        other_item.id,
+        "reminder",
+        "other",
+        now,
+        false,
+    )
+    .await;
+    link_delivery(&db.pool, other, other_seq).await;
+
+    // Доставка без строки outbox: сообщение ещё не передавалось.
+    let unlinked = support::notifications::insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        item.id,
+        "reminder",
+        "unlinked",
+        now,
+        false,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let marked = notifications::mark_dismissed(&mut conn, owner_chat, 303, now)
+        .await
+        .expect("mark dismissed");
+    assert_eq!(marked, 1);
+    let (dismissed_at, ..) = delivery_dismissal(&db.pool, target).await;
+    assert_eq!(dismissed_at, Some(now));
+    for id in [foreign, other, unlinked] {
+        let (dismissed_at, ..) = delivery_dismissal(&db.pool, id).await;
+        assert_eq!(dismissed_at, None, "чужие записи не задеты");
+    }
 }
