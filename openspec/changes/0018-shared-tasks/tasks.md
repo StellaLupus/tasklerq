@@ -2,7 +2,7 @@
 
 ## 1. Получатель напоминания
 
-- [ ] 1.1 `plan_reminders` выбирает получателя по `assignee_user_id`,
+- [x] 1.1 `plan_reminders` выбирает получателя по `assignee_user_id`,
   `NoticeRow::recipient_selected` сравнивает только с исполнителем;
   `reminder_stale` для snooze устаревает, если исполнитель есть и это не
   получатель. Обновить существующие тесты, где

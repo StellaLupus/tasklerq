@@ -303,7 +303,7 @@ async fn plan_reminders(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::
         "WITH candidates AS (
              SELECT i.id AS item_id, i.household_id, i.due_at, i.due_date,
                     h.timezone AS household_timezone,
-                    COALESCE(i.assignee_user_id, i.created_by_user_id) AS selected_user_id,
+                    i.assignee_user_id AS selected_user_id,
                     CASE
                         WHEN i.due_at IS NOT NULL
                         THEN to_char(

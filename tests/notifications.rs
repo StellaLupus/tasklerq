@@ -24,7 +24,7 @@ use tasklerq::domain::recurrence::Due;
 use tasklerq::jobs::domain::DomainTicker;
 use tasklerq::jobs::scheduler::{Scheduler, all_day_occurrence_key, occurrence_key, snooze_origin};
 use tasklerq::storage::repositories::notifications::{self, NewDelivery, NotificationKind};
-use tasklerq::storage::repositories::{items, users};
+use tasklerq::storage::repositories::{items, members, users};
 use tasklerq::telegram::api::TelegramError;
 use tasklerq::telegram::outbox::OutboxWorker;
 use tokio::sync::Notify;
@@ -1385,6 +1385,8 @@ async fn assignee_gets_the_reminder_and_author_does_not() {
     let owner_chat = chat_id(&db.pool, household.owner_id).await;
     let member_chat = chat_id(&db.pool, household.member_id).await;
 
+    // Задачу создал владелец, но назначил участнику: напоминание получает
+    // только исполнитель, автор — нет.
     let assigned = create_task_without_assignment_notice(
         &db,
         &household,
@@ -1394,21 +1396,20 @@ async fn assignee_gets_the_reminder_and_author_does_not() {
         None,
     )
     .await;
-    // Без исполнителя напоминание получает автор.
-    let authored = create_task(&db, &household, "Задача автора", Some(due), None, None).await;
 
     let stats = scheduler(&db.pool)
         .tick(due - Duration::minutes(15))
         .await
         .expect("tick");
-    assert_eq!(stats.delivered, 2);
+    assert_eq!(stats.delivered, 1);
 
     let member_messages = messages(&db.pool, member_chat).await;
     assert_eq!(member_messages.len(), 1, "{member_messages:?}");
     assert!(member_messages[0].contains("Задача участника"));
-    let owner_messages = messages(&db.pool, owner_chat).await;
-    assert_eq!(owner_messages.len(), 1, "{owner_messages:?}");
-    assert!(owner_messages[0].contains("Задача автора"));
+    assert!(
+        messages(&db.pool, owner_chat).await.is_empty(),
+        "the author must not get a reminder for a task assigned to someone else"
+    );
 
     let assigned_user: Uuid =
         sqlx::query_scalar("SELECT user_id FROM notification_deliveries WHERE item_id = $1")
@@ -1417,13 +1418,331 @@ async fn assignee_gets_the_reminder_and_author_does_not() {
             .await
             .expect("assignee delivery");
     assert_eq!(assigned_user, household.member_id);
-    let authored_user: Uuid =
-        sqlx::query_scalar("SELECT user_id FROM notification_deliveries WHERE item_id = $1")
-            .bind(authored.id)
-            .fetch_one(&db.pool)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_task_reminds_every_enabled_member_including_author_once() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(&db, &household, "Общая задача", Some(due), None, None).await;
+    let owner_chat = chat_id(&db.pool, household.owner_id).await;
+    let member_chat = chat_id(&db.pool, household.member_id).await;
+    let scheduler = scheduler(&db.pool);
+    let now = due - Duration::minutes(15);
+
+    let stats = scheduler.tick(now).await.expect("shared tick");
+    assert_eq!(stats.planned, 2);
+    assert_eq!(stats.delivered, 2);
+    let owner_messages = messages(&db.pool, owner_chat).await;
+    assert_eq!(owner_messages.len(), 1, "{owner_messages:?}");
+    assert!(owner_messages[0].contains("Общая задача"));
+    let member_messages = messages(&db.pool, member_chat).await;
+    assert_eq!(member_messages.len(), 1, "{member_messages:?}");
+    assert!(member_messages[0].contains("Общая задача"));
+
+    // Повторный тик не дублирует: каждому ровно одно сообщение.
+    assert_eq!(scheduler.tick(now).await.expect("repeat tick").delivered, 0);
+    assert_eq!(messages(&db.pool, owner_chat).await.len(), 1);
+    assert_eq!(messages(&db.pool, member_chat).await.len(), 1);
+    assert_eq!(delivery_rows(&db.pool, item.id).await.len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_task_skips_member_with_disabled_reminders() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let extra_id = add_member(&db.pool, household.household_id, "Extra member", false).await;
+    set_notifications_without_digest(
+        &db.pool,
+        household.member_id,
+        json!({"reminders_enabled": false}),
+    )
+    .await;
+    let due = rounded_now() + Duration::hours(3);
+    create_task(&db, &household, "Общая задача", Some(due), None, None).await;
+    let owner_chat = chat_id(&db.pool, household.owner_id).await;
+    let member_chat = chat_id(&db.pool, household.member_id).await;
+    let extra_chat = chat_id(&db.pool, extra_id).await;
+
+    let stats = scheduler(&db.pool)
+        .tick(due - Duration::minutes(15))
+        .await
+        .expect("tick");
+    assert_eq!(stats.delivered, 2);
+    assert_eq!(messages(&db.pool, owner_chat).await.len(), 1);
+    assert_eq!(messages(&db.pool, extra_chat).await.len(), 1);
+    assert!(
+        messages(&db.pool, member_chat).await.is_empty(),
+        "a member with disabled reminders must not get the shared task"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn assigning_shared_task_cancels_pending_reminders_of_other_members() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let extra_id = add_member(&db.pool, household.household_id, "Extra member", false).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(&db, &household, "Общая задача", Some(due), None, None).await;
+    let now = due - Duration::minutes(15);
+    let key = occurrence_key(due);
+    // Запланированные, но ещё не доставленные напоминания остальным участникам.
+    for user_id in [household.owner_id, extra_id] {
+        insert_delivery(
+            &db.pool,
+            household.household_id,
+            user_id,
+            Some(item.id),
+            &key,
+            "pending",
+            now,
+        )
+        .await
+        .expect("pending reminder");
+    }
+    assign_without_notice(&db.pool, item.id, household.member_id).await;
+
+    let owner_chat = chat_id(&db.pool, household.owner_id).await;
+    let member_chat = chat_id(&db.pool, household.member_id).await;
+    let extra_chat = chat_id(&db.pool, extra_id).await;
+    let stats = scheduler(&db.pool).tick(now).await.expect("assign tick");
+    assert_eq!(stats.cancelled, 2, "{stats:?}");
+    assert_eq!(stats.delivered, 1, "{stats:?}");
+    assert_eq!(
+        delivery_status(&db.pool, item.id, household.owner_id)
             .await
-            .expect("author delivery");
-    assert_eq!(authored_user, household.owner_id);
+            .as_deref(),
+        Some("cancelled")
+    );
+    assert_eq!(
+        delivery_status(&db.pool, item.id, extra_id)
+            .await
+            .as_deref(),
+        Some("cancelled")
+    );
+    assert_eq!(
+        delivery_status(&db.pool, item.id, household.member_id)
+            .await
+            .as_deref(),
+        Some("sent")
+    );
+    assert!(messages(&db.pool, owner_chat).await.is_empty());
+    assert!(messages(&db.pool, extra_chat).await.is_empty());
+    assert_eq!(messages(&db.pool, member_chat).await.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unassigning_adds_reminders_for_other_members_on_next_tick() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(
+        &db,
+        &household,
+        "Снять исполнителя",
+        Some(due),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let owner_chat = chat_id(&db.pool, household.owner_id).await;
+    let member_chat = chat_id(&db.pool, household.member_id).await;
+    let scheduler = scheduler(&db.pool);
+    let now = due - Duration::minutes(15);
+
+    // Сначала напоминание получает только исполнитель (владелец).
+    assert_eq!(
+        scheduler.tick(now).await.expect("assigned tick").delivered,
+        1
+    );
+    assert_eq!(messages(&db.pool, owner_chat).await.len(), 1);
+    assert!(messages(&db.pool, member_chat).await.is_empty());
+
+    // Снятие исполнителя делает задачу общей: на следующем тике напоминание
+    // получает оставшийся участник, а у владельца не дублируется.
+    sqlx::query("UPDATE items SET assignee_user_id = NULL WHERE id = $1")
+        .bind(item.id)
+        .execute(&db.pool)
+        .await
+        .expect("unassign");
+    let stats = scheduler.tick(now).await.expect("shared tick");
+    assert_eq!(stats.delivered, 1, "{stats:?}");
+    assert_eq!(messages(&db.pool, member_chat).await.len(), 1);
+    assert_eq!(messages(&db.pool, owner_chat).await.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_assignee_from_household_makes_task_shared() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let extra_id = add_member(&db.pool, household.household_id, "Extra member", false).await;
+    let due = rounded_now() + Duration::hours(3);
+    create_task(
+        &db,
+        &household,
+        "Задача исключённого",
+        Some(due),
+        Some(household.member_id),
+        None,
+    )
+    .await;
+    let owner_chat = chat_id(&db.pool, household.owner_id).await;
+    let member_chat = chat_id(&db.pool, household.member_id).await;
+    let extra_chat = chat_id(&db.pool, extra_id).await;
+
+    // Исключение исполнителя реальным путём снимает его с задачи (detach).
+    let mut conn = db.pool.acquire().await.expect("conn");
+    members::remove(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        household.member_id,
+        Utc::now(),
+    )
+    .await
+    .expect("remove member");
+    drop(conn);
+
+    let stats = scheduler(&db.pool)
+        .tick(due - Duration::minutes(15))
+        .await
+        .expect("tick");
+    assert_eq!(stats.delivered, 2, "{stats:?}");
+    assert_eq!(messages(&db.pool, owner_chat).await.len(), 1);
+    assert_eq!(messages(&db.pool, extra_chat).await.len(), 1);
+    assert!(messages(&db.pool, member_chat).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn event_without_participant_reminds_every_enabled_member() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let due = rounded_now() + Duration::hours(3);
+    let event = create_event(
+        &db,
+        &household,
+        "Общее событие",
+        due,
+        due + Duration::minutes(90),
+    )
+    .await;
+    let owner_chat = chat_id(&db.pool, household.owner_id).await;
+    let member_chat = chat_id(&db.pool, household.member_id).await;
+
+    let stats = scheduler(&db.pool)
+        .tick(due - Duration::minutes(15))
+        .await
+        .expect("event tick");
+    assert_eq!(stats.delivered, 2, "{stats:?}");
+    let owner_messages = messages(&db.pool, owner_chat).await;
+    assert_eq!(owner_messages.len(), 1, "{owner_messages:?}");
+    assert!(owner_messages[0].contains("Общее событие"));
+    let member_messages = messages(&db.pool, member_chat).await;
+    assert_eq!(member_messages.len(), 1, "{member_messages:?}");
+    assert!(member_messages[0].contains("Общее событие"));
+    assert_eq!(delivery_rows(&db.pool, event.id).await.len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snooze_on_shared_task_is_cancelled_when_assigned_to_another_member() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(&db, &household, "Общая задача", Some(due), None, None).await;
+    let owner_chat = chat_id(&db.pool, household.owner_id).await;
+    let at = due - Duration::minutes(15);
+    // Петя (владелец) получает напоминание об общей задаче и откладывает его.
+    scheduler(&db.pool).tick(at).await.expect("reminder tick");
+    let snooze_at = at + Duration::hours(1);
+    insert_snooze_with_origin(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        item.id,
+        &notifications::snooze_key(snooze_at),
+        Some(&snooze_origin(item.due_at, None)),
+        snooze_at,
+    )
+    .await
+    .expect("snooze");
+    // Задачу назначили Маше: отложенное напоминание Пете больше не нужно.
+    assign_without_notice(&db.pool, item.id, household.member_id).await;
+
+    let stats = scheduler(&db.pool)
+        .tick(snooze_at)
+        .await
+        .expect("snooze tick");
+    assert_eq!(stats.delivered, 0, "{stats:?}");
+    assert!(stats.cancelled >= 1, "{stats:?}");
+    let snooze_messages: Vec<String> = sqlx::query_scalar(
+        "SELECT payload->>'html' FROM outbox
+         WHERE chat_id = $1 AND dedupe_key LIKE 'notification:snooze:%'",
+    )
+    .bind(owner_chat)
+    .fetch_all(&db.pool)
+    .await
+    .expect("snooze messages");
+    assert!(snooze_messages.is_empty(), "{snooze_messages:?}");
+    let status: String = sqlx::query_scalar(
+        "SELECT status::text FROM notification_deliveries
+         WHERE item_id = $1 AND kind = 'snooze'",
+    )
+    .bind(item.id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("snooze status");
+    assert_eq!(status, "cancelled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snooze_on_shared_task_is_delivered_when_assigned_to_the_same_member() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(&db, &household, "Общая задача", Some(due), None, None).await;
+    let owner_chat = chat_id(&db.pool, household.owner_id).await;
+    let at = due - Duration::minutes(15);
+    scheduler(&db.pool).tick(at).await.expect("reminder tick");
+    let snooze_at = at + Duration::hours(1);
+    insert_snooze_with_origin(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        item.id,
+        &notifications::snooze_key(snooze_at),
+        Some(&snooze_origin(item.due_at, None)),
+        snooze_at,
+    )
+    .await
+    .expect("snooze");
+    // Задачу назначили самому Пете: отложенное напоминание по-прежнему его.
+    assign_without_notice(&db.pool, item.id, household.owner_id).await;
+
+    let stats = scheduler(&db.pool)
+        .tick(snooze_at)
+        .await
+        .expect("snooze tick");
+    assert_eq!(stats.delivered, 1, "{stats:?}");
+    let snooze_messages: Vec<String> = sqlx::query_scalar(
+        "SELECT payload->>'html' FROM outbox
+         WHERE chat_id = $1 AND dedupe_key LIKE 'notification:snooze:%'",
+    )
+    .bind(owner_chat)
+    .fetch_all(&db.pool)
+    .await
+    .expect("snooze messages");
+    assert_eq!(snooze_messages.len(), 1, "{snooze_messages:?}");
+    assert!(snooze_messages[0].contains("Общая задача"));
+    let status: String = sqlx::query_scalar(
+        "SELECT status::text FROM notification_deliveries
+         WHERE item_id = $1 AND kind = 'snooze'",
+    )
+    .bind(item.id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("snooze status");
+    assert_eq!(status, "sent");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2220,14 +2539,14 @@ async fn deleted_household_cancels_pending_delivery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn clearing_assignee_cancels_old_delivery_and_notifies_the_author() {
+async fn clearing_assignee_makes_the_task_shared_and_reminds_every_member() {
     let db = support::isolated_db().await;
     let household = household_without_digest(&db).await;
     let due = rounded_now() + Duration::hours(3);
     let item = create_task_without_assignment_notice(
         &db,
         &household,
-        "Вернуть автору",
+        "Общая задача",
         Some(due),
         household.member_id,
         None,
@@ -2252,17 +2571,19 @@ async fn clearing_assignee_cancels_old_delivery_and_notifies_the_author() {
     let owner_chat = chat_id(&db.pool, household.owner_id).await;
     let member_chat = chat_id(&db.pool, household.member_id).await;
 
+    // Без исполнителя задача общая: прежнее напоминание исполнителя остаётся
+    // актуальным, а остальные участники получают своё на этом же тике.
     let stats = scheduler(&db.pool)
         .tick(due - Duration::minutes(15))
         .await
         .expect("tick");
-    assert_eq!(stats.cancelled, 1);
-    assert_eq!(stats.delivered, 1);
+    assert_eq!(stats.cancelled, 0);
+    assert_eq!(stats.delivered, 2);
     assert_eq!(
         delivery_status(&db.pool, item.id, household.member_id)
             .await
             .as_deref(),
-        Some("cancelled")
+        Some("sent")
     );
     assert_eq!(
         delivery_status(&db.pool, item.id, household.owner_id)
@@ -2271,7 +2592,7 @@ async fn clearing_assignee_cancels_old_delivery_and_notifies_the_author() {
         Some("sent")
     );
     assert_eq!(messages(&db.pool, owner_chat).await.len(), 1);
-    assert!(messages(&db.pool, member_chat).await.is_empty());
+    assert_eq!(messages(&db.pool, member_chat).await.len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

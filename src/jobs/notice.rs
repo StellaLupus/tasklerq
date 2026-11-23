@@ -26,7 +26,6 @@ pub(crate) const NOTICE_ROW_COLUMNS: &str = "d.id, d.household_id, d.user_id, d.
         i.due_date AS item_due_date, i.end_at AS item_end_at,
         i.end_date AS item_end_date,
         i.assignee_user_id AS item_assignee_user_id,
-        i.created_by_user_id AS item_created_by_user_id,
         l.id AS list_id, l.kind::text AS list_kind,
         l.deleted_at AS list_deleted_at, l.is_archived AS list_archived,
         u.id AS recipient_id, u.deleted_at AS recipient_deleted_at,
@@ -65,7 +64,6 @@ pub(crate) struct NoticeRow {
     pub item_end_at: Option<DateTime<Utc>>,
     pub item_end_date: Option<NaiveDate>,
     pub item_assignee_user_id: Option<Uuid>,
-    pub item_created_by_user_id: Option<Uuid>,
     pub list_id: Option<Uuid>,
     pub list_kind: Option<String>,
     pub list_deleted_at: Option<DateTime<Utc>>,
@@ -165,9 +163,10 @@ impl NoticeRow {
     }
 
     /// Получатель напоминания всё ещё выбран по правилу
-    /// исполнитель → автор → участники.
+    /// исполнитель → участники: без исполнителя задача общая и напоминание
+    /// получает каждый участник.
     fn recipient_selected(&self) -> bool {
-        match self.item_assignee_user_id.or(self.item_created_by_user_id) {
+        match self.item_assignee_user_id {
             Some(selected) => selected == self.user_id,
             None => true,
         }
@@ -191,10 +190,11 @@ impl NoticeRow {
     ///
     /// Напоминание сверяется с текущим вхождением срока ([`current_key`]) и
     /// окном вседневной доставки. Напоминание о событии дополнительно
-    /// устаревает, когда прошёл его эффективный конец. Snooze сверяется только
-    /// со своим `origin_key`: он устаревает, когда [`snooze_origin`] по
-    /// текущему сроку задачи даёт другое значение, в том числе когда привязки
-    /// нет. Поэтому смена локальной даты и тихие часы snooze не отменяют.
+    /// устаревает, когда прошёл его эффективный конец. Snooze сверяется со
+    /// своим `origin_key` и получателем: он устаревает, когда [`snooze_origin`]
+    /// по текущему сроку задачи даёт другое значение (в том числе когда
+    /// привязки нет), либо когда у задачи есть исполнитель и это не получатель.
+    /// Поэтому смена локальной даты и тихие часы snooze не отменяют.
     ///
     /// Назначение не зависит от напоминаний и архива списка: задача остаётся
     /// открытой и всё ещё назначена получателю. Список при этом должен
@@ -232,6 +232,11 @@ impl NoticeRow {
             return true;
         }
         if self.is_snooze() {
+            // Отложенное напоминание устаревает и когда задачу назначили
+            // другому: исполнитель есть и это не получатель (design, решение 1).
+            if matches!(self.item_assignee_user_id, Some(assignee) if assignee != self.user_id) {
+                return true;
+            }
             return self.origin_key.as_deref()
                 != Some(snooze_origin(self.item_due_at, self.item_due_date).as_str());
         }
