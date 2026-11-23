@@ -395,30 +395,38 @@ household.
 `notification_deliveries`: `id`, `household_id`, `user_id`, `item_id` (NULL для
 сводки), `occurrence_key`, `origin_key`, `kind`, `status`, `scheduled_at`, `deferred`,
 `outbox_seq`, `batch_id`, `batch_version`, `batch_state`, `batch_snoozed_until`,
-`batched`, `created_at`, `updated_at`; UNIQUE `(user_id, item_id,
-occurrence_key, kind)`. `kind` — `reminder`, `digest`, `assignment` или
-`snooze`; `status` — `pending`, `sent` или `cancelled`. `deferred` отмечает
-запись, хотя бы раз отложенную тихими часами: перенесённая через полночь
-сводка или вседневное напоминание не отменяются только из-за смены локальной
-даты. `snooze` — отдельная доставка отложенного напоминания, её ключ включает
+`batched`, `dismissed_at`, `replaces_message_id`, `created_at`, `updated_at`;
+UNIQUE `(user_id, item_id, occurrence_key, kind)`. `kind` — `reminder`,
+`digest`, `assignment` или `snooze`; `status` — `pending`, `sent` или
+`cancelled`. `deferred` отмечает запись, хотя бы раз отложенную тихими часами:
+перенесённая через полночь сводка или вседневное напоминание не отменяются
+только из-за смены локальной даты. `snooze` — отдельная доставка отложенного напоминания, её ключ включает
 время snooze. `origin_key` — вхождение срока, из которого отложили snooze:
 ключ напоминания (`due_at` в UTC или `date:YYYY-MM-DD`), `no-due` у задачи без
 срока; у остальных видов пусто. Отложенное («😴») напоминание отменяется, если
 к моменту доставки у получателя выключены напоминания, а также когда
 `snooze_origin` текущего срока не равен `origin_key`. Повторный snooze на то же
 время перепривязывает `pending`- или `cancelled`-запись к текущему вхождению: upsert
-сбрасывает `deferred` и `batched`, переписывает `scheduled_at` и `outbox_seq`,
-но не трогает `batch_id`, `batch_version` и `batch_state`. `batch_id` связывает
+сбрасывает `deferred` и `batched`, переписывает `scheduled_at`, `outbox_seq` и
+`replaces_message_id`, но не трогает `batch_id`, `batch_version` и `batch_state`;
+затёртый другой непустой `replaces_message_id` удаляется сразу. `batch_id` связывает
 доставку со сводным сообщением, `batch_version` хранит версию задачи на момент
 выпуска, `batch_state` — итог действия над блоком (`done`/`snoozed`/`missing`),
-`batched` отмечает групповой snooze.
+`batched` отмечает групповой snooze. `dismissed_at` — отметка уборки: ставится,
+когда сообщение удаляется кнопкой «🗑 Убрать» или заменяется новым (доставка
+snooze, сводное сообщение, новая сводка); статус остаётся `sent`, и последующие
+правки отправленных сообщений убранную запись не трогают. `replaces_message_id` —
+сообщение, которое удалит этот snooze: сообщение, где нажали кнопку snooze; у
+snooze из сводного сообщения пусто. Удаление ставится после доставки нового
+напоминания, а при отмене snooze — сразу.
 Для сводок `item_id` равен NULL, поэтому уникальность обеспечивается
 `UNIQUE NULLS NOT DISTINCT` (PostgreSQL 15+). Составные внешние ключи
 `(user_id, household_id)` и `(item_id, household_id)` не дают записать
 получателя или элемент из чужого household. `outbox_seq` ссылается на
 поставленное сообщение; после retention outbox ссылка обнуляется, а запись
 доставки остаётся для аудита дедупликации. Завершённые доставки (`sent`,
-`cancelled`) хранятся 30 дней (`RETENTION_OUTBOX_DAYS`); `pending` не удаляются.
+`cancelled`) хранятся 30 дней (`RETENTION_OUTBOX_DAYS`), но не меньше 48 часов
+при любом значении; `pending` не удаляются.
 
 `notification_batches`: `id`, `household_id`, `user_id`, `chat_id`, `page`
 (текущая страница сводного), `result_completed`, `result_changed`,

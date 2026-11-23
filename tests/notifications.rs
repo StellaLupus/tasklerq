@@ -5636,6 +5636,84 @@ async fn digest_older_than_the_replacement_window_is_left_alone() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_sent_46_hours_ago_is_still_replaced() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    digest_on(&db.pool, household.owner_id).await;
+
+    let d1_at = local_utc(moscow, day, 8, 30);
+    bot.freeze_at(d1_at);
+    let d1 = deliver_digest_at(&mut bot, &db.pool, d1_at).await;
+
+    // Новая сводка через 46 часов — внутри окна замены в 47 часов.
+    set_notifications(
+        &db.pool,
+        household.owner_id,
+        json!({"digest_enabled": true, "digest_time": "06:30", "quiet_hours_enabled": false}),
+    )
+    .await;
+    let d2_at = local_utc(moscow, day + Duration::days(2), 6, 30);
+    assert_eq!(d2_at - d1_at, Duration::hours(46));
+    let stats = scheduler(&db.pool).tick(d2_at).await.expect("digest tick");
+    assert_eq!(stats.delivered, 1, "{stats:?}");
+    let payload = latest_digest_payload(&db.pool, bot.chat).await;
+    assert_eq!(payload["replaces"], json!([d1]), "{payload}");
+    assert!(
+        digest_dismissed_at(&db.pool, household.owner_id, &format!("digest:{day}"))
+            .await
+            .is_some()
+    );
+
+    bot.advance(d2_at - bot.now);
+    bot.deliver().await;
+    let deletes = replace_delete_rows(&db.pool, bot.chat).await;
+    assert_eq!(deletes.len(), 1, "{deletes:?}");
+    assert_eq!(
+        deletes[0].1,
+        format!("replace:{}:{d1}", bot.chat),
+        "{deletes:?}"
+    );
+    assert!(deleted(&bot, d1));
+    assert_eq!(alive_digests(&bot).len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_sent_48_hours_ago_is_not_replaced() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    digest_on(&db.pool, household.owner_id).await;
+
+    let d1_at = local_utc(moscow, day, 8, 30);
+    bot.freeze_at(d1_at);
+    let d1 = deliver_digest_at(&mut bot, &db.pool, d1_at).await;
+
+    // Новая сводка через 48 часов — за окном замены в 47 часов.
+    let d2_at = local_utc(moscow, day + Duration::days(2), 8, 30);
+    assert_eq!(d2_at - d1_at, Duration::hours(48));
+    let stats = scheduler(&db.pool).tick(d2_at).await.expect("digest tick");
+    assert_eq!(stats.delivered, 1, "{stats:?}");
+    let payload = latest_digest_payload(&db.pool, bot.chat).await;
+    assert!(payload.get("replaces").is_none(), "{payload}");
+    assert!(
+        digest_dismissed_at(&db.pool, household.owner_id, &format!("digest:{day}"))
+            .await
+            .is_none()
+    );
+
+    bot.advance(d2_at - bot.now);
+    bot.deliver().await;
+    assert!(replace_delete_rows(&db.pool, bot.chat).await.is_empty());
+    assert!(!deleted(&bot, d1));
+    assert_eq!(alive_digests(&bot).len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn already_dismissed_digest_is_not_replaced_again() {
     let db = support::isolated_db().await;
     let mut bot = onboarded(&db.pool).await;
