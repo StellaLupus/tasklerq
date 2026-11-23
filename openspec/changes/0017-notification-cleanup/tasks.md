@@ -60,7 +60,7 @@
   `tests/telegram_outbox.rs`: отменяется только будущая строка этого
   сообщения, удаление другого сообщения и уже наступившее не трогаются
   (design, решение 4).
-- [ ] 3.2 `notify::show_done` (правка в `done_ui` и отложенное `cleanup`-удаление
+- [x] 3.2 `notify::show_done` (правка в `done_ui` и отложенное `cleanup`-удаление
   на `now + UNDO_WINDOW_MINUTES` с ключом `notice-expire:{chat}:{msg}:{now_ms}`)
   вызывается из `complete` и из ветки «уже выполнена» `show_current`;
   `notify::undo` при успехе вызывает `cancel_scheduled_deletes`. Проверить в

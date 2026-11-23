@@ -340,6 +340,40 @@ pub(super) async fn edit_notice(ctx: &mut Ctx<'_>, message_id: i64, ui: &Ui) -> 
     Ok(())
 }
 
+/// Показать «✅ Выполнено» в сообщении-уведомлении и запланировать его
+/// автоудаление (0017, решение 4).
+///
+/// Сообщение удаляется само через [`items::UNDO_WINDOW_MINUTES`] после того,
+/// как стало «Выполнено»: отложенное `cleanup`-удаление с ключом
+/// [`outbox::notice_expire_key`]. Прежние запланированные удаления этого
+/// сообщения не отменяются — повторное «Выполнено» после отмены ставит новое
+/// удаление, а удаление уже удалённого сообщения считается доставленным
+/// (`MessageGone`). «↩️ Отменить» отменяет удаление через
+/// [`outbox::cancel_scheduled_deletes`].
+async fn show_done(
+    ctx: &mut Ctx<'_>,
+    message_id: i64,
+    item: &Item,
+    list_id: Uuid,
+    next: Option<&str>,
+) -> Result<(), Fail> {
+    let ui = done_ui(item, list_id, next);
+    edit_notice(ctx, message_id, &ui).await?;
+    outbox::enqueue_at(
+        &mut *ctx.conn,
+        ctx.chat_id,
+        &Outgoing::Delete {
+            message_id,
+            cleanup: true,
+        },
+        Some(&outbox::notice_expire_key(ctx.chat_id, message_id, ctx.now)),
+        ctx.now,
+        ctx.now + Duration::minutes(items::UNDO_WINDOW_MINUTES),
+    )
+    .await?;
+    Ok(())
+}
+
 /// Показать актуальное состояние задачи в сообщении-уведомлении.
 async fn show_current(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> Result<(), Fail> {
     match load(ctx, item_id).await? {
@@ -347,10 +381,7 @@ async fn show_current(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> Resu
             let ui = reminder_ui(&item, &list, ctx.tz, ctx.now, None);
             edit_notice(ctx, message_id, &ui).await
         }
-        Some((item, list)) => {
-            let ui = done_ui(&item, list.id, None);
-            edit_notice(ctx, message_id, &ui).await
-        }
+        Some((item, list)) => show_done(ctx, message_id, &item, list.id, None).await,
         None => edit_notice(ctx, message_id, &gone_ui()).await,
     }
 }
@@ -382,8 +413,7 @@ pub async fn complete(
                 None
             };
             ctx.toast(ru::DONE_TOAST);
-            let ui = done_ui(&item, item.list_id, next.as_deref());
-            edit_notice(ctx, message_id, &ui).await
+            show_done(ctx, message_id, &item, item.list_id, next.as_deref()).await
         }
         Err(DomainError::Conflict { .. } | DomainError::NotFound) => {
             // Задачу успели изменить: кнопки обновляются, действие не повторяется.
@@ -400,11 +430,20 @@ pub async fn complete(
 }
 
 /// Отменить завершение из уведомления.
+///
+/// При успешной отмене сообщение снова показывает напоминание, поэтому
+/// запланированное автоудаление «✅ Выполнено» отменяется (0017, решение 4):
+/// будущие `pending`-удаления этого сообщения переходят в `skipped`. Неудачная
+/// отмена («Время отмены истекло») удаление не отменяет.
 pub async fn undo(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
     let actor = ctx.actor()?;
     match items::undo_last(&mut *ctx.conn, household_id, &actor, item_id, ctx.now).await {
-        Ok(_) => ctx.toast("Отменено"),
+        Ok(_) => {
+            ctx.toast("Отменено");
+            outbox::cancel_scheduled_deletes(&mut *ctx.conn, ctx.chat_id, message_id, ctx.now)
+                .await?;
+        }
         Err(DomainError::Database(error)) => return Err(Fail::Infra(error)),
         Err(_) => ctx.toast("Время отмены истекло"),
     }

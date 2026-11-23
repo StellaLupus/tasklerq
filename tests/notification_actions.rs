@@ -288,12 +288,53 @@ async fn delivery_states(
     .expect("delivery states")
 }
 
+/// Строки отложенного удаления «✅ Выполнено» сообщения: статус, время
+/// следующей попытки и payload (после доставки и отмены скрыт).
+async fn notice_expire_rows(
+    pool: &PgPool,
+    chat: i64,
+    message_id: i64,
+) -> Vec<(String, DateTime<Utc>, serde_json::Value)> {
+    sqlx::query_as(
+        "SELECT status::text, next_attempt_at, payload FROM outbox
+         WHERE chat_id = $1 AND kind = 'delete' AND dedupe_key LIKE $2
+         ORDER BY seq",
+    )
+    .bind(chat)
+    .bind(format!("notice-expire:{chat}:{message_id}:%"))
+    .fetch_all(pool)
+    .await
+    .expect("notice expire rows")
+}
+
+/// Есть ли среди вызовов фейка удаление данного сообщения.
+fn deleted(bot: &Harness, message_id: i64) -> bool {
+    bot.fake.calls().iter().any(
+        |call| matches!(call, Call::Delete { chat, id } if *chat == bot.chat && *id == message_id),
+    )
+}
+
 fn local_utc(timezone: Tz, date: NaiveDate, hour: u32, minute: u32) -> DateTime<Utc> {
     timezone
         .with_ymd_and_hms(date.year(), date.month(), date.day(), hour, minute, 0)
         .single()
         .expect("local time")
         .with_timezone(&Utc)
+}
+
+/// Ближайший будущий момент `hour:minute` по Москве. Заморозка часов не должна
+/// уводить время назад относительно реального: событие создания задачи
+/// пишется с реальным `created_at`, и в прошлом оно оказалось бы «новее»
+/// завершения — `undo_last` выбрал бы не то событие.
+fn next_moscow_time(bot: &Harness, hour: u32, minute: u32) -> DateTime<Utc> {
+    let moscow = chrono_tz::Europe::Moscow;
+    let mut day = bot.now.with_timezone(&moscow).date_naive();
+    let mut at = local_utc(moscow, day, hour, minute);
+    if at <= bot.now {
+        day += Duration::days(1);
+        at = local_utc(moscow, day, hour, minute);
+    }
+    at
 }
 
 fn rounded_now() -> DateTime<Utc> {
@@ -1751,4 +1792,357 @@ async fn moving_a_deleted_event_reports_unavailable_and_opens_nothing() {
         "a deleted event must not open the quick due screen"
     );
     assert!(snooze_rows(&db.pool, event.id).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_in_a_reminder_is_deleted_ten_minutes_later() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let at = next_moscow_time(&bot, 9, 0);
+    bot.freeze_at(at);
+    let item = create_task(
+        &db.pool,
+        &household,
+        "Оплатить интернет",
+        at + Duration::minutes(15),
+        None,
+    )
+    .await;
+
+    tick_and_deliver(&mut bot, &db.pool, at).await;
+    let (message_id, html) = bot.latest();
+    let done = button_of(&html, "Выполнено");
+
+    // Обработчик прошёл, исходящие ещё не доставлены: payload удаления цел.
+    bot.press_data_pending(&done, message_id).await;
+    let rows = notice_expire_rows(&db.pool, bot.chat, message_id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "pending", "{rows:?}");
+    assert_eq!(rows[0].1, at + Duration::minutes(10), "{rows:?}");
+    assert_eq!(rows[0].2["message_id"], json!(message_id), "{rows:?}");
+    assert_eq!(rows[0].2["cleanup"], json!(true), "{rows:?}");
+
+    bot.deliver().await;
+    let (_, done_html) = bot.latest();
+    assert!(done_html.contains("✅ Выполнено"), "{done_html}");
+    assert!(
+        buttons(&done_html)
+            .iter()
+            .any(|(label, _)| label.contains("Отменить")),
+        "{done_html}"
+    );
+    assert_eq!(item_status(&db.pool, item.id).await.0, "done");
+
+    // До истечения окна сообщение живо.
+    tick_and_deliver(&mut bot, &db.pool, at + Duration::minutes(9)).await;
+    assert!(
+        !deleted(&bot, message_id),
+        "the notice must wait for the window"
+    );
+
+    tick_and_deliver(&mut bot, &db.pool, at + Duration::minutes(11)).await;
+    assert!(
+        deleted(&bot, message_id),
+        "the notice must be deleted at 09:10"
+    );
+    assert!(
+        !bot.fake
+            .messages(bot.chat)
+            .into_iter()
+            .any(|(id, _)| id == message_id),
+        "the done notice must disappear from the chat"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undo_in_the_window_cancels_the_scheduled_delete() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let at = next_moscow_time(&bot, 9, 0);
+    bot.freeze_at(at);
+    let item = create_task(
+        &db.pool,
+        &household,
+        "Оплатить интернет",
+        at + Duration::minutes(15),
+        None,
+    )
+    .await;
+
+    tick_and_deliver(&mut bot, &db.pool, at).await;
+    let (message_id, html) = bot.latest();
+    bot.press_data(&button_of(&html, "Выполнено"), message_id)
+        .await;
+    let undo = button_of(&bot.latest().1, "Отменить");
+
+    bot.advance(Duration::minutes(5));
+    bot.press_data(&undo, message_id).await;
+
+    let rows = notice_expire_rows(&db.pool, bot.chat, message_id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "skipped", "{rows:?}");
+    assert_eq!(item_status(&db.pool, item.id).await.0, "open");
+    let (_, restored) = bot.latest();
+    assert!(!restored.contains("✅"), "{restored}");
+    assert!(restored.contains("Отложить на час"), "{restored}");
+
+    tick_and_deliver(&mut bot, &db.pool, at + Duration::minutes(11)).await;
+    assert!(
+        !deleted(&bot, message_id),
+        "the cancelled delete must not run at 09:10"
+    );
+    assert!(
+        bot.fake
+            .messages(bot.chat)
+            .into_iter()
+            .any(|(id, _)| id == message_id),
+        "the restored reminder must stay in the chat"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_again_after_undo_schedules_a_new_delete() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let at = next_moscow_time(&bot, 9, 0);
+    bot.freeze_at(at);
+    let item = create_task(
+        &db.pool,
+        &household,
+        "Оплатить интернет",
+        at + Duration::minutes(15),
+        None,
+    )
+    .await;
+
+    tick_and_deliver(&mut bot, &db.pool, at).await;
+    let (message_id, html) = bot.latest();
+    bot.press_data(&button_of(&html, "Выполнено"), message_id)
+        .await;
+    bot.advance(Duration::minutes(5));
+    bot.press_data(&button_of(&bot.latest().1, "Отменить"), message_id)
+        .await;
+
+    // 09:06: напоминание возвращено, кнопка несёт актуальную версию.
+    bot.advance(Duration::minutes(1));
+    let done_again = button_of(&bot.latest().1, "Выполнено");
+    bot.press_data_pending(&done_again, message_id).await;
+
+    let rows = notice_expire_rows(&db.pool, bot.chat, message_id).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0].0, "skipped", "{rows:?}");
+    assert_eq!(rows[0].1, at + Duration::minutes(10), "{rows:?}");
+    assert_eq!(rows[1].0, "pending", "{rows:?}");
+    assert_eq!(rows[1].1, at + Duration::minutes(16), "{rows:?}");
+    assert_eq!(rows[1].2["message_id"], json!(message_id), "{rows:?}");
+    assert_eq!(rows[1].2["cleanup"], json!(true), "{rows:?}");
+    assert_eq!(item_status(&db.pool, item.id).await.0, "done");
+
+    bot.deliver().await;
+    tick_and_deliver(&mut bot, &db.pool, at + Duration::minutes(11)).await;
+    assert!(
+        !deleted(&bot, message_id),
+        "the first delete is skipped, the second is not due yet"
+    );
+
+    tick_and_deliver(&mut bot, &db.pool, at + Duration::minutes(17)).await;
+    assert!(
+        deleted(&bot, message_id),
+        "the notice must be deleted at 09:16"
+    );
+    assert!(
+        !bot.fake
+            .messages(bot.chat)
+            .into_iter()
+            .any(|(id, _)| id == message_id),
+        "the done notice must disappear from the chat"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_in_an_assignment_notice_schedules_the_delete_and_undo_cancels_it() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let at = next_moscow_time(&bot, 9, 0);
+    bot.freeze_at(at);
+    let item = create_task(
+        &db.pool,
+        &household,
+        "Купить торт",
+        at + Duration::hours(3),
+        None,
+    )
+    .await;
+    support::notifications::insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        item.id,
+        "assignment",
+        "assignment:done:0",
+        at,
+        false,
+    )
+    .await;
+
+    tick_and_deliver(&mut bot, &db.pool, at).await;
+    let (message_id, html) = bot.latest();
+    assert!(html.contains("Вам назначили задачу"), "{html}");
+    let done = button_of(&html, "Выполнено");
+
+    bot.press_data_pending(&done, message_id).await;
+    let rows = notice_expire_rows(&db.pool, bot.chat, message_id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "pending", "{rows:?}");
+    assert_eq!(rows[0].1, at + Duration::minutes(10), "{rows:?}");
+    assert_eq!(rows[0].2["message_id"], json!(message_id), "{rows:?}");
+    assert_eq!(rows[0].2["cleanup"], json!(true), "{rows:?}");
+    bot.deliver().await;
+    assert!(
+        bot.latest().1.contains("✅ Выполнено"),
+        "{}",
+        bot.latest().1
+    );
+
+    bot.advance(Duration::minutes(5));
+    bot.press_data(&button_of(&bot.latest().1, "Отменить"), message_id)
+        .await;
+    let rows = notice_expire_rows(&db.pool, bot.chat, message_id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "skipped", "{rows:?}");
+    assert_eq!(item_status(&db.pool, item.id).await.0, "open");
+
+    tick_and_deliver(&mut bot, &db.pool, at + Duration::minutes(11)).await;
+    assert!(
+        !deleted(&bot, message_id),
+        "the cancelled delete must not run at 09:10"
+    );
+    assert!(
+        bot.fake
+            .messages(bot.chat)
+            .into_iter()
+            .any(|(id, _)| id == message_id),
+        "the restored notice must stay in the chat"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_on_a_task_completed_from_the_card_schedules_the_delete() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let at = next_moscow_time(&bot, 12, 0);
+    bot.freeze_at(at);
+    let item = create_task(
+        &db.pool,
+        &household,
+        "Оплатить интернет",
+        at + Duration::minutes(15),
+        None,
+    )
+    .await;
+
+    tick_and_deliver(&mut bot, &db.pool, at).await;
+    let (message_id, html) = bot.latest();
+    let done = button_of(&html, "Выполнено");
+
+    // Задачу выполнили из карточки: кнопка в напоминании устарела по версии.
+    let mut conn = db.pool.acquire().await.expect("conn");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        item.id,
+        None,
+        "Europe/Moscow",
+        bot.now,
+    )
+    .await
+    .expect("complete from the card");
+    drop(conn);
+
+    bot.press_data_pending(&done, message_id).await;
+    assert_eq!(last_toast(&bot).as_deref(), Some("Задача уже выполнена"));
+    let rows = notice_expire_rows(&db.pool, bot.chat, message_id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "pending", "{rows:?}");
+    assert_eq!(rows[0].1, at + Duration::minutes(10), "{rows:?}");
+    assert_eq!(rows[0].2["cleanup"], json!(true), "{rows:?}");
+
+    bot.deliver().await;
+    assert!(
+        bot.latest().1.contains("✅ Выполнено"),
+        "{}",
+        bot.latest().1
+    );
+
+    tick_and_deliver(&mut bot, &db.pool, at + Duration::minutes(11)).await;
+    assert!(
+        deleted(&bot, message_id),
+        "the notice must be deleted at 12:10"
+    );
+    assert!(
+        !bot.fake
+            .messages(bot.chat)
+            .into_iter()
+            .any(|(id, _)| id == message_id),
+        "the done notice must disappear from the chat"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_undo_does_not_cancel_the_scheduled_delete() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let at = next_moscow_time(&bot, 9, 0);
+    bot.freeze_at(at);
+    let item = create_task(
+        &db.pool,
+        &household,
+        "Оплатить интернет",
+        at + Duration::minutes(15),
+        None,
+    )
+    .await;
+
+    tick_and_deliver(&mut bot, &db.pool, at).await;
+    let (message_id, html) = bot.latest();
+    bot.press_data(&button_of(&html, "Выполнено"), message_id)
+        .await;
+    let undo = button_of(&bot.latest().1, "Отменить");
+
+    // 09:11: окно отмены истекло, срок удаления уже наступил.
+    bot.advance(Duration::minutes(11));
+    bot.press_data(&undo, message_id).await;
+
+    assert_eq!(last_toast(&bot).as_deref(), Some("Время отмены истекло"));
+    assert_eq!(item_status(&db.pool, item.id).await.0, "done");
+    let rows = notice_expire_rows(&db.pool, bot.chat, message_id).await;
+    assert_eq!(
+        rows[0].0, "sent",
+        "the expired undo must not skip the delete: {rows:?}"
+    );
+    assert_eq!(rows[0].1, at + Duration::minutes(10), "{rows:?}");
+    assert!(
+        deleted(&bot, message_id),
+        "the scheduled delete must still run"
+    );
+    assert!(
+        !bot.fake
+            .messages(bot.chat)
+            .into_iter()
+            .any(|(id, _)| id == message_id),
+        "the done notice must disappear from the chat"
+    );
 }
