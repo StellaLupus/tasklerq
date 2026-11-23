@@ -54,7 +54,7 @@
 
 ## 3. Автоудаление «✅ Выполнено»
 
-- [ ] 3.1 `outbox::cancel_scheduled_deletes(chat_id, message_id)`: будущие
+- [x] 3.1 `outbox::cancel_scheduled_deletes(chat_id, message_id)`: будущие
   `pending`-строки `delete` с ключом
   `notice-expire:{chat_id}:{message_id}:` → `skipped`. Проверить в
   `tests/telegram_outbox.rs`: отменяется только будущая строка этого

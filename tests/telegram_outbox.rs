@@ -241,6 +241,27 @@ impl Rig {
         .expect("seq")
     }
 
+    /// Отложенное удаление уборки сообщения (0017, решение 4): ключ
+    /// `notice_expire_key`, время выполнения `run_at`.
+    async fn notice_delete_at(&self, chat: i64, message_id: i64, run_at: DateTime<Utc>) -> i64 {
+        let mut conn = self.pool.acquire().await.expect("conn");
+        let key = outbox::notice_expire_key(chat, message_id, self.now);
+        outbox::enqueue_at(
+            &mut conn,
+            chat,
+            &Outgoing::Delete {
+                message_id,
+                cleanup: true,
+            },
+            Some(&key),
+            self.now,
+            run_at,
+        )
+        .await
+        .expect("enqueue")
+        .expect("seq")
+    }
+
     /// Создать строку вида чата, чтобы проверить `buried`.
     async fn put_view(&self) {
         let mut conn = self.pool.acquire().await.expect("conn");
@@ -2035,5 +2056,200 @@ async fn delete_of_regular_message_in_carrier_chat_is_delivered() {
         rig.fake.messages(rig.chat),
         vec![(carrier, "<p>носитель</p>".to_owned())],
         "only the non-carrier message is removed; the carrier stays"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_scheduled_deletes_skips_the_future_notice_delete() {
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    let seq = rig
+        .notice_delete_at(rig.chat, 77, rig.now + Duration::minutes(10))
+        .await;
+
+    let mut conn = db.pool.acquire().await.expect("conn");
+    assert_eq!(
+        outbox::cancel_scheduled_deletes(&mut conn, rig.chat, 77, rig.now)
+            .await
+            .expect("cancel"),
+        1
+    );
+    assert_eq!(
+        outbox::cancel_scheduled_deletes(&mut conn, rig.chat, 77, rig.now)
+            .await
+            .expect("cancel again"),
+        0,
+        "a repeated cancel has nothing left to skip"
+    );
+    drop(conn);
+
+    assert_eq!(
+        rig.row(seq).await,
+        ("skipped".into(), 0, Some("cancelled".into()), None)
+    );
+    assert_eq!(
+        rig.payload_text(seq).await,
+        r#"{"redacted": true}"#,
+        "the cancelled delete payload must be redacted like other skipped rows"
+    );
+
+    // После срока отменённое удаление в Telegram не уходит.
+    assert_eq!(rig.pass_after(StdDuration::from_secs(11 * 60)).await, 0);
+    assert!(
+        rig.fake.calls().is_empty(),
+        "a cancelled delete must not reach Telegram: {:?}",
+        rig.fake.calls()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_scheduled_deletes_leaves_other_messages_and_chats_pending() {
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    let other_chat = next_telegram_id();
+    let run_at = rig.now + Duration::minutes(10);
+    let cancelled = rig.notice_delete_at(rig.chat, 77, run_at).await;
+    let other_message = rig.notice_delete_at(rig.chat, 78, run_at).await;
+    let foreign = rig.notice_delete_at(other_chat, 77, run_at).await;
+
+    let mut conn = db.pool.acquire().await.expect("conn");
+    assert_eq!(
+        outbox::cancel_scheduled_deletes(&mut conn, rig.chat, 77, rig.now)
+            .await
+            .expect("cancel"),
+        1
+    );
+    drop(conn);
+
+    assert_eq!(rig.row(cancelled).await.0, "skipped");
+    assert_eq!(rig.row(other_message).await.0, "pending");
+    assert_eq!(rig.row(foreign).await.0, "pending");
+
+    // Проход на now + 11 мин: удаление B и удаление A в чужом чате выполняются.
+    assert_eq!(rig.pass_after(StdDuration::from_secs(11 * 60)).await, 1);
+    let mut other_worker =
+        OutboxWorker::new(db.pool.clone(), rig.fake.clone()).only_chat(other_chat);
+    assert_eq!(
+        other_worker
+            .run_once(rig.now, rig.clock)
+            .await
+            .expect("other chat pass"),
+        1
+    );
+    assert_eq!(rig.row(other_message).await.0, "sent");
+    assert_eq!(rig.row(foreign).await.0, "sent");
+
+    let calls = rig.fake.calls();
+    assert!(
+        calls.iter().any(
+            |call| matches!(call, Call::Delete { chat, id } if *chat == rig.chat && *id == 78)
+        ),
+        "message B of the same chat must still be deleted: {calls:?}"
+    );
+    assert!(
+        calls.iter().any(
+            |call| matches!(call, Call::Delete { chat, id } if *chat == other_chat && *id == 77)
+        ),
+        "message A of another chat must still be deleted: {calls:?}"
+    );
+    assert!(
+        !calls.iter().any(
+            |call| matches!(call, Call::Delete { chat, id } if *chat == rig.chat && *id == 77)
+        ),
+        "the cancelled delete must not reach Telegram: {calls:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_scheduled_deletes_does_not_touch_due_rows() {
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    // Строка уже наступила: next_attempt_at == now.
+    let seq = rig.notice_delete_at(rig.chat, 77, rig.now).await;
+
+    let mut conn = db.pool.acquire().await.expect("conn");
+    assert_eq!(
+        outbox::cancel_scheduled_deletes(&mut conn, rig.chat, 77, rig.now)
+            .await
+            .expect("cancel"),
+        0,
+        "a due row is already being delivered and must not be cancelled"
+    );
+    drop(conn);
+
+    assert_eq!(rig.row(seq).await.0, "pending");
+    assert_eq!(rig.pass().await, 1);
+    assert_eq!(rig.row(seq).await.0, "sent");
+    assert_eq!(
+        rig.fake.calls(),
+        vec![Call::Delete {
+            chat: rig.chat,
+            id: 77
+        }]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_scheduled_deletes_ignores_regular_delete_keys() {
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    // Обычное удаление того же сообщения с другим ключом, тоже будущее.
+    let key = format!("delete:{}:77", rig.chat);
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let seq = outbox::enqueue_at(
+        &mut conn,
+        rig.chat,
+        &Outgoing::Delete {
+            message_id: 77,
+            cleanup: false,
+        },
+        Some(&key),
+        rig.now,
+        rig.now + Duration::minutes(10),
+    )
+    .await
+    .expect("enqueue")
+    .expect("seq");
+    assert_eq!(
+        outbox::cancel_scheduled_deletes(&mut conn, rig.chat, 77, rig.now)
+            .await
+            .expect("cancel"),
+        0,
+        "only notice-expire deletes are cancellable"
+    );
+    drop(conn);
+
+    assert_eq!(rig.row(seq).await.0, "pending");
+    assert_eq!(rig.pass_after(StdDuration::from_secs(11 * 60)).await, 1);
+    assert_eq!(rig.row(seq).await.0, "sent");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_scheduled_deletes_prefix_does_not_match_longer_ids() {
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    let seq = rig
+        .notice_delete_at(rig.chat, 123, rig.now + Duration::minutes(10))
+        .await;
+
+    let mut conn = db.pool.acquire().await.expect("conn");
+    assert_eq!(
+        outbox::cancel_scheduled_deletes(&mut conn, rig.chat, 12, rig.now)
+            .await
+            .expect("cancel"),
+        0,
+        "cancelling message 12 must not touch message 123"
+    );
+    drop(conn);
+
+    assert_eq!(rig.row(seq).await.0, "pending");
+    assert_eq!(rig.pass_after(StdDuration::from_secs(11 * 60)).await, 1);
+    assert_eq!(rig.row(seq).await.0, "sent");
+    assert_eq!(
+        rig.fake.calls(),
+        vec![Call::Delete {
+            chat: rig.chat,
+            id: 123
+        }]
     );
 }

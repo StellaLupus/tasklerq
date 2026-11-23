@@ -367,6 +367,56 @@ pub async fn enqueue_screen(
     Ok(seq)
 }
 
+/// Префикс ключа отложенного удаления «✅ Выполнено» без метки времени.
+///
+/// Заканчивается на `:`, поэтому сообщение 12 не задевает ключи сообщения 123.
+/// Общий для [`notice_expire_key`] и [`cancel_scheduled_deletes`].
+fn notice_expire_prefix(chat_id: i64, message_id: i64) -> String {
+    format!("notice-expire:{chat_id}:{message_id}:")
+}
+
+/// Ключ отложенного удаления сообщения «✅ Выполнено» (0017, решение 4).
+///
+/// Метка времени в конце нужна потому, что `dedupe_key` уникален по таблице,
+/// а повторное «Выполнено» после отмены ставит удаление снова.
+pub fn notice_expire_key(chat_id: i64, message_id: i64, now: DateTime<Utc>) -> String {
+    format!(
+        "{}{}",
+        notice_expire_prefix(chat_id, message_id),
+        now.timestamp_millis()
+    )
+}
+
+/// Отменить отложенные удаления уборки сообщения (0017, решение 4).
+///
+/// «↩️ Отменить» переводит в `skipped` будущие (`next_attempt_at > now`)
+/// `pending`-строки `delete` этого чата, чей `dedupe_key` начинается с
+/// [`notice_expire_prefix`] этого сообщения. Поиск идёт по ключу: у ожидающей
+/// строки `outbox.message_id` ещё пуст. Наступившие строки и удаления с другими
+/// ключами не трогаются. Возвращает число отменённых строк.
+pub async fn cancel_scheduled_deletes(
+    conn: &mut PgConnection,
+    chat_id: i64,
+    message_id: i64,
+    now: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
+    // Префикс собран из чисел и `:`, символов шаблона LIKE в нём нет.
+    let pattern = format!("{}%", notice_expire_prefix(chat_id, message_id));
+    Ok(sqlx::query(
+        "UPDATE outbox
+         SET status = 'skipped', last_error = 'cancelled',
+             payload = jsonb_build_object('redacted', true)
+         WHERE kind = 'delete' AND status = 'pending' AND chat_id = $1
+           AND next_attempt_at > $2 AND dedupe_key LIKE $3",
+    )
+    .bind(chat_id)
+    .bind(now)
+    .bind(pattern)
+    .execute(conn)
+    .await?
+    .rows_affected())
+}
+
 /// Состояние outbox.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Counts {
@@ -1296,6 +1346,15 @@ mod tests {
             cleanup: true,
         };
         assert_eq!(cleanup.payload(), json!({"message_id": 8, "cleanup": true}));
+    }
+
+    #[test]
+    fn notice_expire_key_contains_chat_message_and_millis() {
+        let now = DateTime::from_timestamp_millis(1_700_000_000_123).expect("time");
+        assert_eq!(
+            notice_expire_key(-100_123, 42, now),
+            "notice-expire:-100123:42:1700000000123"
+        );
     }
 
     #[test]
