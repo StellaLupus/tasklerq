@@ -108,7 +108,7 @@ impl NoticeRow {
     }
 
     /// Задача существует, открыта и имеет название.
-    fn item_alive(&self) -> bool {
+    pub(crate) fn item_alive(&self) -> bool {
         self.item_id.is_some()
             && self.item_deleted_at.is_none()
             && self.item_status == Some(ItemStatus::Open)
@@ -152,7 +152,7 @@ impl NoticeRow {
     }
 
     /// Получатель существует, всё ещё в том же household и доступен в Telegram.
-    fn recipient_alive(&self) -> bool {
+    pub(crate) fn recipient_alive(&self) -> bool {
         self.recipient_id.is_some()
             && self.recipient_deleted_at.is_none()
             && self.recipient_household_id == Some(self.household_id)

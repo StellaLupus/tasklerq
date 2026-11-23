@@ -45,7 +45,7 @@ use uuid::Uuid;
 use super::delivery::{self, DeliveryScope};
 use super::notice::NoticeRow;
 use super::quiet::resolved_timezone;
-use super::{assignment, batch, digest};
+use super::{assignment, batch, digest, notice_sync};
 use crate::domain::recurrence::resolve_local;
 use crate::domain::settings::{MAX_LEAD_MINUTES, NotificationSettings, parse_hhmm};
 use crate::storage::repositories::notifications::{
@@ -70,6 +70,8 @@ pub struct TickStats {
     pub delivered: u64,
     /// Отменено устаревших записей.
     pub cancelled: u64,
+    /// Изменено сообщений синхронизацией отправленных уведомлений.
+    pub synced: u64,
 }
 
 /// Планировщик уведомлений.
@@ -96,6 +98,17 @@ impl Scheduler {
         // не учитывался.
         let mut rescheduled = 0;
 
+        // Синхронизация отправленных уведомлений идёт до отмены устаревших
+        // записей: иначе отмена pending-snooze из 0017 успела бы убрать
+        // сообщение «😴 Напомню …» раньше, чем шаг перерисует его в
+        // «✅ Выполнено» / «👤 Назначено» (0018, решение 4).
+        step(
+            "sync_completed_notices",
+            notice_sync::sync(&self.pool, now),
+            &mut stats.synced,
+            &mut last_error,
+        )
+        .await;
         step(
             "cancel_stale reminders",
             delivery::cancel_stale(&self.pool, now, DeliveryScope::Reminder),
@@ -195,7 +208,7 @@ impl Scheduler {
         )
         .await;
 
-        if stats.delivered > 0 {
+        if stats.delivered > 0 || stats.synced > 0 {
             self.wake_outbox.notify_one();
         }
 

@@ -295,14 +295,15 @@ fn gone_ui() -> Ui {
 
 /// Имя участника для закрытого уведомления (0018, решение 5).
 ///
-/// `member` — сведения об участнике из household получателя, как в журнале
-/// выполнений: активный участник (`users::get` возвращает только его). Имя не
-/// показывается, если выполнивший — сам получатель, если выполнение без
-/// участника (`actor_user_id` пуст: HA, интеграции) или если участник исключён
-/// из household / удалён. Формат без рода и склонения — отображаемое имя.
-/// Тем же правилом пользуется имя исполнителя в «👤 Назначено».
-// Используется шагом синхронизации (3.5); пока покрыто юнит-тестами.
-#[cfg_attr(not(test), allow(dead_code))]
+/// `member` — сведения об участнике, загруженные из household получателя
+/// (`users::get(household получателя, …)` возвращает только активного
+/// участника этого household): вызывающий обязан передать именно такого
+/// участника, как в журнале выполнений. Имя не показывается, если выполнивший —
+/// сам получатель, если выполнение без участника (`actor_user_id` пуст: HA,
+/// интеграции) или если участник исключён из household / удалён (`member` пуст
+/// или помечен удалённым). Формат без рода и склонения — отображаемое имя.
+/// Тем же правилом пользуется имя исполнителя в «👤 Назначено»: если
+/// исполнителя нельзя показать (исключён/удалён), имя не выводится.
 pub(crate) fn member_name(
     actor_user_id: Option<Uuid>,
     recipient_user_id: Uuid,
@@ -322,9 +323,7 @@ pub(crate) fn member_name(
 /// Экран «✅ Выполнено: <название>[ · <имя>]» — уведомление, закрытое
 /// выполнением задачи не из него (0018, решение 4). Единственная кнопка —
 /// «🗑 Убрать»: отменить выполнение из такого сообщения нельзя. Название
-/// обрезается, как в [`done_ui`]. Вызывается шагом синхронизации (3.5).
-// Используется шагом синхронизации (3.5); пока покрыто юнит-тестами.
-#[cfg_attr(not(test), allow(dead_code))]
+/// обрезается, как в [`done_ui`]. Вызывается шагом синхронизации.
 pub(crate) fn completed_ui(title: &str, actor_name: Option<&str>) -> Ui {
     let mut heading = format!("✅ Выполнено: {}", clip(title, 100));
     if let Some(name) = actor_name {
@@ -335,19 +334,18 @@ pub(crate) fn completed_ui(title: &str, actor_name: Option<&str>) -> Ui {
         .row(vec![button(ru::DISMISS_BUTTON, Action::NoticeClose)])
 }
 
-/// Экран «👤 Назначено: <название> · <имя исполнителя>» — уведомление,
+/// Экран «👤 Назначено: <название>[ · <имя исполнителя>]» — уведомление,
 /// закрытое назначением задачи другому участнику (0018, решение 4).
-/// Единственная кнопка — «🗑 Убрать». Название обрезается, как в [`done_ui`].
-/// Вызывается шагом синхронизации (3.5).
-// Используется шагом синхронизации (3.5); пока покрыто юнит-тестами.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn assigned_ui(title: &str, assignee_name: &str) -> Ui {
+/// Единственная кнопка — «🗑 Убрать». Если имя исполнителя показать нельзя
+/// (исключён/удалён), заголовок без имени. Название обрезается, как в
+/// [`done_ui`]. Вызывается шагом синхронизации.
+pub(crate) fn assigned_ui(title: &str, assignee_name: Option<&str>) -> Ui {
+    let mut heading = format!("👤 Назначено: {}", clip(title, 100));
+    if let Some(name) = assignee_name {
+        heading.push_str(&format!(" · {name}"));
+    }
     Ui::new()
-        .heading(format!(
-            "👤 Назначено: {} · {}",
-            clip(title, 100),
-            assignee_name
-        ))
+        .heading(heading)
         .row(vec![button(ru::DISMISS_BUTTON, Action::NoticeClose)])
 }
 
@@ -1156,8 +1154,15 @@ mod tests {
 
     #[test]
     fn assigned_screen_shows_the_assignee_name_and_only_dismiss() {
-        let ui = assigned_ui("Вынести мусор", "Маша");
+        let ui = assigned_ui("Вынести мусор", Some("Маша"));
         assert_eq!(heading(&ui), "👤 Назначено: Вынести мусор · Маша");
+        assert_only_dismiss(&ui);
+    }
+
+    #[test]
+    fn assigned_screen_without_a_name_has_only_dismiss() {
+        let ui = assigned_ui("Вынести мусор", None);
+        assert_eq!(heading(&ui), "👤 Назначено: Вынести мусор");
         assert_only_dismiss(&ui);
     }
 
@@ -1167,7 +1172,7 @@ mod tests {
         let clipped = format!("{}…", "я".repeat(99));
         let completed = completed_ui(&long, None);
         assert_eq!(heading(&completed), format!("✅ Выполнено: {clipped}"));
-        let assigned = assigned_ui(&long, "Маша");
+        let assigned = assigned_ui(&long, Some("Маша"));
         assert_eq!(
             heading(&assigned),
             format!("👤 Назначено: {clipped} · Маша")
