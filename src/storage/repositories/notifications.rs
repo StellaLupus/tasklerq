@@ -539,7 +539,9 @@ pub async fn mark_dismissed(
 /// уведомления: отметка закрытия пишется в той же транзакции, а шаг
 /// синхронизации (0018, решение 4) не перерисовывает сообщение, которое
 /// прямо сейчас закрывают своим нажатием. Блокируются только записи доставки,
-/// не outbox. Возвращает число заблокированных записей.
+/// не outbox. Доставки сводного сообщения (`batch_id`) не трогаются: они делят
+/// одну строку outbox, а синхронизация их не затрагивает. Возвращает число
+/// заблокированных записей.
 pub async fn lock_message_deliveries(
     conn: &mut PgConnection,
     chat_id: i64,
@@ -551,6 +553,7 @@ pub async fn lock_message_deliveries(
          JOIN outbox o ON o.seq = d.outbox_seq
          WHERE o.chat_id = $1
            AND o.message_id = $2
+           AND d.batch_id IS NULL
          FOR UPDATE OF d",
     )
     .bind(chat_id)
@@ -566,7 +569,8 @@ pub async fn lock_message_deliveries(
 /// id события выполнения из `completions::latest_for_item`. Сообщение уже
 /// показывает «✅ Выполнено» (`show_done`), поэтому шаг синхронизации такие
 /// доставки не трогает. Сопоставление с сообщением — как у [`mark_dismissed`];
-/// возвращается число отмеченных записей.
+/// доставки сводного сообщения (`batch_id`) не отмечаются. Возвращает число
+/// отмеченных записей.
 pub async fn mark_closed_completed(
     conn: &mut PgConnection,
     chat_id: i64,
@@ -580,7 +584,8 @@ pub async fn mark_closed_completed(
          FROM outbox o
          WHERE o.seq = d.outbox_seq
            AND o.chat_id = $1
-           AND o.message_id = $2",
+           AND o.message_id = $2
+           AND d.batch_id IS NULL",
     )
     .bind(chat_id)
     .bind(message_id)
@@ -596,7 +601,8 @@ pub async fn mark_closed_completed(
 /// Вызывается при успешной отмене выполнения из уведомления: сообщение снова
 /// показывает напоминание, и шаг синхронизации снова может закрыть его, если
 /// задачу выполнят не из него. Все три поля (`closed_at`, `closed_reason`,
-/// `closed_by_event`) очищаются; возвращается число затронутых записей.
+/// `closed_by_event`) очищаются; доставки сводного сообщения (`batch_id`) не
+/// трогаются. Возвращает число затронутых записей.
 pub async fn clear_closed(
     conn: &mut PgConnection,
     chat_id: i64,
@@ -608,7 +614,8 @@ pub async fn clear_closed(
          FROM outbox o
          WHERE o.seq = d.outbox_seq
            AND o.chat_id = $1
-           AND o.message_id = $2",
+           AND o.message_id = $2
+           AND d.batch_id IS NULL",
     )
     .bind(chat_id)
     .bind(message_id)

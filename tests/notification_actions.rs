@@ -3056,3 +3056,134 @@ async fn insert_snooze_fills_an_empty_recorded_message_without_overwrite() {
     assert_eq!(scheduled, deliver_at);
     assert_eq!(replaces, Some(202), "the new message must be recorded");
 }
+
+/// Функции блокировки и закрытия доставки не трогают блоки сводного сообщения:
+/// они делят одну строку outbox, а синхронизация (0018) их не затрагивает.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_functions_do_not_touch_batch_deliveries() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    // Тихие часы: два напоминания собираются в одно сводное сообщение.
+    support::notifications::quiet_settings(&db.pool, household.owner_id, false).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = bot.now.with_timezone(&moscow).date_naive();
+    let morning = local_utc(moscow, day, 8, 0);
+    let due = local_utc(moscow, day, 9, 0);
+    let first = create_task(&db.pool, &household, "Первая", due, None).await;
+    let second = create_task(&db.pool, &household, "Вторая", due, None).await;
+    support::notifications::deferred_reminder(&db.pool, &household, first.id, due, morning).await;
+    support::notifications::deferred_reminder(&db.pool, &household, second.id, due, morning).await;
+
+    tick_and_deliver(&mut bot, &db.pool, morning).await;
+    let (message_id, html) = bot.latest();
+    assert!(html.contains("Первая") && html.contains("Вторая"), "{html}");
+    // «✓ Выполнено» в блоке сводного: реальное событие выполнения для отметки.
+    bot.press_data(&button_of(&html, "Выполнено"), message_id)
+        .await;
+    let event_id = latest_completion_event(&db.pool, first.id)
+        .await
+        .expect("completion event");
+
+    // Прямые вызовы функций закрытия по сообщению сводного: ни одна доставка
+    // не блокируется и не отмечается.
+    let mut conn = db.pool.acquire().await.expect("conn");
+    assert_eq!(
+        notifications::lock_message_deliveries(&mut conn, bot.chat, message_id)
+            .await
+            .expect("lock"),
+        0
+    );
+    assert_eq!(
+        notifications::mark_closed_completed(&mut conn, bot.chat, message_id, event_id, bot.now)
+            .await
+            .expect("mark"),
+        0
+    );
+    assert_eq!(
+        notifications::clear_closed(&mut conn, bot.chat, message_id)
+            .await
+            .expect("clear"),
+        0
+    );
+    drop(conn);
+
+    let rows = notice_closed_rows(&db.pool, bot.chat, message_id).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    for row in &rows {
+        assert_eq!(
+            *row,
+            (None, None, None),
+            "batch delivery must stay open: {rows:?}"
+        );
+    }
+}
+
+/// «✓ Выполнено» в напоминании о повторяющейся задаче, изменённой из карточки
+/// (срок перенесён, версия устарела), не закрывает доставку: прошлое выполнение
+/// осталось, но `latest_for_item` вернул бы старое событие, а задача открыта.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_on_a_changed_recurring_task_keeps_the_delivery_open() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let at = next_moscow_time(&bot, 9, 0);
+    bot.freeze_at(at);
+    let item = create_task(
+        &db.pool,
+        &household,
+        "Ежедневная зарядка",
+        at + Duration::minutes(15),
+        Some(support::recurrence(RecurrenceFreq::Daily, Vec::new())),
+    )
+    .await;
+
+    tick_and_deliver(&mut bot, &db.pool, at).await;
+    let (message_id, html) = bot.latest();
+    let done = button_of(&html, "Выполнено");
+
+    // Прошлое выполнение из карточки: задача перешла на завтра, событие
+    // осталось действующим — latest_for_item вернул бы именно его.
+    let mut conn = db.pool.acquire().await.expect("conn");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        item.id,
+        None,
+        "Europe/Moscow",
+        bot.now,
+    )
+    .await
+    .expect("past completion");
+    drop(conn);
+    let old_event = latest_completion_event(&db.pool, item.id)
+        .await
+        .expect("old completion event");
+
+    // Задачу изменили из карточки: перенесли срок, версия в напоминании устарела.
+    sqlx::query("UPDATE items SET due_at = $2, version = version + 1 WHERE id = $1")
+        .bind(item.id)
+        .bind(at + Duration::hours(2))
+        .execute(&db.pool)
+        .await
+        .expect("move due");
+
+    bot.press_data(&done, message_id).await;
+    assert_eq!(last_toast(&bot).as_deref(), Some("Задача уже изменилась"));
+    // Новое выполнение не записано, старое событие по-прежнему последнее.
+    assert_eq!(completed_events(&db.pool, item.id).await, 1);
+    assert_eq!(
+        latest_completion_event(&db.pool, item.id).await,
+        Some(old_event)
+    );
+    // Поля закрытия доставки пусты: сообщение не закрывали.
+    let rows = notice_closed_rows(&db.pool, bot.chat, message_id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0], (None, None, None), "{rows:?}");
+    // Сообщение снова показывает напоминание, а не «✅ Выполнено».
+    let (_, redrawn) = bot.latest();
+    assert!(!redrawn.contains("✅ Выполнено"), "{redrawn}");
+    assert!(redrawn.contains("Отложить на час"), "{redrawn}");
+}
