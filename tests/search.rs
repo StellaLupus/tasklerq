@@ -388,6 +388,52 @@ async fn search_mine_for_returns_own_and_shared_tasks_only() {
         .expect("third page");
     assert!(third.is_empty());
     assert!(next.is_none());
+
+    // Текстовый запрос (ветка с CTE кандидатов) вместе с mine_for: под запрос
+    // подходят своя, общая и чужая задачи, но выдача оставляет только свои и
+    // общие.
+    let with_q = SearchFilters {
+        q: Some("задача".into()),
+        mine_for: Some(household.member_id),
+        ..SearchFilters::default()
+    };
+    let (hits, _) = items::search(&mut conn, household.household_id, "Europe/Moscow", &with_q)
+        .await
+        .expect("mine_for search with a query");
+    let ids: HashSet<Uuid> = hits.iter().map(|hit| hit.item.id).collect();
+    assert_eq!(
+        ids,
+        HashSet::from([mine.id, shared.id]),
+        "mine_for with a text query must keep own and shared tasks only"
+    );
+
+    // Курсор в ветке с запросом: страницы не повторяют и не теряют задачи.
+    let mut with_q = SearchFilters {
+        q: Some("задача".into()),
+        mine_for: Some(household.member_id),
+        limit: 1,
+        ..SearchFilters::default()
+    };
+    let (first, next) = items::search(&mut conn, household.household_id, "Europe/Moscow", &with_q)
+        .await
+        .expect("first page with a query");
+    assert_eq!(first.len(), 1);
+    with_q.cursor = Some(decode_cursor(&next.expect("next cursor")).expect("cursor decodes"));
+    let (second, next) = items::search(&mut conn, household.household_id, "Europe/Moscow", &with_q)
+        .await
+        .expect("second page with a query");
+    assert_eq!(second.len(), 1);
+    assert_eq!(
+        HashSet::from([first[0].item.id, second[0].item.id]),
+        HashSet::from([mine.id, shared.id]),
+        "pages with a query must not repeat or lose tasks"
+    );
+    with_q.cursor = Some(decode_cursor(&next.expect("next cursor")).expect("cursor decodes"));
+    let (third, next) = items::search(&mut conn, household.household_id, "Europe/Moscow", &with_q)
+        .await
+        .expect("third page with a query");
+    assert!(third.is_empty());
+    assert!(next.is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

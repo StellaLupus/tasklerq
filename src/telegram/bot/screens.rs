@@ -450,6 +450,16 @@ pub fn task_label(item: &Item, tz: Tz, now: DateTime<Utc>) -> String {
     label
 }
 
+/// Подпись строки «Моих задач»: общая задача (без исполнителя) получает
+/// отметку «👥» в конце подписи, как маркер приоритета.
+fn mine_label(item: &Item, tz: Tz, now: DateTime<Utc>) -> String {
+    let mut label = task_label(item, tz, now);
+    if item.assignee_user_id.is_none() {
+        label.push_str(" · 👥");
+    }
+    label
+}
+
 /// Подпись строки выполненной сегодня задачи: «✅ Название · 13:47».
 pub fn completion_label(completion: &items::completions::Completion, tz: Tz) -> String {
     format!(
@@ -652,7 +662,7 @@ async fn mine(ctx: &mut Ctx<'_>, page: u32) -> Result<Ui, Fail> {
     // ограничен MAX_LIMIT и не должен уменьшать число в заголовке.
     let total = items::open_mine_tasks(&mut *ctx.conn, household_id, user_id).await?;
     let filters = SearchFilters {
-        assignee_user_id: Some(user_id),
+        mine_for: Some(user_id),
         limit: crate::domain::search::MAX_LIMIT,
         ..SearchFilters::default()
     };
@@ -672,12 +682,12 @@ async fn mine(ctx: &mut Ctx<'_>, page: u32) -> Result<Ui, Fail> {
     let mut ui = Ui::new().heading(here(page).trail(&format!("Мои задачи · {total}"), None));
     if tasks.is_empty() {
         return Ok(ui
-            .text("Вам пока ничего не назначено")
+            .text("Нет ни ваших, ни общих задач")
             .row(nav_row(&here(page), Screen::Menu)));
     }
     for item in &tasks[start..end] {
         ui = ui.row(vec![go(
-            &task_label(item, ctx.tz, ctx.now),
+            &mine_label(item, ctx.tz, ctx.now),
             Screen::Item {
                 item_id: item.id,
                 back: Box::new(here(page)),
