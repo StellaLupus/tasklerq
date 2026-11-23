@@ -11,9 +11,10 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
-use crate::domain::models::{Item, ItemStatus, List, ListKind};
+use crate::domain::models::{Item, ItemStatus, List, ListKind, User};
 use crate::domain::recurrence::resolve_local;
 use crate::jobs::keys::snooze_origin;
+use crate::storage::repositories::items::completions;
 use crate::storage::repositories::notifications::{self, NewDelivery, NotificationKind};
 use crate::storage::repositories::{items, lists};
 use crate::telegram::callbacks::Scope;
@@ -292,6 +293,62 @@ fn gone_ui() -> Ui {
     ])
 }
 
+/// Имя участника для закрытого уведомления (0018, решение 5).
+///
+/// `member` — сведения об участнике, загруженные из household получателя
+/// (`users::get(household получателя, …)` возвращает только активного
+/// участника этого household): вызывающий обязан передать именно такого
+/// участника, как в журнале выполнений. Имя не показывается, если выполнивший —
+/// сам получатель, если выполнение без участника (`actor_user_id` пуст: HA,
+/// интеграции) или если участник исключён из household / удалён (`member` пуст
+/// или помечен удалённым). Формат без рода и склонения — отображаемое имя.
+/// Тем же правилом пользуется имя исполнителя в «👤 Назначено»: если
+/// исполнителя нельзя показать (исключён/удалён), имя не выводится.
+pub(crate) fn member_name(
+    actor_user_id: Option<Uuid>,
+    recipient_user_id: Uuid,
+    member: Option<&User>,
+) -> Option<String> {
+    let actor = actor_user_id?;
+    if actor == recipient_user_id {
+        return None;
+    }
+    let member = member?;
+    if member.deleted_at.is_some() {
+        return None;
+    }
+    Some(member.display_name.clone())
+}
+
+/// Экран «✅ Выполнено: <название>[ · <имя>]» — уведомление, закрытое
+/// выполнением задачи не из него (0018, решение 4). Единственная кнопка —
+/// «🗑 Убрать»: отменить выполнение из такого сообщения нельзя. Название
+/// обрезается, как в [`done_ui`]. Вызывается шагом синхронизации.
+pub(crate) fn completed_ui(title: &str, actor_name: Option<&str>) -> Ui {
+    let mut heading = format!("✅ Выполнено: {}", clip(title, 100));
+    if let Some(name) = actor_name {
+        heading.push_str(&format!(" · {name}"));
+    }
+    Ui::new()
+        .heading(heading)
+        .row(vec![button(ru::DISMISS_BUTTON, Action::NoticeClose)])
+}
+
+/// Экран «👤 Назначено: <название>[ · <имя исполнителя>]» — уведомление,
+/// закрытое назначением задачи другому участнику (0018, решение 4).
+/// Единственная кнопка — «🗑 Убрать». Если имя исполнителя показать нельзя
+/// (исключён/удалён), заголовок без имени. Название обрезается, как в
+/// [`done_ui`]. Вызывается шагом синхронизации.
+pub(crate) fn assigned_ui(title: &str, assignee_name: Option<&str>) -> Ui {
+    let mut heading = format!("👤 Назначено: {}", clip(title, 100));
+    if let Some(name) = assignee_name {
+        heading.push_str(&format!(" · {name}"));
+    }
+    Ui::new()
+        .heading(heading)
+        .row(vec![button(ru::DISMISS_BUTTON, Action::NoticeClose)])
+}
+
 /// Собрать HTML уведомления для получателя: выпускает кнопки с областью
 /// `notice`. `issued_at` — момент доставки, от него отсчитывается срок
 /// действия кнопок.
@@ -332,7 +389,11 @@ pub(super) async fn edit_notice(ctx: &mut Ctx<'_>, message_id: i64, ui: &Ui) -> 
     outbox::enqueue(
         &mut *ctx.conn,
         ctx.chat_id,
-        &Outgoing::Edit { message_id, html },
+        &Outgoing::Edit {
+            message_id,
+            html,
+            resend_if_gone: true,
+        },
         None,
         ctx.now,
     )
@@ -386,7 +447,36 @@ async fn show_current(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> Resu
     }
 }
 
+/// Отметить доставки нажатого сообщения закрытыми по последнему действующему
+/// выполнению задачи (0018, решение 4). Если выполнения нет (не должно
+/// случиться), отметка не пишется.
+async fn mark_closed_by_completion(
+    ctx: &mut Ctx<'_>,
+    household_id: Uuid,
+    item_id: Uuid,
+    message_id: i64,
+) -> Result<(), Fail> {
+    let Some(event) = completions::latest_for_item(&mut *ctx.conn, household_id, item_id).await?
+    else {
+        return Ok(());
+    };
+    notifications::mark_closed_completed(
+        &mut *ctx.conn,
+        ctx.chat_id,
+        message_id,
+        event.completion.event_id,
+        ctx.now,
+    )
+    .await?;
+    Ok(())
+}
+
 /// «Выполнено» из уведомления.
+///
+/// Доставки нажатого сообщения блокируются до выполнения и в той же
+/// транзакции отмечаются закрытыми по выполнению (0018, решение 4): шаг
+/// синхронизации не трогает сообщение, которое уже показывает «✅ Выполнено»
+/// (`show_done`).
 pub async fn complete(
     ctx: &mut Ctx<'_>,
     message_id: i64,
@@ -395,6 +485,7 @@ pub async fn complete(
 ) -> Result<(), Fail> {
     let household = ctx.household()?.clone();
     let actor = ctx.actor()?;
+    notifications::lock_message_deliveries(&mut *ctx.conn, ctx.chat_id, message_id).await?;
     let result = items::complete(
         &mut *ctx.conn,
         household.id,
@@ -412,16 +503,23 @@ pub async fn complete(
             } else {
                 None
             };
+            mark_closed_by_completion(ctx, household.id, item_id, message_id).await?;
             ctx.toast(ru::DONE_TOAST);
             show_done(ctx, message_id, &item, item.list_id, next.as_deref()).await
         }
         Err(DomainError::Conflict { .. } | DomainError::NotFound) => {
             // Задачу успели изменить: кнопки обновляются, действие не повторяется.
-            let toast = match load(ctx, item_id).await? {
+            let loaded = load(ctx, item_id).await?;
+            let toast = match &loaded {
                 None => "Задача больше недоступна",
                 Some((item, _)) if item.status == ItemStatus::Done => "Задача уже выполнена",
                 Some(_) => "Задача уже изменилась",
             };
+            if matches!(&loaded, Some((item, _)) if item.status == ItemStatus::Done) {
+                // Сообщение покажет «✅ Выполнено» — закрываем его и здесь,
+                // иначе шаг синхронизации перерисует его второй раз.
+                mark_closed_by_completion(ctx, household.id, item_id, message_id).await?;
+            }
             ctx.toast(toast);
             show_current(ctx, message_id, item_id).await
         }
@@ -434,12 +532,16 @@ pub async fn complete(
 /// При успешной отмене сообщение снова показывает напоминание, поэтому
 /// запланированное автоудаление «✅ Выполнено» отменяется (0017, решение 4):
 /// будущие `pending`-удаления этого сообщения переходят в `skipped`. Неудачная
-/// отмена («Время отмены истекло») удаление не отменяет.
+/// отмена («Время отмены истекло») удаление не отменяет. Отметка закрытия
+/// доставок этого сообщения снимается только при успешной отмене (0018,
+/// решение 4): шаг синхронизации снова может закрыть возвращённое напоминание.
 pub async fn undo(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
     let actor = ctx.actor()?;
+    notifications::lock_message_deliveries(&mut *ctx.conn, ctx.chat_id, message_id).await?;
     match items::undo_last(&mut *ctx.conn, household_id, &actor, item_id, ctx.now).await {
         Ok(_) => {
+            notifications::clear_closed(&mut *ctx.conn, ctx.chat_id, message_id).await?;
             ctx.toast("Отменено");
             outbox::cancel_scheduled_deletes(&mut *ctx.conn, ctx.chat_id, message_id, ctx.now)
                 .await?;
@@ -631,7 +733,7 @@ mod tests {
     use chrono::TimeZone;
 
     use super::*;
-    use crate::domain::models::{ItemPriority, ItemSource};
+    use crate::domain::models::{ItemPriority, ItemSource, User, UserRole};
     use crate::telegram::rich::{Block, Button};
 
     #[test]
@@ -968,5 +1070,112 @@ mod tests {
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(row_labels(rows[0]), ["🏠 Меню", "🗑 Убрать"]);
         assert!(matches!(rows[0][1].action, Action::NoticeClose));
+    }
+
+    fn notice_member(id: Uuid, name: &str, deleted: bool) -> User {
+        User {
+            id,
+            household_id: Uuid::nil(),
+            telegram_user_id: 1,
+            telegram_chat_id: 1,
+            display_name: name.into(),
+            username: None,
+            role: UserRole::Member,
+            timezone: None,
+            settings: serde_json::json!({}),
+            created_at: DateTime::UNIX_EPOCH,
+            updated_at: DateTime::UNIX_EPOCH,
+            deleted_at: deleted.then_some(DateTime::UNIX_EPOCH),
+        }
+    }
+
+    fn heading(ui: &Ui) -> &str {
+        match &ui.blocks[0] {
+            Block::Heading(text) => text,
+            other => panic!("expected a heading, got {other:?}"),
+        }
+    }
+
+    fn assert_only_dismiss(ui: &Ui) {
+        assert_eq!(ui.button_count(), 1, "{:?}", ui.blocks);
+        let rows = button_rows(ui);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(row_labels(rows[0]), ["🗑 Убрать"]);
+        assert!(matches!(rows[0][0].action, Action::NoticeClose));
+    }
+
+    #[test]
+    fn member_name_is_hidden_for_the_recipient_themselves() {
+        let recipient = Uuid::now_v7();
+        let member = notice_member(recipient, "Маша", false);
+        assert_eq!(member_name(Some(recipient), recipient, Some(&member)), None);
+    }
+
+    #[test]
+    fn member_name_is_hidden_without_an_actor() {
+        let recipient = Uuid::now_v7();
+        assert_eq!(member_name(None, recipient, None), None);
+    }
+
+    #[test]
+    fn member_name_is_hidden_for_an_excluded_member() {
+        let recipient = Uuid::now_v7();
+        let actor = Uuid::now_v7();
+        let excluded = notice_member(actor, "Маша", true);
+        assert_eq!(member_name(Some(actor), recipient, Some(&excluded)), None);
+        // Участника нет среди активных в household получателя — имени нет.
+        assert_eq!(member_name(Some(actor), recipient, None), None);
+    }
+
+    #[test]
+    fn member_name_is_shown_for_another_active_member() {
+        let recipient = Uuid::now_v7();
+        let actor = Uuid::now_v7();
+        let member = notice_member(actor, "Маша", false);
+        assert_eq!(
+            member_name(Some(actor), recipient, Some(&member)),
+            Some("Маша".to_owned())
+        );
+    }
+
+    #[test]
+    fn completed_screen_without_a_name_has_only_dismiss() {
+        let ui = completed_ui("Вынести мусор", None);
+        assert_eq!(heading(&ui), "✅ Выполнено: Вынести мусор");
+        assert_only_dismiss(&ui);
+    }
+
+    #[test]
+    fn completed_screen_with_a_name_appends_it() {
+        let ui = completed_ui("Вынести мусор", Some("Маша"));
+        assert_eq!(heading(&ui), "✅ Выполнено: Вынести мусор · Маша");
+        assert_only_dismiss(&ui);
+    }
+
+    #[test]
+    fn assigned_screen_shows_the_assignee_name_and_only_dismiss() {
+        let ui = assigned_ui("Вынести мусор", Some("Маша"));
+        assert_eq!(heading(&ui), "👤 Назначено: Вынести мусор · Маша");
+        assert_only_dismiss(&ui);
+    }
+
+    #[test]
+    fn assigned_screen_without_a_name_has_only_dismiss() {
+        let ui = assigned_ui("Вынести мусор", None);
+        assert_eq!(heading(&ui), "👤 Назначено: Вынести мусор");
+        assert_only_dismiss(&ui);
+    }
+
+    #[test]
+    fn closed_screens_clip_the_title_like_done_ui() {
+        let long = "я".repeat(150);
+        let clipped = format!("{}…", "я".repeat(99));
+        let completed = completed_ui(&long, None);
+        assert_eq!(heading(&completed), format!("✅ Выполнено: {clipped}"));
+        let assigned = assigned_ui(&long, Some("Маша"));
+        assert_eq!(
+            heading(&assigned),
+            format!("👤 Назначено: {clipped} · Маша")
+        );
     }
 }

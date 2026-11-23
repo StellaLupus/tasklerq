@@ -143,6 +143,17 @@ async fn search_filters_status_list_assignee_and_due_range() {
         support::new_item(household.tasks_list_id, "Старое дело"),
     )
     .await;
+
+    // 0018-shared-tasks 2.1: общая задача не входит в буквальный фильтр
+    // по исполнителю.
+    let shared = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        support::new_item(household.tasks_list_id, "Общая без исполнителя"),
+    )
+    .await;
     let mut conn = db.pool.acquire().await.expect("connection");
     items::complete(
         &mut conn,
@@ -192,7 +203,9 @@ async fn search_filters_status_list_assignee_and_due_range() {
     .expect("filter by assignee");
     assert_eq!(
         hits.iter().map(|hit| hit.item.id).collect::<Vec<_>>(),
-        vec![assigned.id]
+        vec![assigned.id],
+        "the literal assignee filter must not include the shared task {}",
+        shared.id
     );
 
     let open_only = SearchFilters::default();
@@ -267,6 +280,160 @@ async fn search_filters_status_list_assignee_and_due_range() {
         items::search(&mut conn, household.household_id, "Europe/Moscow", &invalid).await,
         Err(DomainError::Validation(_))
     ));
+}
+
+// 0018-shared-tasks 2.1: «мои задачи» участника — назначенные ему и общие,
+// только в списках вида `tasks`; чужие и элементы покупок/событий не входят.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_mine_for_returns_own_and_shared_tasks_only() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let owner = household.owner();
+
+    let mut mine = support::new_item(household.tasks_list_id, "Моя задача");
+    mine.assignee_user_id = Some(household.member_id);
+    let mine =
+        support::create_item(&db.pool, &household, household.tasks_list_id, &owner, mine).await;
+
+    let shared = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &owner,
+        support::new_item(household.tasks_list_id, "Общая задача"),
+    )
+    .await;
+
+    let mut foreign = support::new_item(household.tasks_list_id, "Чужая задача");
+    foreign.assignee_user_id = Some(household.owner_id);
+    support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &owner,
+        foreign,
+    )
+    .await;
+
+    // Элементы покупок и событий без исполнителя не должны вытеснять задачи.
+    support::create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &owner,
+        support::new_item(household.shopping_list_id, "Общая покупка"),
+    )
+    .await;
+    let mut own_purchase = support::new_item(household.shopping_list_id, "Моя покупка");
+    own_purchase.assignee_user_id = Some(household.member_id);
+    support::create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &owner,
+        own_purchase,
+    )
+    .await;
+    let mut event = support::new_item(household.events_list_id, "Общее событие");
+    event.due_at = Some(Utc::now() + Duration::days(1));
+    support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &owner,
+        event,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    let filters = SearchFilters {
+        mine_for: Some(household.member_id),
+        ..SearchFilters::default()
+    };
+    let (hits, _) = items::search(&mut conn, household.household_id, "Europe/Moscow", &filters)
+        .await
+        .expect("mine_for search");
+    let ids: HashSet<Uuid> = hits.iter().map(|hit| hit.item.id).collect();
+    assert_eq!(
+        ids,
+        HashSet::from([mine.id, shared.id]),
+        "mine_for must return own and shared tasks only"
+    );
+
+    // Курсор с заданным mine_for: сдвинутые привязки не ломают пагинацию.
+    let mut filters = SearchFilters {
+        mine_for: Some(household.member_id),
+        limit: 1,
+        ..SearchFilters::default()
+    };
+    let (first, next) = items::search(&mut conn, household.household_id, "Europe/Moscow", &filters)
+        .await
+        .expect("first page");
+    assert_eq!(first.len(), 1);
+    filters.cursor = Some(decode_cursor(&next.expect("next cursor")).expect("cursor decodes"));
+    let (second, next) =
+        items::search(&mut conn, household.household_id, "Europe/Moscow", &filters)
+            .await
+            .expect("second page");
+    assert_eq!(second.len(), 1);
+    assert_eq!(
+        HashSet::from([first[0].item.id, second[0].item.id]),
+        HashSet::from([mine.id, shared.id]),
+        "pages must not repeat or lose tasks"
+    );
+    // Полная страница всегда отдаёт курсор; следующая за ней — пустая.
+    filters.cursor = Some(decode_cursor(&next.expect("next cursor")).expect("cursor decodes"));
+    let (third, next) = items::search(&mut conn, household.household_id, "Europe/Moscow", &filters)
+        .await
+        .expect("third page");
+    assert!(third.is_empty());
+    assert!(next.is_none());
+
+    // Текстовый запрос (ветка с CTE кандидатов) вместе с mine_for: под запрос
+    // подходят своя, общая и чужая задачи, но выдача оставляет только свои и
+    // общие.
+    let with_q = SearchFilters {
+        q: Some("задача".into()),
+        mine_for: Some(household.member_id),
+        ..SearchFilters::default()
+    };
+    let (hits, _) = items::search(&mut conn, household.household_id, "Europe/Moscow", &with_q)
+        .await
+        .expect("mine_for search with a query");
+    let ids: HashSet<Uuid> = hits.iter().map(|hit| hit.item.id).collect();
+    assert_eq!(
+        ids,
+        HashSet::from([mine.id, shared.id]),
+        "mine_for with a text query must keep own and shared tasks only"
+    );
+
+    // Курсор в ветке с запросом: страницы не повторяют и не теряют задачи.
+    let mut with_q = SearchFilters {
+        q: Some("задача".into()),
+        mine_for: Some(household.member_id),
+        limit: 1,
+        ..SearchFilters::default()
+    };
+    let (first, next) = items::search(&mut conn, household.household_id, "Europe/Moscow", &with_q)
+        .await
+        .expect("first page with a query");
+    assert_eq!(first.len(), 1);
+    with_q.cursor = Some(decode_cursor(&next.expect("next cursor")).expect("cursor decodes"));
+    let (second, next) = items::search(&mut conn, household.household_id, "Europe/Moscow", &with_q)
+        .await
+        .expect("second page with a query");
+    assert_eq!(second.len(), 1);
+    assert_eq!(
+        HashSet::from([first[0].item.id, second[0].item.id]),
+        HashSet::from([mine.id, shared.id]),
+        "pages with a query must not repeat or lose tasks"
+    );
+    with_q.cursor = Some(decode_cursor(&next.expect("next cursor")).expect("cursor decodes"));
+    let (third, next) = items::search(&mut conn, household.household_id, "Europe/Moscow", &with_q)
+        .await
+        .expect("third page with a query");
+    assert!(third.is_empty());
+    assert!(next.is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

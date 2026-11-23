@@ -225,24 +225,26 @@ pub async fn overdue_tasks(
     hydrate_many(conn, rows).await
 }
 
-/// Открытые задачи, назначенные участнику.
-pub async fn open_assigned_tasks(
+/// Открытые задачи участника в видимых списках задач: назначенные ему
+/// и общие (без исполнителя).
+pub async fn open_mine_tasks(
     conn: &mut PgConnection,
     household_id: Uuid,
     user_id: Uuid,
 ) -> Result<i64, DomainError> {
-    let count = sqlx::query_scalar(
+    let count = sqlx::query_scalar(&format!(
         "SELECT count(*)
          FROM items i
          JOIN lists l ON l.id = i.list_id
          WHERE i.household_id = $1
-           AND i.assignee_user_id = $2
+           AND {}
            AND i.status = 'open'
            AND i.deleted_at IS NULL
            AND l.kind = 'tasks'
            AND l.deleted_at IS NULL
            AND NOT l.is_archived",
-    )
+        super::mine_predicate("$2"),
+    ))
     .bind(household_id)
     .bind(user_id)
     .fetch_one(conn)

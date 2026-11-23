@@ -384,11 +384,32 @@ async fn task_rows_have_one_button_and_open_the_card_without_changing_the_task()
         "opening the card must not change the task"
     );
 
-    // «Мои задачи» и поиск используют ту же строку-кнопку.
+    // «Мои задачи» и поиск используют ту же строку-кнопку. В «Мои задачи»
+    // входят и общие задачи без исполнителя — с отметкой «👥» в конце.
     bot.press("Назад").await; // список
     bot.press("Назад").await; // меню
     bot.press("Мои задачи").await;
-    assert_one_element_row(&bot.screen(), "Срочная задача");
+    bot.assert_screen_contains("Мои задачи · 3");
+    for title in ["Срочная задача", "Высокая задача", "Обычная задача"]
+    {
+        assert_one_element_row(&bot.screen(), title);
+    }
+    let mine_rows = support::telegram::buttons(&bot.screen());
+    let mine_row = |title: &str| {
+        mine_rows
+            .iter()
+            .find(|(label, _)| label.contains(title))
+            .map(|(label, _)| label.as_str())
+            .expect("mine row")
+    };
+    assert!(!mine_row("Срочная задача").contains("👥"));
+    assert!(mine_row("Высокая задача").ends_with(" · 👥"));
+    assert!(mine_row("Обычная задача").ends_with(" · 👥"));
+    assert!(
+        !bot.screen().contains("Молоко"),
+        "shopping must not enter «Мои задачи»:\n{}",
+        bot.screen()
+    );
     bot.press("Назад").await;
 
     bot.press("Поиск").await;
@@ -1494,9 +1515,182 @@ async fn search_and_my_tasks() {
 
     bot.press("Назад").await;
     bot.press("Мои задачи").await;
-    bot.assert_screen_contains("Мои задачи · 1");
-    bot.assert_screen_contains("Моя задача");
-    assert!(!bot.screen().contains("Купить молоко домой"));
+    // 0018-shared-tasks 2.2: экран показывает свои и общие задачи; общая
+    // «Купить молоко домой» без исполнителя помечена «👥».
+    bot.assert_screen_contains("Мои задачи · 2");
+    assert_one_element_row(&bot.screen(), "Моя задача");
+    assert_one_element_row(&bot.screen(), "Купить молоко домой");
+    let rows = support::telegram::buttons(&bot.screen());
+    let row = |title: &str| {
+        rows.iter()
+            .find(|(label, _)| label.contains(title))
+            .map(|(label, _)| label.as_str())
+            .expect("task row")
+    };
+    assert_eq!(row("Моя задача"), "Моя задача");
+    assert_eq!(row("Купить молоко домой"), "Купить молоко домой · 👥");
+    assert_eq!(rows.len(), 3, "two task rows and the back button: {rows:?}");
+}
+
+// 0018-shared-tasks 2.2: «Мои задачи» — свои и общие задачи; общая помечена
+// «👥», чужая не входит, кнопка меню и заголовок считают тот же состав.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mine_screen_shows_own_and_shared_tasks_with_shared_marker() {
+    let db = db().await;
+    let mut owner = onboarded_named(&db.pool, "Пётр").await;
+    let maria = invite(&mut owner, &db.pool, "Мария").await;
+    let household = household_for(&db.pool, owner.chat).await;
+    let maria_id = household_for(&db.pool, maria.chat).await.owner_id;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+
+    let mut own = new_item(household.tasks_list_id, "Своя задача");
+    own.assignee_user_id = Some(household.owner_id);
+    create_item(&db.pool, &household, household.tasks_list_id, &actor, own).await;
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, "Общая задача"),
+    )
+    .await;
+    let mut foreign = new_item(household.tasks_list_id, "Чужая задача");
+    foreign.assignee_user_id = Some(maria_id);
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        foreign,
+    )
+    .await;
+
+    owner.text("/start").await;
+    owner.assert_screen_contains("👤 Мои задачи · 2");
+    owner.press("Мои задачи").await;
+    owner.assert_screen_contains("Мои задачи · 2");
+    let rows = support::telegram::buttons(&owner.screen());
+    let row = |title: &str| {
+        rows.iter()
+            .find(|(label, _)| label.contains(title))
+            .map(|(label, _)| label.as_str())
+            .expect("task row")
+    };
+    assert_eq!(
+        row("Своя задача"),
+        "Своя задача",
+        "own task must not carry the shared marker"
+    );
+    assert_eq!(row("Общая задача"), "Общая задача · 👥");
+    assert!(
+        !owner.screen().contains("Чужая задача"),
+        "a task assigned to another member must not enter «Мои задачи»:\n{}",
+        owner.screen()
+    );
+    assert_eq!(rows.len(), 3, "two task rows and the back button: {rows:?}");
+}
+
+// 0018-shared-tasks 2.2: назначение общей задачи другому участнику уменьшает
+// счётчик владельца; у нового исполнителя строка этой задачи без «👥».
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mine_counter_drops_when_shared_task_is_assigned_away() {
+    let db = db().await;
+    let mut owner = onboarded_named(&db.pool, "Пётр").await;
+    let mut maria = invite(&mut owner, &db.pool, "Мария").await;
+    let household = household_for(&db.pool, owner.chat).await;
+    let maria_id = household_for(&db.pool, maria.chat).await.owner_id;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+
+    let mut own = new_item(household.tasks_list_id, "Своя задача");
+    own.assignee_user_id = Some(household.owner_id);
+    create_item(&db.pool, &household, household.tasks_list_id, &actor, own).await;
+    let shared = create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        new_item(household.tasks_list_id, "Общая задача"),
+    )
+    .await;
+
+    owner.text("/start").await;
+    owner.assert_screen_contains("👤 Мои задачи · 2");
+    owner.press("Мои задачи").await;
+    owner.assert_screen_contains("Общая задача · 👥");
+    owner.press("Назад").await;
+
+    // Владелец назначает общую задачу Марии.
+    let mut conn = db.pool.acquire().await.expect("connection");
+    items::update(
+        &mut conn,
+        household.household_id,
+        &actor,
+        shared.id,
+        shared.version,
+        ItemPatch {
+            assignee_user_id: Field::Value(maria_id),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        Utc::now(),
+    )
+    .await
+    .expect("assign the shared task");
+    drop(conn);
+
+    owner.text("/start").await;
+    owner.assert_screen_contains("👤 Мои задачи · 1");
+    owner.press("Мои задачи").await;
+    owner.assert_screen_contains("Мои задачи · 1");
+    assert!(
+        !owner.screen().contains("Общая задача"),
+        "the assigned-away task must leave the owner's screen:\n{}",
+        owner.screen()
+    );
+
+    // У нового исполнителя задача своя: строка без «👥».
+    maria.text("/start").await;
+    maria.assert_screen_contains("👤 Мои задачи · 1");
+    maria.press("Мои задачи").await;
+    maria.assert_screen_contains("Мои задачи · 1");
+    let rows = support::telegram::buttons(&maria.screen());
+    assert!(
+        rows.iter().any(|(label, _)| label == "Общая задача"),
+        "the assignee must see the task without the shared marker: {rows:?}"
+    );
+    assert!(
+        !maria.screen().contains("👥"),
+        "an assigned task must not carry «👥»:\n{}",
+        maria.screen()
+    );
+}
+
+// 0018-shared-tasks 2.2: только чужие задачи — новый текст пустого экрана.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mine_screen_is_empty_when_all_tasks_belong_to_others() {
+    let db = db().await;
+    let mut owner = onboarded_named(&db.pool, "Пётр").await;
+    let maria = invite(&mut owner, &db.pool, "Мария").await;
+    let household = household_for(&db.pool, owner.chat).await;
+    let maria_id = household_for(&db.pool, maria.chat).await.owner_id;
+    let actor = Actor::user(household.owner_id, UserRole::Owner);
+    let mut foreign = new_item(household.tasks_list_id, "Чужая задача");
+    foreign.assignee_user_id = Some(maria_id);
+    create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &actor,
+        foreign,
+    )
+    .await;
+
+    owner.text("/start").await;
+    owner.assert_screen_contains("👤 Мои задачи · 0");
+    owner.press("Мои задачи").await;
+    owner.assert_screen_contains("Мои задачи · 0");
+    owner.assert_screen_contains("Нет ни ваших, ни общих задач");
+    assert!(!owner.screen().contains("Чужая задача"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

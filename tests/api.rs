@@ -774,6 +774,57 @@ async fn unknown_resources_and_households_are_not_leaked() {
     assert_eq!(body["error"]["code"], "not_found");
 }
 
+// 0018-shared-tasks 2.1: фильтр по исполнителю в API остаётся буквальным и
+// не включает общие задачи (без исполнителя).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_assignee_filter_excludes_shared_tasks() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+    let token =
+        support::issue_token(&db.pool, household.household_id, &["ha:read", "ha:write"]).await;
+    let app = support::app(&db.pool);
+
+    let (status, personal) = support::request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/lists/{}/items", household.tasks_list_id),
+        Some(&token),
+        Some(json!({"title": "Личная задача", "assignee_user_id": household.member_id})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = support::request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/lists/{}/items", household.tasks_list_id),
+        Some(&token),
+        Some(json!({"title": "Общая задача"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, search) = support::request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/search?assignee_user_id={}", household.member_id),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<&str> = search["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|item| item["id"].as_str().expect("item id"))
+        .collect();
+    assert_eq!(
+        ids,
+        vec![personal["id"].as_str().expect("item id")],
+        "the assignee filter must return only that assignee's tasks, not shared ones"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn search_due_bounds_use_household_timezone() {
     let db = support::db().await;

@@ -4,19 +4,29 @@
 //! актуальности — в [`crate::jobs::notice`], тихие часы и пояс получателя — в
 //! [`crate::jobs::quiet`]. Сводка живёт в [`crate::jobs::digest`], сводное
 //! сообщение — в [`crate::jobs::batch`], уведомление о назначении — в
-//! [`crate::jobs::assignment`]. Здесь остаются цикл, тик и планирование
+//! [`crate::jobs::assignment`], синхронизация отправленных уведомлений — в
+//! [`crate::jobs::notice_sync`]. Здесь остаются цикл, тик и планирование
 //! напоминаний.
 //!
-//! Один тик делает три шага:
+//! Один тик выполняет шаги в таком порядке:
 //!
-//! 1. отменяет `pending`-доставки, вхождение которых больше не актуально
+//! 1. синхронизирует отправленные уведомления (`sync_completed_notices`,
+//!    [`crate::jobs::notice_sync`]): перерисовывает копии напоминаний, чью
+//!    задачу выполнили не из них или назначили другому, и возвращает копию,
+//!    если причина закрытия исчезла. Шаг стоит первым, до отмены устаревших
+//!    доставок, чтобы успеть перерисовать «😴 Напомню …» раньше, чем отмена
+//!    уберёт сообщение;
+//! 2. отменяет `pending`-доставки, вхождение которых больше не актуально
 //!    (задача завершена, удалена, срок сдвинулся, получатель сменился,
 //!    напоминания или сводка выключены, элемент назначен другому);
-//! 2. планирует напоминания для открытых задач и событий со временем, у
+//! 3. планирует напоминания для открытых задач и событий со временем, у
 //!    которых наступил момент `due_at - lead_minutes` получателя, для
 //!    вседневных — у которых наступило локальное `all_day_time` в день
 //!    начала; сводки и уведомления о назначении уже стоят в очереди;
-//! 3. ставит готовые `pending`-доставки в `outbox` одной транзакцией со сменой
+//! 4. пересчитывает время отложенных `pending`-доставок по текущим настройкам
+//!    получателей: новое время сводки, lead time, пояс и границы тихих часов
+//!    применяются без перезапуска;
+//! 5. ставит готовые `pending`-доставки в `outbox` одной транзакцией со сменой
 //!    статуса и будит outbox-воркер.
 //!
 //! Переход повторяющихся событий сюда не входит: он живёт в
@@ -29,9 +39,10 @@
 //! вхождение повторяющейся задачи получает новый срок, а значит и новый
 //! `occurrence_key`.
 //!
-//! Получатель напоминания — исполнитель, иначе автор-пользователь, иначе каждый
-//! активный участник household с включёнными напоминаниями. Ошибка БД на одной
-//! записи логируется и не прерывает обработку остальных.
+//! Напоминание получает исполнитель; у задачи без исполнителя (общей) — каждый
+//! активный участник household с включёнными напоминаниями, независимо от
+//! автора. Ошибка БД на одной записи логируется и не прерывает обработку
+//! остальных.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -45,7 +56,7 @@ use uuid::Uuid;
 use super::delivery::{self, DeliveryScope};
 use super::notice::NoticeRow;
 use super::quiet::resolved_timezone;
-use super::{assignment, batch, digest};
+use super::{assignment, batch, digest, notice_sync};
 use crate::domain::recurrence::resolve_local;
 use crate::domain::settings::{MAX_LEAD_MINUTES, NotificationSettings, parse_hhmm};
 use crate::storage::repositories::notifications::{
@@ -70,6 +81,8 @@ pub struct TickStats {
     pub delivered: u64,
     /// Отменено устаревших записей.
     pub cancelled: u64,
+    /// Изменено сообщений синхронизацией отправленных уведомлений.
+    pub synced: u64,
 }
 
 /// Планировщик уведомлений.
@@ -96,6 +109,17 @@ impl Scheduler {
         // не учитывался.
         let mut rescheduled = 0;
 
+        // Синхронизация отправленных уведомлений идёт до отмены устаревших
+        // записей: иначе отмена pending-snooze из 0017 успела бы убрать
+        // сообщение «😴 Напомню …» раньше, чем шаг перерисует его в
+        // «✅ Выполнено» / «👤 Назначено» (0018, решение 4).
+        step(
+            "sync_completed_notices",
+            notice_sync::sync(&self.pool, now),
+            &mut stats.synced,
+            &mut last_error,
+        )
+        .await;
         step(
             "cancel_stale reminders",
             delivery::cancel_stale(&self.pool, now, DeliveryScope::Reminder),
@@ -195,7 +219,7 @@ impl Scheduler {
         )
         .await;
 
-        if stats.delivered > 0 {
+        if stats.delivered > 0 || stats.synced > 0 {
             self.wake_outbox.notify_one();
         }
 
@@ -303,7 +327,7 @@ async fn plan_reminders(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::
         "WITH candidates AS (
              SELECT i.id AS item_id, i.household_id, i.due_at, i.due_date,
                     h.timezone AS household_timezone,
-                    COALESCE(i.assignee_user_id, i.created_by_user_id) AS selected_user_id,
+                    i.assignee_user_id AS selected_user_id,
                     CASE
                         WHEN i.due_at IS NOT NULL
                         THEN to_char(

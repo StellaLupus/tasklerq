@@ -965,8 +965,11 @@ async fn event_counters_skip_events_older_than_the_sql_prefilter() {
     );
 }
 
+// 0018-shared-tasks 2.1: считаются свои и общие открытые задачи в видимых
+// списках задач; чужие, закрытые, удалённые, в архивных/удалённых списках и
+// элементы списков других видов — нет.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn open_assigned_tasks_counts_only_open_own_tasks_in_visible_task_lists() {
+async fn open_mine_tasks_counts_open_own_and_shared_tasks_in_visible_task_lists() {
     let db = support::db().await;
     let household = support::create_household(&db.pool).await;
     let owner = household.owner();
@@ -974,6 +977,16 @@ async fn open_assigned_tasks_counts_only_open_own_tasks_in_visible_task_lists() 
     let mut mine = support::new_item(household.tasks_list_id, "Моя задача");
     mine.assignee_user_id = Some(household.member_id);
     support::create_item(&db.pool, &household, household.tasks_list_id, &owner, mine).await;
+
+    // Общая задача без исполнителя считается каждому участнику.
+    support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &owner,
+        support::new_item(household.tasks_list_id, "Общая задача"),
+    )
+    .await;
 
     let mut done = support::new_item(household.tasks_list_id, "Выполненная");
     done.assignee_user_id = Some(household.member_id);
@@ -984,6 +997,15 @@ async fn open_assigned_tasks_counts_only_open_own_tasks_in_visible_task_lists() 
     other.assignee_user_id = Some(household.owner_id);
     support::create_item(&db.pool, &household, household.tasks_list_id, &owner, other).await;
 
+    let deleted = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &owner,
+        support::new_item(household.tasks_list_id, "Удалённая общая"),
+    )
+    .await;
+
     let mut shopping = support::new_item(household.shopping_list_id, "Покупка");
     shopping.assignee_user_id = Some(household.member_id);
     support::create_item(
@@ -992,6 +1014,24 @@ async fn open_assigned_tasks_counts_only_open_own_tasks_in_visible_task_lists() 
         household.shopping_list_id,
         &owner,
         shopping,
+    )
+    .await;
+    support::create_item(
+        &db.pool,
+        &household,
+        household.shopping_list_id,
+        &owner,
+        support::new_item(household.shopping_list_id, "Общая покупка"),
+    )
+    .await;
+    let mut event = support::new_item(household.events_list_id, "Общее событие");
+    event.due_at = Some(Utc::now() + Duration::days(1));
+    support::create_item(
+        &db.pool,
+        &household,
+        household.events_list_id,
+        &owner,
+        event,
     )
     .await;
 
@@ -1005,11 +1045,31 @@ async fn open_assigned_tasks_counts_only_open_own_tasks_in_visible_task_lists() 
     )
     .await
     .expect("archive list");
+    let removed = lists::create(
+        &mut conn,
+        household.household_id,
+        ListKind::Tasks,
+        "Удалённый список",
+        Utc::now(),
+    )
+    .await
+    .expect("removed list");
     let mut archived_item = support::new_item(archived.id, "В архиве");
     archived_item.assignee_user_id = Some(household.member_id);
+    let mut removed_item = support::new_item(removed.id, "В удалённом списке");
+    removed_item.assignee_user_id = Some(household.member_id);
     drop(conn);
 
     support::create_item(&db.pool, &household, archived.id, &owner, archived_item).await;
+    support::create_item(&db.pool, &household, removed.id, &owner, removed_item).await;
+    support::create_item(
+        &db.pool,
+        &household,
+        removed.id,
+        &owner,
+        support::new_item(removed.id, "Общая в удалённом списке"),
+    )
+    .await;
 
     let mut conn = db.pool.acquire().await.expect("connection");
     items::complete(
@@ -1023,6 +1083,15 @@ async fn open_assigned_tasks_counts_only_open_own_tasks_in_visible_task_lists() 
     )
     .await
     .expect("complete an assigned task");
+    items::soft_delete(
+        &mut conn,
+        household.household_id,
+        &owner,
+        deleted.id,
+        Utc::now(),
+    )
+    .await
+    .expect("delete a shared task");
     lists::update(
         &mut conn,
         household.household_id,
@@ -1034,13 +1103,30 @@ async fn open_assigned_tasks_counts_only_open_own_tasks_in_visible_task_lists() 
     )
     .await
     .expect("archive the list");
+    lists::delete(
+        &mut conn,
+        household.household_id,
+        removed.id,
+        true,
+        Utc::now(),
+    )
+    .await
+    .expect("delete the list");
 
-    let count = items::open_assigned_tasks(&mut conn, household.household_id, household.member_id)
+    let count = items::open_mine_tasks(&mut conn, household.household_id, household.member_id)
         .await
-        .expect("assigned count");
+        .expect("mine count");
     assert_eq!(
-        count, 1,
-        "only the open own task in a visible tasks list counts"
+        count, 2,
+        "the open own task and the shared task in visible tasks lists count"
+    );
+
+    let owner_count = items::open_mine_tasks(&mut conn, household.household_id, household.owner_id)
+        .await
+        .expect("owner mine count");
+    assert_eq!(
+        owner_count, 2,
+        "the owner sees their own task and the shared one, not the member's"
     );
 }
 

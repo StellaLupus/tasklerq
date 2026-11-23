@@ -310,6 +310,43 @@ async fn notice_expire_rows(
     .expect("notice expire rows")
 }
 
+/// Поля закрытия доставок сообщения (сопоставление через outbox, как у
+/// `mark_dismissed`): `closed_at`, `closed_reason`, `closed_by_event`.
+async fn notice_closed_rows(
+    pool: &PgPool,
+    chat: i64,
+    message_id: i64,
+) -> Vec<(Option<DateTime<Utc>>, Option<String>, Option<Uuid>)> {
+    sqlx::query_as(
+        "SELECT d.closed_at, d.closed_reason, d.closed_by_event
+         FROM notification_deliveries d
+         JOIN outbox o ON o.seq = d.outbox_seq
+         WHERE o.chat_id = $1 AND o.message_id = $2
+         ORDER BY d.created_at, d.id",
+    )
+    .bind(chat)
+    .bind(message_id)
+    .fetch_all(pool)
+    .await
+    .expect("notice closed rows")
+}
+
+/// Id последнего действующего выполнения задачи по `item_events`: событие
+/// `completed`, не компенсирующее и не отменённое.
+async fn latest_completion_event(pool: &PgPool, item_id: Uuid) -> Option<Uuid> {
+    sqlx::query_scalar(
+        "SELECT e.id FROM item_events e
+         WHERE e.item_id = $1 AND e.event_type = 'completed' AND e.undo_of IS NULL
+           AND NOT EXISTS (SELECT 1 FROM item_events u WHERE u.undo_of = e.id)
+         ORDER BY e.created_at DESC, e.id DESC
+         LIMIT 1",
+    )
+    .bind(item_id)
+    .fetch_optional(pool)
+    .await
+    .expect("latest completion event")
+}
+
 /// Есть ли среди вызовов фейка удаление данного сообщения.
 fn deleted(bot: &Harness, message_id: i64) -> bool {
     bot.fake.calls().iter().any(
@@ -2177,6 +2214,314 @@ async fn expired_undo_does_not_cancel_the_scheduled_delete() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_from_reminder_marks_its_delivery_closed() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let at = next_moscow_time(&bot, 9, 0);
+    bot.freeze_at(at);
+    let item = create_task(
+        &db.pool,
+        &household,
+        "Оплатить интернет",
+        at + Duration::minutes(15),
+        None,
+    )
+    .await;
+
+    tick_and_deliver(&mut bot, &db.pool, at).await;
+    let (message_id, html) = bot.latest();
+    bot.press_data(&button_of(&html, "Выполнено"), message_id)
+        .await;
+
+    let event_id = latest_completion_event(&db.pool, item.id)
+        .await
+        .expect("completion event");
+    let rows = notice_closed_rows(&db.pool, bot.chat, message_id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let closed_at = rows[0].0.expect("closed_at must be set");
+    assert!(
+        (closed_at - at).num_seconds().abs() <= 5,
+        "closed_at {closed_at}, expected about {at}"
+    );
+    assert_eq!(rows[0].1.as_deref(), Some("completed"), "{rows:?}");
+    assert_eq!(rows[0].2, Some(event_id), "{rows:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undo_clears_the_close_and_done_again_marks_the_new_event() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let at = next_moscow_time(&bot, 9, 0);
+    bot.freeze_at(at);
+    let item = create_task(
+        &db.pool,
+        &household,
+        "Оплатить интернет",
+        at + Duration::minutes(15),
+        None,
+    )
+    .await;
+
+    tick_and_deliver(&mut bot, &db.pool, at).await;
+    let (message_id, html) = bot.latest();
+    bot.press_data(&button_of(&html, "Выполнено"), message_id)
+        .await;
+    let first_event = latest_completion_event(&db.pool, item.id)
+        .await
+        .expect("first completion event");
+    let rows = notice_closed_rows(&db.pool, bot.chat, message_id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].2, Some(first_event), "{rows:?}");
+
+    bot.advance(Duration::minutes(5));
+    bot.press_data(&button_of(&bot.latest().1, "Отменить"), message_id)
+        .await;
+    let rows = notice_closed_rows(&db.pool, bot.chat, message_id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0], (None, None, None), "{rows:?}");
+
+    bot.advance(Duration::minutes(1));
+    bot.press_data(&button_of(&bot.latest().1, "Выполнено"), message_id)
+        .await;
+    let second_event = latest_completion_event(&db.pool, item.id)
+        .await
+        .expect("second completion event");
+    assert_ne!(second_event, first_event);
+    let rows = notice_closed_rows(&db.pool, bot.chat, message_id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let closed_at = rows[0].0.expect("closed_at must be set again");
+    assert!(
+        (closed_at - (at + Duration::minutes(6)))
+            .num_seconds()
+            .abs()
+            <= 5,
+        "closed_at {closed_at}, expected about {}",
+        at + Duration::minutes(6)
+    );
+    assert_eq!(rows[0].1.as_deref(), Some("completed"), "{rows:?}");
+    assert_eq!(rows[0].2, Some(second_event), "{rows:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_in_an_assignment_notice_marks_its_delivery_closed_and_undo_clears() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let at = next_moscow_time(&bot, 9, 0);
+    bot.freeze_at(at);
+    let item = create_task(
+        &db.pool,
+        &household,
+        "Купить торт",
+        at + Duration::hours(3),
+        None,
+    )
+    .await;
+    support::notifications::insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        item.id,
+        "assignment",
+        "assignment:closed:0",
+        at,
+        false,
+    )
+    .await;
+
+    tick_and_deliver(&mut bot, &db.pool, at).await;
+    let (message_id, html) = bot.latest();
+    assert!(html.contains("Вам назначили задачу"), "{html}");
+    bot.press_data(&button_of(&html, "Выполнено"), message_id)
+        .await;
+
+    let event_id = latest_completion_event(&db.pool, item.id)
+        .await
+        .expect("completion event");
+    let rows = notice_closed_rows(&db.pool, bot.chat, message_id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].0.is_some(), "{rows:?}");
+    assert_eq!(rows[0].1.as_deref(), Some("completed"), "{rows:?}");
+    assert_eq!(rows[0].2, Some(event_id), "{rows:?}");
+
+    bot.advance(Duration::minutes(5));
+    bot.press_data(&button_of(&bot.latest().1, "Отменить"), message_id)
+        .await;
+    let rows = notice_closed_rows(&db.pool, bot.chat, message_id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0], (None, None, None), "{rows:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_from_reminder_leaves_other_recipients_deliveries_open() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let at = next_moscow_time(&bot, 9, 0);
+    bot.freeze_at(at);
+
+    // Второй участник household со своим чатом и включёнными напоминаниями.
+    let member_telegram = next_telegram_id();
+    let member_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO users (
+             id, household_id, telegram_user_id, telegram_chat_id, display_name,
+             role, settings, created_at, updated_at
+         )
+         VALUES (
+             $1, $2, $3, $3, 'Masha', 'member',
+             jsonb_build_object(
+                 'notifications',
+                 jsonb_build_object('digest_enabled', false, 'quiet_hours_enabled', false)
+             ),
+             $4, $4
+         )",
+    )
+    .bind(member_id)
+    .bind(household.household_id)
+    .bind(member_telegram)
+    .bind(at)
+    .execute(&db.pool)
+    .await
+    .expect("member");
+    let mut member = Harness::sharing(&db.pool, member_telegram, bot.fake.clone()).named("Masha");
+    member.freeze_at(at);
+
+    // Общая задача без исполнителя: напоминание приходит обоим участникам.
+    let mut new = new_item(household.tasks_list_id, "Общая задача");
+    new.due_at = Some(at + Duration::minutes(15));
+    let item = create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &Actor::user(household.owner_id, UserRole::Owner),
+        new,
+    )
+    .await;
+
+    tick_and_deliver(&mut bot, &db.pool, at).await;
+    member.deliver().await;
+    let (message_id, html) = bot.latest();
+    let (member_message_id, member_html) = member.latest();
+    assert!(member_html.contains("Общая задача"), "{member_html}");
+
+    bot.press_data(&button_of(&html, "Выполнено"), message_id)
+        .await;
+
+    let event_id = latest_completion_event(&db.pool, item.id)
+        .await
+        .expect("completion event");
+    let rows = notice_closed_rows(&db.pool, bot.chat, message_id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].0.is_some(), "{rows:?}");
+    assert_eq!(rows[0].1.as_deref(), Some("completed"), "{rows:?}");
+    assert_eq!(rows[0].2, Some(event_id), "{rows:?}");
+    let member_rows = notice_closed_rows(&db.pool, member.chat, member_message_id).await;
+    assert_eq!(member_rows.len(), 1, "{member_rows:?}");
+    assert_eq!(member_rows[0], (None, None, None), "{member_rows:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_on_a_task_completed_from_the_card_marks_its_delivery_closed() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let at = next_moscow_time(&bot, 12, 0);
+    bot.freeze_at(at);
+    let item = create_task(
+        &db.pool,
+        &household,
+        "Оплатить интернет",
+        at + Duration::minutes(15),
+        None,
+    )
+    .await;
+
+    tick_and_deliver(&mut bot, &db.pool, at).await;
+    let (message_id, html) = bot.latest();
+    let done = button_of(&html, "Выполнено");
+
+    // Задачу выполнили из карточки: кнопка в напоминании устарела по версии.
+    let mut conn = db.pool.acquire().await.expect("conn");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        item.id,
+        None,
+        "Europe/Moscow",
+        bot.now,
+    )
+    .await
+    .expect("complete from the card");
+    drop(conn);
+    let event_id = latest_completion_event(&db.pool, item.id)
+        .await
+        .expect("completion event");
+
+    bot.press_data(&done, message_id).await;
+    assert_eq!(last_toast(&bot).as_deref(), Some("Задача уже выполнена"));
+    let rows = notice_closed_rows(&db.pool, bot.chat, message_id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let closed_at = rows[0].0.expect("closed_at must be set");
+    assert!(
+        (closed_at - at).num_seconds().abs() <= 5,
+        "closed_at {closed_at}, expected about {at}"
+    );
+    assert_eq!(rows[0].1.as_deref(), Some("completed"), "{rows:?}");
+    assert_eq!(rows[0].2, Some(event_id), "{rows:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_undo_keeps_the_delivery_closed() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let at = next_moscow_time(&bot, 9, 0);
+    bot.freeze_at(at);
+    let item = create_task(
+        &db.pool,
+        &household,
+        "Оплатить интернет",
+        at + Duration::minutes(15),
+        None,
+    )
+    .await;
+
+    tick_and_deliver(&mut bot, &db.pool, at).await;
+    let (message_id, html) = bot.latest();
+    bot.press_data(&button_of(&html, "Выполнено"), message_id)
+        .await;
+    let event_id = latest_completion_event(&db.pool, item.id)
+        .await
+        .expect("completion event");
+    let undo = button_of(&bot.latest().1, "Отменить");
+
+    // 09:11: окно отмены истекло.
+    bot.advance(Duration::minutes(11));
+    bot.press_data(&undo, message_id).await;
+
+    assert_eq!(last_toast(&bot).as_deref(), Some("Время отмены истекло"));
+    let rows = notice_closed_rows(&db.pool, bot.chat, message_id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let closed_at = rows[0].0.expect("closed_at must stay set");
+    assert!(
+        (closed_at - at).num_seconds().abs() <= 5,
+        "closed_at {closed_at}, expected about {at}"
+    );
+    assert_eq!(rows[0].1.as_deref(), Some("completed"), "{rows:?}");
+    assert_eq!(rows[0].2, Some(event_id), "{rows:?}");
+}
+
 /// `replaces_message_id` snooze-доставок задачи в порядке создания.
 async fn snooze_replaces(pool: &PgPool, item_id: Uuid) -> Vec<Option<i64>> {
     sqlx::query_scalar(
@@ -2710,4 +3055,135 @@ async fn insert_snooze_fills_an_empty_recorded_message_without_overwrite() {
     .expect("snooze row");
     assert_eq!(scheduled, deliver_at);
     assert_eq!(replaces, Some(202), "the new message must be recorded");
+}
+
+/// Функции блокировки и закрытия доставки не трогают блоки сводного сообщения:
+/// они делят одну строку outbox, а синхронизация (0018) их не затрагивает.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_functions_do_not_touch_batch_deliveries() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    // Тихие часы: два напоминания собираются в одно сводное сообщение.
+    support::notifications::quiet_settings(&db.pool, household.owner_id, false).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = bot.now.with_timezone(&moscow).date_naive();
+    let morning = local_utc(moscow, day, 8, 0);
+    let due = local_utc(moscow, day, 9, 0);
+    let first = create_task(&db.pool, &household, "Первая", due, None).await;
+    let second = create_task(&db.pool, &household, "Вторая", due, None).await;
+    support::notifications::deferred_reminder(&db.pool, &household, first.id, due, morning).await;
+    support::notifications::deferred_reminder(&db.pool, &household, second.id, due, morning).await;
+
+    tick_and_deliver(&mut bot, &db.pool, morning).await;
+    let (message_id, html) = bot.latest();
+    assert!(html.contains("Первая") && html.contains("Вторая"), "{html}");
+    // «✓ Выполнено» в блоке сводного: реальное событие выполнения для отметки.
+    bot.press_data(&button_of(&html, "Выполнено"), message_id)
+        .await;
+    let event_id = latest_completion_event(&db.pool, first.id)
+        .await
+        .expect("completion event");
+
+    // Прямые вызовы функций закрытия по сообщению сводного: ни одна доставка
+    // не блокируется и не отмечается.
+    let mut conn = db.pool.acquire().await.expect("conn");
+    assert_eq!(
+        notifications::lock_message_deliveries(&mut conn, bot.chat, message_id)
+            .await
+            .expect("lock"),
+        0
+    );
+    assert_eq!(
+        notifications::mark_closed_completed(&mut conn, bot.chat, message_id, event_id, bot.now)
+            .await
+            .expect("mark"),
+        0
+    );
+    assert_eq!(
+        notifications::clear_closed(&mut conn, bot.chat, message_id)
+            .await
+            .expect("clear"),
+        0
+    );
+    drop(conn);
+
+    let rows = notice_closed_rows(&db.pool, bot.chat, message_id).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    for row in &rows {
+        assert_eq!(
+            *row,
+            (None, None, None),
+            "batch delivery must stay open: {rows:?}"
+        );
+    }
+}
+
+/// «✓ Выполнено» в напоминании о повторяющейся задаче, изменённой из карточки
+/// (срок перенесён, версия устарела), не закрывает доставку: прошлое выполнение
+/// осталось, но `latest_for_item` вернул бы старое событие, а задача открыта.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_on_a_changed_recurring_task_keeps_the_delivery_open() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let at = next_moscow_time(&bot, 9, 0);
+    bot.freeze_at(at);
+    let item = create_task(
+        &db.pool,
+        &household,
+        "Ежедневная зарядка",
+        at + Duration::minutes(15),
+        Some(support::recurrence(RecurrenceFreq::Daily, Vec::new())),
+    )
+    .await;
+
+    tick_and_deliver(&mut bot, &db.pool, at).await;
+    let (message_id, html) = bot.latest();
+    let done = button_of(&html, "Выполнено");
+
+    // Прошлое выполнение из карточки: задача перешла на завтра, событие
+    // осталось действующим — latest_for_item вернул бы именно его.
+    let mut conn = db.pool.acquire().await.expect("conn");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        item.id,
+        None,
+        "Europe/Moscow",
+        bot.now,
+    )
+    .await
+    .expect("past completion");
+    drop(conn);
+    let old_event = latest_completion_event(&db.pool, item.id)
+        .await
+        .expect("old completion event");
+
+    // Задачу изменили из карточки: перенесли срок, версия в напоминании устарела.
+    sqlx::query("UPDATE items SET due_at = $2, version = version + 1 WHERE id = $1")
+        .bind(item.id)
+        .bind(at + Duration::hours(2))
+        .execute(&db.pool)
+        .await
+        .expect("move due");
+
+    bot.press_data(&done, message_id).await;
+    assert_eq!(last_toast(&bot).as_deref(), Some("Задача уже изменилась"));
+    // Новое выполнение не записано, старое событие по-прежнему последнее.
+    assert_eq!(completed_events(&db.pool, item.id).await, 1);
+    assert_eq!(
+        latest_completion_event(&db.pool, item.id).await,
+        Some(old_event)
+    );
+    // Поля закрытия доставки пусты: сообщение не закрывали.
+    let rows = notice_closed_rows(&db.pool, bot.chat, message_id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0], (None, None, None), "{rows:?}");
+    // Сообщение снова показывает напоминание, а не «✅ Выполнено».
+    let (_, redrawn) = bot.latest();
+    assert!(!redrawn.contains("✅ Выполнено"), "{redrawn}");
+    assert!(redrawn.contains("Отложить на час"), "{redrawn}");
 }

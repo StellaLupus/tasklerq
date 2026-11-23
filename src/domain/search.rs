@@ -29,6 +29,10 @@ pub struct SearchFilters {
     pub list_id: Option<Uuid>,
     /// Исполнитель.
     pub assignee_user_id: Option<Uuid>,
+    /// «Мои задачи» участника: назначенные ему и общие (без исполнителя),
+    /// только в списках вида `tasks`. Не меняет буквальный фильтр
+    /// `assignee_user_id`.
+    pub mine_for: Option<Uuid>,
     /// Тег.
     pub tag: Option<String>,
     /// Начало диапазона сроков.
@@ -49,6 +53,7 @@ impl Default for SearchFilters {
             all_status: false,
             list_id: None,
             assignee_user_id: None,
+            mine_for: None,
             tag: None,
             due_from: None,
             due_to: None,

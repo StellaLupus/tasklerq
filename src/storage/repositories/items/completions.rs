@@ -227,6 +227,62 @@ pub async fn recent_for_item(
         .collect())
 }
 
+/// Действующие выполнения элемента, созданные строго после `since`, с поздних.
+///
+/// Правило отбора — [`COMPLETION_SELECTION`]. Шаг синхронизации отправленных
+/// уведомлений (0018, решение 4) ищет выполнение, созданное после постановки
+/// доставки в outbox, поэтому граница передаётся снаружи.
+pub async fn since_for_item(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    item_id: Uuid,
+    since: DateTime<Utc>,
+) -> Result<Vec<Completion>, DomainError> {
+    let sql = format!(
+        "SELECT e.id, e.item_id, e.actor_user_id, e.created_at, e.payload,
+                i.list_id AS current_list_id
+         FROM item_events e
+         JOIN items i ON i.id = e.item_id AND i.household_id = e.household_id
+         WHERE {COMPLETION_SELECTION}
+           AND e.item_id = $2
+           AND e.created_at > $3
+         ORDER BY e.created_at DESC, e.id DESC"
+    );
+    let rows = sqlx::query_as::<_, CompletionRow>(&sql)
+        .bind(household_id)
+        .bind(item_id)
+        .bind(since)
+        .fetch_all(conn)
+        .await?;
+    Ok(rows.into_iter().map(Completion::from).collect())
+}
+
+/// Действующее выполнение по id события, если оно ещё не отменено и не снято.
+///
+/// Отбор — [`COMPLETION_SELECTION`]. Шаг синхронизации (0018, решение 4)
+/// проверяет, живо ли выполнение, по которому уведомление закрыто: `None` —
+/// причина закрытия исчезла (отмена или `reopened`), уведомление возвращается.
+pub async fn active_for_event(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    event_id: Uuid,
+) -> Result<Option<Completion>, DomainError> {
+    let sql = format!(
+        "SELECT e.id, e.item_id, e.actor_user_id, e.created_at, e.payload,
+                i.list_id AS current_list_id
+         FROM item_events e
+         JOIN items i ON i.id = e.item_id AND i.household_id = e.household_id
+         WHERE {COMPLETION_SELECTION}
+           AND e.id = $2"
+    );
+    let row = sqlx::query_as::<_, CompletionRow>(&sql)
+        .bind(household_id)
+        .bind(event_id)
+        .fetch_optional(conn)
+        .await?;
+    Ok(row.map(Completion::from))
+}
+
 /// Последнее неотменённое выполнение элемента вместе со снимком события.
 ///
 /// Нужно возврату выполнения: проверить, что оно последнее, и восстановить

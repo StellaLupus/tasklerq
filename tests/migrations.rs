@@ -2369,3 +2369,158 @@ async fn notice_cleanup_migration_keeps_existing_deliveries_undismissed() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// 0026 применяется поверх базы с данными до 0025: уже отправленное
+/// уведомление считается незакрытым; причина закрытия ограничена CHECK,
+/// удаление события выполнения обнуляет ссылку, не трогая доставку.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notice_closed_migration_keeps_existing_deliveries_unclosed() {
+    let db = support::empty_db().await;
+    let dir = std::env::temp_dir().join(format!(
+        "tasklerq-migrations-0025-closed-{}",
+        Uuid::now_v7().simple()
+    ));
+    std::fs::create_dir_all(&dir).expect("temporary migration directory");
+    copy_migrations_through(25, &dir);
+
+    let before = Migrator::new(dir.as_path())
+        .await
+        .expect("a migrator through 0025 should resolve");
+    before
+        .run(&db.pool)
+        .await
+        .context("migrations through 0025 should apply")
+        .expect("migrations through 0025");
+
+    let (household_id, owner_id, tasks_list_id) = create_household_before_events(&db.pool).await;
+    let item_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO items (
+             id, household_id, list_id, title, status, priority, source, position, version
+         )
+         VALUES ($1, $2, $3, 'Задача с уведомлением', 'open', 'normal', 'api', 0, 1)",
+    )
+    .bind(item_id)
+    .bind(household_id)
+    .bind(tasks_list_id)
+    .execute(&db.pool)
+    .await
+    .expect("item before 0026");
+    let sent_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO notification_deliveries (
+             id, household_id, user_id, item_id, occurrence_key, kind,
+             status, scheduled_at, created_at, updated_at
+         )
+         VALUES ($1, $2, $3, $4, '2026-11-20T09:00:00+00:00', 'reminder',
+                 'sent', now(), now(), now())",
+    )
+    .bind(sent_id)
+    .bind(household_id)
+    .bind(owner_id)
+    .bind(item_id)
+    .execute(&db.pool)
+    .await
+    .expect("sent reminder before the migration");
+
+    MIGRATOR
+        .run(&db.pool)
+        .await
+        .expect("0026 must apply over existing deliveries");
+
+    let row: (Option<String>, Option<String>, Option<Uuid>) = sqlx::query_as(
+        "SELECT closed_at::text, closed_reason, closed_by_event
+         FROM notification_deliveries
+         WHERE id = $1",
+    )
+    .bind(sent_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("delivery after the migration");
+    assert_eq!(
+        row,
+        (None, None, None),
+        "a notification sent before the migration must stay unclosed"
+    );
+
+    let index: Option<String> = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes
+         WHERE schemaname = 'public' AND tablename = 'notification_deliveries'
+           AND indexname = 'notification_deliveries_sent_idx'",
+    )
+    .fetch_optional(&db.pool)
+    .await
+    .expect("sent index lookup");
+    let index = index.expect("0026 must create the partial index for the sync step");
+    assert!(
+        index.contains("(updated_at)") && index.contains("status = 'sent'"),
+        "the index must cover updated_at of sent deliveries only: {index}"
+    );
+
+    let unknown_reason =
+        sqlx::query("UPDATE notification_deliveries SET closed_reason = 'other' WHERE id = $1")
+            .bind(sent_id)
+            .execute(&db.pool)
+            .await;
+    assert_check_violation(&unknown_reason, "notification_deliveries_closed_reason");
+
+    for reason in ["completed", "assigned"] {
+        sqlx::query(
+            "UPDATE notification_deliveries
+             SET closed_at = now(), closed_reason = $2
+             WHERE id = $1",
+        )
+        .bind(sent_id)
+        .bind(reason)
+        .execute(&db.pool)
+        .await
+        .unwrap_or_else(|error| panic!("closed_reason = '{reason}' must be accepted: {error}"));
+    }
+
+    let event_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO item_events (
+             id, household_id, item_id, actor_user_id, actor_type, event_type
+         )
+         VALUES ($1, $2, $3, $4, 'user', 'completed')",
+    )
+    .bind(event_id)
+    .bind(household_id)
+    .bind(item_id)
+    .bind(owner_id)
+    .execute(&db.pool)
+    .await
+    .expect("completion event");
+    sqlx::query(
+        "UPDATE notification_deliveries
+         SET closed_at = now(), closed_reason = 'completed', closed_by_event = $2
+         WHERE id = $1",
+    )
+    .bind(sent_id)
+    .bind(event_id)
+    .execute(&db.pool)
+    .await
+    .expect("closing the delivery by a completion event");
+
+    sqlx::query("DELETE FROM item_events WHERE id = $1")
+        .bind(event_id)
+        .execute(&db.pool)
+        .await
+        .expect("completion event deletion");
+    let row: (String, Option<Uuid>) = sqlx::query_as(
+        "SELECT closed_reason, closed_by_event
+         FROM notification_deliveries
+         WHERE id = $1",
+    )
+    .bind(sent_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("the delivery must survive the event deletion");
+    assert_eq!(
+        row,
+        ("completed".to_owned(), None),
+        "the event deletion clears only the reference, the delivery stays closed"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
