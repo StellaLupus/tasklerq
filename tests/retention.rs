@@ -714,6 +714,112 @@ async fn retention_purges_an_outbox_message_referenced_by_a_delivery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_keeps_outbox_rows_younger_than_48_hours_with_one_day_retention() {
+    let db = support::isolated_db().await;
+    let now = Utc::now();
+    let tag = Uuid::now_v7().to_string();
+    let config = RetentionConfig {
+        outbox_days: 1,
+        ..config()
+    };
+
+    // Окно замены прежней сводки — 47 часов (design 0017, решение 6):
+    // строка outbox моложе 48 часов остаётся даже при сроке в одни сутки.
+    let mut seqs = Vec::new();
+    for age_hours in [30, 50] {
+        let sent_at = now - Duration::hours(age_hours);
+        let seq: i64 = sqlx::query_scalar(
+            "INSERT INTO outbox (
+                 chat_id, kind, payload, status, created_at, sent_at, message_id, dedupe_key
+             )
+             VALUES (1, 'message', '{}'::jsonb, 'sent', $1, $1, $2, $3)
+             RETURNING seq",
+        )
+        .bind(sent_at)
+        .bind(age_hours)
+        .bind(format!("{tag}:{age_hours}"))
+        .fetch_one(&db.pool)
+        .await
+        .expect("outbox message");
+        seqs.push(seq);
+    }
+
+    retention::run(&db.pool, &config, now)
+        .await
+        .expect("retention");
+
+    let recent_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM outbox WHERE seq = $1)")
+            .bind(seqs[0])
+            .fetch_one(&db.pool)
+            .await
+            .expect("recent outbox");
+    assert!(
+        recent_exists,
+        "a sent outbox row 30 hours old must survive the 48-hour floor"
+    );
+    let old_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM outbox WHERE seq = $1)")
+            .bind(seqs[1])
+            .fetch_one(&db.pool)
+            .await
+            .expect("old outbox");
+    assert!(!old_exists, "a sent outbox row 50 hours old must be purged");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_keeps_finished_deliveries_younger_than_48_hours_with_one_day_retention() {
+    let db = support::isolated_db().await;
+    let household = support::create_household(&db.pool).await;
+    let now = Utc::now();
+    let config = RetentionConfig {
+        outbox_days: 1,
+        ..config()
+    };
+
+    // Нижняя граница 48 часов — у общей отсечки outbox, поэтому она действует
+    // и на завершённые доставки: `sent` возрастом 30 часов остаётся,
+    // 50 часов — удаляется.
+    let recent = insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        "recent-sent",
+        "sent",
+        now - Duration::hours(30),
+        false,
+        None,
+    )
+    .await;
+    insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        "old-sent",
+        "sent",
+        now - Duration::hours(50),
+        false,
+        None,
+    )
+    .await;
+
+    let stats = retention::run(&db.pool, &config, now)
+        .await
+        .expect("retention");
+    assert_eq!(stats.purged_notification_deliveries, 1);
+
+    let left: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM notification_deliveries ORDER BY id")
+        .fetch_all(&db.pool)
+        .await
+        .expect("deliveries");
+    assert_eq!(
+        left,
+        vec![recent],
+        "only the 50-hour-old delivery is purged"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retention_worker_skips_the_run_when_the_advisory_lock_is_held() {
     let db = support::isolated_db().await;
     let household = support::create_household(&db.pool).await;

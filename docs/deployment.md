@@ -367,7 +367,7 @@ curl -sS -X POST \
 | `RETENTION_LLM_RUNS_DAYS` | нет | `90` | Метаданные LLM. |
 | `RETENTION_EVENTS_DAYS` | нет | `365` | События задач. |
 | `RETENTION_DELETED_DAYS` | нет | `30` | Мягко удалённые данные. |
-| `RETENTION_OUTBOX_DAYS` | нет | `30` | Завершённый outbox (`sent`, `skipped`, `dead`) и завершённые записи `notification_deliveries` (`sent`, `cancelled`); `pending` не удаляются. |
+| `RETENTION_OUTBOX_DAYS` | нет | `30` | Завершённый outbox (`sent`, `skipped`, `dead`) и завершённые записи `notification_deliveries` (`sent`, `cancelled`); `pending` не удаляются. Строки outbox и завершённые записи доставок хранятся не меньше 48 часов при любом значении. |
 | `RETENTION_AUDIT_DAYS` | нет | `365` | События членства и безопасности, а также использованные, отозванные и истёкшие приглашения. Не меньше 90: столько дней показывает «Журнал». |
 | `RUST_LOG` | нет | `info,tasklerq=debug` | Логи. |
 | `TZ` | нет | `UTC` | Сервисом не читается. В образе `debian:bookworm-slim` нет `tzdata`, поэтому переменная не меняет ни журналы, ни расчёты: JSON-логи всегда пишутся в UTC, а часовой пояс household задаётся IANA-именем (`households.timezone`, `chrono-tz`) и от `TZ` не зависит. |
@@ -1626,8 +1626,8 @@ Alertmanager доставляет срабатывание администра�
 | `llm_runs` | 90 дней | `RETENTION_LLM_RUNS_DAYS` |
 | `item_events` | 365 дней | `RETENTION_EVENTS_DAYS` |
 | soft-deleted items | 30 дней | `RETENTION_DELETED_DAYS` |
-| outbox: отправленные, пропущенные и `dead` (текст затирается при отправке, пропуске и переводе в `dead`) | 30 дней | `RETENTION_OUTBOX_DAYS` |
-| `notification_deliveries` завершённые: `sent` и `cancelled`; `pending`, в том числе отложенные тихими часами, не удаляются никогда | 30 дней | `RETENTION_OUTBOX_DAYS` |
+| outbox: отправленные, пропущенные и `dead` (текст затирается при отправке, пропуске и переводе в `dead`) | 30 дней (не меньше 48 часов при любом значении) | `RETENTION_OUTBOX_DAYS` |
+| `notification_deliveries` завершённые: `sent` и `cancelled`; `pending`, в том числе отложенные тихими часами, не удаляются никогда | 30 дней (не меньше 48 часов при любом значении) | `RETENTION_OUTBOX_DAYS` |
 | `audit_events`, использованные и истёкшие `invites` | 365 дней (не меньше 90) | `RETENTION_AUDIT_DAYS` |
 | `admin_one_time_codes`: использованные и истёкшие (действующий код и неиспользованный setup-код без срока остаются) | 7 дней | — |
 | `admin_sessions` старше абсолютного срока сессии | 30 дней | — |

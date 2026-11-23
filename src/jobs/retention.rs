@@ -24,6 +24,16 @@ pub const RUN_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 /// задаёт не таймер, а создание учётной записи.
 const ADMIN_CODE_RETENTION_DAYS: i64 = 7;
 
+/// Нижняя граница хранения завершённого outbox: 48 часов при любом
+/// `RETENTION_OUTBOX_DAYS`.
+///
+/// Новая сводка убирает прежнюю, отправленную не раньше 47 часов назад
+/// (design 0017, решение 6), и ищет её по записи доставки и её строке outbox:
+/// без строки outbox сводка не найдётся, а запись доставки без строки outbox
+/// бесполезна. Поэтому общая отсечка outbox, завершённых доставок и батчей
+/// берётся не позже `now - 48 часов`.
+const OUTBOX_MIN_RETENTION_HOURS: i64 = 48;
+
 /// Фиксированный ключ advisory-блокировки retention.
 ///
 /// Ключ общий для всех экземпляров сервиса: пока один чистит базу, второй
@@ -131,7 +141,11 @@ async fn run_in_tx(
     let drafts_cutoff = now - Duration::days(i64::from(config.drafts_days));
     let audit_cutoff = now - Duration::days(i64::from(config.audit_days));
     let updates_cutoff = now - Duration::days(i64::from(config.updates_days));
-    let outbox_cutoff = now - Duration::days(i64::from(config.outbox_days));
+    // Отсечка outbox — более ранняя из настроенного срока и нижней границы
+    // в 48 часов (`OUTBOX_MIN_RETENTION_HOURS`): общая для строк outbox,
+    // завершённых доставок и батчей.
+    let outbox_cutoff = (now - Duration::days(i64::from(config.outbox_days)))
+        .min(now - Duration::hours(OUTBOX_MIN_RETENTION_HOURS));
 
     let expired_drafts = sqlx::query(
         "UPDATE capture_drafts
@@ -223,7 +237,8 @@ async fn run_in_tx(
     let purged_callback_tokens = crate::telegram::callbacks::purge_expired(&mut *conn, now).await?;
     let purged_outbox = crate::telegram::outbox::purge(&mut *conn, outbox_cutoff).await?;
 
-    // Завершённые доставки старше срока outbox. `pending` не трогаем никогда:
+    // Завершённые доставки старше отсечки outbox (настроенный срок, но не
+    // меньше 48 часов). `pending` не трогаем никогда:
     // запись может ждать тихих часов или ещё не наступившего вхождения.
     //
     // Доставки батча, который ещё жив (его `updated_at` обновило листание или
@@ -235,14 +250,17 @@ async fn run_in_tx(
     // Для дедупликации безопасно: вхождение остаётся в таблице, пока его ещё
     // можно перепланировать, — timed до срока, вседневное и сводка до конца
     // локального дня; назначение и snooze вставляются однократно. Поэтому
-    // `sent`/`cancelled` старше `RETENTION_OUTBOX_DAYS` уже не участвуют в
+    // `sent`/`cancelled` старше отсечки outbox уже не участвуют в
     // проверке уникальности.
     //
-    // Инвариант: `RETENTION_OUTBOX_DAYS` >= 1 (минимум в `config/mod.rs`), а
-    // `MAX_LEAD_MINUTES` = 1440 (`domain/settings.rs`) — напоминание о timed-сроке
-    // не создаётся раньше чем за сутки до него. Если изменить любое из этих
-    // значений, пересмотреть очистку: строка `sent`/`cancelled` должна
-    // пережить окно, в котором её вхождение ещё может быть перепланировано.
+    // Инвариант: отсечка outbox — более ранняя из `now - RETENTION_OUTBOX_DAYS`
+    // и `now - OUTBOX_MIN_RETENTION_HOURS` (48 часов — окно замены прежней
+    // сводки 47 часов, design 0017, решение 6). `RETENTION_OUTBOX_DAYS` >= 1
+    // (минимум в `config/mod.rs`), а `MAX_LEAD_MINUTES` = 1440
+    // (`domain/settings.rs`) — напоминание о timed-сроке не создаётся раньше
+    // чем за сутки до него. Если изменить любое из этих значений, пересмотреть
+    // очистку: строка `sent`/`cancelled` должна пережить окно, в котором её
+    // вхождение ещё может быть перепланировано.
     let purged_notification_deliveries = delete_before(
         &mut *conn,
         "DELETE FROM notification_deliveries d
