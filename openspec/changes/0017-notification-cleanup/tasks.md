@@ -73,7 +73,7 @@
 
 ## 4. Замена: «😴 Напомню …» и прежняя сводка
 
-- [ ] 4.1 `Outgoing::Message { …, replaces }` (в payload, у старых строк
+- [x] 4.1 `Outgoing::Message { …, replaces }` (в payload, у старых строк
   пусто): в транзакции отметки `sent` — `cleanup`-удаление каждого id с ключом
   `replace:{chat}:{id}`. Проверить в `tests/telegram_outbox.rs`: удаление
   ставится только после доставки; новое сообщение в `dead` — удаления нет;

@@ -138,6 +138,7 @@ pub(crate) async fn confirm(
             rich: false,
             delete_after: None,
             disable_preview: false,
+            replaces: Vec::new(),
         },
         None,
         now,

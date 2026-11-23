@@ -324,6 +324,7 @@ async fn repeated_processing_after_success_keeps_one_message_and_the_same_id() {
             rich: true,
             delete_after: None,
             disable_preview: false,
+            replaces: Vec::new(),
         },
         Some(&key),
         rig.now,

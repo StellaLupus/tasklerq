@@ -171,6 +171,7 @@ impl Rig {
                 rich: true,
                 delete_after: None,
                 disable_preview: false,
+                replaces: Vec::new(),
             },
             key,
             self.now,
@@ -194,6 +195,33 @@ impl Rig {
                 rich: true,
                 delete_after: Some(delete_after),
                 disable_preview: false,
+                replaces: Vec::new(),
+            },
+            key,
+            self.now,
+        )
+        .await
+        .expect("enqueue")
+    }
+
+    /// Сообщение, заменяющее прежние (0017, решение 5): после доставки
+    /// ставит cleanup-удаления id из `replaces`.
+    async fn message_replacing(
+        &self,
+        html: &str,
+        replaces: Vec<i64>,
+        key: Option<&str>,
+    ) -> Option<i64> {
+        let mut conn = self.pool.acquire().await.expect("conn");
+        outbox::enqueue(
+            &mut conn,
+            self.chat,
+            &Outgoing::Message {
+                html: html.into(),
+                rich: true,
+                delete_after: None,
+                disable_preview: false,
+                replaces,
             },
             key,
             self.now,
@@ -1475,6 +1503,192 @@ async fn failed_delivery_does_not_schedule_deletion() {
         rig.delete_rows().await.is_empty(),
         "an undelivered message has no id to delete"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivered_message_deletes_the_replaced_messages_after_delivery() {
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    let seq = rig
+        .message_replacing("<p>новое напоминание</p>", vec![71, 72], None)
+        .await
+        .expect("seq");
+
+    // До доставки нового сообщения удалений прежних нет.
+    assert!(rig.delete_rows().await.is_empty());
+
+    assert_eq!(rig.pass().await, 1);
+    assert_eq!(rig.row(seq).await.0, "sent");
+
+    let deletes = rig.delete_rows().await;
+    assert_eq!(deletes.len(), 2, "{deletes:?}");
+    for (id, (delete_seq, payload, _, key)) in [71, 72].into_iter().zip(deletes) {
+        assert_eq!(key, Some(outbox::replace_key(rig.chat, id)));
+        let payload: serde_json::Value = serde_json::from_str(&payload).expect("payload");
+        assert_eq!(payload["message_id"], id);
+        assert_eq!(payload["cleanup"], true);
+        assert_eq!(rig.row(delete_seq).await.0, "pending");
+    }
+
+    // Следующие проходы доставляют оба удаления: за проход воркер берёт
+    // только голову очереди чата.
+    rig.fake.clear_calls();
+    assert_eq!(rig.pass_after(SECOND).await, 1);
+    assert_eq!(rig.pass_after(SECOND).await, 1);
+    assert_eq!(
+        rig.fake.calls(),
+        vec![
+            Call::Delete {
+                chat: rig.chat,
+                id: 71
+            },
+            Call::Delete {
+                chat: rig.chat,
+                id: 72
+            },
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dead_replacement_does_not_delete_the_previous_message() {
+    let _dead = DEAD_METRIC.lock().await;
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    let seq = rig
+        .message_replacing("<p>новое</p>", vec![71], None)
+        .await
+        .expect("seq");
+    rig.fake
+        .fail_next(TelegramError::Forbidden("blocked".into()));
+
+    assert_eq!(rig.pass().await, 0);
+
+    assert_eq!(rig.row(seq).await.0, "dead");
+    assert!(
+        rig.delete_rows().await.is_empty(),
+        "an undelivered replacement must not delete the previous message"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacement_delete_is_scheduled_once_after_a_retry() {
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    let seq = rig
+        .message_replacing("<p>новое</p>", vec![71], None)
+        .await
+        .expect("seq");
+    rig.fake.fail_next(TelegramError::Transient("503".into()));
+
+    assert_eq!(rig.pass().await, 0);
+    assert!(rig.delete_rows().await.is_empty());
+
+    assert_eq!(rig.pass_after(SECOND * 2).await, 1);
+    assert_eq!(rig.row(seq).await.0, "sent");
+    let deletes = rig.delete_rows().await;
+    assert_eq!(deletes.len(), 1, "{deletes:?}");
+    assert_eq!(deletes[0].3, Some(outbox::replace_key(rig.chat, 71)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replace_delete_key_is_not_duplicated() {
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    // Заранее поставленная строка с тем же ключом (например, отмена snooze).
+    let key = outbox::replace_key(rig.chat, 71);
+    let run_at = rig.now + Duration::hours(1);
+    let mut conn = rig.pool.acquire().await.expect("conn");
+    let existing = outbox::enqueue_at(
+        &mut conn,
+        rig.chat,
+        &Outgoing::Delete {
+            message_id: 71,
+            cleanup: true,
+        },
+        Some(&key),
+        rig.now,
+        run_at,
+    )
+    .await
+    .expect("enqueue")
+    .expect("seq");
+    drop(conn);
+
+    rig.message_replacing("<p>первое</p>", vec![71], None)
+        .await
+        .expect("seq");
+    assert_eq!(rig.pass().await, 1);
+    // Второе сообщение с тем же id замены.
+    rig.message_replacing("<p>второе</p>", vec![71], None)
+        .await
+        .expect("seq");
+    assert_eq!(rig.pass_after(SECOND).await, 1);
+
+    let rows: Vec<(i64, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT seq, next_attempt_at FROM outbox
+         WHERE chat_id = $1 AND kind = 'delete' AND dedupe_key = $2",
+    )
+    .bind(rig.chat)
+    .bind(&key)
+    .fetch_all(&db.pool)
+    .await
+    .expect("rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "a repeated replacement must not add a second delete"
+    );
+    assert_eq!(rows[0].0, existing);
+    assert_eq!(
+        (rows[0].1 - run_at).num_milliseconds().abs(),
+        0,
+        "the pre-existing row keeps its schedule"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn message_rows_without_replaces_never_schedule_deletion() {
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+
+    // Старая строка, вставленная SQL-ом без поля `replaces`.
+    let legacy = rig
+        .raw_message(serde_json::json!({"html": "<p>старое</p>", "rich": true}))
+        .await;
+    let plain = rig.message("<p>обычное</p>", None).await.expect("seq");
+    assert!(
+        !rig.payload_text(plain).await.contains("replaces"),
+        "an empty replaces must not be written to the payload"
+    );
+
+    assert_eq!(rig.pass().await, 1);
+    assert_eq!(rig.pass_after(SECOND).await, 1);
+
+    assert_eq!(rig.row(legacy).await.0, "sent");
+    assert_eq!(rig.row(plain).await.0, "sent");
+    assert!(
+        rig.delete_rows().await.is_empty(),
+        "a message without replaces must not schedule a delete"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacement_skips_the_id_of_the_new_message_itself() {
+    let db = db().await;
+    let mut rig = Rig::new(&db.pool);
+    // Первая же отправка подделки получает id 1.
+    let seq = rig
+        .message_replacing("<p>новое</p>", vec![1, 71], None)
+        .await
+        .expect("seq");
+
+    assert_eq!(rig.pass().await, 1);
+    assert_eq!(rig.row(seq).await.3, Some(1));
+
+    let deletes = rig.delete_rows().await;
+    assert_eq!(deletes.len(), 1, "{deletes:?}");
+    assert_eq!(deletes[0].3, Some(outbox::replace_key(rig.chat, 71)));
 }
 
 /// Дождаться, пока соединение встанет в ожидание блокировки.

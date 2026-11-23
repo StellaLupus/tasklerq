@@ -444,6 +444,7 @@ pub(crate) async fn enqueue_message(
         rich,
         delete_after: None,
         disable_preview: false,
+        replaces: Vec::new(),
     };
     match outbox::enqueue(conn, chat_id, &outgoing, Some(dedupe_key), now).await? {
         Some(seq) => Ok(seq),

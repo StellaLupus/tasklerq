@@ -892,6 +892,7 @@ async fn enqueue_secret_message(
             rich: true,
             delete_after: Some(SECRET_MESSAGE_TTL),
             disable_preview: false,
+            replaces: Vec::new(),
         },
         None,
         ctx.now,

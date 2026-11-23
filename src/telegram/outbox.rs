@@ -116,6 +116,11 @@ pub enum Outgoing {
         ///
         /// `false` — обычное поведение; так читаются старые строки без поля.
         disable_preview: bool,
+        /// Id прежних сообщений этого чата, которые удаляются после доставки
+        /// нового (0017, решение 5).
+        ///
+        /// Пустой вектор — без замены; так читаются старые строки без поля.
+        replaces: Vec<i64>,
     },
     /// Редактирование конкретного сообщения (например, уведомления).
     Edit {
@@ -168,6 +173,7 @@ impl Outgoing {
                 rich,
                 delete_after,
                 disable_preview,
+                replaces,
             } => {
                 let mut payload = json!({"html": html, "rich": rich});
                 if let Some(seconds) = delete_after {
@@ -175,6 +181,9 @@ impl Outgoing {
                 }
                 if *disable_preview {
                     payload["disable_preview"] = json!(true);
+                }
+                if !replaces.is_empty() {
+                    payload["replaces"] = json!(replaces);
                 }
                 payload
             }
@@ -217,6 +226,16 @@ impl Outgoing {
                     .get("disable_preview")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                // Отсутствующее поле — «без замены»: старые строки и все
+                // обычные сообщения. Испорченное значение не подменяется
+                // пустым списком: строка уходит в `invalid_payload`, как
+                // испорченный `delete_after`, — поле велит удалить прежние
+                // сообщения, и молча потерянный список оставил бы их в чате
+                // без сигнала о поломке.
+                replaces: match payload.get("replaces") {
+                    None => Vec::new(),
+                    Some(value) => serde_json::from_value(value.clone()).ok()?,
+                },
             }),
             "edit" => Some(Self::Edit {
                 message_id: payload.get("message_id")?.as_i64()?,
@@ -385,6 +404,15 @@ pub fn notice_expire_key(chat_id: i64, message_id: i64, now: DateTime<Utc>) -> S
         notice_expire_prefix(chat_id, message_id),
         now.timestamp_millis()
     )
+}
+
+/// Ключ удаления прежнего сообщения при замене (0017, решение 5).
+///
+/// Детерминированный ключ делает постановку идемпотентной для всех путей
+/// (доставка, отмена, сводное): повторная постановка того же id не создаёт
+/// вторую строку.
+pub fn replace_key(chat_id: i64, message_id: i64) -> String {
+    format!("replace:{chat_id}:{message_id}")
 }
 
 /// Отменить отложенные удаления уборки сообщения (0017, решение 4).
@@ -759,6 +787,32 @@ impl OutboxWorker {
                         now + Duration::seconds(i64::from(*seconds)),
                     )
                     .await?;
+                }
+                // Замена (0017, решение 5): прежние сообщения удаляются только
+                // после фактической доставки нового, поэтому строки ставятся
+                // здесь же, в транзакции отметки `sent`. Ушедшее в `dead`
+                // сообщение прежнее не удаляет. Дубликат ключа — не ошибка:
+                // удаление этого id уже поставлено другим путём.
+                if let Outgoing::Message { replaces, .. } = &outgoing {
+                    for id in replaces {
+                        // Новое сообщение не удаляет само себя.
+                        if *id == message_id {
+                            continue;
+                        }
+                        let key = replace_key(row.chat_id, *id);
+                        enqueue_at(
+                            &mut tx,
+                            row.chat_id,
+                            &Outgoing::Delete {
+                                message_id: *id,
+                                cleanup: true,
+                            },
+                            Some(&key),
+                            now,
+                            now,
+                        )
+                        .await?;
+                    }
                 }
                 // Вариант A: носитель уже доставлен, теперь в той же транзакции
                 // запоминаем его id и ставим удаление прежнего. Прежний id
@@ -1136,18 +1190,28 @@ mod tests {
                 rich: true,
                 delete_after: None,
                 disable_preview: false,
+                replaces: Vec::new(),
             },
             Outgoing::Message {
                 html: "b".into(),
                 rich: false,
                 delete_after: Some(3_600),
                 disable_preview: false,
+                replaces: Vec::new(),
             },
             Outgoing::Message {
                 html: "b".into(),
                 rich: false,
                 delete_after: Some(900),
                 disable_preview: true,
+                replaces: Vec::new(),
+            },
+            Outgoing::Message {
+                html: "b".into(),
+                rich: true,
+                delete_after: None,
+                disable_preview: false,
+                replaces: vec![5, 6],
             },
             Outgoing::Edit {
                 message_id: 7,
@@ -1255,6 +1319,7 @@ mod tests {
                 rich: true,
                 delete_after: None,
                 disable_preview: false,
+                replaces: Vec::new(),
             })
         );
     }
@@ -1285,6 +1350,7 @@ mod tests {
             rich: false,
             delete_after: None,
             disable_preview: false,
+            replaces: Vec::new(),
         };
         assert_eq!(plain.payload(), json!({"html": "a", "rich": false}));
 
@@ -1293,6 +1359,7 @@ mod tests {
             rich: false,
             delete_after: Some(3_600),
             disable_preview: false,
+            replaces: Vec::new(),
         };
         assert_eq!(
             expiring.payload(),
@@ -1307,6 +1374,7 @@ mod tests {
             rich: false,
             delete_after: Some(900),
             disable_preview: true,
+            replaces: Vec::new(),
         };
         assert_eq!(
             hidden.payload(),
@@ -1319,6 +1387,7 @@ mod tests {
                 rich: false,
                 delete_after: None,
                 disable_preview: true,
+                replaces: Vec::new(),
             })
         );
         assert_eq!(
@@ -1328,9 +1397,73 @@ mod tests {
                 rich: false,
                 delete_after: None,
                 disable_preview: false,
+                replaces: Vec::new(),
             }),
             "a broken flag must not hide the link nor kill the row"
         );
+    }
+
+    #[test]
+    fn message_row_without_replaces_reads_as_no_replacement() {
+        assert_eq!(
+            Outgoing::from_row("message", &json!({"html": "a", "rich": true})),
+            Some(Outgoing::Message {
+                html: "a".into(),
+                rich: true,
+                delete_after: None,
+                disable_preview: false,
+                replaces: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn message_row_with_invalid_replaces_is_not_parsed() {
+        for replaces in [
+            json!("abc"),
+            json!(5),
+            json!([1, "a"]),
+            json!([1.5]),
+            json!({"a": 1}),
+        ] {
+            assert_eq!(
+                Outgoing::from_row(
+                    "message",
+                    &json!({"html": "a", "rich": true, "replaces": replaces})
+                ),
+                None,
+                "replaces {replaces} must become invalid_payload, not no replacement"
+            );
+        }
+    }
+
+    #[test]
+    fn message_payload_has_replaces_only_when_non_empty() {
+        let plain = Outgoing::Message {
+            html: "a".into(),
+            rich: false,
+            delete_after: None,
+            disable_preview: false,
+            replaces: Vec::new(),
+        };
+        assert_eq!(plain.payload(), json!({"html": "a", "rich": false}));
+
+        let replacing = Outgoing::Message {
+            html: "a".into(),
+            rich: false,
+            delete_after: None,
+            disable_preview: false,
+            replaces: vec![5, 6],
+        };
+        assert_eq!(
+            replacing.payload(),
+            json!({"html": "a", "rich": false, "replaces": [5, 6]})
+        );
+    }
+
+    #[test]
+    fn replace_key_contains_chat_and_message() {
+        assert_eq!(replace_key(-100_123, 42), "replace:-100123:42");
     }
 
     #[test]
