@@ -234,7 +234,12 @@ async fn run_in_tx(
     )
     .await?;
 
-    let purged_callback_tokens = crate::telegram::callbacks::purge_expired(&mut *conn, now).await?;
+    // Токены «🗑 Убрать» (`notice`/`notice_close`) живут до отсечки outbox:
+    // кнопка работает и после истечения токена, пока жива строка outbox
+    // уведомления (design 0017, решение 1). Остальные истёкшие токены
+    // удаляются как раньше.
+    let purged_callback_tokens =
+        crate::telegram::callbacks::purge_expired(&mut *conn, now, outbox_cutoff).await?;
     let purged_outbox = crate::telegram::outbox::purge(&mut *conn, outbox_cutoff).await?;
 
     // Завершённые доставки старше отсечки outbox (настроенный срок, но не

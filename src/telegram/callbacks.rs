@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::auth::secrets::random_base64url;
 use crate::auth::tokens::hash_token;
+use crate::telegram::bot::model::Action;
 
 /// Префикс `callback_data` бота.
 pub const PREFIX: &str = "t:";
@@ -89,8 +90,10 @@ pub enum Consumed {
     Valid(Token),
     /// Токен уже был использован.
     Replayed(Scope),
-    /// Срок действия истёк.
-    Expired(Scope),
+    /// Срок действия истёк; токен не потреблён. Строка токена отдаётся
+    /// владельцу: «🗑 Убрать» выполняется и после истечения (design 0017,
+    /// решение 1).
+    Expired(Token),
     /// Токен выпущен другому пользователю.
     Foreign,
     /// Такого токена нет.
@@ -98,7 +101,15 @@ pub enum Consumed {
 }
 
 type ConsumedRow = (Option<Uuid>, String, String, Value, Option<i32>);
-type TokenStateRow = (i64, Option<DateTime<Utc>>, DateTime<Utc>, String);
+type TokenStateRow = (
+    i64,
+    Option<DateTime<Utc>>,
+    Option<Uuid>,
+    String,
+    String,
+    Value,
+    Option<i32>,
+);
 
 /// Сгенерировать значение `callback_data`.
 pub fn generate() -> String {
@@ -193,7 +204,7 @@ pub async fn consume(
 
     // Не потребили: выясняем причину, не раскрывая содержимое чужого токена.
     let row: Option<TokenStateRow> = sqlx::query_as(
-        "SELECT telegram_user_id, consumed_at, expires_at, scope
+        "SELECT telegram_user_id, consumed_at, household_id, scope, action, payload, version
          FROM callback_tokens WHERE token_hash = $1",
     )
     .bind(&token_hash)
@@ -202,24 +213,42 @@ pub async fn consume(
 
     Ok(match row {
         None => Consumed::Unknown,
-        Some((owner, _, _, _)) if owner != telegram_user_id => Consumed::Foreign,
-        Some((_, Some(_), _, scope)) => Consumed::Replayed(Scope::parse(&scope)),
-        Some((_, None, _, scope)) => Consumed::Expired(Scope::parse(&scope)),
+        Some((owner, ..)) if owner != telegram_user_id => Consumed::Foreign,
+        Some((_, Some(_), _, scope, ..)) => Consumed::Replayed(Scope::parse(&scope)),
+        Some((_, None, household_id, scope, action, payload, version)) => {
+            Consumed::Expired(Token {
+                household_id,
+                scope: Scope::parse(&scope),
+                action,
+                payload,
+                version,
+            })
+        }
     })
 }
 
 /// Удалить токены, истёкшие до `cutoff`.
+///
+/// Токены «🗑 Убрать» (`notice`/`notice_close`) хранятся до отсечки outbox
+/// `outbox_cutoff`: кнопка работает и после истечения, пока жива строка
+/// outbox уведомления (design 0017, решение 1). Остальные истёкшие токены
+/// удаляются как раньше.
 pub async fn purge_expired(
     conn: &mut PgConnection,
     cutoff: DateTime<Utc>,
+    outbox_cutoff: DateTime<Utc>,
 ) -> Result<u64, sqlx::Error> {
-    Ok(
-        sqlx::query("DELETE FROM callback_tokens WHERE expires_at < $1")
-            .bind(cutoff)
-            .execute(conn)
-            .await?
-            .rows_affected(),
+    Ok(sqlx::query(
+        "DELETE FROM callback_tokens
+         WHERE expires_at < $1
+           AND NOT (scope = 'notice' AND action = $2 AND created_at >= $3)",
     )
+    .bind(cutoff)
+    .bind(Action::NoticeClose.name())
+    .bind(outbox_cutoff)
+    .execute(conn)
+    .await?
+    .rows_affected())
 }
 
 #[cfg(test)]

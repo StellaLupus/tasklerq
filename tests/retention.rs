@@ -819,6 +819,81 @@ async fn retention_keeps_finished_deliveries_younger_than_48_hours_with_one_day_
     );
 }
 
+/// Выпустить callback-токен на действие в заданный момент.
+async fn issue_callback_token(
+    pool: &PgPool,
+    scope: tasklerq::telegram::callbacks::Scope,
+    action: &tasklerq::telegram::bot::model::Action,
+    at: DateTime<Utc>,
+) -> String {
+    let mut conn = pool.acquire().await.expect("connection");
+    tasklerq::telegram::callbacks::issue_many(
+        &mut conn,
+        &[tasklerq::telegram::callbacks::NewToken {
+            telegram_user_id: 1,
+            household_id: None,
+            scope,
+            action: action.name(),
+            payload: serde_json::to_value(action).expect("payload"),
+            version: None,
+        }],
+        at,
+    )
+    .await
+    .expect("issue")
+    .remove(0)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_keeps_dismiss_tokens_until_the_outbox_cutoff() {
+    use tasklerq::auth::tokens::hash_token;
+    use tasklerq::telegram::bot::model::Action;
+    use tasklerq::telegram::callbacks::Scope;
+
+    let db = support::isolated_db().await;
+    let now = Utc::now();
+    let config = RetentionConfig {
+        outbox_days: 1,
+        ..config()
+    };
+
+    // «🗑 Убрать» работает, пока жива строка outbox (design 0017, решение 1):
+    // его токен хранится до отсечки outbox (не меньше 48 часов), остальные
+    // истёкшие токены удаляются как раньше.
+    let close = Action::NoticeClose;
+    let recent_dismiss =
+        issue_callback_token(&db.pool, Scope::Notice, &close, now - Duration::hours(30)).await;
+    let old_dismiss =
+        issue_callback_token(&db.pool, Scope::Notice, &close, now - Duration::hours(50)).await;
+    let screen = issue_callback_token(
+        &db.pool,
+        Scope::Screen,
+        &Action::Refresh,
+        now - Duration::hours(30),
+    )
+    .await;
+
+    let stats = retention::run(&db.pool, &config, now)
+        .await
+        .expect("retention");
+    assert_eq!(stats.purged_callback_tokens, 2);
+
+    for (token, remains) in [
+        (&recent_dismiss, true),
+        (&old_dismiss, false),
+        (&screen, false),
+    ] {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM callback_tokens WHERE token_hash = $1)",
+        )
+        .bind(hash_token(token))
+        .fetch_one(&db.pool)
+        .await
+        .expect("token exists");
+        assert_eq!(exists, remains, "token {token} remains={remains}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retention_worker_skips_the_run_when_the_advisory_lock_is_held() {
     let db = support::isolated_db().await;
