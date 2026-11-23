@@ -45,7 +45,7 @@
   без `mark_buried`. Проверить в `tests/telegram_outbox.rs`: правка
   исчезнувшего сообщения с `false` ничего не присылает и не засыпает вид;
   с `true` и для старой строки — прежнее поведение (design, решение 3).
-- [ ] 3.3 `notify::complete` под `FOR UPDATE` записывает `closed_at`,
+- [x] 3.3 `notify::complete` под `FOR UPDATE` записывает `closed_at`,
   `closed_reason = 'completed'` и `closed_by_event` (id из
   `completions::latest_for_item`) у
   доставки своего сообщения, `notify::undo` очищает. Проверить в

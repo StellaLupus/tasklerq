@@ -14,6 +14,7 @@ use crate::domain::error::DomainError;
 use crate::domain::models::{Item, ItemStatus, List, ListKind};
 use crate::domain::recurrence::resolve_local;
 use crate::jobs::keys::snooze_origin;
+use crate::storage::repositories::items::completions;
 use crate::storage::repositories::notifications::{self, NewDelivery, NotificationKind};
 use crate::storage::repositories::{items, lists};
 use crate::telegram::callbacks::Scope;
@@ -390,7 +391,36 @@ async fn show_current(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> Resu
     }
 }
 
+/// Отметить доставки нажатого сообщения закрытыми по последнему действующему
+/// выполнению задачи (0018, решение 4). Если выполнения нет (не должно
+/// случиться), отметка не пишется.
+async fn mark_closed_by_completion(
+    ctx: &mut Ctx<'_>,
+    household_id: Uuid,
+    item_id: Uuid,
+    message_id: i64,
+) -> Result<(), Fail> {
+    let Some(event) = completions::latest_for_item(&mut *ctx.conn, household_id, item_id).await?
+    else {
+        return Ok(());
+    };
+    notifications::mark_closed_completed(
+        &mut *ctx.conn,
+        ctx.chat_id,
+        message_id,
+        event.completion.event_id,
+        ctx.now,
+    )
+    .await?;
+    Ok(())
+}
+
 /// «Выполнено» из уведомления.
+///
+/// Доставки нажатого сообщения блокируются до выполнения и в той же
+/// транзакции отмечаются закрытыми по выполнению (0018, решение 4): шаг
+/// синхронизации не трогает сообщение, которое уже показывает «✅ Выполнено»
+/// (`show_done`).
 pub async fn complete(
     ctx: &mut Ctx<'_>,
     message_id: i64,
@@ -399,6 +429,7 @@ pub async fn complete(
 ) -> Result<(), Fail> {
     let household = ctx.household()?.clone();
     let actor = ctx.actor()?;
+    notifications::lock_message_deliveries(&mut *ctx.conn, ctx.chat_id, message_id).await?;
     let result = items::complete(
         &mut *ctx.conn,
         household.id,
@@ -416,16 +447,23 @@ pub async fn complete(
             } else {
                 None
             };
+            mark_closed_by_completion(ctx, household.id, item_id, message_id).await?;
             ctx.toast(ru::DONE_TOAST);
             show_done(ctx, message_id, &item, item.list_id, next.as_deref()).await
         }
         Err(DomainError::Conflict { .. } | DomainError::NotFound) => {
             // Задачу успели изменить: кнопки обновляются, действие не повторяется.
-            let toast = match load(ctx, item_id).await? {
+            let loaded = load(ctx, item_id).await?;
+            let toast = match &loaded {
                 None => "Задача больше недоступна",
                 Some((item, _)) if item.status == ItemStatus::Done => "Задача уже выполнена",
                 Some(_) => "Задача уже изменилась",
             };
+            if matches!(&loaded, Some((item, _)) if item.status == ItemStatus::Done) {
+                // Сообщение покажет «✅ Выполнено» — закрываем его и здесь,
+                // иначе шаг синхронизации перерисует его второй раз.
+                mark_closed_by_completion(ctx, household.id, item_id, message_id).await?;
+            }
             ctx.toast(toast);
             show_current(ctx, message_id, item_id).await
         }
@@ -438,12 +476,16 @@ pub async fn complete(
 /// При успешной отмене сообщение снова показывает напоминание, поэтому
 /// запланированное автоудаление «✅ Выполнено» отменяется (0017, решение 4):
 /// будущие `pending`-удаления этого сообщения переходят в `skipped`. Неудачная
-/// отмена («Время отмены истекло») удаление не отменяет.
+/// отмена («Время отмены истекло») удаление не отменяет. Отметка закрытия
+/// доставок этого сообщения снимается только при успешной отмене (0018,
+/// решение 4): шаг синхронизации снова может закрыть возвращённое напоминание.
 pub async fn undo(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> Result<(), Fail> {
     let household_id = ctx.household()?.id;
     let actor = ctx.actor()?;
+    notifications::lock_message_deliveries(&mut *ctx.conn, ctx.chat_id, message_id).await?;
     match items::undo_last(&mut *ctx.conn, household_id, &actor, item_id, ctx.now).await {
         Ok(_) => {
+            notifications::clear_closed(&mut *ctx.conn, ctx.chat_id, message_id).await?;
             ctx.toast("Отменено");
             outbox::cancel_scheduled_deletes(&mut *ctx.conn, ctx.chat_id, message_id, ctx.now)
                 .await?;

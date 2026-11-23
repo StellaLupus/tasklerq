@@ -531,6 +531,92 @@ pub async fn mark_dismissed(
     .rows_affected())
 }
 
+/// Заблокировать доставки сообщения уведомления для изменения (`FOR UPDATE`).
+///
+/// Выбираются записи, чья строка outbox доставила это сообщение
+/// (`outbox_seq → outbox` с этими `chat_id` и `message_id` — сопоставление как
+/// у [`mark_dismissed`]). Вызывается до выполнения или отмены задачи из
+/// уведомления: отметка закрытия пишется в той же транзакции, а шаг
+/// синхронизации (0018, решение 4) не перерисовывает сообщение, которое
+/// прямо сейчас закрывают своим нажатием. Блокируются только записи доставки,
+/// не outbox. Возвращает число заблокированных записей.
+pub async fn lock_message_deliveries(
+    conn: &mut PgConnection,
+    chat_id: i64,
+    message_id: i64,
+) -> Result<u64, sqlx::Error> {
+    let rows: Vec<(Uuid,)> = sqlx::query_as(
+        "SELECT d.id
+         FROM notification_deliveries d
+         JOIN outbox o ON o.seq = d.outbox_seq
+         WHERE o.chat_id = $1
+           AND o.message_id = $2
+         FOR UPDATE OF d",
+    )
+    .bind(chat_id)
+    .bind(message_id)
+    .fetch_all(conn)
+    .await?;
+    Ok(rows.len() as u64)
+}
+
+/// Отметить доставки сообщения закрытыми по выполнению (0018, решение 4).
+///
+/// Записывает `closed_at`, `closed_reason = 'completed'` и `closed_by_event` —
+/// id события выполнения из `completions::latest_for_item`. Сообщение уже
+/// показывает «✅ Выполнено» (`show_done`), поэтому шаг синхронизации такие
+/// доставки не трогает. Сопоставление с сообщением — как у [`mark_dismissed`];
+/// возвращается число отмеченных записей.
+pub async fn mark_closed_completed(
+    conn: &mut PgConnection,
+    chat_id: i64,
+    message_id: i64,
+    event_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query(
+        "UPDATE notification_deliveries d
+         SET closed_at = $3, closed_reason = 'completed', closed_by_event = $4
+         FROM outbox o
+         WHERE o.seq = d.outbox_seq
+           AND o.chat_id = $1
+           AND o.message_id = $2",
+    )
+    .bind(chat_id)
+    .bind(message_id)
+    .bind(now)
+    .bind(event_id)
+    .execute(conn)
+    .await?
+    .rows_affected())
+}
+
+/// Снять отметку закрытия с доставок сообщения (0018, решение 4).
+///
+/// Вызывается при успешной отмене выполнения из уведомления: сообщение снова
+/// показывает напоминание, и шаг синхронизации снова может закрыть его, если
+/// задачу выполнят не из него. Все три поля (`closed_at`, `closed_reason`,
+/// `closed_by_event`) очищаются; возвращается число затронутых записей.
+pub async fn clear_closed(
+    conn: &mut PgConnection,
+    chat_id: i64,
+    message_id: i64,
+) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query(
+        "UPDATE notification_deliveries d
+         SET closed_at = NULL, closed_reason = NULL, closed_by_event = NULL
+         FROM outbox o
+         WHERE o.seq = d.outbox_seq
+           AND o.chat_id = $1
+           AND o.message_id = $2",
+    )
+    .bind(chat_id)
+    .bind(message_id)
+    .execute(conn)
+    .await?
+    .rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
