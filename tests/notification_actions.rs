@@ -7,7 +7,7 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use serde_json::json;
 use sqlx::PgPool;
-use support::notifications::{button_of, tick_and_deliver};
+use support::notifications::{button_of, scheduler, tick_and_deliver};
 use support::telegram::{Call, Harness, buttons};
 use support::{TestHousehold, create_item, isolated_db, new_item, next_telegram_id};
 use tasklerq::domain::models::{Actor, Item, RecurrenceFreq, RecurrenceInput, UserRole};
@@ -503,9 +503,11 @@ async fn snooze_one_hour_creates_one_delivery_and_keeps_the_due_date() {
     tick_and_deliver(&mut bot, &db.pool, expected - Duration::minutes(1)).await;
     assert_eq!(message_count(&bot, "Позвонить маме"), 1);
 
-    // В момент snooze приходит новое напоминание с кнопками.
+    // В момент snooze приходит новое напоминание с кнопками, а сообщение
+    // «😴 Напомню …» удаляется: в чате одно сообщение по задаче.
     tick_and_deliver(&mut bot, &db.pool, expected).await;
-    assert_eq!(message_count(&bot, "Позвонить маме"), 2);
+    assert_eq!(message_count(&bot, "Позвонить маме"), 1);
+    assert!(deleted(&bot, message_id));
     let (_, reminder) = bot.latest();
     assert_eq!(buttons(&reminder).len(), 5, "{reminder}");
 }
@@ -611,7 +613,8 @@ async fn snooze_at_night_is_delivered_at_the_end_of_quiet_hours() {
         local_utc(moscow, day + Duration::days(1), 8, 0),
     )
     .await;
-    assert_eq!(message_count(&bot, "Выключить свет"), 2);
+    assert_eq!(message_count(&bot, "Выключить свет"), 1);
+    assert!(deleted(&bot, message_id));
     assert_eq!(buttons(&bot.latest().1).len(), 5);
     assert_eq!(snooze_rows(&db.pool, item.id).await[0].0, "sent");
 }
@@ -649,7 +652,9 @@ async fn disabling_reminders_cancels_a_snoozed_delivery() {
     let rows = snooze_rows(&db.pool, item.id).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].0, "cancelled");
-    assert_eq!(message_count(&bot, "Позвонить маме"), 1);
+    // Отмена snooze удаляет сообщение «😴 Напомню …».
+    assert_eq!(message_count(&bot, "Позвонить маме"), 0);
+    assert!(deleted(&bot, message_id));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -685,7 +690,9 @@ async fn completing_the_task_cancels_the_snoozed_delivery() {
     let rows = snooze_rows(&db.pool, item.id).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].0, "cancelled");
-    assert_eq!(message_count(&bot, "Купить билеты"), 1);
+    // Отмена snooze удаляет сообщение «😴 Напомню …».
+    assert_eq!(message_count(&bot, "Купить билеты"), 0);
+    assert!(deleted(&bot, message_id));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -895,11 +902,13 @@ async fn changed_due_cancels_the_snooze_and_the_new_reminder_fires() {
     let rows = snooze_rows(&db.pool, item.id).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].0, "cancelled", "{rows:?}");
-    assert_eq!(message_count(&bot, "Оплатить интернет"), 1);
+    // Отмена snooze удаляет сообщение «😴 Напомню …».
+    assert_eq!(message_count(&bot, "Оплатить интернет"), 0);
+    assert!(deleted(&bot, message_id));
 
     // Напоминание о новом сроке приходит за 15 минут до него.
     tick_and_deliver(&mut bot, &db.pool, new_due - Duration::minutes(15)).await;
-    assert_eq!(message_count(&bot, "Оплатить интернет"), 2);
+    assert_eq!(message_count(&bot, "Оплатить интернет"), 1);
     assert!(
         bot.latest().1.contains("⏰ Через 15 минут"),
         "{}",
@@ -935,7 +944,9 @@ async fn removed_due_cancels_the_snooze() {
     let rows = snooze_rows(&db.pool, item.id).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].0, "cancelled", "{rows:?}");
-    assert_eq!(message_count(&bot, "Позвонить маме"), 1);
+    // Отмена snooze удаляет сообщение «😴 Напомню …».
+    assert_eq!(message_count(&bot, "Позвонить маме"), 0);
+    assert!(deleted(&bot, message_id));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -986,10 +997,12 @@ async fn completing_a_recurring_task_cancels_the_snooze_of_the_previous_occurren
     let rows = snooze_rows(&db.pool, item.id).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].0, "cancelled", "{rows:?}");
-    assert_eq!(message_count(&bot, "Ежедневная зарядка"), 1);
+    // Отмена snooze удаляет сообщение «😴 Напомню …».
+    assert_eq!(message_count(&bot, "Ежедневная зарядка"), 0);
+    assert!(deleted(&bot, message_id));
 
     tick_and_deliver(&mut bot, &db.pool, next_due - Duration::minutes(15)).await;
-    assert_eq!(message_count(&bot, "Ежедневная зарядка"), 2);
+    assert_eq!(message_count(&bot, "Ежедневная зарядка"), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1073,7 +1086,9 @@ async fn snooze_until_morning_survives_midnight_at_the_same_due() {
     tick_and_deliver(&mut bot, &db.pool, next_morning).await;
     let rows = snooze_rows(&db.pool, item.id).await;
     assert_eq!(rows[0].0, "sent", "{rows:?}");
-    assert_eq!(message_count(&bot, "Выключить свет"), 2);
+    // Новое напоминание заменило сообщение «😴 Напомню …».
+    assert_eq!(message_count(&bot, "Выключить свет"), 1);
+    assert!(deleted(&bot, message_id));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1120,7 +1135,9 @@ async fn snooze_until_morning_survives_midnight_for_an_all_day_task() {
     tick_and_deliver(&mut bot, &db.pool, next_morning).await;
     let rows = snooze_rows(&db.pool, item.id).await;
     assert_eq!(rows[0].0, "sent", "{rows:?}");
-    assert_eq!(message_count(&bot, "Вынести мусор"), 2);
+    // Новое напоминание заменило сообщение «😴 Напомню …».
+    assert_eq!(message_count(&bot, "Вынести мусор"), 1);
+    assert!(deleted(&bot, message_id));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1282,7 +1299,17 @@ async fn repeat_morning_snooze_after_due_change(cancel_before_second: bool) {
     );
     assert_eq!(rows[0].0, "sent", "{rows:?}");
     assert_eq!(rows[0].3.as_deref(), Some(new_origin.as_str()));
-    assert_eq!(message_count(&bot, "Позвонить маме"), before + 1);
+    // Новое напоминание приходит, а сообщение «😴 Напомню …» удаляется.
+    // Если отмена уже удалила его раньше, перерисовки по нажатиям создали
+    // запасные сообщения и счёт растёт на одно новое напоминание; иначе
+    // новое напоминание заменяет прежнее сообщение, и счёт не меняется.
+    let expected = if cancel_before_second {
+        before + 1
+    } else {
+        before
+    };
+    assert_eq!(message_count(&bot, "Позвонить маме"), expected);
+    assert!(deleted(&bot, message_id));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2275,8 +2302,14 @@ async fn repeating_the_same_snooze_from_the_same_message_queues_no_delete() {
         .execute(&db.pool)
         .await
         .expect("move due");
-    let stats = tick_and_deliver(&mut bot, &db.pool, at).await;
+    // Отмена snooze сама ставит удаление сообщения «😴 Напомню …»; payload
+    // проверяется до доставки, пока он не скрыт.
+    let stats = scheduler(&db.pool).tick(at).await.expect("cancel tick");
     assert!(stats.cancelled >= 1, "{stats:?}");
+    let deletes = replace_delete_rows(&db.pool, bot.chat).await;
+    assert_eq!(deletes.len(), 1, "{deletes:?}");
+    assert_eq!(deletes[0].1["message_id"], json!(message_id), "{deletes:?}");
+    bot.deliver().await;
     let version = item_status(&db.pool, item.id).await.2;
     let again = fresh_snooze_token(&db.pool, &bot, &household, item.id, version).await;
     bot.press_data(&again, message_id).await;
@@ -2287,10 +2320,9 @@ async fn repeating_the_same_snooze_from_the_same_message_queues_no_delete() {
         snooze_replaces(&db.pool, item.id).await,
         vec![Some(message_id)]
     );
-    assert!(
-        replace_delete_rows(&db.pool, bot.chat).await.is_empty(),
-        "an equal id must not be deleted"
-    );
+    // Повтор из того же сообщения не добавляет второе удаление.
+    let deletes = replace_delete_rows(&db.pool, bot.chat).await;
+    assert_eq!(deletes.len(), 1, "{deletes:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2320,31 +2352,17 @@ async fn snooze_after_cancel_from_another_message_deletes_the_overwritten_one() 
     );
 
     // Срок перенесён: тик отменяет прежний snooze и выпускает напоминание
-    // о новом сроке — второе сообщение по той же задаче.
+    // о новом сроке — второе сообщение по той же задаче. Отмена сразу ставит
+    // удаление сообщения «😴 Напомню …»; payload проверяется до доставки.
     sqlx::query("UPDATE items SET due_at = $2, version = version + 1 WHERE id = $1")
         .bind(item.id)
         .bind(at + Duration::minutes(10))
         .execute(&db.pool)
         .await
         .expect("move due");
-    let stats = tick_and_deliver(&mut bot, &db.pool, at).await;
+    let stats = scheduler(&db.pool).tick(at).await.expect("cancel tick");
     assert!(stats.cancelled >= 1, "{stats:?}");
     assert_eq!(snooze_rows(&db.pool, item.id).await[0].0, "cancelled");
-    let (second_id, html) = bot.latest();
-    assert_ne!(second_id, first_id);
-
-    // Тот же час snooze из другого сообщения: поле обновлено, прежнее
-    // сообщение удаляется сразу — новая доставка его уже не заменит.
-    bot.press_data_pending(&button_of(&html, "на час"), second_id)
-        .await;
-    let rows = snooze_rows(&db.pool, item.id).await;
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0].0, "pending", "{rows:?}");
-    assert_eq!(rows[0].1, snoozed_at, "{rows:?}");
-    assert_eq!(
-        snooze_replaces(&db.pool, item.id).await,
-        vec![Some(second_id)]
-    );
     let deletes = replace_delete_rows(&db.pool, bot.chat).await;
     assert_eq!(deletes.len(), 1, "{deletes:?}");
     assert_eq!(deletes[0].1["message_id"], json!(first_id), "{deletes:?}");
@@ -2358,6 +2376,29 @@ async fn snooze_after_cancel_from_another_message_deletes_the_overwritten_one() 
     .await
     .expect("replace key");
     assert_eq!(key, format!("replace:{}:{first_id}", bot.chat));
+
+    bot.deliver().await;
+    let (second_id, html) = bot.latest();
+    assert_ne!(second_id, first_id);
+    assert!(
+        deleted(&bot, first_id),
+        "the cancelled snooze message must be deleted"
+    );
+
+    // Тот же час snooze из другого сообщения: поле обновлено. Удаление прежнего
+    // сообщения тем же ключом уже поставлено отменой — вторая строка не создаётся.
+    bot.press_data_pending(&button_of(&html, "на час"), second_id)
+        .await;
+    let rows = snooze_rows(&db.pool, item.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "pending", "{rows:?}");
+    assert_eq!(rows[0].1, snoozed_at, "{rows:?}");
+    assert_eq!(
+        snooze_replaces(&db.pool, item.id).await,
+        vec![Some(second_id)]
+    );
+    let deletes = replace_delete_rows(&db.pool, bot.chat).await;
+    assert_eq!(deletes.len(), 1, "{deletes:?}");
 
     // Доставки прежнего сообщения отмечены убранными; новое напоминание и
     // сама snooze-доставка — нет.

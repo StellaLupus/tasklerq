@@ -52,8 +52,6 @@ pub(crate) struct NoticeRow {
     pub occurrence_key: String,
     pub origin_key: Option<String>,
     /// Сообщение «😴 Напомню …», которое заменит snooze-доставка.
-    // Читает доставка и отмена snooze (0017, пункт 4.3).
-    #[allow(dead_code)]
     pub replaces_message_id: Option<i64>,
     pub scheduled_at: DateTime<Utc>,
     pub deferred: bool,

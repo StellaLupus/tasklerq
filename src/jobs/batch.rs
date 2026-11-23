@@ -42,6 +42,9 @@ struct BatchCandidate {
     delivery_id: Uuid,
     scheduled_at: DateTime<Utc>,
     scope: DeliveryScope,
+    /// Сообщение «😴 Напомню …», которое заменит snooze-доставка; у остальных
+    /// видов пусто.
+    replaces_message_id: Option<i64>,
     entry: notify::BatchEntry,
 }
 
@@ -246,6 +249,7 @@ async fn prepare_deferred_batch(
             delivery_id: row.id,
             scheduled_at: row.scheduled_at,
             scope,
+            replaces_message_id: row.replaces_message_id,
             entry: notify::BatchEntry {
                 item_id: item.id,
                 kind: row.kind,
@@ -377,9 +381,27 @@ async fn commit_prepared_batch(
             )
             .await?;
             let dedupe_key = format!("notification:batch:{batch_id}");
-            let seq =
-                enqueue_message(&mut *conn, identity.chat_id, &dedupe_key, html, true, now).await?;
+            // Замена (0017, решение 5): сводное сообщение удаляет прежние
+            // сообщения snooze-блоков после своей доставки; само сводное
+            // сообщение при этом не удаляется.
+            let replaces: Vec<i64> = candidates
+                .iter()
+                .filter_map(|candidate| candidate.replaces_message_id)
+                .collect();
+            let seq = enqueue_message(
+                &mut *conn,
+                identity.chat_id,
+                &dedupe_key,
+                html,
+                true,
+                replaces,
+                now,
+            )
+            .await?;
             for candidate in &candidates {
+                if let Some(old) = candidate.replaces_message_id {
+                    notifications::mark_dismissed(&mut *conn, identity.chat_id, old, now).await?;
+                }
                 mark_batch_sent(
                     &mut *conn,
                     candidate.delivery_id,
