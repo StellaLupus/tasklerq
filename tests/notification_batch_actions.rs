@@ -4,7 +4,7 @@ mod support;
 
 use chrono::{DateTime, Duration, Utc};
 use support::notifications::*;
-use support::telegram::{Harness, buttons};
+use support::telegram::{Call, Harness, buttons};
 use tasklerq::domain::models::{Actor, Item, RecurrenceFreq, UserRole};
 use tasklerq::jobs::scheduler::occurrence_key;
 use tasklerq::storage::repositories::items;
@@ -685,6 +685,88 @@ async fn snooze_in_a_block_creates_one_delivery_and_an_ordinary_reminder_later()
     let (_, next) = bot.latest();
     assert!(!next.contains("Пока были тихие часы"), "{next}");
     assert!(next.contains("Пора"), "{next}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dismiss_of_a_batch_deletes_it_and_keeps_the_block_snooze_pending() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = bot.now.with_timezone(&moscow).date_naive();
+    let morning = local_utc(moscow, day, 8, 0);
+    let due = local_utc(moscow, day, 9, 0);
+    let first = create_task(&db.pool, &household, "Первая", due, None).await;
+    let second = create_task(&db.pool, &household, "Вторая", due, None).await;
+    deferred_reminder(&db.pool, &household, first.id, due, morning).await;
+    deferred_reminder(&db.pool, &household, second.id, due, morning).await;
+
+    tick_and_deliver(&mut bot, &db.pool, morning).await;
+    let (message_id, html) = bot.latest();
+    bot.press_data(&button_of(&html, "На час"), message_id)
+        .await;
+    let (snoozed_item, snoozed_at): (Uuid, DateTime<Utc>) = sqlx::query_as(
+        "SELECT item_id, scheduled_at FROM notification_deliveries
+         WHERE kind = 'snooze' AND status = 'pending'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("snooze delivery");
+    let batch = batch_message(&bot, message_id);
+    assert!(batch.contains("😴 Напомню в"), "{batch}");
+    let dismiss = button_of(&batch, "🗑 Убрать");
+
+    bot.press_data(&dismiss, message_id).await;
+
+    assert!(
+        bot.fake.calls().iter().any(|call| matches!(
+            call,
+            Call::Delete { chat, id } if *chat == bot.chat && *id == message_id
+        )),
+        "«🗑 Убрать» must delete the batch through the outbox"
+    );
+    assert!(
+        !bot.fake
+            .messages(bot.chat)
+            .into_iter()
+            .any(|(id, _)| id == message_id),
+        "the batch must disappear from the chat"
+    );
+    // Все записи блоков сводного сообщения отмечены убранной, статус прежний.
+    let block_states: Vec<(String, Option<DateTime<Utc>>)> = sqlx::query_as(
+        "SELECT d.status::text, d.dismissed_at
+         FROM notification_deliveries d
+         JOIN outbox o ON o.seq = d.outbox_seq
+         WHERE o.chat_id = $1 AND o.message_id = $2
+         ORDER BY d.created_at, d.id",
+    )
+    .bind(bot.chat)
+    .bind(message_id)
+    .fetch_all(&db.pool)
+    .await
+    .expect("batch delivery states");
+    assert_eq!(block_states.len(), 2, "{block_states:?}");
+    for (status, dismissed_at) in &block_states {
+        assert_eq!(status, "sent", "{block_states:?}");
+        assert!(dismissed_at.is_some(), "{block_states:?}");
+    }
+    // Snooze-доставка блока остаётся pending с прежним сроком, без отметки.
+    let rows = snooze_rows(&db.pool, snoozed_item).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "pending", "{rows:?}");
+    assert_eq!(rows[0].1, snoozed_at, "{rows:?}");
+    let snooze_dismissed: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT dismissed_at FROM notification_deliveries
+         WHERE item_id = $1 AND kind = 'snooze'",
+    )
+    .bind(snoozed_item)
+    .fetch_one(&db.pool)
+    .await
+    .expect("snooze dismissed_at");
+    assert!(snooze_dismissed.is_none(), "{snooze_dismissed:?}");
+    assert_eq!(item_status(&db.pool, first.id).await.0, "open");
+    assert_eq!(item_status(&db.pool, second.id).await.0, "open");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

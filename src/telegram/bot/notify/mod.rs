@@ -427,21 +427,26 @@ pub(super) async fn open(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> R
 
 /// «🗑 Убрать» из любого уведомления: удалить сообщение из чата.
 ///
-/// Запись доставки не меняется и остаётся `sent`, поэтому напоминание о том же
-/// вхождении повторно не планируется; о следующем вхождении придёт по
-/// расписанию.
+/// Удаление — уборка (`cleanup = true`): отказ Telegram не засыпает вид чата.
+/// В той же транзакции записи доставки этого сообщения отмечаются
+/// `dismissed_at`: их статус остаётся `sent`, поэтому напоминание о том же
+/// вхождении повторно не планируется, а правки отправленных сообщений
+/// (0018, 0019) убранное не трогают. Задачу, событие и отложенные
+/// snooze-доставки уборка не меняет; о следующем вхождении напоминание
+/// придёт по расписанию.
 pub async fn close(ctx: &mut Ctx<'_>, message_id: i64) -> Result<(), Fail> {
     outbox::enqueue(
         &mut *ctx.conn,
         ctx.chat_id,
         &Outgoing::Delete {
             message_id,
-            cleanup: false,
+            cleanup: true,
         },
         Some(&super::delete_dedupe_key(ctx.chat_id, message_id)),
         ctx.now,
     )
     .await?;
+    notifications::mark_dismissed(&mut *ctx.conn, ctx.chat_id, message_id, ctx.now).await?;
     Ok(())
 }
 

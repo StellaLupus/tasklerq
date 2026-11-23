@@ -270,6 +270,24 @@ async fn reminder_rows(pool: &PgPool, item_id: Uuid) -> Vec<(String, String)> {
     .expect("reminder deliveries")
 }
 
+/// Статус и отметка уборки доставок задачи данного вида.
+async fn delivery_states(
+    pool: &PgPool,
+    item_id: Uuid,
+    kind: &str,
+) -> Vec<(String, Option<DateTime<Utc>>)> {
+    sqlx::query_as(
+        "SELECT status::text, dismissed_at FROM notification_deliveries
+         WHERE item_id = $1 AND kind = $2::notification_kind
+         ORDER BY created_at, id",
+    )
+    .bind(item_id)
+    .bind(kind)
+    .fetch_all(pool)
+    .await
+    .expect("delivery states")
+}
+
 fn local_utc(timezone: Tz, date: NaiveDate, hour: u32, minute: u32) -> DateTime<Utc> {
     timezone
         .with_ymd_and_hms(date.year(), date.month(), date.day(), hour, minute, 0)
@@ -1367,6 +1385,11 @@ async fn closed_event_reminder_is_deleted_and_does_not_come_back_for_the_same_oc
     let rows = reminder_rows(&db.pool, event.id).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].0, "sent", "{rows:?}");
+    let states = delivery_states(&db.pool, event.id, "reminder").await;
+    assert!(
+        states[0].1.is_some(),
+        "«🗑 Убрать» must mark the delivery dismissed: {states:?}"
+    );
 
     // Тик того же вхождения ничего не планирует повторно.
     tick_and_deliver(&mut bot, &db.pool, start - Duration::minutes(5)).await;
@@ -1390,6 +1413,202 @@ async fn closed_event_reminder_is_deleted_and_does_not_come_back_for_the_same_oc
     let rows = reminder_rows(&db.pool, event.id).await;
     assert_eq!(rows.len(), 2, "{rows:?}");
     assert_eq!(rows[1].0, "sent", "{rows:?}");
+    let states = delivery_states(&db.pool, event.id, "reminder").await;
+    assert!(
+        states[1].1.is_none(),
+        "the next occurrence must not be dismissed: {states:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dismiss_in_a_task_reminder_deletes_with_cleanup_and_marks_the_delivery() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(&db.pool, &household, "Оплатить интернет", due, None).await;
+
+    tick_and_deliver(&mut bot, &db.pool, due - Duration::minutes(15)).await;
+    let (message_id, html) = bot.latest();
+    let dismiss = button_of(&html, "🗑 Убрать");
+    let before = item_status(&db.pool, item.id).await;
+
+    // Обработчик прошёл, исходящие ещё не доставлены: payload удаления цел.
+    bot.press_data_pending(&dismiss, message_id).await;
+    let payload: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload FROM outbox
+         WHERE chat_id = $1 AND kind = 'delete' AND dedupe_key = $2",
+    )
+    .bind(bot.chat)
+    .bind(format!("delete:{}:{message_id}", bot.chat))
+    .fetch_one(&db.pool)
+    .await
+    .expect("cleanup delete row");
+    assert_eq!(payload["message_id"], json!(message_id), "{payload}");
+    assert_eq!(payload["cleanup"], json!(true), "{payload}");
+
+    bot.deliver().await;
+    assert!(
+        !bot.fake
+            .messages(bot.chat)
+            .into_iter()
+            .any(|(id, _)| id == message_id),
+        "the reminder must disappear from the chat"
+    );
+    assert_eq!(
+        item_status(&db.pool, item.id).await,
+        before,
+        "«🗑 Убрать» must not change the task"
+    );
+    let stored_due: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT due_at FROM items WHERE id = $1")
+            .bind(item.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("due");
+    assert_eq!(
+        stored_due,
+        Some(due),
+        "«🗑 Убрать» must not move the due date"
+    );
+    let states = delivery_states(&db.pool, item.id, "reminder").await;
+    assert_eq!(states.len(), 1, "{states:?}");
+    assert_eq!(states[0].0, "sent", "{states:?}");
+    assert!(
+        states[0].1.is_some(),
+        "«🗑 Убрать» must mark the delivery dismissed: {states:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dismiss_in_an_assignment_notice_deletes_with_cleanup_and_marks_the_delivery() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(&db.pool, &household, "Купить торт", due, None).await;
+    let now = rounded_now();
+    support::notifications::insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        item.id,
+        "assignment",
+        "assignment:dismiss:0",
+        now,
+        false,
+    )
+    .await;
+
+    tick_and_deliver(&mut bot, &db.pool, now).await;
+    let (message_id, html) = bot.latest();
+    assert!(html.contains("Вам назначили задачу"), "{html}");
+    let dismiss = button_of(&html, "🗑 Убрать");
+    let before = item_status(&db.pool, item.id).await;
+
+    bot.press_data_pending(&dismiss, message_id).await;
+    let payload: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload FROM outbox
+         WHERE chat_id = $1 AND kind = 'delete' AND dedupe_key = $2",
+    )
+    .bind(bot.chat)
+    .bind(format!("delete:{}:{message_id}", bot.chat))
+    .fetch_one(&db.pool)
+    .await
+    .expect("cleanup delete row");
+    assert_eq!(payload["message_id"], json!(message_id), "{payload}");
+    assert_eq!(payload["cleanup"], json!(true), "{payload}");
+
+    bot.deliver().await;
+    assert!(
+        !bot.fake
+            .messages(bot.chat)
+            .into_iter()
+            .any(|(id, _)| id == message_id),
+        "the assignment notice must disappear from the chat"
+    );
+    assert_eq!(
+        item_status(&db.pool, item.id).await,
+        before,
+        "«🗑 Убрать» must not change the task"
+    );
+    let states = delivery_states(&db.pool, item.id, "assignment").await;
+    assert_eq!(states.len(), 1, "{states:?}");
+    assert_eq!(states[0].0, "sent", "{states:?}");
+    assert!(
+        states[0].1.is_some(),
+        "«🗑 Убрать» must mark the delivery dismissed: {states:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dismiss_after_snooze_deletes_the_message_and_keeps_the_snooze_pending() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let due = rounded_now() + Duration::hours(3);
+    let item = create_task(&db.pool, &household, "Позвонить маме", due, None).await;
+
+    tick_and_deliver(&mut bot, &db.pool, due - Duration::minutes(15)).await;
+    let (message_id, html) = bot.latest();
+    bot.press_data(&button_of(&html, "на час"), message_id)
+        .await;
+    let rows = snooze_rows(&db.pool, item.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "pending", "{rows:?}");
+    let snoozed_at = rows[0].1;
+    let (_, snoozed_html) = bot.latest();
+    assert!(snoozed_html.contains("😴 Напомню"), "{snoozed_html}");
+    let dismiss = button_of(&snoozed_html, "🗑 Убрать");
+
+    bot.press_data(&dismiss, message_id).await;
+
+    assert!(
+        bot.fake.calls().iter().any(|call| matches!(
+            call,
+            Call::Delete { chat, id } if *chat == bot.chat && *id == message_id
+        )),
+        "«🗑 Убрать» must delete the snoozed message through the outbox"
+    );
+    assert!(
+        !bot.fake
+            .messages(bot.chat)
+            .into_iter()
+            .any(|(id, _)| id == message_id),
+        "the snoozed message must disappear from the chat"
+    );
+    // Отложенная доставка не тронута: прежний срок, без отметки уборки.
+    let rows = snooze_rows(&db.pool, item.id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "pending", "{rows:?}");
+    assert_eq!(rows[0].1, snoozed_at, "{rows:?}");
+    let snooze_dismissed: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT dismissed_at FROM notification_deliveries
+         WHERE item_id = $1 AND kind = 'snooze'",
+    )
+    .bind(item.id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("snooze dismissed_at");
+    assert!(snooze_dismissed.is_none(), "{snooze_dismissed:?}");
+    // Запись исходного напоминания отмечена убранной, статус прежний.
+    let states = delivery_states(&db.pool, item.id, "reminder").await;
+    assert_eq!(states.len(), 1, "{states:?}");
+    assert_eq!(states[0].0, "sent", "{states:?}");
+    assert!(states[0].1.is_some(), "{states:?}");
+    assert_eq!(
+        item_status(&db.pool, item.id).await.2,
+        item.version,
+        "«🗑 Убрать» must not change the task"
+    );
+
+    // Отложенное напоминание всё равно приходит в свой срок.
+    tick_and_deliver(&mut bot, &db.pool, snoozed_at).await;
+    assert_eq!(message_count(&bot, "Позвонить маме"), 1);
+    assert_eq!(snooze_rows(&db.pool, item.id).await[0].0, "sent");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
