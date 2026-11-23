@@ -85,9 +85,11 @@ erDiagram
 | `deleted_at` | `timestamptz` | NULL. |
 
 Один пользователь — один household. При удалении участника строка остаётся с
-`deleted_at`, чтобы сохранить авторство задач. В household не более одного
-активного `owner` (частичный UNIQUE по `household_id` для `role = 'owner'`);
-владение передаётся в одной транзакции. `telegram_user_id` не редактируется.
+`deleted_at`, чтобы сохранить авторство задач; его назначения снимаются
+(`assignee_user_id` очищается), и открытые задачи, которые были на нём,
+становятся общими (раздел 3.4). В household не более одного активного `owner`
+(частичный UNIQUE по `household_id` для `role = 'owner'`); владение передаётся
+в одной транзакции. `telegram_user_id` не редактируется.
 
 ### 3.3 `lists`
 
@@ -205,6 +207,13 @@ CHECK (recurrence_until IS NULL
 включительно (последний день события). «Конец только у событий» и
 обязательное начало события проверяет домен: ограничение БД не видит
 `lists.kind`.
+
+**Общая задача.** Открытая задача без исполнителя (`assignee_user_id IS NULL`)
+считается общей задачей household независимо от того, кто и каким способом её
+создал (бот, HTTP API, Home Assistant, голос). Общая задача входит в «мои
+задачи» каждого участника; назначение исполнителя делает задачу личной
+задачей исполнителя, снятие исполнителя — снова общей. Фильтр по конкретному
+исполнителю общие задачи не включает.
 
 ### 3.5 `subtasks`
 
@@ -398,8 +407,9 @@ notice`, действие `notice_close`): выполняется и после 
 `notification_deliveries`: `id`, `household_id`, `user_id`, `item_id` (NULL
 для сводки), `occurrence_key`, `origin_key`, `kind`, `status`, `scheduled_at`,
 `deferred`, `outbox_seq`, `batch_id`, `batch_version`, `batch_state`,
-`batch_snoozed_until`, `batched`, `dismissed_at`, `replaces_message_id`,
-`created_at`, `updated_at`; UNIQUE `(user_id, item_id, occurrence_key, kind)`.
+`batch_snoozed_until`, `batched`, `dismissed_at`, `closed_at`, `closed_reason`,
+`closed_by_event`, `replaces_message_id`, `created_at`, `updated_at`; UNIQUE
+`(user_id, item_id, occurrence_key, kind)`.
 `kind` — `reminder`, `digest`, `assignment` или `snooze`; `status` —
 `pending`, `sent` или `cancelled`. `deferred` отмечает запись, хотя бы раз
 отложенную тихими часами: перенесённая через полночь сводка или вседневное
@@ -421,6 +431,16 @@ notice`, действие `notice_close`): выполняется и после 
 «🗑 Убрать» или заменяется новым (доставка snooze, сводное сообщение, новая
 сводка); статус остаётся `sent`; правки отправленных сообщений не должны
 трогать запись с `dismissed_at` (контракт для 0018/0019).
+`closed_at`, `closed_reason` и `closed_by_event` — отметка закрытия
+отправленного уведомления перерисовкой (миграция `0026`): когда закрыто,
+причина (`completed` — задача выполнена, `assigned` — назначена другому
+участнику) и выполнение, по которому сообщение закрыто; для `assigned`
+выполнение пусто, у незакрытой доставки все три поля NULL. Отметку ставит шаг
+синхронизации отправленных уведомлений и действие «✓ Выполнено» в самом
+уведомлении; отмена выполнения и возврат уведомления очищают её.
+`closed_by_event` ссылается на `item_events` с ON DELETE SET NULL: при
+удалении события ссылка обнуляется, запись доставки остаётся. Выборку шага
+обслуживает частичный индекс по `updated_at` для `sent` (раздел 12).
 `replaces_message_id` — сообщение, которое удалит этот snooze: сообщение, где
 нажали кнопку snooze; у snooze из сводного сообщения пусто. Удаление ставится
 после доставки нового напоминания, а при отмене snooze — сразу. Для сводок
@@ -901,6 +921,9 @@ CREATE INDEX outbox_pending_idx
   ON outbox (chat_id, seq) WHERE status = 'pending';
 CREATE INDEX notification_deliveries_pending_idx
   ON notification_deliveries (scheduled_at) WHERE status = 'pending';
+-- 0026: выборка шага синхронизации отправленных уведомлений.
+CREATE INDEX notification_deliveries_sent_idx
+  ON notification_deliveries (updated_at) WHERE status = 'sent';
 -- UNIQUE NULLS NOT DISTINCT (user_id, item_id, occurrence_key, kind)
 -- объявлен в 0008 как ограничение таблицы, а не отдельный индекс.
 
