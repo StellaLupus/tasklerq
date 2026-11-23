@@ -291,6 +291,47 @@ pub async fn tick_with_a_failing_digest(
     result
 }
 
+/// Тик с триггером, ломающим закрытие доставки шагом синхронизации: шаг
+/// сообщает ошибку, а триггер снимается и в этом случае, поэтому база остаётся
+/// пригодной.
+///
+/// База должна быть отдельной: DDL на `notification_deliveries` задел бы
+/// параллельные тики общей базы.
+pub async fn tick_with_a_failing_notice_sync(
+    pool: &PgPool,
+    at: DateTime<Utc>,
+) -> Result<TickStats, sqlx::Error> {
+    sqlx::query(
+        "CREATE FUNCTION fail_notice_sync() RETURNS trigger AS $$
+         BEGIN
+             RAISE EXCEPTION 'forced notice sync failure';
+         END $$ LANGUAGE plpgsql",
+    )
+    .execute(pool)
+    .await
+    .expect("function");
+    sqlx::query(
+        "CREATE TRIGGER fail_notice_sync BEFORE UPDATE ON notification_deliveries
+         FOR EACH ROW WHEN (NEW.closed_reason IS NOT NULL) EXECUTE FUNCTION fail_notice_sync()",
+    )
+    .execute(pool)
+    .await
+    .expect("trigger");
+
+    let result = scheduler(pool).tick(at).await;
+
+    sqlx::query("DROP TRIGGER fail_notice_sync ON notification_deliveries")
+        .execute(pool)
+        .await
+        .expect("drop trigger");
+    sqlx::query("DROP FUNCTION fail_notice_sync()")
+        .execute(pool)
+        .await
+        .expect("drop function");
+
+    result
+}
+
 pub async fn tick_and_deliver(bot: &mut Harness, pool: &PgPool, at: DateTime<Utc>) -> TickStats {
     // В проде переход событий и планировщик — два независимых цикла. Тест
     // сохраняет прежний порядок одного тика: сначала доменный шаг, затем

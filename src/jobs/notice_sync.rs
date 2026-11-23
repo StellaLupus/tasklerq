@@ -37,6 +37,12 @@ const UPDATED_WINDOW_HOURS: i64 = 48;
 const SENT_WINDOW_HOURS: i64 = 47;
 
 /// Условия кандидата, общие для выборки и повторной проверки под блокировкой.
+///
+/// SQL-условия живого получателя (`u.…`, `h.…`) — предфильтр: они должны
+/// совпадать с [`NoticeRow::recipient_alive`], который остаётся проверкой после
+/// блокировки. Условие `closed_at` отсекает закрытые доставки, чьё окно возврата
+/// уже истекло: возврат возможен только до `closed_at + UNDO_WINDOW_MINUTES`
+/// (для выполнения — до момента выполнения + окно, что не позже).
 const CANDIDATE_WHERE: &str = "d.status = 'sent'
      AND d.kind IN ('reminder', 'snooze', 'assignment')
      AND d.batch_id IS NULL
@@ -44,6 +50,7 @@ const CANDIDATE_WHERE: &str = "d.status = 'sent'
      AND d.updated_at >= $1
      AND o.message_id IS NOT NULL
      AND o.sent_at >= $2
+     AND (d.closed_at IS NULL OR d.closed_at > $3)
      AND l.kind IS DISTINCT FROM 'events'
      AND u.id IS NOT NULL AND u.deleted_at IS NULL
      AND u.household_id = d.household_id
@@ -79,10 +86,12 @@ fn from() -> String {
 }
 
 /// Синхронизировать отправленные уведомления; возвращает число изменённых
-/// сообщений. Ошибка одной записи логируется и не прерывает остальные.
+/// сообщений. Ошибка одной записи логируется и не прерывает остальные, но
+/// возвращается наверх, чтобы тик сообщил её с названием шага.
 pub(crate) async fn sync(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error> {
     let updated_since = now - Duration::hours(UPDATED_WINDOW_HOURS);
     let sent_since = now - Duration::hours(SENT_WINDOW_HOURS);
+    let closed_since = now - Duration::minutes(items::UNDO_WINDOW_MINUTES);
     let sql = format!(
         "SELECT d.id {from} WHERE {CANDIDATE_WHERE} ORDER BY d.updated_at, d.id",
         from = from()
@@ -90,21 +99,29 @@ pub(crate) async fn sync(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx:
     let ids: Vec<Uuid> = sqlx::query_scalar(&sql)
         .bind(updated_since)
         .bind(sent_since)
+        .bind(closed_since)
         .fetch_all(pool)
         .await?;
 
     let mut changed = 0;
+    let mut last_error = None;
     for id in ids {
-        match sync_row(pool, id, now, updated_since, sent_since).await {
+        match sync_row(pool, id, now, updated_since, sent_since, closed_since).await {
             Ok(rows) => changed += rows,
-            Err(error) => tracing::error!(
-                delivery_id = %id,
-                %error,
-                "failed to sync notification delivery"
-            ),
+            Err(error) => {
+                tracing::error!(
+                    delivery_id = %id,
+                    %error,
+                    "failed to sync notification delivery"
+                );
+                last_error = Some(error);
+            }
         }
     }
-    Ok(changed)
+    match last_error {
+        Some(error) => Err(error),
+        None => Ok(changed),
+    }
 }
 
 /// Перечитать запись под блокировкой и обработать её по свежему снимку.
@@ -117,11 +134,12 @@ async fn sync_row(
     now: DateTime<Utc>,
     updated_since: DateTime<Utc>,
     sent_since: DateTime<Utc>,
+    closed_since: DateTime<Utc>,
 ) -> Result<u64, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let sql = format!(
         "SELECT {columns} {from}
-         WHERE d.id = $3 AND {CANDIDATE_WHERE}
+         WHERE d.id = $4 AND {CANDIDATE_WHERE}
          FOR UPDATE OF d SKIP LOCKED",
         columns = columns(),
         from = from()
@@ -129,9 +147,12 @@ async fn sync_row(
     let row: Option<SyncRow> = sqlx::query_as(&sql)
         .bind(updated_since)
         .bind(sent_since)
+        .bind(closed_since)
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
+    // SQL-условия живого получателя в выборке — предфильтр; после блокировки
+    // проверку повторяет `NoticeRow::recipient_alive`.
     let changed = match row {
         Some(row) if row.notice.recipient_alive() => process(&mut tx, &row, now).await?,
         _ => 0,
@@ -334,10 +355,10 @@ async fn maybe_return(
             }
             match row.closed_by_event {
                 Some(event_id) => {
-                    !completions::active_for_event(conn, notice.household_id, event_id)
+                    completions::active_for_event(conn, notice.household_id, event_id)
                         .await
                         .map_err(domain_db)?
-                        .is_some()
+                        .is_none()
                 }
                 None => true,
             }

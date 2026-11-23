@@ -383,6 +383,33 @@ async fn update_assignee(
     .expect("assignee update")
 }
 
+async fn move_due(
+    db: &TestDb,
+    household: &TestHousehold,
+    actor: &Actor,
+    item: &Item,
+    due_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Item {
+    let patch = ItemPatch {
+        due_at: Field::Value(due_at),
+        ..ItemPatch::default()
+    };
+    let mut conn = db.pool.acquire().await.expect("conn");
+    items::update(
+        &mut conn,
+        household.household_id,
+        actor,
+        item.id,
+        item.version,
+        patch,
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("due update")
+}
+
 async fn insert_digest_delivery(
     pool: &PgPool,
     household_id: Uuid,
@@ -7476,4 +7503,238 @@ async fn sync_closes_assigned_copy_without_name_when_assignee_deleted() {
     assert_only_dismiss_button(&html);
     let rows = notice_closed_rows(&db.pool, stand.bot.chat, stand.bot_msg).await;
     assert_eq!(rows[0].1.as_deref(), Some("assigned"), "{rows:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_delete_deadline_is_completion_time_plus_window_not_tick_time() {
+    let db = support::isolated_db().await;
+    let mut stand = shared_task_stand(&db, "Вынести мусор").await;
+    let at = stand.at;
+    let done_at = at + Duration::minutes(1);
+    complete_as(
+        &db,
+        &stand.household,
+        stand.item.id,
+        &stand.household.owner(),
+        done_at,
+    )
+    .await;
+
+    // Тик шага через 3 минуты после выполнения: срок удаления всё равно
+    // отсчитывается от момента выполнения, а не от тика.
+    sync_tick(&mut stand, done_at + Duration::minutes(3)).await;
+
+    let deletes = notice_expire_rows(&db.pool, stand.bot.chat, stand.bot_msg).await;
+    assert_eq!(deletes.len(), 1, "{deletes:?}");
+    assert_eq!(
+        deletes[0].2,
+        done_at + Duration::minutes(10),
+        "delete must be scheduled from completion time, not tick time: {deletes:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_does_not_return_completed_copy_after_return_window() {
+    let db = support::isolated_db().await;
+    let mut stand = shared_task_stand(&db, "Вынести мусор").await;
+    let at = stand.at;
+    let done_at = at + Duration::minutes(1);
+    complete_as(
+        &db,
+        &stand.household,
+        stand.item.id,
+        &stand.household.owner(),
+        done_at,
+    )
+    .await;
+    sync_tick(&mut stand, done_at).await;
+    assert!(message_html(&stand.bot, stand.bot_msg).contains("✅ Выполнено"));
+    let event_id = latest_completion_event(&db.pool, stand.item.id)
+        .await
+        .expect("completion event");
+
+    // Выполнение снято позже окна возврата: тик через 11 минут после выполнения.
+    let late = done_at + Duration::minutes(11);
+    let mut conn = db.pool.acquire().await.expect("conn");
+    items::reopen(
+        &mut conn,
+        stand.household.household_id,
+        &stand.household.owner(),
+        stand.item.id,
+        None,
+        late,
+    )
+    .await
+    .expect("reopen");
+    drop(conn);
+    scheduler(&db.pool).tick(late).await.expect("late tick");
+
+    // Копия не возвращается: новой правки нет, отметка закрытия на месте,
+    // отложенное удаление не отменено.
+    assert_eq!(edit_count(&db.pool, stand.bot.chat).await, 1);
+    let rows = notice_closed_rows(&db.pool, stand.bot.chat, stand.bot_msg).await;
+    assert!(rows[0].0.is_some(), "{rows:?}");
+    assert_eq!(rows[0].1.as_deref(), Some("completed"), "{rows:?}");
+    assert_eq!(rows[0].2, Some(event_id), "{rows:?}");
+    let deletes = notice_expire_rows(&db.pool, stand.bot.chat, stand.bot_msg).await;
+    assert_eq!(deletes.len(), 1, "{deletes:?}");
+    assert_ne!(deletes[0].0, "skipped", "{deletes:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_does_not_return_assigned_copy_after_return_window() {
+    let db = support::isolated_db().await;
+    let mut stand = shared_task_stand(&db, "Вынести мусор").await;
+    let at = stand.at;
+    let item = update_assignee(
+        &db,
+        &stand.household,
+        &stand.household.owner(),
+        &stand.item,
+        Some(stand.member_id),
+        at,
+    )
+    .await;
+    sync_tick(&mut stand, at).await;
+    assert!(message_html(&stand.bot, stand.bot_msg).contains("👤 Назначено"));
+
+    // Исполнитель снят позже окна возврата: тик через 11 минут после закрытия.
+    let late = at + Duration::minutes(11);
+    update_assignee(
+        &db,
+        &stand.household,
+        &stand.household.owner(),
+        &item,
+        None,
+        late,
+    )
+    .await;
+    scheduler(&db.pool).tick(late).await.expect("late tick");
+
+    assert_eq!(edit_count(&db.pool, stand.bot.chat).await, 1);
+    let rows = notice_closed_rows(&db.pool, stand.bot.chat, stand.bot_msg).await;
+    assert!(rows[0].0.is_some(), "{rows:?}");
+    assert_eq!(rows[0].1.as_deref(), Some("assigned"), "{rows:?}");
+    let deletes = notice_expire_rows(&db.pool, stand.bot.chat, stand.bot_msg).await;
+    assert_eq!(deletes.len(), 1, "{deletes:?}");
+    assert_ne!(deletes[0].0, "skipped", "{deletes:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_does_not_close_reminder_copy_of_a_different_occurrence() {
+    let db = support::isolated_db().await;
+    let at = sync_now();
+    let due_a = at + Duration::minutes(15);
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    bot.freeze_at(at);
+    let item = create_task(
+        &db,
+        &household,
+        "Перенесённая",
+        Some(due_a),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    tick_and_deliver(&mut bot, &db.pool, at).await;
+    let (msg, html) = bot.latest();
+    assert!(html.contains("Перенесённая"), "{html}");
+
+    // Срок перенесли на B и задачу выполнили: выполнение относится к вхождению B.
+    let due_b = at + Duration::hours(2);
+    let item = move_due(
+        &db,
+        &household,
+        &household.owner(),
+        &item,
+        due_b,
+        at + Duration::minutes(1),
+    )
+    .await;
+    complete_as(
+        &db,
+        &household,
+        item.id,
+        &household.owner(),
+        at + Duration::minutes(2),
+    )
+    .await;
+    scheduler(&db.pool)
+        .tick(at + Duration::minutes(2))
+        .await
+        .expect("sync tick");
+    bot.advance(Duration::minutes(2));
+    bot.deliver().await;
+
+    // Копия о сроке A не закрыта выполнением вхождения B.
+    let rows = notice_closed_rows(&db.pool, bot.chat, msg).await;
+    assert_ne!(rows[0].1.as_deref(), Some("completed"), "{rows:?}");
+    let html = message_html(&bot, msg);
+    assert!(!html.contains("✅ Выполнено"), "{html}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_does_not_close_snooze_copy_of_a_different_occurrence() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    quiet_off(&db.pool, bot.chat).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let at = sync_now();
+    bot.freeze_at(at);
+    let due_a = at + Duration::minutes(15);
+    let item = create_task(
+        &db,
+        &household,
+        "Отложенная",
+        Some(due_a),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    tick_and_deliver(&mut bot, &db.pool, at).await;
+    let (msg, html) = bot.latest();
+    bot.press_data(&button_of(&html, "на час"), msg).await;
+    let snooze_at = at + Duration::hours(1);
+    bot.advance(Duration::hours(1));
+    scheduler(&db.pool)
+        .tick(snooze_at)
+        .await
+        .expect("snooze tick");
+    bot.deliver().await;
+    let (snooze_msg, snooze_html) = bot.latest();
+    assert!(snooze_html.contains("⏰ Пора"), "{snooze_html}");
+
+    // Срок перенесли на B и задачу выполнили: выполнение относится к вхождению B,
+    // а origin_key доставки привязан к сроку A.
+    let due_b = snooze_at + Duration::hours(2);
+    let item = move_due(
+        &db,
+        &household,
+        &household.owner(),
+        &item,
+        due_b,
+        snooze_at + Duration::minutes(1),
+    )
+    .await;
+    complete_as(
+        &db,
+        &household,
+        item.id,
+        &household.owner(),
+        snooze_at + Duration::minutes(2),
+    )
+    .await;
+    scheduler(&db.pool)
+        .tick(snooze_at + Duration::minutes(2))
+        .await
+        .expect("sync tick");
+    bot.advance(Duration::minutes(2));
+    bot.deliver().await;
+
+    let rows = notice_closed_rows(&db.pool, bot.chat, snooze_msg).await;
+    assert_ne!(rows[0].1.as_deref(), Some("completed"), "{rows:?}");
+    let html = message_html(&bot, snooze_msg);
+    assert!(!html.contains("✅ Выполнено"), "{html}");
 }

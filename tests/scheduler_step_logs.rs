@@ -1,4 +1,4 @@
-//! Лог ошибки шага тика планировщика: сбой сводки не отменяет доставку
+//! Лог ошибки шага тика планировщика: сбой шага не отменяет доставку
 //! напоминания и попадает в журнал с названием шага.
 //!
 //! Отдельный тестовый бинарник, как `outbox_dead_logs.rs`: `tracing` кеширует
@@ -10,6 +10,7 @@ mod support;
 use chrono::Duration;
 use serde_json::json;
 use support::logs::LogBuffer;
+use tasklerq::storage::repositories::items;
 
 #[test]
 fn a_failed_digest_step_is_logged_with_its_name_and_still_delivers_reminders() {
@@ -217,6 +218,132 @@ fn a_failed_event_advance_step_is_logged_with_its_name_and_still_delivers_remind
     assert!(logs.contains("\"level\":\"ERROR\""), "{logs}");
     assert!(
         logs.contains("\"step\":\"advance events\""),
+        "the error must carry the step name:\n{logs}"
+    );
+    assert!(
+        logs.contains("\"error\":"),
+        "the step error must be logged:\n{logs}"
+    );
+}
+
+#[test]
+fn a_failed_notice_sync_step_is_logged_with_its_name_and_still_delivers_reminders() {
+    let buffer = LogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(buffer.clone())
+        .finish();
+
+    let result = tracing::subscriber::with_default(subscriber, || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let db = support::isolated_db().await;
+            let household = support::create_household(&db.pool).await;
+            for user_id in [household.owner_id, household.member_id] {
+                support::notifications::set_notifications(
+                    &db.pool,
+                    user_id,
+                    json!({
+                        "digest_enabled": false,
+                        "quiet_hours_enabled": false
+                    }),
+                )
+                .await;
+            }
+
+            // Задача, чью отправленную копию шаг синхронизации попробует
+            // закрыть: напоминание уже доставлено, задача выполнена.
+            let due = chrono::Utc::now() + Duration::hours(3);
+            let mut broken = support::new_item(household.tasks_list_id, "Сломанная");
+            broken.due_at = Some(due);
+            broken.assignee_user_id = Some(household.owner_id);
+            let broken = support::create_item(
+                &db.pool,
+                &household,
+                household.tasks_list_id,
+                &household.owner(),
+                broken,
+            )
+            .await;
+            support::notifications::scheduler(&db.pool)
+                .tick(due - Duration::minutes(15))
+                .await
+                .expect("first tick");
+            // Outbox-воркер «отправил» сообщение: шаг синхронизации берёт
+            // только доставки с известным message_id и sent_at.
+            sqlx::query(
+                "UPDATE outbox SET status = 'sent', message_id = 501, sent_at = $2
+                 WHERE seq = (SELECT outbox_seq FROM notification_deliveries
+                              WHERE item_id = $1 AND kind = 'reminder')",
+            )
+            .bind(broken.id)
+            .bind(due - Duration::minutes(15))
+            .execute(&db.pool)
+            .await
+            .expect("mark outbox sent");
+            let mut conn = db.pool.acquire().await.expect("conn");
+            items::complete(
+                &mut conn,
+                household.household_id,
+                &household.owner(),
+                broken.id,
+                None,
+                "Europe/Moscow",
+                due - Duration::minutes(14),
+            )
+            .await
+            .expect("complete");
+            drop(conn);
+
+            // Другая задача: её напоминание должно доставиться в том же тике,
+            // где шаг синхронизации падает на закрытии копии первой задачи.
+            let other_due = due + Duration::hours(1);
+            let mut other = support::new_item(household.tasks_list_id, "Другая");
+            other.due_at = Some(other_due);
+            other.assignee_user_id = Some(household.owner_id);
+            let other = support::create_item(
+                &db.pool,
+                &household,
+                household.tasks_list_id,
+                &household.owner(),
+                other,
+            )
+            .await;
+
+            let result = support::notifications::tick_with_a_failing_notice_sync(
+                &db.pool,
+                other_due - Duration::minutes(15),
+            )
+            .await;
+
+            let delivered: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM notification_deliveries
+                 WHERE item_id = $1 AND kind = 'reminder' AND status = 'sent'",
+            )
+            .bind(other.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("delivered reminders");
+            (result.is_err(), delivered)
+        })
+    });
+
+    let logs = buffer.contents();
+    assert!(
+        result.0,
+        "a failed notice sync step must be reported by the tick:\n{logs}"
+    );
+    assert_eq!(
+        result.1, 1,
+        "the reminder must still be delivered after the failed step:\n{logs}"
+    );
+    assert!(logs.contains("\"level\":\"ERROR\""), "{logs}");
+    assert!(
+        logs.contains("\"step\":\"sync_completed_notices\""),
         "the error must carry the step name:\n{logs}"
     );
     assert!(
