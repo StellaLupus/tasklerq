@@ -288,10 +288,14 @@ pub(crate) async fn deliver_one_in_conn(
     };
 
     let dedupe_key = delivery_dedupe_key(row.id, row.kind);
-    // Замена (0017, решение 5): snooze из отдельного уведомления удаляет
-    // сообщение «😴 Напомню …» после доставки нового; отметка уборки ставится
-    // здесь же, в транзакции доставки.
-    let replaces: Vec<i64> = row.replaces_message_id.into_iter().collect();
+    // Замена (0017, решения 5, 6): snooze из отдельного уведомления удаляет
+    // сообщение «😴 Напомню …», новая сводка — прежние сводки получателя.
+    // Удаление ставит outbox после фактической доставки нового; отметка уборки
+    // ставится здесь же, в транзакции доставки.
+    let replaces: Vec<i64> = match scope {
+        DeliveryScope::Digest => digest::replace_previous(&mut *conn, &row, chat_id, now).await?,
+        _ => row.replaces_message_id.into_iter().collect(),
+    };
     let seq = enqueue_message(&mut *conn, chat_id, &dedupe_key, html, true, replaces, now).await?;
     if let Some(old) = row.replaces_message_id {
         notifications::mark_dismissed(&mut *conn, chat_id, old, now).await?;

@@ -2,10 +2,14 @@
 
 mod support;
 
+use std::time::{Duration as StdDuration, Instant};
+
 use chrono::{DateTime, Duration, Utc};
+use serde_json::json;
 use support::notifications::*;
-use support::telegram::{Harness, buttons};
+use support::telegram::{Call, Harness, buttons};
 use tasklerq::jobs::digest::digest_occurrence_key;
+use tasklerq::telegram::outbox::OutboxWorker;
 use uuid::Uuid;
 
 /// Последняя строка outbox чата — отметка перед действием.
@@ -892,4 +896,235 @@ async fn manual_release_sends_nothing_when_the_scheduler_already_delivered() {
             .all(|(_, html)| !html.contains("Пока были тихие часы")),
         "manual release must not send a duplicate batch"
     );
+}
+
+/// Payload последней сводки чата в outbox.
+async fn latest_digest_payload(bot: &Harness) -> serde_json::Value {
+    sqlx::query_scalar(
+        "SELECT payload FROM outbox
+         WHERE chat_id = $1 AND kind = 'message' AND dedupe_key LIKE 'notification:digest:%'
+         ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(bot.chat)
+    .fetch_one(&bot.pool)
+    .await
+    .expect("digest payload")
+}
+
+/// Строки удаления с ключом замены: статус, ключ и payload.
+async fn replace_delete_rows(bot: &Harness) -> Vec<(String, String, serde_json::Value)> {
+    sqlx::query_as(
+        "SELECT status::text, dedupe_key, payload FROM outbox
+         WHERE chat_id = $1 AND kind = 'delete' AND dedupe_key LIKE 'replace:%'
+         ORDER BY seq",
+    )
+    .bind(bot.chat)
+    .fetch_all(&bot.pool)
+    .await
+    .expect("replace delete rows")
+}
+
+/// Есть ли среди вызовов фейка удаление данного сообщения.
+fn deleted(bot: &Harness, message_id: i64) -> bool {
+    bot.fake.calls().iter().any(
+        |call| matches!(call, Call::Delete { chat, id } if *chat == bot.chat && *id == message_id),
+    )
+}
+
+/// Живые сообщения сводки чата по версии фейка.
+fn alive_digests(bot: &Harness) -> Vec<(i64, String)> {
+    bot.fake
+        .messages(bot.chat)
+        .into_iter()
+        .filter(|(_, html)| html.contains("Доброе утро"))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manually_released_digest_replaces_the_previous_one() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    let yesterday = day - Duration::days(1);
+    quiet_settings(&db.pool, household.owner_id, true).await;
+
+    // Вчерашняя сводка доставлена после конца тихих часов.
+    let d1_at = local_utc(moscow, yesterday, 9, 0);
+    bot.freeze_at(d1_at);
+    let stats = scheduler(&db.pool)
+        .tick(d1_at)
+        .await
+        .expect("yesterday tick");
+    assert_eq!(stats.delivered, 1, "{stats:?}");
+    bot.deliver().await;
+    let (d1, html) = bot.latest();
+    assert!(html.contains("Доброе утро"), "{html}");
+
+    // Сегодняшняя сводка отложена тихими часами на 08:00.
+    let release_at = local_utc(moscow, day, 8, 0);
+    insert_digest_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        &digest_occurrence_key(day),
+        release_at,
+        true,
+    )
+    .await;
+
+    // Ручной выпуск в 06:00, внутри тихих часов: обновление обработано,
+    // исходящие ещё не доставлены.
+    bot.advance(local_utc(moscow, day, 6, 0) - bot.now);
+    open_notifications(&mut bot).await;
+    let screen = bot.screen();
+    let start = screen.find("🌙 Тихие часы").expect("quiet hours block");
+    let toggle = button_of(&screen[start..], "Выкл");
+    let (screen_id, _) = bot.active();
+    bot.press_data_pending(&toggle, screen_id).await;
+
+    let payload = latest_digest_payload(&bot).await;
+    assert_eq!(payload["replaces"], json!([d1]), "{payload}");
+    // До доставки выпущенной сводки удаления прежней нет.
+    assert!(replace_delete_rows(&bot).await.is_empty());
+
+    // Проходы воркера: сначала экран, затем выпущенная сводка; удаление
+    // ставится только после доставки сводки.
+    let mut worker = OutboxWorker::new(db.pool.clone(), bot.fake.clone()).only_chat(bot.chat);
+    let mut clock = Instant::now();
+    clock += StdDuration::from_secs(2);
+    assert_eq!(
+        worker.run_once(bot.now, clock).await.expect("screen pass"),
+        1
+    );
+    assert!(replace_delete_rows(&bot).await.is_empty());
+    clock += StdDuration::from_secs(2);
+    assert_eq!(
+        worker.run_once(bot.now, clock).await.expect("digest pass"),
+        1
+    );
+    let (d2, html) = bot.latest();
+    assert!(html.contains("Доброе утро"), "{html}");
+    assert_ne!(d2, d1);
+    let deletes = replace_delete_rows(&bot).await;
+    assert_eq!(deletes.len(), 1, "{deletes:?}");
+    assert_eq!(deletes[0].0, "pending", "{deletes:?}");
+    assert_eq!(
+        deletes[0].1,
+        format!("replace:{}:{d1}", bot.chat),
+        "{deletes:?}"
+    );
+    assert_eq!(deletes[0].2["message_id"], json!(d1), "{deletes:?}");
+    assert_eq!(deletes[0].2["cleanup"], json!(true), "{deletes:?}");
+    assert!(
+        !deleted(&bot, d1),
+        "the delete must not run before its own pass"
+    );
+
+    // Следующий проход выполняет удаление: в чате одна сводка.
+    clock += StdDuration::from_secs(2);
+    worker.run_once(bot.now, clock).await.expect("delete pass");
+    assert!(deleted(&bot, d1));
+    let alive = alive_digests(&bot);
+    assert_eq!(alive.len(), 1, "{alive:?}");
+    assert_ne!(alive[0].0, d1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_deferred_by_quiet_hours_replaces_the_previous_one_when_released_by_tick() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    let yesterday = day - Duration::days(1);
+    // Сводка в 07:00 попадает внутрь тихих часов 22:00–08:00.
+    set_notifications(
+        &db.pool,
+        household.owner_id,
+        json!({
+            "digest_enabled": true,
+            "digest_time": "07:00",
+            "quiet_hours_enabled": true,
+            "quiet_start": "22:00",
+            "quiet_end": "08:00"
+        }),
+    )
+    .await;
+
+    // Вчерашняя сводка доставлена после конца тихих часов.
+    let d1_at = local_utc(moscow, yesterday, 9, 0);
+    bot.freeze_at(d1_at);
+    let stats = scheduler(&db.pool)
+        .tick(d1_at)
+        .await
+        .expect("yesterday tick");
+    assert_eq!(stats.delivered, 1, "{stats:?}");
+    bot.deliver().await;
+    let (d1, html) = bot.latest();
+    assert!(html.contains("Доброе утро"), "{html}");
+
+    // 07:30: время сводки (07:00) прошло, но ещё тихо — запись планируется
+    // и переносится тихими часами на их конец.
+    let morning = local_utc(moscow, day, 7, 30);
+    bot.advance(morning - bot.now);
+    let stats = scheduler(&db.pool)
+        .tick(morning)
+        .await
+        .expect("morning tick");
+    assert_eq!(stats.delivered, 0, "{stats:?}");
+    let (scheduled_at, deferred): (DateTime<Utc>, bool) = sqlx::query_as(
+        "SELECT scheduled_at, deferred FROM notification_deliveries
+         WHERE user_id = $1 AND kind = 'digest' AND status = 'pending'",
+    )
+    .bind(household.owner_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("deferred digest");
+    assert_eq!(scheduled_at, local_utc(moscow, day, 8, 0));
+    assert!(deferred);
+
+    // 08:00: тихие часы закончились, тик выпускает сводку, и она убирает прежнюю.
+    let release_at = local_utc(moscow, day, 8, 0);
+    let stats = scheduler(&db.pool)
+        .tick(release_at)
+        .await
+        .expect("release tick");
+    assert_eq!(stats.delivered, 1, "{stats:?}");
+    let payload = latest_digest_payload(&bot).await;
+    assert_eq!(payload["replaces"], json!([d1]), "{payload}");
+    assert!(replace_delete_rows(&bot).await.is_empty());
+
+    bot.advance(release_at - bot.now);
+    // Первый проход воркера доставляет сводку и ставит удаление прежней.
+    let mut worker = OutboxWorker::new(db.pool.clone(), bot.fake.clone()).only_chat(bot.chat);
+    let mut clock = Instant::now();
+    clock += StdDuration::from_secs(2);
+    assert_eq!(
+        worker.run_once(bot.now, clock).await.expect("digest pass"),
+        1
+    );
+    let deletes = replace_delete_rows(&bot).await;
+    assert_eq!(deletes.len(), 1, "{deletes:?}");
+    assert_eq!(deletes[0].0, "pending", "{deletes:?}");
+    assert_eq!(
+        deletes[0].1,
+        format!("replace:{}:{d1}", bot.chat),
+        "{deletes:?}"
+    );
+    assert_eq!(deletes[0].2["message_id"], json!(d1), "{deletes:?}");
+    assert_eq!(deletes[0].2["cleanup"], json!(true), "{deletes:?}");
+    assert!(
+        !deleted(&bot, d1),
+        "the delete must not run before its own pass"
+    );
+
+    // Следующий проход выполняет удаление: в чате одна сводка.
+    clock += StdDuration::from_secs(2);
+    worker.run_once(bot.now, clock).await.expect("delete pass");
+    assert!(deleted(&bot, d1));
+    let alive = alive_digests(&bot);
+    assert_eq!(alive.len(), 1, "{alive:?}");
+    assert_ne!(alive[0].0, d1);
 }
