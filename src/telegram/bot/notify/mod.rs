@@ -83,7 +83,7 @@ pub fn reminder_ui(
     };
     if list.kind == ListKind::Events {
         // Событие не выполняется и не откладывается: у напоминания свои
-        // действия — закрыть, перенести начало или открыть карточку.
+        // действия — убрать, перенести начало или открыть карточку.
         return Ui::new()
             .heading(heading)
             .spans(title_spans(&item.title))
@@ -96,7 +96,7 @@ pub fn reminder_ui(
                 event_moment(item.end_at, item.end_date, tz, now)
             ))
             .row(vec![
-                button("Закрыть", Action::NoticeClose),
+                button(ru::DISMISS_BUTTON, Action::NoticeClose),
                 button("📅 Перенести", Action::NoticeMove { item_id: item.id }),
             ])
             .row(vec![button(
@@ -136,6 +136,7 @@ pub fn reminder_ui(
             ),
             button("📋 Открыть", Action::NoticeOpen { item_id: item.id }),
         ])
+        .row(vec![button(ru::DISMISS_BUTTON, Action::NoticeClose)])
 }
 
 /// Уведомление о назначении.
@@ -154,6 +155,7 @@ pub fn assignment_ui(item: &Item, list: &List, tz: Tz, now: DateTime<Utc>) -> Ui
                 },
             ),
         ])
+        .row(vec![button(ru::DISMISS_BUTTON, Action::NoticeClose)])
 }
 
 /// Строка утренней сводки.
@@ -259,6 +261,7 @@ pub fn digest_ui(
         }
     }
     ui.row(row)
+        .row(vec![button(ru::DISMISS_BUTTON, Action::NoticeClose)])
 }
 
 /// Экран после действия над уведомлением.
@@ -278,6 +281,14 @@ pub fn done_ui(item: &Item, list_id: Uuid, next: Option<&str>) -> Ui {
                 from_lists: false,
             },
         ),
+    ])
+}
+
+/// Экран «Задача больше недоступна».
+fn gone_ui() -> Ui {
+    Ui::new().heading("Задача больше недоступна").row(vec![
+        back_button(ru::MENU_BUTTON, Screen::Menu),
+        button(ru::DISMISS_BUTTON, Action::NoticeClose),
     ])
 }
 
@@ -340,12 +351,7 @@ async fn show_current(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> Resu
             let ui = done_ui(&item, list.id, None);
             edit_notice(ctx, message_id, &ui).await
         }
-        None => {
-            let ui = Ui::new()
-                .heading("Задача больше недоступна")
-                .row(vec![back_button(ru::MENU_BUTTON, Screen::Menu)]);
-            edit_notice(ctx, message_id, &ui).await
-        }
+        None => edit_notice(ctx, message_id, &gone_ui()).await,
     }
 }
 
@@ -419,7 +425,7 @@ pub(super) async fn open(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> R
     .await
 }
 
-/// «Закрыть» из напоминания о событии: удалить сообщение из чата.
+/// «🗑 Убрать» из любого уведомления: удалить сообщение из чата.
 ///
 /// Запись доставки не меняется и остаётся `sent`, поэтому напоминание о том же
 /// вхождении повторно не планируется; о следующем вхождении придёт по
@@ -507,6 +513,14 @@ pub(super) async fn insert_snooze(
     Ok(())
 }
 
+/// Экран «😴 Напомню …» после откладывания напоминания.
+fn snoozed_ui(heading: String, title: &str, item_id: Uuid) -> Ui {
+    Ui::new().heading(heading).text(clip(title, 120)).row(vec![
+        button("📋 Открыть", Action::NoticeOpen { item_id }),
+        button(ru::DISMISS_BUTTON, Action::NoticeClose),
+    ])
+}
+
 /// «Отложить»: создаёт отдельную доставку, которую отправит планировщик.
 pub async fn snooze(
     ctx: &mut Ctx<'_>,
@@ -539,10 +553,7 @@ pub async fn snooze(
         ru::due_label(Some(deliver_at), None, ctx.tz, ctx.now)
             .unwrap_or_else(|| local.format("%H:%M").to_string())
     );
-    let ui = Ui::new()
-        .heading(text)
-        .text(clip(&item.title, 120))
-        .row(vec![button("📋 Открыть", Action::NoticeOpen { item_id })]);
+    let ui = snoozed_ui(text, &item.title, item_id);
     edit_notice(ctx, message_id, &ui).await
 }
 
@@ -551,6 +562,8 @@ mod tests {
     use chrono::TimeZone;
 
     use super::*;
+    use crate::domain::models::{ItemPriority, ItemSource};
+    use crate::telegram::rich::{Block, Button};
 
     #[test]
     fn snooze_options_resolve_in_local_time() {
@@ -595,8 +608,8 @@ mod tests {
             })
             .collect();
         let ui = digest_ui(&lines, &[], 0, Some(Uuid::now_v7()), None);
-        assert_eq!(ui.button_count(), 2);
-        let tokens = vec!["t:AAAAAAAAAAAAAAAA".to_owned(); 2];
+        assert_eq!(ui.button_count(), 3);
+        let tokens = vec!["t:AAAAAAAAAAAAAAAA".to_owned(); 3];
         let html = crate::telegram::rich::render(&ui, &tokens).html;
 
         assert_eq!(html.matches("☐ Задача").count(), 20);
@@ -619,7 +632,7 @@ mod tests {
             is_event: true,
         }));
         let ui = digest_ui(&lines, &[], 0, Some(Uuid::now_v7()), None);
-        let tokens = vec!["t:AAAAAAAAAAAAAAAA".to_owned(); 2];
+        let tokens = vec!["t:AAAAAAAAAAAAAAAA".to_owned(); 3];
         let html = crate::telegram::rich::render(&ui, &tokens).html;
 
         assert_eq!(html.matches("☐ Задача").count(), 15);
@@ -697,7 +710,8 @@ mod tests {
     #[test]
     fn empty_digest_says_the_day_is_free() {
         let ui = digest_ui(&[], &[], 0, None, None);
-        let html = crate::telegram::rich::render(&ui, &[]).html;
+        let tokens = vec!["t:AAAAAAAAAAAAAAAA".to_owned()];
+        let html = crate::telegram::rich::render(&ui, &tokens).html;
         assert!(html.contains("День свободен."));
         assert!(!html.contains("Сегодня"));
         assert!(!html.contains("Просрочено"));
@@ -707,7 +721,183 @@ mod tests {
     #[test]
     fn digest_with_only_shopping_keeps_the_purchase_count() {
         let ui = digest_ui(&[], &[], 7, None, None);
-        let html = crate::telegram::rich::render(&ui, &[]).html;
+        let tokens = vec!["t:AAAAAAAAAAAAAAAA".to_owned()];
+        let html = crate::telegram::rich::render(&ui, &tokens).html;
         assert!(html.contains("Покупки: 7 позиций"));
+    }
+
+    fn notice_item(title: &str) -> Item {
+        Item {
+            id: Uuid::now_v7(),
+            household_id: Uuid::nil(),
+            list_id: Uuid::nil(),
+            title: title.into(),
+            notes: None,
+            status: ItemStatus::Open,
+            priority: ItemPriority::Normal,
+            due_at: Some(Utc.with_ymd_and_hms(2026, 11, 23, 12, 0, 0).unwrap()),
+            due_date: None,
+            end_at: None,
+            end_date: None,
+            assignee_user_id: None,
+            created_by_user_id: None,
+            source: ItemSource::Telegram,
+            capture_id: None,
+            completed_at: None,
+            completed_by_user_id: None,
+            quantity: None,
+            unit: None,
+            position: 0,
+            version: 1,
+            recurrence: None,
+            created_at: DateTime::UNIX_EPOCH,
+            updated_at: DateTime::UNIX_EPOCH,
+            deleted_at: None,
+            tags: Vec::new(),
+            subtasks: Vec::new(),
+        }
+    }
+
+    fn notice_list(kind: ListKind, name: &str) -> List {
+        List {
+            id: Uuid::now_v7(),
+            household_id: Uuid::nil(),
+            kind,
+            name: name.into(),
+            is_default: true,
+            is_archived: false,
+            position: 0,
+            created_at: DateTime::UNIX_EPOCH,
+            updated_at: DateTime::UNIX_EPOCH,
+            deleted_at: None,
+        }
+    }
+
+    fn moscow_now() -> (Tz, DateTime<Utc>) {
+        (
+            "Europe/Moscow".parse().expect("tz"),
+            Utc.with_ymd_and_hms(2026, 11, 23, 9, 0, 0).unwrap(),
+        )
+    }
+
+    fn button_rows(ui: &Ui) -> Vec<&[Button<Action>]> {
+        ui.blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Buttons(buttons) => Some(buttons.as_slice()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn row_labels(row: &[Button<Action>]) -> Vec<&str> {
+        row.iter().map(|button| button.label.as_str()).collect()
+    }
+
+    #[test]
+    fn task_reminder_has_dismiss_button_on_the_third_row() {
+        let (tz, now) = moscow_now();
+        let item = notice_item("Оплатить интернет");
+        let list = notice_list(ListKind::Tasks, "Задачи");
+        let ui = reminder_ui(&item, &list, tz, now, Some(15));
+
+        let rows = button_rows(&ui);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(row_labels(rows[0]), ["✓ Выполнено", "😴 Отложить на час"]);
+        assert_eq!(row_labels(rows[1]), ["📅 Завтра в 09:00", "📋 Открыть"]);
+        assert_eq!(row_labels(rows[2]), ["🗑 Убрать"]);
+        assert!(matches!(rows[2][0].action, Action::NoticeClose));
+    }
+
+    #[test]
+    fn event_reminder_replaces_close_with_dismiss() {
+        let (tz, now) = moscow_now();
+        let mut item = notice_item("Маникюр");
+        item.end_at = Some(Utc.with_ymd_and_hms(2026, 11, 23, 13, 30, 0).unwrap());
+        let list = notice_list(ListKind::Events, "События");
+        let ui = reminder_ui(&item, &list, tz, now, Some(15));
+
+        let rows = button_rows(&ui);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(row_labels(rows[0]), ["🗑 Убрать", "📅 Перенести"]);
+        assert_eq!(row_labels(rows[1]), ["📋 Открыть"]);
+        assert!(matches!(rows[0][0].action, Action::NoticeClose));
+        assert!(
+            !rows
+                .iter()
+                .flat_map(|row| row_labels(row))
+                .any(|label| label.contains("Закрыть")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn assignment_notice_has_dismiss_button_on_a_separate_row() {
+        let (tz, now) = moscow_now();
+        let item = notice_item("Купить торт");
+        let list = notice_list(ListKind::Tasks, "Задачи");
+        let ui = assignment_ui(&item, &list, tz, now);
+
+        let rows = button_rows(&ui);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(row_labels(rows[0]), ["📋 Открыть", "✓ Выполнено"]);
+        assert_eq!(row_labels(rows[1]), ["🗑 Убрать"]);
+        assert!(matches!(rows[1][0].action, Action::NoticeClose));
+    }
+
+    #[test]
+    fn digest_has_dismiss_button_on_the_last_row() {
+        let lines: Vec<DigestLine> = (0..25)
+            .map(|n| DigestLine {
+                title: format!("Задача {n}"),
+                when: "сегодня".into(),
+                is_event: false,
+            })
+            .collect();
+        let ui = digest_ui(&lines, &[], 3, Some(Uuid::now_v7()), Some(Uuid::now_v7()));
+
+        let rows = button_rows(&ui);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(
+            row_labels(rows[0]),
+            ["📋 Задачи", "🛒 Покупки", "Показать ещё"]
+        );
+        assert_eq!(row_labels(rows[1]), ["🗑 Убрать"]);
+        assert!(matches!(rows[1][0].action, Action::NoticeClose));
+    }
+
+    #[test]
+    fn empty_digest_has_dismiss_button() {
+        let ui = digest_ui(&[], &[], 0, None, None);
+
+        let rows = button_rows(&ui);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(row_labels(rows[0]), ["🗑 Убрать"]);
+        assert!(matches!(rows[0][0].action, Action::NoticeClose));
+    }
+
+    #[test]
+    fn snoozed_screen_has_dismiss_button() {
+        let item_id = Uuid::now_v7();
+        let ui = snoozed_ui("😴 Напомню в 11:00".into(), "Позвонить маме", item_id);
+
+        let rows = button_rows(&ui);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(row_labels(rows[0]), ["📋 Открыть", "🗑 Убрать"]);
+        assert!(matches!(
+            rows[0][0].action,
+            Action::NoticeOpen { item_id: id } if id == item_id
+        ));
+        assert!(matches!(rows[0][1].action, Action::NoticeClose));
+    }
+
+    #[test]
+    fn gone_screen_has_dismiss_button() {
+        let ui = gone_ui();
+
+        let rows = button_rows(&ui);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(row_labels(rows[0]), ["🏠 Меню", "🗑 Убрать"]);
+        assert!(matches!(rows[0][1].action, Action::NoticeClose));
     }
 }

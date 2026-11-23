@@ -286,7 +286,7 @@ fn rounded_now() -> DateTime<Utc> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn scheduler_reminder_has_four_action_buttons() {
+async fn scheduler_reminder_has_five_action_buttons() {
     let db = isolated_db().await;
     let mut bot = onboarded(&db.pool).await;
     quiet_off(&db.pool, bot.chat).await;
@@ -300,9 +300,14 @@ async fn scheduler_reminder_has_four_action_buttons() {
     assert!(html.contains("⏰ Через 15 минут"), "{html}");
     assert!(html.contains("Оплатить интернет"), "{html}");
     let labels: Vec<String> = buttons(&html).into_iter().map(|(label, _)| label).collect();
-    assert_eq!(labels.len(), 4, "{labels:?}");
-    for expected in ["Выполнено", "Отложить на час", "Завтра в 09:00", "Открыть"]
-    {
+    assert_eq!(labels.len(), 5, "{labels:?}");
+    for expected in [
+        "Выполнено",
+        "Отложить на час",
+        "Завтра в 09:00",
+        "Открыть",
+        "Убрать",
+    ] {
         assert!(
             labels.iter().any(|label| label.contains(expected)),
             "button `{expected}` missing: {labels:?}"
@@ -440,7 +445,7 @@ async fn snooze_one_hour_creates_one_delivery_and_keeps_the_due_date() {
     tick_and_deliver(&mut bot, &db.pool, expected).await;
     assert_eq!(message_count(&bot, "Позвонить маме"), 2);
     let (_, reminder) = bot.latest();
-    assert_eq!(buttons(&reminder).len(), 4, "{reminder}");
+    assert_eq!(buttons(&reminder).len(), 5, "{reminder}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -545,7 +550,7 @@ async fn snooze_at_night_is_delivered_at_the_end_of_quiet_hours() {
     )
     .await;
     assert_eq!(message_count(&bot, "Выключить свет"), 2);
-    assert_eq!(buttons(&bot.latest().1).len(), 4);
+    assert_eq!(buttons(&bot.latest().1).len(), 5);
     assert_eq!(snooze_rows(&db.pool, item.id).await[0].0, "sent");
 }
 
@@ -1298,7 +1303,7 @@ async fn event_reminder_shows_start_end_and_event_actions() {
 
     let labels: Vec<String> = buttons(&html).into_iter().map(|(label, _)| label).collect();
     assert_eq!(labels.len(), 3, "{labels:?}");
-    for expected in ["Закрыть", "📅 Перенести", "Открыть"] {
+    for expected in ["🗑 Убрать", "📅 Перенести", "Открыть"] {
         assert!(
             labels.iter().any(|label| label.contains(expected)),
             "button `{expected}` missing: {labels:?}"
@@ -1335,7 +1340,7 @@ async fn closed_event_reminder_is_deleted_and_does_not_come_back_for_the_same_oc
 
     tick_and_deliver(&mut bot, &db.pool, start - Duration::minutes(15)).await;
     let (message_id, html) = bot.latest();
-    let close = button_of(&html, "Закрыть");
+    let close = button_of(&html, "🗑 Убрать");
     let before = event_times(&db.pool, event.id).await;
 
     bot.press_data(&close, message_id).await;
@@ -1345,7 +1350,7 @@ async fn closed_event_reminder_is_deleted_and_does_not_come_back_for_the_same_oc
             call,
             Call::Delete { chat, id } if *chat == bot.chat && *id == message_id
         )),
-        "«Закрыть» must delete the reminder through the outbox"
+        "«🗑 Убрать» must delete the reminder through the outbox"
     );
     assert!(
         !bot.fake
@@ -1357,7 +1362,7 @@ async fn closed_event_reminder_is_deleted_and_does_not_come_back_for_the_same_oc
     assert_eq!(
         event_times(&db.pool, event.id).await,
         before,
-        "«Закрыть» must not change the event"
+        "«🗑 Убрать» must not change the event"
     );
     let rows = reminder_rows(&db.pool, event.id).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
