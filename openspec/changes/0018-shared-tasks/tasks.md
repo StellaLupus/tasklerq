@@ -34,7 +34,7 @@
 
 ## 3. Синхронизация отправленных уведомлений
 
-- [ ] 3.1 Миграция `0026_notice_closed.sql` (номер сдвигается при другом
+- [x] 3.1 Миграция `0026_notice_closed.sql` (номер сдвигается при другом
   порядке слияния): `notification_deliveries.closed_at`, `closed_reason`
   (`completed` | `assigned`, CHECK), `closed_by_event`
   (`REFERENCES item_events (id) ON DELETE SET NULL`), частичный индекс
