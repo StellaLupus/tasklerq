@@ -2,7 +2,7 @@
 
 ## 1. Настройка состава сводки
 
-- [ ] 1.1 `DigestScope` (`all` | `mine`, неизвестное значение → `all` через
+- [x] 1.1 `DigestScope` (`all` | `mine`, неизвестное значение → `all` через
   `#[serde(other)]`) и поле `digest_scope` с умолчанием `all` в
   `NotificationSettings` и patch (`src/domain/settings.rs`). Проверить в
   `tests/settings.rs`: настройки без поля читаются как `all`; неизвестное

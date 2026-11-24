@@ -10,7 +10,9 @@ use tasklerq::auth::tokens::hash_token;
 use tasklerq::domain::error::DomainError;
 use tasklerq::domain::identity::{AuditEventType, NewMember, NoticeKind};
 use tasklerq::domain::models::{Actor, ActorType, EventType, ItemPatch, UserRole};
-use tasklerq::domain::settings::{NotificationSettings, NotificationSettingsUpdate, ProfileUpdate};
+use tasklerq::domain::settings::{
+    DigestScope, NotificationSettings, NotificationSettingsUpdate, ProfileUpdate,
+};
 use tasklerq::storage::repositories::audit::{self, JournalCursor};
 use tasklerq::storage::repositories::{households, invites, items, members, users};
 use uuid::Uuid;
@@ -216,6 +218,65 @@ async fn notification_settings_are_validated_and_independent() {
     )
     .await;
     assert!(matches!(system, Err(DomainError::Forbidden(_))));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_scope_patch_changes_only_scope_and_only_this_member() {
+    let db = support::db().await;
+    let household = support::create_household(&db.pool).await;
+
+    // Участник заранее меняет другие настройки; состав пока по умолчанию.
+    let customized = update_profile(
+        &db.pool,
+        &household,
+        &household.member(),
+        ProfileUpdate {
+            notifications: Some(NotificationSettingsUpdate {
+                lead_minutes: Some(60),
+                digest_time: Some("07:45".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("member settings");
+    let before = NotificationSettings::from_settings(&customized.settings);
+    assert_eq!(before.digest_scope, DigestScope::All);
+
+    // Patch только состава: остальные поля участника прежние.
+    let updated = update_profile(
+        &db.pool,
+        &household,
+        &household.member(),
+        ProfileUpdate {
+            notifications: Some(NotificationSettingsUpdate {
+                digest_scope: Some(DigestScope::Mine),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("scope patch");
+    let after = NotificationSettings::from_settings(&updated.settings);
+    let mut expected = before;
+    expected.digest_scope = DigestScope::Mine;
+    assert_eq!(after, expected);
+
+    // Настройки второго участника остаются по умолчанию, состав — «все».
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let owner = users::get(&mut conn, household.household_id, household.owner_id)
+        .await
+        .expect("owner");
+    assert_eq!(
+        NotificationSettings::from_settings(&owner.settings),
+        NotificationSettings::default()
+    );
+    assert_eq!(
+        NotificationSettings::from_settings(&owner.settings).digest_scope,
+        DigestScope::All
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
