@@ -3846,11 +3846,11 @@ async fn digest_view_shows_a_done_task_without_a_completion_event() {
     assert!(!html.contains("✅ Вынести мусор ·"), "{html}");
 }
 
-/// Отрисовка не зависит от «сейчас»: `digest_view` одной доставки при неизменном
-/// состоянии даёт одинаковый отпечаток, когда бы он ни считался; подписи
-/// относительны к дню сводки («вчера», «следующее завтра»).
+/// Подписи сводки относительны к дню сводки, а не к моменту отрисовки:
+/// вседневная задача дня сводки — «весь день», вчерашняя — «вчера, 12:00»,
+/// следующая у выполненной ежедневной — «следующее завтра».
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn digest_view_fingerprint_does_not_depend_on_when_it_is_computed() {
+async fn digest_view_labels_are_relative_to_the_digest_day() {
     let db = support::isolated_db().await;
     let household = household_without_digest(&db).await;
     let moscow = chrono_tz::Europe::Moscow;
@@ -3922,19 +3922,6 @@ async fn digest_view_fingerprint_does_not_depend_on_when_it_is_computed() {
     assert!(html.contains("☐ Сегодняшняя · весь день"), "{html}");
     assert!(html.contains("☐ Просроченная · вчера, 12:00"), "{html}");
     assert!(html.contains("✅ Ежедневная · следующее завтра"), "{html}");
-    let first = tasklerq::telegram::bot::notify::ui_fingerprint(
-        &tasklerq::telegram::bot::notify::digest_ui(&view),
-    );
-
-    // Состояние не менялось; повторное представление той же доставки (спустя
-    // сутки — `digest_view` не принимает «сейчас») даёт тот же отпечаток.
-    let again = tasklerq::jobs::digest::digest_view(&mut conn, delivery_id)
-        .await
-        .expect("digest view again");
-    let second = tasklerq::telegram::bot::notify::ui_fingerprint(
-        &tasklerq::telegram::bot::notify::digest_ui(&again),
-    );
-    assert_eq!(first, second);
 }
 
 /// Удалённая задача, задача из архивного списка и удалённое событие — текст

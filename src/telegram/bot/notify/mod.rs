@@ -894,25 +894,13 @@ pub async fn digest_toggle(
     version: i32,
 ) -> Result<(), Fail> {
     let household = ctx.household()?.clone();
-    let user_id = ctx.user()?.id;
     let actor = ctx.actor()?;
 
     // Сводка получателя этого чата со снимком; чужая/не сводка/без снимка —
     // ничего не меняем.
-    let delivery: Option<(Option<serde_json::Value>,)> = sqlx::query_as(
-        "SELECT digest_items
-         FROM notification_deliveries
-         WHERE id = $1 AND user_id = $2 AND household_id = $3 AND kind = 'digest'
-         FOR UPDATE",
-    )
-    .bind(delivery_id)
-    .bind(user_id)
-    .bind(household.id)
-    .fetch_optional(&mut *ctx.conn)
-    .await?;
-    let Some((Some(_),)) = delivery else {
+    if !lock_own_digest(ctx, delivery_id).await? {
         return Ok(());
-    };
+    }
 
     let view = crate::jobs::digest::digest_view(&mut *ctx.conn, delivery_id).await?;
     if let Some(line) = view.lines.iter().find(|line| line.item_id == item_id) {
@@ -941,6 +929,12 @@ pub async fn digest_toggle(
                         .is_some_and(|line| {
                             matches!(line.state, DigestLineState::Completed { .. })
                         });
+                    // «Задача уже выполнена» здесь достижима только гонкой:
+                    // представление выше показало строку открытой, значит на
+                    // момент чтения вхождение было открыто; Conflict без
+                    // выполненного нами вхождения означает, что другой участник
+                    // выполнил его между чтением представления и complete.
+                    // Детерминированным тестом эта ветка не покрывается.
                     ctx.toast(if completed {
                         "Задача уже выполнена"
                     } else {
@@ -1002,6 +996,56 @@ pub async fn digest_toggle(
     }
 
     // Перерисовка всей сводки на месте и запись отпечатка новой отрисовки.
+    redraw_digest(ctx, message_id, delivery_id).await
+}
+
+/// Истёкший токен строки сводки: задачу не меняем, перерисовываем сводку с
+/// новыми токенами и просим нажать ещё раз (0019, design, решение 2; spec
+/// «Устаревшие кнопки сводки»). Сводка живёт до 47 часов, а токены — 24.
+///
+/// Перерисовка — только если доставка действительно сводка этого получателя
+/// (та же охрана, что у [`digest_toggle`]); иначе — тост «устарело», как у
+/// прочих истёкших действий. Чужой токен и токен после смены household
+/// отклоняются общими правилами `on_callback` до вызова.
+pub async fn digest_refresh(
+    ctx: &mut Ctx<'_>,
+    message_id: i64,
+    delivery_id: Uuid,
+) -> Result<(), Fail> {
+    if !lock_own_digest(ctx, delivery_id).await? {
+        ctx.toast("Это действие устарело. Открываю актуальный экран.");
+        return Ok(());
+    }
+    redraw_digest(ctx, message_id, delivery_id).await?;
+    ctx.toast("Сводка обновлена — нажмите ещё раз");
+    Ok(())
+}
+
+/// Заблокировать `FOR UPDATE` доставку сводки этого получателя в текущем
+/// household со снимком. `false` — чужая, не сводка или без снимка: действие
+/// ничего не меняет (0019, design, решение 2). Общая охрана касания строки
+/// ([`digest_toggle`]) и перерисовки по истёкшему токену ([`digest_refresh`]).
+async fn lock_own_digest(ctx: &mut Ctx<'_>, delivery_id: Uuid) -> Result<bool, Fail> {
+    let household_id = ctx.household()?.id;
+    let user_id = ctx.user()?.id;
+    let delivery: Option<(Option<serde_json::Value>,)> = sqlx::query_as(
+        "SELECT digest_items
+         FROM notification_deliveries
+         WHERE id = $1 AND user_id = $2 AND household_id = $3 AND kind = 'digest'
+         FOR UPDATE",
+    )
+    .bind(delivery_id)
+    .bind(user_id)
+    .bind(household_id)
+    .fetch_optional(&mut *ctx.conn)
+    .await?;
+    Ok(matches!(delivery, Some((Some(_),))))
+}
+
+/// Перерисовать всю сводку на месте и записать отпечаток новой отрисовки в
+/// `digest_hash` (0019, design, решения 2, 6). Общая часть касания строки
+/// ([`digest_toggle`]) и перерисовки по истёкшему токену ([`digest_refresh`]).
+async fn redraw_digest(ctx: &mut Ctx<'_>, message_id: i64, delivery_id: Uuid) -> Result<(), Fail> {
     let view = crate::jobs::digest::digest_view(&mut *ctx.conn, delivery_id).await?;
     let ui = digest_ui(&view);
     edit_notice(ctx, message_id, &ui).await?;

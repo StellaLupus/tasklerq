@@ -1012,6 +1012,7 @@ async fn on_callback(ctx: &mut Ctx<'_>, message_id: i64, data: &str) -> Result<(
     }
 
     let consumed = callbacks::consume(&mut *ctx.conn, data, ctx.sender.id, ctx.now).await?;
+    let expired = matches!(consumed, Consumed::Expired(_));
     let token = match consumed {
         Consumed::Valid(token) => token,
         Consumed::Replayed(scope) => {
@@ -1020,14 +1021,18 @@ async fn on_callback(ctx: &mut Ctx<'_>, message_id: i64, data: &str) -> Result<(
         }
         Consumed::Expired(token) => {
             // «🗑 Убрать» выполняется и после истечения токена: удалить своё
-            // сообщение безопасно (design 0017, решение 1). Остальные истёкшие
-            // действия ведут себя как раньше.
-            let dismiss = token.scope == Scope::Notice
+            // сообщение безопасно (design 0017, решение 1). Касание строки
+            // сводки по истёкшему токену не меняет задачу, а перерисовывает
+            // сводку с новыми токенами (0019, решение 2): сводка живёт до 47
+            // часов, а токены — 24. Остальные истёкшие действия ведут себя как
+            // раньше. Проверки household и чужого токена ниже действуют и для
+            // этих исключений.
+            let keep = token.scope == Scope::Notice
                 && matches!(
                     serde_json::from_value::<Action>(token.payload.clone()),
-                    Ok(Action::NoticeClose)
+                    Ok(Action::NoticeClose | Action::DigestToggle { .. })
                 );
-            if dismiss {
+            if keep {
                 token
             } else {
                 ctx.toast("Это действие устарело. Открываю актуальный экран.");
@@ -1077,7 +1082,7 @@ async fn on_callback(ctx: &mut Ctx<'_>, message_id: i64, data: &str) -> Result<(
     // Действующий токен уже потреблён: откат действия его не возвращает
     // (истёкший «🗑 Убрать» не потребляется и повторное нажатие безопасно:
     // удаление идемпотентно по ключу).
-    ctx.in_step(|ctx| Box::pin(run_action(ctx, message_id, action)))
+    ctx.in_step(|ctx| Box::pin(run_action(ctx, message_id, action, expired)))
         .await
 }
 
@@ -1090,7 +1095,12 @@ async fn refresh_unless_notice(ctx: &mut Ctx<'_>, scope: Scope) -> Result<(), Fa
     }
 }
 
-async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Result<(), Fail> {
+async fn run_action(
+    ctx: &mut Ctx<'_>,
+    message_id: i64,
+    action: Action,
+    expired: bool,
+) -> Result<(), Fail> {
     match action {
         Action::Go { to } => {
             if !matches!(to, Screen::Form) {
@@ -1235,7 +1245,15 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
             delivery_id,
             item_id,
             version,
-        } => notify::digest_toggle(ctx, message_id, delivery_id, item_id, version).await,
+        } => {
+            if expired {
+                // Истёкший токен: задачу не трогаем, перерисовываем сводку с
+                // новыми токенами (0019, решение 2).
+                notify::digest_refresh(ctx, message_id, delivery_id).await
+            } else {
+                notify::digest_toggle(ctx, message_id, delivery_id, item_id, version).await
+            }
+        }
 
         Action::BatchPage { batch_id, page } => {
             notify::batch_page(ctx, message_id, batch_id, page).await
