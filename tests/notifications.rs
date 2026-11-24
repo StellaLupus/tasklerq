@@ -2844,7 +2844,7 @@ async fn digest_fires_at_local_digest_time_once_and_next_day_gets_a_new_key() {
     let overdue_at = html.find("<b>Просрочено</b>").expect("overdue heading");
     let morning_at = html.find("Утренняя задача").expect("morning task");
     assert!(morning_at > overdue_at, "{html}");
-    assert!(html.contains("Покупки: 3 позиции"), "{html}");
+    assert!(html.contains("🛒 Покупки · 3"), "{html}");
     assert!(!html.contains("Куплено"), "{html}");
 
     let rows = digest_rows(&db.pool, household.owner_id).await;
@@ -3315,17 +3315,27 @@ async fn digest_skips_completed_deleted_and_other_household_tasks() {
     assert!(!html.contains("Чужая задача"), "{html}");
 }
 
+/// Элементы household для тестов состава сводки.
+struct DigestScopeItems {
+    petya_task: Uuid,
+    shared_task: Uuid,
+    masha_task: Uuid,
+    petya_event: Uuid,
+    shared_event: Uuid,
+    masha_event: Uuid,
+}
+
 /// Household для тестов состава сводки: Петя получает сводку, Маша — нет.
 /// На сегодня задача Пети, общая задача, задача Маши, событие Пети, событие
 /// Маши, общее событие и одна открытая покупка.
-async fn digest_scope_household(db: &TestDb) -> (TestHousehold, Uuid) {
+async fn digest_scope_household(db: &TestDb) -> (TestHousehold, Uuid, Uuid, DigestScopeItems) {
     let household = household_without_digest(db).await;
     set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
     let petya = add_member(&db.pool, household.household_id, "Петя", true).await;
     let masha = add_member(&db.pool, household.household_id, "Маша", false).await;
     let moscow = chrono_tz::Europe::Moscow;
     let day = digest_day();
-    create_task_without_assignment_notice(
+    let petya_task = create_task_without_assignment_notice(
         db,
         &household,
         "Задача Пети",
@@ -3334,7 +3344,7 @@ async fn digest_scope_household(db: &TestDb) -> (TestHousehold, Uuid) {
         None,
     )
     .await;
-    create_task(
+    let shared_task = create_task(
         db,
         &household,
         "Общая задача",
@@ -3343,7 +3353,7 @@ async fn digest_scope_household(db: &TestDb) -> (TestHousehold, Uuid) {
         None,
     )
     .await;
-    create_task_without_assignment_notice(
+    let masha_task = create_task_without_assignment_notice(
         db,
         &household,
         "Задача Маши",
@@ -3361,7 +3371,7 @@ async fn digest_scope_household(db: &TestDb) -> (TestHousehold, Uuid) {
     )
     .await;
     assign_without_notice(&db.pool, masha_event.id, masha).await;
-    create_event(
+    let shared_event = create_event(
         db,
         &household,
         "Общее событие",
@@ -3379,13 +3389,41 @@ async fn digest_scope_household(db: &TestDb) -> (TestHousehold, Uuid) {
     .await;
     assign_without_notice(&db.pool, petya_event.id, petya).await;
     create_shopping(db, &household, "Молоко").await;
-    (household, petya)
+    let items = DigestScopeItems {
+        petya_task: petya_task.id,
+        shared_task: shared_task.id,
+        masha_task: masha_task.id,
+        petya_event: petya_event.id,
+        shared_event: shared_event.id,
+        masha_event: masha_event.id,
+    };
+    (household, petya, masha, items)
+}
+
+/// Id последней доставленной сводки получателя.
+async fn latest_digest_id(pool: &PgPool, user_id: Uuid) -> Uuid {
+    sqlx::query_scalar(
+        "SELECT id FROM notification_deliveries
+         WHERE user_id = $1 AND kind = 'digest'
+         ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .expect("digest delivery id")
+}
+
+/// HTML отрисовки представления сводки с фиктивными токенами.
+fn digest_view_html(view: &tasklerq::telegram::bot::notify::DigestView) -> String {
+    let ui = tasklerq::telegram::bot::notify::digest_ui(view);
+    let tokens = vec!["t:AAAAAAAAAAAAAAAA".to_owned(); ui.button_count()];
+    tasklerq::telegram::rich::render(&ui, &tokens).html
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn digest_mine_scope_shows_own_and_shared_items_only() {
     let db = support::isolated_db().await;
-    let (household, petya) = digest_scope_household(&db).await;
+    let (household, petya, _masha, scope_items) = digest_scope_household(&db).await;
     let moscow = chrono_tz::Europe::Moscow;
     let day = digest_day();
     set_digest_scope(&db.pool, household.household_id, petya, DigestScope::Mine).await;
@@ -3407,13 +3445,29 @@ async fn digest_mine_scope_shows_own_and_shared_items_only() {
     assert!(!html.contains("Задача Маши"), "{html}");
     assert!(!html.contains("Событие Маши"), "{html}");
     // Число покупок от состава не зависит.
-    assert!(html.contains("Покупки: 1 позиция"), "{html}");
+    assert!(html.contains("🛒 Покупки · 1"), "{html}");
+
+    // Снимок «только мои» содержит ровно задачу Пети, общую задачу, событие
+    // Пети и общее событие — и ничего Машиного.
+    let (snapshot, _hash) = digest_snapshot_and_hash(&db.pool, petya).await;
+    let ids: Vec<Uuid> = snapshot.iter().map(|line| line.item_id).collect();
+    assert_eq!(ids.len(), 4, "{snapshot:?}");
+    for id in [
+        scope_items.petya_task,
+        scope_items.shared_task,
+        scope_items.petya_event,
+        scope_items.shared_event,
+    ] {
+        assert!(ids.contains(&id), "{snapshot:?}");
+    }
+    assert!(!ids.contains(&scope_items.masha_task), "{snapshot:?}");
+    assert!(!ids.contains(&scope_items.masha_event), "{snapshot:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn digest_all_scope_shows_the_whole_family() {
     let db = support::isolated_db().await;
-    let (household, petya) = digest_scope_household(&db).await;
+    let (household, petya, _masha, _items) = digest_scope_household(&db).await;
     let moscow = chrono_tz::Europe::Moscow;
     let day = digest_day();
     set_digest_scope(&db.pool, household.household_id, petya, DigestScope::All).await;
@@ -3434,7 +3488,353 @@ async fn digest_all_scope_shows_the_whole_family() {
     assert!(html.contains("Общее событие"), "{html}");
     assert!(html.contains("Событие Маши"), "{html}");
     // Столько же покупок, сколько в составе «только мои».
-    assert!(html.contains("Покупки: 1 позиция"), "{html}");
+    assert!(html.contains("🛒 Покупки · 1"), "{html}");
+}
+
+/// Перерисовка сводки из снимка после назначения общей задачи Маше:
+/// в «только мои» строка скрыта и итоги пересчитаны, после снятия
+/// исполнителя — снова видна с «👥»; в «все в семье» — с «👤 Маша».
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_view_hides_a_task_assigned_to_another_member_in_mine_scope() {
+    let db = support::isolated_db().await;
+    let (household, petya, masha, scope_items) = digest_scope_household(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    set_digest_scope(&db.pool, household.household_id, petya, DigestScope::Mine).await;
+
+    let stats = scheduler(&db.pool)
+        .tick(local_utc(moscow, day, 8, 30))
+        .await
+        .expect("mine digest tick");
+    assert_eq!(stats.delivered, 1);
+    let delivery_id = latest_digest_id(&db.pool, petya).await;
+    let now = local_utc(moscow, day, 9, 0);
+
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let shared = items::get(&mut conn, household.household_id, scope_items.shared_task)
+        .await
+        .expect("shared task");
+    drop(conn);
+
+    // Общую задачу назначили Маше после доставки.
+    let shared = update_assignee(
+        &db,
+        &household,
+        &household.owner(),
+        &shared,
+        Some(masha),
+        now,
+    )
+    .await;
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let view = tasklerq::jobs::digest::digest_view(&mut conn, delivery_id)
+        .await
+        .expect("digest view");
+    drop(conn);
+    let html = digest_view_html(&view);
+    assert!(!html.contains("Общая задача"), "{html}");
+    assert!(html.contains("Задача Пети"), "{html}");
+    // Итоги пересчитаны без исчезнувшей задачи: 1 задача · 2 события.
+    assert!(html.contains("1 задача · 2 события"), "{html}");
+    assert!(!html.contains("2 задачи"), "{html}");
+    // Снимок при этом не меняется.
+    let (snapshot, _hash) = digest_snapshot_and_hash(&db.pool, petya).await;
+    assert!(
+        snapshot
+            .iter()
+            .any(|line| line.item_id == scope_items.shared_task)
+    );
+
+    // Исполнителя сняли — задача снова видна с «👥».
+    update_assignee(&db, &household, &household.owner(), &shared, None, now).await;
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let view = tasklerq::jobs::digest::digest_view(&mut conn, delivery_id)
+        .await
+        .expect("digest view");
+    drop(conn);
+    let html = digest_view_html(&view);
+    assert!(html.contains("☐ Общая задача"), "{html}");
+    assert!(html.contains("👥"), "{html}");
+    assert!(html.contains("2 задачи · 2 события"), "{html}");
+}
+
+/// В составе «все в семье» назначенная после доставки задача остаётся
+/// в сводке с меткой «👤 Маша».
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_view_labels_a_task_assigned_to_another_member_in_all_scope() {
+    let db = support::isolated_db().await;
+    let (household, petya, masha, scope_items) = digest_scope_household(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    set_digest_scope(&db.pool, household.household_id, petya, DigestScope::All).await;
+
+    let stats = scheduler(&db.pool)
+        .tick(local_utc(moscow, day, 8, 30))
+        .await
+        .expect("all digest tick");
+    assert_eq!(stats.delivered, 1);
+    let delivery_id = latest_digest_id(&db.pool, petya).await;
+    let now = local_utc(moscow, day, 9, 0);
+
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let shared = items::get(&mut conn, household.household_id, scope_items.shared_task)
+        .await
+        .expect("shared task");
+    drop(conn);
+    update_assignee(
+        &db,
+        &household,
+        &household.owner(),
+        &shared,
+        Some(masha),
+        now,
+    )
+    .await;
+
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let view = tasklerq::jobs::digest::digest_view(&mut conn, delivery_id)
+        .await
+        .expect("digest view");
+    drop(conn);
+    let html = digest_view_html(&view);
+    assert!(html.contains("Общая задача"), "{html}");
+    assert!(html.contains("👤 Маша"), "{html}");
+    assert!(html.contains("3 задачи · 3 события"), "{html}");
+}
+
+/// После доставки `digest_hash` равен отпечатку отрисовки
+/// `digest_ui(digest_view(...))` этой доставки.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_hash_matches_the_fingerprint_of_the_delivery_render() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    enable_digest(&db.pool, household.owner_id).await;
+    create_task(
+        &db,
+        &household,
+        "Задача сегодня",
+        Some(local_utc(moscow, day, 18, 0)),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    create_event(
+        &db,
+        &household,
+        "Событие сегодня",
+        local_utc(moscow, day, 14, 0),
+        local_utc(moscow, day, 15, 0),
+    )
+    .await;
+
+    let stats = scheduler(&db.pool)
+        .tick(local_utc(moscow, day, 8, 30))
+        .await
+        .expect("digest tick");
+    assert_eq!(stats.delivered, 1);
+
+    let (_snapshot, hash) = digest_snapshot_and_hash(&db.pool, household.owner_id).await;
+    let delivery_id = latest_digest_id(&db.pool, household.owner_id).await;
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let view = tasklerq::jobs::digest::digest_view(&mut conn, delivery_id)
+        .await
+        .expect("digest view");
+    let ui = tasklerq::telegram::bot::notify::digest_ui(&view);
+    assert_eq!(hash, tasklerq::telegram::bot::notify::ui_fingerprint(&ui));
+}
+
+/// Повторяющееся событие, сдвинутое DomainTicker на следующее вхождение,
+/// остаётся в сводке со своим временем из снимка.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_view_keeps_the_event_time_from_the_snapshot() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    set_notifications(
+        &db.pool,
+        household.owner_id,
+        json!({"digest_enabled": true, "reminders_enabled": false, "quiet_hours_enabled": false}),
+    )
+    .await;
+    let start = local_utc(moscow, day, 7, 0);
+    create_recurring_event(
+        &db,
+        &household,
+        "Бассейн",
+        start,
+        start + Duration::hours(1),
+        // 30 октября 2026 — пятница.
+        support::recurrence(RecurrenceFreq::Weekly, vec![5]),
+    )
+    .await;
+    let task = create_task(
+        &db,
+        &household,
+        "Задача",
+        Some(local_utc(moscow, day, 18, 0)),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+
+    let stats = scheduler(&db.pool)
+        .tick(local_utc(moscow, day, 8, 30))
+        .await
+        .expect("digest tick");
+    assert_eq!(stats.delivered, 1);
+    let delivery_id = latest_digest_id(&db.pool, household.owner_id).await;
+
+    // Событие прошло, и DomainTicker сдвинул его на следующую неделю.
+    ticker(&db.pool)
+        .tick(local_utc(moscow, day, 9, 0))
+        .await
+        .expect("event moves to the next occurrence");
+    let mut conn = db.pool.acquire().await.expect("conn");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        task.id,
+        None,
+        "Europe/Moscow",
+        local_utc(moscow, day, 9, 0),
+    )
+    .await
+    .expect("complete task");
+    let view = tasklerq::jobs::digest::digest_view(&mut conn, delivery_id)
+        .await
+        .expect("digest view");
+    drop(conn);
+
+    let html = digest_view_html(&view);
+    assert!(html.contains("🗓 Бассейн · 07:00–08:00"), "{html}");
+    assert!(html.contains("✅ Задача"), "{html}");
+    assert!(html.contains("Выполнено 1 из 1"), "{html}");
+}
+
+/// Выполненная из сводки ежедневная задача показывает «следующее завтра» —
+/// текущий срок повторяющейся задачи относительно дня сводки.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_view_shows_the_next_due_of_a_completed_daily_task() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    set_notifications(
+        &db.pool,
+        household.owner_id,
+        json!({"digest_enabled": true, "reminders_enabled": false, "quiet_hours_enabled": false}),
+    )
+    .await;
+    let mut item = support::new_item(household.tasks_list_id, "Вынести мусор");
+    item.due_date = Some(day);
+    item.assignee_user_id = Some(household.owner_id);
+    item.recurrence = Some(support::recurrence(RecurrenceFreq::Daily, vec![]));
+    let task = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        item,
+    )
+    .await;
+
+    let stats = scheduler(&db.pool)
+        .tick(local_utc(moscow, day, 8, 30))
+        .await
+        .expect("digest tick");
+    assert_eq!(stats.delivered, 1);
+    let delivery_id = latest_digest_id(&db.pool, household.owner_id).await;
+
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let task = items::get(&mut conn, household.household_id, task.id)
+        .await
+        .expect("task");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        task.id,
+        Some(task.version),
+        "Europe/Moscow",
+        local_utc(moscow, day, 9, 0),
+    )
+    .await
+    .expect("complete daily task");
+    let view = tasklerq::jobs::digest::digest_view(&mut conn, delivery_id)
+        .await
+        .expect("digest view");
+    drop(conn);
+
+    let html = digest_view_html(&view);
+    assert!(
+        html.contains("✅ Вынести мусор · следующее завтра"),
+        "{html}"
+    );
+    assert!(html.contains("Выполнено 1 из 1"), "{html}");
+}
+
+/// Отпечаток не зависит от токенов: два `render_notice` одного `Ui` дают
+/// разные токены в HTML, а `ui_fingerprint` — одинаковый.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_fingerprint_does_not_depend_on_notice_tokens() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    enable_digest(&db.pool, household.owner_id).await;
+    create_task(
+        &db,
+        &household,
+        "Задача сегодня",
+        Some(local_utc(moscow, day, 18, 0)),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+
+    let stats = scheduler(&db.pool)
+        .tick(local_utc(moscow, day, 8, 30))
+        .await
+        .expect("digest tick");
+    assert_eq!(stats.delivered, 1);
+
+    let delivery_id = latest_digest_id(&db.pool, household.owner_id).await;
+    // В фикстурах telegram_user_id совпадает с telegram_chat_id.
+    let telegram_id = chat_id(&db.pool, household.owner_id).await;
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let view = tasklerq::jobs::digest::digest_view(&mut conn, delivery_id)
+        .await
+        .expect("digest view");
+    let ui = tasklerq::telegram::bot::notify::digest_ui(&view);
+    let before = tasklerq::telegram::bot::notify::ui_fingerprint(&ui);
+    let now = local_utc(moscow, day, 9, 0);
+    let first = tasklerq::telegram::bot::notify::render_notice(
+        &mut conn,
+        telegram_id,
+        household.household_id,
+        &ui,
+        now,
+    )
+    .await
+    .expect("first render");
+    let second = tasklerq::telegram::bot::notify::render_notice(
+        &mut conn,
+        telegram_id,
+        household.household_id,
+        &ui,
+        now,
+    )
+    .await
+    .expect("second render");
+    assert_ne!(first, second, "tokens must differ between renders");
+    assert_eq!(before, tasklerq::telegram::bot::notify::ui_fingerprint(&ui));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

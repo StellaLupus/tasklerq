@@ -1119,6 +1119,16 @@ pub enum Action {
         /// Элемент.
         item_id: Uuid,
     },
+    /// Касание строки сводки: выполнить открытое вхождение или отменить
+    /// выполненное (0019, решение 2). Обработчик — пункт 4.1 change 0019.
+    DigestToggle {
+        /// Доставка сводки: по ней находится снимок состава.
+        delivery_id: Uuid,
+        /// Элемент.
+        item_id: Uuid,
+        /// Версия задачи на момент отрисовки.
+        version: i32,
+    },
     /// Перелистнуть сводное сообщение после тихих часов.
     BatchPage {
         /// Сводное сообщение.
@@ -1317,6 +1327,7 @@ impl Action {
             | Self::DueSet { version, .. }
             | Self::DueText { version, .. }
             | Self::NoticeComplete { version, .. }
+            | Self::DigestToggle { version, .. }
             | Self::BatchComplete { version, .. }
             | Self::DuplicateIncrease { version, .. } => Some(*version),
             Self::Snooze { version, .. } | Self::BatchSnooze { version, .. } => *version,

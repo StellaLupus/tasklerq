@@ -1231,6 +1231,12 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
         Action::NoticeClose => notify::close(ctx, message_id).await,
         Action::NoticeMove { item_id } => notify::event_due(ctx, item_id).await,
         Action::NoticeUndo { item_id } => notify::undo(ctx, message_id, item_id).await,
+        Action::DigestToggle { .. } => {
+            // Обработчик касания строки сводки — пункт 4.1 change 0019.
+            // Пока действие ничего не меняет: токен уже потреблён `consume`,
+            // ответ на callback уходит без тоста, как у прочих no-op веток.
+            Ok(())
+        }
 
         Action::BatchPage { batch_id, page } => {
             notify::batch_page(ctx, message_id, batch_id, page).await
