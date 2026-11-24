@@ -9296,6 +9296,34 @@ async fn sync_digests_edits_after_deletion() {
     assert_digest_hash_matches_render(&db.pool, stand.petya_id).await;
 }
 
+/// Архивирование списка задачи из снимка — правка со строкой «— в архиве».
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_digests_edits_after_list_archive() {
+    let db = support::isolated_db().await;
+    let mut stand = digest_sync_stand(&db).await;
+    let now = stand.at + Duration::minutes(1);
+    // Список по умолчанию архивировать нельзя (check-ограничение): снимаем
+    // признак, как другие тесты архивирования.
+    sqlx::query("UPDATE lists SET is_default = false, is_archived = true WHERE id = $1")
+        .bind(stand.household.tasks_list_id)
+        .execute(&db.pool)
+        .await
+        .expect("archive list");
+
+    digest_sync_tick(&mut stand, now).await;
+    stand.petya.deliver().await;
+    stand.masha.deliver().await;
+
+    let html = message_html(&stand.petya, stand.petya_msg);
+    assert!(html.contains("Вынести мусор — в архиве"), "{html}");
+    let labels: Vec<String> = buttons(&html).into_iter().map(|(label, _)| label).collect();
+    assert!(
+        !labels.iter().any(|label| label.contains("Вынести мусор")),
+        "{labels:?}"
+    );
+    assert_digest_hash_matches_render(&db.pool, stand.petya_id).await;
+}
+
 /// В «только мои» назначенная Маше общая задача исчезает из сводки Пети,
 /// после снятия исполнителя — возвращается с «👥».
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9467,6 +9495,90 @@ async fn sync_digests_leaves_digest_older_than_47_hours_alone() {
     assert_eq!(edit_count(&db.pool, stand.petya.chat).await, 0);
 }
 
+/// Сдвинуть отправку сводки получателя в прошлое: `sent_at` строки outbox и
+/// `updated_at` записи доставки (запись получает его при постановке в outbox).
+async fn age_digest_sent_at(pool: &PgPool, user_id: Uuid, sent_at: DateTime<Utc>) {
+    sqlx::query(
+        "UPDATE outbox SET sent_at = $2
+         WHERE seq = (SELECT outbox_seq FROM notification_deliveries
+                      WHERE user_id = $1 AND kind = 'digest')",
+    )
+    .bind(user_id)
+    .bind(sent_at)
+    .execute(pool)
+    .await
+    .expect("age digest message");
+    sqlx::query(
+        "UPDATE notification_deliveries SET updated_at = $2
+         WHERE user_id = $1 AND kind = 'digest'",
+    )
+    .bind(user_id)
+    .bind(sent_at)
+    .execute(pool)
+    .await
+    .expect("age digest delivery");
+}
+
+/// Граница 47 часов: сводка, доставленная 46 ч 59 мин назад, ещё правится.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_digests_edits_digest_delivered_just_under_47_hours_ago() {
+    let db = support::isolated_db().await;
+    let mut stand = digest_sync_stand(&db).await;
+    let done_at = stand.at + Duration::minutes(1);
+    age_digest_sent_at(
+        &db.pool,
+        stand.petya_id,
+        done_at - Duration::hours(47) + Duration::minutes(1),
+    )
+    .await;
+    complete_as(
+        &db,
+        &stand.household,
+        stand.shared.id,
+        &Actor::user(stand.masha_id, UserRole::Member),
+        done_at,
+    )
+    .await;
+
+    digest_sync_tick(&mut stand, done_at).await;
+    stand.petya.deliver().await;
+    stand.masha.deliver().await;
+
+    assert_eq!(edit_count(&db.pool, stand.petya.chat).await, 1);
+    let html = message_html(&stand.petya, stand.petya_msg);
+    assert!(html.contains("✅ Вынести мусор · Маша"), "{html}");
+    assert_digest_hash_matches_render(&db.pool, stand.petya_id).await;
+}
+
+/// Граница 47 часов: сводка, доставленная 47 ч 01 мин назад, уже не правится.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_digests_leaves_digest_delivered_just_over_47_hours_ago() {
+    let db = support::isolated_db().await;
+    let mut stand = digest_sync_stand(&db).await;
+    let done_at = stand.at + Duration::minutes(1);
+    age_digest_sent_at(
+        &db.pool,
+        stand.petya_id,
+        done_at - Duration::hours(47) - Duration::minutes(1),
+    )
+    .await;
+    complete_as(
+        &db,
+        &stand.household,
+        stand.shared.id,
+        &Actor::user(stand.masha_id, UserRole::Member),
+        done_at,
+    )
+    .await;
+
+    digest_sync_tick(&mut stand, done_at).await;
+    stand.petya.deliver().await;
+    stand.masha.deliver().await;
+
+    assert_eq!(edit_count(&db.pool, stand.petya.chat).await, 0);
+    assert!(message_html(&stand.petya, stand.petya_msg).contains("☐ Вынести мусор"));
+}
+
 /// Сводка без снимка (как до выката) не правится.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sync_digests_leaves_digest_without_snapshot_alone() {
@@ -9536,4 +9648,37 @@ async fn sync_digests_leaves_recipient_without_chat_alone() {
     petya.deliver().await;
 
     assert_eq!(edit_count(&db.pool, petya_chat).await, 0);
+}
+
+/// Получатель сменил чат: прежняя сводка не правится — её `message_id`
+/// принадлежит старому чату, а правка ушла бы в новый.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_digests_leaves_digest_alone_after_recipient_changed_chat() {
+    let db = support::isolated_db().await;
+    let mut stand = digest_sync_stand(&db).await;
+    let new_chat = support::next_telegram_id();
+    sqlx::query("UPDATE users SET telegram_chat_id = $2 WHERE id = $1")
+        .bind(stand.petya_id)
+        .bind(new_chat)
+        .execute(&db.pool)
+        .await
+        .expect("change chat");
+    let done_at = stand.at + Duration::minutes(1);
+    complete_as(
+        &db,
+        &stand.household,
+        stand.shared.id,
+        &Actor::user(stand.masha_id, UserRole::Member),
+        done_at,
+    )
+    .await;
+
+    digest_sync_tick(&mut stand, done_at).await;
+    stand.petya.deliver().await;
+    stand.masha.deliver().await;
+
+    // Ни в старом, ни в новом чате Пети правки нет; сводка осталась прежней.
+    assert_eq!(edit_count(&db.pool, stand.petya.chat).await, 0);
+    assert_eq!(edit_count(&db.pool, new_chat).await, 0);
+    assert!(message_html(&stand.petya, stand.petya_msg).contains("☐ Вынести мусор"));
 }

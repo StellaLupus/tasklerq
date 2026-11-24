@@ -7,7 +7,7 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use serde_json::json;
 use sqlx::PgPool;
-use support::notifications::{button_of, scheduler, tick_and_deliver};
+use support::notifications::{button_of, digest_delivery_id, scheduler, tick_and_deliver};
 use support::telegram::{Call, Harness, buttons};
 use support::{TestHousehold, create_item, isolated_db, new_item, next_telegram_id};
 use tasklerq::domain::models::{Actor, Item, ItemPatch, RecurrenceFreq, RecurrenceInput, UserRole};
@@ -3274,19 +3274,6 @@ async fn create_shared_all_day_task(
     .await
 }
 
-/// Id доставки сводки получателя и её сообщение в чате.
-async fn digest_delivery_id(pool: &PgPool, user_id: Uuid) -> Uuid {
-    sqlx::query_scalar(
-        "SELECT id FROM notification_deliveries
-         WHERE user_id = $1 AND kind = 'digest'
-         ORDER BY created_at DESC, id DESC LIMIT 1",
-    )
-    .bind(user_id)
-    .fetch_one(pool)
-    .await
-    .expect("digest delivery id")
-}
-
 /// Касание выполняет задачу и правит сводку на месте, без нового экрана;
 /// `digest_hash` после касания равен отпечатку новой отрисовки.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3738,6 +3725,22 @@ async fn digest_toggle_ignores_a_foreign_or_non_digest_delivery() {
         false,
     )
     .await;
+    // Не-сводка несёт непустой снимок сводки: охрана должна отсеять её именно
+    // по `kind = 'digest'`, а не по отсутствию снимка.
+    sqlx::query(
+        "UPDATE notification_deliveries
+         SET digest_items = (
+             SELECT digest_items FROM notification_deliveries
+             WHERE user_id = $1 AND kind = 'digest'
+             ORDER BY created_at DESC, id DESC LIMIT 1
+         )
+         WHERE id = $2",
+    )
+    .bind(household.owner_id)
+    .bind(reminder_delivery)
+    .execute(&db.pool)
+    .await
+    .expect("snapshot for non-digest delivery");
 
     let before = item_status(&db.pool, task.id).await;
     let edits_before = edit_count(&db.pool, bot.chat).await;
@@ -3825,6 +3828,12 @@ async fn digest_toggle_on_a_deleted_line_or_event_changes_nothing() {
 
     let edits_before = edit_count(&db.pool, bot.chat).await;
     let event_before = item_status(&db.pool, event.id).await;
+    // Версия удалённой задачи после удаления: касание не должно её менять.
+    let deleted_version: i32 = sqlx::query_scalar("SELECT version FROM items WHERE id = $1")
+        .bind(task.id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("deleted task version");
 
     // Касание устаревшей кнопки удалённой задачи: строка «удалена», задача не
     // меняется, сводка перерисована.
@@ -3836,6 +3845,15 @@ async fn digest_toggle_on_a_deleted_line_or_event_changes_nothing() {
             .await
             .expect("deleted_at");
     assert!(deleted_at.is_some(), "the task must stay deleted");
+    let deleted_version_after: i32 = sqlx::query_scalar("SELECT version FROM items WHERE id = $1")
+        .bind(task.id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("deleted task version after press");
+    assert_eq!(
+        deleted_version_after, deleted_version,
+        "the deleted task version must not change"
+    );
     let (_, after) = bot.latest();
     assert!(after.contains("Вынести мусор — удалена"), "{after}");
 

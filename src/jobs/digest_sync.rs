@@ -12,8 +12,9 @@
 //! она `sent`, со снимком (`digest_items IS NOT NULL`), не убрана
 //! (`dismissed_at IS NULL`), строка outbox доставила сообщение
 //! (`message_id IS NOT NULL`), `sent_at` не старше 47 часов, а получатель жив,
-//! в том же household и с чатом. Если новая сводка уже поставлена, но ещё не
-//! доставлена, прежняя кандидатом не считается — её удалит замена из 0017.
+//! в том же household и с чатом, совпадающим с чатом доставки. Если новая
+//! сводка уже поставлена, но ещё не доставлена, прежняя кандидатом не считается
+//! — её удалит замена из 0017.
 //!
 //! Каждая запись обрабатывается в своей транзакции под `FOR UPDATE SKIP LOCKED`
 //! с повторной проверкой условий после блокировки. Отрисовка строится той же
@@ -42,12 +43,26 @@ const SENT_WINDOW_HOURS: i64 = 47;
 /// сводка сама кандидатом не станет (`message_id IS NULL`), а прежнюю удалит
 /// замена из 0017. SQL-условия живого получателя (`u.…`, `h.…`) проверяются и
 /// при выборке, и под блокировкой.
+///
+/// Предфильтр `d.updated_at >= $1 - 1 день` обслуживается частичным индексом
+/// `notification_deliveries_sent_idx` (0026): без него выборка каждые 30 секунд
+/// читала бы все `sent`-доставки за всё время хранения. Это надмножество
+/// кандидатов: запись получает `status = 'sent'` и `updated_at` в момент
+/// постановки в outbox, `o.sent_at` не раньше этого момента, а `updated_at`
+/// только растёт. Сутки запаса покрывают задержку outbox между постановкой и
+/// отправкой, поэтому любая доставка с `o.sent_at >= $1` проходит предфильтр.
+///
+/// `o.chat_id = u.telegram_chat_id` отсекает сводки, доставленные в прежний
+/// чат получателя: их `message_id` принадлежит старому чату, править его в
+/// новом нельзя (как `replace_previous` в `digest.rs`).
 const CANDIDATE_WHERE: &str = "d.kind = 'digest'
      AND d.status = 'sent'
+     AND d.updated_at >= $1 - INTERVAL '1 day'
      AND d.digest_items IS NOT NULL
      AND d.dismissed_at IS NULL
      AND o.message_id IS NOT NULL
      AND o.sent_at >= $1
+     AND o.chat_id = u.telegram_chat_id
      AND u.id IS NOT NULL AND u.deleted_at IS NULL
      AND u.household_id = d.household_id
      AND h.id IS NOT NULL AND h.deleted_at IS NULL

@@ -691,19 +691,6 @@ async fn digest_stand(pool: &sqlx::PgPool) -> (Harness, Item, i64, String, suppo
     (bot, task, message_id, html, household)
 }
 
-/// Id последней доставки сводки получателя.
-async fn digest_delivery_id(pool: &sqlx::PgPool, user_id: uuid::Uuid) -> uuid::Uuid {
-    sqlx::query_scalar(
-        "SELECT id FROM notification_deliveries
-         WHERE user_id = $1 AND kind = 'digest'
-         ORDER BY created_at DESC, id DESC LIMIT 1",
-    )
-    .bind(user_id)
-    .fetch_one(pool)
-    .await
-    .expect("digest delivery id")
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn expired_digest_toggle_refreshes_the_digest_and_a_new_press_completes() {
     let db = isolated_db().await;
@@ -744,7 +731,8 @@ async fn expired_digest_toggle_refreshes_the_digest_and_a_new_press_completes() 
     assert_ne!(new_toggle, toggle, "the redraw must reissue tokens");
 
     // digest_hash записан и равен отпечатку новой отрисовки.
-    let delivery_id = digest_delivery_id(&db.pool, household.owner_id).await;
+    let delivery_id =
+        support::notifications::digest_delivery_id(&db.pool, household.owner_id).await;
     let mut conn = db.pool.acquire().await.expect("conn");
     let view = tasklerq::jobs::digest::digest_view(&mut conn, delivery_id)
         .await
@@ -774,7 +762,8 @@ async fn expired_digest_toggle_after_household_change_changes_nothing() {
     let db = isolated_db().await;
     let (mut bot, task, message_id, html, household) = digest_stand(&db.pool).await;
     let before = support::notifications::item_status(&db.pool, task.id).await;
-    let delivery_id = digest_delivery_id(&db.pool, household.owner_id).await;
+    let delivery_id =
+        support::notifications::digest_delivery_id(&db.pool, household.owner_id).await;
 
     // Пользователь сменил household после выпуска кнопки: токен несёт прежний
     // household, отличный от текущего. Выпускаем истёкший токен строки сводки
