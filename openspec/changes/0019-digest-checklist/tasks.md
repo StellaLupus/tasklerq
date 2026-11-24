@@ -31,7 +31,7 @@
 
 ## 3. Отрисовка
 
-- [ ] 3.1 Публичный предикат `items::can_undo(actor_user_id, recipient_id,
+- [x] 3.1 Публичный предикат `items::can_undo(actor_user_id, recipient_id,
   recipient_role)` по правилам `ensure_can_undo` (сама проверка в `undo_last`
   переходит на него) и `ru::events`. Проверить юнит-тестами в
   `lifecycle.rs`: выполнивший, владелец, выполнение без участника — `true`;

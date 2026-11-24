@@ -12,7 +12,7 @@ use super::{
     UNDO_WINDOW_EXPIRED, UNDO_WINDOW_MINUTES, local_today, recurrence_values, version_conflict,
 };
 use crate::domain::error::DomainError;
-use crate::domain::models::{Actor, EventType, Item, ItemStatus, ListKind};
+use crate::domain::models::{Actor, EventType, Item, ItemStatus, ListKind, UserRole};
 use crate::domain::recurrence::Due;
 use crate::storage::repositories::{events, lists, notifications, subtasks, tags};
 
@@ -552,14 +552,29 @@ fn ensure_can_modify(actor: &Actor, created_by_user_id: Option<Uuid>) -> Result<
     }
 }
 
+/// Может ли получатель отменить выполнение элемента.
+///
+/// Правило отмены (как в `ensure_can_undo`): отменить может выполнивший
+/// участник, владелец household, а также любой получатель, если выполнение
+/// было без участника (`actor_user_id` = `None` — например, HA или интеграции).
+/// Использует сводка 0019: выполненная строка показывается кнопкой (касание —
+/// отмена) только при `true`, иначе текстом.
+pub fn can_undo(actor_user_id: Option<Uuid>, recipient_id: Uuid, recipient_role: UserRole) -> bool {
+    actor_user_id.is_none()
+        || recipient_role == UserRole::Owner
+        || actor_user_id == Some(recipient_id)
+}
+
 fn ensure_can_undo(
     actor: &Actor,
     event: &crate::domain::models::ItemEvent,
 ) -> Result<(), DomainError> {
-    if actor.user_id.is_none() || actor.is_owner() || event.actor_user_id.is_none() {
+    // Актор без пользователя (системный, интеграции) отменяет всегда.
+    let Some(recipient_id) = actor.user_id else {
         return Ok(());
-    }
-    if actor.user_id == event.actor_user_id {
+    };
+    let recipient_role = actor.role.unwrap_or(UserRole::Member);
+    if can_undo(event.actor_user_id, recipient_id, recipient_role) {
         Ok(())
     } else {
         Err(DomainError::Forbidden(
@@ -577,5 +592,36 @@ fn undo_event_type(current: &Item, restored: &Item) -> EventType {
         EventType::Reopened
     } else {
         EventType::Updated
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn can_undo_by_the_executor() {
+        let executor = Uuid::new_v4();
+        assert!(can_undo(Some(executor), executor, UserRole::Member));
+    }
+
+    #[test]
+    fn can_undo_by_the_owner_when_someone_else_executed() {
+        let executor = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        assert!(can_undo(Some(executor), owner, UserRole::Owner));
+    }
+
+    #[test]
+    fn can_undo_when_executed_without_a_participant() {
+        let recipient = Uuid::new_v4();
+        assert!(can_undo(None, recipient, UserRole::Member));
+    }
+
+    #[test]
+    fn cannot_undo_by_another_member() {
+        let executor = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        assert!(!can_undo(Some(executor), other, UserRole::Member));
     }
 }

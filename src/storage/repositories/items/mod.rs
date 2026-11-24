@@ -9,7 +9,7 @@ mod stats;
 mod write;
 
 pub use find::{SearchHit, search};
-pub use lifecycle::{complete, reopen, revert_completion, soft_delete, undo_last};
+pub use lifecycle::{can_undo, complete, reopen, revert_completion, soft_delete, undo_last};
 pub use read::{all_for_export, calendar_items, get, is_deleted, list_by_list, snapshot};
 pub use stats::{
     MenuCounts, menu_counts, menu_counts_with_timezone, open_counts_by_list,
