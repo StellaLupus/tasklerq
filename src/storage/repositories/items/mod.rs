@@ -29,7 +29,7 @@ use crate::domain::recurrence::parse_timezone;
 /// `param` — номер или имя позиционного параметра с идентификатором
 /// участника. Фрагмент только про исполнителя: условие на вид списка
 /// добавляет вызывающий запрос (поиск «моих задач», счётчик, сводка 0019).
-pub(super) fn mine_predicate(param: &str) -> String {
+pub(crate) fn mine_predicate(param: &str) -> String {
     format!("(i.assignee_user_id = {param} OR i.assignee_user_id IS NULL)")
 }
 

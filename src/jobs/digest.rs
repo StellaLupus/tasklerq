@@ -12,7 +12,8 @@ use super::quiet::{desired_schedule, resolved_timezone};
 use crate::domain::events::effective_end;
 use crate::domain::models::ListKind;
 use crate::domain::recurrence::resolve_local;
-use crate::domain::settings::{NotificationSettings, parse_hhmm};
+use crate::domain::settings::{DigestScope, NotificationSettings, parse_hhmm};
+use crate::storage::repositories::items;
 use crate::storage::repositories::notifications::{self, NewDelivery, NotificationKind};
 use crate::telegram::bot::notify::{self, DigestLine};
 use crate::telegram::ru;
@@ -290,24 +291,35 @@ fn event_when(item: &DigestItem, timezone: Tz, today: NaiveDate) -> String {
 ///
 /// Разделы совпадают с экраном списка: timed-задача со сроком в прошлом и
 /// вседневная задача с прошедшей датой — «Просрочено», остальные задачи с
-/// локальной датой получателя — «Сегодня».
+/// локальной датой получателя — «Сегодня». В составе «только мои» задачи и
+/// события фильтруются общим предикатом «мои» (у события исполнитель —
+/// участник, чьё оно); число покупок от состава не зависит.
 async fn content(
     conn: &mut PgConnection,
     household_id: Uuid,
+    user_id: Uuid,
+    scope: DigestScope,
     timezone: Tz,
     household_timezone: Tz,
     now: DateTime<Utc>,
 ) -> Result<DigestContent, sqlx::Error> {
-    let mut rows: Vec<DigestItem> = sqlx::query_as(
+    let mine_for = match scope {
+        DigestScope::Mine => Some(user_id),
+        DigestScope::All => None,
+    };
+    let mut rows: Vec<DigestItem> = sqlx::query_as(&format!(
         "SELECT i.id, i.title, l.kind, i.due_at, i.due_date, i.end_at, i.end_date
          FROM items i
          JOIN lists l
            ON l.id = i.list_id AND l.deleted_at IS NULL
           AND NOT l.is_archived AND l.kind IN ('tasks', 'events')
          WHERE i.household_id = $1 AND i.status = 'open' AND i.deleted_at IS NULL
-           AND (i.due_at IS NOT NULL OR i.due_date IS NOT NULL)",
-    )
+           AND (i.due_at IS NOT NULL OR i.due_date IS NOT NULL)
+           AND ($2::uuid IS NULL OR {})",
+        items::mine_predicate("$2"),
+    ))
     .bind(household_id)
+    .bind(mine_for)
     .fetch_all(&mut *conn)
     .await?;
     rows.sort_by_key(digest_sort_key);
@@ -410,6 +422,8 @@ pub(crate) async fn digest_message(
     let content = content(
         conn,
         row.household_id,
+        row.user_id,
+        row.settings().digest_scope,
         row.timezone(),
         resolved_timezone(None, row.household_timezone.as_deref()),
         now,

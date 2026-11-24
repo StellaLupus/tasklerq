@@ -22,6 +22,7 @@ use tasklerq::domain::models::{
     RecurrenceInput, UserRole,
 };
 use tasklerq::domain::recurrence::Due;
+use tasklerq::domain::settings::{DigestScope, NotificationSettingsUpdate, ProfileUpdate};
 use tasklerq::jobs::domain::DomainTicker;
 use tasklerq::jobs::scheduler::{
     Scheduler, TickStats, all_day_occurrence_key, occurrence_key, snooze_origin,
@@ -470,6 +471,27 @@ async fn set_notifications(pool: &PgPool, user_id: Uuid, value: serde_json::Valu
     .execute(pool)
     .await
     .expect("settings");
+}
+
+/// Состав сводки участника через patch настроек, как на экране уведомлений.
+async fn set_digest_scope(pool: &PgPool, household_id: Uuid, user_id: Uuid, scope: DigestScope) {
+    let mut tx = pool.begin().await.expect("tx");
+    users::update_profile(
+        &mut tx,
+        household_id,
+        &Actor::user(user_id, UserRole::Member),
+        ProfileUpdate {
+            notifications: Some(NotificationSettingsUpdate {
+                digest_scope: Some(scope),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        Utc::now(),
+    )
+    .await
+    .expect("digest scope");
+    tx.commit().await.expect("commit");
 }
 
 /// Настройки напоминаний при заведомо выключенной сводке: тесты, которые
@@ -3175,6 +3197,118 @@ async fn digest_skips_completed_deleted_and_other_household_tasks() {
     assert!(!html.contains("Выполненная задача"), "{html}");
     assert!(!html.contains("Удалённая задача"), "{html}");
     assert!(!html.contains("Чужая задача"), "{html}");
+}
+
+/// Household для тестов состава сводки: Петя получает сводку, Маша — нет.
+/// На сегодня задача Пети, общая задача, задача Маши, событие Маши, общее
+/// событие и одна открытая покупка.
+async fn digest_scope_household(db: &TestDb) -> (TestHousehold, Uuid) {
+    let household = household_without_digest(db).await;
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    let petya = add_member(&db.pool, household.household_id, "Петя", true).await;
+    let masha = add_member(&db.pool, household.household_id, "Маша", false).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    create_task_without_assignment_notice(
+        db,
+        &household,
+        "Задача Пети",
+        Some(local_utc(moscow, day, 18, 0)),
+        petya,
+        None,
+    )
+    .await;
+    create_task(
+        db,
+        &household,
+        "Общая задача",
+        Some(local_utc(moscow, day, 19, 0)),
+        None,
+        None,
+    )
+    .await;
+    create_task_without_assignment_notice(
+        db,
+        &household,
+        "Задача Маши",
+        Some(local_utc(moscow, day, 20, 0)),
+        masha,
+        None,
+    )
+    .await;
+    let masha_event = create_event(
+        db,
+        &household,
+        "Событие Маши",
+        local_utc(moscow, day, 14, 0),
+        local_utc(moscow, day, 15, 30),
+    )
+    .await;
+    assign_without_notice(&db.pool, masha_event.id, masha).await;
+    create_event(
+        db,
+        &household,
+        "Общее событие",
+        local_utc(moscow, day, 16, 0),
+        local_utc(moscow, day, 17, 0),
+    )
+    .await;
+    create_shopping(db, &household, "Молоко").await;
+    (household, petya)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_mine_scope_shows_own_and_shared_items_only() {
+    let db = support::isolated_db().await;
+    let (household, petya) = digest_scope_household(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    set_digest_scope(&db.pool, household.household_id, petya, DigestScope::Mine).await;
+    let chat = chat_id(&db.pool, petya).await;
+
+    let stats = scheduler(&db.pool)
+        .tick(local_utc(moscow, day, 8, 30))
+        .await
+        .expect("mine digest tick");
+    assert_eq!(stats.delivered, 1);
+
+    let sent = messages(&db.pool, chat).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let html = &sent[0];
+    assert!(html.contains("Задача Пети"), "{html}");
+    assert!(html.contains("Общая задача"), "{html}");
+    assert!(html.contains("Общее событие"), "{html}");
+    assert!(!html.contains("Задача Маши"), "{html}");
+    assert!(!html.contains("Событие Маши"), "{html}");
+    // Число покупок от состава не зависит.
+    assert!(html.contains("Покупки: 1 позиция"), "{html}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_all_scope_shows_the_whole_family() {
+    let db = support::isolated_db().await;
+    let (household, petya) = digest_scope_household(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    set_digest_scope(&db.pool, household.household_id, petya, DigestScope::All).await;
+    let chat = chat_id(&db.pool, petya).await;
+
+    let stats = scheduler(&db.pool)
+        .tick(local_utc(moscow, day, 8, 30))
+        .await
+        .expect("all digest tick");
+    assert_eq!(stats.delivered, 1);
+
+    let sent = messages(&db.pool, chat).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let html = &sent[0];
+    assert!(html.contains("Задача Пети"), "{html}");
+    assert!(html.contains("Общая задача"), "{html}");
+    assert!(html.contains("Задача Маши"), "{html}");
+    assert!(html.contains("Общее событие"), "{html}");
+    assert!(html.contains("Событие Маши"), "{html}");
+    // Столько же покупок, сколько в составе «только мои».
+    assert!(html.contains("Покупки: 1 позиция"), "{html}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
