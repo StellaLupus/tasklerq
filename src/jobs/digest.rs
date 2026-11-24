@@ -7,6 +7,7 @@ use sqlx::{FromRow, PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::delivery::{self, DeliveryScope};
+use super::domain_db;
 use super::keys::{digest_key_date, item_occurrence_key};
 use super::notice::NoticeRow;
 use super::quiet::{desired_schedule, resolved_timezone};
@@ -767,15 +768,6 @@ fn snapshot_event_when(key: &str, item: &ViewItem, timezone: Tz, day: NaiveDate)
             }
         }
         None => format!("{prefix}{}", start_local.format("%H:%M")),
-    }
-}
-
-/// Ошибка БД доменного слоя как ошибка sqlx; прочие варианты не возникают у
-/// запросов выборки выполнений и участников.
-fn domain_db(error: crate::domain::error::DomainError) -> sqlx::Error {
-    match error {
-        crate::domain::error::DomainError::Database(error) => error,
-        other => sqlx::Error::Protocol(other.to_string()),
     }
 }
 
