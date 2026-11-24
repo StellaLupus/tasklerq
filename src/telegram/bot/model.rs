@@ -1120,7 +1120,7 @@ pub enum Action {
         item_id: Uuid,
     },
     /// Касание строки сводки: выполнить открытое вхождение или отменить
-    /// выполненное (0019, решение 2). Обработчик — пункт 4.1 change 0019.
+    /// выполненное (0019, решение 2). Обработчик — `notify::digest_toggle`.
     DigestToggle {
         /// Доставка сводки: по ней находится снимок состава.
         delivery_id: Uuid,
@@ -2129,6 +2129,22 @@ mod tests {
         let payload = serde_json::to_value(&batch).expect("batch snooze payload");
         assert_eq!(payload["version"], json!(9));
         assert_eq!(batch.version(), Some(9));
+    }
+
+    #[test]
+    fn digest_toggle_carries_the_rendered_version() {
+        let action = Action::DigestToggle {
+            delivery_id: Uuid::nil(),
+            item_id: Uuid::nil(),
+            version: 7,
+        };
+        let payload = serde_json::to_value(&action).expect("digest toggle payload");
+        assert_eq!(payload["a"], json!("digest_toggle"));
+        assert_eq!(payload["version"], json!(7));
+        assert_eq!(action.version(), Some(7));
+
+        let roundtrip: Action = serde_json::from_value(payload).expect("digest toggle roundtrip");
+        assert_eq!(roundtrip, action);
     }
 
     #[test]

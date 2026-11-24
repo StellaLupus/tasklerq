@@ -18,7 +18,7 @@ use support::notifications::{
 use support::telegram::{Call, Harness, buttons};
 use support::{TestDb, TestHousehold, new_member, next_telegram_id};
 use tasklerq::domain::models::{
-    Actor, ActorType, Field, Item, ItemPatch, ItemPriority, ItemSource, RecurrenceFreq,
+    Actor, ActorType, Field, Item, ItemPatch, ItemPriority, ItemSource, ListKind, RecurrenceFreq,
     RecurrenceInput, UserRole,
 };
 use tasklerq::domain::recurrence::Due;
@@ -29,7 +29,7 @@ use tasklerq::jobs::scheduler::{
     Scheduler, TickStats, all_day_occurrence_key, occurrence_key, snooze_origin,
 };
 use tasklerq::storage::repositories::notifications::{self, NewDelivery, NotificationKind};
-use tasklerq::storage::repositories::{items, members, users};
+use tasklerq::storage::repositories::{items, lists, members, users};
 use tasklerq::telegram::api::TelegramError;
 use tasklerq::telegram::outbox::OutboxWorker;
 use tokio::sync::Notify;
@@ -3778,6 +3778,459 @@ async fn digest_view_shows_the_next_due_of_a_completed_daily_task() {
         "{html}"
     );
     assert!(html.contains("Выполнено 1 из 1"), "{html}");
+}
+
+/// Выполненная неповторяющаяся задача без действующего события выполнения
+/// (событие удалено хранением): строка «✅ <название>» без имени и без кнопки,
+/// а не открытая строка с кнопкой (design, решение 2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_view_shows_a_done_task_without_a_completion_event() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    enable_digest(&db.pool, household.owner_id).await;
+    let task = create_all_day_task(
+        &db,
+        &household,
+        "Вынести мусор",
+        day,
+        Some(household.owner_id),
+    )
+    .await;
+
+    let stats = scheduler(&db.pool)
+        .tick(local_utc(moscow, day, 8, 30))
+        .await
+        .expect("digest tick");
+    assert_eq!(stats.delivered, 1);
+    let delivery_id = latest_digest_id(&db.pool, household.owner_id).await;
+
+    let mut conn = db.pool.acquire().await.expect("conn");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        task.id,
+        None,
+        "Europe/Moscow",
+        local_utc(moscow, day, 9, 0),
+    )
+    .await
+    .expect("complete task");
+    // Действующего события выполнения больше нет (например, удалено хранением),
+    // но задача осталась выполненной.
+    sqlx::query("DELETE FROM item_events WHERE item_id = $1 AND event_type = 'completed'")
+        .bind(task.id)
+        .execute(&mut *conn)
+        .await
+        .expect("purge completion event");
+    let view = tasklerq::jobs::digest::digest_view(&mut conn, delivery_id)
+        .await
+        .expect("digest view");
+    drop(conn);
+
+    assert!(matches!(
+        view.lines[0].state,
+        tasklerq::telegram::bot::notify::DigestLineState::Completed {
+            can_undo: false,
+            actor_name: None,
+            completion_event: None,
+            ..
+        }
+    ));
+    let html = digest_view_html(&view);
+    assert!(html.contains("✅ Вынести мусор"), "{html}");
+    assert!(!html.contains("☐ Вынести мусор"), "{html}");
+    assert!(!html.contains("✅ Вынести мусор ·"), "{html}");
+}
+
+/// Отрисовка не зависит от «сейчас»: `digest_view` одной доставки при неизменном
+/// состоянии даёт одинаковый отпечаток, когда бы он ни считался; подписи
+/// относительны к дню сводки («вчера», «следующее завтра»).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_view_fingerprint_does_not_depend_on_when_it_is_computed() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    set_notifications(
+        &db.pool,
+        household.owner_id,
+        json!({"digest_enabled": true, "reminders_enabled": false, "quiet_hours_enabled": false}),
+    )
+    .await;
+    create_all_day_task(
+        &db,
+        &household,
+        "Сегодняшняя",
+        day,
+        Some(household.owner_id),
+    )
+    .await;
+    create_task(
+        &db,
+        &household,
+        "Просроченная",
+        Some(local_utc(moscow, day - Duration::days(1), 12, 0)),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let mut daily = support::new_item(household.tasks_list_id, "Ежедневная");
+    daily.due_date = Some(day);
+    daily.assignee_user_id = Some(household.owner_id);
+    daily.recurrence = Some(support::recurrence(RecurrenceFreq::Daily, vec![]));
+    let daily = support::create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        daily,
+    )
+    .await;
+
+    let stats = scheduler(&db.pool)
+        .tick(local_utc(moscow, day, 8, 30))
+        .await
+        .expect("digest tick");
+    assert_eq!(stats.delivered, 1);
+    let delivery_id = latest_digest_id(&db.pool, household.owner_id).await;
+
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let daily = items::get(&mut conn, household.household_id, daily.id)
+        .await
+        .expect("daily task");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        daily.id,
+        Some(daily.version),
+        "Europe/Moscow",
+        local_utc(moscow, day, 9, 0),
+    )
+    .await
+    .expect("complete daily task");
+
+    let view = tasklerq::jobs::digest::digest_view(&mut conn, delivery_id)
+        .await
+        .expect("digest view");
+    let html = digest_view_html(&view);
+    assert!(html.contains("☐ Сегодняшняя · весь день"), "{html}");
+    assert!(html.contains("☐ Просроченная · вчера, 12:00"), "{html}");
+    assert!(html.contains("✅ Ежедневная · следующее завтра"), "{html}");
+    let first = tasklerq::telegram::bot::notify::ui_fingerprint(
+        &tasklerq::telegram::bot::notify::digest_ui(&view),
+    );
+
+    // Состояние не менялось; повторное представление той же доставки (спустя
+    // сутки — `digest_view` не принимает «сейчас») даёт тот же отпечаток.
+    let again = tasklerq::jobs::digest::digest_view(&mut conn, delivery_id)
+        .await
+        .expect("digest view again");
+    let second = tasklerq::telegram::bot::notify::ui_fingerprint(
+        &tasklerq::telegram::bot::notify::digest_ui(&again),
+    );
+    assert_eq!(first, second);
+}
+
+/// Удалённая задача, задача из архивного списка и удалённое событие — текст
+/// без кнопки.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_view_shows_deleted_archived_and_deleted_event_lines() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    enable_digest(&db.pool, household.owner_id).await;
+    let deleted =
+        create_all_day_task(&db, &household, "Удалённая", day, Some(household.owner_id)).await;
+    // Архивный список — не по умолчанию (список по умолчанию архивировать нельзя).
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let archive_list = lists::create(
+        &mut conn,
+        household.household_id,
+        ListKind::Tasks,
+        "Архив",
+        Utc::now(),
+    )
+    .await
+    .expect("archive list");
+    drop(conn);
+    let mut archived_item = support::new_item(archive_list.id, "Архивная");
+    archived_item.due_date = Some(day);
+    archived_item.assignee_user_id = Some(household.owner_id);
+    let _archived = support::create_item(
+        &db.pool,
+        &household,
+        archive_list.id,
+        &household.owner(),
+        archived_item,
+    )
+    .await;
+    let event = create_event(
+        &db,
+        &household,
+        "Удалённое событие",
+        local_utc(moscow, day, 14, 0),
+        local_utc(moscow, day, 15, 0),
+    )
+    .await;
+
+    let stats = scheduler(&db.pool)
+        .tick(local_utc(moscow, day, 8, 30))
+        .await
+        .expect("digest tick");
+    assert_eq!(stats.delivered, 1);
+    let delivery_id = latest_digest_id(&db.pool, household.owner_id).await;
+
+    let mut conn = db.pool.acquire().await.expect("conn");
+    items::soft_delete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        deleted.id,
+        local_utc(moscow, day, 9, 0),
+    )
+    .await
+    .expect("delete task");
+    items::soft_delete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        event.id,
+        local_utc(moscow, day, 9, 0),
+    )
+    .await
+    .expect("delete event");
+    sqlx::query("UPDATE lists SET is_archived = true WHERE id = $1")
+        .bind(archive_list.id)
+        .execute(&mut *conn)
+        .await
+        .expect("archive list");
+    let view = tasklerq::jobs::digest::digest_view(&mut conn, delivery_id)
+        .await
+        .expect("digest view");
+    drop(conn);
+
+    let html = digest_view_html(&view);
+    assert!(html.contains("Удалённая — удалена"), "{html}");
+    assert!(html.contains("Архивная — в архиве"), "{html}");
+    assert!(html.contains("Удалённое событие — удалено"), "{html}");
+    // Ни одна из этих строк не кнопка.
+    let labels: Vec<String> = buttons(&html).into_iter().map(|(label, _)| label).collect();
+    assert!(
+        !labels.iter().any(|label| label.contains("Удалённая")
+            || label.contains("Архивная")
+            || label.contains("Удалённое событие")),
+        "{labels:?}"
+    );
+}
+
+/// Выполнение другим участником: «✅ … · Маша» без кнопки у участника-не
+/// владельца и с кнопкой у владельца.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_view_completed_by_another_member_button_follows_the_role() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    enable_digest(&db.pool, household.owner_id).await;
+    let petya = add_member(&db.pool, household.household_id, "Петя", true).await;
+    let masha = add_member(&db.pool, household.household_id, "Маша", false).await;
+    let task = create_task(
+        &db,
+        &household,
+        "Вынести мусор",
+        Some(local_utc(moscow, day, 18, 0)),
+        None,
+        None,
+    )
+    .await;
+
+    let stats = scheduler(&db.pool)
+        .tick(local_utc(moscow, day, 8, 30))
+        .await
+        .expect("digest tick");
+    assert_eq!(stats.delivered, 2, "owner and Petya digests");
+    let owner_delivery = latest_digest_id(&db.pool, household.owner_id).await;
+    let petya_delivery = latest_digest_id(&db.pool, petya).await;
+
+    let mut conn = db.pool.acquire().await.expect("conn");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &Actor::user(masha, UserRole::Member),
+        task.id,
+        None,
+        "Europe/Moscow",
+        local_utc(moscow, day, 9, 0),
+    )
+    .await
+    .expect("masha completes");
+
+    let petya_view = tasklerq::jobs::digest::digest_view(&mut conn, petya_delivery)
+        .await
+        .expect("petya view");
+    let owner_view = tasklerq::jobs::digest::digest_view(&mut conn, owner_delivery)
+        .await
+        .expect("owner view");
+    drop(conn);
+
+    // Петя-не владелец: «✅ … · Маша» без кнопки.
+    let petya_html = digest_view_html(&petya_view);
+    assert!(
+        petya_html.contains("✅ Вынести мусор · Маша"),
+        "{petya_html}"
+    );
+    assert!(
+        !buttons(&petya_html)
+            .iter()
+            .any(|(label, _)| label.contains("Вынести мусор")),
+        "{petya_html}"
+    );
+    // Владелец: та же строка с кнопкой (касание — отмена).
+    let owner_html = digest_view_html(&owner_view);
+    assert!(
+        owner_html.contains("✅ Вынести мусор · Маша"),
+        "{owner_html}"
+    );
+    assert!(
+        buttons(&owner_html)
+            .iter()
+            .any(|(label, _)| label.contains("✅ Вынести мусор · Маша")),
+        "{owner_html}"
+    );
+}
+
+/// Выполнение самим получателем, без участника (HA) и исключённым участником —
+/// без имени.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_view_completed_line_hides_the_name_for_recipient_system_and_excluded() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    enable_digest(&db.pool, household.owner_id).await;
+    let masha = add_member(&db.pool, household.household_id, "Маша", false).await;
+    let by_recipient =
+        create_all_day_task(&db, &household, "Своя", day, Some(household.owner_id)).await;
+    let by_system = create_all_day_task(
+        &db,
+        &household,
+        "Без участника",
+        day,
+        Some(household.owner_id),
+    )
+    .await;
+    let by_excluded = create_all_day_task(
+        &db,
+        &household,
+        "Исключённым",
+        day,
+        Some(household.owner_id),
+    )
+    .await;
+
+    let stats = scheduler(&db.pool)
+        .tick(local_utc(moscow, day, 8, 30))
+        .await
+        .expect("digest tick");
+    assert_eq!(stats.delivered, 1);
+    let delivery_id = latest_digest_id(&db.pool, household.owner_id).await;
+
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let now = local_utc(moscow, day, 9, 0);
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        by_recipient.id,
+        None,
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("recipient completes");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &Actor::system(ActorType::HomeAssistant),
+        by_system.id,
+        None,
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("system completes");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &Actor::user(masha, UserRole::Member),
+        by_excluded.id,
+        None,
+        "Europe/Moscow",
+        now,
+    )
+    .await
+    .expect("masha completes");
+    // Машу исключили из household после выполнения.
+    sqlx::query("UPDATE users SET deleted_at = now() WHERE id = $1")
+        .bind(masha)
+        .execute(&mut *conn)
+        .await
+        .expect("exclude masha");
+    let view = tasklerq::jobs::digest::digest_view(&mut conn, delivery_id)
+        .await
+        .expect("digest view");
+    drop(conn);
+
+    let html = digest_view_html(&view);
+    assert!(html.contains("✅ Своя"), "{html}");
+    assert!(html.contains("✅ Без участника"), "{html}");
+    assert!(html.contains("✅ Исключённым"), "{html}");
+    assert!(!html.contains("✅ Своя ·"), "{html}");
+    assert!(!html.contains("✅ Без участника ·"), "{html}");
+    assert!(!html.contains("✅ Исключённым ·"), "{html}");
+    assert!(!html.contains("Маша"), "{html}");
+}
+
+/// В составе «только мои» событие, ставшее чужим после доставки, скрыто
+/// (фильтр состава по текущему участнику — как для задач).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_view_hides_an_event_assigned_to_another_member_in_mine_scope() {
+    let db = support::isolated_db().await;
+    let (household, petya, masha, scope_items) = digest_scope_household(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    set_digest_scope(&db.pool, household.household_id, petya, DigestScope::Mine).await;
+
+    let stats = scheduler(&db.pool)
+        .tick(local_utc(moscow, day, 8, 30))
+        .await
+        .expect("mine digest tick");
+    assert_eq!(stats.delivered, 1);
+    let delivery_id = latest_digest_id(&db.pool, petya).await;
+
+    // Общее событие из снимка Пети назначили Маше после доставки.
+    assign_without_notice(&db.pool, scope_items.shared_event, masha).await;
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let view = tasklerq::jobs::digest::digest_view(&mut conn, delivery_id)
+        .await
+        .expect("digest view");
+    drop(conn);
+
+    let html = digest_view_html(&view);
+    assert!(!html.contains("Общее событие"), "{html}");
+    assert!(html.contains("Событие Пети"), "{html}");
+    // Итоги пересчитаны без исчезнувшего события.
+    assert!(html.contains("2 задачи · 1 событие"), "{html}");
 }
 
 /// Отпечаток не зависит от токенов: два `render_notice` одного `Ui` дают

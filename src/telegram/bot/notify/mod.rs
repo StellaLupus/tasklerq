@@ -208,6 +208,10 @@ pub enum DigestLineState {
         version: i32,
         /// Получатель может отменить это выполнение ([`items::can_undo`]).
         can_undo: bool,
+        /// Событие выполнения вхождения; `None` — выполненная неповторяющаяся
+        /// задача без действующего события (отменить нечего, кнопки нет).
+        /// Обработчик касания сверяет его с последним отменяемым событием.
+        completion_event: Option<Uuid>,
     },
     /// Задача удалена: текст без кнопки.
     Deleted {
@@ -870,6 +874,150 @@ pub async fn undo(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> Result<(
     show_current(ctx, message_id, item_id).await
 }
 
+/// Касание строки сводки: выполнить открытое вхождение или отменить выполненное
+/// (0019, design, решение 2).
+///
+/// Запись доставки блокируется `FOR UPDATE` (против гонки с шагом `sync_digests`);
+/// чужая, не сводка или без снимка — ничего не меняется. Состояние строки берётся
+/// из [`crate::jobs::digest::digest_view`] — того же представления, что рисует
+/// сводку: открытое вхождение выполняется с версией кнопки, выполненное
+/// отменяется, только если его событие выполнения — последнее отменяемое событие
+/// задачи (как `card::undo_deleted` защищает от отката чужого действия). Отказ
+/// отмены различается по типу ошибки: окно, права, изменённый элемент. После
+/// любого исхода вся сводка перерисовывается на месте через [`edit_notice`], а
+/// отпечаток новой отрисовки записывается в `digest_hash` той же транзакцией.
+pub async fn digest_toggle(
+    ctx: &mut Ctx<'_>,
+    message_id: i64,
+    delivery_id: Uuid,
+    item_id: Uuid,
+    version: i32,
+) -> Result<(), Fail> {
+    let household = ctx.household()?.clone();
+    let user_id = ctx.user()?.id;
+    let actor = ctx.actor()?;
+
+    // Сводка получателя этого чата со снимком; чужая/не сводка/без снимка —
+    // ничего не меняем.
+    let delivery: Option<(Option<serde_json::Value>,)> = sqlx::query_as(
+        "SELECT digest_items
+         FROM notification_deliveries
+         WHERE id = $1 AND user_id = $2 AND household_id = $3 AND kind = 'digest'
+         FOR UPDATE",
+    )
+    .bind(delivery_id)
+    .bind(user_id)
+    .bind(household.id)
+    .fetch_optional(&mut *ctx.conn)
+    .await?;
+    let Some((Some(_),)) = delivery else {
+        return Ok(());
+    };
+
+    let view = crate::jobs::digest::digest_view(&mut *ctx.conn, delivery_id).await?;
+    if let Some(line) = view.lines.iter().find(|line| line.item_id == item_id) {
+        match &line.state {
+            DigestLineState::Open { .. } => {
+                let result = items::complete(
+                    &mut *ctx.conn,
+                    household.id,
+                    &actor,
+                    item_id,
+                    Some(version),
+                    &household.timezone,
+                    ctx.now,
+                )
+                .await;
+                if let Err(DomainError::Conflict { .. } | DomainError::NotFound) = result {
+                    // Вхождение успели выполнить (в том числе повторяющуюся
+                    // задачу перевели на следующее вхождение) или изменить:
+                    // тост выбирается по текущему состоянию строки.
+                    let view =
+                        crate::jobs::digest::digest_view(&mut *ctx.conn, delivery_id).await?;
+                    let completed = view
+                        .lines
+                        .iter()
+                        .find(|line| line.item_id == item_id)
+                        .is_some_and(|line| {
+                            matches!(line.state, DigestLineState::Completed { .. })
+                        });
+                    ctx.toast(if completed {
+                        "Задача уже выполнена"
+                    } else {
+                        "Задача уже изменилась"
+                    });
+                } else if let Err(error) = result {
+                    return Err(error.into());
+                }
+            }
+            DigestLineState::Completed {
+                completion_event,
+                version: current_version,
+                ..
+            } => {
+                // Отменяем, только если выполнение вхождения из снимка —
+                // последнее отменяемое событие задачи: иначе касание откатило
+                // бы чужое или более позднее действие.
+                let latest = crate::storage::repositories::events::latest_undoable(
+                    &mut *ctx.conn,
+                    household.id,
+                    item_id,
+                )
+                .await?;
+                let is_latest = completion_event.is_some_and(|event_id| {
+                    latest.as_ref().is_some_and(|event| event.id == event_id)
+                });
+                if !is_latest {
+                    ctx.toast("Задача уже изменилась");
+                } else if version != *current_version {
+                    // Кнопка выпущена, когда вхождение было открыто (версия
+                    // устарела), а выполнить его успел другой участник.
+                    ctx.toast("Задача уже выполнена");
+                } else {
+                    match items::undo_last(&mut *ctx.conn, household.id, &actor, item_id, ctx.now)
+                        .await
+                    {
+                        Ok(_) => {}
+                        // Истёкшее окно — единственный конфликт с
+                        // машиночитаемой причиной (как card::undo_deleted).
+                        Err(DomainError::Conflict { details, .. })
+                            if details.get("reason").and_then(|value| value.as_str())
+                                == Some(items::UNDO_WINDOW_EXPIRED) =>
+                        {
+                            ctx.toast("Время отмены истекло");
+                        }
+                        Err(DomainError::Forbidden(_)) => {
+                            ctx.toast("Отменить может только выполнивший или владелец");
+                        }
+                        Err(DomainError::Conflict { .. } | DomainError::NotFound) => {
+                            ctx.toast("Задача уже изменилась");
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+            // Удалённая, архивная, событие: ничего не меняем.
+            _ => {}
+        }
+    }
+
+    // Перерисовка всей сводки на месте и запись отпечатка новой отрисовки.
+    let view = crate::jobs::digest::digest_view(&mut *ctx.conn, delivery_id).await?;
+    let ui = digest_ui(&view);
+    edit_notice(ctx, message_id, &ui).await?;
+    sqlx::query(
+        "UPDATE notification_deliveries
+         SET digest_hash = $2, updated_at = $3
+         WHERE id = $1",
+    )
+    .bind(delivery_id)
+    .bind(ui_fingerprint(&ui))
+    .bind(ctx.now)
+    .execute(&mut *ctx.conn)
+    .await?;
+    Ok(())
+}
+
 /// «Открыть» из уведомления: карточка задачи в экране навигации.
 pub(super) async fn open(ctx: &mut Ctx<'_>, message_id: i64, item_id: Uuid) -> Result<(), Fail> {
     if load(ctx, item_id).await?.is_none() {
@@ -1132,6 +1280,7 @@ mod tests {
                 next_due_date: None,
                 version: 2,
                 can_undo,
+                completion_event: Some(Uuid::now_v7()),
             },
         }
     }
@@ -1345,6 +1494,33 @@ mod tests {
         assert_eq!(rows[0][0].label, "✅ Вынести мусор");
     }
 
+    /// Выполненная неповторяющаяся задача без действующего события выполнения:
+    /// «✅ <название>» без имени и без кнопки (`can_undo` не на чем проверять).
+    #[test]
+    fn digest_done_without_a_completion_event_is_text_without_a_button() {
+        let view = digest_view(vec![DigestViewLine {
+            item_id: Uuid::now_v7(),
+            section: DigestSection::Today,
+            state: DigestLineState::Completed {
+                title: "Вынести мусор".into(),
+                actor_name: None,
+                next_due_at: None,
+                next_due_date: None,
+                version: 2,
+                can_undo: false,
+                completion_event: None,
+            },
+        }]);
+        let ui = digest_ui(&view);
+        let html = digest_html(&ui);
+        assert!(html.contains("✅ Вынести мусор"), "{html}");
+        assert!(!html.contains("✅ Вынести мусор ·"), "{html}");
+        // Кнопки только нижние: строка выполненной задачи — текст.
+        let rows = button_rows(&ui);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(row_labels(rows[0]), ["📋 Задачи"]);
+    }
+
     #[test]
     fn digest_completed_recurring_shows_the_next_due() {
         let mut line = completed_task("Вынести мусор", None, true);
@@ -1473,46 +1649,6 @@ mod tests {
     }
 
     #[test]
-    fn digest_labels_are_relative_to_the_digest_day_not_now() {
-        let day = digest_day();
-        let tz: Tz = "Europe/Moscow".parse().expect("tz");
-        let overdue = DigestViewLine {
-            item_id: Uuid::now_v7(),
-            section: DigestSection::Overdue,
-            state: DigestLineState::Open {
-                title: "Просроченная".into(),
-                due_at: Some(
-                    tz.from_local_datetime(
-                        &(day - Duration::days(1)).and_hms_opt(12, 0, 0).unwrap(),
-                    )
-                    .unwrap()
-                    .with_timezone(&Utc),
-                ),
-                due_date: None,
-                version: 1,
-                assignee: None,
-                assignee_name: None,
-            },
-        };
-        let mut recurring = completed_task("Ежедневная", None, true);
-        let DigestLineState::Completed { next_due_date, .. } = &mut recurring.state else {
-            panic!("completed");
-        };
-        *next_due_date = Some(day + Duration::days(1));
-        let view = digest_view(vec![open_task("Сегодняшняя"), overdue, recurring]);
-
-        // Отрисовка не принимает «сейчас»: подписи строятся от дня сводки,
-        // поэтому повторная отрисовка того же представления даёт тот же
-        // отпечаток, когда бы она ни произошла.
-        let ui = digest_ui(&view);
-        let html = digest_html(&ui);
-        assert!(html.contains("☐ Сегодняшняя · весь день"), "{html}");
-        assert!(html.contains("☐ Просроченная · вчера, 12:00"), "{html}");
-        assert!(html.contains("✅ Ежедневная · следующее завтра"), "{html}");
-        assert_eq!(ui_fingerprint(&ui), ui_fingerprint(&digest_ui(&view)));
-    }
-
-    #[test]
     fn ui_fingerprint_is_deterministic_hex() {
         let mut view = digest_view((0..3).map(|n| open_task(&format!("Задача {n}"))).collect());
         view.shopping_open = 2;
@@ -1582,6 +1718,39 @@ mod tests {
         completed.lines[0] = completed_task("Вынести мусор", None, true);
         completed.lines[0].item_id = view.lines[0].item_id;
         assert_ne!(base, ui_fingerprint(&digest_ui(&completed)));
+
+        // Срок: вседневная задача дня сводки — «весь день», следующий день — «завтра».
+        let mut due_changed = view.clone();
+        let DigestLineState::Open { due_date, .. } = &mut due_changed.lines[0].state else {
+            panic!("open task");
+        };
+        *due_date = Some(digest_day() + Duration::days(1));
+        assert_ne!(base, ui_fingerprint(&digest_ui(&due_changed)));
+
+        // Метка исполнителя: общая задача стала назначенной другому («👤 Маша»).
+        let mut assignee_changed = view.clone();
+        set_open_assignee(&mut assignee_changed, Some(Uuid::now_v7()), Some("Маша"));
+        assert_ne!(base, ui_fingerprint(&digest_ui(&assignee_changed)));
+
+        // can_undo: выполненная строка кнопкой ↔ текстом.
+        let with_button = digest_view(vec![completed_task("Вынести мусор", Some("Маша"), true)]);
+        let without_button =
+            digest_view(vec![completed_task("Вынести мусор", Some("Маша"), false)]);
+        assert_ne!(
+            ui_fingerprint(&digest_ui(&with_button)),
+            ui_fingerprint(&digest_ui(&without_button))
+        );
+
+        // Удалена: текст «— удалена» вместо кнопки.
+        let mut deleted = view.clone();
+        deleted.lines[0] = DigestViewLine {
+            item_id: view.lines[0].item_id,
+            section: DigestSection::Today,
+            state: DigestLineState::Deleted {
+                title: "Вынести мусор".into(),
+            },
+        };
+        assert_ne!(base, ui_fingerprint(&digest_ui(&deleted)));
     }
 
     fn notice_item(title: &str) -> Item {

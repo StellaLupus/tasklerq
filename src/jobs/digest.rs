@@ -455,6 +455,11 @@ struct ViewItem {
 /// «мои», что [`content`] (в «только мои» ставшие чужими строки скрыты, при
 /// снятии исполнителя — снова видны с «👥»). Запросы идут по всем строкам
 /// снимка сразу (`= ANY`), не по одной на строку.
+///
+/// Функция не принимает «сейчас» и не зависит от текущего времени: день
+/// сводки берётся из ключа доставки, все подписи относительны к нему, поэтому
+/// отпечаток отрисовки не меняется с течением времени и полночь не вызывает
+/// правок (design, решение 5).
 pub async fn digest_view(
     conn: &mut PgConnection,
     delivery_id: Uuid,
@@ -583,6 +588,12 @@ pub async fn digest_view(
                             .flatten()
                     })
             });
+            // Выполненная неповторяющаяся задача без действующего события
+            // выполнения (например, событие удалено хранением): выполненность
+            // определяется статусом «выполнено» (design, решение 2). Имени и
+            // кнопки нет — `can_undo` не на чем проверять.
+            let done_without_event =
+                !item.recurring && item.status == ItemStatus::Done && completion.is_none();
             match completion {
                 Some(completion) => {
                     let actor_name = notify::member_name(
@@ -603,8 +614,18 @@ pub async fn digest_view(
                             delivery.user_id,
                             delivery.role,
                         ),
+                        completion_event: Some(completion.event_id),
                     }
                 }
+                None if done_without_event => notify::DigestLineState::Completed {
+                    title,
+                    actor_name: None,
+                    next_due_at: None,
+                    next_due_date: None,
+                    version: item.version,
+                    can_undo: false,
+                    completion_event: None,
+                },
                 None => notify::DigestLineState::Open {
                     title,
                     due_at: item.due_at,
