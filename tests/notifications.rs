@@ -23,6 +23,7 @@ use tasklerq::domain::models::{
 };
 use tasklerq::domain::recurrence::Due;
 use tasklerq::domain::settings::{DigestScope, NotificationSettingsUpdate, ProfileUpdate};
+use tasklerq::jobs::digest::{DigestSection, DigestSnapshotItem};
 use tasklerq::jobs::domain::DomainTicker;
 use tasklerq::jobs::scheduler::{
     Scheduler, TickStats, all_day_occurrence_key, occurrence_key, snooze_origin,
@@ -334,6 +335,26 @@ async fn digest_rows(
     .fetch_all(pool)
     .await
     .expect("digest deliveries")
+}
+
+/// Снимок и отпечаток последней доставленной сводки получателя.
+async fn digest_snapshot_and_hash(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> (Vec<DigestSnapshotItem>, String) {
+    let (items, hash): (Option<serde_json::Value>, Option<String>) = sqlx::query_as(
+        "SELECT digest_items, digest_hash
+         FROM notification_deliveries
+         WHERE user_id = $1 AND kind = 'digest'
+         ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .expect("digest delivery");
+    let snapshot =
+        serde_json::from_value(items.expect("digest_items written")).expect("snapshot reads");
+    (snapshot, hash.expect("digest_hash written"))
 }
 
 async fn assignment_rows(
@@ -3052,15 +3073,18 @@ async fn digest_shows_twenty_task_lines_and_a_show_more_button() {
     let moscow = chrono_tz::Europe::Moscow;
     let day = digest_day();
     enable_digest(&db.pool, household.owner_id).await;
+    let mut tasks = Vec::new();
     for n in 0..25 {
-        create_all_day_task(
-            &db,
-            &household,
-            &format!("Задача {n}"),
-            day,
-            Some(household.owner_id),
-        )
-        .await;
+        tasks.push(
+            create_all_day_task(
+                &db,
+                &household,
+                &format!("Задача {n}"),
+                day,
+                Some(household.owner_id),
+            )
+            .await,
+        );
     }
     let chat = chat_id(&db.pool, household.owner_id).await;
 
@@ -3076,6 +3100,98 @@ async fn digest_shows_twenty_task_lines_and_a_show_more_button() {
     assert_eq!(html.matches("☐ ").count(), 20, "{html}");
     assert!(html.contains("…и ещё 5 задач"), "{html}");
     assert!(html.contains("Показать ещё"), "{html}");
+    assert!(html.contains("Задача 19"), "{html}");
+    assert!(!html.contains("Задача 20"), "{html}");
+
+    // Снимок хранит все 25 строк в порядке отрисовки, хотя в сообщении 20.
+    let (snapshot, _hash) = digest_snapshot_and_hash(&db.pool, household.owner_id).await;
+    let expected: Vec<DigestSnapshotItem> = tasks
+        .iter()
+        .map(|task| DigestSnapshotItem {
+            item_id: task.id,
+            section: DigestSection::Today,
+            occurrence_key: all_day_occurrence_key(day),
+        })
+        .collect();
+    assert_eq!(snapshot, expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_delivery_writes_snapshot_and_render_hash() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    enable_digest(&db.pool, household.owner_id).await;
+    let today_task = create_task(
+        &db,
+        &household,
+        "Задача сегодня",
+        Some(local_utc(moscow, day, 18, 0)),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let overdue_task = create_task(
+        &db,
+        &household,
+        "Просроченная задача",
+        Some(local_utc(moscow, day - Duration::days(1), 18, 0)),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+    let event = create_event(
+        &db,
+        &household,
+        "Событие сегодня",
+        local_utc(moscow, day, 14, 0),
+        local_utc(moscow, day, 15, 0),
+    )
+    .await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+
+    let stats = scheduler(&db.pool)
+        .tick(local_utc(moscow, day, 8, 30))
+        .await
+        .expect("digest tick");
+    assert_eq!(stats.delivered, 1);
+
+    // Снимок — все строки в порядке отрисовки: «Сегодня», затем «Просрочено»;
+    // ключ вхождения — как у напоминаний, у события — ключ начала.
+    let (snapshot, hash) = digest_snapshot_and_hash(&db.pool, household.owner_id).await;
+    assert_eq!(
+        snapshot,
+        vec![
+            DigestSnapshotItem {
+                item_id: event.id,
+                section: DigestSection::Event,
+                occurrence_key: occurrence_key(event.due_at.expect("event start")),
+            },
+            DigestSnapshotItem {
+                item_id: today_task.id,
+                section: DigestSection::Today,
+                occurrence_key: occurrence_key(today_task.due_at.expect("task due")),
+            },
+            DigestSnapshotItem {
+                item_id: overdue_task.id,
+                section: DigestSection::Overdue,
+                occurrence_key: occurrence_key(overdue_task.due_at.expect("task due")),
+            },
+        ]
+    );
+    assert_eq!(hash.len(), 64, "{hash}");
+    assert!(hash.chars().all(|ch| ch.is_ascii_hexdigit()), "{hash}");
+
+    // Порядок строк сообщения совпадает с порядком снимка.
+    let sent = messages(&db.pool, chat).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let html = &sent[0];
+    let event_at = html.find("Событие сегодня").expect("event line");
+    let today_at = html.find("Задача сегодня").expect("today line");
+    let overdue_at = html.find("Просроченная задача").expect("overdue line");
+    assert!(event_at < today_at && today_at < overdue_at, "{html}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3200,8 +3316,8 @@ async fn digest_skips_completed_deleted_and_other_household_tasks() {
 }
 
 /// Household для тестов состава сводки: Петя получает сводку, Маша — нет.
-/// На сегодня задача Пети, общая задача, задача Маши, событие Маши, общее
-/// событие и одна открытая покупка.
+/// На сегодня задача Пети, общая задача, задача Маши, событие Пети, событие
+/// Маши, общее событие и одна открытая покупка.
 async fn digest_scope_household(db: &TestDb) -> (TestHousehold, Uuid) {
     let household = household_without_digest(db).await;
     set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
@@ -3253,6 +3369,15 @@ async fn digest_scope_household(db: &TestDb) -> (TestHousehold, Uuid) {
         local_utc(moscow, day, 17, 0),
     )
     .await;
+    let petya_event = create_event(
+        db,
+        &household,
+        "Событие Пети",
+        local_utc(moscow, day, 12, 0),
+        local_utc(moscow, day, 13, 0),
+    )
+    .await;
+    assign_without_notice(&db.pool, petya_event.id, petya).await;
     create_shopping(db, &household, "Молоко").await;
     (household, petya)
 }
@@ -3278,6 +3403,7 @@ async fn digest_mine_scope_shows_own_and_shared_items_only() {
     assert!(html.contains("Задача Пети"), "{html}");
     assert!(html.contains("Общая задача"), "{html}");
     assert!(html.contains("Общее событие"), "{html}");
+    assert!(html.contains("Событие Пети"), "{html}");
     assert!(!html.contains("Задача Маши"), "{html}");
     assert!(!html.contains("Событие Маши"), "{html}");
     // Число покупок от состава не зависит.

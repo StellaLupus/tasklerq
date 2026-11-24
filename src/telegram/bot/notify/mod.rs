@@ -7,6 +7,7 @@
 
 use chrono::{DateTime, Duration, NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
+use sha2::{Digest, Sha256};
 use sqlx::PgConnection;
 use uuid::Uuid;
 
@@ -19,7 +20,7 @@ use crate::storage::repositories::notifications::{self, NewDelivery, Notificatio
 use crate::storage::repositories::{items, lists};
 use crate::telegram::callbacks::Scope;
 use crate::telegram::outbox::{self, Outgoing};
-use crate::telegram::rich::{Span, button};
+use crate::telegram::rich::{Block, Span, button};
 use crate::telegram::ru;
 
 use super::model::{Action, Screen, SnoozeUntil, Ui};
@@ -368,6 +369,53 @@ pub async fn render_notice(
         issued_at,
     )
     .await
+}
+
+/// Отпечаток отрисовки без токенов (design, решение 6): SHA-256 в hex от
+/// текста экрана и подписей/действий его кнопок. Токены выпускаются при
+/// [`render_notice`] и меняются при каждой отрисовке, поэтому в отпечаток не
+/// входят: одинаковый `Ui` всегда даёт одинаковый отпечаток. По нему шаг
+/// `sync_digests` и обработчик касания сводки решают, нужна ли правка
+/// сообщения, а запись `digest_hash` хранит отпечаток последней отрисовки.
+pub(crate) fn ui_fingerprint(ui: &Ui) -> String {
+    let blocks: Vec<serde_json::Value> = ui
+        .blocks
+        .iter()
+        .map(|block| match block {
+            Block::Heading(text) => serde_json::json!({ "heading": text }),
+            Block::Paragraph(spans) => serde_json::json!({
+                "paragraph": spans
+                    .iter()
+                    .map(|span| match span {
+                        Span::Text(text) => serde_json::json!({ "text": text }),
+                        Span::Bold(text) => serde_json::json!({ "bold": text }),
+                        Span::Italic(text) => serde_json::json!({ "italic": text }),
+                        Span::Code(text) => serde_json::json!({ "code": text }),
+                    })
+                    .collect::<Vec<_>>()
+            }),
+            Block::Rule => serde_json::json!({ "rule": true }),
+            Block::Details { summary, body } => {
+                serde_json::json!({ "details": [summary, body] })
+            }
+            Block::Quote(text) => serde_json::json!({ "quote": text }),
+            Block::CollapsedQuote(text) => serde_json::json!({ "collapsed_quote": text }),
+            Block::Buttons(buttons) => serde_json::json!({
+                "buttons": buttons
+                    .iter()
+                    .map(|button| serde_json::json!({
+                        "label": button.label,
+                        "action": button.action,
+                    }))
+                    .collect::<Vec<_>>()
+            }),
+        })
+        .collect();
+    let canonical = serde_json::to_string(&blocks).expect("fingerprint blocks serialize");
+    Sha256::digest(canonical.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 async fn load(ctx: &mut Ctx<'_>, item_id: Uuid) -> Result<Option<(Item, List)>, Fail> {
@@ -895,6 +943,68 @@ mod tests {
         let tokens = vec!["t:AAAAAAAAAAAAAAAA".to_owned()];
         let html = crate::telegram::rich::render(&ui, &tokens).html;
         assert!(html.contains("Покупки: 7 позиций"));
+    }
+
+    #[test]
+    fn ui_fingerprint_is_deterministic_hex() {
+        let lines: Vec<DigestLine> = (0..3)
+            .map(|n| DigestLine {
+                title: format!("Задача {n}"),
+                when: "сегодня".into(),
+                is_event: false,
+            })
+            .collect();
+        let ui = digest_ui(&lines, &[], 2, Some(Uuid::now_v7()), Some(Uuid::now_v7()));
+
+        let hash = ui_fingerprint(&ui);
+        assert_eq!(hash.len(), 64, "{hash}");
+        assert!(hash.chars().all(|ch| ch.is_ascii_hexdigit()), "{hash}");
+        assert_eq!(hash, ui_fingerprint(&ui));
+    }
+
+    #[test]
+    fn ui_fingerprint_changes_with_line_text_or_button_action() {
+        let item_id = Uuid::now_v7();
+        let base = Ui::new()
+            .heading("☀️ Доброе утро!")
+            .text("☐ Задача · сегодня")
+            .row(vec![button("📋 Открыть", Action::NoticeOpen { item_id })]);
+        let other_text = Ui::new()
+            .heading("☀️ Доброе утро!")
+            .text("☐ Другая задача · сегодня")
+            .row(vec![button("📋 Открыть", Action::NoticeOpen { item_id })]);
+        let other_action = Ui::new()
+            .heading("☀️ Доброе утро!")
+            .text("☐ Задача · сегодня")
+            .row(vec![button("📋 Открыть", Action::NoticeClose)]);
+        let other_label = Ui::new()
+            .heading("☀️ Доброе утро!")
+            .text("☐ Задача · сегодня")
+            .row(vec![button("🗑 Убрать", Action::NoticeOpen { item_id })]);
+
+        assert_ne!(ui_fingerprint(&base), ui_fingerprint(&other_text));
+        assert_ne!(ui_fingerprint(&base), ui_fingerprint(&other_action));
+        assert_ne!(ui_fingerprint(&base), ui_fingerprint(&other_label));
+    }
+
+    #[test]
+    fn ui_fingerprint_does_not_depend_on_button_tokens() {
+        let lines: Vec<DigestLine> = (0..3)
+            .map(|n| DigestLine {
+                title: format!("Задача {n}"),
+                when: "сегодня".into(),
+                is_event: false,
+            })
+            .collect();
+        let ui = digest_ui(&lines, &[], 0, None, None);
+
+        let before = ui_fingerprint(&ui);
+        // render_notice выпускает новые токены при каждой отрисовке: HTML
+        // двух отрисовок одного Ui различается, а отпечаток — нет.
+        let first = crate::telegram::rich::render(&ui, &["t:AAAAAAAAAAAAAAAA".to_owned()]).html;
+        let second = crate::telegram::rich::render(&ui, &["t:BBBBBBBBBBBBBBBB".to_owned()]).html;
+        assert_ne!(first, second);
+        assert_eq!(before, ui_fingerprint(&ui));
     }
 
     fn notice_item(title: &str) -> Item {

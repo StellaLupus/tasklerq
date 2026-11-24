@@ -2,11 +2,12 @@
 
 use chrono::{DateTime, Duration, NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
+use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::delivery::{self, DeliveryScope};
-use super::keys::digest_key_date;
+use super::keys::{digest_key_date, item_occurrence_key};
 use super::notice::NoticeRow;
 use super::quiet::{desired_schedule, resolved_timezone};
 use crate::domain::events::effective_end;
@@ -196,9 +197,40 @@ struct DigestItem {
     end_date: Option<NaiveDate>,
 }
 
+/// Раздел строки снимка сводки на момент доставки.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DigestSection {
+    /// «Сегодня».
+    Today,
+    /// «Просрочено».
+    Overdue,
+    /// Событие.
+    Event,
+}
+
+/// Строка снимка состава сводки (design, решение 1).
+///
+/// Снимок фиксируется при доставке в `notification_deliveries.digest_items`
+/// и дальше не меняется: перерисовка читает состав отсюда, а состояние — из
+/// `items` и событий выполнения. Первые 20 строк снимка — это 20 строк
+/// текущей сводки в том же порядке.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DigestSnapshotItem {
+    /// Элемент: задача или событие.
+    pub item_id: Uuid,
+    /// Раздел строки на момент доставки.
+    pub section: DigestSection,
+    /// Ключ вхождения срока (`keys::item_occurrence_key`), как у напоминаний;
+    /// у события — ключ начала вхождения тем же способом.
+    pub occurrence_key: String,
+}
+
 struct DigestContent {
     today: Vec<DigestLine>,
     overdue: Vec<DigestLine>,
+    /// Упорядоченный снимок всех строк в порядке отрисовки.
+    snapshot: Vec<DigestSnapshotItem>,
     shopping_open: i64,
     tasks_list: Option<Uuid>,
     shopping_list: Option<Uuid>,
@@ -293,7 +325,9 @@ fn event_when(item: &DigestItem, timezone: Tz, today: NaiveDate) -> String {
 /// вседневная задача с прошедшей датой — «Просрочено», остальные задачи с
 /// локальной датой получателя — «Сегодня». В составе «только мои» задачи и
 /// события фильтруются общим предикатом «мои» (у события исполнитель —
-/// участник, чьё оно); число покупок от состава не зависит.
+/// участник, чьё оно); число покупок от состава не зависит. Вместе с
+/// содержимым возвращается упорядоченный снимок всех строк в порядке
+/// отрисовки.
 async fn content(
     conn: &mut PgConnection,
     household_id: Uuid,
@@ -327,7 +361,12 @@ async fn content(
     let today = now.with_timezone(&timezone).date_naive();
     let mut today_lines = Vec::new();
     let mut overdue_lines = Vec::new();
+    let mut today_items = Vec::new();
+    let mut overdue_items = Vec::new();
     for row in rows {
+        // Ключ вхождения строки снимка — как у напоминаний; у события ключ
+        // начала вхождения считается тем же способом.
+        let occurrence_key = item_occurrence_key(row.due_at, row.due_date).unwrap_or_default();
         if row.kind == ListKind::Events {
             // Событие никогда не попадает в просроченные: прошедшее просто не
             // показывается, а начавшееся раньше и ещё идущее — в «Сегодня».
@@ -336,6 +375,11 @@ async fn content(
                     when: event_when(&row, timezone, today),
                     title: row.title,
                     is_event: true,
+                });
+                today_items.push(DigestSnapshotItem {
+                    item_id: row.id,
+                    section: DigestSection::Event,
+                    occurrence_key,
                 });
             }
             continue;
@@ -347,12 +391,22 @@ async fn content(
                     when: ru::due_label(Some(due_at), None, timezone, now).unwrap_or_default(),
                     is_event: false,
                 });
+                overdue_items.push(DigestSnapshotItem {
+                    item_id: row.id,
+                    section: DigestSection::Overdue,
+                    occurrence_key,
+                });
             }
             (Some(due_at), None) if due_at.with_timezone(&timezone).date_naive() == today => {
                 today_lines.push(DigestLine {
                     title: row.title,
                     when: due_at.with_timezone(&timezone).format("%H:%M").to_string(),
                     is_event: false,
+                });
+                today_items.push(DigestSnapshotItem {
+                    item_id: row.id,
+                    section: DigestSection::Today,
+                    occurrence_key,
                 });
             }
             (None, Some(due_date)) if due_date < today => {
@@ -361,12 +415,22 @@ async fn content(
                     when: ru::date_label(due_date, today),
                     is_event: false,
                 });
+                overdue_items.push(DigestSnapshotItem {
+                    item_id: row.id,
+                    section: DigestSection::Overdue,
+                    occurrence_key,
+                });
             }
             (None, Some(due_date)) if due_date == today => {
                 today_lines.push(DigestLine {
                     title: row.title,
                     when: ru::ALL_DAY.to_owned(),
                     is_event: false,
+                });
+                today_items.push(DigestSnapshotItem {
+                    item_id: row.id,
+                    section: DigestSection::Today,
+                    occurrence_key,
                 });
             }
             _ => {}
@@ -405,6 +469,8 @@ async fn content(
     Ok(DigestContent {
         today: today_lines,
         overdue: overdue_lines,
+        // Порядок снимка — порядок отрисовки: «Сегодня», затем «Просрочено».
+        snapshot: today_items.into_iter().chain(overdue_items).collect(),
         shopping_open,
         tasks_list: find("tasks"),
         shopping_list: find("shopping"),
@@ -413,6 +479,10 @@ async fn content(
 
 /// Собрать сообщение сводки; содержимое собирается здесь, а не при
 /// планировании.
+///
+/// Снимок состава и отпечаток отправленной отрисовки записываются в запись
+/// доставки в той же транзакции, что ставит сообщение в outbox (design,
+/// решения 1, 6).
 pub(crate) async fn digest_message(
     conn: &mut PgConnection,
     row: &NoticeRow,
@@ -436,9 +506,19 @@ pub(crate) async fn digest_message(
         content.tasks_list,
         content.shopping_list,
     );
-    notify::render_notice(conn, telegram_user_id, row.household_id, &ui, now)
-        .await
-        .map(Some)
+    let html = notify::render_notice(conn, telegram_user_id, row.household_id, &ui, now).await?;
+    sqlx::query(
+        "UPDATE notification_deliveries
+         SET digest_items = $2, digest_hash = $3, updated_at = $4
+         WHERE id = $1",
+    )
+    .bind(row.id)
+    .bind(serde_json::to_value(&content.snapshot).expect("digest snapshot serializes"))
+    .bind(notify::ui_fingerprint(&ui))
+    .bind(now)
+    .execute(&mut *conn)
+    .await?;
+    Ok(Some(html))
 }
 
 /// Окно поиска прежней сводки для замены: 47 часов.
