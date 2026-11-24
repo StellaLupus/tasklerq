@@ -1264,6 +1264,8 @@ pub enum Setting {
     Reminders,
     /// Утренняя сводка.
     Digest,
+    /// Состав утренней сводки.
+    DigestScope,
     /// Уведомления о назначении.
     Assignment,
     /// Тихие часы.
