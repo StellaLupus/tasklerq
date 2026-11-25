@@ -13,7 +13,8 @@ use chrono_tz::Tz;
 use serde_json::json;
 use sqlx::{Acquire, PgPool};
 use support::notifications::{
-    button_of, household_for, local_today, onboarded, quiet_off, tick_and_deliver,
+    button_of, digest_delivery_id, household_for, local_today, onboarded, quiet_off,
+    tick_and_deliver,
 };
 use support::telegram::{Call, Harness, buttons};
 use support::{TestDb, TestHousehold, new_member, next_telegram_id};
@@ -3400,19 +3401,6 @@ async fn digest_scope_household(db: &TestDb) -> (TestHousehold, Uuid, Uuid, Dige
     (household, petya, masha, items)
 }
 
-/// Id последней доставленной сводки получателя.
-async fn latest_digest_id(pool: &PgPool, user_id: Uuid) -> Uuid {
-    sqlx::query_scalar(
-        "SELECT id FROM notification_deliveries
-         WHERE user_id = $1 AND kind = 'digest'
-         ORDER BY created_at DESC, id DESC LIMIT 1",
-    )
-    .bind(user_id)
-    .fetch_one(pool)
-    .await
-    .expect("digest delivery id")
-}
-
 /// HTML отрисовки представления сводки с фиктивными токенами.
 fn digest_view_html(view: &tasklerq::telegram::bot::notify::DigestView) -> String {
     let ui = tasklerq::telegram::bot::notify::digest_ui(view);
@@ -3507,7 +3495,7 @@ async fn digest_view_hides_a_task_assigned_to_another_member_in_mine_scope() {
         .await
         .expect("mine digest tick");
     assert_eq!(stats.delivered, 1);
-    let delivery_id = latest_digest_id(&db.pool, petya).await;
+    let delivery_id = digest_delivery_id(&db.pool, petya).await;
     let now = local_utc(moscow, day, 9, 0);
 
     let mut conn = db.pool.acquire().await.expect("conn");
@@ -3573,7 +3561,7 @@ async fn digest_view_labels_a_task_assigned_to_another_member_in_all_scope() {
         .await
         .expect("all digest tick");
     assert_eq!(stats.delivered, 1);
-    let delivery_id = latest_digest_id(&db.pool, petya).await;
+    let delivery_id = digest_delivery_id(&db.pool, petya).await;
     let now = local_utc(moscow, day, 9, 0);
 
     let mut conn = db.pool.acquire().await.expect("conn");
@@ -3637,7 +3625,7 @@ async fn digest_hash_matches_the_fingerprint_of_the_delivery_render() {
     assert_eq!(stats.delivered, 1);
 
     let (_snapshot, hash) = digest_snapshot_and_hash(&db.pool, household.owner_id).await;
-    let delivery_id = latest_digest_id(&db.pool, household.owner_id).await;
+    let delivery_id = digest_delivery_id(&db.pool, household.owner_id).await;
     let mut conn = db.pool.acquire().await.expect("conn");
     let view = tasklerq::jobs::digest::digest_view(&mut conn, delivery_id)
         .await
@@ -3687,7 +3675,7 @@ async fn digest_view_keeps_the_event_time_from_the_snapshot() {
         .await
         .expect("digest tick");
     assert_eq!(stats.delivered, 1);
-    let delivery_id = latest_digest_id(&db.pool, household.owner_id).await;
+    let delivery_id = digest_delivery_id(&db.pool, household.owner_id).await;
 
     // Событие прошло, и DomainTicker сдвинул его на следующую неделю.
     ticker(&db.pool)
@@ -3750,7 +3738,7 @@ async fn digest_view_shows_the_next_due_of_a_completed_daily_task() {
         .await
         .expect("digest tick");
     assert_eq!(stats.delivered, 1);
-    let delivery_id = latest_digest_id(&db.pool, household.owner_id).await;
+    let delivery_id = digest_delivery_id(&db.pool, household.owner_id).await;
 
     let mut conn = db.pool.acquire().await.expect("conn");
     let task = items::get(&mut conn, household.household_id, task.id)
@@ -3805,7 +3793,7 @@ async fn digest_view_shows_a_done_task_without_a_completion_event() {
         .await
         .expect("digest tick");
     assert_eq!(stats.delivered, 1);
-    let delivery_id = latest_digest_id(&db.pool, household.owner_id).await;
+    let delivery_id = digest_delivery_id(&db.pool, household.owner_id).await;
 
     let mut conn = db.pool.acquire().await.expect("conn");
     items::complete(
@@ -3897,7 +3885,7 @@ async fn digest_view_labels_are_relative_to_the_digest_day() {
         .await
         .expect("digest tick");
     assert_eq!(stats.delivered, 1);
-    let delivery_id = latest_digest_id(&db.pool, household.owner_id).await;
+    let delivery_id = digest_delivery_id(&db.pool, household.owner_id).await;
 
     let mut conn = db.pool.acquire().await.expect("conn");
     let daily = items::get(&mut conn, household.household_id, daily.id)
@@ -3973,7 +3961,7 @@ async fn digest_view_shows_deleted_archived_and_deleted_event_lines() {
         .await
         .expect("digest tick");
     assert_eq!(stats.delivered, 1);
-    let delivery_id = latest_digest_id(&db.pool, household.owner_id).await;
+    let delivery_id = digest_delivery_id(&db.pool, household.owner_id).await;
 
     let mut conn = db.pool.acquire().await.expect("conn");
     items::soft_delete(
@@ -4045,8 +4033,8 @@ async fn digest_view_completed_by_another_member_button_follows_the_role() {
         .await
         .expect("digest tick");
     assert_eq!(stats.delivered, 2, "owner and Petya digests");
-    let owner_delivery = latest_digest_id(&db.pool, household.owner_id).await;
-    let petya_delivery = latest_digest_id(&db.pool, petya).await;
+    let owner_delivery = digest_delivery_id(&db.pool, household.owner_id).await;
+    let petya_delivery = digest_delivery_id(&db.pool, petya).await;
 
     let mut conn = db.pool.acquire().await.expect("conn");
     items::complete(
@@ -4130,7 +4118,7 @@ async fn digest_view_completed_line_hides_the_name_for_recipient_system_and_excl
         .await
         .expect("digest tick");
     assert_eq!(stats.delivered, 1);
-    let delivery_id = latest_digest_id(&db.pool, household.owner_id).await;
+    let delivery_id = digest_delivery_id(&db.pool, household.owner_id).await;
 
     let mut conn = db.pool.acquire().await.expect("conn");
     let now = local_utc(moscow, day, 9, 0);
@@ -4203,7 +4191,7 @@ async fn digest_view_hides_an_event_assigned_to_another_member_in_mine_scope() {
         .await
         .expect("mine digest tick");
     assert_eq!(stats.delivered, 1);
-    let delivery_id = latest_digest_id(&db.pool, petya).await;
+    let delivery_id = digest_delivery_id(&db.pool, petya).await;
 
     // Общее событие из снимка Пети назначили Маше после доставки.
     assign_without_notice(&db.pool, scope_items.shared_event, masha).await;
@@ -4245,7 +4233,7 @@ async fn digest_fingerprint_does_not_depend_on_notice_tokens() {
         .expect("digest tick");
     assert_eq!(stats.delivered, 1);
 
-    let delivery_id = latest_digest_id(&db.pool, household.owner_id).await;
+    let delivery_id = digest_delivery_id(&db.pool, household.owner_id).await;
     // В фикстурах telegram_user_id совпадает с telegram_chat_id.
     let telegram_id = chat_id(&db.pool, household.owner_id).await;
     let mut conn = db.pool.acquire().await.expect("conn");
@@ -8960,7 +8948,7 @@ async fn outbox_count(pool: &PgPool, chat: i64) -> i64 {
 
 /// `digest_hash` последней сводки получателя равен отпечатку её текущей отрисовки.
 async fn assert_digest_hash_matches_render(pool: &PgPool, user_id: Uuid) {
-    let delivery_id = latest_digest_id(pool, user_id).await;
+    let delivery_id = digest_delivery_id(pool, user_id).await;
     let mut conn = pool.acquire().await.expect("conn");
     let view = tasklerq::jobs::digest::digest_view(&mut conn, delivery_id)
         .await
@@ -9497,7 +9485,16 @@ async fn sync_digests_leaves_digest_older_than_47_hours_alone() {
 
 /// Сдвинуть отправку сводки получателя в прошлое: `sent_at` строки outbox и
 /// `updated_at` записи доставки (запись получает его при постановке в outbox).
-async fn age_digest_sent_at(pool: &PgPool, user_id: Uuid, sent_at: DateTime<Utc>) {
+///
+/// `updated_at` можно задать отдельно от `sent_at`: задержка outbox между
+/// постановкой и фактической отправкой ничем не ограничена, поэтому `sent_at`
+/// внутри окна может сочетаться со старым `updated_at`. По умолчанию они равны.
+async fn age_digest_sent_at(
+    pool: &PgPool,
+    user_id: Uuid,
+    sent_at: DateTime<Utc>,
+    updated_at: Option<DateTime<Utc>>,
+) {
     sqlx::query(
         "UPDATE outbox SET sent_at = $2
          WHERE seq = (SELECT outbox_seq FROM notification_deliveries
@@ -9513,7 +9510,7 @@ async fn age_digest_sent_at(pool: &PgPool, user_id: Uuid, sent_at: DateTime<Utc>
          WHERE user_id = $1 AND kind = 'digest'",
     )
     .bind(user_id)
-    .bind(sent_at)
+    .bind(updated_at.unwrap_or(sent_at))
     .execute(pool)
     .await
     .expect("age digest delivery");
@@ -9529,6 +9526,7 @@ async fn sync_digests_edits_digest_delivered_just_under_47_hours_ago() {
         &db.pool,
         stand.petya_id,
         done_at - Duration::hours(47) + Duration::minutes(1),
+        None,
     )
     .await;
     complete_as(
@@ -9560,6 +9558,7 @@ async fn sync_digests_leaves_digest_delivered_just_over_47_hours_ago() {
         &db.pool,
         stand.petya_id,
         done_at - Duration::hours(47) - Duration::minutes(1),
+        None,
     )
     .await;
     complete_as(
@@ -9577,6 +9576,74 @@ async fn sync_digests_leaves_digest_delivered_just_over_47_hours_ago() {
 
     assert_eq!(edit_count(&db.pool, stand.petya.chat).await, 0);
     assert!(message_html(&stand.petya, stand.petya_msg).contains("☐ Вынести мусор"));
+}
+
+/// Граница 47 часов включительна: сводка, доставленная ровно 47 часов назад,
+/// ещё правится (`o.sent_at >= $1`, мутация на `>` ломает тест).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_digests_edits_digest_delivered_exactly_47_hours_ago() {
+    let db = support::isolated_db().await;
+    let mut stand = digest_sync_stand(&db).await;
+    let done_at = stand.at + Duration::minutes(1);
+    age_digest_sent_at(
+        &db.pool,
+        stand.petya_id,
+        done_at - Duration::hours(47),
+        None,
+    )
+    .await;
+    complete_as(
+        &db,
+        &stand.household,
+        stand.shared.id,
+        &Actor::user(stand.masha_id, UserRole::Member),
+        done_at,
+    )
+    .await;
+
+    digest_sync_tick(&mut stand, done_at).await;
+    stand.petya.deliver().await;
+    stand.masha.deliver().await;
+
+    assert_eq!(edit_count(&db.pool, stand.petya.chat).await, 1);
+    let html = message_html(&stand.petya, stand.petya_msg);
+    assert!(html.contains("✅ Вынести мусор · Маша"), "{html}");
+    assert_digest_hash_matches_render(&db.pool, stand.petya_id).await;
+}
+
+/// Задержка outbox не ограничена: сводка, поставленная 76 часов назад, но
+/// фактически отправленная 46 часов назад, ещё правится. Прежний предфильтр
+/// по `updated_at` (`done_at - 71 ч`) исключил бы её до проверки `sent_at`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_digests_edits_a_digest_delivered_late_from_a_stale_queue() {
+    let db = support::isolated_db().await;
+    let mut stand = digest_sync_stand(&db).await;
+    let done_at = stand.at + Duration::minutes(1);
+    let sent_at = done_at - Duration::hours(46);
+    age_digest_sent_at(
+        &db.pool,
+        stand.petya_id,
+        sent_at,
+        Some(sent_at - Duration::hours(30)),
+    )
+    .await;
+    complete_as(
+        &db,
+        &stand.household,
+        stand.shared.id,
+        &Actor::user(stand.masha_id, UserRole::Member),
+        done_at,
+    )
+    .await;
+
+    digest_sync_tick(&mut stand, done_at).await;
+    stand.petya.deliver().await;
+    stand.masha.deliver().await;
+
+    assert_eq!(edit_count(&db.pool, stand.petya.chat).await, 1);
+    let html = message_html(&stand.petya, stand.petya_msg);
+    assert!(html.contains("✅ Вынести мусор · Маша"), "{html}");
+    assert_digest_hash_matches_render(&db.pool, stand.petya_id).await;
 }
 
 /// Сводка без снимка (как до выката) не правится.

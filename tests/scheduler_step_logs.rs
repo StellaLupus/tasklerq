@@ -12,6 +12,31 @@ use serde_json::json;
 use support::logs::LogBuffer;
 use tasklerq::storage::repositories::items;
 
+/// Единственная запись журнала о сбое шага: одна строка JSON, где `level`
+/// равен `ERROR`, `step` — имя шага и присутствует поле `error`. Независимые
+/// `contains` по всему буферу склеили бы поля разных записей.
+fn step_error_entry(logs: &str, step: &str) -> serde_json::Value {
+    let matches: Vec<serde_json::Value> = logs
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("log line is not JSON ({error}): {line}"))
+        })
+        .filter(|entry: &serde_json::Value| {
+            entry["level"] == "ERROR"
+                && entry["fields"]["step"] == step
+                && entry["fields"].get("error").is_some()
+        })
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected exactly one ERROR entry for step `{step}`:\n{logs}"
+    );
+    matches.into_iter().next().expect("one entry")
+}
+
 #[test]
 fn a_failed_digest_step_is_logged_with_its_name_and_still_delivers_reminders() {
     let buffer = LogBuffer::default();
@@ -477,13 +502,9 @@ fn a_failed_digest_sync_step_is_logged_with_its_name_and_still_delivers_reminder
         result.1, 1,
         "the reminder must still be delivered after the failed step:\n{logs}"
     );
-    assert!(logs.contains("\"level\":\"ERROR\""), "{logs}");
+    let entry = step_error_entry(&logs, "sync_digests");
     assert!(
-        logs.contains("\"step\":\"sync_digests\""),
-        "the error must carry the step name:\n{logs}"
-    );
-    assert!(
-        logs.contains("\"error\":"),
-        "the step error must be logged:\n{logs}"
+        entry["fields"]["error"].is_string(),
+        "the step error must carry its message: {entry}"
     );
 }
