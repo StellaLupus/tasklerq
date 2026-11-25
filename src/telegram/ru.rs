@@ -345,6 +345,8 @@ pub const DONE_TOAST: &str = "Выполнено";
 pub const BACK_BUTTON: &str = "⬅️ Назад";
 /// Кнопка возврата в главное меню.
 pub const MENU_BUTTON: &str = "🏠 Меню";
+/// Кнопка сводки по запросу на постоянной клавиатуре под полем ввода.
+pub const DIGEST_KEYBOARD_BUTTON: &str = "☀️ Сводка";
 /// Текст носителя постоянной reply-клавиатуры: подсказывает написать задачу
 /// и вызвать меню кнопкой под полем ввода.
 pub const KEYBOARD_CARRIER_TEXT: &str =

@@ -885,6 +885,59 @@ pub async fn request_manual(
     user_id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<Option<Uuid>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    match request_manual_in_conn(&mut tx, user_id, now).await? {
+        Some(id) => {
+            tx.commit().await?;
+            Ok(Some(id))
+        }
+        None => {
+            tx.rollback().await?;
+            Ok(None)
+        }
+    }
+}
+
+/// То же, что [`request_manual`], но в транзакции вызывающего.
+///
+/// Так сводку по кнопке клавиатуры ставит обработчик бота: очистка формы,
+/// удаление текста кнопки и запись сводки фиксируются одной транзакцией
+/// воркера. `None` (получатель недоступен или занят планировщиком) откатывает
+/// вложенный savepoint: частичной записи в транзакции вызывающего не остаётся.
+pub(crate) async fn request_manual_in_conn(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query("SAVEPOINT manual_digest")
+        .execute(&mut *conn)
+        .await?;
+    let result = build_manual_digest(conn, user_id, now).await;
+    match &result {
+        Ok(Some(_)) => {
+            sqlx::query("RELEASE SAVEPOINT manual_digest")
+                .execute(&mut *conn)
+                .await?;
+        }
+        Ok(None) => {
+            sqlx::query("ROLLBACK TO SAVEPOINT manual_digest")
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query("RELEASE SAVEPOINT manual_digest")
+                .execute(&mut *conn)
+                .await?;
+        }
+        // Ошибку откатывает вызывающий вместе со всей транзакцией.
+        Err(_) => {}
+    }
+    result
+}
+
+async fn build_manual_digest(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<Option<Uuid>, sqlx::Error> {
     #[derive(FromRow)]
     struct Recipient {
         household_id: Uuid,
@@ -900,7 +953,7 @@ pub async fn request_manual(
          WHERE u.id = $1 AND u.deleted_at IS NULL",
     )
     .bind(user_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
     let Some(recipient) = recipient else {
         return Ok(None);
@@ -912,12 +965,11 @@ pub async fn request_manual(
     let local_date = now.with_timezone(&timezone).date_naive();
     let occurrence_key = format!("digest:{local_date}#manual:{}", now.timestamp_millis());
 
-    let mut tx = pool.begin().await?;
     // Ручной запрос соревнуется за получателя с утренней доставкой сводки,
     // пакетным шагом тика и обработчиком настроек: все они берут ту же
     // транзакционную блокировку. Занятого получателя не ждём: утренняя запись
     // останется на следующий тик, а повторное нажатие создаст новую сводку.
-    if !delivery::try_recipient_lock(&mut tx, user_id).await? {
+    if !delivery::try_recipient_lock(conn, user_id).await? {
         return Ok(None);
     }
 
@@ -934,7 +986,7 @@ pub async fn request_manual(
     .bind(user_id)
     .bind(&occurrence_key)
     .bind(now)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
 
     let sql = format!(
@@ -942,7 +994,7 @@ pub async fn request_manual(
          {NOTICE_ROW_FROM}
          WHERE d.id = $1"
     );
-    let row: NoticeRow = sqlx::query_as(&sql).bind(id).fetch_one(&mut *tx).await?;
+    let row: NoticeRow = sqlx::query_as(&sql).bind(id).fetch_one(&mut *conn).await?;
     // Удаление получателя могло произойти после первичной проверки, но до
     // этой строки: мягкое удаление не очищает Telegram-поля.
     if !row.recipient_alive() {
@@ -953,16 +1005,15 @@ pub async fn request_manual(
         return Ok(None);
     };
 
-    let Some(html) = digest_message(&mut tx, &row, telegram_user_id, now).await? else {
+    let Some(html) = digest_message(conn, &row, telegram_user_id, now).await? else {
         return Ok(None);
     };
-    supersede_pending_manual(&mut tx, user_id, row.id, now).await?;
-    let replaces = replace_previous(&mut tx, &row, chat_id, now).await?;
+    supersede_pending_manual(conn, user_id, row.id, now).await?;
+    let replaces = replace_previous(conn, &row, chat_id, now).await?;
     let dedupe_key = delivery::delivery_dedupe_key(row.id, NotificationKind::Digest);
     let seq =
-        delivery::enqueue_message(&mut tx, chat_id, &dedupe_key, html, true, replaces, now).await?;
-    delivery::mark_sent(&mut tx, row.id, seq, now).await?;
-    tx.commit().await?;
+        delivery::enqueue_message(conn, chat_id, &dedupe_key, html, true, replaces, now).await?;
+    delivery::mark_sent(conn, row.id, seq, now).await?;
     Ok(Some(row.id))
 }
 

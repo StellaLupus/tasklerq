@@ -2890,7 +2890,7 @@ async fn menu_sends_the_keyboard_carrier_before_the_menu() {
         "the carrier must be queued before the menu: {rows:?}"
     );
 
-    // Носитель доставлен с текстом спеки и раскладкой из одной кнопки меню.
+    // Носитель доставлен с текстом спеки и рядом «🏠 Меню» и «☀️ Сводка».
     let carrier_id = assert_carrier_sent(&bot);
 
     // Вызовы фейка: сначала носитель, затем меню.
@@ -2966,7 +2966,7 @@ async fn start_sends_the_keyboard_carrier_before_the_menu() {
         "the carrier must be queued before the menu: {rows:?}"
     );
 
-    // Носитель доставлен с текстом спеки и раскладкой из одной кнопки меню.
+    // Носитель доставлен с текстом спеки и рядом «🏠 Меню» и «☀️ Сводка».
     let carrier_id = assert_carrier_sent(&bot);
 
     // Вызовы фейка: сначала носитель, затем меню.
@@ -3051,7 +3051,7 @@ async fn household_creation_by_zone_text_sends_the_carrier_before_a_fresh_welcom
         "the carrier must be queued before the welcome: {rows:?}"
     );
 
-    // Носитель доставлен с текстом спеки и раскладкой из одной кнопки меню.
+    // Носитель доставлен с текстом спеки и рядом «🏠 Меню» и «☀️ Сводка».
     let carrier_id = assert_carrier_sent(&bot);
 
     // Приветствие — новое сообщение после носителя, не правка якоря формы.
@@ -3343,6 +3343,236 @@ async fn menu_word_without_the_emoji_stays_ordinary_text() {
     );
 }
 
+/// Сколько записей сводки у пользователя и в каком статусе.
+async fn digest_deliveries(bot: &Harness) -> Vec<(String, String)> {
+    sqlx::query_as(
+        "SELECT d.status::text, d.occurrence_key
+         FROM notification_deliveries d
+         JOIN users u ON u.id = d.user_id
+         WHERE u.telegram_user_id = $1 AND d.kind = 'digest'
+         ORDER BY d.created_at, d.id",
+    )
+    .bind(bot.chat)
+    .fetch_all(&bot.pool)
+    .await
+    .expect("digest deliveries")
+}
+
+/// Сообщения сводки в outbox чата: статус, ключ и id сообщения.
+async fn digest_outbox(bot: &Harness) -> Vec<(String, String, Option<i64>)> {
+    sqlx::query_as(
+        "SELECT status::text, dedupe_key, message_id FROM outbox
+         WHERE chat_id = $1 AND dedupe_key LIKE 'notification:digest:%'
+         ORDER BY seq",
+    )
+    .bind(bot.chat)
+    .fetch_all(&bot.pool)
+    .await
+    .expect("digest outbox")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_button_sends_a_manual_digest_without_a_new_carrier() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let (carrier_id, _) = chat_carrier(&bot);
+    bot.fake.clear_calls();
+
+    let (message_id, rows) = send_text(&mut bot, ru::DIGEST_KEYBOARD_BUTTON).await;
+
+    // Текст кнопки удалён общим механизмом обработанных входящих; экрана и
+    // нового носителя нет — только сообщение сводки.
+    delete_seq(&rows, message_id);
+    assert!(
+        !rows.iter().any(|(_, kind, _)| kind == "screen"),
+        "the digest button must not present a screen: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|(_, kind, _)| kind == "keyboard"),
+        "the digest button must not enqueue a carrier: {rows:?}"
+    );
+
+    let deliveries = digest_deliveries(&bot).await;
+    assert_eq!(deliveries.len(), 1, "{deliveries:?}");
+    assert_eq!(deliveries[0].0, "sent", "{deliveries:?}");
+    assert!(
+        deliveries[0].1.contains("#manual:"),
+        "manual occurrence key expected: {deliveries:?}"
+    );
+    let outbox = digest_outbox(&bot).await;
+    assert_eq!(outbox.len(), 1, "{outbox:?}");
+    assert_eq!(outbox[0].0, "sent", "{outbox:?}");
+    assert!(
+        outbox[0].2.is_some(),
+        "digest message must be sent: {outbox:?}"
+    );
+
+    let calls = bot.fake.calls();
+    assert!(
+        !calls
+            .iter()
+            .any(|call| matches!(call, Call::SendKeyboard { .. })),
+        "no SendKeyboard after the digest button: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| matches!(call, Call::Delete { id, .. } if *id == message_id)),
+        "the button text must be deleted: {calls:?}"
+    );
+    assert!(
+        is_alive(&bot, carrier_id),
+        "the existing carrier must stay in the chat"
+    );
+    assert!(
+        bot.latest().1.contains("☀️ На сегодня ·"),
+        "the digest must arrive as the latest message: {}",
+        bot.latest().1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_button_closes_the_editor_waiting_for_a_title() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.text("Важное дело").await;
+    bot.press("Сохранить").await;
+    bot.press("Важное дело").await;
+    bot.press("Править").await;
+    bot.press("Название").await;
+    bot.assert_screen_contains("Отправьте название сообщением");
+    let household = household_of(&db.pool, bot.chat).await;
+    bot.fake.clear_calls();
+
+    let (message_id, rows) = send_text(&mut bot, ru::DIGEST_KEYBOARD_BUTTON).await;
+
+    delete_seq(&rows, message_id);
+    assert!(
+        !rows.iter().any(|(_, kind, _)| kind == "keyboard"),
+        "the digest button must not enqueue a carrier: {rows:?}"
+    );
+    let forms: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM conversation_states WHERE chat_id = $1")
+            .bind(bot.chat)
+            .fetch_one(&db.pool)
+            .await
+            .expect("conversation count");
+    assert_eq!(forms, 0, "the editor form must be cleared");
+    let title: String = sqlx::query_scalar(
+        "SELECT title FROM items WHERE household_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(household)
+    .fetch_one(&db.pool)
+    .await
+    .expect("item title");
+    assert_eq!(
+        title, "Важное дело",
+        "the button text must not become the title"
+    );
+    let deliveries = digest_deliveries(&bot).await;
+    assert_eq!(deliveries.len(), 1, "{deliveries:?}");
+    assert_eq!(deliveries[0].0, "sent", "{deliveries:?}");
+    assert!(
+        !bot.fake
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::SendKeyboard { .. })),
+        "no SendKeyboard after the digest button"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_button_with_capture_enabled_sends_the_digest_without_parsing() {
+    let db = db().await;
+    let handler = Bot::new("tasklerqbot")
+        .with_llm(support::llm::capture_handle())
+        .with_tenancy(tasklerq::config::TenancyMode::Multi);
+    let mut bot = Harness::with_handler(
+        &db.pool,
+        next_telegram_id(),
+        Arc::new(handler),
+        FakeTelegram::new(),
+    );
+    bot.text("/start").await;
+    bot.text("Семья").await;
+    bot.press("Москва").await;
+    bot.press("меню").await;
+    bot.fake.clear_calls();
+
+    let (message_id, rows) = send_text(&mut bot, ru::DIGEST_KEYBOARD_BUTTON).await;
+
+    delete_seq(&rows, message_id);
+    assert!(
+        !rows.iter().any(|(_, kind, _)| kind == "keyboard"),
+        "the digest button must not enqueue a carrier: {rows:?}"
+    );
+    let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM capture_jobs WHERE chat_id = $1")
+        .bind(bot.chat)
+        .fetch_one(&db.pool)
+        .await
+        .expect("capture jobs");
+    assert_eq!(jobs, 0, "the button text must not be parsed");
+    let deliveries = digest_deliveries(&bot).await;
+    assert_eq!(deliveries.len(), 1, "{deliveries:?}");
+    assert_eq!(deliveries[0].0, "sent", "{deliveries:?}");
+    assert!(
+        !bot.fake
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::SendKeyboard { .. })),
+        "no SendKeyboard after the digest button"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_word_without_the_emoji_stays_ordinary_text() {
+    let db = db().await;
+    let mut bot = onboarded(&db.pool).await;
+    bot.fake.clear_calls();
+
+    // «Сводка» без эмодзи — обычное добавление, а не нажатие кнопки.
+    bot.text("Сводка").await;
+    bot.assert_screen_contains("Название: Сводка");
+    assert!(
+        digest_deliveries(&bot).await.is_empty(),
+        "ordinary text must not request a digest"
+    );
+    assert!(
+        !bot.fake
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::SendKeyboard { .. })),
+        "ordinary text must not send a carrier"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_button_without_a_household_stays_ordinary_text() {
+    let db = db().await;
+    let mut bot = Harness::new(&db.pool, next_telegram_id());
+    bot.fake.clear_calls();
+
+    let (message_id, rows) = send_text(&mut bot, ru::DIGEST_KEYBOARD_BUTTON).await;
+
+    delete_seq(&rows, message_id);
+    assert!(
+        !rows.iter().any(|(_, kind, _)| kind == "keyboard"),
+        "onboarding must not get a carrier: {rows:?}"
+    );
+    assert!(
+        digest_deliveries(&bot).await.is_empty(),
+        "without a household the button text must not request a digest"
+    );
+    assert!(
+        !bot.fake
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::SendKeyboard { .. })),
+        "no SendKeyboard without a household"
+    );
+    bot.assert_screen_contains("Как назовём ваше пространство");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn menu_button_press_after_exclusion_shows_onboarding_without_the_carrier() {
     let db = db().await;
@@ -3534,7 +3764,10 @@ async fn menu_button_after_a_notice_keeps_the_keyboard_carrier() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fake_tracks_the_carrier_by_id_not_by_text() {
     let fake = FakeTelegram::new();
-    let rows = vec![vec![ru::MENU_BUTTON.to_owned()]];
+    let rows = vec![vec![
+        ru::MENU_BUTTON.to_owned(),
+        ru::DIGEST_KEYBOARD_BUTTON.to_owned(),
+    ]];
     let text = escape(ru::KEYBOARD_CARRIER_TEXT);
     let carrier_id = fake
         .send_keyboard_message(7, &text, &rows)

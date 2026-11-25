@@ -32,6 +32,7 @@ use crate::domain::error::DomainError;
 use crate::domain::identity::{MembershipChange, MembershipNotice, NoticeKind};
 use crate::domain::models::{Actor, Household, User};
 use crate::domain::recurrence::parse_timezone;
+use crate::jobs::digest;
 use crate::llm::LlmHandle;
 use crate::rate_limit::RateLimiter;
 use crate::security_audit::Audit;
@@ -769,6 +770,12 @@ async fn on_text(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
         return open_menu(ctx, false).await;
     }
 
+    // «☀️ Сводка» — вторая кнопка той же клавиатуры. Без household это обычный
+    // текст: у онбординга клавиатуры нет.
+    if text == ru::DIGEST_KEYBOARD_BUTTON && ctx.user.is_some() && ctx.household.is_some() {
+        return request_digest(ctx).await;
+    }
+
     if let Some((command, argument)) = parse_command(text) {
         return on_command(ctx, &command, argument).await;
     }
@@ -908,12 +915,15 @@ impl<'a> Ctx<'a> {
     }
 }
 
-/// Раскладка постоянной reply-клавиатуры: один ряд с одной кнопкой меню.
+/// Раскладка постоянной reply-клавиатуры: один ряд с меню и сводкой.
 ///
 /// Единственное место, где строится раскладка носителя: подписи уходят в
 /// `reply_markup.keyboard`, доставка от слоя бота не зависит.
 fn keyboard_rows() -> Vec<Vec<String>> {
-    vec![vec![ru::MENU_BUTTON.to_owned()]]
+    vec![vec![
+        ru::MENU_BUTTON.to_owned(),
+        ru::DIGEST_KEYBOARD_BUTTON.to_owned(),
+    ]]
 }
 
 /// Ключ удаления входящего сообщения.
@@ -946,6 +956,22 @@ async fn open_menu(ctx: &mut Ctx<'_>, carrier: bool) -> Result<(), Fail> {
         ctx.carrier_pending = true;
     }
     ctx.menu_or_onboarding().await
+}
+
+/// Нажатие «☀️ Сводка»: закрыть форму и выпустить сводку по запросу в
+/// транзакции обработчика. Новый носитель и экран не ставятся: текст кнопки
+/// удаляет общий механизм обработанных входящих, сводка приходит своим
+/// сообщением.
+///
+/// `None` от [`digest::request_manual_in_conn`] означает, что получатель
+/// недоступен или его сейчас держит планировщик. Тогда сводка не ставится:
+/// повтор создаст новую запись, а спека не просит отдельного сообщения об
+/// ошибке. Текст кнопки уже удалён общим механизмом.
+async fn request_digest(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
+    views::clear_conversation(&mut *ctx.conn, ctx.chat_id).await?;
+    let user_id = ctx.user()?.id;
+    let _ = digest::request_manual_in_conn(&mut *ctx.conn, user_id, ctx.now).await?;
+    Ok(())
 }
 
 async fn on_command(ctx: &mut Ctx<'_>, command: &str, argument: &str) -> Result<(), Fail> {
@@ -1315,8 +1341,14 @@ mod tests {
     use crate::telegram::rich::button;
 
     #[test]
-    fn keyboard_rows_are_a_single_row_with_the_menu_button() {
-        assert_eq!(keyboard_rows(), vec![vec![ru::MENU_BUTTON.to_owned()]]);
+    fn keyboard_rows_are_a_single_row_with_the_menu_and_digest_buttons() {
+        assert_eq!(
+            keyboard_rows(),
+            vec![vec![
+                ru::MENU_BUTTON.to_owned(),
+                ru::DIGEST_KEYBOARD_BUTTON.to_owned(),
+            ]]
+        );
     }
 
     #[test]
