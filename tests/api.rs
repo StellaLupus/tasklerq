@@ -500,6 +500,15 @@ async fn search_and_snapshot_contract() {
         support::issue_token(&db.pool, household.household_id, &["ha:read", "ha:write"]).await;
     let app = support::app(&db.pool);
 
+    // Начало календарного окна снапшота — «сегодня» в поясе household
+    // (Europe/Moscow), поэтому дата события задаётся от текущего момента, а не
+    // константой: иначе тест краснеет, как только эта дата станет прошлой.
+    let today = Utc::now()
+        .with_timezone(&chrono_tz::Europe::Moscow)
+        .date_naive();
+    let calendar_due = today + Duration::days(1);
+    let calendar_end = calendar_due + Duration::days(30);
+
     let (status, first) = support::request(
         &app,
         Method::POST,
@@ -533,7 +542,9 @@ async fn search_and_snapshot_contract() {
         Method::POST,
         &format!("/api/v1/lists/{}/items", household.tasks_list_id),
         Some(&token),
-        Some(json!({"title": "Календарная", "due_date": "2026-11-25"})),
+        Some(
+            json!({"title": "Календарная", "due_date": calendar_due.format("%Y-%m-%d").to_string()}),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
@@ -669,7 +680,10 @@ async fn search_and_snapshot_contract() {
     let (status, with_calendar) = support::request(
         &app,
         Method::GET,
-        "/api/v1/snapshot?calendar_end=2026-12-31",
+        &format!(
+            "/api/v1/snapshot?calendar_end={}",
+            calendar_end.format("%Y-%m-%d")
+        ),
         Some(&token),
         None,
     )

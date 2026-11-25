@@ -3458,15 +3458,24 @@ async fn digest_button_closes_the_editor_waiting_for_a_title() {
             .await
             .expect("conversation count");
     assert_eq!(forms, 0, "the editor form must be cleared");
-    let title: String = sqlx::query_scalar(
-        "SELECT title FROM items WHERE household_id = $1 AND deleted_at IS NULL",
+    let items_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM items WHERE household_id = $1 AND deleted_at IS NULL",
     )
     .bind(household)
     .fetch_one(&db.pool)
     .await
-    .expect("item title");
+    .expect("items count");
+    assert_eq!(items_count, 1, "the button text must not create a task");
+    let titles: Vec<String> = sqlx::query_scalar(
+        "SELECT title FROM items WHERE household_id = $1 AND deleted_at IS NULL ORDER BY title",
+    )
+    .bind(household)
+    .fetch_all(&db.pool)
+    .await
+    .expect("item titles");
     assert_eq!(
-        title, "Важное дело",
+        titles,
+        vec!["Важное дело".to_owned()],
         "the button text must not become the title"
     );
     let deliveries = digest_deliveries(&bot).await;
@@ -3479,6 +3488,89 @@ async fn digest_button_closes_the_editor_waiting_for_a_title() {
             .any(|call| matches!(call, Call::SendKeyboard { .. })),
         "no SendKeyboard after the digest button"
     );
+}
+
+/// `None` от `request_manual_in_conn` внутри транзакции воркера откатывает
+/// savepoint: частичная запись сводки и правка получателя триггером не
+/// остаются в общей транзакции, а очистка формы и удаление текста коммитятся.
+///
+/// DDL (триггер на `notification_deliveries`) требует отдельной базы: на общей
+/// он задел бы сводки параллельных тестов и подвесил их на блокировке таблицы.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_button_rolls_back_the_partial_digest_when_the_recipient_disappears() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    // Открытая форма: её очистка идёт в той же транзакции воркера, что и
+    // запись сводки.
+    bot.text("Важное дело").await;
+    bot.press("Сохранить").await;
+    bot.press("Важное дело").await;
+    bot.press("Править").await;
+    bot.press("Название").await;
+    bot.assert_screen_contains("Отправьте название сообщением");
+
+    // Мягкое удаление между первичной проверкой получателя и чтением записи:
+    // вставка сводки проходит, но `recipient_alive` уже ложен, и
+    // `request_manual_in_conn` возвращает `None` после частичных записей.
+    sqlx::query(
+        "CREATE FUNCTION delete_manual_digest_recipient() RETURNS trigger AS $$
+         BEGIN
+             UPDATE users SET deleted_at = now() WHERE id = NEW.user_id;
+             RETURN NEW;
+         END $$ LANGUAGE plpgsql",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("function");
+    sqlx::query(
+        "CREATE TRIGGER delete_manual_digest_recipient BEFORE INSERT ON notification_deliveries
+         FOR EACH ROW WHEN (NEW.kind = 'digest') EXECUTE FUNCTION delete_manual_digest_recipient()",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("trigger");
+
+    let (message_id, rows) = send_text(&mut bot, ru::DIGEST_KEYBOARD_BUTTON).await;
+
+    sqlx::query("DROP TRIGGER delete_manual_digest_recipient ON notification_deliveries")
+        .execute(&db.pool)
+        .await
+        .expect("drop trigger");
+    sqlx::query("DROP FUNCTION delete_manual_digest_recipient()")
+        .execute(&db.pool)
+        .await
+        .expect("drop function");
+
+    delete_seq(&rows, message_id);
+    assert!(
+        !rows.iter().any(|(_, kind, _)| kind == "keyboard"),
+        "the digest button must not enqueue a carrier: {rows:?}"
+    );
+    assert!(
+        digest_deliveries(&bot).await.is_empty(),
+        "the partial digest row must be rolled back to the savepoint"
+    );
+    assert!(
+        digest_outbox(&bot).await.is_empty(),
+        "no digest message must be queued"
+    );
+    let deleted_at: Option<chrono::DateTime<Utc>> =
+        sqlx::query_scalar("SELECT deleted_at FROM users WHERE telegram_user_id = $1")
+            .bind(bot.chat)
+            .fetch_one(&db.pool)
+            .await
+            .expect("recipient");
+    assert!(
+        deleted_at.is_none(),
+        "the trigger edit must be rolled back with the savepoint"
+    );
+    let forms: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM conversation_states WHERE chat_id = $1")
+            .bind(bot.chat)
+            .fetch_one(&db.pool)
+            .await
+            .expect("conversation count");
+    assert_eq!(forms, 0, "the editor form must be cleared");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3571,6 +3663,14 @@ async fn digest_button_without_a_household_stays_ordinary_text() {
         "no SendKeyboard without a household"
     );
     bot.assert_screen_contains("Как назовём ваше пространство");
+    // Без гварда перехвата тот же текст уходит в `request_digest` →
+    // `Fail::User`, и над онбордингом появляется баннер ошибки. Экран при этом
+    // тот же, поэтому баннер проверяется отдельно.
+    let latest = bot.latest().1;
+    assert!(
+        !latest.contains("отправьте /start"),
+        "the missing household must not be reported as an error: {latest}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
