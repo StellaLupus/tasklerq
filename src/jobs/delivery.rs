@@ -5,9 +5,9 @@
 //! остальное — пересчёт времени, отмена устаревших записей, проверка тихих
 //! часов под блокировкой, outbox и смена статуса — общее.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use chrono_tz::Tz;
-use sqlx::{PgConnection, PgPool};
+use sqlx::{Acquire, PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::notice::{NOTICE_ROW_COLUMNS, NOTICE_ROW_FROM, NoticeRow};
@@ -53,11 +53,12 @@ impl DeliveryScope {
         }
     }
 
-    /// Блокировка получателя нужна путям, которые собираются в сводное
-    /// сообщение. Сводка в него не входит и доставляется отдельно, поэтому,
-    /// как и раньше, обходится без неё.
+    /// Блокировка получателя нужна всем путям доставки: сводка тоже
+    /// соревнуется за получателя с ручным запросом, пакетным шагом тика и
+    /// обработчиком настроек. Занятого получателя тик пропускает до
+    /// следующего прохода.
     fn locks_recipient(self) -> bool {
-        !matches!(self, Self::Digest)
+        true
     }
 }
 
@@ -183,12 +184,75 @@ async fn cancel_stale_row(pool: &PgPool, id: Uuid, now: DateTime<Utc>) -> Result
     Ok(cancelled)
 }
 
+/// Убрать лишние живые сводки получателя после гонки постановки.
+///
+/// `replace_previous` знает прежние сообщения только по `message_id`, а у
+/// строки outbox, которая ещё ждёт отправки, его нет. Если ручная сводка
+/// пришла, пока утренняя ждала воркер, обе могут уйти в чат. Этот шаг оставляет
+/// у получателя последнюю по созданию живую сводку и удаляет прежние, как
+/// замена 0017; получатели с ещё не доставленной (`pending`) сводкой
+/// пропускаются — их прежние сообщения уберёт замена новой доставки.
+async fn coalesce_sent_digests(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error> {
+    let victims: Vec<(i64, i64)> = sqlx::query_as(
+        "WITH alive AS (
+             SELECT o.chat_id, o.message_id,
+                    row_number() OVER (
+                        PARTITION BY d.user_id
+                        ORDER BY d.created_at DESC, d.id DESC
+                    ) AS rank
+             FROM notification_deliveries d
+             JOIN outbox o ON o.seq = d.outbox_seq
+             JOIN users u ON u.id = d.user_id
+             WHERE d.kind = 'digest' AND d.status = 'sent'
+               AND d.dismissed_at IS NULL
+               AND o.message_id IS NOT NULL AND o.sent_at >= $1
+               AND o.chat_id = u.telegram_chat_id
+               AND u.deleted_at IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM notification_deliveries p
+                   WHERE p.user_id = d.user_id AND p.kind = 'digest'
+                     AND p.status = 'pending'
+               )
+         )
+         SELECT chat_id, message_id FROM alive WHERE rank > 1
+         ORDER BY chat_id, message_id",
+    )
+    .bind(now - Duration::hours(digest::REPLACE_WINDOW_HOURS))
+    .fetch_all(pool)
+    .await?;
+    if victims.is_empty() {
+        return Ok(0);
+    }
+
+    let mut conn = pool.acquire().await?;
+    let mut tx = conn.begin().await?;
+    for (chat_id, message_id) in &victims {
+        outbox::enqueue(
+            &mut tx,
+            *chat_id,
+            &Outgoing::Delete {
+                message_id: *message_id,
+                cleanup: true,
+            },
+            Some(&outbox::replace_key(*chat_id, *message_id)),
+            now,
+        )
+        .await?;
+        notifications::mark_dismissed(&mut tx, *chat_id, *message_id, now).await?;
+    }
+    tx.commit().await?;
+    Ok(u64::try_from(victims.len()).unwrap_or(0))
+}
+
 /// Передать готовые доставки вида в outbox.
 pub(crate) async fn deliver_due(
     pool: &PgPool,
     now: DateTime<Utc>,
     scope: DeliveryScope,
 ) -> Result<u64, sqlx::Error> {
+    if scope == DeliveryScope::Digest {
+        coalesce_sent_digests(pool, now).await?;
+    }
     let sql = format!(
         "SELECT d.id, d.user_id FROM notification_deliveries d
          WHERE d.status = 'pending' AND {}
@@ -287,6 +351,13 @@ pub(crate) async fn deliver_one_in_conn(
         return Ok(0);
     };
 
+    // Утренняя доставка заменяет и ещё не ушедшую ручную сводку: её строка
+    // outbox ожидает, `replace_previous` её не видит, а отменять саму утреннюю
+    // запись нельзя. Ожидающее ручное сообщение вытесняется, как экран.
+    if scope == DeliveryScope::Digest {
+        digest::supersede_pending_manual(&mut *conn, row.user_id, row.id, now).await?;
+    }
+
     let dedupe_key = delivery_dedupe_key(row.id, row.kind);
     // Замена (0017, решения 5, 6): snooze из отдельного уведомления удаляет
     // сообщение «😴 Напомню …», новая сводка — прежние сводки получателя.
@@ -367,7 +438,7 @@ async fn render(
 }
 
 /// Ключ `dedupe_key` outbox для доставки.
-fn delivery_dedupe_key(id: Uuid, kind: NotificationKind) -> String {
+pub(crate) fn delivery_dedupe_key(id: Uuid, kind: NotificationKind) -> String {
     format!("notification:{}:{id}", kind.as_str())
 }
 
@@ -417,7 +488,7 @@ pub(crate) async fn mark_cancelled(
 }
 
 /// Пометить доставку переданной в outbox.
-async fn mark_sent(
+pub(crate) async fn mark_sent(
     conn: &mut PgConnection,
     id: Uuid,
     seq: i64,

@@ -105,7 +105,7 @@
 
 ## 6. Сводка по запросу и кнопка
 
-- [ ] 6.1 Сводка по запросу в `src/jobs/digest.rs`: запись `kind = 'digest'`
+- [x] 6.1 Сводка по запросу в `src/jobs/digest.rs`: запись `kind = 'digest'`
   с `occurrence_key = "digest:<дата>#manual:<unix_ms>"` сразу `sent`, в одной
   транзакции — `content` по настройке состава, снимок и отпечаток,
   `digest::replace_previous` (0017), сообщение с `replaces`; без

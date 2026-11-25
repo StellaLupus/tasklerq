@@ -8,8 +8,8 @@ use uuid::Uuid;
 
 use super::delivery::{self, DeliveryScope};
 use super::domain_db;
-use super::keys::{digest_key_date, item_occurrence_key};
-use super::notice::NoticeRow;
+use super::keys::{digest_key_date, digest_key_manual, item_occurrence_key};
+use super::notice::{NOTICE_ROW_COLUMNS, NOTICE_ROW_FROM, NoticeRow};
 use super::quiet::{desired_schedule, resolved_timezone};
 use crate::domain::events::effective_end;
 use crate::domain::models::{ItemStatus, ListKind, UserRole};
@@ -177,15 +177,16 @@ pub async fn reschedule(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::
 }
 
 /// Момент сводки по ключу её вхождения и текущим настройкам получателя.
+///
+/// Дата берётся до суффикса `#manual:<ms>`, поэтому ключ сводки по запросу
+/// разбирается так же, как утренний. Без разобранной даты момента нет: откат
+/// на `created_at` считал бы такую запись чужим днём (design, решение 7).
 fn digest_intended(row: &NoticeRow) -> Option<DateTime<Utc>> {
+    let date = digest_key_date(&row.occurrence_key)?;
     let settings = row.settings();
     let time =
         parse_hhmm(&settings.digest_time, "digest time").unwrap_or_else(|_| default_digest_time());
-    Some(
-        digest_key_date(&row.occurrence_key)
-            .and_then(|date| resolve_local(row.timezone(), date, time).ok())
-            .unwrap_or(row.created_at),
-    )
+    resolve_local(row.timezone(), date, time).ok()
 }
 
 #[derive(FromRow)]
@@ -482,18 +483,11 @@ pub async fn digest_view(
         delivery.user_timezone.as_deref(),
         Some(&delivery.household_timezone),
     );
-    // Признак ручной сводки — суффикс `#manual` (design, решение 7); день —
-    // дата ключа до суффикса. Пока `digest_key_date` не понимает суффикс
-    // (пункт 6.1), отсекаем его здесь.
-    let manual = delivery.occurrence_key.contains("#manual");
-    let day = digest_key_date(
-        delivery
-            .occurrence_key
-            .split('#')
-            .next()
-            .unwrap_or(&delivery.occurrence_key),
-    )
-    .unwrap_or_else(|| delivery.created_at.with_timezone(&timezone).date_naive());
+    // Признак ручной сводки — суффикс `#manual`, день — дата ключа до
+    // суффикса (design, решение 7); разбор общий с планировщиком.
+    let manual = digest_key_manual(&delivery.occurrence_key);
+    let day = digest_key_date(&delivery.occurrence_key)
+        .unwrap_or_else(|| delivery.created_at.with_timezone(&timezone).date_naive());
     let scope = NotificationSettings::from_settings(&delivery.settings).digest_scope;
     let snapshot: Vec<DigestSnapshotItem> = delivery
         .digest_items
@@ -777,7 +771,7 @@ fn snapshot_event_when(key: &str, item: &ViewItem, timezone: Tz, day: NaiveDate)
 /// учитывает очередь outbox и расхождение часов, чтобы удаление не уперлось
 /// в лимит уже после доставки новой сводки (design 0017, решение 6). Строки
 /// outbox при этом живут не меньше 48 часов (`jobs::retention`).
-const REPLACE_WINDOW_HOURS: i64 = 47;
+pub(crate) const REPLACE_WINDOW_HOURS: i64 = 47;
 
 /// Отобрать прежние сводки получателя, которые уберёт новая.
 ///
@@ -814,6 +808,162 @@ pub(crate) async fn replace_previous(
         notifications::mark_dismissed(conn, chat_id, *id, now).await?;
     }
     Ok(ids)
+}
+
+/// Вытеснить ещё не доставленные сообщения прежних ручных сводок получателя.
+///
+/// Между нажатиями «☀️ Сводка» воркер outbox может не успеть отправить
+/// предыдущее сообщение. Такая запись уже `sent`, но у её строки outbox нет
+/// `message_id`, поэтому [`replace_previous`] её не видит. Ожидающее сообщение
+/// вытесняется так же, как неотправленный экран: оно никогда не уйдёт, а
+/// запись помечается убранной. Утренняя сводка не трогается: её доставка не
+/// должна отменяться (design, решение 7).
+pub(crate) async fn supersede_pending_manual(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+    current_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT d.occurrence_key, o.seq
+         FROM notification_deliveries d
+         JOIN outbox o ON o.seq = d.outbox_seq
+         WHERE d.user_id = $1 AND d.kind = 'digest' AND d.status = 'sent'
+           AND d.id <> $2 AND o.status = 'pending' AND o.message_id IS NULL
+         FOR UPDATE OF o",
+    )
+    .bind(user_id)
+    .bind(current_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    let seqs: Vec<i64> = rows
+        .iter()
+        .filter(|(key, _)| digest_key_manual(key))
+        .map(|(_, seq)| *seq)
+        .collect();
+    if seqs.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "UPDATE outbox
+         SET status = 'skipped', last_error = 'cancelled',
+             payload = jsonb_build_object('redacted', true)
+         WHERE seq = ANY($1)",
+    )
+    .bind(&seqs)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "UPDATE notification_deliveries
+         SET dismissed_at = $2, updated_at = $2
+         WHERE outbox_seq = ANY($1) AND dismissed_at IS NULL",
+    )
+    .bind(&seqs)
+    .bind(now)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Немедленно выпустить сводку по запросу получателя (0019, design, решение 7).
+///
+/// Запись коммитится сразу `sent`, поэтому проверки конвейера доставки (тихие
+/// часы, `digest_enabled`, актуальность вхождения) её не касаются: это явный
+/// запрос. В одной транзакции собирается `content` по текущему составу,
+/// записываются снимок и отпечаток, прежние сводки получателя помечаются
+/// убранными и заменяются новой.
+///
+/// Ключ `digest:<локальная дата>#manual:<unix_ms>` не совпадает с ключом
+/// утренней сводки `digest:<дата>`: запланированная доставка утра не
+/// отменяется и не сдвигается, а утренняя потом заменяет ручную по правилу
+/// 0017.
+///
+/// Возвращает id записи или `None`, если получатель недоступен либо его сейчас
+/// доставляет планировщик (блокировка получателя занята).
+pub async fn request_manual(
+    pool: &PgPool,
+    user_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    #[derive(FromRow)]
+    struct Recipient {
+        household_id: Uuid,
+        user_timezone: Option<String>,
+        household_timezone: String,
+    }
+
+    let recipient: Option<Recipient> = sqlx::query_as(
+        "SELECT u.household_id, u.timezone AS user_timezone,
+                h.timezone AS household_timezone
+         FROM users u
+         JOIN households h ON h.id = u.household_id AND h.deleted_at IS NULL
+         WHERE u.id = $1 AND u.deleted_at IS NULL",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(recipient) = recipient else {
+        return Ok(None);
+    };
+    let timezone = resolved_timezone(
+        recipient.user_timezone.as_deref(),
+        Some(&recipient.household_timezone),
+    );
+    let local_date = now.with_timezone(&timezone).date_naive();
+    let occurrence_key = format!("digest:{local_date}#manual:{}", now.timestamp_millis());
+
+    let mut tx = pool.begin().await?;
+    // Ручной запрос соревнуется за получателя с утренней доставкой сводки,
+    // пакетным шагом тика и обработчиком настроек: все они берут ту же
+    // транзакционную блокировку. Занятого получателя не ждём: утренняя запись
+    // останется на следующий тик, а повторное нажатие создаст новую сводку.
+    if !delivery::try_recipient_lock(&mut tx, user_id).await? {
+        return Ok(None);
+    }
+
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO notification_deliveries (
+             id, household_id, user_id, item_id, occurrence_key, kind,
+             status, scheduled_at, created_at, updated_at
+         )
+         VALUES ($1, $2, $3, NULL, $4, 'digest', 'pending', $5, $5, $5)",
+    )
+    .bind(id)
+    .bind(recipient.household_id)
+    .bind(user_id)
+    .bind(&occurrence_key)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+
+    let sql = format!(
+        "SELECT {NOTICE_ROW_COLUMNS}
+         {NOTICE_ROW_FROM}
+         WHERE d.id = $1"
+    );
+    let row: NoticeRow = sqlx::query_as(&sql).bind(id).fetch_one(&mut *tx).await?;
+    // Удаление получателя могло произойти после первичной проверки, но до
+    // этой строки: мягкое удаление не очищает Telegram-поля.
+    if !row.recipient_alive() {
+        return Ok(None);
+    }
+    let (Some(chat_id), Some(telegram_user_id)) = (row.telegram_chat_id, row.telegram_user_id)
+    else {
+        return Ok(None);
+    };
+
+    let Some(html) = digest_message(&mut tx, &row, telegram_user_id, now).await? else {
+        return Ok(None);
+    };
+    supersede_pending_manual(&mut tx, user_id, row.id, now).await?;
+    let replaces = replace_previous(&mut tx, &row, chat_id, now).await?;
+    let dedupe_key = delivery::delivery_dedupe_key(row.id, NotificationKind::Digest);
+    let seq =
+        delivery::enqueue_message(&mut tx, chat_id, &dedupe_key, html, true, replaces, now).await?;
+    delivery::mark_sent(&mut tx, row.id, seq, now).await?;
+    tx.commit().await?;
+    Ok(Some(row.id))
 }
 
 /// Немедленно выпустить отложенные сводки получателя.

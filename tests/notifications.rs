@@ -24,7 +24,7 @@ use tasklerq::domain::models::{
 };
 use tasklerq::domain::recurrence::Due;
 use tasklerq::domain::settings::{DigestScope, NotificationSettingsUpdate, ProfileUpdate};
-use tasklerq::jobs::digest::{DigestSection, DigestSnapshotItem};
+use tasklerq::jobs::digest::{DigestSection, DigestSnapshotItem, request_manual};
 use tasklerq::jobs::domain::DomainTicker;
 use tasklerq::jobs::scheduler::{
     Scheduler, TickStats, all_day_occurrence_key, occurrence_key, snooze_origin,
@@ -7342,6 +7342,633 @@ async fn digest_replacement_does_not_touch_another_recipient() {
             .iter()
             .any(|(id, _)| *id == member_d1)
     );
+}
+
+// ---------------------------------------------------------------------------
+// Сводка по запросу (0019, design решение 7, пункт 6.1).
+// ---------------------------------------------------------------------------
+
+/// Ключ сводки по запросу для дня сводки и момента запроса.
+fn manual_key(day: NaiveDate, at: DateTime<Utc>) -> String {
+    format!("digest:{day}#manual:{}", at.timestamp_millis())
+}
+
+/// Запросить сводку и вернуть её id; `None` от функции означает занятого
+/// получателя и в тестах не ожидается.
+async fn manual_digest(pool: &PgPool, user_id: Uuid, at: DateTime<Utc>) -> Uuid {
+    request_manual(pool, user_id, at)
+        .await
+        .expect("manual digest request")
+        .expect("manual digest scheduled")
+}
+
+/// Живые сообщения сводки по запросу в чате: заголовок «☀️ На сегодня · …»,
+/// а не строка «На сегодня» экрана меню.
+fn alive_manual_digests(bot: &Harness) -> Vec<(i64, String)> {
+    bot.fake
+        .messages(bot.chat)
+        .into_iter()
+        .filter(|(_, html)| html.contains("На сегодня ·"))
+        .collect()
+}
+
+/// Строки outbox сообщений сводок чата: статус, ключ и id сообщения.
+async fn digest_outbox_rows(pool: &PgPool, chat: i64) -> Vec<(String, String, Option<i64>)> {
+    sqlx::query_as(
+        "SELECT status::text, dedupe_key, message_id FROM outbox
+         WHERE chat_id = $1 AND dedupe_key LIKE 'notification:digest:%'
+         ORDER BY seq",
+    )
+    .bind(chat)
+    .fetch_all(pool)
+    .await
+    .expect("digest outbox rows")
+}
+
+/// Ключ транзакционной блокировки получателя, как в `jobs::delivery`.
+fn recipient_lock_key(user_id: Uuid) -> i64 {
+    i64::from_be_bytes(
+        user_id.as_bytes()[8..]
+            .try_into()
+            .expect("uuid has at least sixteen bytes"),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_digest_midday_includes_a_task_added_after_morning_and_replaces_it() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    digest_on(&db.pool, household.owner_id).await;
+
+    let morning_at = local_utc(moscow, day, 8, 30);
+    bot.freeze_at(morning_at);
+    let morning = deliver_digest_at(&mut bot, &db.pool, morning_at).await;
+
+    create_task(
+        &db,
+        &household,
+        "Позвонить в банк",
+        Some(local_utc(moscow, day, 18, 0)),
+        Some(household.owner_id),
+        None,
+    )
+    .await;
+
+    let manual_at = local_utc(moscow, day, 15, 0);
+    let manual_id = manual_digest(&db.pool, household.owner_id, manual_at).await;
+
+    let payload = latest_digest_payload(&db.pool, bot.chat).await;
+    assert_eq!(payload["replaces"], json!([morning]), "{payload}");
+    let (status, hash): (String, Option<String>) = sqlx::query_as(
+        "SELECT status::text, digest_hash
+         FROM notification_deliveries WHERE id = $1",
+    )
+    .bind(manual_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("manual digest row");
+    assert_eq!(status, "sent");
+    assert!(hash.is_some(), "digest_hash written");
+    assert!(
+        digest_dismissed_at(&db.pool, household.owner_id, &format!("digest:{day}"))
+            .await
+            .is_some()
+    );
+
+    bot.advance(manual_at - bot.now);
+    bot.deliver().await;
+    assert!(deleted(&bot, morning));
+    let alive = alive_manual_digests(&bot);
+    assert_eq!(alive.len(), 1, "{alive:?}");
+    assert!(alive[0].1.contains("Позвонить в банк"), "{}", alive[0].1);
+    assert!(alive[0].1.contains("На сегодня"), "{}", alive[0].1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_digest_arrives_during_quiet_hours_with_morning_digest_disabled() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    set_notifications(
+        &db.pool,
+        household.owner_id,
+        json!({
+            "digest_enabled": false,
+            "digest_time": "08:30",
+            "quiet_hours_enabled": true,
+            "quiet_start": "22:00",
+            "quiet_end": "08:00"
+        }),
+    )
+    .await;
+    create_all_day_task(
+        &db,
+        &household,
+        "Полить цветы",
+        day,
+        Some(household.owner_id),
+    )
+    .await;
+
+    let at = local_utc(moscow, day, 23, 0);
+    manual_digest(&db.pool, household.owner_id, at).await;
+
+    let html = messages(&db.pool, chat_id(&db.pool, household.owner_id).await)
+        .await
+        .pop()
+        .expect("manual digest message");
+    assert!(html.contains("На сегодня"), "{html}");
+    assert!(html.contains("Полить цветы"), "{html}");
+
+    let rows = digest_rows(&db.pool, household.owner_id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, manual_key(day, at));
+    assert_eq!(rows[0].1, "sent");
+    assert_eq!(rows[0].2, None);
+    assert!(rows[0].3.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_manual_digests_leave_a_single_message_in_the_chat() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    digest_on(&db.pool, household.owner_id).await;
+    create_all_day_task(
+        &db,
+        &household,
+        "Разобрать почту",
+        day,
+        Some(household.owner_id),
+    )
+    .await;
+
+    let first_at = local_utc(moscow, day, 15, 0);
+    bot.freeze_at(first_at);
+    manual_digest(&db.pool, household.owner_id, first_at).await;
+    bot.deliver().await;
+    let (first_msg, html) = bot.latest();
+    assert!(html.contains("На сегодня"), "{html}");
+
+    let second_at = first_at + Duration::minutes(5);
+    manual_digest(&db.pool, household.owner_id, second_at).await;
+    let payload = latest_digest_payload(&db.pool, bot.chat).await;
+    assert_eq!(payload["replaces"], json!([first_msg]), "{payload}");
+    assert!(
+        digest_dismissed_at(&db.pool, household.owner_id, &manual_key(day, first_at))
+            .await
+            .is_some()
+    );
+
+    bot.advance(second_at - bot.now);
+    bot.deliver().await;
+    assert!(deleted(&bot, first_msg));
+    let alive = alive_manual_digests(&bot);
+    assert_eq!(alive.len(), 1, "{alive:?}");
+    assert_ne!(alive[0].0, first_msg);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_digests_queued_back_to_back_leave_a_single_message() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    digest_on(&db.pool, household.owner_id).await;
+    create_all_day_task(
+        &db,
+        &household,
+        "Проверить почту",
+        day,
+        Some(household.owner_id),
+    )
+    .await;
+
+    // Воркер outbox между нажатиями не проходит: первое сообщение ещё не
+    // доставлено, у его строки нет `message_id`.
+    let first_at = local_utc(moscow, day, 15, 0);
+    bot.freeze_at(first_at);
+    manual_digest(&db.pool, household.owner_id, first_at).await;
+    let second_at = first_at + Duration::minutes(1);
+    manual_digest(&db.pool, household.owner_id, second_at).await;
+
+    let rows = digest_outbox_rows(&db.pool, bot.chat).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0].0, "skipped");
+    assert_eq!(rows[0].2, None);
+    assert_eq!(rows[1].0, "pending");
+    assert_eq!(rows[1].2, None);
+    assert!(
+        digest_dismissed_at(&db.pool, household.owner_id, &manual_key(day, first_at))
+            .await
+            .is_some()
+    );
+
+    bot.advance(second_at - bot.now);
+    bot.deliver().await;
+    let rows = digest_outbox_rows(&db.pool, bot.chat).await;
+    assert_eq!(rows[0].0, "skipped");
+    assert_eq!(rows[1].0, "sent");
+    assert!(rows[1].2.is_some());
+    let alive = alive_manual_digests(&bot);
+    assert_eq!(alive.len(), 1, "{alive:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn morning_digest_supersedes_a_manual_that_is_still_in_the_outbox() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    digest_on(&db.pool, household.owner_id).await;
+    create_all_day_task(
+        &db,
+        &household,
+        "Забрать заказ",
+        day,
+        Some(household.owner_id),
+    )
+    .await;
+
+    let manual_at = local_utc(moscow, day, 8, 29);
+    bot.freeze_at(manual_at);
+    manual_digest(&db.pool, household.owner_id, manual_at).await;
+
+    // Утренняя поставлена и передана в outbox до того, как воркер отправил
+    // ручную: ручное сообщение вытесняется, утренняя остаётся.
+    let morning_at = local_utc(moscow, day, 8, 30);
+    let stats = scheduler(&db.pool)
+        .tick(morning_at)
+        .await
+        .expect("morning tick");
+    assert_eq!(stats.delivered, 1, "{stats:?}");
+    let rows = digest_outbox_rows(&db.pool, bot.chat).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0].0, "skipped");
+    assert_eq!(rows[1].0, "pending");
+    assert!(
+        digest_dismissed_at(&db.pool, household.owner_id, &manual_key(day, manual_at))
+            .await
+            .is_some()
+    );
+
+    bot.advance(morning_at - bot.now);
+    bot.deliver().await;
+    let rows = digest_outbox_rows(&db.pool, bot.chat).await;
+    assert_eq!(rows[1].0, "sent");
+    let alive = alive_digests(&bot);
+    assert_eq!(alive.len(), 1, "{alive:?}");
+    assert!(alive[0].1.contains("Забрать заказ"), "{}", alive[0].1);
+    assert!(alive_manual_digests(&bot).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_after_a_queued_morning_is_coalesced_on_the_next_tick() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    digest_on(&db.pool, household.owner_id).await;
+    create_all_day_task(
+        &db,
+        &household,
+        "Забрать заказ",
+        day,
+        Some(household.owner_id),
+    )
+    .await;
+
+    // Утренняя уже в outbox, но воркер её ещё не отправил.
+    let morning_at = local_utc(moscow, day, 8, 30);
+    bot.freeze_at(morning_at);
+    let stats = scheduler(&db.pool)
+        .tick(morning_at)
+        .await
+        .expect("morning tick");
+    assert_eq!(stats.delivered, 1, "{stats:?}");
+
+    // Ручная не отменяет и не сдвигает утреннюю: обе строки ждут отправки.
+    let manual_at = morning_at + Duration::milliseconds(300);
+    manual_digest(&db.pool, household.owner_id, manual_at).await;
+    let rows = digest_outbox_rows(&db.pool, bot.chat).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0].0, "pending");
+    assert_eq!(rows[1].0, "pending");
+    assert!(
+        digest_dismissed_at(&db.pool, household.owner_id, &format!("digest:{day}"))
+            .await
+            .is_none()
+    );
+
+    // Обе доставлены: окно гонки видно в чате до следующего тика.
+    bot.advance(manual_at - bot.now);
+    bot.deliver().await;
+    let alive = |bot: &Harness| -> Vec<(i64, String)> {
+        bot.fake
+            .messages(bot.chat)
+            .into_iter()
+            .filter(|(_, html)| html.contains("Доброе утро") || html.contains("На сегодня ·"))
+            .collect()
+    };
+    let both = alive(&bot);
+    assert_eq!(both.len(), 2, "{both:?}");
+    let morning_msg = both
+        .iter()
+        .find(|(_, html)| html.contains("Доброе утро"))
+        .map(|(id, _)| *id)
+        .expect("morning message");
+
+    // Тик доставки оставляет последнюю живую сводку — ручную.
+    let later = manual_at + Duration::minutes(1);
+    scheduler(&db.pool)
+        .tick(later)
+        .await
+        .expect("coalesce tick");
+    bot.advance(later - bot.now);
+    bot.deliver().await;
+    assert!(deleted(&bot, morning_msg));
+    let remaining = alive(&bot);
+    assert_eq!(remaining.len(), 1, "{remaining:?}");
+    assert!(
+        remaining[0].1.contains("На сегодня ·"),
+        "{}",
+        remaining[0].1
+    );
+    assert!(
+        digest_dismissed_at(&db.pool, household.owner_id, &format!("digest:{day}"))
+            .await
+            .is_some()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn morning_digest_after_a_manual_one_is_planned_and_replaces_it() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    digest_on(&db.pool, household.owner_id).await;
+    create_all_day_task(
+        &db,
+        &household,
+        "Забрать заказ",
+        day,
+        Some(household.owner_id),
+    )
+    .await;
+
+    let manual_at = local_utc(moscow, day, 7, 0);
+    bot.freeze_at(manual_at);
+    manual_digest(&db.pool, household.owner_id, manual_at).await;
+    bot.deliver().await;
+    let (manual_msg, html) = bot.latest();
+    assert!(html.contains("На сегодня"), "{html}");
+
+    let morning_at = local_utc(moscow, day, 8, 30);
+    let morning = deliver_digest_at(&mut bot, &db.pool, morning_at).await;
+    assert!(
+        digest_dismissed_at(&db.pool, household.owner_id, &manual_key(day, manual_at))
+            .await
+            .is_some()
+    );
+    assert!(deleted(&bot, manual_msg));
+    let alive = alive_digests(&bot);
+    assert_eq!(alive.len(), 1, "{alive:?}");
+    assert_eq!(alive[0].0, morning);
+    assert!(alive[0].1.contains("Забрать заказ"), "{}", alive[0].1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_digests_updates_the_manual_digest_as_the_latest() {
+    let db = support::isolated_db().await;
+    let mut stand = digest_sync_stand(&db).await;
+    let manual_at = stand.at + Duration::minutes(30);
+    let manual_id = manual_digest(&db.pool, stand.petya_id, manual_at).await;
+    stand.petya.freeze_at(manual_at);
+    stand.petya.deliver().await;
+    let (manual_msg, html) = stand.petya.latest();
+    assert!(html.contains("На сегодня"), "{html}");
+    assert!(html.contains("Вынести мусор"), "{html}");
+
+    stand.masha.advance(Duration::minutes(1));
+    let masha_html = message_html(&stand.masha, stand.masha_msg);
+    stand
+        .masha
+        .press_data(&button_of(&masha_html, "Вынести мусор"), stand.masha_msg)
+        .await;
+
+    let done_at = manual_at + Duration::minutes(1);
+    let stats = digest_sync_tick(&mut stand, done_at).await;
+    assert_eq!(stats.synced, 1, "{stats:?}");
+    let edits = pending_edit_payloads(&db.pool, stand.petya.chat).await;
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert_eq!(edits[0]["message_id"], json!(manual_msg));
+
+    stand.petya.deliver().await;
+    let html = message_html(&stand.petya, manual_msg);
+    assert!(html.contains("На сегодня"), "{html}");
+    assert!(html.contains("✅ Вынести мусор · Маша"), "{html}");
+    assert!(html.contains("Выполнено 1 из 2"), "{html}");
+    assert_digest_hash_matches_render(&db.pool, stand.petya_id).await;
+
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let view = tasklerq::jobs::digest::digest_view(&mut conn, manual_id)
+        .await
+        .expect("manual digest view");
+    assert_eq!(
+        view.kind,
+        tasklerq::telegram::bot::notify::DigestKind::Manual
+    );
+    assert_eq!(view.day, stand.day);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_view_takes_the_manual_day_from_the_key_not_created_at() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    let created_at = local_utc(moscow, day - Duration::days(1), 12, 0);
+    let key = manual_key(day, created_at);
+    let id = insert_digest_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        &key,
+        created_at,
+    )
+    .await;
+
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let view = tasklerq::jobs::digest::digest_view(&mut conn, id)
+        .await
+        .expect("manual digest view");
+    assert_eq!(
+        view.kind,
+        tasklerq::telegram::bot::notify::DigestKind::Manual
+    );
+    assert_eq!(view.day, day);
+
+    let ui = tasklerq::telegram::bot::notify::digest_ui(&view);
+    let html = tasklerq::telegram::bot::notify::render_notice(
+        &mut conn,
+        chat,
+        household.household_id,
+        &ui,
+        created_at,
+    )
+    .await
+    .expect("manual digest render");
+    assert!(html.contains("На сегодня"), "{html}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_digest_respects_the_mine_scope() {
+    let db = support::isolated_db().await;
+    let stand = digest_sync_stand_scoped(&db, DigestScope::Mine).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    create_task_without_assignment_notice(
+        &db,
+        &stand.household,
+        "Задача Маши",
+        Some(local_utc(moscow, stand.day, 19, 0)),
+        stand.masha_id,
+        None,
+    )
+    .await;
+
+    let manual_at = stand.at + Duration::minutes(30);
+    manual_digest(&db.pool, stand.petya_id, manual_at).await;
+    let payload = latest_digest_payload(&db.pool, stand.petya.chat).await;
+    let html = payload["html"]
+        .as_str()
+        .expect("manual digest payload")
+        .to_owned();
+    assert!(html.contains("Вынести мусор"), "{html}");
+    assert!(html.contains("Забрать посылку"), "{html}");
+    assert!(!html.contains("Задача Маши"), "{html}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_delivery_and_manual_request_share_the_recipient_lock() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    digest_on(&db.pool, household.owner_id).await;
+    create_all_day_task(
+        &db,
+        &household,
+        "Забрать заказ",
+        day,
+        Some(household.owner_id),
+    )
+    .await;
+    let chat = chat_id(&db.pool, household.owner_id).await;
+    let at = local_utc(moscow, day, 8, 30);
+
+    // Держим блокировку получателя на другой транзакции: доставка сводки и
+    // ручной запрос обязаны её заметить.
+    let mut lock_conn = db.pool.acquire().await.expect("lock conn");
+    let mut lock_tx = lock_conn.begin().await.expect("lock tx");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(recipient_lock_key(household.owner_id))
+        .execute(&mut *lock_tx)
+        .await
+        .expect("hold recipient lock");
+
+    let stats = scheduler(&db.pool).tick(at).await.expect("locked tick");
+    assert_eq!(stats.delivered, 0, "{stats:?}");
+    let rows = digest_rows(&db.pool, household.owner_id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].1, "pending");
+
+    let manual_at = at + Duration::minutes(1);
+    assert!(
+        request_manual(&db.pool, household.owner_id, manual_at)
+            .await
+            .expect("manual request")
+            .is_none()
+    );
+
+    lock_tx.rollback().await.expect("release recipient lock");
+    let later = at + Duration::minutes(2);
+    let stats = scheduler(&db.pool)
+        .tick(later)
+        .await
+        .expect("unlocked tick");
+    assert_eq!(stats.delivered, 1, "{stats:?}");
+    let rows = digest_rows(&db.pool, household.owner_id).await;
+    assert_eq!(rows[0].1, "sent");
+    assert!(rows[0].3.is_some());
+    let sent = messages(&db.pool, chat).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(sent[0].contains("Доброе утро"), "{}", sent[0]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_digest_is_not_queued_when_the_recipient_disappears_mid_transaction() {
+    let db = support::isolated_db().await;
+    let household = household_without_digest(&db).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = digest_day();
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+
+    // Мягкое удаление между первичной проверкой и чтением записи: Telegram-поля
+    // при удалении не очищаются.
+    sqlx::query(
+        "CREATE FUNCTION delete_digest_recipient() RETURNS trigger AS $$
+         BEGIN
+             UPDATE users SET deleted_at = now() WHERE id = NEW.user_id;
+             RETURN NEW;
+         END $$ LANGUAGE plpgsql",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("function");
+    sqlx::query(
+        "CREATE TRIGGER delete_digest_recipient BEFORE INSERT ON notification_deliveries
+         FOR EACH ROW WHEN (NEW.kind = 'digest') EXECUTE FUNCTION delete_digest_recipient()",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("trigger");
+
+    let at = local_utc(moscow, day, 15, 0);
+    let result = request_manual(&db.pool, household.owner_id, at).await;
+
+    sqlx::query("DROP TRIGGER delete_digest_recipient ON notification_deliveries")
+        .execute(&db.pool)
+        .await
+        .expect("drop trigger");
+    sqlx::query("DROP FUNCTION delete_digest_recipient()")
+        .execute(&db.pool)
+        .await
+        .expect("drop function");
+
+    assert!(result.expect("manual request").is_none());
+    assert!(digest_rows(&db.pool, household.owner_id).await.is_empty());
+    let deleted_at: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT deleted_at FROM users WHERE id = $1")
+            .bind(household.owner_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("recipient");
+    assert!(deleted_at.is_none(), "request transaction rolled back");
 }
 
 // ---------------------------------------------------------------------------

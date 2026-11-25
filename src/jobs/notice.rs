@@ -10,7 +10,7 @@ use chrono_tz::Tz;
 use sqlx::FromRow;
 use uuid::Uuid;
 
-use super::keys::{digest_occurrence_key, item_occurrence_key, snooze_origin};
+use super::keys::{digest_key_date, item_occurrence_key, snooze_origin};
 use super::quiet::resolved_timezone;
 use crate::domain::events::is_past;
 use crate::domain::models::ItemStatus;
@@ -247,7 +247,10 @@ impl NoticeRow {
     }
 
     /// Сводка актуальна, пока пользователь и household живы, сводка включена,
-    /// а ключ соответствует текущему локальному дню получателя.
+    /// а день ключа соответствует текущему локальному дню получателя. Ключ
+    /// сводки по запросу (`digest:<дата>#manual:<ms>`) разбирается по дате до
+    /// суффикса: такая запись в `pending` не бывает, но разбор не должен
+    /// считать её чужим днём.
     ///
     /// Сводка, отложенная тихими часами через полночь (например, в 23:00 при
     /// тихих часах до 08:00), остаётся актуальной до утра: иначе она была бы
@@ -259,9 +262,9 @@ impl NoticeRow {
             return true;
         }
         let today = now.with_timezone(&self.timezone()).date_naive();
-        let current = digest_occurrence_key(today);
-        self.occurrence_key != current
-            && !(self.deferred
-                && self.occurrence_key == digest_occurrence_key(today - Duration::days(1)))
+        let Some(day) = digest_key_date(&self.occurrence_key) else {
+            return true;
+        };
+        day != today && !(self.deferred && day == today - Duration::days(1))
     }
 }
