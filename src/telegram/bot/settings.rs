@@ -7,8 +7,8 @@ use crate::domain::error::DomainError;
 use crate::domain::identity::{AuditEvent, AuditEventType};
 use crate::domain::models::{Actor, ActorType, Household, User, UserRole};
 use crate::domain::settings::{
-    NotificationSettings, NotificationSettingsUpdate, ProfileUpdate, SUGGESTED_TIMEZONES,
-    validate_timezone,
+    DigestScope, NotificationSettings, NotificationSettingsUpdate, ProfileUpdate,
+    SUGGESTED_TIMEZONES, validate_timezone,
 };
 use crate::jobs::{batch, delivery, quiet};
 use crate::storage::repositories::{audit, invites, members, tokens, users};
@@ -275,6 +275,22 @@ fn notifications(ctx: &Ctx<'_>) -> Result<Ui, Fail> {
             ),
             toggle(settings.digest_enabled, Setting::Digest),
         ])
+        .text(format!(
+            "Задачи в сводке: {}",
+            match settings.digest_scope {
+                DigestScope::All => "все в семье",
+                DigestScope::Mine => "только мои",
+            }
+        ))
+        .row(vec![button(
+            match settings.digest_scope {
+                DigestScope::All => "👤 Только мои",
+                DigestScope::Mine => "👥 Все в семье",
+            },
+            Action::Toggle {
+                setting: Setting::DigestScope,
+            },
+        )])
     } else {
         ui.row(vec![toggle(settings.digest_enabled, Setting::Digest)])
     };
@@ -724,6 +740,13 @@ pub async fn toggle(ctx: &mut Ctx<'_>, setting: Setting) -> Result<(), Fail> {
         },
         Setting::Digest => NotificationSettingsUpdate {
             digest_enabled: Some(!current.digest_enabled),
+            ..Default::default()
+        },
+        Setting::DigestScope => NotificationSettingsUpdate {
+            digest_scope: Some(match current.digest_scope {
+                DigestScope::All => DigestScope::Mine,
+                DigestScope::Mine => DigestScope::All,
+            }),
             ..Default::default()
         },
         Setting::Assignment => NotificationSettingsUpdate {

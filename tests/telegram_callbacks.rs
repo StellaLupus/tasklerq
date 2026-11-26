@@ -640,3 +640,216 @@ async fn foreign_expired_dismiss_is_refused() {
         "the reminder must stay in the chat"
     );
 }
+
+// 0019-digest-checklist 4.2: истёкший токен строки сводки перерисовывает её с
+// новыми токенами, не меняя задачу; чужой токен и токен после смены household
+// отклоняются общими правилами.
+
+/// Доставленная утренняя сводка владельца со снимком и кнопкой открытой задачи.
+async fn digest_stand(pool: &sqlx::PgPool) -> (Harness, Item, i64, String, support::TestHousehold) {
+    let mut bot = support::notifications::onboarded(pool).await;
+    let household = support::notifications::household_for(pool, bot.chat).await;
+    sqlx::query("UPDATE households SET timezone = $2 WHERE id = $1")
+        .bind(household.household_id)
+        .bind("Europe/Moscow")
+        .execute(pool)
+        .await
+        .expect("household timezone");
+    support::notifications::set_notifications(
+        pool,
+        household.owner_id,
+        json!({
+            "digest_enabled": true,
+            "digest_time": "08:30",
+            "reminders_enabled": false,
+            "quiet_hours_enabled": false
+        }),
+    )
+    .await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let mut day = bot.now.with_timezone(&moscow).date_naive();
+    let mut at = support::notifications::local_utc(moscow, day, 9, 0);
+    if at <= bot.now {
+        day += Duration::days(1);
+        at = support::notifications::local_utc(moscow, day, 9, 0);
+    }
+    bot.freeze_at(at);
+    let mut item = new_item(household.tasks_list_id, "Вынести мусор");
+    item.due_date = Some(day);
+    item.assignee_user_id = Some(household.owner_id);
+    let task = create_item(
+        pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        item,
+    )
+    .await;
+    let now = bot.now;
+    support::notifications::tick_and_deliver(&mut bot, pool, now).await;
+    let (message_id, html) = bot.latest();
+    (bot, task, message_id, html, household)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_digest_toggle_refreshes_the_digest_and_a_new_press_completes() {
+    let db = isolated_db().await;
+    let (mut bot, task, message_id, html, household) = digest_stand(&db.pool).await;
+    let toggle = support::notifications::button_of(&html, "Вынести мусор");
+    let before = support::notifications::item_status(&db.pool, task.id).await;
+    let sends_before = bot.fake.sent().len();
+
+    // Кнопки устарели: токен выпущен 30 часов назад, сводка ещё жива (до 47 ч).
+    bot.advance(Duration::hours(30));
+    bot.press_data(&toggle, message_id).await;
+
+    // Задача не выполнена и не изменена.
+    let after_status = support::notifications::item_status(&db.pool, task.id).await;
+    assert_eq!(
+        after_status.0, "open",
+        "the expired toggle must not complete"
+    );
+    assert_eq!(after_status.1, before.1, "the task version must not change");
+    assert!(
+        bot.fake.answers().iter().any(|(_, text, _)| {
+            text.as_deref() == Some("Сводка обновлена — нажмите ещё раз")
+        }),
+        "the expired toggle must ask to press again: {:?}",
+        bot.fake.answers()
+    );
+
+    // Сводка правится на месте с новыми токенами, нового экрана нет.
+    let (id_after, after) = bot.latest();
+    assert_eq!(id_after, message_id, "digest must be edited in place");
+    assert!(after.contains("☐ Вынести мусор"), "{after}");
+    assert_eq!(
+        bot.fake.sent().len(),
+        sends_before,
+        "no new screen or message must be sent"
+    );
+    let new_toggle = support::notifications::button_of(&after, "Вынести мусор");
+    assert_ne!(new_toggle, toggle, "the redraw must reissue tokens");
+
+    // digest_hash записан и равен отпечатку новой отрисовки.
+    let delivery_id =
+        support::notifications::digest_delivery_id(&db.pool, household.owner_id).await;
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let view = tasklerq::jobs::digest::digest_view(&mut conn, delivery_id)
+        .await
+        .expect("digest view");
+    let ui = tasklerq::telegram::bot::notify::digest_ui(&view);
+    let hash: String =
+        sqlx::query_scalar("SELECT digest_hash FROM notification_deliveries WHERE id = $1")
+            .bind(delivery_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("digest hash");
+    assert_eq!(hash, tasklerq::telegram::bot::notify::ui_fingerprint(&ui));
+    drop(conn);
+
+    // Повторное касание по новой кнопке выполняет задачу.
+    bot.press_data(&new_toggle, message_id).await;
+    assert_eq!(
+        support::notifications::item_status(&db.pool, task.id)
+            .await
+            .0,
+        "done"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_digest_toggle_after_household_change_changes_nothing() {
+    let db = isolated_db().await;
+    let (mut bot, task, message_id, html, household) = digest_stand(&db.pool).await;
+    let before = support::notifications::item_status(&db.pool, task.id).await;
+    let delivery_id =
+        support::notifications::digest_delivery_id(&db.pool, household.owner_id).await;
+
+    // Пользователь сменил household после выпуска кнопки: токен несёт прежний
+    // household, отличный от текущего. Выпускаем истёкший токен строки сводки
+    // в другом household (перенос самого пользователя ограничен FK доставок).
+    let other = create_household(&db.pool).await;
+    let action = Action::DigestToggle {
+        delivery_id,
+        item_id: task.id,
+        version: task.version,
+    };
+    let spec = NewToken {
+        telegram_user_id: bot.chat,
+        household_id: Some(other.household_id),
+        scope: Scope::Notice,
+        action: action.name(),
+        payload: serde_json::to_value(&action).expect("payload"),
+        version: action.version(),
+    };
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let toggle = callbacks::issue_many(&mut conn, &[spec], bot.now - Duration::hours(30))
+        .await
+        .expect("issue")
+        .remove(0);
+    drop(conn);
+    bot.press_data(&toggle, message_id).await;
+
+    // Задача не меняется.
+    let after_status = support::notifications::item_status(&db.pool, task.id).await;
+    assert_eq!(after_status.0, before.0);
+    assert_eq!(after_status.1, before.1);
+    // Сводка не перерисовывается: сообщение осталось прежним.
+    assert!(
+        bot.fake
+            .messages(bot.chat)
+            .into_iter()
+            .any(|(id, content)| id == message_id && content == html),
+        "the digest must not be redrawn after a household change"
+    );
+    // Общее правило отказа, без тоста «Сводка обновлена».
+    assert!(
+        bot.fake.answers().iter().any(|(_, text, _)| {
+            text.as_deref() == Some("Это действие уже неактуально.")
+        }),
+        "the household rule must refuse the token: {:?}",
+        bot.fake.answers()
+    );
+    assert!(
+        !bot.fake.answers().iter().any(|(_, text, _)| {
+            text.as_deref() == Some("Сводка обновлена — нажмите ещё раз")
+        }),
+        "the refresh toast must not appear: {:?}",
+        bot.fake.answers()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreign_expired_digest_toggle_is_refused() {
+    let db = isolated_db().await;
+    let (mut bot, task, message_id, html, _household) = digest_stand(&db.pool).await;
+    let toggle = support::notifications::button_of(&html, "Вынести мусор");
+    let mut other =
+        Harness::sharing(&db.pool, next_telegram_id(), bot.fake.clone()).named("Mallory");
+
+    bot.advance(Duration::hours(30));
+    other.set_now(bot.now);
+    other.press_data(&toggle, message_id).await;
+
+    assert!(
+        other.fake.answers().iter().any(|(_, text, alert)| {
+            *alert && text.as_deref() == Some("Эта кнопка предназначена другому пользователю.")
+        }),
+        "a foreign expired digest token must be refused with an alert: {:?}",
+        other.fake.answers()
+    );
+    assert_eq!(
+        support::notifications::item_status(&db.pool, task.id)
+            .await
+            .0,
+        "open",
+        "a foreign press must not change the task"
+    );
+    assert!(
+        bot.fake
+            .messages(bot.chat)
+            .into_iter()
+            .any(|(id, content)| id == message_id && content == html),
+        "a foreign press must not redraw the digest"
+    );
+}

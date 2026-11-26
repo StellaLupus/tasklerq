@@ -257,6 +257,36 @@ pub async fn since_for_item(
     Ok(rows.into_iter().map(Completion::from).collect())
 }
 
+/// Действующие выполнения нескольких элементов одним запросом, с поздних.
+///
+/// Правило отбора — [`COMPLETION_SELECTION`]. Сводка 0019 читает выполнения
+/// всех строк снимка сразу (`= ANY`), а не по одной на строку; совпадение
+/// вхождения со снимком проверяет вызывающий.
+pub async fn active_for_items(
+    conn: &mut PgConnection,
+    household_id: Uuid,
+    item_ids: &[Uuid],
+) -> Result<Vec<Completion>, DomainError> {
+    if item_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT e.id, e.item_id, e.actor_user_id, e.created_at, e.payload,
+                i.list_id AS current_list_id
+         FROM item_events e
+         JOIN items i ON i.id = e.item_id AND i.household_id = e.household_id
+         WHERE {COMPLETION_SELECTION}
+           AND e.item_id = ANY($2)
+         ORDER BY e.created_at DESC, e.id DESC"
+    );
+    let rows = sqlx::query_as::<_, CompletionRow>(&sql)
+        .bind(household_id)
+        .bind(item_ids)
+        .fetch_all(conn)
+        .await?;
+    Ok(rows.into_iter().map(Completion::from).collect())
+}
+
 /// Действующее выполнение по id события, если оно ещё не отменено и не снято.
 ///
 /// Отбор — [`COMPLETION_SELECTION`]. Шаг синхронизации (0018, решение 4)

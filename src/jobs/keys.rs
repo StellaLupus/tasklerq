@@ -40,10 +40,18 @@ pub fn digest_occurrence_key(date: NaiveDate) -> String {
     format!("digest:{date}")
 }
 
-/// Дата из ключа `digest:YYYY-MM-DD`.
+/// Дата из ключа сводки: `digest:YYYY-MM-DD` или
+/// `digest:YYYY-MM-DD#manual:<unix_ms>`.
 pub(crate) fn digest_key_date(key: &str) -> Option<NaiveDate> {
-    key.strip_prefix("digest:")
-        .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+    let key = key.strip_prefix("digest:")?;
+    let date = key.split_once('#').map_or(key, |(date, _)| date);
+    NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()
+}
+
+/// Признак сводки по запросу: суффикс ключа начинается с `manual`.
+pub(crate) fn digest_key_manual(key: &str) -> bool {
+    key.split_once('#')
+        .is_some_and(|(_, suffix)| suffix.starts_with("manual"))
 }
 
 #[cfg(test)]
@@ -97,5 +105,28 @@ mod tests {
         );
         assert_eq!(snooze_origin(None, None), NO_DUE_ORIGIN);
         assert_eq!(snooze_origin(Some(due()), Some(date())), NO_DUE_ORIGIN);
+    }
+
+    #[test]
+    fn digest_key_date_parses_the_date_before_an_optional_suffix() {
+        assert_eq!(digest_key_date("digest:2026-11-09"), Some(date()));
+        assert_eq!(
+            digest_key_date("digest:2026-11-09#manual:1731234567890"),
+            Some(date())
+        );
+        assert_eq!(digest_key_date("digest:2026-11-09#other:1"), Some(date()));
+    }
+
+    #[test]
+    fn digest_key_date_rejects_a_malformed_date() {
+        assert_eq!(digest_key_date("digest:2026-13-09"), None);
+        assert_eq!(digest_key_date("date:2026-11-09"), None);
+    }
+
+    #[test]
+    fn digest_key_manual_reads_the_suffix() {
+        assert!(!digest_key_manual("digest:2026-11-09"));
+        assert!(digest_key_manual("digest:2026-11-09#manual:1731234567890"));
+        assert!(!digest_key_manual("digest:2026-11-09#other:1"));
     }
 }

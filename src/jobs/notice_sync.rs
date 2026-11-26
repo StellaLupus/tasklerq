@@ -19,6 +19,7 @@ use chrono::{DateTime, Duration, NaiveDate, Utc};
 use sqlx::{FromRow, PgConnection, PgPool};
 use uuid::Uuid;
 
+use super::domain_db;
 use super::keys::snooze_origin;
 use super::notice::{NOTICE_ROW_COLUMNS, NOTICE_ROW_FROM, NoticeRow};
 use crate::domain::error::DomainError;
@@ -477,14 +478,5 @@ async fn member_option(
         Err(DomainError::NotFound) => Ok(None),
         Err(DomainError::Database(error)) => Err(error),
         Err(_) => Ok(None),
-    }
-}
-
-/// Ошибка БД доменного слоя как ошибка sqlx; прочие варианты не возникают у
-/// запросов выборки выполнений.
-fn domain_db(error: DomainError) -> sqlx::Error {
-    match error {
-        DomainError::Database(error) => error,
-        other => sqlx::Error::Protocol(other.to_string()),
     }
 }

@@ -16,7 +16,7 @@ use tasklerq::domain::models::{
     Actor, Field, ItemPatch, ItemPriority, ItemStatus, ListKind, RecurrenceFreq, UserRole,
 };
 use tasklerq::domain::recurrence::Due;
-use tasklerq::domain::settings::NotificationSettings;
+use tasklerq::domain::settings::{DigestScope, NotificationSettings};
 use tasklerq::jobs::scheduler::Scheduler;
 use tasklerq::storage::repositories::{items, lists};
 use tasklerq::telegram::bot::Bot;
@@ -2003,6 +2003,52 @@ async fn settings_edit_notification_times_and_reject_invalid_values() {
 
     bot.press("Отмена").await;
     bot.assert_has_button("Конец тихих: 08:00");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_scope_switches_on_the_notifications_screen() {
+    let db = db().await;
+    let mut bot = onboarded_named(&db.pool, "Alice").await;
+
+    bot.press("Настройки").await;
+    bot.press("Уведомления").await;
+    bot.assert_screen_contains("🌅 Утренняя сводка: 08:30");
+    bot.assert_screen_contains("Задачи в сводке: все в семье");
+    bot.assert_has_button("👤 Только мои");
+    // Строка и переключатель — внутри блока сводки.
+    let screen = bot.screen();
+    let block = &screen[screen.find("🌅 Утренняя сводка").expect("digest block")
+        ..screen.find("👤 О назначениях").expect("assignments block")];
+    assert!(block.contains("Задачи в сводке: все в семье"), "{block}");
+    assert!(
+        support::telegram::buttons(block)
+            .iter()
+            .any(|(label, _)| label == "👤 Только мои"),
+        "the scope toggle must sit in the digest block:\n{block}"
+    );
+
+    bot.press("👤 Только мои").await;
+    bot.assert_screen_contains("Задачи в сводке: только мои");
+    bot.assert_has_button("👥 Все в семье");
+    assert_eq!(
+        notification_settings(&db.pool, bot.chat).await.digest_scope,
+        DigestScope::Mine
+    );
+
+    bot.press("👥 Все в семье").await;
+    bot.assert_screen_contains("Задачи в сводке: все в семье");
+    bot.assert_has_button("👤 Только мои");
+    assert_eq!(
+        notification_settings(&db.pool, bot.chat).await.digest_scope,
+        DigestScope::All
+    );
+
+    // При выключенной сводке ни строки, ни переключателя нет.
+    bot.press_after("🌅 Утренняя сводка", "Выкл").await;
+    bot.assert_screen_contains("🌅 Утренняя сводка: выкл");
+    assert!(!bot.screen().contains("Задачи в сводке"));
+    assert!(bot.find_button("Только мои").is_none());
+    assert!(bot.find_button("Все в семье").is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

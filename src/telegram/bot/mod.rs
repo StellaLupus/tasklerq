@@ -32,6 +32,7 @@ use crate::domain::error::DomainError;
 use crate::domain::identity::{MembershipChange, MembershipNotice, NoticeKind};
 use crate::domain::models::{Actor, Household, User};
 use crate::domain::recurrence::parse_timezone;
+use crate::jobs::digest;
 use crate::llm::LlmHandle;
 use crate::rate_limit::RateLimiter;
 use crate::security_audit::Audit;
@@ -769,6 +770,12 @@ async fn on_text(ctx: &mut Ctx<'_>, text: &str) -> Result<(), Fail> {
         return open_menu(ctx, false).await;
     }
 
+    // «☀️ Сводка» — вторая кнопка той же клавиатуры. Без household это обычный
+    // текст: у онбординга клавиатуры нет.
+    if text == ru::DIGEST_KEYBOARD_BUTTON && ctx.user.is_some() && ctx.household.is_some() {
+        return request_digest(ctx).await;
+    }
+
     if let Some((command, argument)) = parse_command(text) {
         return on_command(ctx, &command, argument).await;
     }
@@ -908,12 +915,15 @@ impl<'a> Ctx<'a> {
     }
 }
 
-/// Раскладка постоянной reply-клавиатуры: один ряд с одной кнопкой меню.
+/// Раскладка постоянной reply-клавиатуры: один ряд с меню и сводкой.
 ///
 /// Единственное место, где строится раскладка носителя: подписи уходят в
 /// `reply_markup.keyboard`, доставка от слоя бота не зависит.
 fn keyboard_rows() -> Vec<Vec<String>> {
-    vec![vec![ru::MENU_BUTTON.to_owned()]]
+    vec![vec![
+        ru::MENU_BUTTON.to_owned(),
+        ru::DIGEST_KEYBOARD_BUTTON.to_owned(),
+    ]]
 }
 
 /// Ключ удаления входящего сообщения.
@@ -946,6 +956,22 @@ async fn open_menu(ctx: &mut Ctx<'_>, carrier: bool) -> Result<(), Fail> {
         ctx.carrier_pending = true;
     }
     ctx.menu_or_onboarding().await
+}
+
+/// Нажатие «☀️ Сводка»: закрыть форму и выпустить сводку по запросу в
+/// транзакции обработчика. Новый носитель и экран не ставятся: текст кнопки
+/// удаляет общий механизм обработанных входящих, сводка приходит своим
+/// сообщением.
+///
+/// `None` от [`digest::request_manual_in_conn`] означает, что получатель
+/// недоступен или его сейчас держит планировщик. Тогда сводка не ставится:
+/// повтор создаст новую запись, а спека не просит отдельного сообщения об
+/// ошибке. Текст кнопки уже удалён общим механизмом.
+async fn request_digest(ctx: &mut Ctx<'_>) -> Result<(), Fail> {
+    views::clear_conversation(&mut *ctx.conn, ctx.chat_id).await?;
+    let user_id = ctx.user()?.id;
+    let _ = digest::request_manual_in_conn(&mut *ctx.conn, user_id, ctx.now).await?;
+    Ok(())
 }
 
 async fn on_command(ctx: &mut Ctx<'_>, command: &str, argument: &str) -> Result<(), Fail> {
@@ -993,7 +1019,7 @@ const UNKNOWN_COMMAND: &str = "Не знаю такой команды. Отпр
 const HELP: &str = "Я помогаю вести задачи и покупки всей семьёй.\n\n\
 Напишите, что нужно сделать: с включённым разбором я разделю текст на задачи и покупки и покажу черновик, а без разбора или когда разбор не удался открою редактор с этим текстом в названии.\n\n\
 По экранам можно ходить кнопками «⬅️ Назад» и «🏠 Меню» внутри сообщений; хлебные крошки в заголовке показывают путь.\n\n\
-Ваши сообщения я удаляю из чата после обработки. Кнопка «🏠 Меню» внизу, под полем ввода, возвращает меню вниз чата — как /start или /menu.\n\n\
+Ваши сообщения я удаляю из чата после обработки. Кнопка «🏠 Меню» внизу, под полем ввода, возвращает меню вниз чата — как /start или /menu; кнопка «☀️ Сводка» рядом с ней присылает сводку на сегодня по запросу.\n\n\
 /menu — главное меню\n\
 /settings — настройки\n\
 /cancel — отменить текущее действие\n\
@@ -1012,6 +1038,7 @@ async fn on_callback(ctx: &mut Ctx<'_>, message_id: i64, data: &str) -> Result<(
     }
 
     let consumed = callbacks::consume(&mut *ctx.conn, data, ctx.sender.id, ctx.now).await?;
+    let expired = matches!(consumed, Consumed::Expired(_));
     let token = match consumed {
         Consumed::Valid(token) => token,
         Consumed::Replayed(scope) => {
@@ -1020,14 +1047,18 @@ async fn on_callback(ctx: &mut Ctx<'_>, message_id: i64, data: &str) -> Result<(
         }
         Consumed::Expired(token) => {
             // «🗑 Убрать» выполняется и после истечения токена: удалить своё
-            // сообщение безопасно (design 0017, решение 1). Остальные истёкшие
-            // действия ведут себя как раньше.
-            let dismiss = token.scope == Scope::Notice
+            // сообщение безопасно (design 0017, решение 1). Касание строки
+            // сводки по истёкшему токену не меняет задачу, а перерисовывает
+            // сводку с новыми токенами (0019, решение 2): сводка живёт до 47
+            // часов, а токены — 24. Остальные истёкшие действия ведут себя как
+            // раньше. Проверки household и чужого токена ниже действуют и для
+            // этих исключений.
+            let keep = token.scope == Scope::Notice
                 && matches!(
                     serde_json::from_value::<Action>(token.payload.clone()),
-                    Ok(Action::NoticeClose)
+                    Ok(Action::NoticeClose | Action::DigestToggle { .. })
                 );
-            if dismiss {
+            if keep {
                 token
             } else {
                 ctx.toast("Это действие устарело. Открываю актуальный экран.");
@@ -1077,7 +1108,7 @@ async fn on_callback(ctx: &mut Ctx<'_>, message_id: i64, data: &str) -> Result<(
     // Действующий токен уже потреблён: откат действия его не возвращает
     // (истёкший «🗑 Убрать» не потребляется и повторное нажатие безопасно:
     // удаление идемпотентно по ключу).
-    ctx.in_step(|ctx| Box::pin(run_action(ctx, message_id, action)))
+    ctx.in_step(|ctx| Box::pin(run_action(ctx, message_id, action, expired)))
         .await
 }
 
@@ -1090,7 +1121,12 @@ async fn refresh_unless_notice(ctx: &mut Ctx<'_>, scope: Scope) -> Result<(), Fa
     }
 }
 
-async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Result<(), Fail> {
+async fn run_action(
+    ctx: &mut Ctx<'_>,
+    message_id: i64,
+    action: Action,
+    expired: bool,
+) -> Result<(), Fail> {
     match action {
         Action::Go { to } => {
             if !matches!(to, Screen::Form) {
@@ -1231,6 +1267,19 @@ async fn run_action(ctx: &mut Ctx<'_>, message_id: i64, action: Action) -> Resul
         Action::NoticeClose => notify::close(ctx, message_id).await,
         Action::NoticeMove { item_id } => notify::event_due(ctx, item_id).await,
         Action::NoticeUndo { item_id } => notify::undo(ctx, message_id, item_id).await,
+        Action::DigestToggle {
+            delivery_id,
+            item_id,
+            version,
+        } => {
+            if expired {
+                // Истёкший токен: задачу не трогаем, перерисовываем сводку с
+                // новыми токенами (0019, решение 2).
+                notify::digest_refresh(ctx, message_id, delivery_id).await
+            } else {
+                notify::digest_toggle(ctx, message_id, delivery_id, item_id, version).await
+            }
+        }
 
         Action::BatchPage { batch_id, page } => {
             notify::batch_page(ctx, message_id, batch_id, page).await
@@ -1292,8 +1341,14 @@ mod tests {
     use crate::telegram::rich::button;
 
     #[test]
-    fn keyboard_rows_are_a_single_row_with_the_menu_button() {
-        assert_eq!(keyboard_rows(), vec![vec![ru::MENU_BUTTON.to_owned()]]);
+    fn keyboard_rows_are_a_single_row_with_the_menu_and_digest_buttons() {
+        assert_eq!(
+            keyboard_rows(),
+            vec![vec![
+                ru::MENU_BUTTON.to_owned(),
+                ru::DIGEST_KEYBOARD_BUTTON.to_owned(),
+            ]]
+        );
     }
 
     #[test]

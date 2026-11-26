@@ -783,8 +783,8 @@ pub fn chat_carrier(bot: &Harness) -> (i64, String) {
 }
 
 /// Носитель клавиатуры доставлен ровно один раз, с текстом и раскладкой спеки
-/// (`ru::KEYBOARD_CARRIER_TEXT`, раскладка `[["🏠 Меню"]]`); возвращает id
-/// живого носителя в чате.
+/// (`ru::KEYBOARD_CARRIER_TEXT`, один ряд «🏠 Меню» и «☀️ Сводка»); возвращает
+/// id живого носителя в чате.
 ///
 /// Payload строки outbox после доставки скрыт, поэтому содержимое проверяется
 /// по вызову фейка: он получает html и rows прямо из строки outbox.
@@ -799,6 +799,12 @@ pub fn assert_carrier_sent(bot: &Harness) -> i64 {
         .collect();
     assert_eq!(keyboards.len(), 1, "exactly one carrier: {calls:?}");
     assert_eq!(keyboards[0].0, &escape(ru::KEYBOARD_CARRIER_TEXT));
-    assert_eq!(keyboards[0].1, &vec![vec![ru::MENU_BUTTON.to_owned()]]);
+    assert_eq!(
+        keyboards[0].1,
+        &vec![vec![
+            ru::MENU_BUTTON.to_owned(),
+            ru::DIGEST_KEYBOARD_BUTTON.to_owned(),
+        ]]
+    );
     chat_carrier(bot).0
 }

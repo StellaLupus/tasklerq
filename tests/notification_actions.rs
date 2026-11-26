@@ -7,10 +7,10 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use serde_json::json;
 use sqlx::PgPool;
-use support::notifications::{button_of, scheduler, tick_and_deliver};
+use support::notifications::{button_of, digest_delivery_id, scheduler, tick_and_deliver};
 use support::telegram::{Call, Harness, buttons};
 use support::{TestHousehold, create_item, isolated_db, new_item, next_telegram_id};
-use tasklerq::domain::models::{Actor, Item, RecurrenceFreq, RecurrenceInput, UserRole};
+use tasklerq::domain::models::{Actor, Item, ItemPatch, RecurrenceFreq, RecurrenceInput, UserRole};
 use tasklerq::storage::repositories::items;
 use tasklerq::storage::repositories::notifications::{self, NewDelivery, NotificationKind};
 use tasklerq::telegram::bot::model::{Action, SnoozeUntil};
@@ -3186,4 +3186,744 @@ async fn done_on_a_changed_recurring_task_keeps_the_delivery_open() {
     let (_, redrawn) = bot.latest();
     assert!(!redrawn.contains("✅ Выполнено"), "{redrawn}");
     assert!(redrawn.contains("Отложить на час"), "{redrawn}");
+}
+
+// ===== Касание строки сводки: Action::DigestToggle (0019, пункт 4.1) =====
+
+async fn set_household_timezone(pool: &PgPool, household_id: Uuid, timezone: &str) {
+    sqlx::query("UPDATE households SET timezone = $2 WHERE id = $1")
+        .bind(household_id)
+        .bind(timezone)
+        .execute(pool)
+        .await
+        .expect("household timezone");
+}
+
+/// Участник household с уникальным Telegram ID; возвращает `(id, telegram_id)`.
+async fn add_member(
+    pool: &PgPool,
+    household_id: Uuid,
+    name: &str,
+    digest_enabled: bool,
+) -> (Uuid, i64) {
+    let id = Uuid::now_v7();
+    let telegram_id = next_telegram_id();
+    sqlx::query(
+        "INSERT INTO users (
+             id, household_id, telegram_user_id, telegram_chat_id, display_name,
+             role, settings, created_at, updated_at
+         )
+         VALUES (
+             $1, $2, $3, $3, $4, 'member',
+             jsonb_build_object(
+                 'notifications',
+                 jsonb_build_object(
+                     'digest_enabled', $5, 'digest_time', '08:30',
+                     'reminders_enabled', false, 'quiet_hours_enabled', false
+                 )
+             ),
+             now(), now()
+         )",
+    )
+    .bind(id)
+    .bind(household_id)
+    .bind(telegram_id)
+    .bind(name)
+    .bind(digest_enabled)
+    .execute(pool)
+    .await
+    .expect("extra member");
+    (id, telegram_id)
+}
+
+/// Включить утреннюю сводку у бота стенда и заморозить часы на ближайшем
+/// будущем 09:00 по Москве. Возвращает день сводки (локальная дата этого момента).
+async fn digest_morning(bot: &mut Harness, pool: &PgPool) -> NaiveDate {
+    set_notifications(
+        pool,
+        bot.chat,
+        json!({
+            "digest_enabled": true,
+            "digest_time": "08:30",
+            "reminders_enabled": false,
+            "quiet_hours_enabled": false
+        }),
+    )
+    .await;
+    let at = next_moscow_time(bot, 9, 0);
+    bot.freeze_at(at);
+    at.with_timezone(&chrono_tz::Europe::Moscow).date_naive()
+}
+
+/// Всеобщая вседневная задача без исполнителя на день сводки.
+async fn create_shared_all_day_task(
+    pool: &PgPool,
+    household: &TestHousehold,
+    title: &str,
+    day: NaiveDate,
+) -> Item {
+    let mut item = new_item(household.tasks_list_id, title);
+    item.due_date = Some(day);
+    create_item(
+        pool,
+        household,
+        household.tasks_list_id,
+        &household.owner(),
+        item,
+    )
+    .await
+}
+
+/// Касание выполняет задачу и правит сводку на месте, без нового экрана;
+/// `digest_hash` после касания равен отпечатку новой отрисовки.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_toggle_completes_the_task_and_edits_the_digest_in_place() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    let day = digest_morning(&mut bot, &db.pool).await;
+    let task = create_all_day_task(&db.pool, &household, "Вынести мусор", day).await;
+
+    {
+        let now = bot.now;
+        tick_and_deliver(&mut bot, &db.pool, now).await;
+    }
+    let (message_id, html) = bot.latest();
+    assert!(html.contains("☐ Вынести мусор · весь день"), "{html}");
+    let toggle = button_of(&html, "Вынести мусор");
+    let sends_before = bot.fake.sent().len();
+
+    bot.press_data(&toggle, message_id).await;
+
+    // Задача выполнена.
+    assert_eq!(item_status(&db.pool, task.id).await.0, "done");
+    // Сводка правится на месте: то же сообщение, строка «✅», нового экрана нет.
+    let (id_after, after) = bot.latest();
+    assert_eq!(id_after, message_id, "digest must be edited in place");
+    assert!(after.contains("✅ Вынести мусор"), "{after}");
+    assert!(after.contains("Выполнено 1 из 1"), "{after}");
+    assert_eq!(
+        bot.fake.sent().len(),
+        sends_before,
+        "no new screen or message must be sent"
+    );
+
+    // digest_hash равен отпечатку новой отрисовки этой доставки.
+    let delivery_id = digest_delivery_id(&db.pool, household.owner_id).await;
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let view = tasklerq::jobs::digest::digest_view(&mut conn, delivery_id)
+        .await
+        .expect("digest view");
+    let ui = tasklerq::telegram::bot::notify::digest_ui(&view);
+    let hash: String =
+        sqlx::query_scalar("SELECT digest_hash FROM notification_deliveries WHERE id = $1")
+            .bind(delivery_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("digest hash");
+    assert_eq!(hash, tasklerq::telegram::bot::notify::ui_fingerprint(&ui));
+}
+
+/// Повторное касание в окне отмены снова открывает задачу, строка «☐ …».
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_toggle_again_within_the_window_reopens_the_task() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    let day = digest_morning(&mut bot, &db.pool).await;
+    let task = create_all_day_task(&db.pool, &household, "Вынести мусор", day).await;
+
+    {
+        let now = bot.now;
+        tick_and_deliver(&mut bot, &db.pool, now).await;
+    }
+    let (message_id, html) = bot.latest();
+    let toggle = button_of(&html, "Вынести мусор");
+    bot.press_data(&toggle, message_id).await;
+    assert_eq!(item_status(&db.pool, task.id).await.0, "done");
+
+    // Кнопка выполненной строки (касание — отмена) из перерисованной сводки.
+    let (_, done_html) = bot.latest();
+    assert!(done_html.contains("✅ Вынести мусор"), "{done_html}");
+    let undo_toggle = button_of(&done_html, "Вынести мусор");
+    bot.press_data(&undo_toggle, message_id).await;
+
+    assert_eq!(item_status(&db.pool, task.id).await.0, "open");
+    let (_, reopened) = bot.latest();
+    assert!(
+        reopened.contains("☐ Вынести мусор · весь день"),
+        "{reopened}"
+    );
+}
+
+/// Касание выполненной строки через 15 минут — тост «Время отмены истекло»,
+/// задача остаётся выполненной.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_toggle_after_the_undo_window_toasts_expired() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    let day = digest_morning(&mut bot, &db.pool).await;
+    let task = create_all_day_task(&db.pool, &household, "Вынести мусор", day).await;
+
+    {
+        let now = bot.now;
+        tick_and_deliver(&mut bot, &db.pool, now).await;
+    }
+    let (message_id, html) = bot.latest();
+    let toggle = button_of(&html, "Вынести мусор");
+    bot.press_data(&toggle, message_id).await;
+    assert_eq!(item_status(&db.pool, task.id).await.0, "done");
+    let (_, done_html) = bot.latest();
+    let undo_toggle = button_of(&done_html, "Вынести мусор");
+
+    bot.advance(Duration::minutes(15));
+    bot.press_data(&undo_toggle, message_id).await;
+
+    assert_eq!(last_toast(&bot).as_deref(), Some("Время отмены истекло"));
+    assert_eq!(item_status(&db.pool, task.id).await.0, "done");
+}
+
+/// Переименованная после доставки задача не выполняется по старой кнопке:
+/// тост «Задача уже изменилась», сводка перерисована с новым названием.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_toggle_with_a_stale_version_after_rename_toasts_changed() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    let day = digest_morning(&mut bot, &db.pool).await;
+    let task = create_all_day_task(&db.pool, &household, "Вынести мусор", day).await;
+
+    {
+        let now = bot.now;
+        tick_and_deliver(&mut bot, &db.pool, now).await;
+    }
+    let (message_id, html) = bot.latest();
+    let toggle = button_of(&html, "Вынести мусор");
+
+    // Задачу переименовали после доставки: версия в кнопке устарела.
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let current = items::get(&mut conn, household.household_id, task.id)
+        .await
+        .expect("task");
+    items::update(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        task.id,
+        current.version,
+        ItemPatch {
+            title: Some("Вынести мусор и пыль".into()),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        bot.now,
+    )
+    .await
+    .expect("rename");
+    drop(conn);
+
+    bot.press_data(&toggle, message_id).await;
+
+    assert_eq!(last_toast(&bot).as_deref(), Some("Задача уже изменилась"));
+    assert_eq!(item_status(&db.pool, task.id).await.0, "open");
+    let (_, after) = bot.latest();
+    assert!(after.contains("Вынести мусор и пыль"), "{after}");
+}
+
+/// Маша выполнила задачу до обновления сводки: Петя-не владелец получает тост
+/// «Задача уже выполнена», строка «✅ … · Маша» без кнопки.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_toggle_after_completion_by_another_member_toasts_done() {
+    let db = isolated_db().await;
+    let mut owner_bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, owner_bot.chat).await;
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    let day = digest_morning(&mut owner_bot, &db.pool).await;
+    let (_petya, petya_telegram) = add_member(&db.pool, household.household_id, "Петя", true).await;
+    let (masha, _) = add_member(&db.pool, household.household_id, "Маша", false).await;
+    let task = create_shared_all_day_task(&db.pool, &household, "Вынести мусор", day).await;
+
+    let mut petya_bot = Harness::new(&db.pool, petya_telegram).named("Петя");
+    petya_bot.freeze_at(owner_bot.now);
+    tick_and_deliver(&mut petya_bot, &db.pool, owner_bot.now).await;
+    let (message_id, html) = petya_bot.latest();
+    assert!(html.contains("☐ Вынести мусор"), "{html}");
+    let toggle = button_of(&html, "Вынести мусор");
+
+    // Маша выполняет задачу раньше, чем сводка Пети обновилась.
+    let mut conn = db.pool.acquire().await.expect("conn");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &Actor::user(masha, UserRole::Member),
+        task.id,
+        None,
+        "Europe/Moscow",
+        owner_bot.now,
+    )
+    .await
+    .expect("masha completes");
+    drop(conn);
+
+    petya_bot.press_data(&toggle, message_id).await;
+
+    assert_eq!(
+        last_toast(&petya_bot).as_deref(),
+        Some("Задача уже выполнена")
+    );
+    assert_eq!(item_status(&db.pool, task.id).await.0, "done");
+    let (_, after) = petya_bot.latest();
+    assert!(after.contains("✅ Вынести мусор · Маша"), "{after}");
+    // У Пети-не владельца нет права отменить выполнение Маши — кнопки нет.
+    assert!(
+        !buttons(&after)
+            .iter()
+            .any(|(label, _)| label.contains("Вынести мусор")),
+        "{after}"
+    );
+}
+
+/// Петя выполнил задачу, Маша сразу переименовала её: повторное касание Пети —
+/// тост «Задача уже изменилась», задача выполнена, переименование не откачено.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_toggle_after_a_rename_by_another_member_does_not_undo() {
+    let db = isolated_db().await;
+    let mut owner_bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, owner_bot.chat).await;
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    let day = digest_morning(&mut owner_bot, &db.pool).await;
+    let (_petya, petya_telegram) = add_member(&db.pool, household.household_id, "Петя", true).await;
+    let (masha, _) = add_member(&db.pool, household.household_id, "Маша", false).await;
+    let task = create_shared_all_day_task(&db.pool, &household, "Вынести мусор", day).await;
+
+    let mut petya_bot = Harness::new(&db.pool, petya_telegram).named("Петя");
+    petya_bot.freeze_at(owner_bot.now);
+    tick_and_deliver(&mut petya_bot, &db.pool, owner_bot.now).await;
+    let (message_id, html) = petya_bot.latest();
+    let toggle = button_of(&html, "Вынести мусор");
+
+    // Петя выполняет задачу из своей сводки.
+    petya_bot.press_data(&toggle, message_id).await;
+    assert_eq!(item_status(&db.pool, task.id).await.0, "done");
+    let (_, done_html) = petya_bot.latest();
+    let undo_toggle = button_of(&done_html, "Вынести мусор");
+
+    // Маша переименовывает задачу после выполнения.
+    petya_bot.advance(Duration::minutes(1));
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let current = items::get(&mut conn, household.household_id, task.id)
+        .await
+        .expect("task");
+    items::update(
+        &mut conn,
+        household.household_id,
+        &Actor::user(masha, UserRole::Member),
+        task.id,
+        current.version,
+        ItemPatch {
+            title: Some("Вынести мусор и пыль".into()),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        petya_bot.now,
+    )
+    .await
+    .expect("rename");
+    drop(conn);
+
+    petya_bot.press_data(&undo_toggle, message_id).await;
+
+    assert_eq!(
+        last_toast(&petya_bot).as_deref(),
+        Some("Задача уже изменилась")
+    );
+    assert_eq!(item_status(&db.pool, task.id).await.0, "done");
+    let title: String = sqlx::query_scalar("SELECT title FROM items WHERE id = $1")
+        .bind(task.id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("title");
+    assert_eq!(title, "Вынести мусор и пыль", "rename must not be undone");
+}
+
+/// То же для владельца: выполнение владельцем, переименование Машей, повторное
+/// касание владельца не откатывает переименование.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_toggle_after_a_rename_does_not_undo_for_the_owner_too() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    let day = digest_morning(&mut bot, &db.pool).await;
+    let (masha, _) = add_member(&db.pool, household.household_id, "Маша", false).await;
+    let task = create_shared_all_day_task(&db.pool, &household, "Вынести мусор", day).await;
+
+    {
+        let now = bot.now;
+        tick_and_deliver(&mut bot, &db.pool, now).await;
+    }
+    let (message_id, html) = bot.latest();
+    let toggle = button_of(&html, "Вынести мусор");
+
+    bot.press_data(&toggle, message_id).await;
+    assert_eq!(item_status(&db.pool, task.id).await.0, "done");
+    let (_, done_html) = bot.latest();
+    let undo_toggle = button_of(&done_html, "Вынести мусор");
+
+    bot.advance(Duration::minutes(1));
+    let mut conn = db.pool.acquire().await.expect("conn");
+    let current = items::get(&mut conn, household.household_id, task.id)
+        .await
+        .expect("task");
+    items::update(
+        &mut conn,
+        household.household_id,
+        &Actor::user(masha, UserRole::Member),
+        task.id,
+        current.version,
+        ItemPatch {
+            title: Some("Вынести мусор и пыль".into()),
+            ..ItemPatch::default()
+        },
+        "Europe/Moscow",
+        bot.now,
+    )
+    .await
+    .expect("rename");
+    drop(conn);
+
+    bot.press_data(&undo_toggle, message_id).await;
+
+    assert_eq!(last_toast(&bot).as_deref(), Some("Задача уже изменилась"));
+    assert_eq!(item_status(&db.pool, task.id).await.0, "done");
+    let title: String = sqlx::query_scalar("SELECT title FROM items WHERE id = $1")
+        .bind(task.id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("title");
+    assert_eq!(title, "Вынести мусор и пыль");
+}
+
+/// Ежедневная задача: касание даёт «✅ … · следующее завтра», задача остаётся
+/// в списке со сроком на завтра.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_toggle_completes_a_daily_task_showing_the_next_due() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    let day = digest_morning(&mut bot, &db.pool).await;
+    let mut item = new_item(household.tasks_list_id, "Вынести мусор");
+    item.due_date = Some(day);
+    item.assignee_user_id = Some(household.owner_id);
+    item.recurrence = Some(support::recurrence(RecurrenceFreq::Daily, Vec::new()));
+    let task = create_item(
+        &db.pool,
+        &household,
+        household.tasks_list_id,
+        &household.owner(),
+        item,
+    )
+    .await;
+
+    {
+        let now = bot.now;
+        tick_and_deliver(&mut bot, &db.pool, now).await;
+    }
+    let (message_id, html) = bot.latest();
+    let toggle = button_of(&html, "Вынести мусор");
+
+    bot.press_data(&toggle, message_id).await;
+
+    let (_, after) = bot.latest();
+    assert!(
+        after.contains("✅ Вынести мусор · следующее завтра"),
+        "{after}"
+    );
+    // Задача открыта (следующее вхождение) со сроком на завтра.
+    let (status, _, _) = item_status(&db.pool, task.id).await;
+    assert_eq!(status, "open");
+    let due_date: Option<NaiveDate> =
+        sqlx::query_scalar("SELECT due_date FROM items WHERE id = $1")
+            .bind(task.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("due date");
+    assert_eq!(due_date, Some(day + Duration::days(1)));
+}
+
+/// Свежий токен касания строки сводки (область `notice`) для произвольной
+/// доставки: так проверяется охрана доставки и строки без кнопки (событие).
+async fn digest_toggle_token(
+    pool: &PgPool,
+    bot: &Harness,
+    household: &TestHousehold,
+    delivery_id: Uuid,
+    item_id: Uuid,
+    version: i32,
+) -> String {
+    let action = Action::DigestToggle {
+        delivery_id,
+        item_id,
+        version,
+    };
+    let spec = NewToken {
+        telegram_user_id: bot.chat,
+        household_id: Some(household.household_id),
+        scope: Scope::Notice,
+        action: action.name(),
+        payload: serde_json::to_value(&action).expect("payload"),
+        version: action.version(),
+    };
+    let mut conn = pool.acquire().await.expect("conn");
+    callbacks::issue_many(&mut conn, &[spec], bot.now)
+        .await
+        .expect("digest toggle token")
+        .remove(0)
+}
+
+/// Число строк правки в outbox чата: перерисовка сводки ставит правку, даже
+/// если содержимое не изменилось.
+async fn edit_count(pool: &PgPool, chat: i64) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM outbox WHERE chat_id = $1 AND kind = 'edit'")
+        .bind(chat)
+        .fetch_one(pool)
+        .await
+        .expect("edit count")
+}
+
+/// Охрана доставки: касание с `delivery_id` чужой доставки (другого получателя)
+/// и доставки не-сводки ничего не меняет и не перерисовывает сводку.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_toggle_ignores_a_foreign_or_non_digest_delivery() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    let day = digest_morning(&mut bot, &db.pool).await;
+    let (masha, _) = add_member(&db.pool, household.household_id, "Маша", true).await;
+    let task = create_shared_all_day_task(&db.pool, &household, "Вынести мусор", day).await;
+    let now = bot.now;
+    tick_and_deliver(&mut bot, &db.pool, now).await;
+    let (message_id, html) = bot.latest();
+
+    // Доставка сводки другого получателя (Маши) и доставка не-сводки владельца.
+    let foreign_delivery = digest_delivery_id(&db.pool, masha).await;
+    let reminder_delivery = support::notifications::insert_delivery(
+        &db.pool,
+        household.household_id,
+        household.owner_id,
+        task.id,
+        "reminder",
+        "reminder:test",
+        now,
+        false,
+    )
+    .await;
+    // Не-сводка несёт непустой снимок сводки: охрана должна отсеять её именно
+    // по `kind = 'digest'`, а не по отсутствию снимка.
+    sqlx::query(
+        "UPDATE notification_deliveries
+         SET digest_items = (
+             SELECT digest_items FROM notification_deliveries
+             WHERE user_id = $1 AND kind = 'digest'
+             ORDER BY created_at DESC, id DESC LIMIT 1
+         )
+         WHERE id = $2",
+    )
+    .bind(household.owner_id)
+    .bind(reminder_delivery)
+    .execute(&db.pool)
+    .await
+    .expect("snapshot for non-digest delivery");
+
+    let before = item_status(&db.pool, task.id).await;
+    let edits_before = edit_count(&db.pool, bot.chat).await;
+    let sends_before = bot.fake.sent().len();
+
+    let foreign_token = digest_toggle_token(
+        &db.pool,
+        &bot,
+        &household,
+        foreign_delivery,
+        task.id,
+        task.version,
+    )
+    .await;
+    bot.press_data(&foreign_token, message_id).await;
+    let reminder_token = digest_toggle_token(
+        &db.pool,
+        &bot,
+        &household,
+        reminder_delivery,
+        task.id,
+        task.version,
+    )
+    .await;
+    bot.press_data(&reminder_token, message_id).await;
+
+    // Задача не меняется, сводка не перерисовывается и не присылается заново.
+    let after = item_status(&db.pool, task.id).await;
+    assert_eq!(after.0, before.0);
+    assert_eq!(after.1, before.1);
+    assert_eq!(
+        edit_count(&db.pool, bot.chat).await,
+        edits_before,
+        "a foreign or non-digest delivery must not redraw the digest"
+    );
+    assert_eq!(bot.fake.sent().len(), sends_before);
+    assert!(
+        bot.fake
+            .messages(bot.chat)
+            .into_iter()
+            .any(|(id, content)| id == message_id && content == html),
+        "the digest must stay untouched"
+    );
+}
+
+/// Касание строки «удалена» и строки события: задача/событие не меняются,
+/// сводка перерисовывается.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_toggle_on_a_deleted_line_or_event_changes_nothing() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    let day = digest_morning(&mut bot, &db.pool).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let task = create_shared_all_day_task(&db.pool, &household, "Вынести мусор", day).await;
+    let event = create_event(
+        &db.pool,
+        &household,
+        "Маникюр",
+        local_utc(moscow, day, 14, 0),
+        local_utc(moscow, day, 15, 30),
+        None,
+    )
+    .await;
+    let now = bot.now;
+    tick_and_deliver(&mut bot, &db.pool, now).await;
+    let (message_id, html) = bot.latest();
+    assert!(html.contains("Маникюр"), "{html}");
+    let toggle = button_of(&html, "Вынести мусор");
+    let delivery_id = digest_delivery_id(&db.pool, household.owner_id).await;
+
+    // Задачу удалили после доставки: её строка стала «удалена».
+    let mut conn = db.pool.acquire().await.expect("conn");
+    items::soft_delete(
+        &mut conn,
+        household.household_id,
+        &household.owner(),
+        task.id,
+        bot.now,
+    )
+    .await
+    .expect("delete task");
+    drop(conn);
+
+    let edits_before = edit_count(&db.pool, bot.chat).await;
+    let event_before = item_status(&db.pool, event.id).await;
+    // Версия удалённой задачи после удаления: касание не должно её менять.
+    let deleted_version: i32 = sqlx::query_scalar("SELECT version FROM items WHERE id = $1")
+        .bind(task.id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("deleted task version");
+
+    // Касание устаревшей кнопки удалённой задачи: строка «удалена», задача не
+    // меняется, сводка перерисована.
+    bot.press_data(&toggle, message_id).await;
+    let deleted_at: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT deleted_at FROM items WHERE id = $1")
+            .bind(task.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("deleted_at");
+    assert!(deleted_at.is_some(), "the task must stay deleted");
+    let deleted_version_after: i32 = sqlx::query_scalar("SELECT version FROM items WHERE id = $1")
+        .bind(task.id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("deleted task version after press");
+    assert_eq!(
+        deleted_version_after, deleted_version,
+        "the deleted task version must not change"
+    );
+    let (_, after) = bot.latest();
+    assert!(after.contains("Вынести мусор — удалена"), "{after}");
+
+    // Касание строки события (кнопки у события нет — токен выпускаем вручную):
+    // событие не меняется, сводка перерисована.
+    let event_token = digest_toggle_token(
+        &db.pool,
+        &bot,
+        &household,
+        delivery_id,
+        event.id,
+        event.version,
+    )
+    .await;
+    bot.press_data(&event_token, message_id).await;
+    let event_after = item_status(&db.pool, event.id).await;
+    assert_eq!(event_after.0, event_before.0);
+    assert_eq!(event_after.1, event_before.1);
+    let (_, final_html) = bot.latest();
+    assert!(final_html.contains("Маникюр"), "{final_html}");
+
+    // Оба касания прошли через перерисовку сводки.
+    assert_eq!(
+        edit_count(&db.pool, bot.chat).await,
+        edits_before + 2,
+        "both presses must redraw the digest"
+    );
+}
+
+/// Владелец с устаревшей кнопкой «открытая» на задаче, которую уже выполнила
+/// Маша: тост «Задача уже выполнена», выполнение Маши не откачено.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn digest_toggle_owner_stale_open_button_after_completion_toasts_done() {
+    let db = isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    set_household_timezone(&db.pool, household.household_id, "Europe/Moscow").await;
+    let day = digest_morning(&mut bot, &db.pool).await;
+    let (masha, _) = add_member(&db.pool, household.household_id, "Маша", false).await;
+    let task = create_shared_all_day_task(&db.pool, &household, "Вынести мусор", day).await;
+    let now = bot.now;
+    tick_and_deliver(&mut bot, &db.pool, now).await;
+    let (message_id, html) = bot.latest();
+    // Кнопка выпущена, когда вхождение было открыто: версия устарела.
+    let toggle = button_of(&html, "Вынести мусор");
+
+    // Маша выполняет задачу раньше, чем сводка владельца обновилась.
+    let mut conn = db.pool.acquire().await.expect("conn");
+    items::complete(
+        &mut conn,
+        household.household_id,
+        &Actor::user(masha, UserRole::Member),
+        task.id,
+        None,
+        "Europe/Moscow",
+        bot.now,
+    )
+    .await
+    .expect("masha completes");
+    drop(conn);
+
+    bot.press_data(&toggle, message_id).await;
+
+    assert_eq!(last_toast(&bot).as_deref(), Some("Задача уже выполнена"));
+    // Выполнение Маши не откачено: задача выполнена, строка «✅ … · Маша».
+    assert_eq!(item_status(&db.pool, task.id).await.0, "done");
+    assert_eq!(
+        support::notifications::completed_events(&db.pool, task.id).await,
+        1
+    );
+    let (_, after) = bot.latest();
+    assert!(after.contains("✅ Вынести мусор · Маша"), "{after}");
 }

@@ -42,6 +42,21 @@ pub const SUGGESTED_TIMEZONES: &[&str] = &[
     "UTC",
 ];
 
+/// Состав утренней сводки.
+///
+/// Неизвестное строковое значение разбирается как [`All`](Self::All), чтобы
+/// откат и повторный выкат не сбрасывали остальные настройки.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DigestScope {
+    /// Только задачи и события получателя.
+    Mine,
+    /// Задачи и события всей семьи.
+    #[default]
+    #[serde(other)]
+    All,
+}
+
 /// Настройки уведомлений одного пользователя.
 ///
 /// Отсутствующие в JSON поля принимают значения по умолчанию, поэтому
@@ -59,6 +74,8 @@ pub struct NotificationSettings {
     pub lead_minutes: u16,
     /// Время утренней сводки, `HH:MM`.
     pub digest_time: String,
+    /// Состав утренней сводки: все в семье или только мои.
+    pub digest_scope: DigestScope,
     /// Время напоминания о задачах на весь день, `HH:MM`.
     pub all_day_time: String,
     /// Тихие часы включены.
@@ -77,6 +94,7 @@ impl Default for NotificationSettings {
             assignment_enabled: true,
             lead_minutes: 15,
             digest_time: "08:30".into(),
+            digest_scope: DigestScope::All,
             all_day_time: "09:00".into(),
             quiet_hours_enabled: true,
             quiet_start: "22:00".into(),
@@ -130,6 +148,8 @@ pub struct NotificationSettingsUpdate {
     pub lead_minutes: Option<u16>,
     /// Время сводки.
     pub digest_time: Option<String>,
+    /// Состав сводки.
+    pub digest_scope: Option<DigestScope>,
     /// Время напоминания о задачах на весь день.
     pub all_day_time: Option<String>,
     /// Тихие часы.
@@ -160,6 +180,9 @@ impl NotificationSettingsUpdate {
         }
         if let Some(value) = self.digest_time {
             current.digest_time = normalize_hhmm(&value, "digest time")?;
+        }
+        if let Some(value) = self.digest_scope {
+            current.digest_scope = value;
         }
         if let Some(value) = self.all_day_time {
             current.all_day_time = normalize_hhmm(&value, "all-day reminder time")?;
@@ -261,6 +284,50 @@ mod tests {
             NotificationSettings::from_settings(&json!({"notifications": "broken"})),
             NotificationSettings::default()
         );
+    }
+
+    #[test]
+    fn digest_scope_defaults_to_all_without_the_field() {
+        assert_eq!(
+            NotificationSettings::default().digest_scope,
+            DigestScope::All
+        );
+        let settings = NotificationSettings::from_settings(
+            &json!({"notifications": {"lead_minutes": 60, "digest_time": "07:45"}}),
+        );
+        assert_eq!(settings.digest_scope, DigestScope::All);
+        assert_eq!(settings.lead_minutes, 60);
+        assert_eq!(settings.digest_time, "07:45");
+    }
+
+    #[test]
+    fn digest_scope_mine_round_trips() {
+        let settings = NotificationSettings::from_settings(
+            &json!({"notifications": {"digest_scope": "mine"}}),
+        );
+        assert_eq!(settings.digest_scope, DigestScope::Mine);
+        assert_eq!(
+            serde_json::to_value(DigestScope::Mine).expect("json"),
+            json!("mine")
+        );
+        assert_eq!(
+            serde_json::to_value(DigestScope::All).expect("json"),
+            json!("all")
+        );
+    }
+
+    #[test]
+    fn unknown_digest_scope_keeps_other_fields() {
+        let settings = NotificationSettings::from_settings(&json!({
+            "notifications": {
+                "digest_scope": "family",
+                "lead_minutes": 60,
+                "digest_time": "07:45"
+            }
+        }));
+        assert_eq!(settings.digest_scope, DigestScope::All);
+        assert_eq!(settings.lead_minutes, 60);
+        assert_eq!(settings.digest_time, "07:45");
     }
 
     #[test]

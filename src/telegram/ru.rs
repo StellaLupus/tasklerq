@@ -24,6 +24,11 @@ pub fn tasks(n: i64) -> String {
     format!("{n} {}", plural(n, "задача", "задачи", "задач"))
 }
 
+/// «5 событий».
+pub fn events(n: i64) -> String {
+    format!("{n} {}", plural(n, "событие", "события", "событий"))
+}
+
 /// «5 покупок».
 pub fn purchases(n: i64) -> String {
     format!("{n} {}", plural(n, "покупка", "покупки", "покупок"))
@@ -340,6 +345,8 @@ pub const DONE_TOAST: &str = "Выполнено";
 pub const BACK_BUTTON: &str = "⬅️ Назад";
 /// Кнопка возврата в главное меню.
 pub const MENU_BUTTON: &str = "🏠 Меню";
+/// Кнопка сводки по запросу на постоянной клавиатуре под полем ввода.
+pub const DIGEST_KEYBOARD_BUTTON: &str = "☀️ Сводка";
 /// Текст носителя постоянной reply-клавиатуры: подсказывает написать задачу
 /// и вызвать меню кнопкой под полем ввода.
 pub const KEYBOARD_CARRIER_TEXT: &str =
@@ -592,6 +599,16 @@ mod tests {
         assert_eq!(points(2), "2 пункта");
         assert_eq!(points(5), "5 пунктов");
         assert_eq!(points(21), "21 пункт");
+    }
+
+    #[test]
+    fn events_plural_forms() {
+        assert_eq!(events(1), "1 событие");
+        assert_eq!(events(2), "2 события");
+        assert_eq!(events(5), "5 событий");
+        assert_eq!(events(11), "11 событий");
+        assert_eq!(events(21), "21 событие");
+        assert_eq!(events(22), "22 события");
     }
 
     #[test]

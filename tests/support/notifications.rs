@@ -332,6 +332,61 @@ pub async fn tick_with_a_failing_notice_sync(
     result
 }
 
+/// Тик с триггером, ломающим запись нового отпечатка шагом синхронизации
+/// сводок: шаг сообщает ошибку, а триггер снимается и в этом случае, поэтому
+/// база остаётся пригодной.
+///
+/// База должна быть отдельной: DDL на `notification_deliveries` задел бы
+/// параллельные тики общей базы.
+pub async fn tick_with_a_failing_digest_sync(
+    pool: &PgPool,
+    at: DateTime<Utc>,
+) -> Result<TickStats, sqlx::Error> {
+    sqlx::query(
+        "CREATE FUNCTION fail_digest_sync() RETURNS trigger AS $$
+         BEGIN
+             RAISE EXCEPTION 'forced digest sync failure';
+         END $$ LANGUAGE plpgsql",
+    )
+    .execute(pool)
+    .await
+    .expect("function");
+    sqlx::query(
+        "CREATE TRIGGER fail_digest_sync BEFORE UPDATE ON notification_deliveries
+         FOR EACH ROW WHEN (NEW.kind = 'digest' AND NEW.digest_hash IS DISTINCT FROM OLD.digest_hash)
+         EXECUTE FUNCTION fail_digest_sync()",
+    )
+    .execute(pool)
+    .await
+    .expect("trigger");
+
+    let result = scheduler(pool).tick(at).await;
+
+    sqlx::query("DROP TRIGGER fail_digest_sync ON notification_deliveries")
+        .execute(pool)
+        .await
+        .expect("drop trigger");
+    sqlx::query("DROP FUNCTION fail_digest_sync()")
+        .execute(pool)
+        .await
+        .expect("drop function");
+
+    result
+}
+
+/// Id последней доставки сводки получателя.
+pub async fn digest_delivery_id(pool: &PgPool, user_id: Uuid) -> Uuid {
+    sqlx::query_scalar(
+        "SELECT id FROM notification_deliveries
+         WHERE user_id = $1 AND kind = 'digest'
+         ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .expect("digest delivery id")
+}
+
 pub async fn tick_and_deliver(bot: &mut Harness, pool: &PgPool, at: DateTime<Utc>) -> TickStats {
     // В проде переход событий и планировщик — два независимых цикла. Тест
     // сохраняет прежний порядок одного тика: сначала доменный шаг, затем
