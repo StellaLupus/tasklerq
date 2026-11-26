@@ -594,7 +594,7 @@ pub async fn digest_view(
                     let actor_name = notify::member_name(
                         completion.actor_user_id,
                         delivery.user_id,
-                        completion.actor_user_id.and_then(&member),
+                        completion.actor_user_id.and_then(member),
                     );
                     // «Следующее …» — текущий срок повторяющейся задачи.
                     let next = item.recurring && item.status == ItemStatus::Open;
@@ -630,7 +630,7 @@ pub async fn digest_view(
                     assignee_name: notify::member_name(
                         item.assignee_user_id,
                         delivery.user_id,
-                        item.assignee_user_id.and_then(&member),
+                        item.assignee_user_id.and_then(member),
                     ),
                 },
             }
