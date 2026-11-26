@@ -7686,6 +7686,122 @@ async fn queued_manual_digests_inherit_the_replacement_of_a_delivered_one() {
     assert!(alive_digests(&bot).is_empty());
 }
 
+/// Сдвинуть `sent_at` строки outbox доставленной сводки по ключу вхождения.
+async fn age_digest_sent_at_by_key(
+    pool: &PgPool,
+    user_id: Uuid,
+    occurrence_key: &str,
+    sent_at: DateTime<Utc>,
+) {
+    sqlx::query(
+        "UPDATE outbox SET sent_at = $3
+         WHERE seq = (SELECT outbox_seq FROM notification_deliveries
+                      WHERE user_id = $1 AND kind = 'digest' AND occurrence_key = $2)",
+    )
+    .bind(user_id)
+    .bind(occurrence_key)
+    .bind(sent_at)
+    .execute(pool)
+    .await
+    .expect("age digest message");
+}
+
+/// Перенесённый id старше окна замены отбрасывается: B получила удаление A,
+/// пока та была свежей, но к моменту C A уже вне окна, и наследовать его
+/// нельзя. Проверяется годность перенесённого id в `supersede_pending_manual`
+/// (`o.sent_at >= $3`), а не выборка `replace_previous`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_manual_digests_drop_an_inherited_replacement_outside_the_window() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    digest_on(&db.pool, household.owner_id).await;
+    create_all_day_task(
+        &db,
+        &household,
+        "Проверить почту",
+        day,
+        Some(household.owner_id),
+    )
+    .await;
+
+    // A уже доставлена и лежит в чате.
+    let morning_at = local_utc(moscow, day, 8, 30);
+    bot.freeze_at(morning_at);
+    let delivered = deliver_digest_at(&mut bot, &db.pool, morning_at).await;
+
+    // B запрошена, пока A свежая: B несёт удаление A.
+    let first_at = local_utc(moscow, day, 9, 0);
+    manual_digest(&db.pool, household.owner_id, first_at).await;
+    let payload = latest_digest_payload(&db.pool, bot.chat).await;
+    assert_eq!(payload["replaces"], json!([delivered]), "{payload}");
+
+    // A состаривается после B и до C: `replace_previous` для B уже пропустил
+    // её по своему окну, поэтому проверяется именно фильтр переноса.
+    let second_at = first_at + Duration::minutes(1);
+    age_digest_sent_at_by_key(
+        &db.pool,
+        household.owner_id,
+        &format!("digest:{day}"),
+        second_at - Duration::hours(48),
+    )
+    .await;
+
+    // C вытесняет ожидающую B: перенесённый id A старше окна и отбрасывается.
+    manual_digest(&db.pool, household.owner_id, second_at).await;
+    let payload = latest_digest_payload(&db.pool, bot.chat).await;
+    assert!(payload.get("replaces").is_none(), "{payload}");
+
+    bot.advance(second_at - bot.now);
+    bot.deliver().await;
+    assert!(replace_delete_rows(&db.pool, bot.chat).await.is_empty());
+}
+
+/// Граница окна включительна: перенесённый id A ровно на 47 часов старше
+/// момента C остаётся в `replaces` (`>=`, как у `replace_previous`; мутация
+/// на `>` ломает тест).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_manual_digests_inherit_a_replacement_on_the_exact_window_boundary() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    digest_on(&db.pool, household.owner_id).await;
+    create_all_day_task(
+        &db,
+        &household,
+        "Проверить почту",
+        day,
+        Some(household.owner_id),
+    )
+    .await;
+
+    let morning_at = local_utc(moscow, day, 8, 30);
+    bot.freeze_at(morning_at);
+    let delivered = deliver_digest_at(&mut bot, &db.pool, morning_at).await;
+
+    let first_at = local_utc(moscow, day, 9, 0);
+    manual_digest(&db.pool, household.owner_id, first_at).await;
+    let payload = latest_digest_payload(&db.pool, bot.chat).await;
+    assert_eq!(payload["replaces"], json!([delivered]), "{payload}");
+
+    let second_at = first_at + Duration::minutes(1);
+    age_digest_sent_at_by_key(
+        &db.pool,
+        household.owner_id,
+        &format!("digest:{day}"),
+        second_at - Duration::hours(47),
+    )
+    .await;
+
+    manual_digest(&db.pool, household.owner_id, second_at).await;
+    let payload = latest_digest_payload(&db.pool, bot.chat).await;
+    assert_eq!(payload["replaces"], json!([delivered]), "{payload}");
+}
+
 /// Утренняя сводка, вытеснившая ожидающую ручную, наследует её удаление.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn morning_digest_inherits_the_replacement_of_a_superseded_manual() {
