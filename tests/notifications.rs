@@ -7631,6 +7631,219 @@ async fn morning_digest_supersedes_a_manual_that_is_still_in_the_outbox() {
     assert!(alive_manual_digests(&bot).is_empty());
 }
 
+/// Вытеснение ожидающей ручной сводки не теряет удаление прежней
+/// доставленной: новая сводка наследует `replaces` вытесненной.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_manual_digests_inherit_the_replacement_of_a_delivered_one() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    digest_on(&db.pool, household.owner_id).await;
+    create_all_day_task(
+        &db,
+        &household,
+        "Проверить почту",
+        day,
+        Some(household.owner_id),
+    )
+    .await;
+
+    // A уже доставлена и лежит в чате.
+    let morning_at = local_utc(moscow, day, 8, 30);
+    bot.freeze_at(morning_at);
+    let delivered = deliver_digest_at(&mut bot, &db.pool, morning_at).await;
+    assert_eq!(bot.latest().0, delivered);
+
+    // B и C запрошены подряд: воркер между ними не проходил.
+    let first_at = local_utc(moscow, day, 9, 0);
+    let second_at = first_at + Duration::minutes(1);
+    manual_digest(&db.pool, household.owner_id, first_at).await;
+    manual_digest(&db.pool, household.owner_id, second_at).await;
+
+    let payload = latest_digest_payload(&db.pool, bot.chat).await;
+    assert_eq!(payload["replaces"], json!([delivered]), "{payload}");
+    let rows = digest_outbox_rows(&db.pool, bot.chat).await;
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(rows[0].0, "sent", "{rows:?}");
+    assert_eq!(rows[1].0, "skipped", "{rows:?}");
+    assert_eq!(rows[2].0, "pending", "{rows:?}");
+
+    bot.advance(second_at - bot.now);
+    bot.deliver().await;
+
+    let deletes = replace_delete_rows(&db.pool, bot.chat).await;
+    assert_eq!(deletes.len(), 1, "{deletes:?}");
+    assert_eq!(
+        deletes[0].1,
+        format!("replace:{}:{delivered}", bot.chat),
+        "{deletes:?}"
+    );
+    assert!(deleted(&bot, delivered));
+    let alive = alive_manual_digests(&bot);
+    assert_eq!(alive.len(), 1, "{alive:?}");
+    assert!(alive_digests(&bot).is_empty());
+}
+
+/// Утренняя сводка, вытеснившая ожидающую ручную, наследует её удаление.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn morning_digest_inherits_the_replacement_of_a_superseded_manual() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    let yesterday = day - Duration::days(1);
+    digest_on(&db.pool, household.owner_id).await;
+    create_all_day_task(
+        &db,
+        &household,
+        "Забрать заказ",
+        day,
+        Some(household.owner_id),
+    )
+    .await;
+
+    // A — вчерашняя утренняя, уже в чате.
+    let yesterday_at = local_utc(moscow, yesterday, 8, 30);
+    bot.freeze_at(yesterday_at);
+    let delivered = deliver_digest_at(&mut bot, &db.pool, yesterday_at).await;
+
+    // B запрошена и ждёт воркер: она уже несёт удаление A.
+    let manual_at = local_utc(moscow, day, 8, 29);
+    manual_digest(&db.pool, household.owner_id, manual_at).await;
+    let payload = latest_digest_payload(&db.pool, bot.chat).await;
+    assert_eq!(payload["replaces"], json!([delivered]), "{payload}");
+
+    // Утренняя C вытесняет B до доставки.
+    let morning_at = local_utc(moscow, day, 8, 30);
+    let stats = scheduler(&db.pool)
+        .tick(morning_at)
+        .await
+        .expect("morning tick");
+    assert_eq!(stats.delivered, 1, "{stats:?}");
+    let payload = latest_digest_payload(&db.pool, bot.chat).await;
+    assert_eq!(payload["replaces"], json!([delivered]), "{payload}");
+
+    bot.advance(morning_at - bot.now);
+    bot.deliver().await;
+
+    assert!(deleted(&bot, delivered));
+    let deletes = replace_delete_rows(&db.pool, bot.chat).await;
+    assert_eq!(deletes.len(), 1, "{deletes:?}");
+    let alive = alive_digests(&bot);
+    assert_eq!(alive.len(), 1, "{alive:?}");
+    assert!(alive_manual_digests(&bot).is_empty());
+}
+
+/// Перенос транзитивен: цепочка вытесненных ручных сводок передаёт удаление
+/// прежней доставленной дальше.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacement_is_inherited_transitively_through_queued_manuals() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let household = household_for(&db.pool, bot.chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    digest_on(&db.pool, household.owner_id).await;
+    create_all_day_task(
+        &db,
+        &household,
+        "Проверить почту",
+        day,
+        Some(household.owner_id),
+    )
+    .await;
+
+    let morning_at = local_utc(moscow, day, 8, 30);
+    bot.freeze_at(morning_at);
+    let delivered = deliver_digest_at(&mut bot, &db.pool, morning_at).await;
+
+    let first_at = local_utc(moscow, day, 9, 0);
+    for offset in 0..3 {
+        manual_digest(
+            &db.pool,
+            household.owner_id,
+            first_at + Duration::minutes(offset),
+        )
+        .await;
+    }
+
+    let payload = latest_digest_payload(&db.pool, bot.chat).await;
+    assert_eq!(payload["replaces"], json!([delivered]), "{payload}");
+    let rows = digest_outbox_rows(&db.pool, bot.chat).await;
+    assert_eq!(rows.len(), 4, "{rows:?}");
+    for row in &rows[1..3] {
+        assert_eq!(row.0, "skipped", "{rows:?}");
+    }
+    assert_eq!(rows[3].0, "pending", "{rows:?}");
+
+    bot.advance(first_at + Duration::minutes(2) - bot.now);
+    bot.deliver().await;
+
+    assert!(deleted(&bot, delivered));
+    let alive = alive_manual_digests(&bot);
+    assert_eq!(alive.len(), 1, "{alive:?}");
+}
+
+/// Перенесённый id принадлежит прежнему чату получателя: удаление в новый чат
+/// не ставится.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacement_of_a_message_from_the_previous_chat_is_dropped() {
+    let db = support::isolated_db().await;
+    let mut bot = onboarded(&db.pool).await;
+    let old_chat = bot.chat;
+    let household = household_for(&db.pool, old_chat).await;
+    let moscow = chrono_tz::Europe::Moscow;
+    let day = local_today(&bot, moscow);
+    digest_on(&db.pool, household.owner_id).await;
+    create_all_day_task(
+        &db,
+        &household,
+        "Проверить почту",
+        day,
+        Some(household.owner_id),
+    )
+    .await;
+
+    let morning_at = local_utc(moscow, day, 8, 30);
+    bot.freeze_at(morning_at);
+    let delivered = deliver_digest_at(&mut bot, &db.pool, morning_at).await;
+
+    // B в старом чате несёт удаление A.
+    let first_at = local_utc(moscow, day, 9, 0);
+    manual_digest(&db.pool, household.owner_id, first_at).await;
+    let payload = latest_digest_payload(&db.pool, old_chat).await;
+    assert_eq!(payload["replaces"], json!([delivered]), "{payload}");
+
+    // Получатель сменил чат: C вытесняет B, но удаление A в новый чат не идёт.
+    let new_chat = support::next_telegram_id();
+    sqlx::query("UPDATE users SET telegram_chat_id = $2 WHERE id = $1")
+        .bind(household.owner_id)
+        .bind(new_chat)
+        .execute(&db.pool)
+        .await
+        .expect("change chat");
+    let second_at = first_at + Duration::minutes(1);
+    manual_digest(&db.pool, household.owner_id, second_at).await;
+    let payload = latest_digest_payload(&db.pool, new_chat).await;
+    assert!(payload.get("replaces").is_none(), "{payload}");
+
+    let mut new_bot = Harness::sharing(&db.pool, new_chat, bot.fake.clone());
+    new_bot.freeze_at(second_at);
+    new_bot.deliver().await;
+
+    assert!(replace_delete_rows(&db.pool, new_chat).await.is_empty());
+    assert!(!deleted(&new_bot, delivered));
+    assert!(
+        bot.fake
+            .messages(old_chat)
+            .iter()
+            .any(|(id, _)| *id == delivered)
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_after_a_queued_morning_is_coalesced_on_the_next_tick() {
     let db = support::isolated_db().await;

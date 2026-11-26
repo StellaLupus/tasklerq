@@ -818,14 +818,22 @@ pub(crate) async fn replace_previous(
 /// вытесняется так же, как неотправленный экран: оно никогда не уйдёт, а
 /// запись помечается убранной. Утренняя сводка не трогается: её доставка не
 /// должна отменяться (design, решение 7).
+///
+/// Удаление прежних сообщений — обязательство вытесняемой сводки: её
+/// `replaces` читаются из payload до затирания и возвращаются вызывающему,
+/// чтобы новая сводка унаследовала их. Перенесённые id проходят ту же проверку
+/// годности, что и выборка [`replace_previous`]: сообщение доставлено в этот
+/// чат и не старше [`REPLACE_WINDOW_HOURS`]. Так цепочка вытеснений не теряет
+/// удаление и не ставит его в чужой чат после смены чата получателем.
 pub(crate) async fn supersede_pending_manual(
     conn: &mut PgConnection,
     user_id: Uuid,
     current_id: Uuid,
+    chat_id: i64,
     now: DateTime<Utc>,
-) -> Result<(), sqlx::Error> {
-    let rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT d.occurrence_key, o.seq
+) -> Result<Vec<i64>, sqlx::Error> {
+    let rows: Vec<(String, i64, serde_json::Value)> = sqlx::query_as(
+        "SELECT d.occurrence_key, o.seq, o.payload
          FROM notification_deliveries d
          JOIN outbox o ON o.seq = d.outbox_seq
          WHERE d.user_id = $1 AND d.kind = 'digest' AND d.status = 'sent'
@@ -838,12 +846,50 @@ pub(crate) async fn supersede_pending_manual(
     .await?;
     let seqs: Vec<i64> = rows
         .iter()
-        .filter(|(key, _)| digest_key_manual(key))
-        .map(|(_, seq)| *seq)
+        .filter(|(key, _, _)| digest_key_manual(key))
+        .map(|(_, seq, _)| *seq)
         .collect();
-    if seqs.is_empty() {
-        return Ok(());
+    let mut inherited: Vec<i64> = Vec::new();
+    for (key, _, payload) in &rows {
+        if !digest_key_manual(key) {
+            continue;
+        }
+        let Some(ids) = payload
+            .get("replaces")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for id in ids.iter().filter_map(serde_json::Value::as_i64) {
+            if !inherited.contains(&id) {
+                inherited.push(id);
+            }
+        }
     }
+    if seqs.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Перенесённый id годится, только если сообщение действительно доставлено
+    // в этот чат и Telegram ещё даст его удалить.
+    let inherited = if inherited.is_empty() {
+        inherited
+    } else {
+        let valid: Vec<i64> = sqlx::query_scalar(
+            "SELECT DISTINCT o.message_id
+             FROM outbox o
+             WHERE o.chat_id = $1 AND o.status = 'sent'
+               AND o.message_id = ANY($2) AND o.sent_at >= $3",
+        )
+        .bind(chat_id)
+        .bind(&inherited)
+        .bind(now - Duration::hours(REPLACE_WINDOW_HOURS))
+        .fetch_all(&mut *conn)
+        .await?;
+        inherited
+            .into_iter()
+            .filter(|id| valid.contains(id))
+            .collect()
+    };
     sqlx::query(
         "UPDATE outbox
          SET status = 'skipped', last_error = 'cancelled',
@@ -862,7 +908,16 @@ pub(crate) async fn supersede_pending_manual(
     .bind(now)
     .execute(&mut *conn)
     .await?;
-    Ok(())
+    Ok(inherited)
+}
+
+/// Дополнить `replaces` унаследованными id, не повторяя уже отобранные.
+pub(crate) fn inherit_replaces(replaces: &mut Vec<i64>, inherited: Vec<i64>) {
+    for id in inherited {
+        if !replaces.contains(&id) {
+            replaces.push(id);
+        }
+    }
 }
 
 /// Немедленно выпустить сводку по запросу получателя (0019, design, решение 7).
@@ -1008,8 +1063,9 @@ async fn build_manual_digest(
     let Some(html) = digest_message(conn, &row, telegram_user_id, now).await? else {
         return Ok(None);
     };
-    supersede_pending_manual(conn, user_id, row.id, now).await?;
-    let replaces = replace_previous(conn, &row, chat_id, now).await?;
+    let inherited = supersede_pending_manual(conn, user_id, row.id, chat_id, now).await?;
+    let mut replaces = replace_previous(conn, &row, chat_id, now).await?;
+    inherit_replaces(&mut replaces, inherited);
     let dedupe_key = delivery::delivery_dedupe_key(row.id, NotificationKind::Digest);
     let seq =
         delivery::enqueue_message(conn, chat_id, &dedupe_key, html, true, replaces, now).await?;

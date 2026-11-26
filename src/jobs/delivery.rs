@@ -351,20 +351,24 @@ pub(crate) async fn deliver_one_in_conn(
         return Ok(0);
     };
 
-    // Утренняя доставка заменяет и ещё не ушедшую ручную сводку: её строка
-    // outbox ожидает, `replace_previous` её не видит, а отменять саму утреннюю
-    // запись нельзя. Ожидающее ручное сообщение вытесняется, как экран.
-    if scope == DeliveryScope::Digest {
-        digest::supersede_pending_manual(&mut *conn, row.user_id, row.id, now).await?;
-    }
-
     let dedupe_key = delivery_dedupe_key(row.id, row.kind);
     // Замена (0017, решения 5, 6): snooze из отдельного уведомления удаляет
     // сообщение «😴 Напомню …», новая сводка — прежние сводки получателя.
     // Удаление ставит outbox после фактической доставки нового; отметка уборки
-    // ставится здесь же, в транзакции доставки.
+    // ставится здесь же, в транзакции доставки. Утренняя доставка заменяет и
+    // ещё не ушедшую ручную сводку: её строка outbox ожидает,
+    // `replace_previous` её не видит, а отменять саму утреннюю запись нельзя.
+    // Ожидающее ручное сообщение вытесняется, как экран (design, решение 7), а
+    // его обязательство удаления переходит новой сводке.
     let replaces: Vec<i64> = match scope {
-        DeliveryScope::Digest => digest::replace_previous(&mut *conn, &row, chat_id, now).await?,
+        DeliveryScope::Digest => {
+            let inherited =
+                digest::supersede_pending_manual(&mut *conn, row.user_id, row.id, chat_id, now)
+                    .await?;
+            let mut replaces = digest::replace_previous(&mut *conn, &row, chat_id, now).await?;
+            digest::inherit_replaces(&mut replaces, inherited);
+            replaces
+        }
         _ => row.replaces_message_id.into_iter().collect(),
     };
     let seq = enqueue_message(&mut *conn, chat_id, &dedupe_key, html, true, replaces, now).await?;
